@@ -96,6 +96,41 @@ fn immutable_observations_update_delete_error() {
 }
 
 #[test]
+fn invalidation_state_machine_sql_enforced() {
+    let db = Database::open_memory();
+    let id = Uuid::new_v4();
+
+    db.execute(
+        "INSERT INTO invalidations (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text("pending".into())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO invalidations (id, status) VALUES ($id, $status) ON CONFLICT (id) DO UPDATE SET status=$status",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text("acknowledged".into())),
+        ]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "INSERT INTO invalidations (id, status) VALUES ($id, $status) ON CONFLICT (id) DO UPDATE SET status=$status",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("status", Value::Text("pending".into())),
+            ]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidStateTransition(_)));
+}
+
+#[test]
 fn parameter_binding_and_uuid_text_coercion() {
     let db = Database::open_memory();
     let id = Uuid::new_v4();
@@ -116,6 +151,95 @@ fn parameter_binding_and_uuid_text_coercion() {
         )
         .unwrap();
     assert_eq!(out.rows.len(), 1);
+}
+
+#[test]
+fn vector_dimension_validation_via_sql() {
+    let db = Database::open_memory();
+
+    db.execute(
+        "INSERT INTO observations (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "INSERT INTO observations (id, embedding) VALUES ($id, $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("embedding", Value::Vector(vec![1.0, 0.0])),
+            ]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::VectorDimensionMismatch { .. }));
+}
+
+#[test]
+fn duplicate_uuid_without_conflict_clause_errors() {
+    let db = Database::open_memory();
+    let id = Uuid::new_v4();
+
+    db.execute(
+        "INSERT INTO entities (id, name) VALUES ($id, $name)",
+        &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("a".into()))]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "INSERT INTO entities (id, name) VALUES ($id, $name)",
+            &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("b".into()))]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::UniqueViolation { .. }));
+}
+
+#[test]
+fn archive_intention_with_active_decisions_is_blocked() {
+    let db = Database::open_memory();
+    let intention_id = Uuid::new_v4();
+    let decision_id = Uuid::new_v4();
+
+    let tx = db.begin();
+    db.insert_row(
+        tx,
+        "intentions",
+        params(vec![
+            ("id", Value::Uuid(intention_id)),
+            ("status", Value::Text("active".into())),
+        ]),
+    )
+    .unwrap();
+    db.insert_row(
+        tx,
+        "decisions",
+        params(vec![
+            ("id", Value::Uuid(decision_id)),
+            ("status", Value::Text("active".into())),
+        ]),
+    )
+    .unwrap();
+    db.insert_edge(
+        tx,
+        decision_id,
+        intention_id,
+        "SERVES".to_string(),
+        HashMap::new(),
+    )
+    .unwrap();
+    db.commit(tx).unwrap();
+
+    let err = db
+        .execute(
+            "UPDATE intentions SET status='archived' WHERE id = $id",
+            &params(vec![("id", Value::Uuid(intention_id))]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidStateTransition(_)));
 }
 
 #[test]

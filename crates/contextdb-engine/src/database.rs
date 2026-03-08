@@ -1,5 +1,6 @@
 use crate::composite_store::CompositeStore;
 use crate::executor::execute_plan;
+use crate::schema_enforcer::validate_dml;
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
 use contextdb_parser::Statement;
@@ -112,6 +113,7 @@ impl Database {
         }
 
         let plan = contextdb_planner::plan(&stmt)?;
+        validate_dml(&plan, self, params)?;
         let active_tx = *self.session_tx.lock();
         match active_tx {
             Some(tx) => execute_plan(self, &plan, params, Some(tx)),
@@ -157,6 +159,7 @@ impl Database {
     ) -> Result<QueryResult> {
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
+        validate_dml(&plan, self, params)?;
         execute_plan(self, &plan, params, Some(tx))
     }
 
