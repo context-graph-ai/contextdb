@@ -1,0 +1,33 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: check.py [GO-05] assertions — replay returns BasisComparison per BASED_ON entity with state_at_decision_time vs current_state and FieldDiff list"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Replay — Expected Output Fixture
+
+decision_id: "decision-autoscale"
+decision_time: "<T_decision>"
+
+basis_entities:
+  - entity_id: "entity-infra"
+    state_at_decision_time:
+      node_count: 3
+      cpu_per_node: "4cores"
+    current_state:
+      node_count: 5
+      cpu_per_node: "8cores"
+    diffs:
+      - {field: "cpu_per_node", old_value: "4cores", new_value: "8cores"}
+      - {field: "node_count", old_value: 3, new_value: 5}
+    # diffs sorted alphabetically by field name
+
+  - entity_id: "entity-config"
+    state_at_decision_time:
+      max_replicas: 10
+    current_state:
+      max_replicas: 10
+    diffs: []
+    # no changes — entity unchanged since decision

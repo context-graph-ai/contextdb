@@ -1,0 +1,21 @@
+---
+fixture_basis: empirical
+source: "Standard SQL ON CONFLICT DO UPDATE semantics. Deterministic upsert requirement from contextDB_intent-for-prompt.md."
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Deterministic Upsert — Expected Output Fixture
+
+after_all_operations:
+  rows:
+    - {id: "entity-1", name: "updated", version: 2}  # was "original"/1, updated by op 2, unchanged by op 3
+    - {id: "entity-2", name: "new-entity", version: 1}  # inserted by op 1
+
+  total_rows: 2
+
+operation_results:
+  - {op: 1, result: "inserted", rows_affected: 1}
+  - {op: 2, result: "updated", rows_affected: 1}
+  - {op: 3, result: "updated", rows_affected: 1}  # SQL reports update even though values unchanged (standard behavior)

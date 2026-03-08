@@ -1,0 +1,77 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: check.py [GO-02] assertions, cg_spike.py full_provenance returns ProvenanceResult"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Full Provenance — Expected Output Fixture
+
+decision_id: "decision-main"
+
+decision:
+  id: "decision-main"
+  decision_type: "architecture"
+  description: "route traffic through api-gateway with failover"
+  status: "active"
+  confidence: 0.9
+
+input_snapshots:
+  - entity_id: "entity-db"
+    state_at_decision_time:
+      engine: "postgres"
+      version: "14"
+    current_state:
+      engine: "postgres"
+      version: "14"
+    # same — entity unchanged since decision
+
+  - entity_id: "entity-api"
+    state_at_decision_time:
+      throughput: 1000
+    current_state:
+      throughput: 1000
+
+reasoning_steps:
+  - operation: "analyze"
+    details: "evaluated DB connection patterns"
+    result: "connection pooling sufficient"
+  - operation: "evaluate"
+    details: "checked API gateway throughput"
+    result: "1000 req/s handles current load"
+  - operation: "decide"
+    details: "failover via gateway selected"
+    result: "approved with high confidence"
+
+precedent_decisions:
+  - id: "decision-precedent"
+    decision_type: "architecture"
+    description: "use connection pooling for DB access"
+
+approvals:
+  - approver_id: "agent-senior"
+    level: "architecture-review"
+    rationale: "failover pattern validated against SLA"
+
+outcome:
+  success: true
+  notes: "deployed, uptime target met for 30 days"
+
+timeline:
+  # sorted by timestamp, contains all events
+  - timestamp: "<T1>"
+    event_type: "entity_created"
+    entity_id: "entity-db"
+  - timestamp: "<T2>"
+    event_type: "entity_created"
+    entity_id: "entity-api"
+  - timestamp: "<T3>"
+    event_type: "decision_made"
+    entity_id: "decision-main"
+  - timestamp: "<T4>"
+    event_type: "approval_added"
+    entity_id: "decision-main"
+  - timestamp: "<T5>"
+    event_type: "outcome_recorded"
+    entity_id: "decision-main"

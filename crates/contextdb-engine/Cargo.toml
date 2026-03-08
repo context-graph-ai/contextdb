@@ -14,3 +14,7 @@ contextdb-planner = { path = "../contextdb-planner" }
 roaring.workspace = true
 uuid.workspace = true
 parking_lot.workspace = true
+
+[[test]]
+name = "integration"
+path = "../../tests/integration.rs"

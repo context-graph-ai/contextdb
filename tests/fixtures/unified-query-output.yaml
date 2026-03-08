@@ -1,0 +1,44 @@
+---
+fixture_basis: hypothetical
+source: "Derived from draft query spec execution pattern. No empirical unified query in spike."
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Unified Query — Expected Output Fixture
+# NOTE: hypothetical fixture — pay 2x attention during spike validation
+
+# Graph phase: 2-hop BFS from "hub" via RELATES_TO
+#   hop 1: n1, n2
+#   hop 2: n3 (via n1→n3)
+#   Neighborhood = {n1, n2, n3}
+#   "far" excluded (not connected within 2 hops)
+
+# Relational phase: filter by context_id='ctx-001'
+#   obs-a (n1, ctx-001) ✓
+#   obs-b (n2, ctx-001) ✓
+#   obs-c (n3, ctx-001) ✓
+#   obs-d (n1, ctx-001) ✓
+#   obs-far (far, ctx-001) ✗ — entity not in neighborhood
+#   obs-other (n1, ctx-002) ✗ — wrong context
+
+# Vector phase: cosine similarity to [1,0,0,0], top 3
+#   obs-a [0.9,0.1,0,0] → cos ≈ 0.994
+#   obs-b [0.8,0.2,0,0] → cos ≈ 0.970
+#   obs-d [0.7,0.3,0,0] → cos ≈ 0.919
+#   obs-c [0.1,0.9,0,0] → cos ≈ 0.110
+
+results:
+  - {id: "obs-a", data: {event: "auth-spike"}}
+  - {id: "obs-b", data: {event: "user-load"}}
+  - {id: "obs-d", data: {event: "auth-timeout"}}
+
+# obs-far is excluded despite being more similar (cos ≈ 0.999)
+# because entity "far" is outside the 2-hop neighborhood.
+# This demonstrates the graph→relational→vector pipeline:
+# graph restricts candidates, relational filters, vector ranks.
+excluded:
+  - {id: "obs-far", reason: "entity not in 2-hop neighborhood"}
+  - {id: "obs-other", reason: "wrong context_id"}
+  - {id: "obs-c", reason: "low similarity, beyond LIMIT 3"}

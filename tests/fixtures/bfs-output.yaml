@@ -1,0 +1,19 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: cg_spike.py bounded BFS traversal logic, depth tracking"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Bounded BFS — Expected Output Fixture
+
+results:
+  - {id: "B", depth: 1}
+  - {id: "C", depth: 2}
+  - {id: "D", depth: 3}
+
+# E is NOT returned (depth 4, beyond bound of 3)
+# Order: BFS level order (B before C before D)
+excluded:
+  - {id: "E", reason: "depth 4 exceeds bound of 3"}

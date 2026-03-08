@@ -1,0 +1,56 @@
+---
+fixture_basis: hypothetical
+source: "No unified graph→relational→vector query exists in context-graph spike. Query pattern derived from draft-query-language-spec-for-prompt.txt section 4.1 and ontology operations."
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Unified Query (Graph→Relational→Vector) — Input Fixture
+# NOTE: hypothetical fixture — pay 2x attention during spike validation
+
+setup:
+  context:
+    id: "ctx-001"
+
+  embedding_dim: 4
+
+  entities:
+    - {id: "hub", entity_type: "SERVICE", name: "api-hub", context_id: "ctx-001"}
+    - {id: "n1", entity_type: "SERVICE", name: "auth-svc", context_id: "ctx-001"}
+    - {id: "n2", entity_type: "SERVICE", name: "user-svc", context_id: "ctx-001"}
+    - {id: "n3", entity_type: "SERVICE", name: "billing-svc", context_id: "ctx-001"}
+    - {id: "far", entity_type: "SERVICE", name: "analytics-svc", context_id: "ctx-001"}
+
+  edges:
+    - {source: "hub", target: "n1", kind: "RELATES_TO"}
+    - {source: "hub", target: "n2", kind: "RELATES_TO"}
+    - {source: "n1", target: "n3", kind: "RELATES_TO"}
+    # "far" is NOT connected to hub (3+ hops away or disconnected)
+
+  observations:
+    # In neighborhood (entities n1, n2, n3):
+    - {id: "obs-a", entity_id: "n1", context_id: "ctx-001", embedding: [0.9, 0.1, 0.0, 0.0], data: {event: "auth-spike"}}
+    - {id: "obs-b", entity_id: "n2", context_id: "ctx-001", embedding: [0.8, 0.2, 0.0, 0.0], data: {event: "user-load"}}
+    - {id: "obs-c", entity_id: "n3", context_id: "ctx-001", embedding: [0.1, 0.9, 0.0, 0.0], data: {event: "billing-error"}}
+    - {id: "obs-d", entity_id: "n1", context_id: "ctx-001", embedding: [0.7, 0.3, 0.0, 0.0], data: {event: "auth-timeout"}}
+
+    # Outside neighborhood:
+    - {id: "obs-far", entity_id: "far", context_id: "ctx-001", embedding: [0.95, 0.05, 0.0, 0.0], data: {event: "analytics-spike"}}
+    # obs-far is more similar to query vector but outside 2-hop neighborhood
+
+    # Different context (should be excluded):
+    - {id: "obs-other", entity_id: "n1", context_id: "ctx-002", embedding: [1.0, 0.0, 0.0, 0.0], data: {event: "other"}}
+
+query:
+  sql: |
+    WITH neighborhood AS (
+        MATCH (e:Entity {id: 'hub'})-[:RELATES_TO*1..2]->(n:Entity)
+        RETURN n.id
+    )
+    SELECT o.id, o.data
+    FROM observations o
+    INNER JOIN neighborhood n ON o.entity_id = n.id
+    WHERE o.context_id = 'ctx-001'
+    ORDER BY o.embedding <=> '[1.0, 0.0, 0.0, 0.0]'
+    LIMIT 3

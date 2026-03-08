@@ -1,0 +1,33 @@
+---
+fixture_basis: hypothetical
+source: "No empirical ANN test data in context-graph spike. Spike has no vector operations. Embeddings and cosine similarity behavior derived from HNSW literature."
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# ANN Search — Input Fixture
+# NOTE: hypothetical fixture — pay 2x attention during spike validation
+
+setup:
+  context:
+    id: "ctx-001"
+
+  embedding_dim: 4  # reduced for test clarity (production: 384)
+
+  observations:
+    - {id: "obs-1", entity_id: "e1", context_id: "ctx-001", embedding: [1.0, 0.0, 0.0, 0.0]}
+    - {id: "obs-2", entity_id: "e2", context_id: "ctx-001", embedding: [0.9, 0.1, 0.0, 0.0]}
+    - {id: "obs-3", entity_id: "e3", context_id: "ctx-001", embedding: [0.0, 1.0, 0.0, 0.0]}
+    - {id: "obs-4", entity_id: "e4", context_id: "ctx-001", embedding: [0.0, 0.0, 1.0, 0.0]}
+    - {id: "obs-5", entity_id: "e5", context_id: "ctx-001", embedding: [0.0, 0.0, 0.0, 1.0]}
+    - {id: "obs-6", entity_id: "e6", context_id: "ctx-001", embedding: [0.7, 0.7, 0.0, 0.0]}
+    - {id: "obs-7", entity_id: "e7", context_id: "ctx-001", embedding: [0.5, 0.5, 0.5, 0.5]}
+    - {id: "obs-8", entity_id: "e8", context_id: "ctx-001", embedding: [-1.0, 0.0, 0.0, 0.0]}
+    - {id: "obs-9", entity_id: "e9", context_id: "ctx-001", embedding: [0.95, 0.05, 0.0, 0.0]}
+    - {id: "obs-10", entity_id: "e10", context_id: "ctx-001", embedding: [0.8, 0.2, 0.0, 0.0]}
+
+query:
+  vector: [1.0, 0.0, 0.0, 0.0]
+  limit: 3
+  sql: "SELECT id FROM observations ORDER BY embedding <=> '[1.0, 0.0, 0.0, 0.0]' LIMIT 3"

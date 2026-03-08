@@ -1,0 +1,80 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: check.py [GO-02] 8 assertions, cg_spike.py full_provenance method"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Full Provenance — Input Fixture
+
+setup:
+  context:
+    id: "ctx-001"
+    name: "test-context"
+
+  entities:
+    - id: "entity-db"
+      entity_type: "DATABASE"
+      name: "production-db"
+      context_id: "ctx-001"
+      properties:
+        engine: "postgres"
+        version: "14"
+
+    - id: "entity-api"
+      entity_type: "SERVICE"
+      name: "api-gateway"
+      context_id: "ctx-001"
+      properties:
+        throughput: 1000
+
+  intentions:
+    - id: "intent-reliability"
+      description: "maintain 99.9% uptime"
+      status: "active"
+      context_id: "ctx-001"
+
+  decisions:
+    - id: "decision-precedent"
+      decision_type: "architecture"
+      description: "use connection pooling for DB access"
+      status: "active"
+      confidence: 0.85
+      context_id: "ctx-001"
+      serves: ["intent-reliability"]
+      based_on: ["entity-db"]
+
+    - id: "decision-main"
+      decision_type: "architecture"
+      description: "route traffic through api-gateway with failover"
+      status: "active"
+      confidence: 0.9
+      context_id: "ctx-001"
+      serves: ["intent-reliability"]
+      based_on: ["entity-db", "entity-api"]
+      cites: ["decision-precedent"]
+      reasoning:
+        - operation: "analyze"
+          details: "evaluated DB connection patterns"
+          result: "connection pooling sufficient"
+        - operation: "evaluate"
+          details: "checked API gateway throughput"
+          result: "1000 req/s handles current load"
+        - operation: "decide"
+          details: "failover via gateway selected"
+          result: "approved with high confidence"
+
+  approvals:
+    - decision_id: "decision-main"
+      approver_id: "agent-senior"
+      level: "architecture-review"
+      rationale: "failover pattern validated against SLA"
+
+  outcomes:
+    - decision_id: "decision-main"
+      success: true
+      notes: "deployed, uptime target met for 30 days"
+
+query:
+  full_provenance: "decision-main"

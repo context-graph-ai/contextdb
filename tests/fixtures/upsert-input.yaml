@@ -1,0 +1,23 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: cg_spike.py uses dict-based upsert for entity updates. Deterministic upsert specified in contextDB_intent-for-prompt.md section 4 and draft-query-language-spec section 1.3."
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Deterministic Upsert — Input Fixture
+
+setup:
+  existing_rows:
+    - {id: "entity-1", name: "original", version: 1}
+
+operations:
+  - description: "new row (no conflict)"
+    sql: "INSERT INTO entities (id, name, version) VALUES ('entity-2', 'new-entity', 1) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, version=EXCLUDED.version"
+
+  - description: "conflict with update (different values)"
+    sql: "INSERT INTO entities (id, name, version) VALUES ('entity-1', 'updated', 2) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, version=EXCLUDED.version"
+
+  - description: "conflict with no change (same values — idempotent)"
+    sql: "INSERT INTO entities (id, name, version) VALUES ('entity-1', 'updated', 2) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, version=EXCLUDED.version"

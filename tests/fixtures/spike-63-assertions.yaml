@@ -1,0 +1,70 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: ~/projects/context-graph/spikes/context-graph/check.py — 63 assertions across 10 categories"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Spike 63 Assertions — Reference Fixture
+# This fixture is a pointer to the upstream test suite, not a standalone fixture.
+# ContextDB passes when all 63 assertions from check.py pass with ContextDB as backend.
+
+upstream_test_file: "~/projects/context-graph/spikes/context-graph/check.py"
+upstream_implementation: "~/projects/context-graph/spikes/context-graph/cg_spike.py"
+
+assertion_categories:
+  - name: "[GO-01] Impact Analysis Output Shape"
+    count: 8
+    tests: "invalidation count, severity, basis_diff fields, trigger observation, cascade_from"
+
+  - name: "[GO-05] Replay Output Shape"
+    count: 8
+    tests: "decision_id, basis entities, state_at_decision_time, current_state, diffs"
+
+  - name: "[G2] Property Acquisition"
+    count: 2
+    tests: "new property recorded, invalidation for new property"
+
+  - name: "[G6] Severity with Mixed Confidence"
+    count: 4
+    tests: "high-confidence → critical, low-confidence → info"
+
+  - name: "[JOB-06] Emergent Unknown Detection"
+    count: 4
+    tests: "unwatched field invalidation, correct decision, field_name, severity"
+
+  - name: "[CASCADE] CITES-Based Cascade"
+    count: 2
+    tests: "base decision invalidated, derived decision cascaded"
+
+  - name: "[INVARIANTS] Core Invariants"
+    count: 6
+    tests: "snapshot contiguity, observation immutability, basis snapshot integrity"
+
+  - name: "[GO-02] Full Provenance Shape"
+    count: 8
+    tests: "input_snapshots, reasoning, precedents, approvals, outcome, timeline"
+
+  - name: "[SI-02] Invalidation Status Transitions"
+    count: 4
+    tests: "pending→acknowledged→resolved, cannot re-acknowledge dismissed"
+
+  - name: "[BC-04] No Material Change"
+    count: 1
+    tests: "same-value observation creates no invalidation"
+
+  - name: "[BC-09] Archived Intention Protection"
+    count: 2
+    tests: "cannot archive intention with active decisions"
+
+total_assertions: 49  # Note: spike explore agent reported 63 from check.py
+# Discrepancy to reconcile during spike step — some assertions may be
+# in additional test functions not categorized above
+
+adaptation_notes: |
+  To run these against ContextDB:
+  1. Replace in-memory dict storage in cg_spike.py with ContextDB client
+  2. Maintain identical operation signatures
+  3. All assertions must produce identical results
+  4. Timing may differ (disk-backed vs in-memory) but correctness must match

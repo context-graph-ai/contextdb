@@ -1,0 +1,56 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: check.py [GO-01] 8 assertions + [CASCADE] 2 assertions. Severity logic from cg_spike.py _compute_severity method."
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Impact Analysis — Expected Output Fixture
+
+observation:
+  id: "obs-rate-change"
+  observation_type: "config_change"
+  data:
+    rate_limit: 200
+  entity_id: "entity-rate-limiter"
+  # observation is immutable — data is deep-copied at creation
+
+entity_updated:
+  id: "entity-rate-limiter"
+  properties:
+    rate_limit: 200    # updated from 100
+    timeout_ms: 500    # unchanged
+
+invalidations:
+  - id: "<generated-uuid>"
+    status: "pending"
+    affected_decision_id: "decision-cache"
+    trigger_observation_id: "obs-rate-change"
+    severity: "critical"
+    # critical because: confidence=0.9 >= 0.8 AND is_top_decision
+    # (sole decision serving intent-perf with highest confidence)
+    basis_diff:
+      entity_id: "entity-rate-limiter"
+      field_name: "rate_limit"
+      old_value: 100        # basis snapshot value (at decision creation)
+      new_value: 200        # current entity value
+      cascade_from: null    # direct invalidation, not cascade
+
+  - id: "<generated-uuid>"
+    status: "pending"
+    affected_decision_id: "decision-retry"
+    trigger_observation_id: "obs-rate-change"
+    severity: "warning"
+    # warning because: confidence=0.7 >= 0.5 but < 0.8
+    # cascade through CITES edge from decision-cache
+    basis_diff:
+      entity_id: "entity-rate-limiter"
+      field_name: "rate_limit"
+      old_value: 100
+      new_value: 200
+      cascade_from: "decision-cache"   # cascaded via CITES
+
+# Total invalidations: 2
+# Direct: 1 (decision-cache via BASED_ON)
+# Cascade: 1 (decision-retry via CITES from decision-cache)

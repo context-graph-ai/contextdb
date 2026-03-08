@@ -1,0 +1,57 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: check.py [GO-05] 8 assertions, cg_spike.py replay method returning ReplayResult"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Replay — Input Fixture
+
+setup:
+  context:
+    id: "ctx-001"
+
+  entities:
+    - id: "entity-infra"
+      entity_type: "INFRASTRUCTURE"
+      name: "k8s-cluster"
+      context_id: "ctx-001"
+      properties:
+        node_count: 3
+        cpu_per_node: "4cores"
+
+    - id: "entity-config"
+      entity_type: "CONFIGURATION"
+      name: "scaling-policy"
+      context_id: "ctx-001"
+      properties:
+        max_replicas: 10
+
+  intentions:
+    - id: "intent-scale"
+      description: "handle traffic spikes without manual intervention"
+      status: "active"
+      context_id: "ctx-001"
+
+  decisions:
+    - id: "decision-autoscale"
+      decision_type: "operations"
+      description: "enable HPA with max 10 replicas based on 3-node cluster"
+      status: "active"
+      confidence: 0.8
+      context_id: "ctx-001"
+      serves: ["intent-scale"]
+      based_on: ["entity-infra", "entity-config"]
+
+  # After decision creation, entity-infra is updated:
+  post_decision_updates:
+    - entity_id: "entity-infra"
+      new_properties:
+        node_count: 5          # changed from 3 to 5
+        cpu_per_node: "8cores" # changed from 4cores to 8cores
+
+    # entity-config is NOT updated (stays at max_replicas: 10)
+
+query:
+  replay: "decision-autoscale"

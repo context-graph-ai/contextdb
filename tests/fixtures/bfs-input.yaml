@@ -1,0 +1,30 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: cg_spike.py traverse method with bounded BFS, check.py BFS tests"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Bounded BFS — Input Fixture
+
+setup:
+  context:
+    id: "ctx-001"
+
+  entities:
+    - {id: "A", entity_type: "SERVICE", name: "svc-a", context_id: "ctx-001"}
+    - {id: "B", entity_type: "SERVICE", name: "svc-b", context_id: "ctx-001"}
+    - {id: "C", entity_type: "SERVICE", name: "svc-c", context_id: "ctx-001"}
+    - {id: "D", entity_type: "SERVICE", name: "svc-d", context_id: "ctx-001"}
+    - {id: "E", entity_type: "SERVICE", name: "svc-e", context_id: "ctx-001"}
+
+  edges:
+    - {source: "A", target: "B", kind: "BASED_ON"}
+    - {source: "B", target: "C", kind: "BASED_ON"}
+    - {source: "C", target: "D", kind: "BASED_ON"}
+    - {source: "D", target: "E", kind: "BASED_ON"}
+
+query:
+  match: "(a:Entity {id: 'A'})-[:BASED_ON*1..3]->(target)"
+  return: "target.id"

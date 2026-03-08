@@ -1,0 +1,66 @@
+---
+fixture_basis: empirical
+source: "context-graph spike: ~/projects/context-graph/spikes/context-graph/cg_spike.py (_impact_analysis method) and check.py [GO-01] assertions"
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# Impact Analysis — Input Fixture
+
+setup:
+  context:
+    id: "ctx-001"
+    name: "test-context"
+
+  entities:
+    - id: "entity-rate-limiter"
+      entity_type: "SERVICE"
+      name: "rate-limiter"
+      context_id: "ctx-001"
+      properties:
+        rate_limit: 100
+        timeout_ms: 500
+
+  intentions:
+    - id: "intent-perf"
+      description: "maintain API response times under 200ms"
+      status: "active"
+      context_id: "ctx-001"
+
+  decisions:
+    - id: "decision-cache"
+      decision_type: "architecture"
+      description: "use local cache with 100 req/s rate limit"
+      status: "active"
+      confidence: 0.9
+      context_id: "ctx-001"
+      serves: ["intent-perf"]
+      based_on: ["entity-rate-limiter"]
+      reasoning:
+        - operation: "analyze"
+          details: "checked rate limiter capacity"
+          result: "100 req/s is sufficient for current load"
+
+    - id: "decision-retry"
+      decision_type: "implementation"
+      description: "retry with exponential backoff when rate limited"
+      status: "active"
+      confidence: 0.7
+      context_id: "ctx-001"
+      serves: ["intent-perf"]
+      cites: ["decision-cache"]
+
+  # At decision creation time, entity-rate-limiter had:
+  #   rate_limit: 100, timeout_ms: 500
+  # This becomes the basis snapshot for decision-cache
+
+trigger:
+  observation:
+    id: "obs-rate-change"
+    observation_type: "config_change"
+    entity_id: "entity-rate-limiter"
+    source: "monitoring-agent"
+    context_id: "ctx-001"
+    data:
+      rate_limit: 200  # changed from 100 to 200

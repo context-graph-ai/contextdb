@@ -1,0 +1,32 @@
+---
+fixture_basis: hypothetical
+source: "Cosine similarity computed by hand for 4-dim vectors. No empirical ANN data in context-graph spike."
+status: draft
+owner: claude
+last_updated: 2026-03-07
+---
+
+# ANN Search — Expected Output Fixture
+# NOTE: hypothetical fixture — pay 2x attention during spike validation
+
+# Query vector: [1.0, 0.0, 0.0, 0.0]
+# Cosine similarity = dot(a,b) / (|a| * |b|)
+
+# Computed similarities:
+#   obs-1:  [1,0,0,0] → cos = 1.0 / (1*1) = 1.000
+#   obs-9:  [0.95,0.05,0,0] → cos = 0.95 / (1 * 0.9513) = 0.9987
+#   obs-2:  [0.9,0.1,0,0] → cos = 0.9 / (1 * 0.9055) = 0.9939
+#   obs-10: [0.8,0.2,0,0] → cos = 0.8 / (1 * 0.8246) = 0.9701
+#   obs-6:  [0.7,0.7,0,0] → cos = 0.7 / (1 * 0.9899) = 0.7071
+#   obs-7:  [0.5,0.5,0.5,0.5] → cos = 0.5 / (1 * 1.0) = 0.5000
+#   obs-3:  [0,1,0,0] → cos = 0.0
+#   obs-4:  [0,0,1,0] → cos = 0.0
+#   obs-5:  [0,0,0,1] → cos = 0.0
+#   obs-8:  [-1,0,0,0] → cos = -1.0
+
+results:
+  - {id: "obs-1", cosine_similarity: 1.0000}
+  - {id: "obs-9", cosine_similarity: 0.9987}
+  - {id: "obs-2", cosine_similarity: 0.9939}
+
+# Top-3 by cosine similarity (highest = most similar)
