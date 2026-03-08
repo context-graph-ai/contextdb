@@ -7,3 +7,4 @@ edition = "2024"
 contextdb-core = { path = "../contextdb-core" }
 contextdb-tx = { path = "../contextdb-tx" }
 roaring.workspace = true
+parking_lot.workspace = true
