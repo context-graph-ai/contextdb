@@ -77,7 +77,7 @@ impl RelationalStore {
             .get(table)
             .and_then(|m| m.state_machine.as_ref())
             .filter(|sm| sm.column == column)
-            .map_or(true, |sm| {
+            .is_none_or(|sm| {
                 sm.transitions
                     .get(from)
                     .is_some_and(|targets| targets.iter().any(|t| t == to))

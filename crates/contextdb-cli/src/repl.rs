@@ -124,19 +124,6 @@ fn render_column_type(col_type: &ColumnType) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_backslash_dt() {
-        let db = Database::open_memory();
-        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
-            .unwrap();
-        assert!(handle_meta_command(&db, "\\dt"));
-    }
-}
-
 fn execute_sql(db: &Database, sql: &str) {
     match db.execute(sql, &HashMap::new()) {
         Ok(result) => {
@@ -147,5 +134,18 @@ fn execute_sql(db: &Database, sql: &str) {
             }
         }
         Err(e) => eprintln!("Error: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backslash_dt() {
+        let db = Database::open_memory();
+        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
+            .unwrap();
+        assert!(handle_meta_command(&db, "\\dt"));
     }
 }
