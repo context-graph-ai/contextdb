@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "contextdb-engine",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "roaring",
  "serde",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "contextdb-graph",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-parser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "pest",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-planner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-relational"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-tx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "parking_lot",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-vector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",

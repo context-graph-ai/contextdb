@@ -4,7 +4,7 @@ An embedded database engine for agentic memory systems. Combines relational stor
 
 ## Status
 
-**v0.1 — In-Memory Engine.** Fully functional with all query capabilities. No disk persistence yet (data lives in memory only).
+**v0.2 — Schema-Agnostic In-Memory Engine.** The database starts empty — define your schema with `CREATE TABLE`. Declarative constraints (`IMMUTABLE`, `STATE MACHINE`) enforce integrity per table. No disk persistence yet.
 
 ## Features
 
@@ -14,8 +14,8 @@ An embedded database engine for agentic memory systems. Combines relational stor
   - `<=>` operator for cosine similarity vector search
   - Standard SQL: SELECT, INSERT, UPDATE, DELETE, JOIN, WITH, ORDER BY, LIMIT
 - **MVCC snapshot isolation** — readers never block writers
-- **Schema enforcement** — observation immutability, invalidation state machine, vector dimension validation
-- **CLI REPL** for interactive queries
+- **Declarative table constraints** — `IMMUTABLE` tables and `STATE MACHINE` column constraints via `CREATE TABLE`, plus vector dimension validation
+- **CLI REPL** for interactive queries with both dot and psql-style commands (`.tables`/`\dt`, `.schema`/`\d`, `.help`/`\?`, `.quit`/`\q`)
 
 ## Quick Start
 
@@ -25,8 +25,19 @@ cargo build --release
 ```
 
 ```sql
-contextdb> INSERT INTO contexts (id, name, created_at)
-           VALUES ('550e8400-e29b-41d4-a716-446655440000', 'test', 1709827200000);
+contextdb> CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT);
+contextdb> CREATE TABLE observations (
+             id UUID PRIMARY KEY,
+             data JSON,
+             embedding VECTOR(384)
+           ) IMMUTABLE;
+contextdb> CREATE TABLE invalidations (
+             id UUID PRIMARY KEY,
+             status TEXT
+           ) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed]);
+
+contextdb> INSERT INTO contexts (id, name)
+           VALUES ('550e8400-e29b-41d4-a716-446655440000', 'test');
 
 contextdb> SELECT * FROM contexts;
 
@@ -49,7 +60,7 @@ contextdb> SELECT id, data FROM observations
 
 | Crate | Purpose |
 |-------|---------|
-| `contextdb-core` | Types, executor traits, error types, schema |
+| `contextdb-core` | Types, executor traits, error types, table metadata |
 | `contextdb-tx` | Transaction manager with deferred-apply MVCC |
 | `contextdb-relational` | Relational executor (scan, insert, upsert, delete) |
 | `contextdb-graph` | Graph executor (bounded BFS, adjacency index) |
