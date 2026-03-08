@@ -11,3 +11,5 @@ contextdb-graph = { path = "../contextdb-graph" }
 contextdb-vector = { path = "../contextdb-vector" }
 contextdb-parser = { path = "../contextdb-parser" }
 contextdb-planner = { path = "../contextdb-planner" }
+roaring.workspace = true
+uuid.workspace = true
