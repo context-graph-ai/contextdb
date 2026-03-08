@@ -66,6 +66,7 @@ dependencies = [
 name = "contextdb-cli"
 version = "0.1.0"
 dependencies = [
+ "contextdb-core",
  "contextdb-engine",
  "rustyline",
 ]
@@ -74,6 +75,7 @@ dependencies = [
 name = "contextdb-core"
 version = "0.1.0"
 dependencies = [
+ "roaring",
  "serde",
  "serde_json",
  "thiserror",
@@ -91,6 +93,9 @@ dependencies = [
  "contextdb-relational",
  "contextdb-tx",
  "contextdb-vector",
+ "parking_lot",
+ "roaring",
+ "uuid",
 ]
 
 [[package]]
@@ -99,6 +104,8 @@ version = "0.1.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
+ "parking_lot",
+ "uuid",
 ]
 
 [[package]]
@@ -124,6 +131,8 @@ version = "0.1.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
+ "parking_lot",
+ "uuid",
 ]
 
 [[package]]
@@ -140,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
+ "parking_lot",
  "roaring",
 ]
 
