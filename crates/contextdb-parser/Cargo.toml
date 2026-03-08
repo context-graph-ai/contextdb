@@ -1,0 +1,9 @@
+[package]
+name = "contextdb-parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+contextdb-core = { path = "../contextdb-core" }
+pest.workspace = true
+pest_derive.workspace = true

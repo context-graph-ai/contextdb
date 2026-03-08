@@ -1,0 +1,8 @@
+[package]
+name = "contextdb-relational"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+contextdb-core = { path = "../contextdb-core" }
+contextdb-tx = { path = "../contextdb-tx" }

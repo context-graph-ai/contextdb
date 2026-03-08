@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/contextdb-core",
+    "crates/contextdb-tx",
+    "crates/contextdb-relational",
+    "crates/contextdb-graph",
+    "crates/contextdb-vector",
+    "crates/contextdb-parser",
+    "crates/contextdb-planner",
+    "crates/contextdb-engine",
+    "crates/contextdb-cli",
+]
+
+[workspace.dependencies]
+uuid = { version = "1.22.0", features = ["v4", "serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+roaring = "0.11.3"
+parking_lot = "0.12.5"
+tracing = "0.1.44"
+pest = "2.8.6"
+pest_derive = "2.8.6"
+rustyline = "17.0.2"
