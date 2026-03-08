@@ -8,9 +8,45 @@ fn make_values(pairs: Vec<(&str, Value)>) -> HashMap<ColName, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
+fn setup_db() -> Database {
+    let db = Database::open_memory();
+    let params = HashMap::new();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, version INTEGER, context_id TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) IMMUTABLE",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed])",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, entity_id UUID, valid_from INTEGER, valid_to INTEGER)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &params,
+    )
+    .unwrap();
+    db
+}
+
 #[test]
 fn test_cross_subsystem_atomic_commit() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let entity_id = Uuid::new_v4();
 
     let tx = eng.begin();
@@ -24,14 +60,8 @@ fn test_cross_subsystem_atomic_commit() {
             ]),
         )
         .unwrap();
-    eng.insert_edge(
-        tx,
-        entity_id,
-        Uuid::new_v4(),
-        "RELATES_TO".into(),
-        HashMap::new(),
-    )
-    .unwrap();
+    eng.insert_edge(tx, entity_id, Uuid::new_v4(), "RELATES_TO".into(), HashMap::new())
+        .unwrap();
     eng.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0]).unwrap();
     eng.commit(tx).unwrap();
 
@@ -44,12 +74,7 @@ fn test_cross_subsystem_atomic_commit() {
             .len(),
         1
     );
-    assert_eq!(
-        eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap)
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap).unwrap().len(), 1);
 
     let tx2 = eng.begin();
     eng.insert_row(
@@ -61,14 +86,8 @@ fn test_cross_subsystem_atomic_commit() {
         ]),
     )
     .unwrap();
-    eng.insert_edge(
-        tx2,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        "SERVES".into(),
-        HashMap::new(),
-    )
-    .unwrap();
+    eng.insert_edge(tx2, Uuid::new_v4(), Uuid::new_v4(), "SERVES".into(), HashMap::new())
+        .unwrap();
     eng.insert_vector(tx2, 999, vec![0.0, 1.0, 0.0]).unwrap();
     eng.rollback(tx2).unwrap();
 
@@ -81,7 +100,7 @@ fn test_cross_subsystem_atomic_commit() {
 
 #[test]
 fn test_rollback_across_all_subsystems() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
@@ -90,37 +109,22 @@ fn test_rollback_across_all_subsystems() {
         .insert_row(
             tx,
             "decisions",
-            make_values(vec![
-                ("id", Value::Uuid(a)),
-                ("status", Value::Text("active".into())),
-            ]),
+            make_values(vec![("id", Value::Uuid(a)), ("status", Value::Text("active".into()))]),
         )
         .unwrap();
-    eng.insert_edge(tx, a, b, "SERVES".into(), HashMap::new())
-        .unwrap();
+    eng.insert_edge(tx, a, b, "SERVES".into(), HashMap::new()).unwrap();
     eng.insert_vector(tx, rid, vec![0.5, 0.5, 0.0]).unwrap();
     eng.rollback(tx).unwrap();
 
     let snap = eng.snapshot();
     assert_eq!(eng.scan("decisions", snap).unwrap().len(), 0);
-    assert_eq!(
-        eng.query_bfs(a, None, Direction::Outgoing, 1, snap)
-            .unwrap()
-            .nodes
-            .len(),
-        0
-    );
-    assert_eq!(
-        eng.query_vector(&[0.5, 0.5, 0.0], 10, None, snap)
-            .unwrap()
-            .len(),
-        0
-    );
+    assert_eq!(eng.query_bfs(a, None, Direction::Outgoing, 1, snap).unwrap().nodes.len(), 0);
+    assert_eq!(eng.query_vector(&[0.5, 0.5, 0.0], 10, None, snap).unwrap().len(), 0);
 }
 
 #[test]
 fn test_mvcc_snapshot_isolation() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let eid = Uuid::new_v4();
 
     let tx1 = eng.begin();
@@ -156,24 +160,21 @@ fn test_mvcc_snapshot_isolation() {
 
 #[test]
 fn test_bfs_under_mvcc() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
     let d = Uuid::new_v4();
 
     let tx1 = eng.begin();
-    eng.insert_edge(tx1, a, b, "EDGE".into(), HashMap::new())
-        .unwrap();
-    eng.insert_edge(tx1, b, c, "EDGE".into(), HashMap::new())
-        .unwrap();
+    eng.insert_edge(tx1, a, b, "EDGE".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx1, b, c, "EDGE".into(), HashMap::new()).unwrap();
     eng.commit(tx1).unwrap();
 
     let snap1 = eng.snapshot();
 
     let tx2 = eng.begin();
-    eng.insert_edge(tx2, c, d, "EDGE".into(), HashMap::new())
-        .unwrap();
+    eng.insert_edge(tx2, c, d, "EDGE".into(), HashMap::new()).unwrap();
     eng.commit(tx2).unwrap();
 
     let ids1: HashSet<NodeId> = eng
@@ -199,18 +200,15 @@ fn test_bfs_under_mvcc() {
 
 #[test]
 fn test_bfs_cycle_detection() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
 
     let tx = eng.begin();
-    eng.insert_edge(tx, a, b, "EDGE".into(), HashMap::new())
-        .unwrap();
-    eng.insert_edge(tx, b, c, "EDGE".into(), HashMap::new())
-        .unwrap();
-    eng.insert_edge(tx, c, a, "EDGE".into(), HashMap::new())
-        .unwrap();
+    eng.insert_edge(tx, a, b, "EDGE".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx, b, c, "EDGE".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx, c, a, "EDGE".into(), HashMap::new()).unwrap();
     eng.commit(tx).unwrap();
 
     let ids: Vec<NodeId> = eng
@@ -227,7 +225,7 @@ fn test_bfs_cycle_detection() {
 
 #[test]
 fn test_bfs_depth_bound() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let nodes: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
 
     let tx = eng.begin();
@@ -252,7 +250,7 @@ fn test_bfs_depth_bound() {
 
 #[test]
 fn test_bfs_depth_exceeds_max_is_accepted_in_executor() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let snap = eng.snapshot();
     let result = eng.query_bfs(Uuid::new_v4(), None, Direction::Outgoing, 50, snap);
     assert!(result.is_ok());
@@ -260,7 +258,7 @@ fn test_bfs_depth_exceeds_max_is_accepted_in_executor() {
 
 #[test]
 fn test_vector_search_with_prefilter() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
 
     let tx = eng.begin();
     eng.insert_vector(tx, 1, vec![1.0, 0.0, 0.0]).unwrap();
@@ -292,7 +290,7 @@ fn test_vector_search_with_prefilter() {
 
 #[test]
 fn test_unified_pipeline() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let center = Uuid::new_v4();
     let neighbor1 = Uuid::new_v4();
     let neighbor2 = Uuid::new_v4();
@@ -303,39 +301,27 @@ fn test_unified_pipeline() {
         .insert_row(
             tx,
             "entities",
-            make_values(vec![
-                ("id", Value::Uuid(neighbor1)),
-                ("context_id", Value::Text("ctx1".into())),
-            ]),
+            make_values(vec![("id", Value::Uuid(neighbor1)), ("context_id", Value::Text("ctx1".into()))]),
         )
         .unwrap();
     let rid2 = eng
         .insert_row(
             tx,
             "entities",
-            make_values(vec![
-                ("id", Value::Uuid(neighbor2)),
-                ("context_id", Value::Text("ctx1".into())),
-            ]),
+            make_values(vec![("id", Value::Uuid(neighbor2)), ("context_id", Value::Text("ctx1".into()))]),
         )
         .unwrap();
     let rid3 = eng
         .insert_row(
             tx,
             "entities",
-            make_values(vec![
-                ("id", Value::Uuid(far)),
-                ("context_id", Value::Text("ctx2".into())),
-            ]),
+            make_values(vec![("id", Value::Uuid(far)), ("context_id", Value::Text("ctx2".into()))]),
         )
         .unwrap();
 
-    eng.insert_edge(tx, center, neighbor1, "RELATES_TO".into(), HashMap::new())
-        .unwrap();
-    eng.insert_edge(tx, center, neighbor2, "RELATES_TO".into(), HashMap::new())
-        .unwrap();
-    eng.insert_edge(tx, center, far, "RELATES_TO".into(), HashMap::new())
-        .unwrap();
+    eng.insert_edge(tx, center, neighbor1, "RELATES_TO".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx, center, neighbor2, "RELATES_TO".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx, center, far, "RELATES_TO".into(), HashMap::new()).unwrap();
 
     eng.insert_vector(tx, rid1, vec![1.0, 0.0, 0.0]).unwrap();
     eng.insert_vector(tx, rid2, vec![0.9, 0.1, 0.0]).unwrap();
@@ -375,7 +361,7 @@ fn test_unified_pipeline() {
 
 #[test]
 fn test_upsert_idempotent() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let eid = Uuid::new_v4();
 
     let tx1 = eng.begin();
@@ -417,7 +403,7 @@ fn test_upsert_idempotent() {
 
 #[test]
 fn test_observation_immutability() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
 
     let tx1 = eng.begin();
     let rid = eng
@@ -440,17 +426,14 @@ fn test_observation_immutability() {
 
 #[test]
 fn test_invalidation_state_machine() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let inv_id = Uuid::new_v4();
 
     let tx1 = eng.begin();
     eng.insert_row(
         tx1,
         "invalidations",
-        make_values(vec![
-            ("id", Value::Uuid(inv_id)),
-            ("status", Value::Text("pending".into())),
-        ]),
+        make_values(vec![("id", Value::Uuid(inv_id)), ("status", Value::Text("pending".into()))]),
     )
     .unwrap();
     eng.commit(tx1).unwrap();
@@ -474,10 +457,7 @@ fn test_invalidation_state_machine() {
             tx3,
             "invalidations",
             "id",
-            make_values(vec![
-                ("id", Value::Uuid(inv_id)),
-                ("status", Value::Text("pending".into())),
-            ]),
+            make_values(vec![("id", Value::Uuid(inv_id)), ("status", Value::Text("pending".into()))]),
         )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidStateTransition(_)));
@@ -485,7 +465,7 @@ fn test_invalidation_state_machine() {
 
 #[test]
 fn test_snapshot_contiguity() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let eid = Uuid::new_v4();
 
     let tx1 = eng.begin();
@@ -512,10 +492,7 @@ fn test_snapshot_contiguity() {
         tx2,
         "entity_snapshots",
         make_values(vec![
-            (
-                "id",
-                Value::Uuid(*rows[0].values.get("id").unwrap().as_uuid().unwrap()),
-            ),
+            ("id", Value::Uuid(*rows[0].values.get("id").unwrap().as_uuid().unwrap())),
             ("entity_id", Value::Uuid(eid)),
             ("valid_from", Value::Timestamp(100)),
             ("valid_to", Value::Timestamp(200)),
@@ -547,15 +524,12 @@ fn test_snapshot_contiguity() {
     });
 
     assert_eq!(snapshots.len(), 2);
-    assert_eq!(
-        snapshots[0].values.get("valid_to"),
-        snapshots[1].values.get("valid_from")
-    );
+    assert_eq!(snapshots[0].values.get("valid_to"), snapshots[1].values.get("valid_from"));
 }
 
 #[test]
 fn test_vector_snapshot_isolation() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
 
     let tx1 = eng.begin();
     eng.insert_vector(tx1, 1, vec![1.0, 0.0, 0.0]).unwrap();
@@ -590,28 +564,17 @@ fn test_vector_snapshot_isolation() {
 
 #[test]
 fn test_empty_database() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let snap = eng.snapshot();
 
-    assert_eq!(
-        eng.query_bfs(Uuid::new_v4(), None, Direction::Outgoing, 5, snap)
-            .unwrap()
-            .nodes
-            .len(),
-        0
-    );
-    assert_eq!(
-        eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap)
-            .unwrap()
-            .len(),
-        0
-    );
+    assert_eq!(eng.query_bfs(Uuid::new_v4(), None, Direction::Outgoing, 5, snap).unwrap().nodes.len(), 0);
+    assert_eq!(eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap).unwrap().len(), 0);
     assert_eq!(eng.scan("entities", snap).unwrap().len(), 0);
 }
 
 #[test]
 fn test_vector_search_requires_limit() {
-    let eng = Database::open_memory();
+    let eng = setup_db();
     let tx = eng.begin();
     eng.insert_vector(tx, 1, vec![1.0, 0.0]).unwrap();
     eng.commit(tx).unwrap();

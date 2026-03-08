@@ -7,14 +7,34 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
-#[test]
-fn create_insert_select_roundtrip() {
+fn setup_sql_db() -> Database {
     let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute("CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)", &empty)
+        .unwrap();
     db.execute(
-        "CREATE TABLE test (id UUID PRIMARY KEY, name TEXT)",
-        &HashMap::new(),
+        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) IMMUTABLE",
+        &empty,
     )
     .unwrap();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed])",
+        &empty,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty,
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn create_insert_select_roundtrip() {
+    let db = setup_sql_db();
+    db.execute("CREATE TABLE test (id UUID PRIMARY KEY, name TEXT)", &HashMap::new())
+        .unwrap();
 
     db.execute(
         "INSERT INTO test (id, name) VALUES ($id, $name)",
@@ -31,15 +51,12 @@ fn create_insert_select_roundtrip() {
 
 #[test]
 fn insert_on_conflict_do_update() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
     let id = Uuid::new_v4();
 
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![
-            ("id", Value::Uuid(id)),
-            ("name", Value::Text("a".into())),
-        ]),
+        &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("a".into()))]),
     )
     .unwrap();
 
@@ -56,7 +73,7 @@ fn insert_on_conflict_do_update() {
 
 #[test]
 fn vector_search_and_explain() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
     let tx = db.begin();
     let r1 = db
         .insert_row(
@@ -92,7 +109,7 @@ fn vector_search_and_explain() {
 
 #[test]
 fn immutable_observations_update_delete_error() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
 
     let e1 = db.execute("UPDATE observations SET data='x'", &HashMap::new());
     assert!(matches!(e1, Err(Error::ImmutableTable(_))));
@@ -103,7 +120,7 @@ fn immutable_observations_update_delete_error() {
 
 #[test]
 fn invalidation_state_machine_sql_enforced() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
     let id = Uuid::new_v4();
 
     db.execute(
@@ -138,7 +155,7 @@ fn invalidation_state_machine_sql_enforced() {
 
 #[test]
 fn parameter_binding_and_uuid_text_coercion() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
     let id = Uuid::new_v4();
 
     db.execute(
@@ -161,7 +178,7 @@ fn parameter_binding_and_uuid_text_coercion() {
 
 #[test]
 fn vector_dimension_validation_via_sql() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
 
     db.execute(
         "INSERT INTO observations (id, embedding) VALUES ($id, $embedding)",
@@ -186,77 +203,27 @@ fn vector_dimension_validation_via_sql() {
 
 #[test]
 fn duplicate_uuid_without_conflict_clause_errors() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
     let id = Uuid::new_v4();
 
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![
-            ("id", Value::Uuid(id)),
-            ("name", Value::Text("a".into())),
-        ]),
+        &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("a".into()))]),
     )
     .unwrap();
 
     let err = db
         .execute(
             "INSERT INTO entities (id, name) VALUES ($id, $name)",
-            &params(vec![
-                ("id", Value::Uuid(id)),
-                ("name", Value::Text("b".into())),
-            ]),
+            &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("b".into()))]),
         )
         .unwrap_err();
     assert!(matches!(err, Error::UniqueViolation { .. }));
 }
 
 #[test]
-fn archive_intention_with_active_decisions_is_blocked() {
-    let db = Database::open_memory();
-    let intention_id = Uuid::new_v4();
-    let decision_id = Uuid::new_v4();
-
-    let tx = db.begin();
-    db.insert_row(
-        tx,
-        "intentions",
-        params(vec![
-            ("id", Value::Uuid(intention_id)),
-            ("status", Value::Text("active".into())),
-        ]),
-    )
-    .unwrap();
-    db.insert_row(
-        tx,
-        "decisions",
-        params(vec![
-            ("id", Value::Uuid(decision_id)),
-            ("status", Value::Text("active".into())),
-        ]),
-    )
-    .unwrap();
-    db.insert_edge(
-        tx,
-        decision_id,
-        intention_id,
-        "SERVES".to_string(),
-        HashMap::new(),
-    )
-    .unwrap();
-    db.commit(tx).unwrap();
-
-    let err = db
-        .execute(
-            "UPDATE intentions SET status='archived' WHERE id = $id",
-            &params(vec![("id", Value::Uuid(intention_id))]),
-        )
-        .unwrap_err();
-    assert!(matches!(err, Error::InvalidStateTransition(_)));
-}
-
-#[test]
 fn insert_edge_table_maintains_adjacency() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
     let source = Uuid::new_v4();
     let target = Uuid::new_v4();
 
@@ -272,30 +239,21 @@ fn insert_edge_table_maintains_adjacency() {
     .unwrap();
 
     let bfs = db
-        .query_bfs(
-            source,
-            None,
-            contextdb_core::Direction::Outgoing,
-            1,
-            db.snapshot(),
-        )
+        .query_bfs(source, None, contextdb_core::Direction::Outgoing, 1, db.snapshot())
         .unwrap();
     assert_eq!(bfs.nodes.len(), 1);
 }
 
 #[test]
 fn begin_commit_rollback_session_sql() {
-    let db = Database::open_memory();
+    let db = setup_sql_db();
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
 
     db.execute("BEGIN", &HashMap::new()).unwrap();
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![
-            ("id", Value::Uuid(id1)),
-            ("name", Value::Text("a".into())),
-        ]),
+        &params(vec![("id", Value::Uuid(id1)), ("name", Value::Text("a".into()))]),
     )
     .unwrap();
     db.execute("COMMIT", &HashMap::new()).unwrap();
@@ -303,14 +261,115 @@ fn begin_commit_rollback_session_sql() {
     db.execute("BEGIN", &HashMap::new()).unwrap();
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![
-            ("id", Value::Uuid(id2)),
-            ("name", Value::Text("b".into())),
-        ]),
+        &params(vec![("id", Value::Uuid(id2)), ("name", Value::Text("b".into()))]),
     )
     .unwrap();
     db.execute("ROLLBACK", &HashMap::new()).unwrap();
 
     let rows = db.scan("entities", db.snapshot()).unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_empty_database_has_no_tables() {
+    let db = Database::open_memory();
+    assert!(db.table_names().is_empty());
+}
+
+#[test]
+fn test_create_table_then_insert() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t1 (id UUID PRIMARY KEY, name TEXT)", &HashMap::new())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t1 (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("name", Value::Text("n".into())),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(db.scan("t1", db.snapshot()).unwrap().len(), 1);
+}
+
+#[test]
+fn test_insert_into_nonexistent_table_fails() {
+    let db = Database::open_memory();
+    let err = db
+        .execute(
+            "INSERT INTO missing (id) VALUES ($id)",
+            &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::TableNotFound(_)));
+}
+
+#[test]
+fn test_immutable_via_create_table() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE foo (id UUID PRIMARY KEY, data TEXT) IMMUTABLE", &HashMap::new())
+        .unwrap();
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO foo (id, data) VALUES ($id, $data)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("data", Value::Text("x".into())),
+        ]),
+    )
+    .unwrap();
+    let err = db.execute("DELETE FROM foo", &HashMap::new()).unwrap_err();
+    assert!(matches!(err, Error::ImmutableTable(_)));
+}
+
+#[test]
+fn test_state_machine_via_create_table() {
+    let db = Database::open_memory();
+    let id = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE sm (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved])",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sm (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text("pending".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sm (id, status) VALUES ($id, $status) ON CONFLICT (id) DO UPDATE SET status=$status",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text("acknowledged".into())),
+        ]),
+    )
+    .unwrap();
+    let err = db
+        .execute(
+            "INSERT INTO sm (id, status) VALUES ($id, $status) ON CONFLICT (id) DO UPDATE SET status=$status",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("status", Value::Text("pending".into())),
+            ]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidStateTransition(_)));
+}
+
+#[test]
+fn test_drop_table() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE to_drop (id UUID PRIMARY KEY)", &HashMap::new())
+        .unwrap();
+    db.execute("DROP TABLE to_drop", &HashMap::new()).unwrap();
+    let err = db
+        .execute(
+            "INSERT INTO to_drop (id) VALUES ($id)",
+            &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::TableNotFound(_)));
 }

@@ -4,7 +4,65 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub fn setup_ontology_db() -> Database {
-    Database::open_memory()
+    let db = Database::open_memory();
+    let params = HashMap::new();
+
+    db.execute("CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT)", &params)
+        .unwrap();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, entity_id UUID, state JSON, valid_from INTEGER, valid_to INTEGER)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, entity_id UUID, data JSON, embedding VECTOR(384)) IMMUTABLE",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID, success BOOLEAN)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, affected_decision_id UUID, status TEXT, severity TEXT) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed])",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE approvals (id UUID PRIMARY KEY, decision_id UUID)",
+        &params,
+    )
+    .unwrap();
+    db.execute("CREATE TABLE patterns (id UUID PRIMARY KEY, description TEXT)", &params)
+        .unwrap();
+    db.execute(
+        "CREATE TABLE sync_state (id UUID PRIMARY KEY, push_watermark INTEGER, pull_watermark INTEGER)",
+        &params,
+    )
+    .unwrap();
+
+    db
 }
 
 pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
@@ -40,22 +98,10 @@ pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
         ]),
     )
     .unwrap();
-    db.insert_edge(
-        tx,
-        decision1_id,
-        entity_id,
-        "BASED_ON".to_string(),
-        HashMap::new(),
-    )
-    .unwrap();
-    db.insert_edge(
-        tx,
-        decision2_id,
-        decision1_id,
-        "CITES".to_string(),
-        HashMap::new(),
-    )
-    .unwrap();
+    db.insert_edge(tx, decision1_id, entity_id, "BASED_ON".to_string(), HashMap::new())
+        .unwrap();
+    db.insert_edge(tx, decision2_id, decision1_id, "CITES".to_string(), HashMap::new())
+        .unwrap();
     db.commit(tx).unwrap();
 
     (entity_id, decision1_id, decision2_id)

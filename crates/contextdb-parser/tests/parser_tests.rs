@@ -1,5 +1,5 @@
 use contextdb_core::Error;
-use contextdb_parser::{Statement, parse};
+use contextdb_parser::{parse, Statement};
 
 #[test]
 fn parse_valid_sql_subset() {
@@ -12,9 +12,7 @@ fn parse_valid_sql_subset() {
         Ok(Statement::Insert(_))
     ));
     assert!(matches!(
-        parse(
-            "INSERT INTO entities (id, name) VALUES ($id, $name) ON CONFLICT (id) DO UPDATE SET name=$name"
-        ),
+        parse("INSERT INTO entities (id, name) VALUES ($id, $name) ON CONFLICT (id) DO UPDATE SET name=$name"),
         Ok(Statement::Insert(_))
     ));
     assert!(matches!(
@@ -25,18 +23,13 @@ fn parse_valid_sql_subset() {
         parse("CREATE TABLE foo (id UUID PRIMARY KEY, name TEXT NOT NULL)"),
         Ok(Statement::CreateTable(_))
     ));
-    assert!(matches!(
-        parse("DROP TABLE foo"),
-        Ok(Statement::DropTable(_))
-    ));
+    assert!(matches!(parse("DROP TABLE foo"), Ok(Statement::DropTable(_))));
     assert!(matches!(
         parse("SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 10"),
         Ok(Statement::Select(_))
     ));
     assert!(matches!(
-        parse(
-            "WITH n AS (MATCH (a:Entity {id: $id})-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM n"
-        ),
+        parse("WITH n AS (MATCH (a:Entity {id: $id})-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM n"),
         Ok(Statement::Select(_))
     ));
 }
@@ -72,9 +65,23 @@ fn anti_tests_rejected_constructs() {
 #[test]
 fn cte_ref_subquery_is_allowed() {
     assert!(matches!(
-        parse(
-            "WITH my_cte AS (SELECT id FROM decisions) SELECT * FROM d WHERE id IN (SELECT id FROM my_cte)"
-        ),
+        parse("WITH my_cte AS (SELECT id FROM decisions) SELECT * FROM d WHERE id IN (SELECT id FROM my_cte)"),
         Ok(Statement::Select(_))
+    ));
+}
+
+#[test]
+fn parse_create_table_constraints() {
+    assert!(matches!(
+        parse("CREATE TABLE obs (id UUID PRIMARY KEY) IMMUTABLE"),
+        Ok(Statement::CreateTable(_))
+    ));
+    assert!(matches!(
+        parse("CREATE TABLE inv (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: pending -> [acknowledged], pending -> [dismissed])"),
+        Ok(Statement::CreateTable(_))
+    ));
+    assert!(matches!(
+        parse("CREATE TABLE bad (id UUID PRIMARY KEY) IMMUTABLE STATE MACHINE (status: a -> [b])"),
+        Err(Error::ParseError(_))
     ));
 }
