@@ -64,7 +64,11 @@ pub fn parse(input: &str) -> Result<Statement> {
 }
 
 fn parse_identifier(token: &str) -> String {
-    token.trim_matches('`').trim_matches('"').to_string()
+    token
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .to_string()
 }
 
 fn parse_literal(token: &str) -> Expr {
@@ -94,6 +98,18 @@ fn parse_literal(token: &str) -> Expr {
         table: None,
         column: t.to_string(),
     })
+}
+
+fn parse_condition(token: &str) -> Expr {
+    let t = token.trim();
+    if let Some((l, r)) = t.split_once('=') {
+        return Expr::BinaryOp {
+            left: Box::new(parse_literal(l.trim())),
+            op: BinOp::Eq,
+            right: Box::new(parse_literal(r.trim())),
+        };
+    }
+    parse_literal(t)
 }
 
 fn parse_data_type(token: &str) -> DataType {
@@ -278,7 +294,7 @@ fn parse_delete(s: &str) -> Result<Statement> {
         parse_identifier(s["DELETE FROM".len()..].trim())
     };
 
-    let where_clause = where_idx.map(|idx| parse_literal(s[idx + 7..].trim()));
+    let where_clause = where_idx.map(|idx| parse_condition(s[idx + 7..].trim()));
 
     Ok(Statement::Delete(Delete { table, where_clause }))
 }
@@ -307,7 +323,7 @@ fn parse_update(s: &str) -> Result<Statement> {
         })
         .collect();
 
-    let where_clause = where_idx.map(|idx| parse_literal(s[idx + 7..].trim()));
+    let where_clause = where_idx.map(|idx| parse_condition(s[idx + 7..].trim()));
 
     Ok(Statement::Update(Update {
         table,
@@ -466,7 +482,7 @@ fn parse_select(s: &str) -> Result<Statement> {
 
     let where_clause = where_pos.map(|wp| {
         let end = order_pos.or(limit_pos).unwrap_or(select_source.len());
-        parse_literal(select_source[wp + 7..end].trim())
+        parse_condition(select_source[wp + 7..end].trim())
     });
 
     let mut order_by = Vec::new();

@@ -49,4 +49,12 @@ impl RelationalStore {
             }
         }
     }
+
+    pub fn create_table(&self, name: &str) {
+        self.tables.write().entry(name.to_string()).or_default();
+    }
+
+    pub fn drop_table(&self, name: &str) {
+        self.tables.write().remove(name);
+    }
 }

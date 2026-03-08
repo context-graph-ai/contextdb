@@ -1,18 +1,49 @@
 use crate::composite_store::CompositeStore;
+use crate::executor::execute_plan;
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
+use contextdb_parser::Statement;
+use contextdb_planner::PhysicalPlan;
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
 use contextdb_tx::TxManager;
 use contextdb_vector::{MemVectorExecutor, VectorStore};
+use parking_lot::Mutex;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    pub rows_affected: u64,
+}
+
+impl QueryResult {
+    pub fn empty() -> Self {
+        Self {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: 0,
+        }
+    }
+
+    pub fn empty_with_affected(rows_affected: u64) -> Self {
+        Self {
+            columns: vec![],
+            rows: vec![],
+            rows_affected,
+        }
+    }
+}
+
 pub struct Database {
     tx_mgr: Arc<TxManager<CompositeStore>>,
+    relational_store: Arc<RelationalStore>,
     relational: MemRelationalExecutor<CompositeStore>,
     graph: MemGraphExecutor<CompositeStore>,
     vector: MemVectorExecutor<CompositeStore>,
+    session_tx: Mutex<Option<TxId>>,
 }
 
 impl Database {
@@ -25,10 +56,12 @@ impl Database {
         let tx_mgr = Arc::new(TxManager::new(store));
 
         Self {
+            relational_store: relational.clone(),
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
             vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
             tx_mgr,
+            session_tx: Mutex::new(None),
         }
     }
 
@@ -46,6 +79,85 @@ impl Database {
 
     pub fn snapshot(&self) -> SnapshotId {
         self.tx_mgr.snapshot()
+    }
+
+    pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        let stmt = contextdb_parser::parse(sql)?;
+
+        match stmt {
+            Statement::Begin => {
+                let mut session = self.session_tx.lock();
+                if session.is_none() {
+                    *session = Some(self.begin());
+                }
+                return Ok(QueryResult::empty());
+            }
+            Statement::Commit => {
+                let mut session = self.session_tx.lock();
+                if let Some(tx) = *session {
+                    self.commit(tx)?;
+                    *session = None;
+                }
+                return Ok(QueryResult::empty());
+            }
+            Statement::Rollback => {
+                let mut session = self.session_tx.lock();
+                if let Some(tx) = *session {
+                    self.rollback(tx)?;
+                    *session = None;
+                }
+                return Ok(QueryResult::empty());
+            }
+            _ => {}
+        }
+
+        let plan = contextdb_planner::plan(&stmt)?;
+        let active_tx = *self.session_tx.lock();
+        match active_tx {
+            Some(tx) => execute_plan(self, &plan, params, Some(tx)),
+            None => self.execute_autocommit(&plan, params),
+        }
+    }
+
+    fn execute_autocommit(
+        &self,
+        plan: &PhysicalPlan,
+        params: &HashMap<String, Value>,
+    ) -> Result<QueryResult> {
+        match plan {
+            PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_) => {
+                let tx = self.begin();
+                let result = execute_plan(self, plan, params, Some(tx));
+                match result {
+                    Ok(qr) => {
+                        self.commit(tx)?;
+                        Ok(qr)
+                    }
+                    Err(e) => {
+                        let _ = self.rollback(tx);
+                        Err(e)
+                    }
+                }
+            }
+            _ => execute_plan(self, plan, params, None),
+        }
+    }
+
+    pub fn explain(&self, sql: &str) -> Result<String> {
+        let stmt = contextdb_parser::parse(sql)?;
+        let plan = contextdb_planner::plan(&stmt)?;
+        Ok(plan.explain())
+    }
+
+    pub fn execute_in_tx(
+        &self,
+        tx: TxId,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<QueryResult> {
+        let stmt = contextdb_parser::parse(sql)?;
+        let plan = contextdb_planner::plan(&stmt)?;
+        execute_plan(self, &plan, params, Some(tx))
     }
 
     pub fn insert_row(&self, tx: TxId, table: &str, values: HashMap<ColName, Value>) -> Result<RowId> {
@@ -125,5 +237,13 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
         self.vector.search(query, k, candidates, snapshot)
+    }
+
+    pub(crate) fn graph(&self) -> &MemGraphExecutor<CompositeStore> {
+        &self.graph
+    }
+
+    pub(crate) fn relational_store(&self) -> &Arc<RelationalStore> {
+        &self.relational_store
     }
 }
