@@ -65,7 +65,13 @@ impl RelationalStore {
             .is_some_and(|m| m.immutable)
     }
 
-    pub fn validate_state_transition(&self, table: &str, column: &str, from: &str, to: &str) -> bool {
+    pub fn validate_state_transition(
+        &self,
+        table: &str,
+        column: &str,
+        from: &str,
+        to: &str,
+    ) -> bool {
         self.table_meta
             .read()
             .get(table)

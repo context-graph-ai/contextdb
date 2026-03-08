@@ -25,19 +25,15 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             values: i.values.clone(),
             on_conflict: i.on_conflict.clone().map(Into::into),
         })),
-        Statement::Delete(d) => {
-            Ok(PhysicalPlan::Delete(DeletePlan {
-                table: d.table.clone(),
-                where_clause: d.where_clause.clone(),
-            }))
-        }
-        Statement::Update(u) => {
-            Ok(PhysicalPlan::Update(UpdatePlan {
-                table: u.table.clone(),
-                assignments: u.assignments.clone(),
-                where_clause: u.where_clause.clone(),
-            }))
-        }
+        Statement::Delete(d) => Ok(PhysicalPlan::Delete(DeletePlan {
+            table: d.table.clone(),
+            where_clause: d.where_clause.clone(),
+        })),
+        Statement::Update(u) => Ok(PhysicalPlan::Update(UpdatePlan {
+            table: u.table.clone(),
+            assignments: u.assignments.clone(),
+            where_clause: u.where_clause.clone(),
+        })),
         Statement::Select(sel) => plan_select(sel),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Ok(PhysicalPlan::Pipeline(vec![]))
@@ -51,11 +47,9 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     for cte in &sel.ctes {
         match cte {
             Cte::MatchCte { name, match_clause } => {
-                let step = match_clause
-                    .pattern
-                    .edges
-                    .first()
-                    .ok_or_else(|| Error::PlanError("MATCH must include at least one edge".into()))?;
+                let step = match_clause.pattern.edges.first().ok_or_else(|| {
+                    Error::PlanError("MATCH must include at least one edge".into())
+                })?;
                 let max_depth = if step.max_hops == 0 {
                     DEFAULT_MATCH_DEPTH
                 } else {
@@ -70,11 +64,7 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
                         table: None,
                         column: match_clause.pattern.start.alias.clone(),
                     }),
-                    edge_types: step
-                        .edge_type
-                        .clone()
-                        .map(|t| vec![t])
-                        .unwrap_or_default(),
+                    edge_types: step.edge_type.clone().map(|t| vec![t]).unwrap_or_default(),
                     direction: match step.direction {
                         contextdb_parser::ast::EdgeDirection::Outgoing => Direction::Outgoing,
                         contextdb_parser::ast::EdgeDirection::Incoming => Direction::Incoming,
@@ -136,11 +126,11 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
         return Err(Error::SubqueryNotSupported);
     }
 
-    if sel
-        .ctes
-        .iter()
-        .any(|c| matches!(c, Cte::MatchCte { .. }))
-        && matches!(current, PhysicalPlan::VectorSearch { .. } | PhysicalPlan::Scan { .. })
+    if sel.ctes.iter().any(|c| matches!(c, Cte::MatchCte { .. }))
+        && matches!(
+            current,
+            PhysicalPlan::VectorSearch { .. } | PhysicalPlan::Scan { .. }
+        )
     {
         pipeline.push(current);
         return Ok(PhysicalPlan::Pipeline(pipeline));

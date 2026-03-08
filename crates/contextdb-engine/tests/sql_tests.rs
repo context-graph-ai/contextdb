@@ -10,8 +10,11 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 fn setup_sql_db() -> Database {
     let db = Database::open_memory();
     let empty = HashMap::new();
-    db.execute("CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)", &empty)
-        .unwrap();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
+        &empty,
+    )
+    .unwrap();
     db.execute(
         "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) IMMUTABLE",
         &empty,
@@ -33,8 +36,11 @@ fn setup_sql_db() -> Database {
 #[test]
 fn create_insert_select_roundtrip() {
     let db = setup_sql_db();
-    db.execute("CREATE TABLE test (id UUID PRIMARY KEY, name TEXT)", &HashMap::new())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE test (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
 
     db.execute(
         "INSERT INTO test (id, name) VALUES ($id, $name)",
@@ -56,7 +62,10 @@ fn insert_on_conflict_do_update() {
 
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("a".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("a".into())),
+        ]),
     )
     .unwrap();
 
@@ -208,14 +217,20 @@ fn duplicate_uuid_without_conflict_clause_errors() {
 
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("a".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("a".into())),
+        ]),
     )
     .unwrap();
 
     let err = db
         .execute(
             "INSERT INTO entities (id, name) VALUES ($id, $name)",
-            &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("b".into()))]),
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text("b".into())),
+            ]),
         )
         .unwrap_err();
     assert!(matches!(err, Error::UniqueViolation { .. }));
@@ -239,7 +254,13 @@ fn insert_edge_table_maintains_adjacency() {
     .unwrap();
 
     let bfs = db
-        .query_bfs(source, None, contextdb_core::Direction::Outgoing, 1, db.snapshot())
+        .query_bfs(
+            source,
+            None,
+            contextdb_core::Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
         .unwrap();
     assert_eq!(bfs.nodes.len(), 1);
 }
@@ -253,7 +274,10 @@ fn begin_commit_rollback_session_sql() {
     db.execute("BEGIN", &HashMap::new()).unwrap();
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id1)), ("name", Value::Text("a".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id1)),
+            ("name", Value::Text("a".into())),
+        ]),
     )
     .unwrap();
     db.execute("COMMIT", &HashMap::new()).unwrap();
@@ -261,7 +285,10 @@ fn begin_commit_rollback_session_sql() {
     db.execute("BEGIN", &HashMap::new()).unwrap();
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id2)), ("name", Value::Text("b".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id2)),
+            ("name", Value::Text("b".into())),
+        ]),
     )
     .unwrap();
     db.execute("ROLLBACK", &HashMap::new()).unwrap();
@@ -279,8 +306,11 @@ fn test_empty_database_has_no_tables() {
 #[test]
 fn test_create_table_then_insert() {
     let db = Database::open_memory();
-    db.execute("CREATE TABLE t1 (id UUID PRIMARY KEY, name TEXT)", &HashMap::new())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t1 (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO t1 (id, name) VALUES ($id, $name)",
         &params(vec![
@@ -307,8 +337,11 @@ fn test_insert_into_nonexistent_table_fails() {
 #[test]
 fn test_immutable_via_create_table() {
     let db = Database::open_memory();
-    db.execute("CREATE TABLE foo (id UUID PRIMARY KEY, data TEXT) IMMUTABLE", &HashMap::new())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE foo (id UUID PRIMARY KEY, data TEXT) IMMUTABLE",
+        &HashMap::new(),
+    )
+    .unwrap();
     let id = Uuid::new_v4();
     db.execute(
         "INSERT INTO foo (id, data) VALUES ($id, $data)",
@@ -362,8 +395,11 @@ fn test_state_machine_via_create_table() {
 #[test]
 fn test_drop_table() {
     let db = Database::open_memory();
-    db.execute("CREATE TABLE to_drop (id UUID PRIMARY KEY)", &HashMap::new())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE to_drop (id UUID PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
     db.execute("DROP TABLE to_drop", &HashMap::new()).unwrap();
     let err = db
         .execute(

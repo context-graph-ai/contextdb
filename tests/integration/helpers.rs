@@ -7,8 +7,11 @@ pub fn setup_ontology_db() -> Database {
     let db = Database::open_memory();
     let params = HashMap::new();
 
-    db.execute("CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT)", &params)
-        .unwrap();
+    db.execute(
+        "CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT)",
+        &params,
+    )
+    .unwrap();
     db.execute(
         "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT)",
         &params,
@@ -54,8 +57,11 @@ pub fn setup_ontology_db() -> Database {
         &params,
     )
     .unwrap();
-    db.execute("CREATE TABLE patterns (id UUID PRIMARY KEY, description TEXT)", &params)
-        .unwrap();
+    db.execute(
+        "CREATE TABLE patterns (id UUID PRIMARY KEY, description TEXT)",
+        &params,
+    )
+    .unwrap();
     db.execute(
         "CREATE TABLE sync_state (id UUID PRIMARY KEY, push_watermark INTEGER, pull_watermark INTEGER)",
         &params,
@@ -98,10 +104,22 @@ pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
         ]),
     )
     .unwrap();
-    db.insert_edge(tx, decision1_id, entity_id, "BASED_ON".to_string(), HashMap::new())
-        .unwrap();
-    db.insert_edge(tx, decision2_id, decision1_id, "CITES".to_string(), HashMap::new())
-        .unwrap();
+    db.insert_edge(
+        tx,
+        decision1_id,
+        entity_id,
+        "BASED_ON".to_string(),
+        HashMap::new(),
+    )
+    .unwrap();
+    db.insert_edge(
+        tx,
+        decision2_id,
+        decision1_id,
+        "CITES".to_string(),
+        HashMap::new(),
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     (entity_id, decision1_id, decision2_id)

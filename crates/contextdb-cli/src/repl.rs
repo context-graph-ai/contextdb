@@ -81,7 +81,11 @@ pub(crate) fn handle_meta_command(db: &Database, line: &str) -> bool {
 fn print_table_meta(table: &str, meta: &TableMeta) {
     println!("CREATE TABLE {table} (");
     for (idx, col) in meta.columns.iter().enumerate() {
-        let comma = if idx + 1 == meta.columns.len() { "" } else { "," };
+        let comma = if idx + 1 == meta.columns.len() {
+            ""
+        } else {
+            ","
+        };
         let nullable = if col.nullable { "" } else { " NOT NULL" };
         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
         println!(

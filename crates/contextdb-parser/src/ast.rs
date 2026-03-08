@@ -20,8 +20,14 @@ pub struct SelectStatement {
 
 #[derive(Debug, Clone)]
 pub enum Cte {
-    SqlCte { name: String, query: SelectBody },
-    MatchCte { name: String, match_clause: MatchClause },
+    SqlCte {
+        name: String,
+        query: SelectBody,
+    },
+    MatchCte {
+        name: String,
+        match_clause: MatchClause,
+    },
 }
 
 #[derive(Debug, Clone)]

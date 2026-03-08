@@ -21,7 +21,10 @@ pub fn validate_dml(
                 && let Some(id_idx) = p.columns.iter().position(|c| c == "id")
             {
                 for row in &p.values {
-                    let id_value = row.get(id_idx).map(|e| resolve_expr(e, params)).transpose()?;
+                    let id_value = row
+                        .get(id_idx)
+                        .map(|e| resolve_expr(e, params))
+                        .transpose()?;
                     if let Some(v) = id_value {
                         let lookup = db.point_lookup(&p.table, "id", &v, db.snapshot())?;
                         if lookup.is_some() {
@@ -59,6 +62,8 @@ fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", p))),
         Expr::Column(c) => Ok(Value::Text(c.column.clone())),
-        _ => Err(Error::PlanError("unsupported expression in schema enforcer".to_string())),
+        _ => Err(Error::PlanError(
+            "unsupported expression in schema enforcer".to_string(),
+        )),
     }
 }

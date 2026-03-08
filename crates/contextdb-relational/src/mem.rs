@@ -162,7 +162,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 Ok(UpsertResult::Inserted)
             }
             Some(existing_row) => {
-                let changed = values.iter().any(|(k, v)| existing_row.values.get(k) != Some(v));
+                let changed = values
+                    .iter()
+                    .any(|(k, v)| existing_row.values.get(k) != Some(v));
                 if !changed {
                     return Ok(UpsertResult::NoOp);
                 }
