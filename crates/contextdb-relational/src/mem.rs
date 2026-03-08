@@ -1,5 +1,5 @@
 use crate::store::RelationalStore;
-use contextdb_core::{schema, *};
+use contextdb_core::*;
 use contextdb_tx::{TxManager, WriteSetApplicator};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,29 +74,32 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         values: &HashMap<ColName, Value>,
         snapshot: SnapshotId,
     ) -> Result<()> {
-        if table != "invalidations" {
+        let meta = self.store.table_meta.read();
+        let Some(sm) = meta.get(table).and_then(|m| m.state_machine.as_ref()) else {
             return Ok(());
-        }
+        };
+        let col = &sm.column;
 
-        let new_status = match values.get("status") {
+        let new_status = match values.get(col) {
             Some(Value::Text(s)) => s.as_str(),
             _ => return Ok(()),
         };
 
         let id = match values.get("id") {
-            Some(Value::Uuid(id)) => *id,
+            Some(v @ Value::Uuid(_)) => v.clone(),
             _ => return Ok(()),
         };
 
-        if let Some(existing) =
-            self.point_lookup_with_tx(Some(tx), "invalidations", "id", &Value::Uuid(id), snapshot)?
-        {
+        if let Some(existing) = self.point_lookup_with_tx(Some(tx), table, "id", &id, snapshot)? {
             let old_status = existing
                 .values
-                .get("status")
+                .get(col)
                 .and_then(Value::as_text)
                 .unwrap_or("");
-            if !schema::is_valid_transition(old_status, new_status) {
+            if !self
+                .store
+                .validate_state_transition(table, col, old_status, new_status)
+            {
                 return Err(Error::InvalidStateTransition(format!(
                     "{} -> {}",
                     old_status, new_status
@@ -139,7 +142,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         values: HashMap<ColName, Value>,
         snapshot: SnapshotId,
     ) -> Result<UpsertResult> {
-        if schema::is_immutable(table) {
+        if self.store.is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
 
@@ -159,9 +162,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 Ok(UpsertResult::Inserted)
             }
             Some(existing_row) => {
-                let changed = values
-                    .iter()
-                    .any(|(k, v)| existing_row.values.get(k) != Some(v));
+                let changed = values.iter().any(|(k, v)| existing_row.values.get(k) != Some(v));
                 if !changed {
                     return Ok(UpsertResult::NoOp);
                 }
@@ -215,7 +216,7 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
     }
 
     fn delete(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
-        if schema::is_immutable(table) {
+        if self.store.is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
 
