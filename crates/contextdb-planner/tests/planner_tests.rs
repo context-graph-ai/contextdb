@@ -1,10 +1,11 @@
 use contextdb_core::Error;
 use contextdb_parser::parse;
-use contextdb_planner::{plan, PhysicalPlan};
+use contextdb_planner::{PhysicalPlan, plan};
 
 #[test]
 fn match_cte_routes_to_graph_bfs() {
-    let stmt = parse("WITH n AS (MATCH (a)-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM n").unwrap();
+    let stmt =
+        parse("WITH n AS (MATCH (a)-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM n").unwrap();
     let p = plan(&stmt).unwrap();
     let text = p.explain();
     assert!(text.contains("GraphBfs"));
@@ -51,7 +52,8 @@ fn immutable_table_rejected_at_plan_time() {
 
 #[test]
 fn depth_over_cap_rejected() {
-    let stmt = parse("WITH n AS (MATCH (a)-[:BASED_ON*1..11]->(b) RETURN b.id) SELECT * FROM n").unwrap();
+    let stmt =
+        parse("WITH n AS (MATCH (a)-[:BASED_ON*1..11]->(b) RETURN b.id) SELECT * FROM n").unwrap();
     let err = plan(&stmt).unwrap_err();
     assert!(matches!(err, Error::BfsDepthExceeded(11)));
 }

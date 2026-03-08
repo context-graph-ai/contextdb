@@ -163,7 +163,12 @@ impl Database {
         execute_plan(self, &plan, params, Some(tx))
     }
 
-    pub fn insert_row(&self, tx: TxId, table: &str, values: HashMap<ColName, Value>) -> Result<RowId> {
+    pub fn insert_row(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+    ) -> Result<RowId> {
         self.relational.insert(tx, table, values)
     }
 
@@ -225,7 +230,8 @@ impl Database {
         max_depth: u32,
         snapshot: SnapshotId,
     ) -> Result<TraversalResult> {
-        self.graph.bfs(start, edge_types, direction, 1, max_depth, snapshot)
+        self.graph
+            .bfs(start, edge_types, direction, 1, max_depth, snapshot)
     }
 
     pub fn insert_vector(&self, tx: TxId, row_id: RowId, vector: Vec<f32>) -> Result<()> {

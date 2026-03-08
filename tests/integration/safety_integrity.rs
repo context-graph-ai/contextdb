@@ -8,7 +8,10 @@ fn si_02_invalidation_transitions() {
 
     db.execute(
         "INSERT INTO invalidations (id, status) VALUES ($id, $status)",
-        &make_params(vec![("id", Value::Uuid(id)), ("status", Value::Text("pending".into()))]),
+        &make_params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text("pending".into())),
+        ]),
     )
     .unwrap();
 
@@ -28,7 +31,12 @@ fn si_02_invalidation_transitions() {
 #[test]
 fn si_03_observation_immutability() {
     let db = setup_ontology_db();
-    let err = db.execute("UPDATE observations SET data='x'", &std::collections::HashMap::new()).unwrap_err();
+    let err = db
+        .execute(
+            "UPDATE observations SET data='x'",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap_err();
     assert!(matches!(err, Error::ImmutableTable(_)));
 }
 

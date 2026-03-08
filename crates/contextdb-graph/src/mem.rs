@@ -30,7 +30,8 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         let mut visited = HashSet::new();
         visited.insert(start);
 
-        let mut queue: VecDeque<(NodeId, u32, Vec<(NodeId, EdgeType)>)> = VecDeque::new();
+        type BfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
+        let mut queue: VecDeque<BfsEntry> = VecDeque::new();
         queue.push_back((start, 0, vec![]));
 
         let mut result_nodes = Vec::new();

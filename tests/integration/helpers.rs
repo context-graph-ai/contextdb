@@ -1,4 +1,4 @@
-use contextdb_core::{Value};
+use contextdb_core::Value;
 use contextdb_engine::Database;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -40,10 +40,22 @@ pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
         ]),
     )
     .unwrap();
-    db.insert_edge(tx, decision1_id, entity_id, "BASED_ON".to_string(), HashMap::new())
-        .unwrap();
-    db.insert_edge(tx, decision2_id, decision1_id, "CITES".to_string(), HashMap::new())
-        .unwrap();
+    db.insert_edge(
+        tx,
+        decision1_id,
+        entity_id,
+        "BASED_ON".to_string(),
+        HashMap::new(),
+    )
+    .unwrap();
+    db.insert_edge(
+        tx,
+        decision2_id,
+        decision1_id,
+        "CITES".to_string(),
+        HashMap::new(),
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     (entity_id, decision1_id, decision2_id)

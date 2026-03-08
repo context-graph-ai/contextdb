@@ -1,5 +1,5 @@
 use crate::plan::*;
-use contextdb_core::{schema, Direction, Error, Result};
+use contextdb_core::{Direction, Error, Result, schema};
 use contextdb_parser::ast::{Cte, Expr, SelectStatement, SortDirection, Statement};
 
 const DEFAULT_MATCH_DEPTH: u32 = 5;
@@ -54,11 +54,9 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     for cte in &sel.ctes {
         match cte {
             Cte::MatchCte { name, match_clause } => {
-                let step = match_clause
-                    .pattern
-                    .edges
-                    .first()
-                    .ok_or_else(|| Error::PlanError("MATCH must include at least one edge".into()))?;
+                let step = match_clause.pattern.edges.first().ok_or_else(|| {
+                    Error::PlanError("MATCH must include at least one edge".into())
+                })?;
                 let max_depth = if step.max_hops == 0 {
                     DEFAULT_MATCH_DEPTH
                 } else {
@@ -73,11 +71,7 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
                         table: None,
                         column: match_clause.pattern.start.alias.clone(),
                     }),
-                    edge_types: step
-                        .edge_type
-                        .clone()
-                        .map(|t| vec![t])
-                        .unwrap_or_default(),
+                    edge_types: step.edge_type.clone().map(|t| vec![t]).unwrap_or_default(),
                     direction: match step.direction {
                         contextdb_parser::ast::EdgeDirection::Outgoing => Direction::Outgoing,
                         contextdb_parser::ast::EdgeDirection::Incoming => Direction::Incoming,
@@ -139,11 +133,11 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
         return Err(Error::SubqueryNotSupported);
     }
 
-    if sel
-        .ctes
-        .iter()
-        .any(|c| matches!(c, Cte::MatchCte { .. }))
-        && matches!(current, PhysicalPlan::VectorSearch { .. } | PhysicalPlan::Scan { .. })
+    if sel.ctes.iter().any(|c| matches!(c, Cte::MatchCte { .. }))
+        && matches!(
+            current,
+            PhysicalPlan::VectorSearch { .. } | PhysicalPlan::Scan { .. }
+        )
     {
         pipeline.push(current);
         return Ok(PhysicalPlan::Pipeline(pipeline));

@@ -7,7 +7,10 @@ fn hc_f01_ontology_ops() {
     let id = uuid::Uuid::new_v4();
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &make_params(vec![("id", Value::Uuid(id)), ("name", Value::Text("n".into()))]),
+        &make_params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("n".into())),
+        ]),
     )
     .unwrap();
     assert_eq!(db.scan("entities", db.snapshot()).unwrap().len(), 1);
@@ -35,8 +38,17 @@ fn hc_t04_bfs_mvcc() {
     let a = uuid::Uuid::new_v4();
     let b = uuid::Uuid::new_v4();
     let tx = db.begin();
-    db.insert_edge(tx, a, b, "R".to_string(), std::collections::HashMap::new()).unwrap();
+    db.insert_edge(tx, a, b, "R".to_string(), std::collections::HashMap::new())
+        .unwrap();
     db.commit(tx).unwrap();
-    let result = db.query_bfs(a, None, contextdb_core::Direction::Outgoing, 1, db.snapshot()).unwrap();
+    let result = db
+        .query_bfs(
+            a,
+            None,
+            contextdb_core::Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .unwrap();
     assert_eq!(result.nodes.len(), 1);
 }

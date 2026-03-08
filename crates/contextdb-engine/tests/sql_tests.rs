@@ -10,8 +10,11 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 #[test]
 fn create_insert_select_roundtrip() {
     let db = Database::open_memory();
-    db.execute("CREATE TABLE test (id UUID PRIMARY KEY, name TEXT)", &HashMap::new())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE test (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
 
     db.execute(
         "INSERT INTO test (id, name) VALUES ($id, $name)",
@@ -33,7 +36,10 @@ fn insert_on_conflict_do_update() {
 
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("a".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("a".into())),
+        ]),
     )
     .unwrap();
 
@@ -185,14 +191,20 @@ fn duplicate_uuid_without_conflict_clause_errors() {
 
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("a".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("a".into())),
+        ]),
     )
     .unwrap();
 
     let err = db
         .execute(
             "INSERT INTO entities (id, name) VALUES ($id, $name)",
-            &params(vec![("id", Value::Uuid(id)), ("name", Value::Text("b".into()))]),
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text("b".into())),
+            ]),
         )
         .unwrap_err();
     assert!(matches!(err, Error::UniqueViolation { .. }));
@@ -260,7 +272,13 @@ fn insert_edge_table_maintains_adjacency() {
     .unwrap();
 
     let bfs = db
-        .query_bfs(source, None, contextdb_core::Direction::Outgoing, 1, db.snapshot())
+        .query_bfs(
+            source,
+            None,
+            contextdb_core::Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
         .unwrap();
     assert_eq!(bfs.nodes.len(), 1);
 }
@@ -274,7 +292,10 @@ fn begin_commit_rollback_session_sql() {
     db.execute("BEGIN", &HashMap::new()).unwrap();
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id1)), ("name", Value::Text("a".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id1)),
+            ("name", Value::Text("a".into())),
+        ]),
     )
     .unwrap();
     db.execute("COMMIT", &HashMap::new()).unwrap();
@@ -282,7 +303,10 @@ fn begin_commit_rollback_session_sql() {
     db.execute("BEGIN", &HashMap::new()).unwrap();
     db.execute(
         "INSERT INTO entities (id, name) VALUES ($id, $name)",
-        &params(vec![("id", Value::Uuid(id2)), ("name", Value::Text("b".into()))]),
+        &params(vec![
+            ("id", Value::Uuid(id2)),
+            ("name", Value::Text("b".into())),
+        ]),
     )
     .unwrap();
     db.execute("ROLLBACK", &HashMap::new()).unwrap();

@@ -88,13 +88,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             _ => return Ok(()),
         };
 
-        if let Some(existing) = self.point_lookup_with_tx(
-            Some(tx),
-            "invalidations",
-            "id",
-            &Value::Uuid(id),
-            snapshot,
-        )? {
+        if let Some(existing) =
+            self.point_lookup_with_tx(Some(tx), "invalidations", "id", &Value::Uuid(id), snapshot)?
+        {
             let old_status = existing
                 .values
                 .get("status")
@@ -163,7 +159,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 Ok(UpsertResult::Inserted)
             }
             Some(existing_row) => {
-                let changed = values.iter().any(|(k, v)| existing_row.values.get(k) != Some(v));
+                let changed = values
+                    .iter()
+                    .any(|(k, v)| existing_row.values.get(k) != Some(v));
                 if !changed {
                     return Ok(UpsertResult::NoOp);
                 }

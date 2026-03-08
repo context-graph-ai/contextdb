@@ -24,8 +24,14 @@ fn test_cross_subsystem_atomic_commit() {
             ]),
         )
         .unwrap();
-    eng.insert_edge(tx, entity_id, Uuid::new_v4(), "RELATES_TO".into(), HashMap::new())
-        .unwrap();
+    eng.insert_edge(
+        tx,
+        entity_id,
+        Uuid::new_v4(),
+        "RELATES_TO".into(),
+        HashMap::new(),
+    )
+    .unwrap();
     eng.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0]).unwrap();
     eng.commit(tx).unwrap();
 
@@ -38,7 +44,12 @@ fn test_cross_subsystem_atomic_commit() {
             .len(),
         1
     );
-    assert_eq!(eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap).unwrap().len(), 1);
+    assert_eq!(
+        eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap)
+            .unwrap()
+            .len(),
+        1
+    );
 
     let tx2 = eng.begin();
     eng.insert_row(
@@ -50,8 +61,14 @@ fn test_cross_subsystem_atomic_commit() {
         ]),
     )
     .unwrap();
-    eng.insert_edge(tx2, Uuid::new_v4(), Uuid::new_v4(), "SERVES".into(), HashMap::new())
-        .unwrap();
+    eng.insert_edge(
+        tx2,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "SERVES".into(),
+        HashMap::new(),
+    )
+    .unwrap();
     eng.insert_vector(tx2, 999, vec![0.0, 1.0, 0.0]).unwrap();
     eng.rollback(tx2).unwrap();
 
@@ -73,17 +90,32 @@ fn test_rollback_across_all_subsystems() {
         .insert_row(
             tx,
             "decisions",
-            make_values(vec![("id", Value::Uuid(a)), ("status", Value::Text("active".into()))]),
+            make_values(vec![
+                ("id", Value::Uuid(a)),
+                ("status", Value::Text("active".into())),
+            ]),
         )
         .unwrap();
-    eng.insert_edge(tx, a, b, "SERVES".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx, a, b, "SERVES".into(), HashMap::new())
+        .unwrap();
     eng.insert_vector(tx, rid, vec![0.5, 0.5, 0.0]).unwrap();
     eng.rollback(tx).unwrap();
 
     let snap = eng.snapshot();
     assert_eq!(eng.scan("decisions", snap).unwrap().len(), 0);
-    assert_eq!(eng.query_bfs(a, None, Direction::Outgoing, 1, snap).unwrap().nodes.len(), 0);
-    assert_eq!(eng.query_vector(&[0.5, 0.5, 0.0], 10, None, snap).unwrap().len(), 0);
+    assert_eq!(
+        eng.query_bfs(a, None, Direction::Outgoing, 1, snap)
+            .unwrap()
+            .nodes
+            .len(),
+        0
+    );
+    assert_eq!(
+        eng.query_vector(&[0.5, 0.5, 0.0], 10, None, snap)
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -131,14 +163,17 @@ fn test_bfs_under_mvcc() {
     let d = Uuid::new_v4();
 
     let tx1 = eng.begin();
-    eng.insert_edge(tx1, a, b, "EDGE".into(), HashMap::new()).unwrap();
-    eng.insert_edge(tx1, b, c, "EDGE".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx1, a, b, "EDGE".into(), HashMap::new())
+        .unwrap();
+    eng.insert_edge(tx1, b, c, "EDGE".into(), HashMap::new())
+        .unwrap();
     eng.commit(tx1).unwrap();
 
     let snap1 = eng.snapshot();
 
     let tx2 = eng.begin();
-    eng.insert_edge(tx2, c, d, "EDGE".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx2, c, d, "EDGE".into(), HashMap::new())
+        .unwrap();
     eng.commit(tx2).unwrap();
 
     let ids1: HashSet<NodeId> = eng
@@ -170,9 +205,12 @@ fn test_bfs_cycle_detection() {
     let c = Uuid::new_v4();
 
     let tx = eng.begin();
-    eng.insert_edge(tx, a, b, "EDGE".into(), HashMap::new()).unwrap();
-    eng.insert_edge(tx, b, c, "EDGE".into(), HashMap::new()).unwrap();
-    eng.insert_edge(tx, c, a, "EDGE".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx, a, b, "EDGE".into(), HashMap::new())
+        .unwrap();
+    eng.insert_edge(tx, b, c, "EDGE".into(), HashMap::new())
+        .unwrap();
+    eng.insert_edge(tx, c, a, "EDGE".into(), HashMap::new())
+        .unwrap();
     eng.commit(tx).unwrap();
 
     let ids: Vec<NodeId> = eng
@@ -265,27 +303,39 @@ fn test_unified_pipeline() {
         .insert_row(
             tx,
             "entities",
-            make_values(vec![("id", Value::Uuid(neighbor1)), ("context_id", Value::Text("ctx1".into()))]),
+            make_values(vec![
+                ("id", Value::Uuid(neighbor1)),
+                ("context_id", Value::Text("ctx1".into())),
+            ]),
         )
         .unwrap();
     let rid2 = eng
         .insert_row(
             tx,
             "entities",
-            make_values(vec![("id", Value::Uuid(neighbor2)), ("context_id", Value::Text("ctx1".into()))]),
+            make_values(vec![
+                ("id", Value::Uuid(neighbor2)),
+                ("context_id", Value::Text("ctx1".into())),
+            ]),
         )
         .unwrap();
     let rid3 = eng
         .insert_row(
             tx,
             "entities",
-            make_values(vec![("id", Value::Uuid(far)), ("context_id", Value::Text("ctx2".into()))]),
+            make_values(vec![
+                ("id", Value::Uuid(far)),
+                ("context_id", Value::Text("ctx2".into())),
+            ]),
         )
         .unwrap();
 
-    eng.insert_edge(tx, center, neighbor1, "RELATES_TO".into(), HashMap::new()).unwrap();
-    eng.insert_edge(tx, center, neighbor2, "RELATES_TO".into(), HashMap::new()).unwrap();
-    eng.insert_edge(tx, center, far, "RELATES_TO".into(), HashMap::new()).unwrap();
+    eng.insert_edge(tx, center, neighbor1, "RELATES_TO".into(), HashMap::new())
+        .unwrap();
+    eng.insert_edge(tx, center, neighbor2, "RELATES_TO".into(), HashMap::new())
+        .unwrap();
+    eng.insert_edge(tx, center, far, "RELATES_TO".into(), HashMap::new())
+        .unwrap();
 
     eng.insert_vector(tx, rid1, vec![1.0, 0.0, 0.0]).unwrap();
     eng.insert_vector(tx, rid2, vec![0.9, 0.1, 0.0]).unwrap();
@@ -397,7 +447,10 @@ fn test_invalidation_state_machine() {
     eng.insert_row(
         tx1,
         "invalidations",
-        make_values(vec![("id", Value::Uuid(inv_id)), ("status", Value::Text("pending".into()))]),
+        make_values(vec![
+            ("id", Value::Uuid(inv_id)),
+            ("status", Value::Text("pending".into())),
+        ]),
     )
     .unwrap();
     eng.commit(tx1).unwrap();
@@ -421,7 +474,10 @@ fn test_invalidation_state_machine() {
             tx3,
             "invalidations",
             "id",
-            make_values(vec![("id", Value::Uuid(inv_id)), ("status", Value::Text("pending".into()))]),
+            make_values(vec![
+                ("id", Value::Uuid(inv_id)),
+                ("status", Value::Text("pending".into())),
+            ]),
         )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidStateTransition(_)));
@@ -456,7 +512,10 @@ fn test_snapshot_contiguity() {
         tx2,
         "entity_snapshots",
         make_values(vec![
-            ("id", Value::Uuid(*rows[0].values.get("id").unwrap().as_uuid().unwrap())),
+            (
+                "id",
+                Value::Uuid(*rows[0].values.get("id").unwrap().as_uuid().unwrap()),
+            ),
             ("entity_id", Value::Uuid(eid)),
             ("valid_from", Value::Timestamp(100)),
             ("valid_to", Value::Timestamp(200)),
@@ -488,7 +547,10 @@ fn test_snapshot_contiguity() {
     });
 
     assert_eq!(snapshots.len(), 2);
-    assert_eq!(snapshots[0].values.get("valid_to"), snapshots[1].values.get("valid_from"));
+    assert_eq!(
+        snapshots[0].values.get("valid_to"),
+        snapshots[1].values.get("valid_from")
+    );
 }
 
 #[test]
@@ -531,8 +593,19 @@ fn test_empty_database() {
     let eng = Database::open_memory();
     let snap = eng.snapshot();
 
-    assert_eq!(eng.query_bfs(Uuid::new_v4(), None, Direction::Outgoing, 5, snap).unwrap().nodes.len(), 0);
-    assert_eq!(eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap).unwrap().len(), 0);
+    assert_eq!(
+        eng.query_bfs(Uuid::new_v4(), None, Direction::Outgoing, 5, snap)
+            .unwrap()
+            .nodes
+            .len(),
+        0
+    );
+    assert_eq!(
+        eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap)
+            .unwrap()
+            .len(),
+        0
+    );
     assert_eq!(eng.scan("entities", snap).unwrap().len(), 0);
 }
 

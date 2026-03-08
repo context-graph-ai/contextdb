@@ -89,8 +89,6 @@ fn double_rollback_returns_tx_not_found() {
     });
     let tx: TxId = txm.begin();
     txm.rollback(tx).expect("first rollback should succeed");
-    let err = txm
-        .rollback(tx)
-        .expect_err("second rollback should fail");
+    let err = txm.rollback(tx).expect_err("second rollback should fail");
     assert!(matches!(err, Error::TxNotFound(t) if t == tx));
 }

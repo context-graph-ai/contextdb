@@ -1,5 +1,5 @@
 use crate::database::Database;
-use contextdb_core::{schema, Error, GraphExecutor, Result, Value};
+use contextdb_core::{Error, GraphExecutor, Result, Value, schema};
 use contextdb_parser::ast::{BinOp, Expr, Literal};
 use contextdb_planner::PhysicalPlan;
 use std::collections::HashMap;
@@ -21,7 +21,10 @@ pub fn validate_dml(
                 && let Some(id_idx) = p.columns.iter().position(|c| c == "id")
             {
                 for row in &p.values {
-                    let id_value = row.get(id_idx).map(|e| resolve_expr(e, params)).transpose()?;
+                    let id_value = row
+                        .get(id_idx)
+                        .map(|e| resolve_expr(e, params))
+                        .transpose()?;
                     if let Some(v) = id_value {
                         let lookup = db.point_lookup(&p.table, "id", &v, db.snapshot())?;
                         if lookup.is_some() {
@@ -57,14 +60,12 @@ pub fn validate_dml(
                 .filter_map(|r| r.values.get("id").and_then(Value::as_uuid).copied())
                 .collect();
 
-            let incoming = db
-                .graph()
-                .neighbors(
-                    intention_id,
-                    Some(&["SERVES".to_string()]),
-                    contextdb_core::Direction::Incoming,
-                    db.snapshot(),
-                )?;
+            let incoming = db.graph().neighbors(
+                intention_id,
+                Some(&["SERVES".to_string()]),
+                contextdb_core::Direction::Incoming,
+                db.snapshot(),
+            )?;
 
             if incoming
                 .into_iter()
@@ -100,11 +101,16 @@ fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", p))),
         Expr::Column(c) => Ok(Value::Text(c.column.clone())),
-        _ => Err(Error::PlanError("unsupported expression in schema enforcer".to_string())),
+        _ => Err(Error::PlanError(
+            "unsupported expression in schema enforcer".to_string(),
+        )),
     }
 }
 
-fn extract_id_filter(where_clause: Option<&Expr>, params: &HashMap<String, Value>) -> Result<Option<uuid::Uuid>> {
+fn extract_id_filter(
+    where_clause: Option<&Expr>,
+    params: &HashMap<String, Value>,
+) -> Result<Option<uuid::Uuid>> {
     let Some(Expr::BinaryOp { left, op, right }) = where_clause else {
         return Ok(None);
     };
@@ -113,11 +119,7 @@ fn extract_id_filter(where_clause: Option<&Expr>, params: &HashMap<String, Value
         return Ok(None);
     }
 
-    let left_col = match &**left {
-        Expr::Column(c) if c.column == "id" => true,
-        _ => false,
-    };
-    if !left_col {
+    if !matches!(&**left, Expr::Column(c) if c.column == "id") {
         return Ok(None);
     }
 

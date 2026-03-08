@@ -1,4 +1,4 @@
-use contextdb_core::{schema, RowId, TableName, VersionedRow};
+use contextdb_core::{RowId, TableName, VersionedRow, schema};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

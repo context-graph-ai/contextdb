@@ -53,14 +53,7 @@ fn bfs_depth_bound_on_chain() {
     }
 
     let r = exec
-        .bfs(
-            nodes[0],
-            None,
-            Direction::Outgoing,
-            1,
-            3,
-            tx_mgr.snapshot(),
-        )
+        .bfs(nodes[0], None, Direction::Outgoing, 1, 3, tx_mgr.snapshot())
         .unwrap();
     assert_eq!(r.nodes.len(), 3);
 }
@@ -93,9 +86,7 @@ fn bfs_respects_mvcc_snapshot() {
     let snap1 = tx_mgr.snapshot();
     connect(&tx_mgr, &exec, b, c, "R");
 
-    let old = exec
-        .bfs(a, None, Direction::Outgoing, 1, 5, snap1)
-        .unwrap();
+    let old = exec.bfs(a, None, Direction::Outgoing, 1, 5, snap1).unwrap();
     assert_eq!(old.nodes.len(), 1);
 
     let new = exec

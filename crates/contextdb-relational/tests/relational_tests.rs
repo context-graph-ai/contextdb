@@ -1,4 +1,4 @@
-use contextdb_core::{schema, ColName, Error, RelationalExecutor, RowId, UpsertResult, Value};
+use contextdb_core::{ColName, Error, RelationalExecutor, RowId, UpsertResult, Value, schema};
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use std::collections::HashMap;
@@ -40,8 +40,12 @@ fn setup() -> (Arc<TxManager<TestStore>>, MemRelationalExecutor<TestStore>) {
 fn scan_respects_snapshot_visibility() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();
-    exec.insert(tx, "entities", map(vec![("name", Value::Text("e1".into()))]))
-        .unwrap();
+    exec.insert(
+        tx,
+        "entities",
+        map(vec![("name", Value::Text("e1".into()))]),
+    )
+    .unwrap();
 
     let s0 = tx_mgr.snapshot();
     assert_eq!(exec.scan("entities", s0).unwrap().len(), 0);
@@ -55,8 +59,12 @@ fn scan_respects_snapshot_visibility() {
 fn rollback_hides_inserted_rows() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();
-    exec.insert(tx, "entities", map(vec![("name", Value::Text("e1".into()))]))
-        .unwrap();
+    exec.insert(
+        tx,
+        "entities",
+        map(vec![("name", Value::Text("e1".into()))]),
+    )
+    .unwrap();
     tx_mgr.rollback(tx).unwrap();
 
     let snapshot = tx_mgr.snapshot();
@@ -68,15 +76,23 @@ fn mvcc_snapshot_isolation() {
     let (tx_mgr, exec) = setup();
 
     let tx1 = tx_mgr.begin();
-    exec.insert(tx1, "entities", map(vec![("name", Value::Text("v1".into()))]))
-        .unwrap();
+    exec.insert(
+        tx1,
+        "entities",
+        map(vec![("name", Value::Text("v1".into()))]),
+    )
+    .unwrap();
     tx_mgr.commit(tx1).unwrap();
 
     let snap1 = tx_mgr.snapshot();
 
     let tx2 = tx_mgr.begin();
-    exec.insert(tx2, "entities", map(vec![("name", Value::Text("v2".into()))]))
-        .unwrap();
+    exec.insert(
+        tx2,
+        "entities",
+        map(vec![("name", Value::Text("v2".into()))]),
+    )
+    .unwrap();
     tx_mgr.commit(tx2).unwrap();
 
     assert_eq!(exec.scan("entities", snap1).unwrap().len(), 1);

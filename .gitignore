@@ -1,0 +1,7 @@
+/target
+.claude/
+spikes/
+*.swp
+*.swo
+*~
+.DS_Store

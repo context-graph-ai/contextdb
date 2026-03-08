@@ -64,11 +64,7 @@ pub fn parse(input: &str) -> Result<Statement> {
 }
 
 fn parse_identifier(token: &str) -> String {
-    token
-        .trim()
-        .trim_matches('`')
-        .trim_matches('"')
-        .to_string()
+    token.trim().trim_matches('`').trim_matches('"').to_string()
 }
 
 fn parse_literal(token: &str) -> Expr {
@@ -260,7 +256,10 @@ fn parse_insert(s: &str) -> Result<Statement> {
         let c_upper = c.to_ascii_uppercase();
         let copen = c.find('(')?;
         let cclose = c.find(')')?;
-        let cols: Vec<String> = c[copen + 1..cclose].split(',').map(parse_identifier).collect();
+        let cols: Vec<String> = c[copen + 1..cclose]
+            .split(',')
+            .map(parse_identifier)
+            .collect();
         let set_pos = c_upper.find(" SET ")?;
         let assigns = c[set_pos + 5..]
             .split(',')
@@ -296,7 +295,10 @@ fn parse_delete(s: &str) -> Result<Statement> {
 
     let where_clause = where_idx.map(|idx| parse_condition(s[idx + 7..].trim()));
 
-    Ok(Statement::Delete(Delete { table, where_clause }))
+    Ok(Statement::Delete(Delete {
+        table,
+        where_clause,
+    }))
 }
 
 fn parse_update(s: &str) -> Result<Statement> {
@@ -346,7 +348,9 @@ fn parse_select(s: &str) -> Result<Statement> {
             .find('(')
             .ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?
             + as_pos;
-        let close = s.rfind(')').ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?;
+        let close = s
+            .rfind(')')
+            .ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?;
         let cte_body = s[open + 1..close].trim();
 
         if cte_body.to_ascii_uppercase().starts_with("MATCH") {
@@ -473,7 +477,10 @@ fn parse_select(s: &str) -> Result<Statement> {
         .collect();
 
     let from = from_pos.map(|fp| {
-        let end = where_pos.or(order_pos).or(limit_pos).unwrap_or(select_source.len());
+        let end = where_pos
+            .or(order_pos)
+            .or(limit_pos)
+            .unwrap_or(select_source.len());
         FromClause {
             table: parse_identifier(select_source[fp + 6..end].trim()),
             alias: None,

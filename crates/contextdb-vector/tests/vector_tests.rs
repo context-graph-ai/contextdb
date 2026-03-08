@@ -1,6 +1,6 @@
 use contextdb_core::{Error, RowId, Value, VectorExecutor};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
-use contextdb_vector::{cosine_similarity, MemVectorExecutor, VectorStore};
+use contextdb_vector::{MemVectorExecutor, VectorStore, cosine_similarity};
 use roaring::RoaringTreemap;
 use std::sync::Arc;
 
@@ -44,7 +44,9 @@ fn search_returns_top_k_descending() {
     exec.insert_vector(tx, 3, vec![0.0, 1.0]).unwrap();
     tx_mgr.commit(tx).unwrap();
 
-    let r = exec.search(&[1.0, 0.0], 2, None, tx_mgr.snapshot()).unwrap();
+    let r = exec
+        .search(&[1.0, 0.0], 2, None, tx_mgr.snapshot())
+        .unwrap();
     assert_eq!(r.len(), 2);
     assert_eq!(r[0].0, 1);
     assert_eq!(r[1].0, 2);
@@ -85,7 +87,9 @@ fn mvcc_snapshot_isolation() {
     let old = exec.search(&[1.0, 0.0], 10, None, snap1).unwrap();
     assert_eq!(old.len(), 1);
 
-    let new = exec.search(&[1.0, 0.0], 10, None, tx_mgr.snapshot()).unwrap();
+    let new = exec
+        .search(&[1.0, 0.0], 10, None, tx_mgr.snapshot())
+        .unwrap();
     assert_eq!(new.len(), 2);
 }
 
@@ -97,9 +101,7 @@ fn dimension_mismatch_errors() {
     tx_mgr.commit(tx1).unwrap();
 
     let tx2 = tx_mgr.begin();
-    let err = exec
-        .insert_vector(tx2, 2, vec![1.0, 0.0, 0.0])
-        .unwrap_err();
+    let err = exec.insert_vector(tx2, 2, vec![1.0, 0.0, 0.0]).unwrap_err();
     assert!(matches!(
         err,
         Error::VectorDimensionMismatch {
@@ -112,18 +114,24 @@ fn dimension_mismatch_errors() {
 #[test]
 fn k_zero_returns_empty_and_empty_store_returns_empty() {
     let (tx_mgr, exec) = setup();
-    assert!(exec.search(&[1.0], 0, None, tx_mgr.snapshot()).unwrap().is_empty());
-    assert!(exec
-        .search(&[1.0], 10, None, tx_mgr.snapshot())
-        .unwrap()
-        .is_empty());
+    assert!(
+        exec.search(&[1.0], 0, None, tx_mgr.snapshot())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        exec.search(&[1.0], 10, None, tx_mgr.snapshot())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn float32_precision_is_preserved() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();
-    exec.insert_vector(tx, 1, vec![0.12345679, 0.9876543]).unwrap();
+    exec.insert_vector(tx, 1, vec![0.12345679, 0.9876543])
+        .unwrap();
     tx_mgr.commit(tx).unwrap();
 
     let r = exec

@@ -39,6 +39,7 @@ pub trait GraphExecutor: Send + Sync {
         max_depth: u32,
         snapshot: SnapshotId,
     ) -> Result<TraversalResult>;
+    #[allow(clippy::type_complexity)]
     fn neighbors(
         &self,
         node: NodeId,
