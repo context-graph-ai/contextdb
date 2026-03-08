@@ -20,14 +20,8 @@ pub struct SelectStatement {
 
 #[derive(Debug, Clone)]
 pub enum Cte {
-    SqlCte {
-        name: String,
-        query: SelectBody,
-    },
-    MatchCte {
-        name: String,
-        match_clause: MatchClause,
-    },
+    SqlCte { name: String, query: SelectBody },
+    MatchCte { name: String, match_clause: MatchClause },
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +206,14 @@ pub struct CreateTable {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub if_not_exists: bool,
+    pub immutable: bool,
+    pub state_machine: Option<StateMachineDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateMachineDef {
+    pub column: String,
+    pub transitions: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Debug, Clone)]

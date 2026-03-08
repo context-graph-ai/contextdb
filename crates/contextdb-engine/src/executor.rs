@@ -1,6 +1,6 @@
 use crate::database::{Database, QueryResult};
 use contextdb_core::*;
-use contextdb_parser::ast::{BinOp, Expr, Literal};
+use contextdb_parser::ast::{BinOp, DataType, Expr, Literal};
 use contextdb_planner::{DeletePlan, InsertPlan, PhysicalPlan, UpdatePlan};
 use roaring::RoaringTreemap;
 use std::collections::{BTreeSet, HashMap};
@@ -13,7 +13,28 @@ pub(crate) fn execute_plan(
 ) -> Result<QueryResult> {
     match plan {
         PhysicalPlan::CreateTable(p) => {
-            db.relational_store().create_table(&p.name);
+            let meta = TableMeta {
+                columns: p
+                    .columns
+                    .iter()
+                    .map(|c| contextdb_core::ColumnDef {
+                        name: c.name.clone(),
+                        column_type: map_column_type(&c.data_type),
+                        nullable: c.nullable,
+                        primary_key: c.primary_key,
+                    })
+                    .collect(),
+                immutable: p.immutable,
+                state_machine: p.state_machine.as_ref().map(|sm| StateMachineConstraint {
+                    column: sm.column.clone(),
+                    transitions: sm
+                        .transitions
+                        .iter()
+                        .map(|(from, tos)| (from.clone(), tos.clone()))
+                        .collect(),
+                }),
+            };
+            db.relational_store().create_table(&p.name, meta);
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::DropTable(name) => {
@@ -42,14 +63,16 @@ pub(crate) fn execute_plan(
             } else {
                 Some(edge_types.as_slice())
             };
-            let res = db.graph().bfs(
-                start,
-                edge_types_ref,
-                *direction,
-                *min_depth,
-                *max_depth,
-                db.snapshot(),
-            )?;
+            let res = db
+                .graph()
+                .bfs(
+                    start,
+                    edge_types_ref,
+                    *direction,
+                    *min_depth,
+                    *max_depth,
+                    db.snapshot(),
+                )?;
 
             Ok(QueryResult {
                 columns: vec!["id".to_string(), "depth".to_string()],
@@ -91,9 +114,7 @@ pub(crate) fn execute_plan(
                 columns: vec!["row_id".to_string(), "score".to_string()],
                 rows: res
                     .into_iter()
-                    .map(|(rid, score)| {
-                        vec![Value::Int64(rid as i64), Value::Float64(score as f64)]
-                    })
+                    .map(|(rid, score)| vec![Value::Int64(rid as i64), Value::Float64(score as f64)])
                     .collect(),
                 rows_affected: 0,
             })
@@ -106,9 +127,7 @@ pub(crate) fn execute_plan(
             }
             Ok(last)
         }
-        _ => Err(Error::PlanError(
-            "unsupported plan node in executor".to_string(),
-        )),
+        _ => Err(Error::PlanError("unsupported plan node in executor".to_string())),
     }
 }
 
@@ -140,17 +159,19 @@ fn exec_insert(
         };
 
         if p.table == "edges"
-            && let (
-                Some(Value::Uuid(source)),
-                Some(Value::Uuid(target)),
-                Some(Value::Text(edge_type)),
-            ) = (
+            && let (Some(Value::Uuid(source)), Some(Value::Uuid(target)), Some(Value::Text(edge_type))) = (
                 values.get("source_id"),
                 values.get("target_id"),
                 values.get("edge_type"),
             )
         {
-            db.insert_edge(txid, *source, *target, edge_type.clone(), HashMap::new())?;
+            db.insert_edge(
+                txid,
+                *source,
+                *target,
+                edge_type.clone(),
+                HashMap::new(),
+            )?;
         }
 
         if let Some(Value::Vector(v)) = values.get("embedding")
@@ -176,11 +197,7 @@ fn exec_delete(
     let rows = db.scan(&p.table, snapshot)?;
     let matched: Vec<_> = rows
         .into_iter()
-        .filter(|r| {
-            p.where_clause
-                .as_ref()
-                .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
-        })
+        .filter(|r| p.where_clause.as_ref().is_none_or(|w| row_matches(r, w, params).unwrap_or(false)))
         .collect();
 
     for row in &matched {
@@ -201,11 +218,7 @@ fn exec_update(
     let rows = db.scan(&p.table, snapshot)?;
     let matched: Vec<_> = rows
         .into_iter()
-        .filter(|r| {
-            p.where_clause
-                .as_ref()
-                .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
-        })
+        .filter(|r| p.where_clause.as_ref().is_none_or(|w| row_matches(r, w, params).unwrap_or(false)))
         .collect();
 
     for row in &matched {
@@ -273,11 +286,7 @@ fn row_matches(row: &VersionedRow, expr: &Expr, params: &HashMap<String, Value>)
     }
 }
 
-fn eval_expr_value(
-    row: &VersionedRow,
-    expr: &Expr,
-    params: &HashMap<String, Value>,
-) -> Result<Value> {
+fn eval_expr_value(row: &VersionedRow, expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
     match expr {
         Expr::Column(c) => Ok(row.values.get(&c.column).cloned().unwrap_or(Value::Null)),
         _ => resolve_expr(expr, params),
@@ -308,9 +317,7 @@ fn resolve_uuid(expr: &Expr, params: &HashMap<String, Value>) -> Result<uuid::Uu
         Value::Uuid(u) => Ok(u),
         Value::Text(t) => uuid::Uuid::parse_str(&t)
             .map_err(|e| Error::PlanError(format!("invalid uuid '{}': {}", t, e))),
-        _ => Err(Error::PlanError(
-            "graph start node must be UUID".to_string(),
-        )),
+        _ => Err(Error::PlanError("graph start node must be UUID".to_string())),
     }
 }
 
@@ -321,9 +328,7 @@ fn resolve_vector_from_expr(expr: &Expr, params: &HashMap<String, Value>) -> Res
             Some(Value::Vector(v)) => Ok(v.clone()),
             _ => Err(Error::PlanError("vector parameter missing".to_string())),
         },
-        _ => Err(Error::PlanError(
-            "invalid vector query expression".to_string(),
-        )),
+        _ => Err(Error::PlanError("invalid vector query expression".to_string())),
     }
 }
 
@@ -335,4 +340,17 @@ fn coerce_uuid_if_needed(col: &str, v: Value) -> Value {
         return Value::Uuid(u);
     }
     v
+}
+
+fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
+    match dtype {
+        DataType::Uuid => contextdb_core::ColumnType::Uuid,
+        DataType::Text => contextdb_core::ColumnType::Text,
+        DataType::Integer => contextdb_core::ColumnType::Integer,
+        DataType::Real => contextdb_core::ColumnType::Real,
+        DataType::Boolean => contextdb_core::ColumnType::Boolean,
+        DataType::Timestamp => contextdb_core::ColumnType::Text,
+        DataType::Json => contextdb_core::ColumnType::Json,
+        DataType::Vector(dim) => contextdb_core::ColumnType::Vector(*dim as usize),
+    }
 }

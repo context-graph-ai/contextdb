@@ -64,7 +64,11 @@ pub fn parse(input: &str) -> Result<Statement> {
 }
 
 fn parse_identifier(token: &str) -> String {
-    token.trim().trim_matches('`').trim_matches('"').to_string()
+    token
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .to_string()
 }
 
 fn parse_literal(token: &str) -> Expr {
@@ -134,11 +138,11 @@ fn parse_create_table(s: &str) -> Result<Statement> {
     let open = s
         .find('(')
         .ok_or_else(|| Error::ParseError("invalid CREATE TABLE".to_string()))?;
-    let close = s
-        .rfind(')')
+    let close = find_matching_paren(s, open)
         .ok_or_else(|| Error::ParseError("invalid CREATE TABLE".to_string()))?;
     let prefix = &s[..open];
     let cols = &s[open + 1..close];
+    let options = s[close + 1..].trim();
 
     let parts: Vec<&str> = prefix.split_whitespace().collect();
     let name = parse_identifier(parts.last().copied().unwrap_or(""));
@@ -165,11 +169,158 @@ fn parse_create_table(s: &str) -> Result<Statement> {
         })
         .collect();
 
+    let (immutable, state_machine) = parse_create_table_options(options)?;
+
     Ok(Statement::CreateTable(CreateTable {
         name,
         columns,
         if_not_exists: prefix.to_ascii_uppercase().contains("IF NOT EXISTS"),
+        immutable,
+        state_machine,
     }))
+}
+
+fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
+    let mut depth = 0_i32;
+    for (idx, ch) in s.char_indices().skip(open_idx) {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn parse_create_table_options(options: &str) -> Result<(bool, Option<StateMachineDef>)> {
+    if options.is_empty() {
+        return Ok((false, None));
+    }
+
+    let upper = options.to_ascii_uppercase();
+    let has_immutable = upper.contains("IMMUTABLE");
+    let has_state_machine = upper.contains("STATE MACHINE");
+    if has_immutable && has_state_machine {
+        return Err(Error::ParseError(
+            "IMMUTABLE and STATE MACHINE cannot be used together".to_string(),
+        ));
+    }
+
+    if has_immutable {
+        if upper.trim() != "IMMUTABLE" {
+            return Err(Error::ParseError("invalid CREATE TABLE options".to_string()));
+        }
+        return Ok((true, None));
+    }
+
+    if has_state_machine {
+        if !upper.starts_with("STATE MACHINE") {
+            return Err(Error::ParseError("invalid CREATE TABLE options".to_string()));
+        }
+        let open = options
+            .find('(')
+            .ok_or_else(|| Error::ParseError("invalid STATE MACHINE clause".to_string()))?;
+        let close = find_matching_paren(options, open)
+            .ok_or_else(|| Error::ParseError("invalid STATE MACHINE clause".to_string()))?;
+        if options[close + 1..].trim().is_empty() {
+            let def = parse_state_machine_def(options[open + 1..close].trim())?;
+            return Ok((false, Some(def)));
+        }
+        return Err(Error::ParseError("invalid CREATE TABLE options".to_string()));
+    }
+
+    Err(Error::ParseError("invalid CREATE TABLE options".to_string()))
+}
+
+fn parse_state_machine_def(input: &str) -> Result<StateMachineDef> {
+    let clauses = split_top_level_commas(input);
+    if clauses.is_empty() {
+        return Err(Error::ParseError("STATE MACHINE requires transitions".to_string()));
+    }
+
+    let mut column = None::<String>;
+    let mut transitions: Vec<(String, Vec<String>)> = Vec::new();
+
+    for clause in clauses {
+        let mut clause_text = clause.trim().to_string();
+        if clause_text.is_empty() {
+            continue;
+        }
+
+        if let Some((maybe_col, rest)) = clause_text.split_once(':') {
+            if !rest.contains("->") {
+                return Err(Error::ParseError("invalid STATE MACHINE transition".to_string()));
+            }
+            if column.is_none() {
+                let parsed_col = parse_identifier(maybe_col.trim());
+                if parsed_col.is_empty() {
+                    return Err(Error::ParseError("missing STATE MACHINE column".to_string()));
+                }
+                column = Some(parsed_col);
+            }
+            clause_text = rest.trim().to_string();
+        }
+
+        let (from, rhs) = clause_text
+            .split_once("->")
+            .ok_or_else(|| Error::ParseError("invalid STATE MACHINE transition".to_string()))?;
+        let from = parse_identifier(from.trim());
+        if from.is_empty() {
+            return Err(Error::ParseError("missing STATE MACHINE source state".to_string()));
+        }
+        let rhs = rhs.trim();
+        if !rhs.starts_with('[') || !rhs.ends_with(']') {
+            return Err(Error::ParseError(
+                "STATE MACHINE targets must use [..]".to_string(),
+            ));
+        }
+        let targets: Vec<String> = rhs[1..rhs.len() - 1]
+            .split(',')
+            .map(parse_identifier)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if let Some((_, existing_targets)) = transitions.iter_mut().find(|(src, _)| src == &from) {
+            for target in targets {
+                if !existing_targets.iter().any(|t| t == &target) {
+                    existing_targets.push(target);
+                }
+            }
+        } else {
+            transitions.push((from, targets));
+        }
+    }
+
+    let Some(column) = column else {
+        return Err(Error::ParseError("missing STATE MACHINE column".to_string()));
+    };
+
+    Ok(StateMachineDef {
+        column,
+        transitions,
+    })
+}
+
+fn split_top_level_commas(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0_i32;
+
+    for (idx, ch) in input.char_indices() {
+        if ch == '[' {
+            depth += 1;
+        } else if ch == ']' {
+            depth -= 1;
+        } else if ch == ',' && depth == 0 {
+            out.push(input[start..idx].trim());
+            start = idx + 1;
+        }
+    }
+    out.push(input[start..].trim());
+    out
 }
 
 fn parse_drop_table(s: &str) -> Result<Statement> {
@@ -256,10 +407,7 @@ fn parse_insert(s: &str) -> Result<Statement> {
         let c_upper = c.to_ascii_uppercase();
         let copen = c.find('(')?;
         let cclose = c.find(')')?;
-        let cols: Vec<String> = c[copen + 1..cclose]
-            .split(',')
-            .map(parse_identifier)
-            .collect();
+        let cols: Vec<String> = c[copen + 1..cclose].split(',').map(parse_identifier).collect();
         let set_pos = c_upper.find(" SET ")?;
         let assigns = c[set_pos + 5..]
             .split(',')
@@ -295,10 +443,7 @@ fn parse_delete(s: &str) -> Result<Statement> {
 
     let where_clause = where_idx.map(|idx| parse_condition(s[idx + 7..].trim()));
 
-    Ok(Statement::Delete(Delete {
-        table,
-        where_clause,
-    }))
+    Ok(Statement::Delete(Delete { table, where_clause }))
 }
 
 fn parse_update(s: &str) -> Result<Statement> {
@@ -348,9 +493,7 @@ fn parse_select(s: &str) -> Result<Statement> {
             .find('(')
             .ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?
             + as_pos;
-        let close = s
-            .rfind(')')
-            .ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?;
+        let close = s.rfind(')').ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?;
         let cte_body = s[open + 1..close].trim();
 
         if cte_body.to_ascii_uppercase().starts_with("MATCH") {
@@ -477,10 +620,7 @@ fn parse_select(s: &str) -> Result<Statement> {
         .collect();
 
     let from = from_pos.map(|fp| {
-        let end = where_pos
-            .or(order_pos)
-            .or(limit_pos)
-            .unwrap_or(select_source.len());
+        let end = where_pos.or(order_pos).or(limit_pos).unwrap_or(select_source.len());
         FromClause {
             table: parse_identifier(select_source[fp + 6..end].trim()),
             alias: None,

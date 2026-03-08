@@ -1,5 +1,5 @@
 use contextdb_core::Direction;
-use contextdb_parser::ast::{Expr, OnConflict};
+use contextdb_parser::ast::{ColumnDef, Expr, OnConflict, StateMachineDef};
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
@@ -105,6 +105,9 @@ impl PhysicalPlan {
 #[derive(Debug, Clone)]
 pub struct CreateTablePlan {
     pub name: String,
+    pub columns: Vec<ColumnDef>,
+    pub immutable: bool,
+    pub state_machine: Option<StateMachineDef>,
 }
 
 #[derive(Debug, Clone)]
