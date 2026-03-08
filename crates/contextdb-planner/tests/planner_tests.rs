@@ -1,0 +1,65 @@
+use contextdb_core::Error;
+use contextdb_parser::parse;
+use contextdb_planner::{plan, PhysicalPlan};
+
+#[test]
+fn match_cte_routes_to_graph_bfs() {
+    let stmt = parse("WITH n AS (MATCH (a)-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM n").unwrap();
+    let p = plan(&stmt).unwrap();
+    let text = p.explain();
+    assert!(text.contains("GraphBfs"));
+}
+
+#[test]
+fn cosine_order_routes_to_vector_search() {
+    let stmt = parse("SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 10").unwrap();
+    let p = plan(&stmt).unwrap();
+    let text = p.explain();
+    assert!(text.contains("VectorSearch"));
+}
+
+#[test]
+fn standard_select_routes_to_scan() {
+    let stmt = parse("SELECT * FROM entities WHERE id = $id").unwrap();
+    let p = plan(&stmt).unwrap();
+    assert!(matches!(p, PhysicalPlan::Scan { .. }));
+    assert!(p.explain().contains("Scan"));
+}
+
+#[test]
+fn unified_query_contains_graph_relational_vector() {
+    let stmt = parse(
+        "WITH n AS (MATCH (a)-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 5",
+    )
+    .unwrap();
+    let p = plan(&stmt).unwrap();
+    let e = p.explain();
+    assert!(e.contains("GraphBfs"));
+    assert!(e.contains("VectorSearch"));
+}
+
+#[test]
+fn immutable_table_rejected_at_plan_time() {
+    let update = parse("UPDATE observations SET data = 'x'").unwrap();
+    let err = plan(&update).unwrap_err();
+    assert!(matches!(err, Error::ImmutableTable(_)));
+
+    let delete = parse("DELETE FROM observations WHERE id = $id").unwrap();
+    let err = plan(&delete).unwrap_err();
+    assert!(matches!(err, Error::ImmutableTable(_)));
+}
+
+#[test]
+fn depth_over_cap_rejected() {
+    let stmt = parse("WITH n AS (MATCH (a)-[:BASED_ON*1..11]->(b) RETURN b.id) SELECT * FROM n").unwrap();
+    let err = plan(&stmt).unwrap_err();
+    assert!(matches!(err, Error::BfsDepthExceeded(11)));
+}
+
+#[test]
+fn explain_contains_operator_names() {
+    let stmt = parse("SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 10").unwrap();
+    let p = plan(&stmt).unwrap();
+    let txt = p.explain();
+    assert!(txt.contains("VectorSearch"));
+}
