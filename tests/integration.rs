@@ -6,6 +6,8 @@ mod boundary_conditions;
 mod gate_a_primitives;
 #[path = "integration/gate_b_workflows.rs"]
 mod gate_b_workflows;
+#[path = "integration/gate_c_d_lifecycle.rs"]
+mod gate_c_d_lifecycle;
 #[path = "integration/golden_output.rs"]
 mod golden_output;
 #[path = "integration/helpers.rs"]
