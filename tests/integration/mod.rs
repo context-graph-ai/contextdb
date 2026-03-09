@@ -1,6 +1,7 @@
 pub mod anti_tests;
 pub mod boundary_conditions;
 pub mod gate_a_primitives;
+pub mod gate_b_workflows;
 pub mod golden_output;
 pub mod helpers;
 pub mod hiring_criteria;

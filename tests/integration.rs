@@ -4,6 +4,8 @@ mod anti_tests;
 mod boundary_conditions;
 #[path = "integration/gate_a_primitives.rs"]
 mod gate_a_primitives;
+#[path = "integration/gate_b_workflows.rs"]
+mod gate_b_workflows;
 #[path = "integration/golden_output.rs"]
 mod golden_output;
 #[path = "integration/helpers.rs"]
