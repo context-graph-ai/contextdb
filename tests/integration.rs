@@ -2,6 +2,8 @@
 mod anti_tests;
 #[path = "integration/boundary_conditions.rs"]
 mod boundary_conditions;
+#[path = "integration/gate_a_primitives.rs"]
+mod gate_a_primitives;
 #[path = "integration/golden_output.rs"]
 mod golden_output;
 #[path = "integration/helpers.rs"]
