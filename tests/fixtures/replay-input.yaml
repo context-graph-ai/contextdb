@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: check.py [GO-05] 8 assertions, cg_spike.py replay method returning ReplayResult"
+source: "Replay input derived from [GO-05] 8 assertions validating decision_id, basis entities, state_at_decision_time, current_state, and diffs"
 status: draft
 owner: claude
 last_updated: 2026-03-07

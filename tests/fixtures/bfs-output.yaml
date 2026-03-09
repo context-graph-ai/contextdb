@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: cg_spike.py bounded BFS traversal logic, depth tracking"
+source: "Bounded BFS expected output validating level-order traversal results with depth tracking and bound exclusion"
 status: draft
 owner: claude
 last_updated: 2026-03-07

@@ -1,17 +1,13 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: ~/projects/context-graph/spikes/context-graph/check.py — 63 assertions across 10 categories"
+source: "63 spike assertions across 10 categories validating impact analysis, replay, provenance, and invariants"
 status: draft
 owner: claude
 last_updated: 2026-03-07
 ---
 
 # Spike 63 Assertions — Reference Fixture
-# This fixture is a pointer to the upstream test suite, not a standalone fixture.
-# ContextDB passes when all 63 assertions from check.py pass with ContextDB as backend.
-
-upstream_test_file: "~/projects/context-graph/spikes/context-graph/check.py"
-upstream_implementation: "~/projects/context-graph/spikes/context-graph/cg_spike.py"
+# ContextDB passes when all 63 assertions pass with ContextDB as backend.
 
 assertion_categories:
   - name: "[GO-01] Impact Analysis Output Shape"
@@ -58,13 +54,13 @@ assertion_categories:
     count: 2
     tests: "cannot archive intention with active decisions"
 
-total_assertions: 49  # Note: spike explore agent reported 63 from check.py
+total_assertions: 49  # Note: spike reported 63 total assertions
 # Discrepancy to reconcile during spike step — some assertions may be
 # in additional test functions not categorized above
 
 adaptation_notes: |
   To run these against ContextDB:
-  1. Replace in-memory dict storage in cg_spike.py with ContextDB client
+  1. Replace in-memory dict storage with ContextDB client
   2. Maintain identical operation signatures
   3. All assertions must produce identical results
   4. Timing may differ (disk-backed vs in-memory) but correctness must match

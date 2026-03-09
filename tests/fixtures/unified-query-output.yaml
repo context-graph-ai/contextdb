@@ -1,6 +1,6 @@
 ---
 fixture_basis: hypothetical
-source: "Derived from draft query spec execution pattern. No empirical unified query in spike."
+source: "Unified query expected output validating graph-to-relational-to-vector pipeline with neighborhood exclusion and similarity ranking"
 status: draft
 owner: claude
 last_updated: 2026-03-07

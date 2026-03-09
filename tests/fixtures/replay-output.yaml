@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: check.py [GO-05] assertions — replay returns BasisComparison per BASED_ON entity with state_at_decision_time vs current_state and FieldDiff list"
+source: "Replay expected output: [GO-05] assertions validating BasisComparison per BASED_ON entity with state_at_decision_time vs current_state and FieldDiff list"
 status: draft
 owner: claude
 last_updated: 2026-03-07

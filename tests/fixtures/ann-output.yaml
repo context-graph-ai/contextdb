@@ -1,6 +1,6 @@
 ---
 fixture_basis: hypothetical
-source: "Cosine similarity computed by hand for 4-dim vectors. No empirical ANN data in context-graph spike."
+source: "ANN search expected output with hand-computed cosine similarities for 4-dim vectors, top-3 results by similarity"
 status: draft
 owner: claude
 last_updated: 2026-03-07

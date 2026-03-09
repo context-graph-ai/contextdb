@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: ~/projects/context-graph/spikes/context-graph/cg_spike.py (_impact_analysis method) and check.py [GO-01] assertions"
+source: "Impact analysis input derived from [GO-01] assertions validating invalidation count, severity, basis_diff, and cascade behavior"
 status: draft
 owner: claude
 last_updated: 2026-03-07

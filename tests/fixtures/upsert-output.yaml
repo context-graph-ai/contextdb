@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "Standard SQL ON CONFLICT DO UPDATE semantics. Deterministic upsert requirement from contextDB_intent-for-prompt.md."
+source: "Deterministic upsert expected output validating insert, update, and idempotent conflict results per ON CONFLICT DO UPDATE semantics"
 status: draft
 owner: claude
 last_updated: 2026-03-07

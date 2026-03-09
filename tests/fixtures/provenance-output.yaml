@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: check.py [GO-02] assertions, cg_spike.py full_provenance returns ProvenanceResult"
+source: "Full provenance expected output: [GO-02] assertions validating ProvenanceResult with snapshots, reasoning, precedents, approvals, outcome, and timeline"
 status: draft
 owner: claude
 last_updated: 2026-03-07

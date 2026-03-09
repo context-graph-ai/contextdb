@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: cg_spike.py uses dict-based upsert for entity updates. Deterministic upsert specified in contextDB_intent-for-prompt.md section 4 and draft-query-language-spec section 1.3."
+source: "Deterministic upsert input validating insert, conflict-update, and idempotent conflict scenarios per ON CONFLICT DO UPDATE semantics"
 status: draft
 owner: claude
 last_updated: 2026-03-07

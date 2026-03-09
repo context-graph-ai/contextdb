@@ -1,6 +1,6 @@
 ---
 fixture_basis: hypothetical
-source: "No empirical ANN test data in context-graph spike. Spike has no vector operations. Embeddings and cosine similarity behavior derived from HNSW literature."
+source: "ANN search input with 10 observations of 4-dim embeddings validating cosine-similarity top-k retrieval via HNSW index"
 status: draft
 owner: claude
 last_updated: 2026-03-07

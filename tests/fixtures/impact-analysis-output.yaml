@@ -1,6 +1,6 @@
 ---
 fixture_basis: empirical
-source: "context-graph spike: check.py [GO-01] 8 assertions + [CASCADE] 2 assertions. Severity logic from cg_spike.py _compute_severity method."
+source: "Impact analysis expected output: [GO-01] 8 assertions + [CASCADE] 2 assertions validating severity computation and cascade propagation"
 status: draft
 owner: claude
 last_updated: 2026-03-07

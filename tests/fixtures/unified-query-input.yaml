@@ -1,6 +1,6 @@
 ---
 fixture_basis: hypothetical
-source: "No unified graph→relational→vector query exists in context-graph spike. Query pattern derived from draft-query-language-spec-for-prompt.txt section 4.1 and ontology operations."
+source: "Unified query input validating graph-to-relational-to-vector pipeline: BFS neighborhood, context filtering, cosine-similarity ranking"
 status: draft
 owner: claude
 last_updated: 2026-03-07
