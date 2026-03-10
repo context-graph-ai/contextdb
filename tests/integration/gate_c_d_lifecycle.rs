@@ -534,11 +534,11 @@ fn c4_01_pattern_generates_system_intention() {
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-06 (initial sync)"]
 fn c4_02_pattern_propagation_to_new_context() {
     let _db = setup_ontology_db();
     // TODO: sync server pattern with scope labels to newly created matching edge context.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-06");
 }
 
 #[test]
@@ -993,67 +993,67 @@ fn d1_03_cascade_invalidation_full_chain() {
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-01 (push round-trip)"]
 fn d2_01_edge_pushes_observations_to_server() {
     let _db = setup_ontology_db();
     // TODO: sync_push/sync_pull edge observations to server and validate data + watermark.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-01");
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-02 (pull round-trip)"]
 fn d2_02_server_pushes_patterns_to_edge() {
     let _db = setup_ontology_db();
     // TODO: sync server-created patterns to edge context with matching labels.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-02");
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-03 (bidirectional sync)"]
 fn d2_03_bidirectional_sync_round_trip() {
     let _db = setup_ontology_db();
     // TODO: full bidirectional sync cycle with empty-second-sync assertion.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-03");
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: A9-03/04/05 (conflict resolution)"]
 fn d2_04_sync_with_conflict_resolution() {
     let _db = setup_ontology_db();
     // TODO: LatestWins conflict resolution fixture with preserved append-only observations.
-    todo!("requires sync primitives");
+    todo!("sync plan: A9-03/04/05");
 }
 
 #[test]
-#[ignore = "requires redb persistence"]
+#[ignore = "sync plan: A9-10 + requires redb persistence"]
 fn d2_05_sync_survives_persistence() {
     let _db = setup_ontology_db();
     // TODO: run persisted sync round-trip then reopen and assert watermarks/data.
-    todo!("requires redb persistence + sync primitives");
+    todo!("sync plan: A9-10 + requires redb persistence");
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-09 (cross-edge clustering)"]
 fn d3_01_embedding_correlation_to_pattern() {
     let _db = setup_ontology_db();
     // TODO: correlate cross-edge embeddings, create pattern after min-occurrence threshold.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-09");
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-02 (pull round-trip)"]
 fn d3_02_pattern_propagation_to_existing_edges() {
     let _db = setup_ontology_db();
     // TODO: propagate server-created pattern to participating edges.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-02");
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-06 (initial sync)"]
 fn d3_03_new_edge_inherits_patterns() {
     let _db = setup_ontology_db();
     // TODO: new edge context sync-pull receives scoped collective pattern.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-06");
 }
 
 #[test]

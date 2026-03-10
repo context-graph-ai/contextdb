@@ -4300,11 +4300,11 @@ fn b18_04_high_frequency_write_throughput() {
 }
 
 #[test]
-#[ignore = "requires sync primitives"]
+#[ignore = "sync plan: NT-07 (offline batch sync)"]
 fn b18_05_offline_accumulate_batch_sync() {
     let _db = setup_ontology_db();
     // TODO: build edge/server offline accumulation fixture using sync_push/sync_pull and assert all rows, edges, snapshots, and watermarks.
-    todo!("requires sync primitives");
+    todo!("sync plan: NT-07");
 }
 
 #[test]
