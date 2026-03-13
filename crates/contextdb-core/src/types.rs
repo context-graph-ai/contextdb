@@ -52,6 +52,7 @@ pub struct VersionedRow {
     pub values: HashMap<ColName, Value>,
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
+    pub lsn: u64,
 }
 
 impl VersionedRow {
@@ -69,6 +70,7 @@ pub struct AdjEntry {
     pub properties: HashMap<String, Value>,
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
+    pub lsn: u64,
 }
 
 impl AdjEntry {
@@ -84,6 +86,7 @@ pub struct VectorEntry {
     pub vector: Vec<f32>,
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
+    pub lsn: u64,
 }
 
 impl VectorEntry {

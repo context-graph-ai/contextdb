@@ -125,6 +125,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             values,
             created_tx: tx,
             deleted_tx: None,
+            lsn: 0,
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {

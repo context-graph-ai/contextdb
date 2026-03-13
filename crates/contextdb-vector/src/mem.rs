@@ -69,6 +69,7 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             vector,
             created_tx: tx,
             deleted_tx: None,
+            lsn: 0,
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {

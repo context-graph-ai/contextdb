@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct TxManager<S: WriteSetApplicator> {
     next_tx: AtomicU64,
     committed_watermark: AtomicU64,
+    next_lsn: AtomicU64,
     active_txs: Mutex<HashMap<TxId, WriteSet>>,
     commit_mutex: Mutex<()>,
     store: S,
@@ -17,6 +18,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
         Self {
             next_tx: AtomicU64::new(1),
             committed_watermark: AtomicU64::new(0),
+            next_lsn: AtomicU64::new(1),
             active_txs: Mutex::new(HashMap::new()),
             commit_mutex: Mutex::new(()),
             store,
@@ -44,12 +46,14 @@ impl<S: WriteSetApplicator> TxManager<S> {
     }
 
     pub fn commit(&self, tx: TxId) -> Result<()> {
-        let ws = {
+        let mut ws = {
             let mut active = self.active_txs.lock();
             active.remove(&tx).ok_or(Error::TxNotFound(tx))?
         };
 
         let _lock = self.commit_mutex.lock();
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
+        ws.stamp_lsn(lsn);
         self.store.apply(ws)?;
         self.committed_watermark.fetch_max(tx, Ordering::SeqCst);
         Ok(())
@@ -67,6 +71,14 @@ impl<S: WriteSetApplicator> TxManager<S> {
 
     pub fn new_row_id(&self) -> RowId {
         self.store.new_row_id()
+    }
+
+    pub fn current_lsn(&self) -> u64 {
+        self.next_lsn.load(Ordering::SeqCst).saturating_sub(1)
+    }
+
+    pub fn next_lsn(&self) -> u64 {
+        self.next_lsn.fetch_add(1, Ordering::SeqCst)
     }
 }
 
