@@ -1,6 +1,7 @@
 pub mod anti_tests;
 pub mod boundary_conditions;
 pub mod gate_a_primitives;
+pub mod gate_a_sync;
 pub mod gate_b_workflows;
 pub mod gate_c_d_lifecycle;
 pub mod golden_output;

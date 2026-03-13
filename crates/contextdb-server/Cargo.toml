@@ -1,0 +1,10 @@
+[package]
+name = "contextdb-server"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+contextdb-engine = { path = "../contextdb-engine" }
+contextdb-core = { path = "../contextdb-core" }
+uuid.workspace = true
+tokio = { version = "1", features = ["full"] }

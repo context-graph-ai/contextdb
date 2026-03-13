@@ -9,6 +9,7 @@ members = [
     "crates/contextdb-parser",
     "crates/contextdb-planner",
     "crates/contextdb-engine",
+    "crates/contextdb-server",
     "crates/contextdb-cli",
 ]
 default-members = ["crates/contextdb-engine"]

@@ -1,6 +1,7 @@
 use crate::composite_store::CompositeStore;
 use crate::executor::execute_plan;
 use crate::schema_enforcer::validate_dml;
+use crate::sync_types::{ApplyResult, ChangeSet, ConflictPolicies};
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
 use contextdb_parser::Statement;
@@ -222,6 +223,16 @@ impl Database {
             .insert_edge(tx, source, target, edge_type, properties)
     }
 
+    pub fn delete_edge(
+        &self,
+        tx: TxId,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+    ) -> Result<()> {
+        self.graph.delete_edge(tx, source, target, edge_type)
+    }
+
     pub fn query_bfs(
         &self,
         start: NodeId,
@@ -262,5 +273,24 @@ impl Database {
 
     pub(crate) fn relational_store(&self) -> &Arc<RelationalStore> {
         &self.relational_store
+    }
+
+    /// Extracts changes from this database since the given LSN.
+    pub fn changes_since(&self, _since_lsn: u64) -> ChangeSet {
+        unimplemented!("sync not implemented — ChangeTracking pending")
+    }
+
+    /// Returns the current LSN of this database.
+    pub fn current_lsn(&self) -> u64 {
+        unimplemented!("sync not implemented — ChangeTracking pending")
+    }
+
+    /// Applies a ChangeSet to this database with the given conflict policies.
+    pub fn apply_changes(
+        &self,
+        _changes: ChangeSet,
+        _policies: &ConflictPolicies,
+    ) -> Result<ApplyResult> {
+        unimplemented!("sync not implemented — ChangeApplication pending")
     }
 }

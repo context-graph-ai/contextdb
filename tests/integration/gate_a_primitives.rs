@@ -843,7 +843,6 @@ fn a3_11_bfs_max_visited_limit() {
 }
 
 #[test]
-#[ignore = "requires Database::delete_edge API"]
 fn a3_12_edge_deletion_reflected_in_bfs() {
     let db = setup_ontology_db();
     let a = Uuid::new_v4();
@@ -854,12 +853,27 @@ fn a3_12_edge_deletion_reflected_in_bfs() {
         .expect("insert edge");
     db.commit(tx).expect("commit");
 
-    // TODO: when Database::delete_edge is available:
-    // let tx2 = db.begin();
-    // db.delete_edge(tx2, a, b, "BASED_ON")?;
-    // db.commit(tx2)?;
-    // assert!(db.query_bfs(a, None, Direction::Outgoing, 1, db.snapshot())?.nodes.is_empty());
-    todo!("requires public edge deletion API");
+    // Guard: edge exists
+    let bfs_before = db
+        .query_bfs(a, None, Direction::Outgoing, 1, db.snapshot())
+        .unwrap();
+    assert_eq!(
+        bfs_before.nodes.len(),
+        1,
+        "guard: edge must exist before deletion"
+    );
+
+    let tx2 = db.begin();
+    db.delete_edge(tx2, a, b, "BASED_ON").expect("delete edge");
+    db.commit(tx2).expect("commit");
+
+    let bfs_after = db
+        .query_bfs(a, None, Direction::Outgoing, 1, db.snapshot())
+        .unwrap();
+    assert!(
+        bfs_after.nodes.is_empty(),
+        "BFS must not find edge after deletion"
+    );
 }
 
 #[test]
