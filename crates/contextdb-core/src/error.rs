@@ -42,6 +42,10 @@ pub enum Error {
     ParseError(String),
     #[error("plan error: {0}")]
     PlanError(String),
+    #[error("sync error: {0}")]
+    SyncError(String),
+    #[error("table {0} is not sync-eligible (no natural key)")]
+    NotSyncEligible(String),
     #[error("{0}")]
     Other(String),
 }
