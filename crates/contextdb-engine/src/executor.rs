@@ -33,12 +33,19 @@ pub(crate) fn execute_plan(
                         .map(|(from, tos)| (from.clone(), tos.clone()))
                         .collect(),
                 }),
+                natural_key_column: None,
             };
             db.relational_store().create_table(&p.name, meta);
+            if let Some(table_meta) = db.table_meta(&p.name) {
+                let lsn = db.next_lsn_for_ddl();
+                db.log_create_table_ddl(&p.name, &table_meta, lsn);
+            }
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::DropTable(name) => {
             db.relational_store().drop_table(name);
+            let lsn = db.next_lsn_for_ddl();
+            db.log_drop_table_ddl(name, lsn);
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
