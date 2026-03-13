@@ -1,3 +1,7 @@
+pub mod chunking;
+pub mod error;
+pub mod protocol;
+pub mod subjects;
 pub mod sync_client;
 pub mod sync_server;
 

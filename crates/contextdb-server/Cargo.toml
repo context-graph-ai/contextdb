@@ -7,4 +7,15 @@ edition = "2024"
 contextdb-engine = { path = "../contextdb-engine" }
 contextdb-core = { path = "../contextdb-core" }
 uuid.workspace = true
-tokio = { version = "1", features = ["full"] }
+tokio.workspace = true
+async-nats.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
