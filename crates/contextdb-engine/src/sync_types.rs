@@ -20,10 +20,35 @@ impl ChangeSet {
     /// Filters this changeset to only include tables matching the given directions.
     pub fn filter_by_direction(
         &self,
-        _directions: &HashMap<String, SyncDirection>,
-        _include: &[SyncDirection],
+        directions: &HashMap<String, SyncDirection>,
+        include: &[SyncDirection],
     ) -> ChangeSet {
-        unimplemented!("sync not implemented — direction filtering pending")
+        let include_dir = |table: &str| {
+            let dir = directions
+                .get(table)
+                .copied()
+                .unwrap_or(SyncDirection::Both);
+            include.contains(&dir)
+        };
+
+        ChangeSet {
+            rows: self
+                .rows
+                .iter()
+                .filter(|r| include_dir(&r.table))
+                .cloned()
+                .collect(),
+            edges: self.edges.clone(),
+            vectors: self.vectors.clone(),
+            ddl: self
+                .ddl
+                .iter()
+                .filter(|d| match d {
+                    DdlChange::CreateTable { name, .. } => include_dir(name),
+                })
+                .cloned()
+                .collect(),
+        }
     }
 }
 
