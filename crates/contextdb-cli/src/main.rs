@@ -1,13 +1,12 @@
-use std::env;
+use std::sync::Arc;
 
 mod formatter;
 mod repl;
 
 fn main() {
-    let path = env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: contextdb <path.contextdb | :memory:>");
-        std::process::exit(1);
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| ":memory:".to_string());
 
     let db = if path == ":memory:" {
         contextdb_engine::Database::open_memory()
@@ -16,5 +15,5 @@ fn main() {
         contextdb_engine::Database::open_memory()
     };
 
-    repl::run(db);
+    crate::repl::run(Arc::new(db), None, None);
 }
