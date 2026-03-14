@@ -12,7 +12,7 @@ members = [
     "crates/contextdb-server",
     "crates/contextdb-cli",
 ]
-default-members = ["crates/contextdb-engine"]
+default-members = ["crates/contextdb-engine", "crates/contextdb-cli", "crates/contextdb-server"]
 
 [workspace.dependencies]
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
