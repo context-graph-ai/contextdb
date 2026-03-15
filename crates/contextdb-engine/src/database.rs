@@ -254,6 +254,10 @@ impl Database {
         self.vector.insert_vector(tx, row_id, vector)
     }
 
+    pub fn delete_vector(&self, tx: TxId, row_id: RowId) -> Result<()> {
+        self.vector.delete_vector(tx, row_id)
+    }
+
     pub fn query_vector(
         &self,
         query: &[f32],

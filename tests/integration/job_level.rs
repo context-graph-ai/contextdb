@@ -96,10 +96,6 @@ fn job_04_cross_subsystem_tx() {
 fn job_05_ignored_disk_budget() {}
 
 #[test]
-#[ignore = "requires sync implementation"]
-fn job_06_ignored_sync() {}
-
-#[test]
 fn job_07_embedded_operation() {
     let db = setup_ontology_db();
     assert_eq!(db.scan("entities", db.snapshot()).unwrap().len(), 0);

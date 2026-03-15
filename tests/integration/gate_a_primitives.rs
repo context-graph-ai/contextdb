@@ -1048,7 +1048,6 @@ fn a4_05_dimension_mismatch_error() {
 }
 
 #[test]
-#[ignore = "requires vector deletion propagation"]
 fn a4_06_vector_deletion() {
     let db = setup_ontology_db();
     let tx = db.begin();
@@ -1067,12 +1066,15 @@ fn a4_06_vector_deletion() {
         .expect("insert vector");
     db.commit(tx).expect("commit");
 
-    // TODO: when Database::delete_vector is available:
-    // let tx2 = db.begin();
-    // db.delete_vector(tx2, rid)?;
-    // db.commit(tx2)?;
-    // assert!(!db.query_vector(&[1.0, 0.0], 5, None, db.snapshot())?.iter().any(|(id, _)| *id == rid));
-    todo!("requires public vector deletion API");
+    let tx2 = db.begin();
+    db.delete_vector(tx2, rid).expect("delete vector");
+    db.commit(tx2).expect("commit");
+    assert!(
+        !db.query_vector(&[1.0, 0.0], 5, None, db.snapshot())
+            .expect("search")
+            .iter()
+            .any(|(id, _)| *id == rid)
+    );
 }
 
 #[test]
@@ -1993,86 +1995,6 @@ fn a8_11_single_file_operation() {
     let _db = setup_ontology_db();
     // TODO: verify file-backed mode uses a single .contextdb file (plus WAL while writing), no network process.
     todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-01)"]
-fn a9_01_push_returns_rows_since_watermark() {
-    let _db = setup_ontology_db();
-    // TODO: build sync_push watermark fixture and assert only rows with lsn > since_lsn are returned.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-02)"]
-fn a9_02_pull_inserts_new_rows() {
-    let _db = setup_ontology_db();
-    // TODO: apply edge changeset to server via sync_pull and assert all rows materialize.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-03)"]
-fn a9_03_pull_conflict_server_wins() {
-    let _db = setup_ontology_db();
-    // TODO: conflict fixture with ServerWins policy and assert server state preserved.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-04)"]
-fn a9_04_pull_conflict_latest_wins() {
-    let _db = setup_ontology_db();
-    // TODO: conflict fixture with timestamps and LatestWins policy.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-05)"]
-fn a9_05_pull_conflict_edge_wins() {
-    let _db = setup_ontology_db();
-    // TODO: conflict fixture with EdgeWins policy.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-06)"]
-fn a9_06_observations_never_conflict() {
-    let _db = setup_ontology_db();
-    // TODO: merge append-only observations from both sides and assert union with no conflict records.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-07)"]
-fn a9_07_watermark_advances_after_sync() {
-    let _db = setup_ontology_db();
-    // TODO: assert push/pull watermarks advance to max LSN.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-08)"]
-fn a9_08_sync_is_deterministic() {
-    let _db = setup_ontology_db();
-    // TODO: run identical sync sequence twice and assert equal final state snapshots.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-09)"]
-fn a9_09_memory_to_memory_sync() {
-    let _db = setup_ontology_db();
-    // TODO: sync between two open_memory databases without persistence.
-    todo!("sync plan: engine trait tests");
-}
-
-#[test]
-#[ignore = "sync plan: engine trait tests (A9-10) + requires redb persistence"]
-fn a9_10_sync_round_trip_with_persistence() {
-    let _db = setup_ontology_db();
-    // TODO: full edge/server persisted round-trip and reopen validation.
-    todo!("sync plan: engine trait tests + requires redb persistence");
 }
 
 #[test]

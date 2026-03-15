@@ -4300,14 +4300,6 @@ fn b18_04_high_frequency_write_throughput() {
 }
 
 #[test]
-#[ignore = "sync plan: NT-07 (offline batch sync)"]
-fn b18_05_offline_accumulate_batch_sync() {
-    let _db = setup_ontology_db();
-    // TODO: build edge/server offline accumulation fixture using sync_push/sync_pull and assert all rows, edges, snapshots, and watermarks.
-    todo!("sync plan: NT-07");
-}
-
-#[test]
 fn b18_06_person_reidentification_via_embedding() {
     let db = setup_ontology_db();
     let e1 = Uuid::new_v4();
