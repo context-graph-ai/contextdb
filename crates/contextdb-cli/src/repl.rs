@@ -114,7 +114,7 @@ fn handle_sync_command(
 
     match sub {
         "status" => {
-            let connected = rt.block_on(client.is_connected());
+            let connected = rt.block_on(client.ensure_connected()).is_ok();
             let status = if connected {
                 "connected"
             } else {

@@ -57,7 +57,7 @@ impl SyncClient {
     /// Lazily connect to NATS, reuse existing connection.
     /// Returns cloned Client (cheap — Arc internally) so the mutex is not held during NATS ops.
     /// Returns Err with connection error message if NATS is unreachable.
-    async fn ensure_connected(&self) -> Result<Option<async_nats::Client>, String> {
+    pub async fn ensure_connected(&self) -> Result<Option<async_nats::Client>, String> {
         let mut guard = self.nats.lock().await;
         if guard.is_none() {
             match async_nats::connect(&self.nats_url).await {
