@@ -392,6 +392,34 @@ impl Database {
             }
         }
 
+        // Deduplicate upserts: when a RowDelete is followed by a RowInsert for the same
+        // (table, natural_key), the delete is part of an upsert — remove it.
+        // Build a set of (table, natural_key) that have a non-delete entry.
+        let insert_keys: HashSet<(String, String, String)> = rows
+            .iter()
+            .filter(|r| !matches!(r.values.get("__deleted"), Some(Value::Bool(true))))
+            .map(|r| {
+                (
+                    r.table.clone(),
+                    r.natural_key.column.clone(),
+                    format!("{:?}", r.natural_key.value),
+                )
+            })
+            .collect();
+        rows.retain(|r| {
+            if matches!(r.values.get("__deleted"), Some(Value::Bool(true))) {
+                // Keep the delete only if there's no subsequent insert for this key
+                let key = (
+                    r.table.clone(),
+                    r.natural_key.column.clone(),
+                    format!("{:?}", r.natural_key.value),
+                );
+                !insert_keys.contains(&key)
+            } else {
+                true
+            }
+        });
+
         ChangeSet {
             rows,
             edges,

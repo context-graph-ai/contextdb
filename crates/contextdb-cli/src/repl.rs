@@ -62,7 +62,9 @@ pub(crate) fn handle_meta_command(
             println!(".sync pull                Pull remote changes from server");
             println!(".sync reconnect           Reconnect to NATS");
             println!(".sync direction <t> <d>   Set table sync direction (Push|Pull|Both|None)");
-            println!(".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)");
+            println!(
+                ".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)"
+            );
             println!(".sync policy default <p>  Set default conflict policy");
         }
         ".tables" | "\\dt" => {
@@ -181,7 +183,9 @@ fn handle_sync_command(
                 "EdgeWins" => ConflictPolicy::EdgeWins,
                 "LatestWins" => ConflictPolicy::LatestWins,
                 other => {
-                    return format!("Unknown policy: {other}. Use: InsertIfNotExists, ServerWins, EdgeWins, LatestWins");
+                    return format!(
+                        "Unknown policy: {other}. Use: InsertIfNotExists, ServerWins, EdgeWins, LatestWins"
+                    );
                 }
             };
             if parts[1] == "default" {

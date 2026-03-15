@@ -63,6 +63,13 @@ impl SyncServer {
         tenant_id: &str,
         policies: ConflictPolicies,
     ) -> Self {
+        assert!(
+            !tenant_id.is_empty()
+                && tenant_id
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+            "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
+        );
         local_registry()
             .lock()
             .expect("local registry poisoned")
@@ -173,9 +180,21 @@ impl SyncServer {
         if let Some(max_entries) = request.max_entries {
             let max = max_entries as usize;
             if changes.rows.len() > max {
-                let remainder = changes.rows.split_off(max);
-                cursor = remainder.last().map(|r| r.lsn);
-                has_more = true;
+                let mut remainder = changes.rows.split_off(max);
+                // Don't split in the middle of a same-LSN group: extend returned set
+                // to include all rows sharing the LSN at the split boundary.
+                if let (Some(last_returned), Some(first_remainder)) =
+                    (changes.rows.last(), remainder.first())
+                    && last_returned.lsn == first_remainder.lsn
+                {
+                    let boundary_lsn = last_returned.lsn;
+                    let split_idx = remainder.partition_point(|r| r.lsn == boundary_lsn);
+                    let moved: Vec<_> = remainder.drain(..split_idx).collect();
+                    changes.rows.extend(moved);
+                }
+                // Cursor = last LSN of returned set (not remainder)
+                cursor = changes.rows.last().map(|r| r.lsn);
+                has_more = !remainder.is_empty();
             }
         }
 

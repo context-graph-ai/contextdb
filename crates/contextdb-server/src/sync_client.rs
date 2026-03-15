@@ -62,12 +62,7 @@ impl SyncClient {
         if guard.is_none() {
             match async_nats::connect(&self.nats_url).await {
                 Ok(client) => *guard = Some(client),
-                Err(e) => {
-                    return Err(format!(
-                        "cannot connect to NATS at {}: {e}",
-                        self.nats_url
-                    ))
-                }
+                Err(e) => return Err(format!("cannot connect to NATS at {}: {e}", self.nats_url)),
             }
         }
         Ok((*guard).clone())
@@ -93,10 +88,10 @@ impl SyncClient {
         let since = self.push_watermark.load(Ordering::SeqCst);
         // Clone directions out of RwLock BEFORE any .await
         let directions = self.table_directions.read().unwrap().clone();
-        let changeset = self.db.changes_since(since).filter_by_direction(
-            &directions,
-            &[SyncDirection::Push, SyncDirection::Both],
-        );
+        let changeset = self
+            .db
+            .changes_since(since)
+            .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
 
         if changeset.rows.is_empty()
             && changeset.edges.is_empty()
@@ -111,9 +106,10 @@ impl SyncClient {
             });
         }
 
-        let nats_client = match self.ensure_connected().await {
-            Ok(client) => client,
-            Err(_) => None,
+        // Track NATS connection error for proper error reporting when local fallback also fails
+        let (nats_client, nats_conn_err) = match self.ensure_connected().await {
+            Ok(client) => (client, None),
+            Err(e) => (None, Some(e)),
         };
 
         let mut total = ApplyResult {
@@ -157,11 +153,26 @@ impl SyncClient {
                             .map_err(|e| Error::SyncError(e.to_string()))?;
                         response.result.into()
                     }
-                    Ok(Err(_)) | Err(_) => local_push(&self.tenant_id, batch)
-                        .map_err(|e| Error::SyncError(e.to_string()))?,
+                    Ok(Err(_)) | Err(_) => match local_push(&self.tenant_id, batch) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return Err(Error::SyncError(
+                                "NATS request failed and local fallback unavailable".to_string(),
+                            ));
+                        }
+                    },
                 }
             } else {
-                local_push(&self.tenant_id, batch).map_err(|e| Error::SyncError(e.to_string()))?
+                match local_push(&self.tenant_id, batch) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Return NATS error (actionable) instead of local fallback error
+                        let msg = nats_conn_err
+                            .as_deref()
+                            .unwrap_or("NATS not connected and local fallback unavailable");
+                        return Err(Error::SyncError(msg.to_string()));
+                    }
+                }
             };
             last_successful_lsn = batch_max_lsn;
             total.applied_rows += result.applied_rows;
@@ -177,10 +188,8 @@ impl SyncClient {
 
     /// Pull with explicit policies (frozen test contract, library consumers).
     pub async fn pull(&self, policies: &ConflictPolicies) -> Result<ApplyResult, Error> {
-        let nats_client = match self.ensure_connected().await {
-            Ok(client) => client,
-            Err(_) => None,
-        };
+        let nats_client: Option<async_nats::Client> =
+            self.ensure_connected().await.unwrap_or_default();
         let directions = self.table_directions.read().unwrap().clone();
 
         let mut since_lsn = self.pull_watermark.load(Ordering::SeqCst);
@@ -259,8 +268,7 @@ impl SyncClient {
             since_lsn = cursor.unwrap_or(since_lsn);
         }
 
-        self.pull_watermark
-            .store(last_server_lsn, Ordering::SeqCst);
+        self.pull_watermark.store(last_server_lsn, Ordering::SeqCst);
         Ok(total)
     }
 
@@ -324,9 +332,7 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
         .iter()
         .map(|r| {
             let wire_row = WireRowChange::from(r.clone());
-            rmp_serde::to_vec(&wire_row)
-                .map(|v| v.len())
-                .unwrap_or(128)
+            rmp_serde::to_vec(&wire_row).map(|v| v.len()).unwrap_or(128)
         })
         .collect();
 

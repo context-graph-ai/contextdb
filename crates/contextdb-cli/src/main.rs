@@ -11,7 +11,11 @@ struct Args {
     path: String,
 
     /// NATS URL for sync (WebSocket for edge)
-    #[arg(long, env = "CONTEXTDB_NATS_URL", default_value = "ws://localhost:9222")]
+    #[arg(
+        long,
+        env = "CONTEXTDB_NATS_URL",
+        default_value = "ws://localhost:9222"
+    )]
     nats_url: String,
 
     /// Tenant ID for sync
