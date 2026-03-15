@@ -14,7 +14,7 @@ use contextdb_tx::TxManager;
 use contextdb_vector::{MemVectorExecutor, VectorStore};
 use parking_lot::Mutex;
 use roaring::RoaringTreemap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -328,11 +328,20 @@ impl Database {
                     }
                 }
                 ChangeLogEntry::RowDelete {
-                    table: _,
-                    natural_key: _,
-                    lsn: _,
+                    table,
+                    natural_key,
+                    lsn,
                     ..
-                } => {}
+                } => {
+                    let mut values = HashMap::new();
+                    values.insert("__deleted".to_string(), Value::Bool(true));
+                    rows.push(RowChange {
+                        table,
+                        natural_key,
+                        values,
+                        lsn,
+                    });
+                }
                 ChangeLogEntry::EdgeInsert {
                     source,
                     target,
@@ -417,6 +426,7 @@ impl Database {
             .collect::<Vec<_>>();
         let mut vector_row_map: HashMap<u64, u64> = HashMap::new();
         let mut vector_row_idx = 0usize;
+        let mut failed_row_ids: HashSet<u64> = HashSet::new();
 
         for ddl in changes.ddl {
             match ddl {
@@ -502,6 +512,10 @@ impl Database {
                     }
                     Err(err) => {
                         result.skipped_rows += 1;
+                        if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                            failed_row_ids.insert(*remote_row_id);
+                            vector_row_idx += 1;
+                        }
                         result.conflicts.push(Conflict {
                             natural_key: row.natural_key.clone(),
                             resolution: policy,
@@ -518,6 +532,10 @@ impl Database {
                 }
                 (Some(_), ConflictPolicy::ServerWins) => {
                     result.skipped_rows += 1;
+                    if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                        failed_row_ids.insert(*remote_row_id);
+                        vector_row_idx += 1;
+                    }
                     result.conflicts.push(Conflict {
                         natural_key: row.natural_key.clone(),
                         resolution: ConflictPolicy::ServerWins,
@@ -527,6 +545,10 @@ impl Database {
                 (Some(local), ConflictPolicy::LatestWins) => {
                     if row.lsn <= local.lsn {
                         result.skipped_rows += 1;
+                        if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                            failed_row_ids.insert(*remote_row_id);
+                            vector_row_idx += 1;
+                        }
                         result.conflicts.push(Conflict {
                             natural_key: row.natural_key.clone(),
                             resolution: ConflictPolicy::LatestWins,
@@ -555,6 +577,10 @@ impl Database {
                             }
                             Err(err) => {
                                 result.skipped_rows += 1;
+                                if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                                    failed_row_ids.insert(*remote_row_id);
+                                    vector_row_idx += 1;
+                                }
                                 result.conflicts.push(Conflict {
                                     natural_key: row.natural_key.clone(),
                                     resolution: ConflictPolicy::LatestWins,
@@ -587,6 +613,10 @@ impl Database {
                         }
                         Err(err) => {
                             result.skipped_rows += 1;
+                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                                failed_row_ids.insert(*remote_row_id);
+                                vector_row_idx += 1;
+                            }
                             if let Some(last) = result.conflicts.last_mut() {
                                 last.reason = Some(format!("state_machine_or_constraint: {err}"));
                             }
@@ -615,6 +645,9 @@ impl Database {
         }
 
         for vector in changes.vectors {
+            if failed_row_ids.contains(&vector.row_id) {
+                continue; // skip vectors for rows that failed to insert
+            }
             let local_row_id = vector_row_map
                 .get(&vector.row_id)
                 .copied()
