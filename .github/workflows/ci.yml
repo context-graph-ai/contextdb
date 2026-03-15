@@ -32,11 +32,6 @@ jobs:
   test:
     needs: lint
     runs-on: ubuntu-latest
-    services:
-      nats:
-        image: nats:latest
-        ports:
-          - 4222:4222
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

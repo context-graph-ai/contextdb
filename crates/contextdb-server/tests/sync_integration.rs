@@ -3,22 +3,56 @@ use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+
+struct NatsFixture {
+    _container: ContainerAsync<GenericImage>,
+    nats_url: String,
+    ws_url: String,
+}
+
+async fn start_nats() -> NatsFixture {
+    let nats_conf = format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"));
+
+    let image = GenericImage::new("nats", "latest")
+        .with_exposed_port(4222.tcp())
+        .with_exposed_port(9222.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
+
+    let request = image
+        .with_mount(Mount::bind_mount(&nats_conf, "/etc/nats/nats.conf"))
+        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
+
+    let container: ContainerAsync<GenericImage> = request.start().await.unwrap();
+
+    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
+    let ws_port = container.get_host_port_ipv4(9222.tcp()).await.unwrap();
+
+    NatsFixture {
+        _container: container,
+        nats_url: format!("nats://127.0.0.1:{nats_port}"),
+        ws_url: format!("ws://127.0.0.1:{ws_port}"),
+    }
+}
 
 #[tokio::test]
 async fn sync_round_trip_smoke() {
+    let nats = start_nats().await;
     let edge = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db,
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
 
-    let client = SyncClient::new(edge, "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge, &nats.nats_url, "test_tenant");
     let _ = client.pull(&policies).await;
 }
 
@@ -28,6 +62,7 @@ async fn a1_lazy_connection_and_reuse() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
@@ -43,7 +78,7 @@ async fn a1_lazy_connection_and_reuse() {
 
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "reuse-test",
         policies.clone(),
     ));
@@ -51,7 +86,7 @@ async fn a1_lazy_connection_and_reuse() {
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "reuse-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "reuse-test");
 
     // Before any call, should not be connected (lazy)
     assert!(
@@ -281,6 +316,7 @@ async fn a5_websocket_transport() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -295,7 +331,7 @@ async fn a5_websocket_transport() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "ws-test",
         policies.clone(),
     ));
@@ -304,7 +340,7 @@ async fn a5_websocket_transport() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Edge connects via WebSocket
-    let client = SyncClient::new(edge_db.clone(), "ws://localhost:9222", "ws-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.ws_url, "ws-test");
 
     // Edge pushes a row over WebSocket
     let push_id = Uuid::new_v4();
@@ -348,6 +384,7 @@ async fn a5_websocket_transport() {
 // A6: reconnect() clears stored connection and re-establishes
 #[tokio::test]
 async fn a6_reconnect_clears_and_reestablishes() {
+    let nats = start_nats().await;
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -362,7 +399,7 @@ async fn a6_reconnect_clears_and_reestablishes() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "reconnect-test",
         policies.clone(),
     ));
@@ -371,7 +408,7 @@ async fn a6_reconnect_clears_and_reestablishes() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Success path
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "reconnect-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "reconnect-test");
     client.push().await.unwrap(); // establishes connection
     assert!(client.is_connected().await, "must be connected after push");
     client.reconnect().await; // drops and re-establishes
@@ -849,6 +886,7 @@ async fn a12_nats_request_timeout_falls_back() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -864,20 +902,20 @@ async fn a12_nats_request_timeout_falls_back() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let _server = SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "timeout-test",
         policies.clone(),
     );
     // Do NOT run server.run() — no subscriber to reply
 
     // Subscribe to push subject but never reply (simulating hung server)
-    let nats_client = async_nats::connect("nats://localhost:4222").await.unwrap();
+    let nats_client = async_nats::connect(&nats.nats_url).await.unwrap();
     let _sub = nats_client
         .subscribe(contextdb_server::subjects::push_subject("timeout-test"))
         .await
         .unwrap();
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "timeout-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "timeout-test");
 
     // Insert data so push has something to send
     let id = Uuid::new_v4();
@@ -951,9 +989,10 @@ async fn a13_pull_pagination_fetches_all_pages() {
         .unwrap();
 
     // Start SyncServer on NATS
+    let nats = start_nats().await;
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "pagination-test",
         policies.clone(),
     ));
@@ -962,7 +1001,7 @@ async fn a13_pull_pagination_fetches_all_pages() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Edge client connects via NATS (NOT local fallback)
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "pagination-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "pagination-test");
 
     // Pull all data
     let result = client.pull(&policies).await.unwrap();
