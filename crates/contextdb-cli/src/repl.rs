@@ -1,6 +1,7 @@
 use crate::formatter::format_query_result;
 use contextdb_core::{ColumnType, TableMeta};
 use contextdb_engine::Database;
+use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 use contextdb_server::SyncClient;
 use rustyline::DefaultEditor;
 use std::collections::HashMap;
@@ -8,8 +9,8 @@ use std::sync::Arc;
 
 pub fn run(
     db: Arc<Database>,
-    _sync_client: Option<&SyncClient>,
-    _rt: Option<&tokio::runtime::Runtime>,
+    sync_client: Option<&SyncClient>,
+    rt: Option<&tokio::runtime::Runtime>,
 ) {
     let mut rl = DefaultEditor::new().expect("failed to initialize readline");
     println!("ContextDB v{}", env!("CARGO_PKG_VERSION"));
@@ -26,7 +27,7 @@ pub fn run(
                 let _ = rl.add_history_entry(line);
 
                 if line.starts_with('.') || line.starts_with('\\') {
-                    if !handle_meta_command(&db, _sync_client, _rt, line) {
+                    if !handle_meta_command(&db, sync_client, rt, line) {
                         break;
                     }
                 } else {
@@ -56,6 +57,13 @@ pub(crate) fn handle_meta_command(
             println!(".tables / \\dt       List tables");
             println!(".schema / \\d <tbl>  Show table schema and constraints");
             println!(".explain <sql>      Show execution plan");
+            println!(".sync status              Show sync connection info");
+            println!(".sync push                Push local changes to server");
+            println!(".sync pull                Pull remote changes from server");
+            println!(".sync reconnect           Reconnect to NATS");
+            println!(".sync direction <t> <d>   Set table sync direction (Push|Pull|Both|None)");
+            println!(".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)");
+            println!(".sync policy default <p>  Set default conflict policy");
         }
         ".tables" | "\\dt" => {
             for t in db.table_names() {
@@ -91,11 +99,103 @@ pub(crate) fn handle_meta_command(
 }
 
 fn handle_sync_command(
-    _sync_client: Option<&SyncClient>,
-    _rt: Option<&tokio::runtime::Runtime>,
-    _args: &str,
+    sync_client: Option<&SyncClient>,
+    rt: Option<&tokio::runtime::Runtime>,
+    args: &str,
 ) -> String {
-    "not implemented".to_string()
+    let (Some(client), Some(rt)) = (sync_client, rt) else {
+        return "Sync not configured. Start with --tenant-id to enable.".to_string();
+    };
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let sub = parts.first().copied().unwrap_or("status");
+
+    match sub {
+        "status" => {
+            let connected = rt.block_on(client.is_connected());
+            let status = if connected {
+                "connected"
+            } else {
+                "unreachable (local fallback)"
+            };
+            format!(
+                "Sync: tenant={}, url={}\nNATS: {status}\nDatabase LSN: {}\nPush watermark: LSN {}\nPull watermark: LSN {}",
+                client.tenant_id(),
+                client.nats_url(),
+                client.db().current_lsn(),
+                client.push_watermark(),
+                client.pull_watermark()
+            )
+        }
+        "push" => match rt.block_on(client.push()) {
+            Ok(result) => format!(
+                "Pushed: {} applied, {} skipped, {} conflicts",
+                result.applied_rows,
+                result.skipped_rows,
+                result.conflicts.len()
+            ),
+            Err(e) => format!("Push failed: {e}"),
+        },
+        "pull" => match rt.block_on(client.pull_default()) {
+            Ok(result) => format!(
+                "Pulled: {} applied, {} skipped, {} conflicts",
+                result.applied_rows,
+                result.skipped_rows,
+                result.conflicts.len()
+            ),
+            Err(e) => format!("Pull failed: {e}"),
+        },
+        "reconnect" => {
+            rt.block_on(client.reconnect());
+            let connected = rt.block_on(client.is_connected());
+            if connected {
+                "Reconnected to NATS".to_string()
+            } else {
+                "Reconnection failed — NATS unreachable".to_string()
+            }
+        }
+        "direction" => {
+            if parts.len() != 3 {
+                return "Usage: .sync direction <table> <Push|Pull|Both|None>".to_string();
+            }
+            let table = parts[1];
+            let dir = match parts[2] {
+                "Push" | "push" => SyncDirection::Push,
+                "Pull" | "pull" => SyncDirection::Pull,
+                "Both" | "both" => SyncDirection::Both,
+                "None" | "none" => SyncDirection::None,
+                other => {
+                    return format!("Unknown direction: {other}. Use: Push, Pull, Both, None");
+                }
+            };
+            client.set_table_direction(table, dir);
+            format!("{table} -> {dir:?}")
+        }
+        "policy" => {
+            if parts.len() != 3 {
+                return "Usage: .sync policy <table> <InsertIfNotExists|ServerWins|EdgeWins|LatestWins>\n       .sync policy default <policy>".to_string();
+            }
+            let policy = match parts[2] {
+                "InsertIfNotExists" => ConflictPolicy::InsertIfNotExists,
+                "ServerWins" => ConflictPolicy::ServerWins,
+                "EdgeWins" => ConflictPolicy::EdgeWins,
+                "LatestWins" => ConflictPolicy::LatestWins,
+                other => {
+                    return format!("Unknown policy: {other}. Use: InsertIfNotExists, ServerWins, EdgeWins, LatestWins");
+                }
+            };
+            if parts[1] == "default" {
+                client.set_default_conflict_policy(policy);
+                format!("Default conflict policy -> {policy:?}")
+            } else {
+                client.set_conflict_policy(parts[1], policy);
+                format!("{} -> {policy:?}", parts[1])
+            }
+        }
+        _ => format!(
+            "Unknown sync command: {sub}. Try: status, push, pull, reconnect, direction, policy"
+        ),
+    }
 }
 
 fn print_table_meta(table: &str, meta: &TableMeta) {
