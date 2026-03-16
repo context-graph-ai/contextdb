@@ -92,7 +92,23 @@ fn parse_create_table_constraints() {
         Ok(Statement::CreateTable(_))
     ));
     assert!(matches!(
+        parse(
+            "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES', 'BASED_ON')"
+        ),
+        Ok(Statement::CreateTable(_))
+    ));
+    assert!(matches!(
         parse("CREATE TABLE bad (id UUID PRIMARY KEY) IMMUTABLE STATE MACHINE (status: a -> [b])"),
+        Err(Error::ParseError(_))
+    ));
+    assert!(matches!(
+        parse("CREATE TABLE bad2 (id UUID PRIMARY KEY) IMMUTABLE DAG('CITES')"),
+        Err(Error::ParseError(_))
+    ));
+    assert!(matches!(
+        parse(
+            "CREATE TABLE bad3 (id UUID PRIMARY KEY) STATE MACHINE (status: a -> [b]) DAG('CITES')"
+        ),
         Err(Error::ParseError(_))
     ));
 }

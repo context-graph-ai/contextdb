@@ -250,6 +250,15 @@ impl Database {
             .bfs(start, edge_types, direction, 1, max_depth, snapshot)
     }
 
+    pub fn edge_count(
+        &self,
+        source: NodeId,
+        edge_type: &str,
+        snapshot: SnapshotId,
+    ) -> Result<usize> {
+        Ok(self.graph.edge_count(source, edge_type, snapshot))
+    }
+
     pub fn insert_vector(&self, tx: TxId, row_id: RowId, vector: Vec<f32>) -> Result<()> {
         self.vector.insert_vector(tx, row_id, vector)
     }

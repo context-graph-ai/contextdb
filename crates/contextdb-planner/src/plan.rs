@@ -108,6 +108,7 @@ pub struct CreateTablePlan {
     pub columns: Vec<ColumnDef>,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
+    pub dag_edge_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

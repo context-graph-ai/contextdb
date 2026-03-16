@@ -6,6 +6,8 @@ pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     pub immutable: bool,
     pub state_machine: Option<StateMachineConstraint>,
+    #[serde(default)]
+    pub dag_edge_types: Vec<String>,
     pub natural_key_column: Option<String>,
 }
 

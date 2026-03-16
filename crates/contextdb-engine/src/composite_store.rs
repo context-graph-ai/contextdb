@@ -109,6 +109,15 @@ impl CompositeStore {
                 .join(", ");
             constraints.push(format!("STATE MACHINE ({}: {})", sm.column, states));
         }
+        if !meta.dag_edge_types.is_empty() {
+            let edge_types = meta
+                .dag_edge_types
+                .iter()
+                .map(|edge_type| format!("'{edge_type}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            constraints.push(format!("DAG({edge_types})"));
+        }
 
         self.ddl_log.write().push((
             lsn,

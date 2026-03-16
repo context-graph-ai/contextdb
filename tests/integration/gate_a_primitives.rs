@@ -1,4 +1,4 @@
-use super::helpers::{make_params, setup_ontology_db};
+use super::helpers::{make_params, setup_ontology_db, setup_ontology_db_with_dag};
 use contextdb_core::{Direction, Error, UpsertResult, Value, VersionedRow};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
@@ -1800,6 +1800,319 @@ fn a6_06_vector_dimension_enforced_at_insert() {
             got: 256
         })
     ));
+}
+
+#[test]
+fn a6_10_acyclic_rejects_direct_cycle() {
+    let db = setup_ontology_db_with_dag();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
+        .expect("insert a->b");
+
+    let result = db.insert_edge(tx, b, a, "CITES".to_string(), HashMap::new());
+    assert!(matches!(
+        result,
+        Err(Error::CycleDetected {
+            ref edge_type,
+            source_node,
+            target_node,
+        }) if edge_type == "CITES" && source_node == b && target_node == a
+    ));
+
+    db.commit(tx).expect("commit");
+    let bfs = db
+        .query_bfs(
+            a,
+            Some(&["CITES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs a");
+    assert_eq!(bfs.nodes.len(), 1);
+    assert_eq!(bfs.nodes[0].id, b);
+
+    let bfs_rev = db
+        .query_bfs(
+            b,
+            Some(&["CITES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs b");
+    assert!(bfs_rev.nodes.is_empty());
+}
+
+#[test]
+fn a6_11_acyclic_rejects_transitive_cycle() {
+    let db = setup_ontology_db_with_dag();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
+        .expect("insert a->b");
+    db.insert_edge(tx, b, c, "CITES".to_string(), HashMap::new())
+        .expect("insert b->c");
+
+    let result = db.insert_edge(tx, c, a, "CITES".to_string(), HashMap::new());
+    assert!(matches!(
+        result,
+        Err(Error::CycleDetected {
+            ref edge_type,
+            source_node,
+            target_node,
+        }) if edge_type == "CITES" && source_node == c && target_node == a
+    ));
+
+    db.commit(tx).expect("commit");
+    let bfs = db
+        .query_bfs(
+            a,
+            Some(&["CITES".to_string()]),
+            Direction::Outgoing,
+            2,
+            db.snapshot(),
+        )
+        .expect("bfs");
+    assert_eq!(bfs.nodes.len(), 2);
+    assert_eq!(bfs.nodes[0].id, b);
+    assert_eq!(bfs.nodes[1].id, c);
+}
+
+#[test]
+fn a6_12_acyclic_allows_diamond() {
+    let db = setup_ontology_db_with_dag();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
+        .expect("insert a->b");
+
+    let result = db.insert_edge(tx, c, b, "CITES".to_string(), HashMap::new());
+    assert!(result.is_ok());
+
+    db.commit(tx).expect("commit");
+    let bfs = db
+        .query_bfs(
+            b,
+            Some(&["CITES".to_string()]),
+            Direction::Incoming,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs");
+    assert_eq!(bfs.nodes.len(), 2);
+    let ids: HashSet<Uuid> = bfs.nodes.iter().map(|n| n.id).collect();
+    assert!(ids.contains(&a));
+    assert!(ids.contains(&c));
+}
+
+#[test]
+fn a6_13_non_acyclic_type_allows_cycles() {
+    let db = setup_ontology_db_with_dag();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "SERVES".to_string(), HashMap::new())
+        .expect("insert a->b");
+
+    let result = db.insert_edge(tx, b, a, "SERVES".to_string(), HashMap::new());
+    assert!(result.is_ok());
+
+    db.commit(tx).expect("commit");
+    let bfs_out = db
+        .query_bfs(
+            a,
+            Some(&["SERVES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs out");
+    assert_eq!(bfs_out.nodes.len(), 1);
+    assert_eq!(bfs_out.nodes[0].id, b);
+
+    let bfs_back = db
+        .query_bfs(
+            b,
+            Some(&["SERVES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs back");
+    assert_eq!(bfs_back.nodes.len(), 1);
+    assert_eq!(bfs_back.nodes[0].id, a);
+}
+
+#[test]
+fn a6_14_acyclic_same_tx_write_set_visibility() {
+    let db = setup_ontology_db_with_dag();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let tx = db.begin();
+
+    let result1 = db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new());
+    let result2 = db.insert_edge(tx, b, a, "CITES".to_string(), HashMap::new());
+    assert!(result1.is_ok());
+    assert!(matches!(
+        result2,
+        Err(Error::CycleDetected {
+            ref edge_type,
+            source_node,
+            target_node,
+        }) if edge_type == "CITES" && source_node == b && target_node == a
+    ));
+
+    db.commit(tx).expect("commit");
+    let bfs = db
+        .query_bfs(
+            a,
+            Some(&["CITES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs");
+    assert_eq!(bfs.nodes.len(), 1);
+    assert_eq!(bfs.nodes[0].id, b);
+}
+
+#[test]
+fn a6_15_duplicate_edge_stored_once() {
+    let db = setup_ontology_db();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
+        .expect("insert #1");
+    db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
+        .expect("insert #2");
+    db.commit(tx).expect("commit");
+
+    let bfs = db
+        .query_bfs(
+            a,
+            Some(&["CITES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs");
+    assert_eq!(bfs.nodes.len(), 1);
+    assert_eq!(bfs.nodes[0].id, b);
+    assert_eq!(db.edge_count(a, "CITES", db.snapshot()).unwrap(), 1);
+}
+
+#[test]
+fn a6_16_reinsert_after_delete_creates_edge() {
+    let db = setup_ontology_db();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let tx1 = db.begin();
+    db.insert_edge(tx1, a, b, "CITES".to_string(), HashMap::new())
+        .expect("insert");
+    db.commit(tx1).expect("commit tx1");
+
+    let tx2 = db.begin();
+    db.delete_edge(tx2, a, b, "CITES").expect("delete");
+    db.commit(tx2).expect("commit tx2");
+
+    let tx3 = db.begin();
+    let result = db.insert_edge(tx3, a, b, "CITES".to_string(), HashMap::new());
+    db.commit(tx3).expect("commit tx3");
+
+    assert!(result.is_ok());
+    let bfs = db
+        .query_bfs(
+            a,
+            Some(&["CITES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs");
+    assert_eq!(bfs.nodes.len(), 1);
+    assert_eq!(bfs.nodes[0].id, b);
+}
+
+#[test]
+fn a6_17_different_edge_types_not_duplicates() {
+    let db = setup_ontology_db();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
+        .expect("insert cites");
+    db.insert_edge(tx, a, b, "SERVES".to_string(), HashMap::new())
+        .expect("insert serves");
+    db.commit(tx).expect("commit");
+
+    let bfs_all = db
+        .query_bfs(a, None, Direction::Outgoing, 1, db.snapshot())
+        .expect("bfs all");
+    assert_eq!(bfs_all.nodes.len(), 1);
+    assert_eq!(bfs_all.nodes[0].id, b);
+
+    let bfs_cites = db
+        .query_bfs(
+            a,
+            Some(&["CITES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs cites");
+    assert_eq!(bfs_cites.nodes.len(), 1);
+    assert_eq!(bfs_cites.nodes[0].id, b);
+
+    let bfs_serves = db
+        .query_bfs(
+            a,
+            Some(&["SERVES".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs serves");
+    assert_eq!(bfs_serves.nodes.len(), 1);
+    assert_eq!(bfs_serves.nodes[0].id, b);
+}
+
+#[test]
+fn a6_18_cross_tx_duplicate_stored_once() {
+    let db = setup_ontology_db();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let tx1 = db.begin();
+    db.insert_edge(tx1, a, b, "BASED_ON".to_string(), HashMap::new())
+        .expect("insert tx1");
+    db.commit(tx1).expect("commit tx1");
+
+    let tx2 = db.begin();
+    let result = db.insert_edge(tx2, a, b, "BASED_ON".to_string(), HashMap::new());
+    db.commit(tx2).expect("commit tx2");
+
+    assert!(result.is_ok());
+    let bfs = db
+        .query_bfs(
+            a,
+            Some(&["BASED_ON".to_string()]),
+            Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .expect("bfs");
+    assert_eq!(bfs.nodes.len(), 1);
+    assert_eq!(bfs.nodes[0].id, b);
+    assert_eq!(db.edge_count(a, "BASED_ON", db.snapshot()).unwrap(), 1);
 }
 
 #[test]

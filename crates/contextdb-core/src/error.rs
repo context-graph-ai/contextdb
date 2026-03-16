@@ -48,6 +48,14 @@ pub enum Error {
     SyncError(String),
     #[error("table {0} is not sync-eligible (no natural key)")]
     NotSyncEligible(String),
+    #[error(
+        "cycle detected: inserting {edge_type} edge from {source_node} to {target_node} would create a cycle"
+    )]
+    CycleDetected {
+        edge_type: String,
+        source_node: uuid::Uuid,
+        target_node: uuid::Uuid,
+    },
     #[error("{0}")]
     Other(String),
 }

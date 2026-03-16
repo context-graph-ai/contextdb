@@ -170,7 +170,7 @@ fn parse_create_table(s: &str) -> Result<Statement> {
         })
         .collect();
 
-    let (immutable, state_machine) = parse_create_table_options(options)?;
+    let (immutable, state_machine, dag_edge_types) = parse_create_table_options(options)?;
 
     Ok(Statement::CreateTable(CreateTable {
         name,
@@ -178,6 +178,7 @@ fn parse_create_table(s: &str) -> Result<Statement> {
         if_not_exists: prefix.to_ascii_uppercase().contains("IF NOT EXISTS"),
         immutable,
         state_machine,
+        dag_edge_types,
     }))
 }
 
@@ -196,17 +197,24 @@ fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
-fn parse_create_table_options(options: &str) -> Result<(bool, Option<StateMachineDef>)> {
+fn parse_create_table_options(
+    options: &str,
+) -> Result<(bool, Option<StateMachineDef>, Vec<String>)> {
     if options.is_empty() {
-        return Ok((false, None));
+        return Ok((false, None, Vec::new()));
     }
 
     let upper = options.to_ascii_uppercase();
     let has_immutable = upper.contains("IMMUTABLE");
     let has_state_machine = upper.contains("STATE MACHINE");
-    if has_immutable && has_state_machine {
+    let has_dag = upper.contains("DAG(");
+    let options_selected = [has_immutable, has_state_machine, has_dag]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+    if options_selected > 1 {
         return Err(Error::ParseError(
-            "IMMUTABLE and STATE MACHINE cannot be used together".to_string(),
+            "IMMUTABLE, STATE MACHINE, and DAG cannot be used together".to_string(),
         ));
     }
 
@@ -216,7 +224,7 @@ fn parse_create_table_options(options: &str) -> Result<(bool, Option<StateMachin
                 "invalid CREATE TABLE options".to_string(),
             ));
         }
-        return Ok((true, None));
+        return Ok((true, None, Vec::new()));
     }
 
     if has_state_machine {
@@ -232,16 +240,66 @@ fn parse_create_table_options(options: &str) -> Result<(bool, Option<StateMachin
             .ok_or_else(|| Error::ParseError("invalid STATE MACHINE clause".to_string()))?;
         if options[close + 1..].trim().is_empty() {
             let def = parse_state_machine_def(options[open + 1..close].trim())?;
-            return Ok((false, Some(def)));
+            return Ok((false, Some(def), Vec::new()));
         }
         return Err(Error::ParseError(
             "invalid CREATE TABLE options".to_string(),
         ));
     }
 
+    if has_dag {
+        if !upper.starts_with("DAG") {
+            return Err(Error::ParseError(
+                "invalid CREATE TABLE options".to_string(),
+            ));
+        }
+        let open = options
+            .find('(')
+            .ok_or_else(|| Error::ParseError("invalid DAG clause".to_string()))?;
+        let close = find_matching_paren(options, open)
+            .ok_or_else(|| Error::ParseError("invalid DAG clause".to_string()))?;
+        if !options[close + 1..].trim().is_empty() {
+            return Err(Error::ParseError(
+                "invalid CREATE TABLE options".to_string(),
+            ));
+        }
+        let dag_edge_types = parse_dag_edge_types(options[open + 1..close].trim())?;
+        return Ok((false, None, dag_edge_types));
+    }
+
     Err(Error::ParseError(
         "invalid CREATE TABLE options".to_string(),
     ))
+}
+
+fn parse_dag_edge_types(input: &str) -> Result<Vec<String>> {
+    let edge_types: Vec<String> = split_top_level_commas(input)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|token| {
+            if token.len() < 2 || !token.starts_with('\'') || !token.ends_with('\'') {
+                return Err(Error::ParseError(
+                    "DAG edge types must be single-quoted".to_string(),
+                ));
+            }
+            let edge_type = token[1..token.len() - 1].trim();
+            if edge_type.is_empty() {
+                return Err(Error::ParseError(
+                    "DAG edge types must be non-empty".to_string(),
+                ));
+            }
+            Ok(edge_type.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if edge_types.is_empty() {
+        return Err(Error::ParseError(
+            "DAG requires at least one edge type".to_string(),
+        ));
+    }
+
+    Ok(edge_types)
 }
 
 fn parse_state_machine_def(input: &str) -> Result<StateMachineDef> {

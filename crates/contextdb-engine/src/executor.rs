@@ -33,6 +33,7 @@ pub(crate) fn execute_plan(
                         .map(|(from, tos)| (from.clone(), tos.clone()))
                         .collect(),
                 }),
+                dag_edge_types: p.dag_edge_types.clone(),
                 natural_key_column: None,
             };
             db.relational_store().create_table(&p.name, meta);

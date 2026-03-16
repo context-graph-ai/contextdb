@@ -71,6 +71,74 @@ pub fn setup_ontology_db() -> Database {
     db
 }
 
+pub fn setup_ontology_db_with_dag() -> Database {
+    let db = Database::open_memory();
+    let params = HashMap::new();
+
+    db.execute(
+        "CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, entity_id UUID, state JSON, valid_from INTEGER, valid_to INTEGER)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, entity_id UUID, data JSON, embedding VECTOR(384)) IMMUTABLE",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID, success BOOLEAN)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, affected_decision_id UUID, status TEXT, severity TEXT) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed])",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE approvals (id UUID PRIMARY KEY, decision_id UUID)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE patterns (id UUID PRIMARY KEY, description TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sync_state (id UUID PRIMARY KEY, push_watermark INTEGER, pull_watermark INTEGER)",
+        &params,
+    )
+    .unwrap();
+
+    db
+}
+
 pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
     let entity_id = Uuid::new_v4();
     let decision1_id = Uuid::new_v4();

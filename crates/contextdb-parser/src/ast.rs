@@ -214,6 +214,7 @@ pub struct CreateTable {
     pub if_not_exists: bool,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
+    pub dag_edge_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

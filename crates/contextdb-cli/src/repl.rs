@@ -234,6 +234,15 @@ fn print_table_meta(table: &str, meta: &TableMeta) {
             .collect();
         println!("STATE MACHINE ({}: {})", sm.column, transitions.join(", "));
     }
+    if !meta.dag_edge_types.is_empty() {
+        let edge_types = meta
+            .dag_edge_types
+            .iter()
+            .map(|edge_type| format!("'{edge_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("DAG({edge_types})");
+    }
 }
 
 fn render_column_type(col_type: &ColumnType) -> String {

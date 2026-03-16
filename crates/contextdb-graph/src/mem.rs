@@ -15,6 +15,18 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     pub fn new(store: Arc<GraphStore>, tx_mgr: Arc<TxManager<S>>) -> Self {
         Self { store, tx_mgr }
     }
+
+    pub fn edge_count(&self, source: NodeId, edge_type: &str, snapshot: SnapshotId) -> usize {
+        let fwd = self.store.forward_adj.read();
+        fwd.get(&source)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.edge_type == edge_type && entry.visible_at(snapshot))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
 }
 
 impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
