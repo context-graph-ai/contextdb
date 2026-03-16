@@ -1,6 +1,7 @@
 use crate::ast::*;
 use contextdb_core::{Error, Result};
 use pest::Parser;
+use pest::iterators::Pair;
 use pest_derive::Parser;
 
 #[derive(Parser)]
@@ -8,290 +9,1113 @@ use pest_derive::Parser;
 struct ContextDbParser;
 
 pub fn parse(input: &str) -> Result<Statement> {
-    ContextDbParser::parse(Rule::statement, input).map_err(|e| Error::ParseError(e.to_string()))?;
-    let s = input.trim().trim_end_matches(';').trim();
-    let upper = s.to_ascii_uppercase();
+    let sql = input.trim();
 
-    if upper.starts_with("WITH RECURSIVE") {
-        return Err(Error::RecursiveCteNotSupported);
-    }
-    if upper.contains(" OVER ") {
-        return Err(Error::WindowFunctionNotSupported);
-    }
-    if upper.starts_with("CREATE PROCEDURE") || upper.starts_with("CREATE FUNCTION") {
+    if starts_with_keywords(sql, &["CREATE", "PROCEDURE"])
+        || starts_with_keywords(sql, &["CREATE", "FUNCTION"])
+    {
         return Err(Error::StoredProcNotSupported);
     }
-    if let Some(where_pos) = upper.find(" WHERE ")
-        && upper[where_pos..].contains(" MATCH ")
-    {
+    if starts_with_keywords(sql, &["WITH", "RECURSIVE"]) {
+        return Err(Error::RecursiveCteNotSupported);
+    }
+    if contains_token_outside_strings(sql, "OVER") {
+        return Err(Error::WindowFunctionNotSupported);
+    }
+    if contains_where_match_operator(sql) {
         return Err(Error::FullTextSearchNotSupported);
     }
-    if upper.contains("MATCH") && upper.contains("*") && !upper.contains("..") {
-        return Err(Error::UnboundedTraversal);
-    }
-    if upper.contains("<=>") && !upper.contains(" LIMIT ") {
-        return Err(Error::UnboundedVectorSearch);
-    }
 
-    if upper.starts_with("BEGIN") {
-        return Ok(Statement::Begin);
-    }
-    if upper.starts_with("COMMIT") {
-        return Ok(Statement::Commit);
-    }
-    if upper.starts_with("ROLLBACK") {
-        return Ok(Statement::Rollback);
-    }
+    let mut pairs = ContextDbParser::parse(Rule::statement, sql)
+        .map_err(|e| Error::ParseError(e.to_string()))?;
+    let statement = pairs
+        .next()
+        .ok_or_else(|| Error::ParseError("empty statement".to_string()))?;
+    let inner = statement
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("missing statement body".to_string()))?;
 
-    if upper.starts_with("CREATE TABLE") {
-        return parse_create_table(s);
-    }
-    if upper.starts_with("DROP TABLE") {
-        return parse_drop_table(s);
-    }
-    if upper.starts_with("CREATE INDEX") {
-        return parse_create_index(s);
-    }
-    if upper.starts_with("INSERT INTO") {
-        return parse_insert(s);
-    }
-    if upper.starts_with("DELETE FROM") {
-        return parse_delete(s);
-    }
-    if upper.starts_with("UPDATE") {
-        return parse_update(s);
-    }
-    if upper.starts_with("WITH") || upper.starts_with("SELECT") {
-        return parse_select(s);
-    }
+    let stmt = match inner.as_rule() {
+        Rule::begin_stmt => Statement::Begin,
+        Rule::commit_stmt => Statement::Commit,
+        Rule::rollback_stmt => Statement::Rollback,
+        Rule::create_table_stmt => Statement::CreateTable(build_create_table(inner)?),
+        Rule::drop_table_stmt => Statement::DropTable(build_drop_table(inner)?),
+        Rule::create_index_stmt => Statement::CreateIndex(build_create_index(inner)?),
+        Rule::insert_stmt => Statement::Insert(build_insert(inner)?),
+        Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
+        Rule::update_stmt => Statement::Update(build_update(inner)?),
+        Rule::select_stmt => Statement::Select(build_select(inner)?),
+        _ => return Err(Error::ParseError("unsupported statement".to_string())),
+    };
 
-    Err(Error::ParseError("unsupported statement".to_string()))
+    validate_statement(&stmt)?;
+    Ok(stmt)
 }
 
-fn parse_identifier(token: &str) -> String {
-    token.trim().trim_matches('`').trim_matches('"').to_string()
-}
+fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStatement> {
+    let mut ctes = Vec::new();
+    let mut body = None;
 
-fn parse_literal(token: &str) -> Expr {
-    let t = token.trim();
-    if let Some(stripped) = t.strip_prefix('$') {
-        return Expr::Parameter(stripped.to_string());
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::with_clause => {
+                for item in p.into_inner() {
+                    match item.as_rule() {
+                        Rule::recursive_kw => return Err(Error::RecursiveCteNotSupported),
+                        Rule::cte_def => ctes.push(build_cte(item)?),
+                        _ => {}
+                    }
+                }
+            }
+            Rule::select_core => body = Some(build_select_core(p)?),
+            _ => {}
+        }
     }
-    if t.starts_with('"') && t.ends_with('"') || t.starts_with('\'') && t.ends_with('\'') {
-        return Expr::Literal(Literal::Text(t[1..t.len() - 1].to_string()));
-    }
-    if t.eq_ignore_ascii_case("null") {
-        return Expr::Literal(Literal::Null);
-    }
-    if t.eq_ignore_ascii_case("true") {
-        return Expr::Literal(Literal::Bool(true));
-    }
-    if t.eq_ignore_ascii_case("false") {
-        return Expr::Literal(Literal::Bool(false));
-    }
-    if let Ok(v) = t.parse::<i64>() {
-        return Expr::Literal(Literal::Integer(v));
-    }
-    if let Ok(v) = t.parse::<f64>() {
-        return Expr::Literal(Literal::Real(v));
-    }
-    Expr::Column(ColumnRef {
-        table: None,
-        column: t.to_string(),
+
+    Ok(SelectStatement {
+        ctes,
+        body: body.ok_or_else(|| Error::ParseError("missing SELECT body".to_string()))?,
     })
 }
 
-fn parse_condition(token: &str) -> Expr {
-    let t = token.trim();
-    if let Some((l, r)) = t.split_once('=') {
-        return Expr::BinaryOp {
-            left: Box::new(parse_literal(l.trim())),
-            op: BinOp::Eq,
-            right: Box::new(parse_literal(r.trim())),
-        };
+fn build_cte(pair: Pair<'_, Rule>) -> Result<Cte> {
+    let mut name = None;
+    let mut query = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::select_core => query = Some(build_select_core(p)?),
+            _ => {}
+        }
     }
-    parse_literal(t)
+
+    Ok(Cte::SqlCte {
+        name: name.ok_or_else(|| Error::ParseError("CTE missing name".to_string()))?,
+        query: query.ok_or_else(|| Error::ParseError("CTE missing query".to_string()))?,
+    })
 }
 
-fn parse_data_type(token: &str) -> DataType {
-    let t = token.trim().to_ascii_uppercase();
-    if t.starts_with("VECTOR(") && t.ends_with(')') {
-        let dim = t
-            .trim_start_matches("VECTOR(")
-            .trim_end_matches(')')
-            .parse::<u32>()
-            .unwrap_or(0);
-        return DataType::Vector(dim);
-    }
-    match t.as_str() {
-        "UUID" => DataType::Uuid,
-        "TEXT" => DataType::Text,
-        "INTEGER" | "INT" => DataType::Integer,
-        "REAL" | "FLOAT" => DataType::Real,
-        "BOOLEAN" | "BOOL" => DataType::Boolean,
-        "TIMESTAMP" => DataType::Timestamp,
-        "JSON" => DataType::Json,
-        _ => DataType::Text,
-    }
-}
+fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
+    let mut distinct = false;
+    let mut columns = Vec::new();
+    let mut from = Vec::new();
+    let mut where_clause = None;
+    let mut order_by = Vec::new();
+    let mut limit = None;
 
-fn parse_create_table(s: &str) -> Result<Statement> {
-    let open = s
-        .find('(')
-        .ok_or_else(|| Error::ParseError("invalid CREATE TABLE".to_string()))?;
-    let close = find_matching_paren(s, open)
-        .ok_or_else(|| Error::ParseError("invalid CREATE TABLE".to_string()))?;
-    let prefix = &s[..open];
-    let cols = &s[open + 1..close];
-    let options = s[close + 1..].trim();
-
-    let parts: Vec<&str> = prefix.split_whitespace().collect();
-    let name = parse_identifier(parts.last().copied().unwrap_or(""));
-    if name.is_empty() {
-        return Err(Error::ParseError("missing table name".to_string()));
-    }
-
-    let columns = cols
-        .split(',')
-        .map(|col| {
-            let tokens: Vec<&str> = col.split_whitespace().collect();
-            let cname = parse_identifier(tokens.first().copied().unwrap_or(""));
-            let dtype = parse_data_type(tokens.get(1).copied().unwrap_or("TEXT"));
-            let col_upper = col.to_ascii_uppercase();
-            ColumnDef {
-                name: cname,
-                data_type: dtype,
-                nullable: !col_upper.contains("NOT NULL"),
-                primary_key: col_upper.contains("PRIMARY KEY"),
-                unique: col_upper.contains("UNIQUE"),
-                default: None,
-                references: None,
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::distinct_kw => distinct = true,
+            Rule::select_list => {
+                columns = build_select_list(p)?;
             }
-        })
+            Rule::from_clause => {
+                from = build_from_clause(p)?;
+            }
+            Rule::where_clause => {
+                where_clause = Some(build_where_clause(p)?);
+            }
+            Rule::order_by_clause => {
+                order_by = build_order_by_clause(p)?;
+            }
+            Rule::limit_clause => {
+                limit = Some(build_limit_clause(p)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(SelectBody {
+        distinct,
+        columns,
+        from,
+        joins: Vec::new(),
+        where_clause,
+        order_by,
+        limit,
+    })
+}
+
+fn build_select_list(pair: Pair<'_, Rule>) -> Result<Vec<SelectColumn>> {
+    let mut cols = Vec::new();
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::star => cols.push(SelectColumn {
+                expr: Expr::Column(ColumnRef {
+                    table: None,
+                    column: "*".to_string(),
+                }),
+                alias: None,
+            }),
+            Rule::select_item => cols.push(build_select_item(p)?),
+            _ => {}
+        }
+    }
+
+    Ok(cols)
+}
+
+fn build_select_item(pair: Pair<'_, Rule>) -> Result<SelectColumn> {
+    let mut expr = None;
+    let mut alias = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::expr => expr = Some(build_expr(p)?),
+            Rule::identifier => alias = Some(parse_identifier(p.as_str())),
+            _ => {}
+        }
+    }
+
+    Ok(SelectColumn {
+        expr: expr
+            .ok_or_else(|| Error::ParseError("SELECT item missing expression".to_string()))?,
+        alias,
+    })
+}
+
+fn build_from_clause(pair: Pair<'_, Rule>) -> Result<Vec<FromItem>> {
+    let mut items = Vec::new();
+    for p in pair.into_inner() {
+        if p.as_rule() == Rule::from_item {
+            items.push(build_from_item(p)?);
+        }
+    }
+    Ok(items)
+}
+
+fn build_from_item(pair: Pair<'_, Rule>) -> Result<FromItem> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("missing FROM item".to_string()))?;
+
+    match inner.as_rule() {
+        Rule::table_ref => build_table_ref(inner),
+        Rule::graph_table => build_graph_table(inner),
+        _ => Err(Error::ParseError("invalid FROM item".to_string())),
+    }
+}
+
+fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
+    let mut names: Vec<String> = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
         .collect();
 
-    let (immutable, state_machine, dag_edge_types) = parse_create_table_options(options)?;
+    if names.is_empty() {
+        return Err(Error::ParseError("table name missing".to_string()));
+    }
 
-    Ok(Statement::CreateTable(CreateTable {
-        name,
-        columns,
-        if_not_exists: prefix.to_ascii_uppercase().contains("IF NOT EXISTS"),
-        immutable,
-        state_machine,
-        dag_edge_types,
-    }))
+    let name = names.remove(0);
+    let alias = names.into_iter().next();
+
+    Ok(FromItem::Table { name, alias })
 }
 
-fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
-    let mut depth = 0_i32;
-    for (idx, ch) in s.char_indices().skip(open_idx) {
-        if ch == '(' {
-            depth += 1;
-        } else if ch == ')' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(idx);
+fn build_graph_table(pair: Pair<'_, Rule>) -> Result<FromItem> {
+    let mut graph_name = None;
+    let mut pattern = None;
+    let mut where_clause = None;
+    let mut columns: Vec<GraphTableColumn> = Vec::new();
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if graph_name.is_none() => {
+                graph_name = Some(parse_identifier(p.as_str()))
+            }
+            Rule::graph_match_clause => pattern = Some(build_match_pattern(p)?),
+            Rule::graph_where_clause => {
+                let expr_pair = p
+                    .into_inner()
+                    .find(|i| i.as_rule() == Rule::expr)
+                    .ok_or_else(|| {
+                        Error::ParseError("MATCH WHERE missing expression".to_string())
+                    })?;
+                where_clause = Some(build_expr(expr_pair)?);
+            }
+            Rule::columns_clause => columns = build_columns_clause(p)?,
+            _ => {}
+        }
+    }
+
+    let graph_name = graph_name
+        .ok_or_else(|| Error::ParseError("GRAPH_TABLE requires graph name".to_string()))?;
+    let graph_pattern = pattern
+        .ok_or_else(|| Error::ParseError("GRAPH_TABLE missing MATCH pattern".to_string()))?;
+    let return_cols = columns
+        .iter()
+        .map(|c| ReturnCol {
+            expr: c.expr.clone(),
+            alias: Some(c.alias.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    let match_clause = MatchClause {
+        graph_name: Some(graph_name.clone()),
+        pattern: graph_pattern,
+        where_clause,
+        return_cols,
+    };
+
+    Ok(FromItem::GraphTable {
+        graph_name,
+        match_clause,
+        columns,
+    })
+}
+
+fn build_match_pattern(pair: Pair<'_, Rule>) -> Result<GraphPattern> {
+    let inner = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::graph_pattern)
+        .ok_or_else(|| Error::ParseError("MATCH pattern missing".to_string()))?;
+
+    let mut nodes_and_edges = inner.into_inner();
+    let start_pair = nodes_and_edges
+        .next()
+        .ok_or_else(|| Error::ParseError("pattern start node missing".to_string()))?;
+    let start = build_node_pattern(start_pair)?;
+
+    let mut edges = Vec::new();
+    for p in nodes_and_edges {
+        if p.as_rule() == Rule::edge_step {
+            edges.push(build_edge_step(p)?);
+        }
+    }
+
+    if edges.is_empty() {
+        return Err(Error::ParseError(
+            "MATCH requires at least one edge step".to_string(),
+        ));
+    }
+
+    Ok(GraphPattern { start, edges })
+}
+
+fn build_node_pattern(pair: Pair<'_, Rule>) -> Result<NodePattern> {
+    let mut alias = None;
+    let mut label = None;
+
+    for p in pair.into_inner() {
+        if p.as_rule() == Rule::identifier {
+            if alias.is_none() {
+                alias = Some(parse_identifier(p.as_str()));
+            } else if label.is_none() {
+                label = Some(parse_identifier(p.as_str()));
             }
         }
     }
-    None
+
+    Ok(NodePattern {
+        alias: alias.unwrap_or_default(),
+        label,
+        properties: Vec::new(),
+    })
 }
 
-fn parse_create_table_options(
-    options: &str,
-) -> Result<(bool, Option<StateMachineDef>, Vec<String>)> {
-    if options.is_empty() {
-        return Ok((false, None, Vec::new()));
+fn build_edge_step(pair: Pair<'_, Rule>) -> Result<EdgeStep> {
+    let edge = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("edge step missing".to_string()))?;
+
+    let (direction, inner_rule) = match edge.as_rule() {
+        Rule::outgoing_edge => (EdgeDirection::Outgoing, edge),
+        Rule::incoming_edge => (EdgeDirection::Incoming, edge),
+        Rule::both_edge => (EdgeDirection::Both, edge),
+        _ => return Err(Error::ParseError("invalid edge direction".to_string())),
+    };
+
+    let mut alias = None;
+    let mut edge_type = None;
+    let mut min_hops = 1_u32;
+    let mut max_hops = 1_u32;
+    let mut target = None;
+
+    for p in inner_rule.into_inner() {
+        match p.as_rule() {
+            Rule::edge_bracket => {
+                let (a, t) = build_edge_bracket(p)?;
+                alias = a;
+                edge_type = t;
+            }
+            Rule::quantifier => {
+                let (min, max) = build_quantifier(p)?;
+                min_hops = min;
+                max_hops = max;
+            }
+            Rule::node_pattern => target = Some(build_node_pattern(p)?),
+            _ => {}
+        }
     }
 
-    let upper = options.to_ascii_uppercase();
-    let has_immutable = upper.contains("IMMUTABLE");
-    let has_state_machine = upper.contains("STATE MACHINE");
-    let has_dag = upper.contains("DAG(");
-    let options_selected = [has_immutable, has_state_machine, has_dag]
-        .into_iter()
-        .filter(|enabled| *enabled)
-        .count();
-    if options_selected > 1 {
+    Ok(EdgeStep {
+        direction,
+        edge_type,
+        min_hops,
+        max_hops,
+        alias,
+        target: target.ok_or_else(|| Error::ParseError("edge target node missing".to_string()))?,
+    })
+}
+
+fn build_edge_bracket(pair: Pair<'_, Rule>) -> Result<(Option<String>, Option<String>)> {
+    let mut alias = None;
+    let mut edge_type = None;
+
+    for p in pair.into_inner() {
+        if p.as_rule() == Rule::edge_spec {
+            let raw = p.as_str().trim().to_string();
+            let ids: Vec<String> = p
+                .into_inner()
+                .filter(|i| i.as_rule() == Rule::identifier)
+                .map(|i| parse_identifier(i.as_str()))
+                .collect();
+
+            if raw.starts_with(':') {
+                if let Some(t) = ids.first() {
+                    edge_type = Some(t.clone());
+                }
+            } else if ids.len() == 1 {
+                alias = Some(ids[0].clone());
+            } else if ids.len() >= 2 {
+                alias = Some(ids[0].clone());
+                edge_type = Some(ids[1].clone());
+            }
+        }
+    }
+
+    Ok((alias, edge_type))
+}
+
+fn build_quantifier(pair: Pair<'_, Rule>) -> Result<(u32, u32)> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid quantifier".to_string()))?;
+
+    match inner.as_rule() {
+        Rule::plus_quantifier | Rule::star_quantifier => Ok((1, 0)),
+        Rule::bounded_quantifier => {
+            let nums: Vec<u32> = inner
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::integer)
+                .map(|p| parse_u32(p.as_str(), "invalid quantifier number"))
+                .collect::<Result<Vec<_>>>()?;
+
+            if nums.is_empty() {
+                return Err(Error::ParseError("invalid quantifier".to_string()));
+            }
+
+            let min = nums[0];
+            let max = if nums.len() > 1 { nums[1] } else { 0 };
+            Ok((min, max))
+        }
+        _ => Err(Error::ParseError("invalid quantifier".to_string())),
+    }
+}
+
+fn build_columns_clause(pair: Pair<'_, Rule>) -> Result<Vec<GraphTableColumn>> {
+    let mut cols = Vec::new();
+
+    for p in pair.into_inner() {
+        if p.as_rule() == Rule::graph_column {
+            let mut expr = None;
+            let mut alias = None;
+
+            for inner in p.into_inner() {
+                match inner.as_rule() {
+                    Rule::expr => expr = Some(build_expr(inner)?),
+                    Rule::identifier => alias = Some(parse_identifier(inner.as_str())),
+                    _ => {}
+                }
+            }
+
+            let expr = expr
+                .ok_or_else(|| Error::ParseError("COLUMNS item missing expression".to_string()))?;
+            let alias = alias.unwrap_or_else(|| match &expr {
+                Expr::Column(c) => c.column.clone(),
+                _ => "expr".to_string(),
+            });
+            cols.push(GraphTableColumn { expr, alias });
+        }
+    }
+
+    Ok(cols)
+}
+
+fn build_where_clause(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let expr_pair = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::expr)
+        .ok_or_else(|| Error::ParseError("WHERE missing expression".to_string()))?;
+    build_expr(expr_pair)
+}
+
+fn build_order_by_clause(pair: Pair<'_, Rule>) -> Result<Vec<OrderByItem>> {
+    let mut items = Vec::new();
+    for p in pair.into_inner() {
+        if p.as_rule() == Rule::order_item {
+            items.push(build_order_item(p)?);
+        }
+    }
+    Ok(items)
+}
+
+fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
+    let mut direction = SortDirection::Asc;
+    let mut expr = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::cosine_expr => {
+                let mut it = p.into_inner();
+                let left = build_additive_expr(
+                    it.next()
+                        .ok_or_else(|| Error::ParseError("invalid cosine expr".to_string()))?,
+                )?;
+                let right = build_additive_expr(
+                    it.next()
+                        .ok_or_else(|| Error::ParseError("invalid cosine expr".to_string()))?,
+                )?;
+                expr = Some(Expr::CosineDistance {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+                direction = SortDirection::CosineDistance;
+            }
+            Rule::expr => expr = Some(build_expr(p)?),
+            Rule::sort_dir => {
+                direction = if p.as_str().eq_ignore_ascii_case("DESC") {
+                    SortDirection::Desc
+                } else {
+                    SortDirection::Asc
+                };
+            }
+            _ => {}
+        }
+    }
+
+    Ok(OrderByItem {
+        expr: expr
+            .ok_or_else(|| Error::ParseError("ORDER BY item missing expression".to_string()))?,
+        direction,
+    })
+}
+
+fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
+    let num = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::integer)
+        .ok_or_else(|| Error::ParseError("LIMIT missing value".to_string()))?;
+    parse_u64(num.as_str(), "invalid LIMIT value")
+}
+
+fn build_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid expression".to_string()))?;
+    build_or_expr(inner)
+}
+
+fn build_or_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let first = inner
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid OR expression".to_string()))?;
+    let mut expr = build_and_expr(first)?;
+
+    while let Some(op_or_next) = inner.next() {
+        if op_or_next.as_rule() == Rule::or_op {
+            let rhs_pair = inner
+                .next()
+                .ok_or_else(|| Error::ParseError("OR missing right operand".to_string()))?;
+            let rhs = build_and_expr(rhs_pair)?;
+            expr = Expr::BinaryOp {
+                left: Box::new(expr),
+                op: BinOp::Or,
+                right: Box::new(rhs),
+            };
+        }
+    }
+
+    Ok(expr)
+}
+
+fn build_and_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let first = inner
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid AND expression".to_string()))?;
+    let mut expr = build_unary_bool_expr(first)?;
+
+    while let Some(op_or_next) = inner.next() {
+        if op_or_next.as_rule() == Rule::and_op {
+            let rhs_pair = inner
+                .next()
+                .ok_or_else(|| Error::ParseError("AND missing right operand".to_string()))?;
+            let rhs = build_unary_bool_expr(rhs_pair)?;
+            expr = Expr::BinaryOp {
+                left: Box::new(expr),
+                op: BinOp::And,
+                right: Box::new(rhs),
+            };
+        }
+    }
+
+    Ok(expr)
+}
+
+fn build_unary_bool_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut not_count = 0usize;
+    let mut cmp = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::not_op => not_count += 1,
+            Rule::comparison_expr => cmp = Some(build_comparison_expr(p)?),
+            _ => {}
+        }
+    }
+
+    let mut expr =
+        cmp.ok_or_else(|| Error::ParseError("invalid unary boolean expression".to_string()))?;
+    for _ in 0..not_count {
+        expr = Expr::UnaryOp {
+            op: UnaryOp::Not,
+            operand: Box::new(expr),
+        };
+    }
+    Ok(expr)
+}
+
+fn build_comparison_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let left_pair = inner
+        .next()
+        .ok_or_else(|| Error::ParseError("comparison missing left operand".to_string()))?;
+    let left = build_additive_expr(left_pair)?;
+
+    if let Some(suffix) = inner.next() {
+        build_comparison_suffix(left, suffix)
+    } else {
+        Ok(left)
+    }
+}
+
+fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
+    let suffix = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid comparison suffix".to_string()))?;
+
+    match suffix.as_rule() {
+        Rule::cmp_suffix => {
+            let mut it = suffix.into_inner();
+            let op_pair = it
+                .next()
+                .ok_or_else(|| Error::ParseError("comparison missing operator".to_string()))?;
+            let rhs_pair = it
+                .next()
+                .ok_or_else(|| Error::ParseError("comparison missing right operand".to_string()))?;
+            let op = match op_pair.as_str() {
+                "=" => BinOp::Eq,
+                "!=" | "<>" => BinOp::Neq,
+                "<" => BinOp::Lt,
+                "<=" => BinOp::Lte,
+                ">" => BinOp::Gt,
+                ">=" => BinOp::Gte,
+                _ => {
+                    return Err(Error::ParseError(
+                        "unsupported comparison operator".to_string(),
+                    ));
+                }
+            };
+            let right = build_additive_expr(rhs_pair)?;
+            Ok(Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            })
+        }
+        Rule::is_null_suffix => {
+            let negated = suffix.into_inner().any(|p| p.as_rule() == Rule::not_op);
+            Ok(Expr::IsNull {
+                expr: Box::new(left),
+                negated,
+            })
+        }
+        Rule::like_suffix => {
+            let mut negated = false;
+            let mut pattern = None;
+            for p in suffix.into_inner() {
+                match p.as_rule() {
+                    Rule::not_op => negated = true,
+                    Rule::additive_expr => pattern = Some(build_additive_expr(p)?),
+                    _ => {}
+                }
+            }
+            Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(
+                    pattern.ok_or_else(|| Error::ParseError("LIKE missing pattern".to_string()))?,
+                ),
+                negated,
+            })
+        }
+        Rule::between_suffix => {
+            let mut vals = suffix
+                .into_inner()
+                .filter(|p| p.as_rule() == Rule::additive_expr)
+                .map(build_additive_expr)
+                .collect::<Result<Vec<_>>>()?;
+
+            if vals.len() != 2 {
+                return Err(Error::ParseError(
+                    "BETWEEN requires lower and upper bounds".to_string(),
+                ));
+            }
+
+            let upper = vals.pop().expect("checked len");
+            let lower = vals.pop().expect("checked len");
+            let gte = Expr::BinaryOp {
+                left: Box::new(left.clone()),
+                op: BinOp::Gte,
+                right: Box::new(lower),
+            };
+            let lte = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Lte,
+                right: Box::new(upper),
+            };
+            Ok(Expr::BinaryOp {
+                left: Box::new(gte),
+                op: BinOp::And,
+                right: Box::new(lte),
+            })
+        }
+        Rule::in_suffix => {
+            let mut negated = false;
+            let mut list = Vec::new();
+            let mut subquery = None;
+
+            for p in suffix.into_inner() {
+                match p.as_rule() {
+                    Rule::not_op => negated = true,
+                    Rule::in_contents => {
+                        let mut parts = p.into_inner();
+                        let first = parts.next().ok_or_else(|| {
+                            Error::ParseError("IN list cannot be empty".to_string())
+                        })?;
+                        match first.as_rule() {
+                            Rule::select_core => subquery = Some(build_select_core(first)?),
+                            Rule::expr => {
+                                list.push(build_expr(first)?);
+                                for rest in parts {
+                                    if rest.as_rule() == Rule::expr {
+                                        list.push(build_expr(rest)?);
+                                    }
+                                }
+                            }
+                            _ => return Err(Error::ParseError("invalid IN contents".to_string())),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(sq) = subquery {
+                Ok(Expr::InSubquery {
+                    expr: Box::new(left),
+                    subquery: Box::new(sq),
+                    negated,
+                })
+            } else {
+                Ok(Expr::InList {
+                    expr: Box::new(left),
+                    list,
+                    negated,
+                })
+            }
+        }
+        _ => Err(Error::ParseError(
+            "unsupported comparison suffix".to_string(),
+        )),
+    }
+}
+
+fn build_additive_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let first = inner
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid additive expression".to_string()))?;
+    let mut expr = build_multiplicative_expr(first)?;
+
+    while let Some(op) = inner.next() {
+        let rhs_pair = inner
+            .next()
+            .ok_or_else(|| Error::ParseError("arithmetic missing right operand".to_string()))?;
+        let rhs = build_multiplicative_expr(rhs_pair)?;
+        let func = if op.as_str() == "+" { "__add" } else { "__sub" };
+        expr = Expr::FunctionCall {
+            name: func.to_string(),
+            args: vec![expr, rhs],
+        };
+    }
+
+    Ok(expr)
+}
+
+fn build_multiplicative_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let first = inner
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid multiplicative expression".to_string()))?;
+    let mut expr = build_unary_math_expr(first)?;
+
+    while let Some(op) = inner.next() {
+        let rhs_pair = inner
+            .next()
+            .ok_or_else(|| Error::ParseError("arithmetic missing right operand".to_string()))?;
+        let rhs = build_unary_math_expr(rhs_pair)?;
+        let func = if op.as_str() == "*" { "__mul" } else { "__div" };
+        expr = Expr::FunctionCall {
+            name: func.to_string(),
+            args: vec![expr, rhs],
+        };
+    }
+
+    Ok(expr)
+}
+
+fn build_unary_math_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut neg_count = 0usize;
+    let mut primary = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::unary_minus => neg_count += 1,
+            Rule::primary_expr => primary = Some(build_primary_expr(p)?),
+            _ => {}
+        }
+    }
+
+    let mut expr =
+        primary.ok_or_else(|| Error::ParseError("invalid unary expression".to_string()))?;
+    for _ in 0..neg_count {
+        expr = Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand: Box::new(expr),
+        };
+    }
+
+    Ok(expr)
+}
+
+fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let first = inner
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid primary expression".to_string()))?;
+
+    match first.as_rule() {
+        Rule::function_call => build_function_call(first),
+        Rule::parameter => Ok(Expr::Parameter(
+            first.as_str().trim_start_matches('$').to_string(),
+        )),
+        Rule::null_lit => Ok(Expr::Literal(Literal::Null)),
+        Rule::bool_lit => Ok(Expr::Literal(Literal::Bool(
+            first.as_str().eq_ignore_ascii_case("true"),
+        ))),
+        Rule::float => Ok(Expr::Literal(Literal::Real(parse_f64(
+            first.as_str(),
+            "invalid float literal",
+        )?))),
+        Rule::integer => Ok(Expr::Literal(Literal::Integer(parse_i64(
+            first.as_str(),
+            "invalid integer literal",
+        )?))),
+        Rule::string => Ok(Expr::Literal(Literal::Text(parse_string_literal(
+            first.as_str(),
+        )))),
+        Rule::column_ref => build_column_ref(first),
+        Rule::expr => build_expr(first),
+        _ => Err(Error::ParseError(
+            "unsupported primary expression".to_string(),
+        )),
+    }
+}
+
+fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut name = None;
+    let mut args = Vec::new();
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::expr => args.push(build_expr(p)?),
+            _ => {}
+        }
+    }
+
+    Ok(Expr::FunctionCall {
+        name: name.ok_or_else(|| Error::ParseError("function name missing".to_string()))?,
+        args,
+    })
+}
+
+fn build_column_ref(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let ids: Vec<String> = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .collect();
+
+    match ids.as_slice() {
+        [column] => Ok(Expr::Column(ColumnRef {
+            table: None,
+            column: column.clone(),
+        })),
+        [table, column] => Ok(Expr::Column(ColumnRef {
+            table: Some(table.clone()),
+            column: column.clone(),
+        })),
+        _ => Err(Error::ParseError("invalid column reference".to_string())),
+    }
+}
+
+fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
+    let mut name = None;
+    let mut if_not_exists = false;
+    let mut columns = Vec::new();
+    let mut immutable = false;
+    let mut state_machine = None;
+    let mut dag_edge_types = Vec::new();
+    let mut has_propagation = false;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::if_not_exists => if_not_exists = true,
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::column_def => columns.push(build_column_def(p)?),
+            Rule::table_option => {
+                let opt = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::ParseError("invalid table option".to_string()))?;
+                match opt.as_rule() {
+                    Rule::immutable_option => immutable = true,
+                    Rule::state_machine_option => {
+                        state_machine = Some(build_state_machine_option(opt)?)
+                    }
+                    Rule::dag_option => dag_edge_types = build_dag_option(opt)?,
+                    Rule::propagate_edge_option | Rule::propagate_state_option => {
+                        has_propagation = true;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let options_count = [
+        immutable,
+        state_machine.is_some(),
+        !dag_edge_types.is_empty(),
+    ]
+    .into_iter()
+    .filter(|v| *v)
+    .count();
+
+    if options_count > 1 {
         return Err(Error::ParseError(
             "IMMUTABLE, STATE MACHINE, and DAG cannot be used together".to_string(),
         ));
     }
 
-    if has_immutable {
-        if upper.trim() != "IMMUTABLE" {
-            return Err(Error::ParseError(
-                "invalid CREATE TABLE options".to_string(),
-            ));
-        }
-        return Ok((true, None, Vec::new()));
-    }
-
-    if has_state_machine {
-        if !upper.starts_with("STATE MACHINE") {
-            return Err(Error::ParseError(
-                "invalid CREATE TABLE options".to_string(),
-            ));
-        }
-        let open = options
-            .find('(')
-            .ok_or_else(|| Error::ParseError("invalid STATE MACHINE clause".to_string()))?;
-        let close = find_matching_paren(options, open)
-            .ok_or_else(|| Error::ParseError("invalid STATE MACHINE clause".to_string()))?;
-        if options[close + 1..].trim().is_empty() {
-            let def = parse_state_machine_def(options[open + 1..close].trim())?;
-            return Ok((false, Some(def), Vec::new()));
-        }
+    if has_propagation && (immutable || !dag_edge_types.is_empty()) {
         return Err(Error::ParseError(
-            "invalid CREATE TABLE options".to_string(),
+            "propagation clauses require STATE MACHINE tables".to_string(),
         ));
     }
 
-    if has_dag {
-        if !upper.starts_with("DAG") {
-            return Err(Error::ParseError(
-                "invalid CREATE TABLE options".to_string(),
-            ));
-        }
-        let open = options
-            .find('(')
-            .ok_or_else(|| Error::ParseError("invalid DAG clause".to_string()))?;
-        let close = find_matching_paren(options, open)
-            .ok_or_else(|| Error::ParseError("invalid DAG clause".to_string()))?;
-        if !options[close + 1..].trim().is_empty() {
-            return Err(Error::ParseError(
-                "invalid CREATE TABLE options".to_string(),
-            ));
-        }
-        let dag_edge_types = parse_dag_edge_types(options[open + 1..close].trim())?;
-        return Ok((false, None, dag_edge_types));
-    }
-
-    Err(Error::ParseError(
-        "invalid CREATE TABLE options".to_string(),
-    ))
+    Ok(CreateTable {
+        name: name.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
+        columns,
+        if_not_exists,
+        immutable,
+        state_machine,
+        dag_edge_types,
+    })
 }
 
-fn parse_dag_edge_types(input: &str) -> Result<Vec<String>> {
-    let edge_types: Vec<String> = split_top_level_commas(input)
-        .into_iter()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|token| {
-            if token.len() < 2 || !token.starts_with('\'') || !token.ends_with('\'') {
-                return Err(Error::ParseError(
-                    "DAG edge types must be single-quoted".to_string(),
-                ));
+fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
+    let mut name = None;
+    let mut data_type = None;
+    let mut nullable = true;
+    let mut primary_key = false;
+    let mut unique = false;
+    let mut default = None;
+    let mut references = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::data_type => data_type = Some(build_data_type(p)?),
+            Rule::column_constraint => {
+                let c = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::ParseError("invalid column constraint".to_string()))?;
+                match c.as_rule() {
+                    Rule::not_null => nullable = false,
+                    Rule::primary_key => primary_key = true,
+                    Rule::unique => unique = true,
+                    Rule::default_clause => {
+                        let expr = c
+                            .into_inner()
+                            .find(|i| i.as_rule() == Rule::expr)
+                            .ok_or_else(|| {
+                                Error::ParseError("DEFAULT missing expression".to_string())
+                            })?;
+                        default = Some(build_expr(expr)?);
+                    }
+                    Rule::references_clause => references = Some(build_references_clause(c)?),
+                    Rule::fk_propagation_clause => {}
+                    _ => {}
+                }
             }
-            let edge_type = token[1..token.len() - 1].trim();
-            if edge_type.is_empty() {
-                return Err(Error::ParseError(
-                    "DAG edge types must be non-empty".to_string(),
-                ));
+            _ => {}
+        }
+    }
+
+    Ok(ColumnDef {
+        name: name.ok_or_else(|| Error::ParseError("column name missing".to_string()))?,
+        data_type: data_type.ok_or_else(|| Error::ParseError("column type missing".to_string()))?,
+        nullable,
+        primary_key,
+        unique,
+        default,
+        references,
+    })
+}
+
+fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
+    let ids: Vec<String> = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .collect();
+
+    if ids.len() < 2 {
+        return Err(Error::ParseError(
+            "REFERENCES requires table and column".to_string(),
+        ));
+    }
+
+    Ok(ForeignKey {
+        table: ids[0].clone(),
+        column: ids[1].clone(),
+    })
+}
+
+fn build_data_type(pair: Pair<'_, Rule>) -> Result<DataType> {
+    let txt = pair.as_str().to_string();
+    let mut inner = pair.into_inner();
+    if let Some(v) = inner.find(|p| p.as_rule() == Rule::vector_type) {
+        let dim = v
+            .into_inner()
+            .find(|p| p.as_rule() == Rule::integer)
+            .ok_or_else(|| Error::ParseError("VECTOR dimension missing".to_string()))?;
+        let dim = parse_u32(dim.as_str(), "invalid VECTOR dimension")?;
+        return Ok(DataType::Vector(dim));
+    }
+
+    if txt.eq_ignore_ascii_case("UUID") {
+        Ok(DataType::Uuid)
+    } else if txt.eq_ignore_ascii_case("TEXT") {
+        Ok(DataType::Text)
+    } else if txt.eq_ignore_ascii_case("INTEGER") || txt.eq_ignore_ascii_case("INT") {
+        Ok(DataType::Integer)
+    } else if txt.eq_ignore_ascii_case("REAL") || txt.eq_ignore_ascii_case("FLOAT") {
+        Ok(DataType::Real)
+    } else if txt.eq_ignore_ascii_case("BOOLEAN") || txt.eq_ignore_ascii_case("BOOL") {
+        Ok(DataType::Boolean)
+    } else if txt.eq_ignore_ascii_case("TIMESTAMP") {
+        Ok(DataType::Timestamp)
+    } else if txt.eq_ignore_ascii_case("JSON") {
+        Ok(DataType::Json)
+    } else {
+        Err(Error::ParseError(format!("unsupported data type: {txt}")))
+    }
+}
+
+fn build_state_machine_option(pair: Pair<'_, Rule>) -> Result<StateMachineDef> {
+    let entries = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::state_machine_entries)
+        .ok_or_else(|| Error::ParseError("invalid STATE MACHINE clause".to_string()))?;
+
+    let mut column = None;
+    let mut transitions: Vec<(String, Vec<String>)> = Vec::new();
+
+    for entry in entries
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::state_machine_entry)
+    {
+        let has_column_prefix = entry.as_str().contains(':');
+        let ids: Vec<String> = entry
+            .into_inner()
+            .filter(|p| p.as_rule() == Rule::identifier)
+            .map(|p| parse_identifier(p.as_str()))
+            .collect();
+
+        if ids.len() < 2 {
+            return Err(Error::ParseError(
+                "invalid STATE MACHINE transition".to_string(),
+            ));
+        }
+
+        let (from, to_targets) = if has_column_prefix {
+            if column.is_none() {
+                column = Some(ids[0].clone());
             }
-            Ok(edge_type.to_string())
-        })
-        .collect::<Result<Vec<_>>>()?;
+            (ids[1].clone(), ids[2..].to_vec())
+        } else {
+            (ids[0].clone(), ids[1..].to_vec())
+        };
+
+        if let Some((_, existing)) = transitions.iter_mut().find(|(src, _)| src == &from) {
+            for t in to_targets {
+                if !existing.iter().any(|v| v == &t) {
+                    existing.push(t);
+                }
+            }
+        } else {
+            transitions.push((from, to_targets));
+        }
+    }
+
+    Ok(StateMachineDef {
+        column: column.unwrap_or_else(|| "status".to_string()),
+        transitions,
+    })
+}
+
+fn build_dag_option(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
+    let edge_types = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::string)
+        .map(|p| parse_string_literal(p.as_str()))
+        .collect::<Vec<_>>();
 
     if edge_types.is_empty() {
         return Err(Error::ParseError(
@@ -302,468 +1126,470 @@ fn parse_dag_edge_types(input: &str) -> Result<Vec<String>> {
     Ok(edge_types)
 }
 
-fn parse_state_machine_def(input: &str) -> Result<StateMachineDef> {
-    let clauses = split_top_level_commas(input);
-    if clauses.is_empty() {
-        return Err(Error::ParseError(
-            "STATE MACHINE requires transitions".to_string(),
-        ));
-    }
+fn build_drop_table(pair: Pair<'_, Rule>) -> Result<DropTable> {
+    let mut if_exists = false;
+    let mut name = None;
 
-    let mut column = None::<String>;
-    let mut transitions: Vec<(String, Vec<String>)> = Vec::new();
-
-    for clause in clauses {
-        let mut clause_text = clause.trim().to_string();
-        if clause_text.is_empty() {
-            continue;
-        }
-
-        if let Some((maybe_col, rest)) = clause_text.split_once(':') {
-            if !rest.contains("->") {
-                return Err(Error::ParseError(
-                    "invalid STATE MACHINE transition".to_string(),
-                ));
-            }
-            if column.is_none() {
-                let parsed_col = parse_identifier(maybe_col.trim());
-                if parsed_col.is_empty() {
-                    return Err(Error::ParseError(
-                        "missing STATE MACHINE column".to_string(),
-                    ));
-                }
-                column = Some(parsed_col);
-            }
-            clause_text = rest.trim().to_string();
-        }
-
-        let (from, rhs) = clause_text
-            .split_once("->")
-            .ok_or_else(|| Error::ParseError("invalid STATE MACHINE transition".to_string()))?;
-        let from = parse_identifier(from.trim());
-        if from.is_empty() {
-            return Err(Error::ParseError(
-                "missing STATE MACHINE source state".to_string(),
-            ));
-        }
-        let rhs = rhs.trim();
-        if !rhs.starts_with('[') || !rhs.ends_with(']') {
-            return Err(Error::ParseError(
-                "STATE MACHINE targets must use [..]".to_string(),
-            ));
-        }
-        let targets: Vec<String> = rhs[1..rhs.len() - 1]
-            .split(',')
-            .map(parse_identifier)
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if let Some((_, existing_targets)) = transitions.iter_mut().find(|(src, _)| src == &from) {
-            for target in targets {
-                if !existing_targets.iter().any(|t| t == &target) {
-                    existing_targets.push(target);
-                }
-            }
-        } else {
-            transitions.push((from, targets));
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::if_exists => if_exists = true,
+            Rule::identifier => name = Some(parse_identifier(p.as_str())),
+            _ => {}
         }
     }
 
-    let Some(column) = column else {
-        return Err(Error::ParseError(
-            "missing STATE MACHINE column".to_string(),
-        ));
-    };
-
-    Ok(StateMachineDef {
-        column,
-        transitions,
+    Ok(DropTable {
+        name: name.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
+        if_exists,
     })
 }
 
-fn split_top_level_commas(input: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0_i32;
+fn build_create_index(pair: Pair<'_, Rule>) -> Result<CreateIndex> {
+    let ids: Vec<String> = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .collect();
 
-    for (idx, ch) in input.char_indices() {
-        if ch == '[' {
-            depth += 1;
-        } else if ch == ']' {
-            depth -= 1;
-        } else if ch == ',' && depth == 0 {
-            out.push(input[start..idx].trim());
-            start = idx + 1;
+    if ids.len() < 3 {
+        return Err(Error::ParseError("invalid CREATE INDEX".to_string()));
+    }
+
+    Ok(CreateIndex {
+        name: ids[0].clone(),
+        table: ids[1].clone(),
+        columns: ids[2..].to_vec(),
+    })
+}
+
+fn build_insert(pair: Pair<'_, Rule>) -> Result<Insert> {
+    let mut table = None;
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    let mut on_conflict = None;
+    let mut seen_table = false;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if !seen_table => {
+                table = Some(parse_identifier(p.as_str()));
+                seen_table = true;
+            }
+            Rule::identifier => columns.push(parse_identifier(p.as_str())),
+            Rule::values_row => values.push(build_values_row(p)?),
+            Rule::on_conflict_clause => on_conflict = Some(build_on_conflict(p)?),
+            _ => {}
         }
     }
-    out.push(input[start..].trim());
-    out
-}
 
-fn parse_drop_table(s: &str) -> Result<Statement> {
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    let name = parse_identifier(parts.last().copied().unwrap_or(""));
-    if name.is_empty() {
-        return Err(Error::ParseError("missing table name".to_string()));
-    }
-    Ok(Statement::DropTable(DropTable {
-        name,
-        if_exists: s.to_ascii_uppercase().contains("IF EXISTS"),
-    }))
-}
-
-fn parse_create_index(s: &str) -> Result<Statement> {
-    let upper = s.to_ascii_uppercase();
-    let on_pos = upper
-        .find(" ON ")
-        .ok_or_else(|| Error::ParseError("invalid CREATE INDEX".to_string()))?;
-    let left = &s[..on_pos];
-    let right = &s[on_pos + 4..];
-
-    let idx_name = parse_identifier(left.split_whitespace().last().unwrap_or("idx"));
-    let open = right
-        .find('(')
-        .ok_or_else(|| Error::ParseError("invalid CREATE INDEX".to_string()))?;
-    let close = right
-        .rfind(')')
-        .ok_or_else(|| Error::ParseError("invalid CREATE INDEX".to_string()))?;
-    let table = parse_identifier(right[..open].trim());
-    let columns = right[open + 1..close]
-        .split(',')
-        .map(parse_identifier)
-        .collect();
-
-    Ok(Statement::CreateIndex(CreateIndex {
-        name: idx_name,
-        table,
+    Ok(Insert {
+        table: table.ok_or_else(|| Error::ParseError("INSERT missing table".to_string()))?,
         columns,
-    }))
-}
-
-fn parse_insert(s: &str) -> Result<Statement> {
-    let upper = s.to_ascii_uppercase();
-    let values_idx = upper
-        .find(" VALUES ")
-        .ok_or_else(|| Error::ParseError("invalid INSERT".to_string()))?;
-
-    let head = &s[..values_idx];
-    let tail = &s[values_idx + 8..];
-
-    let open = head
-        .find('(')
-        .ok_or_else(|| Error::ParseError("invalid INSERT".to_string()))?;
-    let close = head
-        .rfind(')')
-        .ok_or_else(|| Error::ParseError("invalid INSERT".to_string()))?;
-
-    let table = parse_identifier(head["INSERT INTO".len()..open].trim());
-    let columns: Vec<String> = head[open + 1..close]
-        .split(',')
-        .map(parse_identifier)
-        .collect();
-
-    let tail_upper = tail.to_ascii_uppercase();
-    let (values_part, conflict_part) = if let Some(idx) = tail_upper.find(" ON CONFLICT ") {
-        (&tail[..idx], Some(&tail[idx + 13..]))
-    } else {
-        (tail, None)
-    };
-
-    let vopen = values_part
-        .find('(')
-        .ok_or_else(|| Error::ParseError("invalid INSERT values".to_string()))?;
-    let vclose = values_part
-        .rfind(')')
-        .ok_or_else(|| Error::ParseError("invalid INSERT values".to_string()))?;
-    let row: Vec<Expr> = values_part[vopen + 1..vclose]
-        .split(',')
-        .map(parse_literal)
-        .collect();
-
-    let on_conflict = conflict_part.and_then(|c| {
-        let c_upper = c.to_ascii_uppercase();
-        let copen = c.find('(')?;
-        let cclose = c.find(')')?;
-        let cols: Vec<String> = c[copen + 1..cclose]
-            .split(',')
-            .map(parse_identifier)
-            .collect();
-        let set_pos = c_upper.find(" SET ")?;
-        let assigns = c[set_pos + 5..]
-            .split(',')
-            .filter_map(|pair| {
-                let mut it = pair.splitn(2, '=');
-                let key = it.next()?.trim().to_string();
-                let val = parse_literal(it.next()?.trim());
-                Some((key, val))
-            })
-            .collect();
-        Some(OnConflict {
-            columns: cols,
-            update_columns: assigns,
-        })
-    });
-
-    Ok(Statement::Insert(Insert {
-        table,
-        columns,
-        values: vec![row],
+        values,
         on_conflict,
-    }))
+    })
 }
 
-fn parse_delete(s: &str) -> Result<Statement> {
-    let upper = s.to_ascii_uppercase();
-    let where_idx = upper.find(" WHERE ");
-    let table = if let Some(idx) = where_idx {
-        parse_identifier(s["DELETE FROM".len()..idx].trim())
-    } else {
-        parse_identifier(s["DELETE FROM".len()..].trim())
-    };
+fn build_values_row(pair: Pair<'_, Rule>) -> Result<Vec<Expr>> {
+    pair.into_inner()
+        .filter(|p| p.as_rule() == Rule::expr)
+        .map(build_expr)
+        .collect()
+}
 
-    let where_clause = where_idx.map(|idx| parse_condition(s[idx + 7..].trim()));
+fn build_on_conflict(pair: Pair<'_, Rule>) -> Result<OnConflict> {
+    let mut columns = Vec::new();
+    let mut update_columns = Vec::new();
 
-    Ok(Statement::Delete(Delete {
-        table,
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier => columns.push(parse_identifier(p.as_str())),
+            Rule::assignment => update_columns.push(build_assignment(p)?),
+            _ => {}
+        }
+    }
+
+    Ok(OnConflict {
+        columns,
+        update_columns,
+    })
+}
+
+fn build_assignment(pair: Pair<'_, Rule>) -> Result<(String, Expr)> {
+    let mut name = None;
+    let mut value = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::expr => value = Some(build_expr(p)?),
+            _ => {}
+        }
+    }
+
+    Ok((
+        name.ok_or_else(|| Error::ParseError("assignment missing column".to_string()))?,
+        value.ok_or_else(|| Error::ParseError("assignment missing value".to_string()))?,
+    ))
+}
+
+fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
+    let mut table = None;
+    let mut where_clause = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier => table = Some(parse_identifier(p.as_str())),
+            Rule::where_clause => where_clause = Some(build_where_clause(p)?),
+            _ => {}
+        }
+    }
+
+    Ok(Delete {
+        table: table.ok_or_else(|| Error::ParseError("DELETE missing table".to_string()))?,
         where_clause,
-    }))
+    })
 }
 
-fn parse_update(s: &str) -> Result<Statement> {
-    let upper = s.to_ascii_uppercase();
-    let set_idx = upper
-        .find(" SET ")
-        .ok_or_else(|| Error::ParseError("invalid UPDATE".to_string()))?;
-    let where_idx = upper.find(" WHERE ");
+fn build_update(pair: Pair<'_, Rule>) -> Result<Update> {
+    let mut table = None;
+    let mut assignments = Vec::new();
+    let mut where_clause = None;
 
-    let table = parse_identifier(s["UPDATE".len()..set_idx].trim());
-    let assigns_str = if let Some(idx) = where_idx {
-        &s[set_idx + 5..idx]
-    } else {
-        &s[set_idx + 5..]
-    };
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if table.is_none() => table = Some(parse_identifier(p.as_str())),
+            Rule::assignment => assignments.push(build_assignment(p)?),
+            Rule::where_clause => where_clause = Some(build_where_clause(p)?),
+            _ => {}
+        }
+    }
 
-    let assignments = assigns_str
-        .split(',')
-        .filter_map(|pair| {
-            let mut it = pair.splitn(2, '=');
-            let key = it.next()?.trim().to_string();
-            let value = parse_literal(it.next()?.trim());
-            Some((key, value))
-        })
-        .collect();
-
-    let where_clause = where_idx.map(|idx| parse_condition(s[idx + 7..].trim()));
-
-    Ok(Statement::Update(Update {
-        table,
+    Ok(Update {
+        table: table.ok_or_else(|| Error::ParseError("UPDATE missing table".to_string()))?,
         assignments,
         where_clause,
-    }))
+    })
 }
 
-fn parse_select(s: &str) -> Result<Statement> {
-    let upper = s.to_ascii_uppercase();
-    let mut ctes = Vec::new();
-    let mut select_source = s;
+fn validate_statement(stmt: &Statement) -> Result<()> {
+    if let Statement::Select(sel) = stmt {
+        validate_select(sel)?;
+    }
+    Ok(())
+}
 
-    if upper.starts_with("WITH ") {
-        let as_pos = upper
-            .find(" AS ")
-            .ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?;
-        let cte_name = parse_identifier(s[5..as_pos].trim());
-        let open = s[as_pos..]
-            .find('(')
-            .ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?
-            + as_pos;
-        let close = s
-            .rfind(')')
-            .ok_or_else(|| Error::ParseError("invalid WITH".to_string()))?;
-        let cte_body = s[open + 1..close].trim();
-
-        if cte_body.to_ascii_uppercase().starts_with("MATCH") {
-            let edge_step = if cte_body.contains("*1..") {
-                let idx = cte_body
-                    .find("*1..")
-                    .ok_or_else(|| Error::ParseError("invalid MATCH".to_string()))?;
-                let rest = &cte_body[idx + 4..];
-                let max = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .unwrap_or(1);
-                EdgeStep {
-                    direction: EdgeDirection::Outgoing,
-                    edge_type: Some("EDGE".to_string()),
-                    min_hops: 1,
-                    max_hops: max,
-                    alias: None,
-                    target: NodePattern {
-                        alias: "b".to_string(),
-                        label: None,
-                        properties: vec![],
-                    },
-                }
-            } else {
-                EdgeStep {
-                    direction: EdgeDirection::Outgoing,
-                    edge_type: Some("EDGE".to_string()),
-                    min_hops: 1,
-                    max_hops: 1,
-                    alias: None,
-                    target: NodePattern {
-                        alias: "b".to_string(),
-                        label: None,
-                        properties: vec![],
-                    },
-                }
-            };
-
-            ctes.push(Cte::MatchCte {
-                name: cte_name,
-                match_clause: MatchClause {
-                    graph_name: None,
-                    pattern: GraphPattern {
-                        start: NodePattern {
-                            alias: "a".to_string(),
-                            label: None,
-                            properties: vec![],
-                        },
-                        edges: vec![edge_step],
-                    },
-                    where_clause: None,
-                    return_cols: vec![],
-                },
-            });
-        } else {
-            ctes.push(Cte::SqlCte {
-                name: cte_name,
-                query: SelectBody {
-                    distinct: false,
-                    columns: vec![],
-                    from: vec![],
-                    joins: vec![],
-                    where_clause: None,
-                    order_by: vec![],
-                    limit: None,
-                },
-            });
+fn validate_select(sel: &SelectStatement) -> Result<()> {
+    for cte in &sel.ctes {
+        if let Cte::SqlCte { query, .. } = cte {
+            validate_select_body(query)?;
         }
-
-        let select_pos = upper
-            .rfind(" SELECT ")
-            .or_else(|| upper.find("SELECT"))
-            .ok_or_else(|| Error::ParseError("missing SELECT".to_string()))?;
-        select_source = &s[select_pos..];
     }
 
-    if upper.contains(" IN (SELECT ") {
-        let in_select_pos = upper
-            .find(" IN (SELECT ")
-            .ok_or_else(|| Error::ParseError("invalid IN subquery".to_string()))?;
-        let subquery = &s[in_select_pos + " IN (".len()..];
-        let sub_upper = subquery.to_ascii_uppercase();
-        let from_pos = sub_upper
-            .find(" FROM ")
-            .ok_or_else(|| Error::ParseError("invalid IN subquery".to_string()))?;
-        let after_from = subquery[from_pos + 6..].trim();
-        let referenced = after_from
-            .split(|c: char| c.is_whitespace() || c == ')')
-            .next()
-            .map(parse_identifier)
-            .unwrap_or_default();
+    validate_select_body(&sel.body)?;
 
-        let cte_names: Vec<String> = ctes
-            .iter()
-            .map(|c| match c {
-                Cte::SqlCte { name, .. } | Cte::MatchCte { name, .. } => name.clone(),
-            })
-            .collect();
+    let cte_names = sel
+        .ctes
+        .iter()
+        .map(|c| match c {
+            Cte::SqlCte { name, .. } | Cte::MatchCte { name, .. } => name.as_str(),
+        })
+        .collect::<Vec<_>>();
 
-        if !cte_names.contains(&referenced) {
+    if let Some(expr) = &sel.body.where_clause {
+        validate_subquery_expr(expr, &cte_names)?;
+    }
+
+    Ok(())
+}
+
+fn validate_select_body(body: &SelectBody) -> Result<()> {
+    if body
+        .order_by
+        .iter()
+        .any(|o| matches!(o.direction, SortDirection::CosineDistance))
+        && body.limit.is_none()
+    {
+        return Err(Error::UnboundedVectorSearch);
+    }
+
+    for from in &body.from {
+        if let FromItem::GraphTable { match_clause, .. } = from {
+            validate_match_clause(match_clause)?;
+        }
+    }
+
+    if let Some(expr) = &body.where_clause {
+        validate_expr(expr)?;
+    }
+
+    Ok(())
+}
+
+fn validate_match_clause(mc: &MatchClause) -> Result<()> {
+    if mc.graph_name.as_ref().is_none_or(|g| g.trim().is_empty()) {
+        return Err(Error::ParseError(
+            "GRAPH_TABLE requires graph name".to_string(),
+        ));
+    }
+    if mc.pattern.start.alias.trim().is_empty() {
+        return Err(Error::ParseError(
+            "MATCH start node alias is required".to_string(),
+        ));
+    }
+
+    for edge in &mc.pattern.edges {
+        if edge.min_hops == 0 && edge.max_hops == 0 {
+            return Err(Error::UnboundedTraversal);
+        }
+        if edge.max_hops == 0 {
+            return Err(Error::UnboundedTraversal);
+        }
+        if edge.min_hops == 0 {
+            return Err(Error::ParseError(
+                "graph quantifier minimum hop must be >= 1".to_string(),
+            ));
+        }
+        if edge.min_hops > edge.max_hops {
+            return Err(Error::ParseError(
+                "graph quantifier minimum cannot exceed maximum".to_string(),
+            ));
+        }
+        if edge.max_hops > 10 {
+            return Err(Error::BfsDepthExceeded(edge.max_hops));
+        }
+    }
+
+    if let Some(expr) = &mc.where_clause {
+        validate_expr(expr)?;
+    }
+
+    Ok(())
+}
+
+fn validate_expr(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::InSubquery { subquery, .. } => {
+            if subquery.from.is_empty() {
+                return Err(Error::SubqueryNotSupported);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            validate_expr(left)?;
+            validate_expr(right)?;
+        }
+        Expr::UnaryOp { operand, .. } => validate_expr(operand)?,
+        Expr::InList { expr, list, .. } => {
+            validate_expr(expr)?;
+            for item in list {
+                validate_expr(item)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            validate_expr(expr)?;
+            validate_expr(pattern)?;
+        }
+        Expr::IsNull { expr, .. } => validate_expr(expr)?,
+        Expr::CosineDistance { left, right } => {
+            validate_expr(left)?;
+            validate_expr(right)?;
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                validate_expr(arg)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
+    match expr {
+        Expr::InSubquery { subquery, .. } => {
+            let referenced = subquery.from.iter().find_map(|f| match f {
+                FromItem::Table { name, .. } => Some(name.as_str()),
+                FromItem::GraphTable { .. } => None,
+            });
+            if let Some(name) = referenced
+                && cte_names.iter().any(|n| n.eq_ignore_ascii_case(name))
+            {
+                return Ok(());
+            }
             return Err(Error::SubqueryNotSupported);
         }
+        Expr::BinaryOp { left, right, .. } => {
+            validate_subquery_expr(left, cte_names)?;
+            validate_subquery_expr(right, cte_names)?;
+        }
+        Expr::UnaryOp { operand, .. } => validate_subquery_expr(operand, cte_names)?,
+        Expr::InList { expr, list, .. } => {
+            validate_subquery_expr(expr, cte_names)?;
+            for item in list {
+                validate_subquery_expr(item, cte_names)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            validate_subquery_expr(expr, cte_names)?;
+            validate_subquery_expr(pattern, cte_names)?;
+        }
+        Expr::IsNull { expr, .. } => validate_subquery_expr(expr, cte_names)?,
+        Expr::CosineDistance { left, right } => {
+            validate_subquery_expr(left, cte_names)?;
+            validate_subquery_expr(right, cte_names)?;
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                validate_subquery_expr(arg, cte_names)?;
+            }
+        }
+        _ => {}
     }
 
-    let src_upper = select_source.to_ascii_uppercase();
-    let from_pos = src_upper.find(" FROM ");
-    let order_pos = src_upper.find(" ORDER BY ");
-    let limit_pos = src_upper.find(" LIMIT ");
-    let where_pos = src_upper.find(" WHERE ");
+    Ok(())
+}
 
-    let columns_part = if let Some(fp) = from_pos {
-        &select_source["SELECT".len()..fp]
+fn parse_identifier(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
     } else {
-        &select_source["SELECT".len()..]
-    };
+        trimmed.to_string()
+    }
+}
 
-    let columns: Vec<SelectColumn> = columns_part
-        .split(',')
-        .map(|c| SelectColumn {
-            expr: parse_literal(c.trim()),
-            alias: None,
-        })
-        .collect();
+fn parse_string_literal(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        trimmed[1..trimmed.len() - 1].replace("''", "'")
+    } else {
+        trimmed.to_string()
+    }
+}
 
-    let from = from_pos
-        .map(|fp| {
-            let end = where_pos
-                .or(order_pos)
-                .or(limit_pos)
-                .unwrap_or(select_source.len());
-            FromItem::Table {
-                name: parse_identifier(select_source[fp + 6..end].trim()),
-                alias: None,
+fn parse_u32(s: &str, err: &str) -> Result<u32> {
+    s.parse::<u32>()
+        .map_err(|_| Error::ParseError(err.to_string()))
+}
+
+fn parse_u64(s: &str, err: &str) -> Result<u64> {
+    s.parse::<u64>()
+        .map_err(|_| Error::ParseError(err.to_string()))
+}
+
+fn parse_i64(s: &str, err: &str) -> Result<i64> {
+    s.parse::<i64>()
+        .map_err(|_| Error::ParseError(err.to_string()))
+}
+
+fn parse_f64(s: &str, err: &str) -> Result<f64> {
+    s.parse::<f64>()
+        .map_err(|_| Error::ParseError(err.to_string()))
+}
+
+fn starts_with_keywords(input: &str, words: &[&str]) -> bool {
+    let tokens: Vec<&str> = input.split_whitespace().take(words.len()).collect();
+
+    if tokens.len() != words.len() {
+        return false;
+    }
+
+    tokens
+        .iter()
+        .zip(words)
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn contains_token_outside_strings(input: &str, token: &str) -> bool {
+    let mut in_str = false;
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if in_str {
+                if let Some((_, next_ch)) = chars.peek()
+                    && *next_ch == '\''
+                {
+                    let _ = chars.next();
+                    continue;
+                }
+                in_str = false;
+            } else {
+                in_str = true;
             }
-        })
-        .into_iter()
-        .collect();
+            continue;
+        }
 
-    let where_clause = where_pos.map(|wp| {
-        let end = order_pos.or(limit_pos).unwrap_or(select_source.len());
-        parse_condition(select_source[wp + 7..end].trim())
-    });
+        if in_str {
+            continue;
+        }
 
-    let mut order_by = Vec::new();
-    if let Some(op) = order_pos {
-        let end = limit_pos.unwrap_or(select_source.len());
-        let expr_text = select_source[op + 10..end].trim();
-        if expr_text.contains("<= >") || expr_text.contains("<=>") {
-            let parts: Vec<&str> = expr_text.split("<=>").collect();
-            if parts.len() == 2 {
-                order_by.push(OrderByItem {
-                    expr: Expr::CosineDistance {
-                        left: Box::new(parse_literal(parts[0].trim())),
-                        right: Box::new(parse_literal(parts[1].trim())),
-                    },
-                    direction: SortDirection::CosineDistance,
-                });
-            }
-        } else {
-            order_by.push(OrderByItem {
-                expr: parse_literal(expr_text),
-                direction: if expr_text.to_ascii_uppercase().ends_with(" DESC") {
-                    SortDirection::Desc
-                } else {
-                    SortDirection::Asc
-                },
-            });
+        if is_word_boundary(input, idx.saturating_sub(1))
+            && input[idx..].len() >= token.len()
+            && input[idx..idx + token.len()].eq_ignore_ascii_case(token)
+            && is_word_boundary(input, idx + token.len())
+        {
+            return true;
         }
     }
 
-    let limit = limit_pos.and_then(|lp| select_source[lp + 7..].trim().parse::<u64>().ok());
+    false
+}
 
-    Ok(Statement::Select(SelectStatement {
-        ctes,
-        body: SelectBody {
-            distinct: false,
-            columns,
-            from,
-            joins: vec![],
-            where_clause,
-            order_by,
-            limit,
-        },
-    }))
+fn contains_where_match_operator(input: &str) -> bool {
+    let mut in_str = false;
+    let mut word = String::new();
+    let mut seen_where = false;
+
+    for ch in input.chars() {
+        if ch == '\'' {
+            in_str = !in_str;
+            if !word.is_empty() {
+                if word.eq_ignore_ascii_case("WHERE") {
+                    seen_where = true;
+                } else if seen_where && word.eq_ignore_ascii_case("MATCH") {
+                    return true;
+                }
+                word.clear();
+            }
+            continue;
+        }
+
+        if in_str {
+            continue;
+        }
+
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word.push(ch);
+            continue;
+        }
+
+        if !word.is_empty() {
+            if word.eq_ignore_ascii_case("WHERE") {
+                seen_where = true;
+            } else if seen_where && word.eq_ignore_ascii_case("MATCH") {
+                return true;
+            } else if seen_where
+                && (word.eq_ignore_ascii_case("GROUP")
+                    || word.eq_ignore_ascii_case("ORDER")
+                    || word.eq_ignore_ascii_case("LIMIT"))
+            {
+                seen_where = false;
+            }
+            word.clear();
+        }
+    }
+
+    if !word.is_empty() && seen_where && word.eq_ignore_ascii_case("MATCH") {
+        return true;
+    }
+
+    false
+}
+
+fn is_word_boundary(s: &str, idx: usize) -> bool {
+    if idx >= s.len() {
+        return true;
+    }
+    !s.as_bytes()[idx].is_ascii_alphanumeric() && s.as_bytes()[idx] != b'_'
 }

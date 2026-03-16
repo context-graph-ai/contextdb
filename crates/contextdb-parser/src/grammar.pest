@@ -1,2 +1,283 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
-statement = { SOI ~ ANY* ~ EOI }
+
+statement = { SOI ~ stmt ~ semicolon? ~ EOI }
+semicolon = _{ ";" }
+
+stmt = _{
+    begin_stmt
+    | commit_stmt
+    | rollback_stmt
+    | create_table_stmt
+    | drop_table_stmt
+    | create_index_stmt
+    | insert_stmt
+    | delete_stmt
+    | update_stmt
+    | select_stmt
+}
+
+begin_stmt = { ^"BEGIN" }
+commit_stmt = { ^"COMMIT" }
+rollback_stmt = { ^"ROLLBACK" }
+
+select_stmt = { with_clause? ~ select_core }
+with_clause = { ^"WITH" ~ recursive_kw? ~ cte_def ~ ("," ~ cte_def)* }
+recursive_kw = { ^"RECURSIVE" }
+cte_def = { identifier ~ ^"AS" ~ "(" ~ select_core ~ ")" }
+
+select_core = {
+    ^"SELECT"
+    ~ distinct_kw?
+    ~ select_list
+    ~ from_clause?
+    ~ where_clause?
+    ~ order_by_clause?
+    ~ limit_clause?
+}
+distinct_kw = { ^"DISTINCT" }
+
+select_list = { star | select_item ~ ("," ~ select_item)* }
+star = { "*" }
+select_item = { expr ~ (^"AS" ~ identifier)? }
+
+from_clause = { ^"FROM" ~ from_item ~ ("," ~ from_item)* }
+from_item = { graph_table | table_ref }
+table_ref = { identifier ~ (^"AS" ~ identifier)? }
+
+where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | limit_start | clause_end) }
+order_by_start = _{ ^"ORDER" ~ ^"BY" }
+limit_start = _{ ^"LIMIT" }
+clause_end = _{ EOI | ")" | "," }
+
+order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
+order_item = { cosine_expr | expr ~ sort_dir? }
+sort_dir = { ^"ASC" | ^"DESC" }
+cosine_expr = { additive_expr ~ "<=>" ~ additive_expr }
+
+limit_clause = { ^"LIMIT" ~ integer }
+
+graph_table = {
+    graph_table_kw
+    ~ "("
+    ~ identifier
+    ~ graph_match_clause
+    ~ graph_where_clause?
+    ~ columns_clause?
+    ~ ")"
+}
+graph_table_kw = { ^"GRAPH_TABLE" }
+graph_match_clause = { ^"MATCH" ~ graph_pattern }
+graph_where_clause = { ^"WHERE" ~ expr ~ &( ^"COLUMNS" | ")" ) }
+columns_clause = { ^"COLUMNS" ~ "(" ~ graph_column ~ ("," ~ graph_column)* ~ ")" }
+graph_column = { expr ~ (^"AS" ~ identifier)? }
+
+graph_pattern = { node_pattern ~ edge_step+ }
+node_pattern = { "(" ~ identifier? ~ (":" ~ identifier)? ~ ")" }
+
+edge_step = { outgoing_edge | incoming_edge | both_edge }
+outgoing_edge = { "-" ~ edge_bracket ~ "->" ~ quantifier? ~ node_pattern }
+incoming_edge = { "<-" ~ edge_bracket ~ "-" ~ quantifier? ~ node_pattern }
+both_edge = { "-" ~ edge_bracket ~ "-" ~ quantifier? ~ node_pattern }
+
+edge_bracket = { "[" ~ edge_spec? ~ "]" }
+edge_spec = { (identifier ~ (":" ~ identifier)?) | (":" ~ identifier) }
+
+quantifier = { plus_quantifier | star_quantifier | bounded_quantifier }
+plus_quantifier = { "+" }
+star_quantifier = { "*" }
+bounded_quantifier = { "{" ~ integer ~ "," ~ integer? ~ "}" }
+
+create_table_stmt = {
+    ^"CREATE"
+    ~ ^"TABLE"
+    ~ if_not_exists?
+    ~ identifier
+    ~ "("
+    ~ column_def
+    ~ ("," ~ column_def)*
+    ~ ")"
+    ~ table_option*
+}
+if_not_exists = { ^"IF" ~ ^"NOT" ~ ^"EXISTS" }
+
+column_def = { identifier ~ data_type ~ column_constraint* }
+
+data_type = {
+    vector_type
+    | ^"UUID"
+    | ^"TEXT"
+    | ^"INTEGER"
+    | ^"INT"
+    | ^"REAL"
+    | ^"FLOAT"
+    | ^"BOOLEAN"
+    | ^"BOOL"
+    | ^"TIMESTAMP"
+    | ^"JSON"
+}
+vector_type = { ^"VECTOR" ~ "(" ~ integer ~ ")" }
+
+column_constraint = {
+    not_null
+    | primary_key
+    | unique
+    | default_clause
+    | references_clause
+    | fk_propagation_clause
+}
+not_null = { ^"NOT" ~ ^"NULL" }
+primary_key = { ^"PRIMARY" ~ ^"KEY" }
+unique = { ^"UNIQUE" }
+default_clause = { ^"DEFAULT" ~ expr }
+references_clause = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
+fk_propagation_clause = {
+    ^"ON"
+    ~ ^"STATE"
+    ~ identifier
+    ~ ^"PROPAGATE"
+    ~ ^"SET"
+    ~ identifier
+    ~ max_depth_clause?
+}
+
+table_option = {
+    immutable_option
+    | state_machine_option
+    | dag_option
+    | propagate_edge_option
+    | propagate_state_option
+}
+immutable_option = { ^"IMMUTABLE" }
+state_machine_option = { ^"STATE" ~ ^"MACHINE" ~ "(" ~ state_machine_entries ~ ")" }
+state_machine_entries = { state_machine_entry ~ ("," ~ state_machine_entry)* }
+state_machine_entry = { (identifier ~ ":")? ~ identifier ~ "->" ~ "[" ~ identifier ~ ("," ~ identifier)* ~ "]" }
+dag_option = { ^"DAG" ~ "(" ~ string ~ ("," ~ string)* ~ ")" }
+propagate_edge_option = {
+    ^"PROPAGATE"
+    ~ ^"ON"
+    ~ ^"EDGE"
+    ~ identifier
+    ~ direction_kw
+    ~ ^"STATE"
+    ~ identifier
+    ~ ^"SET"
+    ~ identifier
+    ~ max_depth_clause?
+}
+propagate_state_option = {
+    ^"PROPAGATE"
+    ~ ^"ON"
+    ~ ^"STATE"
+    ~ identifier
+    ~ ^"EXCLUDE"
+    ~ ^"VECTOR"
+    ~ max_depth_clause?
+}
+max_depth_clause = { ^"MAX" ~ ^"DEPTH" ~ integer }
+direction_kw = { ^"INCOMING" | ^"OUTGOING" | ^"BOTH" }
+
+drop_table_stmt = { ^"DROP" ~ ^"TABLE" ~ if_exists? ~ identifier }
+if_exists = { ^"IF" ~ ^"EXISTS" }
+
+create_index_stmt = {
+    ^"CREATE"
+    ~ ^"INDEX"
+    ~ identifier
+    ~ ^"ON"
+    ~ identifier
+    ~ "("
+    ~ identifier
+    ~ ("," ~ identifier)*
+    ~ ")"
+}
+
+insert_stmt = {
+    ^"INSERT"
+    ~ ^"INTO"
+    ~ identifier
+    ~ "("
+    ~ identifier
+    ~ ("," ~ identifier)*
+    ~ ")"
+    ~ ^"VALUES"
+    ~ values_row
+    ~ ("," ~ values_row)*
+    ~ on_conflict_clause?
+}
+values_row = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
+on_conflict_clause = {
+    ^"ON"
+    ~ ^"CONFLICT"
+    ~ "("
+    ~ identifier
+    ~ ("," ~ identifier)*
+    ~ ")"
+    ~ ^"DO"
+    ~ ^"UPDATE"
+    ~ ^"SET"
+    ~ assignment
+    ~ ("," ~ assignment)*
+}
+assignment = { identifier ~ "=" ~ expr }
+
+delete_stmt = { ^"DELETE" ~ ^"FROM" ~ identifier ~ where_clause? }
+
+update_stmt = {
+    ^"UPDATE"
+    ~ identifier
+    ~ ^"SET"
+    ~ assignment
+    ~ ("," ~ assignment)*
+    ~ where_clause?
+}
+
+expr = { or_expr }
+or_expr = { and_expr ~ (or_op ~ and_expr)* }
+or_op = @{ ^"OR" ~ !ident_char }
+and_expr = { unary_bool_expr ~ (and_op ~ unary_bool_expr)* }
+and_op = @{ ^"AND" ~ !ident_char }
+unary_bool_expr = { not_op* ~ comparison_expr }
+not_op = @{ ^"NOT" ~ !ident_char }
+
+comparison_expr = { additive_expr ~ comparison_suffix? }
+comparison_suffix = { between_suffix | in_suffix | like_suffix | is_null_suffix | cmp_suffix }
+cmp_suffix = { cmp_op ~ additive_expr }
+cmp_op = { "=" | "!=" | "<>" | "<=" | ">=" | "<" | ">" }
+between_suffix = { ^"BETWEEN" ~ additive_expr ~ ^"AND" ~ additive_expr }
+in_suffix = { not_op? ~ ^"IN" ~ "(" ~ in_contents ~ ")" }
+in_contents = { select_core | expr ~ ("," ~ expr)* }
+like_suffix = { not_op? ~ ^"LIKE" ~ additive_expr }
+is_null_suffix = { ^"IS" ~ not_op? ~ ^"NULL" }
+
+additive_expr = { multiplicative_expr ~ (add_op ~ multiplicative_expr)* }
+add_op = { "+" | "-" }
+multiplicative_expr = { unary_math_expr ~ (mul_op ~ unary_math_expr)* }
+mul_op = { "*" | "/" }
+unary_math_expr = { unary_minus* ~ primary_expr }
+unary_minus = { "-" }
+
+primary_expr = {
+    function_call
+    | parameter
+    | null_lit
+    | bool_lit
+    | float
+    | integer
+    | string
+    | column_ref
+    | "(" ~ expr ~ ")"
+}
+function_call = { identifier ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+column_ref = { identifier ~ ("." ~ identifier)? }
+
+parameter = @{ "$" ~ ident }
+null_lit = { ^"NULL" }
+bool_lit = { ^"TRUE" | ^"FALSE" }
+float = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ ASCII_DIGIT+ }
+string = @{ "'" ~ ("''" | (!"'" ~ ANY))* ~ "'" }
+
+ident_char = _{ ASCII_ALPHANUMERIC | "_" }
+ident = @{ (ASCII_ALPHA | "_") ~ ident_char* }
+quoted_ident = @{ "\"" ~ ("\"\"" | (!"\"" ~ ANY))* ~ "\"" }
+identifier = { quoted_ident | ident }
