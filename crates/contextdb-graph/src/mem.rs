@@ -5,15 +5,28 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 const MAX_VISITED: usize = 100_000;
+type AdjPair = (NodeId, NodeId);
 
 pub struct MemGraphExecutor<S: WriteSetApplicator> {
     store: Arc<GraphStore>,
     tx_mgr: Arc<TxManager<S>>,
+    dag_edge_types: parking_lot::RwLock<HashSet<String>>,
 }
 
 impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     pub fn new(store: Arc<GraphStore>, tx_mgr: Arc<TxManager<S>>) -> Self {
-        Self { store, tx_mgr }
+        Self {
+            store,
+            tx_mgr,
+            dag_edge_types: parking_lot::RwLock::new(HashSet::new()),
+        }
+    }
+
+    pub fn register_dag_edge_types(&self, types: &[String]) {
+        let mut set = self.dag_edge_types.write();
+        for t in types {
+            set.insert(t.clone());
+        }
     }
 
     pub fn edge_count(&self, source: NodeId, edge_type: &str, snapshot: SnapshotId) -> usize {
@@ -26,6 +39,71 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    fn bfs_with_write_set(
+        &self,
+        tx: TxId,
+        start: NodeId,
+        goal: NodeId,
+        edge_type: &str,
+    ) -> Result<bool> {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(start);
+        queue.push_back(start);
+
+        let (ws_inserts, ws_deletes): (Vec<AdjPair>, HashSet<AdjPair>) =
+            self.tx_mgr.with_write_set(tx, |ws| {
+                let inserts = ws
+                    .adj_inserts
+                    .iter()
+                    .filter(|e| e.edge_type == edge_type)
+                    .map(|e| (e.source, e.target))
+                    .collect();
+                let deletes = ws
+                    .adj_deletes
+                    .iter()
+                    .filter(|(_, et, _, _)| et == edge_type)
+                    .map(|(s, _, t, _)| (*s, *t))
+                    .collect();
+                (inserts, deletes)
+            })?;
+
+        while let Some(current) = queue.pop_front() {
+            {
+                let fwd = self.store.forward_adj.read();
+                if let Some(entries) = fwd.get(&current) {
+                    for e in entries {
+                        if e.edge_type != edge_type || e.deleted_tx.is_some() {
+                            continue;
+                        }
+                        if ws_deletes.contains(&(e.source, e.target)) {
+                            continue;
+                        }
+                        if e.target == goal {
+                            return Ok(true);
+                        }
+                        if visited.insert(e.target) {
+                            queue.push_back(e.target);
+                        }
+                    }
+                }
+            }
+
+            for (src, tgt) in &ws_inserts {
+                if *src == current {
+                    if *tgt == goal {
+                        return Ok(true);
+                    }
+                    if visited.insert(*tgt) {
+                        queue.push_back(*tgt);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -137,6 +215,53 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         edge_type: EdgeType,
         properties: std::collections::HashMap<String, Value>,
     ) -> Result<()> {
+        let deleted_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
+            ws.adj_deletes
+                .iter()
+                .any(|(s, et, t, _)| *s == source && *t == target && et == &edge_type)
+        })?;
+
+        {
+            let fwd = self.store.forward_adj.read();
+            if let Some(entries) = fwd.get(&source) {
+                let live_in_committed = entries.iter().any(|e| {
+                    e.target == target && e.edge_type == edge_type && e.deleted_tx.is_none()
+                });
+                if live_in_committed && !deleted_in_ws {
+                    return Ok(());
+                }
+            }
+        }
+
+        let duplicate_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
+            let inserted = ws
+                .adj_inserts
+                .iter()
+                .any(|e| e.source == source && e.target == target && e.edge_type == edge_type);
+            inserted && !deleted_in_ws
+        })?;
+        if duplicate_in_ws {
+            return Ok(());
+        }
+
+        if self.dag_edge_types.read().contains(&edge_type) {
+            if source == target {
+                return Err(Error::CycleDetected {
+                    edge_type: edge_type.clone(),
+                    source_node: source,
+                    target_node: target,
+                });
+            }
+
+            if self.bfs_with_write_set(tx, target, source, &edge_type)? {
+                return Err(Error::CycleDetected {
+                    edge_type: edge_type.clone(),
+                    source_node: source,
+                    target_node: target,
+                });
+            }
+        }
+
         let entry = AdjEntry {
             source,
             target,

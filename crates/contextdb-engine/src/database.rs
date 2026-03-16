@@ -91,7 +91,7 @@ impl Database {
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         let stmt = contextdb_parser::parse(sql)?;
 
-        match stmt {
+        match &stmt {
             Statement::Begin => {
                 let mut session = self.session_tx.lock();
                 if session.is_none() {
@@ -121,10 +121,17 @@ impl Database {
         let plan = contextdb_planner::plan(&stmt)?;
         validate_dml(&plan, self, params)?;
         let active_tx = *self.session_tx.lock();
-        match active_tx {
+        let result = match active_tx {
             Some(tx) => execute_plan(self, &plan, params, Some(tx)),
             None => self.execute_autocommit(&plan, params),
+        };
+        if result.is_ok()
+            && let Statement::CreateTable(ct) = &stmt
+            && !ct.dag_edge_types.is_empty()
+        {
+            self.graph.register_dag_edge_types(&ct.dag_edge_types);
         }
+        result
     }
 
     fn execute_autocommit(
@@ -166,7 +173,14 @@ impl Database {
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
         validate_dml(&plan, self, params)?;
-        execute_plan(self, &plan, params, Some(tx))
+        let result = execute_plan(self, &plan, params, Some(tx));
+        if result.is_ok()
+            && let Statement::CreateTable(ct) = &stmt
+            && !ct.dag_edge_types.is_empty()
+        {
+            self.graph.register_dag_edge_types(&ct.dag_edge_types);
+        }
+        result
     }
 
     pub fn insert_row(
