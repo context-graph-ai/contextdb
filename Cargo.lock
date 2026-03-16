@@ -453,6 +453,7 @@ dependencies = [
  "clap",
  "contextdb-core",
  "contextdb-engine",
+ "contextdb-parser",
  "contextdb-server",
  "rustyline",
  "tokio",

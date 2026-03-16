@@ -817,11 +817,13 @@ fn b4_04_traverse_max_depth_10() {
         .expect("depth 11 via direct API");
     assert_eq!(depth_11.nodes.len(), 11);
 
-    let explain_ok =
-        db.explain("WITH n AS (MATCH (a)-[:RELATES_TO*1..10]->(b) RETURN b.id) SELECT * FROM n");
+    let explain_ok = db.explain(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:RELATES_TO]->{1,10}(b) COLUMNS (b.id AS b_id))",
+    );
     assert!(explain_ok.is_ok());
-    let explain_err =
-        db.explain("WITH n AS (MATCH (a)-[:RELATES_TO*1..11]->(b) RETURN b.id) SELECT * FROM n");
+    let explain_err = db.explain(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:RELATES_TO]->{1,11}(b) COLUMNS (b.id AS b_id))",
+    );
     assert!(matches!(explain_err, Err(Error::BfsDepthExceeded(11))));
 }
 

@@ -10,3 +10,6 @@ contextdb-server = { path = "../contextdb-server" }
 rustyline.workspace = true
 clap.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+contextdb-parser = { path = "../contextdb-parser" }

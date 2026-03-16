@@ -32,6 +32,7 @@ pub enum Cte {
 
 #[derive(Debug, Clone)]
 pub struct MatchClause {
+    pub graph_name: Option<String>,
     pub pattern: GraphPattern,
     pub where_clause: Option<Expr>,
     pub return_cols: Vec<ReturnCol>,
@@ -75,8 +76,9 @@ pub enum EdgeDirection {
 
 #[derive(Debug, Clone)]
 pub struct SelectBody {
+    pub distinct: bool,
     pub columns: Vec<SelectColumn>,
-    pub from: Option<FromClause>,
+    pub from: Vec<FromItem>,
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
@@ -90,9 +92,22 @@ pub struct SelectColumn {
 }
 
 #[derive(Debug, Clone)]
-pub struct FromClause {
-    pub table: String,
-    pub alias: Option<String>,
+pub enum FromItem {
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
+    GraphTable {
+        graph_name: String,
+        match_clause: MatchClause,
+        columns: Vec<GraphTableColumn>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphTableColumn {
+    pub expr: Expr,
+    pub alias: String,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +158,11 @@ pub enum Expr {
     InList {
         expr: Box<Expr>,
         list: Vec<Expr>,
+        negated: bool,
+    },
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
         negated: bool,
     },
     InSubquery {

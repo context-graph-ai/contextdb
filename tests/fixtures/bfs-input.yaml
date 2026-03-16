@@ -26,5 +26,5 @@ setup:
     - {source: "D", target: "E", kind: "BASED_ON"}
 
 query:
-  match: "(a:Entity {id: 'A'})-[:BASED_ON*1..3]->(target)"
+  match: "(a:Entity)-[:BASED_ON]->{1,3}(target) WHERE a.id = 'A'"
   return: "target.id"

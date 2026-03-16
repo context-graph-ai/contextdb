@@ -203,7 +203,12 @@ fn handle_sync_command(
 }
 
 fn print_table_meta(table: &str, meta: &TableMeta) {
-    println!("CREATE TABLE {table} (");
+    print!("{}", render_table_meta(table, meta));
+}
+
+fn render_table_meta(table: &str, meta: &TableMeta) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("CREATE TABLE {table} (\n"));
     for (idx, col) in meta.columns.iter().enumerate() {
         let comma = if idx + 1 == meta.columns.len() {
             ""
@@ -212,18 +217,19 @@ fn print_table_meta(table: &str, meta: &TableMeta) {
         };
         let nullable = if col.nullable { "" } else { " NOT NULL" };
         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
-        println!(
+        out.push_str(&format!(
             "  {} {}{}{}{}",
             col.name,
             render_column_type(&col.column_type),
             nullable,
             pk,
             comma
-        );
+        ));
+        out.push('\n');
     }
-    println!(")");
+    out.push_str(")\n");
     if meta.immutable {
-        println!("IMMUTABLE");
+        out.push_str("IMMUTABLE\n");
     }
     if let Some(sm) = &meta.state_machine {
         let mut entries: Vec<_> = sm.transitions.iter().collect();
@@ -232,7 +238,11 @@ fn print_table_meta(table: &str, meta: &TableMeta) {
             .into_iter()
             .map(|(from, tos)| format!("{from} -> [{}]", tos.join(", ")))
             .collect();
-        println!("STATE MACHINE ({}: {})", sm.column, transitions.join(", "));
+        out.push_str(&format!(
+            "STATE MACHINE ({}: {})\n",
+            sm.column,
+            transitions.join(", ")
+        ));
     }
     if !meta.dag_edge_types.is_empty() {
         let edge_types = meta
@@ -241,8 +251,9 @@ fn print_table_meta(table: &str, meta: &TableMeta) {
             .map(|edge_type| format!("'{edge_type}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        println!("DAG({edge_types})");
+        out.push_str(&format!("DAG({edge_types})\n"));
     }
+    out
 }
 
 fn render_column_type(col_type: &ColumnType) -> String {
@@ -274,6 +285,7 @@ fn execute_sql(db: &Database, sql: &str) {
 mod tests {
     use super::*;
     use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
+    use contextdb_parser::{Statement, parse};
 
     #[test]
     fn test_backslash_dt() {
@@ -407,5 +419,19 @@ mod tests {
                 result
             );
         }
+    }
+
+    #[test]
+    fn rt2_repl_schema_display_round_trip_parse() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE repl_rt_sm (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: pending -> [done])",
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let meta = db.table_meta("repl_rt_sm").expect("table meta");
+        let rendered = render_table_meta("repl_rt_sm", &meta);
+        assert!(matches!(parse(&rendered), Ok(Statement::CreateTable(_))));
     }
 }

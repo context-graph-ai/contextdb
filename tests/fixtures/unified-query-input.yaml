@@ -44,13 +44,13 @@ setup:
 
 query:
   sql: |
-    WITH neighborhood AS (
-        MATCH (e:Entity {id: 'hub'})-[:RELATES_TO*1..2]->(n:Entity)
-        RETURN n.id
-    )
+    WITH neighborhood AS (SELECT n_id FROM GRAPH_TABLE (
+      edges MATCH (e:Entity)-[:RELATES_TO]->{1,2}(n:Entity) WHERE e.id = 'hub'
+      COLUMNS (n.id AS n_id)
+    ))
     SELECT o.id, o.data
     FROM observations o
-    INNER JOIN neighborhood n ON o.entity_id = n.id
+    INNER JOIN neighborhood n ON o.entity_id = n.n_id
     WHERE o.context_id = 'ctx-001'
     ORDER BY o.embedding <=> '[1.0, 0.0, 0.0, 0.0]'
     LIMIT 3

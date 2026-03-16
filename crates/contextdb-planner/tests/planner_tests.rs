@@ -4,8 +4,10 @@ use contextdb_planner::{PhysicalPlan, plan};
 
 #[test]
 fn match_cte_routes_to_graph_bfs() {
-    let stmt =
-        parse("WITH n AS (MATCH (a)-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM n").unwrap();
+    let stmt = parse(
+        "WITH n AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:BASED_ON]->{1,3}(b) COLUMNS(b.id AS b_id))) SELECT * FROM n",
+    )
+    .unwrap();
     let p = plan(&stmt).unwrap();
     let text = p.explain();
     assert!(text.contains("GraphBfs"));
@@ -30,7 +32,7 @@ fn standard_select_routes_to_scan() {
 #[test]
 fn unified_query_contains_graph_relational_vector() {
     let stmt = parse(
-        "WITH n AS (MATCH (a)-[:BASED_ON*1..3]->(b) RETURN b.id) SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 5",
+        "WITH n AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:BASED_ON]->{1,3}(b) COLUMNS(b.id AS b_id))) SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 5",
     )
     .unwrap();
     let p = plan(&stmt).unwrap();
@@ -50,8 +52,10 @@ fn immutability_checked_at_runtime_not_plan_time() {
 
 #[test]
 fn depth_over_cap_rejected() {
-    let stmt =
-        parse("WITH n AS (MATCH (a)-[:BASED_ON*1..11]->(b) RETURN b.id) SELECT * FROM n").unwrap();
+    let stmt = parse(
+        "WITH n AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:BASED_ON]->{1,11}(b) COLUMNS(b.id AS b_id))) SELECT * FROM n",
+    )
+    .unwrap();
     let err = plan(&stmt).unwrap_err();
     assert!(matches!(err, Error::BfsDepthExceeded(11)));
 }

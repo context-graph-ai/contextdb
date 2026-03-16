@@ -1,5 +1,7 @@
 use super::helpers::{make_params, setup_ontology_db, setup_ontology_db_with_dag};
 use contextdb_core::{Direction, Error, UpsertResult, Value, VersionedRow};
+use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
+use contextdb_parser::{Statement as AstStatement, parse as parse_sql};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -16,6 +18,31 @@ fn uuid_value(row: &VersionedRow, key: &str) -> Uuid {
         .get(key)
         .and_then(Value::as_uuid)
         .expect("expected uuid value")
+}
+
+fn ddl_sql_from_change(change: &DdlChange) -> String {
+    match change {
+        DdlChange::CreateTable {
+            name,
+            columns,
+            constraints,
+        } => {
+            let mut sql = format!(
+                "CREATE TABLE {} ({})",
+                name,
+                columns
+                    .iter()
+                    .map(|(col, ty)| format!("{col} {ty}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !constraints.is_empty() {
+                sql.push(' ');
+                sql.push_str(&constraints.join(" "));
+            }
+            sql
+        }
+    }
 }
 
 #[test]
@@ -114,6 +141,112 @@ fn a1_05_create_table_columns_preserved() {
     let _db = setup_ontology_db();
     // TODO: open file-backed DB, create mixed-type table, close/reopen, verify exact column types.
     todo!("requires Database::open(path)");
+}
+
+#[test]
+fn rt1_composite_store_ddl_round_trip_parse() {
+    let db = contextdb_engine::Database::open_memory();
+    let params = HashMap::new();
+
+    db.execute(
+        "CREATE TABLE rt_immutable (id UUID PRIMARY KEY, data TEXT) IMMUTABLE",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE rt_state_machine (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: pending -> [done])",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE rt_dag (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
+        &params,
+    )
+    .unwrap();
+
+    let ddl = db.ddl_log_since(0);
+    assert_eq!(ddl.len(), 3);
+
+    for change in ddl {
+        let sql = ddl_sql_from_change(&change);
+        let stmt = parse_sql(&sql).expect("rendered DDL should parse");
+        let AstStatement::CreateTable(parsed) = stmt else {
+            panic!("expected CREATE TABLE");
+        };
+        let DdlChange::CreateTable {
+            name,
+            columns,
+            constraints,
+        } = change;
+
+        assert_eq!(parsed.name, name);
+        assert_eq!(parsed.columns.len(), columns.len());
+        for ((expected_name, _), parsed_col) in columns.iter().zip(parsed.columns.iter()) {
+            assert_eq!(&parsed_col.name, expected_name);
+        }
+        if constraints.iter().any(|c| c == "IMMUTABLE") {
+            assert!(parsed.immutable);
+        }
+        if constraints.iter().any(|c| c.starts_with("STATE MACHINE")) {
+            assert!(parsed.state_machine.is_some());
+        }
+        if constraints.iter().any(|c| c.starts_with("DAG(")) {
+            assert!(!parsed.dag_edge_types.is_empty());
+        }
+    }
+}
+
+#[test]
+fn rt3_database_apply_changes_ddl_round_trip() {
+    let db = contextdb_engine::Database::open_memory();
+    let changes = ChangeSet {
+        ddl: vec![
+            DdlChange::CreateTable {
+                name: "rt3_immutable".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID".to_string()),
+                    ("name".to_string(), "TEXT".to_string()),
+                ],
+                constraints: vec!["IMMUTABLE".to_string()],
+            },
+            DdlChange::CreateTable {
+                name: "rt3_state_machine".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID".to_string()),
+                    ("status".to_string(), "TEXT".to_string()),
+                ],
+                constraints: vec!["STATE MACHINE (status: pending -> [done])".to_string()],
+            },
+            DdlChange::CreateTable {
+                name: "rt3_dag".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID".to_string()),
+                    ("source_id".to_string(), "UUID".to_string()),
+                    ("target_id".to_string(), "UUID".to_string()),
+                    ("edge_type".to_string(), "TEXT".to_string()),
+                ],
+                constraints: vec!["DAG('CITES')".to_string()],
+            },
+        ],
+        ..Default::default()
+    };
+    db.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
+    )
+    .expect("apply changes");
+
+    let immutable = db.table_meta("rt3_immutable").expect("immutable table");
+    assert!(immutable.immutable);
+    assert_eq!(immutable.columns.len(), 2);
+
+    let state_machine = db.table_meta("rt3_state_machine").expect("state table");
+    assert!(state_machine.state_machine.is_some());
+    assert_eq!(state_machine.columns.len(), 2);
+
+    let dag = db.table_meta("rt3_dag").expect("dag table");
+    assert_eq!(dag.dag_edge_types, vec!["CITES".to_string()]);
+    assert_eq!(dag.columns.len(), 4);
 }
 
 #[test]
@@ -816,7 +949,9 @@ fn a3_09_bfs_fan_out() {
 fn a3_10_bfs_via_match_sql_explain_only() {
     let db = setup_ontology_db();
     let explain = db
-        .explain("WITH n AS (MATCH (a)-[:BASED_ON*1..2]->(b) RETURN b.id) SELECT * FROM n")
+        .explain(
+            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,2}(b) COLUMNS (b.id AS b_id))",
+        )
         .expect("explain");
     assert!(explain.contains("GraphBfs"));
 }
@@ -880,7 +1015,9 @@ fn a3_12_edge_deletion_reflected_in_bfs() {
 fn a3_13_bfs_over_adjacency_not_recursive_cte() {
     let db = setup_ontology_db();
     let explain = db
-        .explain("WITH n AS (MATCH (a)-[:BASED_ON*1..2]->(b) RETURN b.id) SELECT * FROM n")
+        .explain(
+            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,2}(b) COLUMNS (b.id AS b_id))",
+        )
         .expect("explain");
     assert!(explain.contains("GraphBfs"));
     assert!(!explain.contains("RecursiveCte"));
@@ -2149,7 +2286,7 @@ fn a7_03_stored_procedure_rejected() {
 fn a7_04_unbounded_traversal_rejected() {
     let db = setup_ontology_db();
     let result = db.execute(
-        "WITH n AS (MATCH (a)-[:EDGE*]->(b) RETURN b) SELECT * FROM n",
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:EDGE]->+(b) COLUMNS (b.id AS b_id))",
         &HashMap::new(),
     );
     assert!(matches!(result, Err(Error::UnboundedTraversal)));
@@ -2213,7 +2350,7 @@ fn a7_08_full_text_search_rejected() {
 fn a7_08b_graph_match_still_works() {
     let db = setup_ontology_db();
     let result = db.execute(
-        "WITH n AS (MATCH (a)-[:BASED_ON*1..2]->(b) RETURN b.id) SELECT * FROM n",
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,2}(b) COLUMNS (b.id AS b_id))",
         &HashMap::new(),
     );
     assert!(!matches!(result, Err(Error::FullTextSearchNotSupported)));

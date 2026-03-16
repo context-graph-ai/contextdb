@@ -27,7 +27,9 @@ fn job_02_impact_analysis_explain_and_result() {
     assert!(!bfs.nodes.is_empty());
 
     let explain = db
-        .explain("WITH n AS (MATCH (a)-[:BASED_ON*1..2]->(b) RETURN b.id) SELECT * FROM n")
+        .explain(
+            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,2}(b) COLUMNS (b.id AS b_id))",
+        )
         .unwrap();
     assert!(explain.contains("GraphBfs"));
 }

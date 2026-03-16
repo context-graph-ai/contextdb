@@ -623,6 +623,7 @@ fn parse_select(s: &str) -> Result<Statement> {
             ctes.push(Cte::MatchCte {
                 name: cte_name,
                 match_clause: MatchClause {
+                    graph_name: None,
                     pattern: GraphPattern {
                         start: NodePattern {
                             alias: "a".to_string(),
@@ -639,8 +640,9 @@ fn parse_select(s: &str) -> Result<Statement> {
             ctes.push(Cte::SqlCte {
                 name: cte_name,
                 query: SelectBody {
+                    distinct: false,
                     columns: vec![],
-                    from: None,
+                    from: vec![],
                     joins: vec![],
                     where_clause: None,
                     order_by: vec![],
@@ -704,16 +706,19 @@ fn parse_select(s: &str) -> Result<Statement> {
         })
         .collect();
 
-    let from = from_pos.map(|fp| {
-        let end = where_pos
-            .or(order_pos)
-            .or(limit_pos)
-            .unwrap_or(select_source.len());
-        FromClause {
-            table: parse_identifier(select_source[fp + 6..end].trim()),
-            alias: None,
-        }
-    });
+    let from = from_pos
+        .map(|fp| {
+            let end = where_pos
+                .or(order_pos)
+                .or(limit_pos)
+                .unwrap_or(select_source.len());
+            FromItem::Table {
+                name: parse_identifier(select_source[fp + 6..end].trim()),
+                alias: None,
+            }
+        })
+        .into_iter()
+        .collect();
 
     let where_clause = where_pos.map(|wp| {
         let end = order_pos.or(limit_pos).unwrap_or(select_source.len());
@@ -752,6 +757,7 @@ fn parse_select(s: &str) -> Result<Statement> {
     Ok(Statement::Select(SelectStatement {
         ctes,
         body: SelectBody {
+            distinct: false,
             columns,
             from,
             joins: vec![],

@@ -1,6 +1,6 @@
 use crate::plan::*;
 use contextdb_core::{Direction, Error, Result};
-use contextdb_parser::ast::{Cte, Expr, SelectStatement, SortDirection, Statement};
+use contextdb_parser::ast::{Cte, Expr, FromItem, SelectStatement, SortDirection, Statement};
 
 const DEFAULT_MATCH_DEPTH: u32 = 5;
 const ENGINE_MAX_BFS_DEPTH: u32 = 10;
@@ -91,8 +91,11 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     let from_table = sel
         .body
         .from
-        .as_ref()
-        .map(|f| f.table.clone())
+        .iter()
+        .find_map(|item| match item {
+            FromItem::Table { name, .. } => Some(name.clone()),
+            FromItem::GraphTable { .. } => None,
+        })
         .unwrap_or_else(|| "dual".to_string());
 
     let mut current = PhysicalPlan::Scan {
@@ -108,8 +111,11 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
             table: sel
                 .body
                 .from
-                .as_ref()
-                .map(|f| f.table.clone())
+                .iter()
+                .find_map(|item| match item {
+                    FromItem::Table { name, .. } => Some(name.clone()),
+                    FromItem::GraphTable { .. } => None,
+                })
                 .unwrap_or_else(|| "observations".to_string()),
             column: "embedding".to_string(),
             query_expr: order.expr.clone(),
