@@ -52,12 +52,18 @@ fn immutability_checked_at_runtime_not_plan_time() {
 
 #[test]
 fn depth_over_cap_rejected() {
-    let stmt = parse(
+    let parsed = parse(
         "WITH n AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:BASED_ON]->{1,11}(b) COLUMNS(b.id AS b_id))) SELECT * FROM n",
-    )
-    .unwrap();
-    let err = plan(&stmt).unwrap_err();
-    assert!(matches!(err, Error::BfsDepthExceeded(11)));
+    );
+
+    match parsed {
+        Err(Error::BfsDepthExceeded(11)) => {}
+        Ok(stmt) => {
+            let err = plan(&stmt).unwrap_err();
+            assert!(matches!(err, Error::BfsDepthExceeded(11)));
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

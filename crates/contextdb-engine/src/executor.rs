@@ -128,6 +128,38 @@ pub(crate) fn execute_plan(
             })
         }
         PhysicalPlan::MaterializeCte { input, .. } => execute_plan(db, input, params, tx),
+        PhysicalPlan::Project { input, columns } => {
+            let input_result = execute_plan(db, input, params, tx)?;
+            let output_columns = columns
+                .iter()
+                .map(|c| {
+                    c.alias.clone().unwrap_or_else(|| match &c.expr {
+                        Expr::Column(col) => col.column.clone(),
+                        _ => "expr".to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut output_rows = Vec::with_capacity(input_result.rows.len());
+            for row in &input_result.rows {
+                let mut projected = Vec::with_capacity(columns.len());
+                for col in columns {
+                    projected.push(eval_project_expr(
+                        &col.expr,
+                        row,
+                        &input_result.columns,
+                        params,
+                    )?);
+                }
+                output_rows.push(projected);
+            }
+
+            Ok(QueryResult {
+                columns: output_columns,
+                rows: output_rows,
+                rows_affected: 0,
+            })
+        }
         PhysicalPlan::Pipeline(plans) => {
             let mut last = QueryResult::empty();
             for p in plans {
@@ -138,6 +170,31 @@ pub(crate) fn execute_plan(
         _ => Err(Error::PlanError(
             "unsupported plan node in executor".to_string(),
         )),
+    }
+}
+
+fn eval_project_expr(
+    expr: &Expr,
+    row: &[Value],
+    input_columns: &[String],
+    params: &HashMap<String, Value>,
+) -> Result<Value> {
+    match expr {
+        Expr::Column(c) => {
+            let idx = input_columns
+                .iter()
+                .position(|name| name == &c.column)
+                .ok_or_else(|| {
+                    Error::PlanError(format!("project column not found: {}", c.column))
+                })?;
+            Ok(row.get(idx).cloned().unwrap_or(Value::Null))
+        }
+        Expr::Literal(lit) => resolve_expr(&Expr::Literal(lit.clone()), params),
+        Expr::Parameter(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", name))),
+        _ => resolve_expr(expr, params),
     }
 }
 
