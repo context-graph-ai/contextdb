@@ -1904,6 +1904,72 @@ fn b6_09_update_nonexistent_entity() {
     }
 }
 
+#[test]
+fn b6_10_null_valid_to_means_current() {
+    let db = setup_ontology_db();
+    let e = Uuid::new_v4();
+    let snap_id = Uuid::new_v4();
+    let tx = db.begin();
+    insert_entity(&db, tx, e, "camera", "pos=north");
+    // Insert snapshot with valid_from=100 and NO valid_to (NULL → still current)
+    db.insert_row(
+        tx,
+        "entity_snapshots",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(snap_id)),
+            ("entity_id".to_string(), Value::Uuid(e)),
+            ("state".to_string(), Value::Text("pos=north".to_string())),
+            ("valid_from".to_string(), Value::Int64(100)),
+        ]),
+    )
+    .expect("snapshot with null valid_to");
+    db.commit(tx).expect("commit");
+
+    // Query at t=999: valid_from <= 999 AND (valid_to is NULL OR valid_to > 999)
+    let current = db
+        .scan_filter("entity_snapshots", db.snapshot(), &|r| {
+            r.values.get("entity_id") == Some(&Value::Uuid(e))
+                && r.values
+                    .get("valid_from")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|vf| vf <= 999)
+                && match r.values.get("valid_to") {
+                    None | Some(&Value::Null) => true,
+                    Some(v) => v.as_i64().is_some_and(|vt| vt > 999),
+                }
+        })
+        .expect("scan at t=999");
+    assert_eq!(
+        current.len(),
+        1,
+        "NULL valid_to snapshot should be found at t=999"
+    );
+    assert_eq!(
+        current[0].values.get("id"),
+        Some(&Value::Uuid(snap_id)),
+        "should return the correct snapshot"
+    );
+
+    // Query at t=50: valid_from <= 50 — should return nothing (before snapshot)
+    let before = db
+        .scan_filter("entity_snapshots", db.snapshot(), &|r| {
+            r.values.get("entity_id") == Some(&Value::Uuid(e))
+                && r.values
+                    .get("valid_from")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|vf| vf <= 50)
+                && match r.values.get("valid_to") {
+                    None | Some(&Value::Null) => true,
+                    Some(v) => v.as_i64().is_some_and(|vt| vt > 50),
+                }
+        })
+        .expect("scan at t=50");
+    assert!(
+        before.is_empty(),
+        "no snapshot should exist before valid_from=100"
+    );
+}
+
 // B7 Decision CRUD
 #[test]
 fn b7_01_record_decision_with_reasoning() {
