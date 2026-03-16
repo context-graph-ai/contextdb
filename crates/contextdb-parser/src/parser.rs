@@ -21,6 +21,11 @@ pub fn parse(input: &str) -> Result<Statement> {
     if upper.starts_with("CREATE PROCEDURE") || upper.starts_with("CREATE FUNCTION") {
         return Err(Error::StoredProcNotSupported);
     }
+    if let Some(where_pos) = upper.find(" WHERE ")
+        && upper[where_pos..].contains(" MATCH ")
+    {
+        return Err(Error::FullTextSearchNotSupported);
+    }
     if upper.contains("MATCH") && upper.contains("*") && !upper.contains("..") {
         return Err(Error::UnboundedTraversal);
     }

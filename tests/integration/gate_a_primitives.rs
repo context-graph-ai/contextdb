@@ -1887,15 +1887,23 @@ fn a7_07_cte_reference_in_where_allowed() {
 }
 
 #[test]
-#[ignore = "requires parser rejection of WHERE MATCH"]
 fn a7_08_full_text_search_rejected() {
     let db = setup_ontology_db();
-    // TODO: once WHERE MATCH parser rejection is implemented, assert exact rejection variant.
-    let _ = db.execute(
+    let result = db.execute(
         "SELECT * FROM observations WHERE text MATCH 'pattern'",
         &HashMap::new(),
     );
-    todo!("requires parser rejection of WHERE MATCH");
+    assert!(matches!(result, Err(Error::FullTextSearchNotSupported)));
+}
+
+#[test]
+fn a7_08b_graph_match_still_works() {
+    let db = setup_ontology_db();
+    let result = db.execute(
+        "WITH n AS (MATCH (a)-[:BASED_ON*1..2]->(b) RETURN b.id) SELECT * FROM n",
+        &HashMap::new(),
+    );
+    assert!(!matches!(result, Err(Error::FullTextSearchNotSupported)));
 }
 
 #[test]

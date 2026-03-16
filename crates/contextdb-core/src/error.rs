@@ -38,6 +38,8 @@ pub enum Error {
     UnboundedVectorSearch,
     #[error("subqueries not supported; use CTE chaining")]
     SubqueryNotSupported,
+    #[error("full-text search (WHERE column MATCH) is not supported")]
+    FullTextSearchNotSupported,
     #[error("parse error: {0}")]
     ParseError(String),
     #[error("plan error: {0}")]
