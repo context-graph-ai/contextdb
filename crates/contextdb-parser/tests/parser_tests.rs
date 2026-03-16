@@ -1068,3 +1068,234 @@ fn sql_pgq_graph_table_keyword_case_insensitive() {
         }
     }
 }
+
+#[test]
+fn anti_string_scan_nested_parens_in_where() {
+    // Deeply nested boolean with parens — string scanner can't track paren depth
+    let result = parse(
+        "SELECT * FROM entities WHERE ((a = 1 AND (b = 2 OR c = 3)) OR (d = 4 AND e = 5)) AND f = 6",
+    );
+    assert!(result.is_ok());
+    if let Ok(Statement::Select(sel)) = result {
+        // The outermost operator must be AND (... AND f = 6)
+        assert!(
+            matches!(
+                &sel.body.where_clause,
+                Some(Expr::BinaryOp { op: BinOp::And, .. })
+            ),
+            "top-level WHERE should be AND, got {:?}",
+            sel.body.where_clause
+        );
+        // The left side of that AND must be an OR (the two paren groups)
+        if let Some(Expr::BinaryOp { left, op, .. }) = &sel.body.where_clause {
+            assert_eq!(*op, BinOp::And);
+            assert!(
+                matches!(left.as_ref(), Expr::BinaryOp { op: BinOp::Or, .. }),
+                "left of top AND should be OR, got {:?}",
+                left
+            );
+        }
+    }
+}
+
+#[test]
+fn anti_string_scan_keyword_in_column_name() {
+    // Column named "select_count", "from_date", alias "as_val" — scanner confuses with keywords
+    let result =
+        parse("SELECT select_count, from_date AS as_val FROM table_from WHERE where_clause = $val");
+    assert!(result.is_ok());
+    if let Ok(Statement::Select(sel)) = result {
+        // Must have exactly 2 columns
+        assert_eq!(
+            sel.body.columns.len(),
+            2,
+            "expected 2 columns, got {:?}",
+            sel.body.columns
+        );
+        // First column must be "select_count"
+        assert!(
+            matches!(&sel.body.columns[0].expr, Expr::Column(cr) if cr.column == "select_count"),
+            "first column should be 'select_count', got {:?}",
+            sel.body.columns[0]
+        );
+        // Second column must be "from_date" with alias "as_val"
+        assert!(
+            matches!(&sel.body.columns[1].expr, Expr::Column(cr) if cr.column == "from_date"),
+            "second column should be 'from_date', got {:?}",
+            sel.body.columns[1]
+        );
+        assert_eq!(
+            sel.body.columns[1].alias.as_deref(),
+            Some("as_val"),
+            "second column alias should be 'as_val', got {:?}",
+            sel.body.columns[1].alias
+        );
+    }
+}
+
+#[test]
+fn anti_string_scan_string_literal_with_sql() {
+    // String literal contains complete SQL statement — scanner must not parse it
+    let result = parse(
+        "INSERT INTO logs (id, query) VALUES ($id, 'SELECT * FROM GRAPH_TABLE (edges MATCH (a)-[:EDGE]->(b) COLUMNS (b.id AS b_id))')",
+    );
+    assert!(matches!(result, Ok(Statement::Insert(_))));
+    if let Ok(Statement::Insert(ins)) = result {
+        assert_eq!(ins.columns.len(), 2, "expected 2 columns");
+        assert_eq!(ins.columns[0], "id");
+        assert_eq!(ins.columns[1], "query");
+        assert_eq!(ins.values.len(), 1, "expected 1 row");
+        assert_eq!(ins.values[0].len(), 2, "expected 2 values in row");
+        // The second value must be a Text literal containing the SQL string, not parsed as SQL
+        assert!(
+            matches!(&ins.values[0][1], Expr::Literal(Literal::Text(t)) if t.contains("GRAPH_TABLE")),
+            "second value should be a string literal containing GRAPH_TABLE, got {:?}",
+            ins.values[0][1]
+        );
+    }
+}
+
+#[test]
+fn anti_string_scan_escaped_quotes_in_string() {
+    // Escaped quotes inside string literal
+    let result = parse(
+        "INSERT INTO entities (id, name) VALUES ($id, 'it''s a ''quoted'' value WITH ''MATCH'' inside')",
+    );
+    assert!(matches!(result, Ok(Statement::Insert(_))));
+    if let Ok(Statement::Insert(ins)) = result {
+        assert_eq!(ins.values[0].len(), 2, "expected 2 values");
+        // The second value must be a single Text literal with escaped quotes resolved
+        assert!(
+            matches!(
+                &ins.values[0][1],
+                Expr::Literal(Literal::Text(t)) if t.contains("it's") && t.contains("MATCH")
+            ),
+            "second value should be text with escaped quotes resolved, got {:?}",
+            ins.values[0][1]
+        );
+    }
+}
+
+#[test]
+fn anti_string_scan_graph_table_in_string_literal() {
+    // GRAPH_TABLE keyword inside a string literal with commas — scanner splits on commas in string
+    let result = parse(
+        "INSERT INTO logs (id, sql_text) VALUES ($id, 'SELECT a, b FROM GRAPH_TABLE (edges MATCH (a)->(b) COLUMNS (a.id AS a_id, b.id AS b_id))')",
+    );
+    assert!(matches!(result, Ok(Statement::Insert(_))));
+    if let Ok(Statement::Insert(ins)) = result {
+        assert_eq!(ins.table, "logs");
+        assert_eq!(ins.columns.len(), 2);
+        // Must be exactly 2 values — scanner that splits on commas inside string literal will see more
+        assert_eq!(
+            ins.values[0].len(),
+            2,
+            "expected 2 values in row, got {:?}",
+            ins.values[0]
+        );
+        // The second value must be a single Text literal containing the entire SQL string
+        assert!(
+            matches!(&ins.values[0][1], Expr::Literal(Literal::Text(t)) if t.contains("GRAPH_TABLE") && t.contains("COLUMNS")),
+            "second value should be a text literal with GRAPH_TABLE, got {:?}",
+            ins.values[0][1]
+        );
+    }
+}
+
+#[test]
+fn anti_string_scan_multiple_graph_tables_in_from() {
+    // Two GRAPH_TABLEs in FROM — string scanner would struggle with boundaries
+    let result = parse(
+        "SELECT a_id, b_id FROM GRAPH_TABLE (edges MATCH (a)-[:SERVES]->(b) COLUMNS (a.id AS a_id)), GRAPH_TABLE (edges MATCH (c)-[:CITES]->(d) COLUMNS (d.id AS b_id))",
+    );
+    assert!(result.is_ok());
+    if let Ok(Statement::Select(sel)) = result {
+        let gt_count = sel
+            .body
+            .from
+            .iter()
+            .filter(|f| matches!(f, FromItem::GraphTable { .. }))
+            .count();
+        assert_eq!(gt_count, 2, "expected two GRAPH_TABLE items in FROM");
+    }
+}
+
+#[test]
+fn anti_string_scan_where_with_subexpression_containing_keywords() {
+    // WHERE clause contains identifiers that look like keywords
+    let result = parse(
+        "SELECT * FROM entities WHERE from_date > $start AND to_date < $end AND select_mode = 'auto'",
+    );
+    assert!(result.is_ok());
+    if let Ok(Statement::Select(sel)) = result {
+        // The WHERE clause must be a compound AND expression with three conditions
+        // A string scanner that splits on "AND" without respecting structure will fail
+        let wc = sel.body.where_clause.as_ref().expect("WHERE should exist");
+        // Outermost must be AND
+        assert!(
+            matches!(wc, Expr::BinaryOp { op: BinOp::And, .. }),
+            "top-level WHERE should be AND, got {:?}",
+            wc
+        );
+        // The from_date condition must use Gt (>), not Eq
+        fn contains_gt(e: &Expr) -> bool {
+            match e {
+                Expr::BinaryOp {
+                    left,
+                    op: BinOp::Gt,
+                    ..
+                } => matches!(left.as_ref(), Expr::Column(cr) if cr.column == "from_date"),
+                Expr::BinaryOp { left, right, .. } => contains_gt(left) || contains_gt(right),
+                _ => false,
+            }
+        }
+        assert!(
+            contains_gt(wc),
+            "WHERE should contain from_date > $start, got {:?}",
+            wc
+        );
+    }
+}
+
+#[test]
+fn anti_string_scan_graph_table_with_complex_where() {
+    // GRAPH_TABLE with multi-condition WHERE inside MATCH + conditions outside
+    let result = parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->(b) WHERE a.status = 'active' AND b.confidence > 0.5 COLUMNS (b.id AS b_id)) WHERE b_id IS NOT NULL",
+    );
+    assert!(result.is_ok());
+    if let Ok(Statement::Select(sel)) = result {
+        // Outer WHERE exists
+        assert!(sel.body.where_clause.is_some(), "outer WHERE should exist");
+        // Inner MATCH WHERE exists
+        let gt = sel
+            .body
+            .from
+            .iter()
+            .find(|f| matches!(f, FromItem::GraphTable { .. }));
+        assert!(gt.is_some(), "expected GRAPH_TABLE");
+        if let Some(FromItem::GraphTable { match_clause, .. }) = gt {
+            assert!(
+                match_clause.where_clause.is_some(),
+                "inner MATCH WHERE should exist"
+            );
+        }
+    }
+}
+
+#[test]
+fn anti_string_scan_whitespace_variations() {
+    // Unusual whitespace — tabs, multiple spaces, newlines
+    let result = parse(
+        "SELECT\n  b_id\nFROM\n  GRAPH_TABLE (\n    edges\n    MATCH  (a)-[:EDGE]->(b)\n    COLUMNS  (b.id  AS  b_id)\n  )",
+    );
+    assert!(result.is_ok());
+    if let Ok(Statement::Select(sel)) = result {
+        assert!(
+            sel.body
+                .from
+                .iter()
+                .any(|f| matches!(f, FromItem::GraphTable { .. }))
+        );
+    }
+}
