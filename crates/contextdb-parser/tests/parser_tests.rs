@@ -1,5 +1,7 @@
 use contextdb_core::Error;
-use contextdb_parser::ast::{BinOp, Cte, Expr, ForeignKey, FromItem, Literal, Statement};
+use contextdb_parser::ast::{
+    BinOp, Cte, EdgeDirection, Expr, ForeignKey, FromItem, Literal, Statement,
+};
 use contextdb_parser::parse;
 
 #[test]
@@ -34,12 +36,20 @@ fn parse_valid_sql_subset() {
         parse("SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 10"),
         Ok(Statement::Select(_))
     ));
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a:Entity)-[:BASED_ON]->{1,3}(b) WHERE a.id = $id COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a:Entity)-[:BASED_ON]->{1,3}(b) WHERE a.id = $id COLUMNS (b.id AS b_id))",
     ));
+    assert_eq!(gn, "edges");
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some("edges".to_string()));
+    assert_eq!(mc.pattern.start.label.as_deref(), Some("Entity"));
+    assert_eq!(mc.pattern.edges[0].min_hops, 1);
+    assert_eq!(mc.pattern.edges[0].max_hops, 3);
+    assert!(mc.where_clause.is_some());
+    assert_eq!(cols.len(), 1);
+    // CRITICAL-2: return_cols mirrors columns
+    assert_eq!(mc.return_cols.len(), cols.len());
+    assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
 }
 
 #[test]
@@ -166,12 +176,29 @@ fn sql_edge_case_multi_cte_queries() {
         ),
         Ok(Statement::Select(_))
     ));
-    assert!(matches!(
-        parse(
-            "WITH graph_results AS (SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,3}(b) COLUMNS (b.id AS b_id))), filtered AS (SELECT id FROM decisions WHERE status = 'active') SELECT * FROM graph_results WHERE b_id IN (SELECT id FROM filtered)"
-        ),
-        Ok(Statement::Select(_))
-    ));
+    {
+        let stmt = parse(
+            "WITH graph_results AS (SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,3}(b) COLUMNS (b.id AS b_id))), filtered AS (SELECT id FROM decisions WHERE status = 'active') SELECT * FROM graph_results WHERE b_id IN (SELECT id FROM filtered)",
+        ).expect("parse should succeed");
+        let Statement::Select(sel) = stmt else {
+            panic!("expected Select");
+        };
+        assert_eq!(sel.ctes.len(), 2);
+        // First CTE should contain a GRAPH_TABLE FROM item
+        let Cte::SqlCte { name, query } = &sel.ctes[0] else {
+            panic!("expected SqlCte");
+        };
+        assert_eq!(name, "graph_results");
+        let gt = query
+            .from
+            .iter()
+            .find(|f| matches!(f, FromItem::GraphTable { .. }));
+        assert!(
+            gt.is_some(),
+            "expected FromItem::GraphTable in CTE body, got {:?}",
+            query.from
+        );
+    }
 }
 
 #[test]
@@ -204,142 +231,362 @@ fn sql_edge_case_null_handling_variations() {
     ));
 }
 
+/// Extract the first `FromItem::GraphTable` from a parsed SELECT, panicking with
+/// diagnostics if the statement is not a SELECT or has no GraphTable in FROM.
+fn expect_graph_table(
+    stmt: Result<Statement, contextdb_core::Error>,
+) -> (
+    String,
+    contextdb_parser::ast::MatchClause,
+    Vec<contextdb_parser::ast::GraphTableColumn>,
+) {
+    let stmt = stmt.expect("parse should succeed");
+    let Statement::Select(sel) = stmt else {
+        panic!("expected Statement::Select, got {:?}", stmt);
+    };
+    for item in &sel.body.from {
+        if let FromItem::GraphTable {
+            graph_name,
+            match_clause,
+            columns,
+        } = item
+        {
+            return (graph_name.clone(), match_clause.clone(), columns.clone());
+        }
+    }
+    panic!(
+        "expected FromItem::GraphTable in FROM clause, got {:?}",
+        sel.body.from
+    );
+}
+
 #[test]
 fn sql_pgq_basic_graph_table_single_edge_step() {
-    let stmt = parse(
+    let (graph_name, mc, cols) = expect_graph_table(parse(
         "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->(b) COLUMNS (b.id AS b_id))",
+    ));
+    assert_eq!(graph_name, "edges");
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some("edges".to_string()));
+    assert_eq!(mc.pattern.start.alias, "a");
+    assert_eq!(mc.pattern.edges.len(), 1);
+    let e = &mc.pattern.edges[0];
+    assert_eq!(e.edge_type.as_deref(), Some("BASED_ON"));
+    assert_eq!(e.direction, EdgeDirection::Outgoing);
+    assert_eq!(e.min_hops, 1);
+    assert_eq!(e.max_hops, 1);
+    assert_eq!(e.target.alias, "b");
+    // MEDIUM-5: edge alias None when absent
+    assert!(
+        e.alias.is_none(),
+        "edge without alias syntax should have alias=None"
     );
-    assert!(matches!(stmt, Ok(Statement::Select(_))));
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].alias, "b_id");
+    // CRITICAL-2: return_cols mirrors columns
+    assert_eq!(mc.return_cols.len(), cols.len());
+    assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
+    // LOW-1: node properties empty when absent
+    assert!(mc.pattern.start.properties.is_empty());
+    assert!(mc.pattern.edges[0].target.properties.is_empty());
 }
 
 #[test]
 fn sql_pgq_multi_step_patterns() {
-    assert!(matches!(
-        parse(
-            "SELECT c_id FROM GRAPH_TABLE (edges MATCH (a)-[:SERVES]->(b)-[:BASED_ON]->(c) COLUMNS (c.id AS c_id))"
-        ),
-        Ok(Statement::Select(_))
+    // Two-step pattern: (a)-[:SERVES]->(b)-[:BASED_ON]->(c)
+    // Chain connectivity is implicit via sequential edge ordering:
+    // start("a") -> edges[0].target("b") -> edges[1].target("c")
+    // Each edge's source is the previous edge's target (or start for edges[0]).
+    // EdgeStep has no `source` field; adjacency is positional.
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT c_id FROM GRAPH_TABLE (edges MATCH (a)-[:SERVES]->(b)-[:BASED_ON]->(c) COLUMNS (c.id AS c_id))",
     ));
-    assert!(matches!(
-        parse(
-            "SELECT d_desc FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->(b)-[:BASED_ON]->(c)-[:SERVES]->(d) COLUMNS (d.description AS d_desc))"
-        ),
-        Ok(Statement::Select(_))
+    assert_eq!(gn, "edges");
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some("edges".to_string()));
+    assert_eq!(mc.pattern.start.alias, "a");
+    assert_eq!(mc.pattern.edges.len(), 2);
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("SERVES"));
+    // HIGH-4: direction assertions for ALL edges
+    assert_eq!(mc.pattern.edges[0].direction, EdgeDirection::Outgoing);
+    // b is target of step 0 and implicit source of step 1
+    assert_eq!(mc.pattern.edges[0].target.alias, "b");
+    assert_eq!(mc.pattern.edges[1].edge_type.as_deref(), Some("BASED_ON"));
+    assert_eq!(mc.pattern.edges[1].direction, EdgeDirection::Outgoing);
+    assert_eq!(mc.pattern.edges[1].target.alias, "c");
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].alias, "c_id");
+    // CRITICAL-2: return_cols mirrors columns
+    assert_eq!(mc.return_cols.len(), cols.len());
+    assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
+    // MEDIUM-4: node labels None when absent
+    assert!(mc.pattern.start.label.is_none());
+    assert!(mc.pattern.edges[0].target.label.is_none());
+    assert!(mc.pattern.edges[1].target.label.is_none());
+    // MEDIUM-5: edge aliases None when absent
+    assert!(mc.pattern.edges[0].alias.is_none());
+    assert!(mc.pattern.edges[1].alias.is_none());
+    // LOW-1: node properties empty when absent
+    assert!(mc.pattern.start.properties.is_empty());
+    assert!(mc.pattern.edges[0].target.properties.is_empty());
+    assert!(mc.pattern.edges[1].target.properties.is_empty());
+
+    // Three-step pattern
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT d_desc FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->(b)-[:BASED_ON]->(c)-[:SERVES]->(d) COLUMNS (d.description AS d_desc))",
     ));
+    assert_eq!(gn, "edges");
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some("edges".to_string()));
+    assert_eq!(mc.pattern.edges.len(), 3);
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("CITES"));
+    assert_eq!(mc.pattern.edges[0].target.alias, "b");
+    assert_eq!(mc.pattern.edges[1].edge_type.as_deref(), Some("BASED_ON"));
+    assert_eq!(mc.pattern.edges[1].target.alias, "c");
+    assert_eq!(mc.pattern.edges[2].edge_type.as_deref(), Some("SERVES"));
+    assert_eq!(mc.pattern.edges[2].target.alias, "d");
+    // HIGH-4: direction assertions for ALL edges in 3-step
+    assert_eq!(mc.pattern.edges[0].direction, EdgeDirection::Outgoing);
+    assert_eq!(mc.pattern.edges[1].direction, EdgeDirection::Outgoing);
+    assert_eq!(mc.pattern.edges[2].direction, EdgeDirection::Outgoing);
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].alias, "d_desc");
+    // CRITICAL-2: return_cols mirrors columns
+    assert_eq!(mc.return_cols.len(), cols.len());
+    assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
 }
 
 #[test]
 fn sql_pgq_meaningful_node_aliases() {
-    assert!(matches!(
-        parse(
-            "SELECT decision_desc FROM GRAPH_TABLE (edges MATCH (entity)-[:BASED_ON]->(decision) COLUMNS (decision.description AS decision_desc))"
-        ),
-        Ok(Statement::Select(_))
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT decision_desc FROM GRAPH_TABLE (edges MATCH (entity)-[:BASED_ON]->(decision) COLUMNS (decision.description AS decision_desc))",
     ));
+    assert_eq!(gn, "edges");
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some("edges".to_string()));
+    assert_eq!(mc.pattern.start.alias, "entity");
+    assert_eq!(mc.pattern.edges.len(), 1);
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("BASED_ON"));
+    assert_eq!(mc.pattern.edges[0].target.alias, "decision");
+    // MEDIUM-5: edge alias None when absent
+    assert!(mc.pattern.edges[0].alias.is_none());
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].alias, "decision_desc");
+    // CRITICAL-2: return_cols mirrors columns
+    assert_eq!(mc.return_cols.len(), cols.len());
+    assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
 }
 
 #[test]
 fn sql_pgq_edge_type_filtering() {
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->(b) COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    // Specific edge type
+    let (gn, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->(b) COLUMNS (b.id AS b_id))",
     ));
-    assert!(matches!(
-        parse("SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[]->(b) COLUMNS (b.id AS b_id))"),
-        Ok(Statement::Select(_))
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("CITES"));
+    // MEDIUM-5: edge alias None when absent
+    assert!(mc.pattern.edges[0].alias.is_none());
+
+    // No edge type (empty brackets)
+    let (gn, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[]->(b) COLUMNS (b.id AS b_id))",
     ));
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].edge_type, None);
+    // MEDIUM-5: edge alias None when absent
+    assert!(mc.pattern.edges[0].alias.is_none());
 }
 
 #[test]
 fn sql_pgq_quantified_paths_depth_bounds() {
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,5}(b) COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    // {1,5}
+    let (gn, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,5}(b) COLUMNS (b.id AS b_id))",
     ));
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->{2,10}(b) COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("BASED_ON"));
+    assert_eq!(mc.pattern.edges[0].min_hops, 1);
+    assert_eq!(mc.pattern.edges[0].max_hops, 5);
+    // MEDIUM-5: edge alias None when absent
+    assert!(mc.pattern.edges[0].alias.is_none());
+
+    // {2,10}
+    let (gn, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->{2,10}(b) COLUMNS (b.id AS b_id))",
     ));
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->{1,1}(b) COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("CITES"));
+    assert_eq!(mc.pattern.edges[0].min_hops, 2);
+    assert_eq!(mc.pattern.edges[0].max_hops, 10);
+
+    // {1,1} - single hop
+    let (_, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->{1,1}(b) COLUMNS (b.id AS b_id))",
     ));
+    assert_eq!(mc.pattern.edges[0].min_hops, 1);
+    assert_eq!(mc.pattern.edges[0].max_hops, 1);
 }
 
 #[test]
 fn sql_pgq_where_inside_match() {
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->(b) WHERE b.status = 'active' COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    // Simple WHERE inside MATCH
+    let (gn, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:CITES]->(b) WHERE b.status = 'active' COLUMNS (b.id AS b_id))",
     ));
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,3}(b) WHERE b.confidence > 0.5 AND a.status = 'active' COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("CITES"));
+    assert!(mc.where_clause.is_some(), "expected WHERE clause in MATCH");
+    // MEDIUM-1: verify WHERE is a real expression, not a dummy literal
+    let wc = mc.where_clause.as_ref().unwrap();
+    assert!(
+        matches!(wc, Expr::BinaryOp { .. }),
+        "expected BinaryOp WHERE clause, got {:?}",
+        wc
+    );
+
+    // Compound WHERE inside MATCH with quantified path
+    let (gn, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,3}(b) WHERE b.confidence > 0.5 AND a.status = 'active' COLUMNS (b.id AS b_id))",
     ));
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].min_hops, 1);
+    assert_eq!(mc.pattern.edges[0].max_hops, 3);
+    assert!(mc.where_clause.is_some(), "expected WHERE clause in MATCH");
+    // MEDIUM-1: verify compound WHERE is a real expression
+    let wc = mc.where_clause.as_ref().unwrap();
+    assert!(
+        matches!(wc, Expr::BinaryOp { .. }),
+        "expected BinaryOp WHERE clause, got {:?}",
+        wc
+    );
 }
 
 #[test]
 fn sql_pgq_bidirectional_edges() {
-    assert!(matches!(
-        parse(
-            "SELECT a_id FROM GRAPH_TABLE (edges MATCH (a)<-[:BASED_ON]-(b) COLUMNS (a.id AS a_id))"
-        ),
-        Ok(Statement::Select(_))
+    // Incoming edge
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT a_id FROM GRAPH_TABLE (edges MATCH (a)<-[:BASED_ON]-(b) COLUMNS (a.id AS a_id))",
     ));
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:RELATES_TO]-(b) COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].direction, EdgeDirection::Incoming);
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("BASED_ON"));
+    // MEDIUM-5: edge alias None when absent
+    assert!(mc.pattern.edges[0].alias.is_none());
+    assert_eq!(cols[0].alias, "a_id");
+
+    // Undirected (both) edge
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:RELATES_TO]-(b) COLUMNS (b.id AS b_id))",
     ));
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].direction, EdgeDirection::Both);
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("RELATES_TO"));
+    // MEDIUM-5: edge alias None when absent
+    assert!(mc.pattern.edges[0].alias.is_none());
+    assert_eq!(cols[0].alias, "b_id");
 }
 
 #[test]
 fn sql_pgq_columns_clause_variations() {
-    assert!(matches!(
-        parse(
-            "SELECT src, tgt, etype FROM GRAPH_TABLE (edges MATCH (a)-[e:CITES]->(b) COLUMNS (a.id AS src, b.id AS tgt, e.edge_type AS etype))"
-        ),
-        Ok(Statement::Select(_))
+    // Multiple columns with edge alias
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT src, tgt, etype FROM GRAPH_TABLE (edges MATCH (a)-[e:CITES]->(b) COLUMNS (a.id AS src, b.id AS tgt, e.edge_type AS etype))",
     ));
-    assert!(matches!(
-        parse(
-            "SELECT b_id, b_name FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,2}(b) COLUMNS (b.id AS b_id, b.name AS b_name))"
-        ),
-        Ok(Statement::Select(_))
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].alias.as_deref(), Some("e"));
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("CITES"));
+    assert_eq!(cols.len(), 3);
+    assert_eq!(cols[0].alias, "src");
+    assert_eq!(cols[1].alias, "tgt");
+    assert_eq!(cols[2].alias, "etype");
+    // CRITICAL-2: return_cols mirrors columns
+    assert_eq!(mc.return_cols.len(), cols.len());
+    assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
+    assert_eq!(mc.return_cols[1].alias.as_deref(), Some(&cols[1].alias[..]));
+    assert_eq!(mc.return_cols[2].alias.as_deref(), Some(&cols[2].alias[..]));
+
+    // Two columns with quantified path
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT b_id, b_name FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,2}(b) COLUMNS (b.id AS b_id, b.name AS b_name))",
     ));
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.edges[0].min_hops, 1);
+    assert_eq!(mc.pattern.edges[0].max_hops, 2);
+    assert_eq!(cols.len(), 2);
+    assert_eq!(cols[0].alias, "b_id");
+    assert_eq!(cols[1].alias, "b_name");
+    // CRITICAL-2: return_cols mirrors columns
+    assert_eq!(mc.return_cols.len(), cols.len());
+    assert_eq!(mc.return_cols[0].alias.as_deref(), Some(&cols[0].alias[..]));
+    assert_eq!(mc.return_cols[1].alias.as_deref(), Some(&cols[1].alias[..]));
 }
 
 #[test]
 fn sql_pgq_graph_table_as_cte_source() {
-    assert!(matches!(
-        parse(
-            "WITH reachable AS (SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,3}(b) COLUMNS (b.id AS b_id))) SELECT * FROM reachable WHERE b_id = $target"
-        ),
-        Ok(Statement::Select(_))
-    ));
+    let stmt = parse(
+        "WITH reachable AS (SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->{1,3}(b) COLUMNS (b.id AS b_id))) SELECT * FROM reachable WHERE b_id = $target",
+    ).expect("parse should succeed");
+    let Statement::Select(sel) = stmt else {
+        panic!("expected Select");
+    };
+    // The CTE's inner SELECT should contain a GraphTable FROM item
+    assert_eq!(sel.ctes.len(), 1);
+    let Cte::SqlCte { name, query } = &sel.ctes[0] else {
+        panic!("expected SqlCte, got {:?}", sel.ctes[0]);
+    };
+    assert_eq!(name, "reachable");
+    let gt = query
+        .from
+        .iter()
+        .find(|f| matches!(f, FromItem::GraphTable { .. }));
+    assert!(
+        gt.is_some(),
+        "expected FromItem::GraphTable in CTE body, got {:?}",
+        query.from
+    );
+    if let Some(FromItem::GraphTable {
+        graph_name,
+        match_clause,
+        columns,
+    }) = gt
+    {
+        assert_eq!(graph_name, "edges");
+        assert_eq!(
+            match_clause.pattern.edges[0].edge_type.as_deref(),
+            Some("BASED_ON")
+        );
+        assert_eq!(match_clause.pattern.edges[0].min_hops, 1);
+        assert_eq!(match_clause.pattern.edges[0].max_hops, 3);
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].alias, "b_id");
+    }
 }
 
 #[test]
 fn sql_pgq_node_labels() {
-    assert!(matches!(
-        parse(
-            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a:Entity)-[:BASED_ON]->(b:Decision) COLUMNS (b.id AS b_id))"
-        ),
-        Ok(Statement::Select(_))
+    let (gn, mc, _) = expect_graph_table(parse(
+        "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a:Entity)-[:BASED_ON]->(b:Decision) COLUMNS (b.id AS b_id))",
     ));
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some(gn.clone()));
+    assert_eq!(mc.pattern.start.alias, "a");
+    assert_eq!(mc.pattern.start.label.as_deref(), Some("Entity"));
+    assert_eq!(mc.pattern.edges[0].target.alias, "b");
+    assert_eq!(
+        mc.pattern.edges[0].target.label.as_deref(),
+        Some("Decision")
+    );
 }
 
 #[test]
@@ -589,13 +836,22 @@ fn rejection_bfs_depth_exceeded() {
 
 #[test]
 fn common_mistake_graph_table_without_columns_clause() {
-    let stmt = parse("SELECT * FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->(b))");
-    assert!(matches!(stmt, Ok(Statement::Select(_))));
-    if let Ok(Statement::Select(sel)) = stmt
-        && let Some(FromItem::GraphTable { match_clause, .. }) = sel.body.from.first()
-    {
-        assert!(match_clause.return_cols.is_empty());
-    }
+    let (gn, mc, cols) = expect_graph_table(parse(
+        "SELECT * FROM GRAPH_TABLE (edges MATCH (a)-[:BASED_ON]->(b))",
+    ));
+    assert_eq!(gn, "edges");
+    // CRITICAL-1: graph_name cross-check
+    assert_eq!(mc.graph_name, Some("edges".to_string()));
+    assert_eq!(mc.pattern.edges[0].edge_type.as_deref(), Some("BASED_ON"));
+    assert_eq!(mc.pattern.edges[0].direction, EdgeDirection::Outgoing);
+    // No COLUMNS clause means empty columns vec
+    assert!(
+        cols.is_empty(),
+        "expected empty columns for GRAPH_TABLE without COLUMNS clause, got {:?}",
+        cols
+    );
+    // CRITICAL-2: return_cols should also be empty when no COLUMNS clause
+    assert!(mc.return_cols.is_empty());
 }
 
 #[test]
@@ -639,15 +895,20 @@ fn sql_basics_not_in_with_literal_list() {
     ));
 }
 
+// HIGH-3: LIKE negated=false explicit assertion via if-let (not matches!)
 #[test]
 fn sql_basics_like_pattern_matching() {
-    let stmt = parse("SELECT * FROM entities WHERE name LIKE 'rate%'");
-    assert!(matches!(stmt, Ok(Statement::Select(_))));
-    if let Ok(Statement::Select(sel)) = stmt {
-        assert!(matches!(
-            sel.body.where_clause,
-            Some(Expr::Like { negated: false, .. })
-        ));
+    let stmt = parse("SELECT * FROM entities WHERE name LIKE 'rate%'").unwrap();
+    let Statement::Select(sel) = stmt else {
+        panic!("expected Select");
+    };
+    if let Some(Expr::Like { negated, .. }) = &sel.body.where_clause {
+        assert!(!negated, "LIKE without NOT should have negated=false");
+    } else {
+        panic!(
+            "expected Expr::Like where clause, got {:?}",
+            sel.body.where_clause
+        );
     }
 }
 
@@ -723,4 +984,87 @@ fn ast_scaffolding_fields_present_and_compilable() {
         right: Box::new(Expr::Literal(Literal::Bool(false))),
     };
     assert!(matches!(and_expr, Expr::BinaryOp { op: BinOp::And, .. }));
+}
+
+// HIGH-1: Invalid quantifier rejection tests
+#[test]
+fn rejection_invalid_quantifier_min_greater_than_max() {
+    assert!(
+        parse(
+            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:EDGE]->{3,1}(b) COLUMNS (b.id AS b_id))"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn rejection_invalid_quantifier_zero_min() {
+    assert!(
+        parse(
+            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:EDGE]->{0,5}(b) COLUMNS (b.id AS b_id))"
+        )
+        .is_err()
+    );
+}
+
+// HIGH-2: DISTINCT=false negative test
+#[test]
+fn sql_basics_select_without_distinct_is_false() {
+    let stmt = parse("SELECT * FROM entities").unwrap();
+    if let Statement::Select(sel) = stmt {
+        assert!(
+            !sel.body.distinct,
+            "SELECT without DISTINCT should have distinct=false"
+        );
+    } else {
+        panic!("expected Select");
+    }
+}
+
+// LOW-2: Rejection test for missing start node alias
+#[test]
+fn rejection_graph_pattern_without_start_node_alias() {
+    assert!(
+        parse("SELECT b_id FROM GRAPH_TABLE (edges MATCH ()-[:EDGE]->(b) COLUMNS (b.id AS b_id))")
+            .is_err()
+    );
+}
+
+// LOW-3: Unbounded {0,} rejection test
+#[test]
+fn rejection_unbounded_traversal_zero_minimum() {
+    assert!(matches!(
+        parse(
+            "SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:EDGE]->{0,}(b) COLUMNS (b.id AS b_id))"
+        ),
+        Err(Error::UnboundedTraversal)
+    ));
+}
+
+#[test]
+fn sql_pgq_graph_table_keyword_case_insensitive() {
+    // SQL keywords are case-insensitive. GRAPH_TABLE must work in any case.
+    let lower =
+        parse("SELECT b_id FROM graph_table (edges MATCH (a)-[:EDGE]->(b) COLUMNS (b.id AS b_id))");
+    let mixed =
+        parse("SELECT b_id FROM Graph_Table (edges MATCH (a)-[:EDGE]->(b) COLUMNS (b.id AS b_id))");
+    let upper =
+        parse("SELECT b_id FROM GRAPH_TABLE (edges MATCH (a)-[:EDGE]->(b) COLUMNS (b.id AS b_id))");
+    // All three must parse successfully and produce FromItem::GraphTable
+    for (label, result) in [("lowercase", lower), ("mixed", mixed), ("uppercase", upper)] {
+        let stmt = result.unwrap_or_else(|e| panic!("{label} GRAPH_TABLE should parse, got: {e}"));
+        match stmt {
+            Statement::Select(sel) => {
+                assert!(
+                    sel.body
+                        .from
+                        .iter()
+                        .any(|f| matches!(f, FromItem::GraphTable { .. })),
+                    "{label} GRAPH_TABLE should produce FromItem::GraphTable, got {:?}",
+                    sel.body.from
+                );
+            }
+            _ => panic!("{label} GRAPH_TABLE should produce Statement::Select"),
+        }
+    }
 }
