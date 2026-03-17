@@ -1,5 +1,7 @@
 use crate::sync_types::{DdlChange, NaturalKey};
-use contextdb_core::{EdgeType, NodeId, Result, RowId, TableMeta, TableName, Value};
+use contextdb_core::{
+    Direction, EdgeType, NodeId, PropagationRule, Result, RowId, TableMeta, TableName, Value,
+};
 use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
@@ -83,7 +85,7 @@ impl CompositeStore {
             .columns
             .iter()
             .map(|col| {
-                let ty = match col.column_type {
+                let mut ty = match col.column_type {
                     contextdb_core::ColumnType::Integer => "INTEGER".to_string(),
                     contextdb_core::ColumnType::Real => "REAL".to_string(),
                     contextdb_core::ColumnType::Text => "TEXT".to_string(),
@@ -92,6 +94,51 @@ impl CompositeStore {
                     contextdb_core::ColumnType::Uuid => "UUID".to_string(),
                     contextdb_core::ColumnType::Vector(dim) => format!("VECTOR({dim})"),
                 };
+
+                let fk_rules = meta
+                    .propagation_rules
+                    .iter()
+                    .filter_map(|rule| match rule {
+                        PropagationRule::ForeignKey {
+                            fk_column,
+                            referenced_table,
+                            referenced_column,
+                            trigger_state,
+                            target_state,
+                            max_depth,
+                            abort_on_failure,
+                        } if fk_column == &col.name => Some((
+                            referenced_table,
+                            referenced_column,
+                            trigger_state,
+                            target_state,
+                            *max_depth,
+                            *abort_on_failure,
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                if let Some((referenced_table, referenced_column, ..)) = fk_rules.first() {
+                    ty.push_str(&format!(
+                        " REFERENCES {}({})",
+                        referenced_table, referenced_column
+                    ));
+                    for (_, _, trigger_state, target_state, max_depth, abort_on_failure) in fk_rules
+                    {
+                        ty.push_str(&format!(
+                            " ON STATE {} PROPAGATE SET {}",
+                            trigger_state, target_state
+                        ));
+                        if max_depth != 10 {
+                            ty.push_str(&format!(" MAX DEPTH {max_depth}"));
+                        }
+                        if abort_on_failure {
+                            ty.push_str(" ABORT ON FAILURE");
+                        }
+                    }
+                }
+
                 (col.name.clone(), ty)
             })
             .collect();
@@ -117,6 +164,42 @@ impl CompositeStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             constraints.push(format!("DAG({edge_types})"));
+        }
+        for rule in &meta.propagation_rules {
+            match rule {
+                PropagationRule::Edge {
+                    edge_type,
+                    direction,
+                    trigger_state,
+                    target_state,
+                    max_depth,
+                    abort_on_failure,
+                } => {
+                    let dir = match direction {
+                        Direction::Incoming => "INCOMING",
+                        Direction::Outgoing => "OUTGOING",
+                        Direction::Both => "BOTH",
+                    };
+                    let mut clause = format!(
+                        "PROPAGATE ON EDGE {} {} STATE {} SET {}",
+                        edge_type, dir, trigger_state, target_state
+                    );
+                    if *max_depth != 10 {
+                        clause.push_str(&format!(" MAX DEPTH {max_depth}"));
+                    }
+                    if *abort_on_failure {
+                        clause.push_str(" ABORT ON FAILURE");
+                    }
+                    constraints.push(clause);
+                }
+                PropagationRule::VectorExclusion { trigger_state } => {
+                    constraints.push(format!(
+                        "PROPAGATE ON STATE {} EXCLUDE VECTOR",
+                        trigger_state
+                    ));
+                }
+                PropagationRule::ForeignKey { .. } => {}
+            }
         }
 
         self.ddl_log.write().push((
