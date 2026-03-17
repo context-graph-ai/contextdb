@@ -1,6 +1,6 @@
 use contextdb_core::Error;
 use contextdb_parser::ast::{
-    BinOp, Cte, EdgeDirection, Expr, ForeignKey, FromItem, Literal, Statement,
+    AstPropagationRule, BinOp, Cte, EdgeDirection, Expr, ForeignKey, FromItem, Literal, Statement,
 };
 use contextdb_parser::parse;
 
@@ -604,7 +604,7 @@ fn ddl_references_table_column() {
             .and_then(|c| c.references.clone());
         assert!(matches!(
             fk,
-            Some(ForeignKey { table, column }) if table == "intentions" && column == "id"
+            Some(ForeignKey { table, column, .. }) if table == "intentions" && column == "id"
         ));
     }
 
@@ -618,49 +618,102 @@ fn ddl_references_table_column() {
 
 #[test]
 fn ddl_state_propagation_fk_rules_parse() {
+    let stmt = parse(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated MAX DEPTH 3 ABORT ON FAILURE ON STATE superseded PROPAGATE SET invalidated) STATE MACHINE (status: active -> [invalidated, superseded])",
+    );
+    assert!(matches!(stmt, Ok(Statement::CreateTable(_))));
+    let Statement::CreateTable(ct) = stmt.expect("create table") else {
+        unreachable!();
+    };
+    let fk_rules = &ct
+        .columns
+        .iter()
+        .find(|c| c.name == "intention_id")
+        .expect("intention_id column")
+        .references
+        .as_ref()
+        .expect("fk references")
+        .propagation_rules;
+    assert_eq!(fk_rules.len(), 2);
     assert!(matches!(
-        parse(
-            "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated) STATE MACHINE (status: active -> [invalidated, superseded])"
-        ),
-        Ok(Statement::CreateTable(_))
+        fk_rules[0],
+        AstPropagationRule::FkState {
+            ref trigger_state,
+            ref target_state,
+            max_depth: Some(3),
+            abort_on_failure: true
+        } if trigger_state == "archived" && target_state == "invalidated"
     ));
     assert!(matches!(
-        parse(
-            "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated ON STATE superseded PROPAGATE SET invalidated) STATE MACHINE (status: active -> [invalidated, superseded])"
-        ),
-        Ok(Statement::CreateTable(_))
+        fk_rules[1],
+        AstPropagationRule::FkState {
+            ref trigger_state,
+            ref target_state,
+            max_depth: None,
+            abort_on_failure: false
+        } if trigger_state == "superseded" && target_state == "invalidated"
     ));
 }
 
 #[test]
 fn ddl_state_propagation_edge_rules_parse() {
+    let stmt = parse(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated MAX DEPTH 5 ABORT ON FAILURE PROPAGATE ON EDGE SERVES BOTH STATE invalidated SET flagged",
+    );
+    assert!(matches!(stmt, Ok(Statement::CreateTable(_))));
+    let Statement::CreateTable(ct) = stmt.expect("create table") else {
+        unreachable!();
+    };
+    assert_eq!(ct.propagation_rules.len(), 2);
     assert!(matches!(
-        parse(
-            "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated"
-        ),
-        Ok(Statement::CreateTable(_))
+        ct.propagation_rules[0],
+        AstPropagationRule::EdgeState {
+            ref edge_type,
+            ref direction,
+            ref trigger_state,
+            ref target_state,
+            max_depth: Some(5),
+            abort_on_failure: true
+        } if edge_type == "CITES"
+            && direction == "INCOMING"
+            && trigger_state == "invalidated"
+            && target_state == "invalidated"
     ));
     assert!(matches!(
-        parse(
-            "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated PROPAGATE ON EDGE SERVES OUTGOING STATE invalidated SET flagged"
-        ),
-        Ok(Statement::CreateTable(_))
+        ct.propagation_rules[1],
+        AstPropagationRule::EdgeState {
+            ref edge_type,
+            ref direction,
+            ref trigger_state,
+            ref target_state,
+            max_depth: None,
+            abort_on_failure: false
+        } if edge_type == "SERVES"
+            && direction == "BOTH"
+            && trigger_state == "invalidated"
+            && target_state == "flagged"
     ));
 }
 
 #[test]
 fn ddl_state_propagation_vector_exclusions_parse() {
+    let stmt = parse(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, embedding VECTOR(384)) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON STATE invalidated EXCLUDE VECTOR PROPAGATE ON STATE superseded EXCLUDE VECTOR",
+    );
+    assert!(matches!(stmt, Ok(Statement::CreateTable(_))));
+    let Statement::CreateTable(ct) = stmt.expect("create table") else {
+        unreachable!();
+    };
+    assert_eq!(ct.propagation_rules.len(), 2);
     assert!(matches!(
-        parse(
-            "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, embedding VECTOR(384)) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON STATE invalidated EXCLUDE VECTOR"
-        ),
-        Ok(Statement::CreateTable(_))
+        ct.propagation_rules[0],
+        AstPropagationRule::VectorExclusion { ref trigger_state }
+            if trigger_state == "invalidated"
     ));
     assert!(matches!(
-        parse(
-            "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, embedding VECTOR(384)) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON STATE invalidated EXCLUDE VECTOR PROPAGATE ON STATE superseded EXCLUDE VECTOR"
-        ),
-        Ok(Statement::CreateTable(_))
+        ct.propagation_rules[1],
+        AstPropagationRule::VectorExclusion { ref trigger_state }
+            if trigger_state == "superseded"
     ));
 }
 

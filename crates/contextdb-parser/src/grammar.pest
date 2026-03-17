@@ -138,6 +138,7 @@ fk_propagation_clause = {
     ~ ^"SET"
     ~ identifier
     ~ max_depth_clause?
+    ~ abort_on_failure_clause?
 }
 
 table_option = {
@@ -163,6 +164,7 @@ propagate_edge_option = {
     ~ ^"SET"
     ~ identifier
     ~ max_depth_clause?
+    ~ abort_on_failure_clause?
 }
 propagate_state_option = {
     ^"PROPAGATE"
@@ -174,6 +176,7 @@ propagate_state_option = {
     ~ max_depth_clause?
 }
 max_depth_clause = { ^"MAX" ~ ^"DEPTH" ~ integer }
+abort_on_failure_clause = { ^"ABORT" ~ ^"ON" ~ ^"FAILURE" }
 direction_kw = { ^"INCOMING" | ^"OUTGOING" | ^"BOTH" }
 
 drop_table_stmt = { ^"DROP" ~ ^"TABLE" ~ if_exists? ~ identifier }

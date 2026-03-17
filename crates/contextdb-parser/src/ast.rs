@@ -235,6 +235,7 @@ pub struct CreateTable {
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
+    pub propagation_rules: Vec<AstPropagationRule>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +272,28 @@ pub struct ColumnDef {
 pub struct ForeignKey {
     pub table: String,
     pub column: String,
+    pub propagation_rules: Vec<AstPropagationRule>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AstPropagationRule {
+    FkState {
+        trigger_state: String,
+        target_state: String,
+        max_depth: Option<u32>,
+        abort_on_failure: bool,
+    },
+    EdgeState {
+        edge_type: String,
+        direction: String,
+        trigger_state: String,
+        target_state: String,
+        max_depth: Option<u32>,
+        abort_on_failure: bool,
+    },
+    VectorExclusion {
+        trigger_state: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -898,13 +898,24 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut immutable = false;
     let mut state_machine = None;
     let mut dag_edge_types = Vec::new();
+    let mut propagation_rules = Vec::new();
     let mut has_propagation = false;
 
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::if_not_exists => if_not_exists = true,
             Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
-            Rule::column_def => columns.push(build_column_def(p)?),
+            Rule::column_def => {
+                let col = build_column_def(p)?;
+                if col
+                    .references
+                    .as_ref()
+                    .is_some_and(|fk| !fk.propagation_rules.is_empty())
+                {
+                    has_propagation = true;
+                }
+                columns.push(col);
+            }
             Rule::table_option => {
                 let opt = p
                     .into_inner()
@@ -916,8 +927,13 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                         state_machine = Some(build_state_machine_option(opt)?)
                     }
                     Rule::dag_option => dag_edge_types = build_dag_option(opt)?,
-                    Rule::propagate_edge_option | Rule::propagate_state_option => {
+                    Rule::propagate_edge_option => {
                         has_propagation = true;
+                        propagation_rules.push(build_edge_propagation_option(opt)?);
+                    }
+                    Rule::propagate_state_option => {
+                        has_propagation = true;
+                        propagation_rules.push(build_vector_propagation_option(opt)?);
                     }
                     _ => {}
                 }
@@ -954,6 +970,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         immutable,
         state_machine,
         dag_edge_types,
+        propagation_rules,
     })
 }
 
@@ -965,6 +982,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
     let mut unique = false;
     let mut default = None;
     let mut references = None;
+    let mut fk_propagation_rules = Vec::new();
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -989,12 +1007,21 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
                         default = Some(build_expr(expr)?);
                     }
                     Rule::references_clause => references = Some(build_references_clause(c)?),
-                    Rule::fk_propagation_clause => {}
+                    Rule::fk_propagation_clause => {
+                        fk_propagation_rules.push(build_fk_propagation_clause(c)?);
+                    }
                     _ => {}
                 }
             }
             _ => {}
         }
+    }
+
+    if !fk_propagation_rules.is_empty() {
+        let fk = references.as_mut().ok_or_else(|| {
+            Error::ParseError("FK propagation requires REFERENCES constraint".to_string())
+        })?;
+        fk.propagation_rules = fk_propagation_rules;
     }
 
     Ok(ColumnDef {
@@ -1024,7 +1051,98 @@ fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
     Ok(ForeignKey {
         table: ids[0].clone(),
         column: ids[1].clone(),
+        propagation_rules: Vec::new(),
     })
+}
+
+fn build_fk_propagation_clause(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
+    let mut trigger_state = None;
+    let mut target_state = None;
+    let mut max_depth = None;
+    let mut abort_on_failure = false;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if trigger_state.is_none() => {
+                trigger_state = Some(parse_identifier(p.as_str()))
+            }
+            Rule::identifier if target_state.is_none() => {
+                target_state = Some(parse_identifier(p.as_str()))
+            }
+            Rule::max_depth_clause => max_depth = Some(parse_max_depth_clause(p)?),
+            Rule::abort_on_failure_clause => abort_on_failure = true,
+            _ => {}
+        }
+    }
+
+    Ok(AstPropagationRule::FkState {
+        trigger_state: trigger_state
+            .ok_or_else(|| Error::ParseError("FK propagation missing trigger state".to_string()))?,
+        target_state: target_state
+            .ok_or_else(|| Error::ParseError("FK propagation missing target state".to_string()))?,
+        max_depth,
+        abort_on_failure,
+    })
+}
+
+fn build_edge_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
+    let mut edge_type = None;
+    let mut direction = None;
+    let mut trigger_state = None;
+    let mut target_state = None;
+    let mut max_depth = None;
+    let mut abort_on_failure = false;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if edge_type.is_none() => {
+                edge_type = Some(parse_identifier(p.as_str()))
+            }
+            Rule::direction_kw => direction = Some(parse_identifier(p.as_str())),
+            Rule::identifier if trigger_state.is_none() => {
+                trigger_state = Some(parse_identifier(p.as_str()))
+            }
+            Rule::identifier if target_state.is_none() => {
+                target_state = Some(parse_identifier(p.as_str()))
+            }
+            Rule::max_depth_clause => max_depth = Some(parse_max_depth_clause(p)?),
+            Rule::abort_on_failure_clause => abort_on_failure = true,
+            _ => {}
+        }
+    }
+
+    Ok(AstPropagationRule::EdgeState {
+        edge_type: edge_type
+            .ok_or_else(|| Error::ParseError("EDGE propagation missing edge type".to_string()))?,
+        direction: direction
+            .ok_or_else(|| Error::ParseError("EDGE propagation missing direction".to_string()))?,
+        trigger_state: trigger_state.ok_or_else(|| {
+            Error::ParseError("EDGE propagation missing trigger state".to_string())
+        })?,
+        target_state: target_state.ok_or_else(|| {
+            Error::ParseError("EDGE propagation missing target state".to_string())
+        })?,
+        max_depth,
+        abort_on_failure,
+    })
+}
+
+fn build_vector_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
+    let trigger_state = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("VECTOR propagation missing trigger state".to_string()))?;
+
+    Ok(AstPropagationRule::VectorExclusion { trigger_state })
+}
+
+fn parse_max_depth_clause(pair: Pair<'_, Rule>) -> Result<u32> {
+    let depth = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::integer)
+        .ok_or_else(|| Error::ParseError("MAX DEPTH missing value".to_string()))?;
+    parse_u32(depth.as_str(), "invalid MAX DEPTH value")
 }
 
 fn build_data_type(pair: Pair<'_, Rule>) -> Result<DataType> {
