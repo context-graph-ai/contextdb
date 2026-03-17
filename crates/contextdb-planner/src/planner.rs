@@ -13,6 +13,7 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             immutable: ct.immutable,
             state_machine: ct.state_machine.clone(),
             dag_edge_types: ct.dag_edge_types.clone(),
+            propagation_rules: Vec::new(),
         })),
         Statement::DropTable(dt) => Ok(PhysicalPlan::DropTable(dt.name.clone())),
         Statement::CreateIndex(ci) => Ok(PhysicalPlan::CreateIndex(CreateIndexPlan {

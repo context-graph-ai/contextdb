@@ -1,4 +1,4 @@
-use contextdb_core::Direction;
+use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{ColumnDef, Expr, OnConflict, StateMachineDef};
 
 #[derive(Debug, Clone)]
@@ -109,6 +109,7 @@ pub struct CreateTablePlan {
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
+    pub propagation_rules: Vec<PropagationRule>,
 }
 
 #[derive(Debug, Clone)]

@@ -35,6 +35,7 @@ pub(crate) fn execute_plan(
                 }),
                 dag_edge_types: p.dag_edge_types.clone(),
                 natural_key_column: None,
+                propagation_rules: p.propagation_rules.clone(),
             };
             db.relational_store().create_table(&p.name, meta);
             if let Some(table_meta) = db.table_meta(&p.name) {

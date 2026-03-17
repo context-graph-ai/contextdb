@@ -8,6 +8,13 @@ pub enum Error {
     ImmutableTable(String),
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
+    #[error("propagation aborted: {table}.{column} transition {from} -> {to} is invalid")]
+    PropagationAborted {
+        table: String,
+        column: String,
+        from: String,
+        to: String,
+    },
     #[error("BFS depth exceeds maximum allowed ({0})")]
     BfsDepthExceeded(u32),
     #[error("BFS visited set exceeded limit ({0})")]
