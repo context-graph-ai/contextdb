@@ -1,4 +1,4 @@
-use super::helpers::setup_ontology_db;
+use super::helpers::{setup_ontology_db, setup_propagation_ontology_db};
 use contextdb_core::{Direction, Error, Value};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
@@ -3018,42 +3018,108 @@ fn b11_03_agent_handoff() {
 }
 
 #[test]
-fn b11_04_cannot_complete_already_completed() {
-    let db = setup_ontology_db();
-    let d = Uuid::new_v4();
+fn b11_04_decision_superseded_by_better_option() {
+    let db = setup_propagation_ontology_db();
+    let i = Uuid::new_v4();
+    let d_old = Uuid::new_v4();
+    let d_new = Uuid::new_v4();
+
+    // Create intention and an initial active decision serving it.
     let tx = db.begin();
-    insert_decision(&db, tx, d, "done", "active", 0.8);
+    db.insert_row(
+        tx,
+        "intentions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(i)),
+            (
+                "description".to_string(),
+                Value::Text("detect anomaly".to_string()),
+            ),
+            ("status".to_string(), Value::Text("active".to_string())),
+        ]),
+    )
+    .expect("insert intention");
+    db.insert_row(
+        tx,
+        "decisions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(d_old)),
+            (
+                "description".to_string(),
+                Value::Text("use model X".to_string()),
+            ),
+            ("status".to_string(), Value::Text("active".to_string())),
+            ("confidence".to_string(), Value::Float64(0.6)),
+            ("intention_id".to_string(), Value::Uuid(i)),
+        ]),
+    )
+    .expect("insert old decision");
+    add_edge(&db, tx, d_old, i, "SERVES");
     db.commit(tx).expect("commit");
 
-    // The "already completed" guard is application-level logic.
-    // The decisions table does not have a state machine, so contextDB allows any status update.
-    // Demonstrate: read current status, check if already "active", refuse to transition.
-    let row = db
-        .point_lookup("decisions", "id", &Value::Uuid(d), db.snapshot())
-        .expect("lookup")
-        .expect("row");
-    let current_status = text(&row, "status");
-    assert_eq!(current_status, "active");
-
-    // Application-level guard: if status is already "active", do not re-complete.
-    // Attempting to set status to "active" when it's already "active" is a no-op.
+    // Application-level supersession: delete old decision, insert it as superseded,
+    // then insert a new better decision. This is explicit application workflow.
     let tx2 = db.begin();
     let old_row = db
-        .point_lookup("decisions", "id", &Value::Uuid(d), db.snapshot())
+        .point_lookup("decisions", "id", &Value::Uuid(d_old), db.snapshot())
         .expect("lookup")
         .expect("row");
     db.delete_row(tx2, "decisions", old_row.row_id)
-        .expect("delete");
-    insert_decision(&db, tx2, d, "done", "active", 0.8);
+        .expect("delete old");
+    db.insert_row(
+        tx2,
+        "decisions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(d_old)),
+            (
+                "description".to_string(),
+                Value::Text("use model X".to_string()),
+            ),
+            ("status".to_string(), Value::Text("superseded".to_string())),
+            ("confidence".to_string(), Value::Float64(0.6)),
+            ("intention_id".to_string(), Value::Uuid(i)),
+        ]),
+    )
+    .expect("re-insert old as superseded");
+    db.insert_row(
+        tx2,
+        "decisions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(d_new)),
+            (
+                "description".to_string(),
+                Value::Text("use model Y".to_string()),
+            ),
+            ("status".to_string(), Value::Text("active".to_string())),
+            ("confidence".to_string(), Value::Float64(0.9)),
+            ("intention_id".to_string(), Value::Uuid(i)),
+        ]),
+    )
+    .expect("insert new decision");
+    add_edge(&db, tx2, d_new, i, "SERVES");
+    add_edge(&db, tx2, d_new, d_old, "SUPERSEDES");
     db.commit(tx2).expect("commit");
 
-    // Decision remains active — the guard is enforced at the application layer,
-    // which checks the current status before allowing transitions.
-    let final_row = db
-        .point_lookup("decisions", "id", &Value::Uuid(d), db.snapshot())
+    // Assert: old decision is superseded
+    let old_final = db
+        .point_lookup("decisions", "id", &Value::Uuid(d_old), db.snapshot())
         .expect("lookup")
-        .expect("row");
-    assert_eq!(text(&final_row, "status"), "active");
+        .expect("old row");
+    assert_eq!(text(&old_final, "status"), "superseded");
+
+    // Assert: new decision is active
+    let new_final = db
+        .point_lookup("decisions", "id", &Value::Uuid(d_new), db.snapshot())
+        .expect("lookup")
+        .expect("new row");
+    assert_eq!(text(&new_final, "status"), "active");
+
+    // Assert: intention is still active (supersession does not affect the intention)
+    let intention_final = db
+        .point_lookup("intentions", "id", &Value::Uuid(i), db.snapshot())
+        .expect("lookup")
+        .expect("intention row");
+    assert_eq!(text(&intention_final, "status"), "active");
 }
 
 // B12 intention
@@ -3087,91 +3153,98 @@ fn b12_01_create_intention() {
 
 #[test]
 fn b12_02_archive_intention_with_active_decisions() {
-    let db = setup_ontology_db();
+    let db = setup_propagation_ontology_db();
     let i = Uuid::new_v4();
-    let d = Uuid::new_v4();
+    let d1 = Uuid::new_v4();
+    let d2 = Uuid::new_v4();
+
+    // Create an intention with two active decisions that reference it via FK.
     let tx = db.begin();
     db.insert_row(
         tx,
         "intentions",
         HashMap::from([
             ("id".to_string(), Value::Uuid(i)),
-            ("description".to_string(), Value::Text("i".to_string())),
+            (
+                "description".to_string(),
+                Value::Text("detect anomaly".to_string()),
+            ),
             ("status".to_string(), Value::Text("active".to_string())),
         ]),
     )
-    .expect("insert i");
-    insert_decision(&db, tx, d, "d", "active", 0.8);
-    add_edge(&db, tx, d, i, "SERVES");
+    .expect("insert intention");
+    db.insert_row(
+        tx,
+        "decisions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(d1)),
+            (
+                "description".to_string(),
+                Value::Text("use model X".to_string()),
+            ),
+            ("status".to_string(), Value::Text("active".to_string())),
+            ("confidence".to_string(), Value::Float64(0.8)),
+            ("intention_id".to_string(), Value::Uuid(i)),
+        ]),
+    )
+    .expect("insert d1");
+    db.insert_row(
+        tx,
+        "decisions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(d2)),
+            (
+                "description".to_string(),
+                Value::Text("use model Y".to_string()),
+            ),
+            ("status".to_string(), Value::Text("active".to_string())),
+            ("confidence".to_string(), Value::Float64(0.7)),
+            ("intention_id".to_string(), Value::Uuid(i)),
+        ]),
+    )
+    .expect("insert d2");
+    add_edge(&db, tx, d1, i, "SERVES");
+    add_edge(&db, tx, d2, i, "SERVES");
     db.commit(tx).expect("commit");
 
-    let active_serving = db
-        .query_bfs(
-            i,
-            Some(&["SERVES".to_string()]),
-            Direction::Incoming,
-            1,
-            db.snapshot(),
-        )
-        .expect("serves");
-    assert_eq!(active_serving.nodes.len(), 1);
-
-    // Check active decisions exist serving this intention
-    let serving_decisions = db
-        .scan_filter("decisions", db.snapshot(), &|r| {
-            let d_id = *r.values.get("id").and_then(Value::as_uuid).expect("id");
-            let is_active = r.values.get("status") == Some(&Value::Text("active".to_string()));
-            let serves_i = db
-                .query_bfs(
-                    d_id,
-                    Some(&["SERVES".to_string()]),
-                    Direction::Outgoing,
-                    1,
-                    db.snapshot(),
-                )
-                .expect("bfs")
-                .nodes
-                .iter()
-                .any(|n| n.id == i);
-            is_active && serves_i
-        })
-        .expect("scan");
-    assert!(
-        !serving_decisions.is_empty(),
-        "active decisions serve this intention"
-    );
-
-    // Attempt to archive the intention via direct API (delete + insert with status="archived").
-    // The intentions table has no state machine preventing this, so the operation succeeds.
-    // The guard that archiving should be prevented when active decisions exist is application-side.
+    // Archive the intention using upsert_row (state machine transition: active -> archived).
+    // FK propagation rule should automatically invalidate both decisions.
     let tx2 = db.begin();
-    let old_intention = db
-        .point_lookup("intentions", "id", &Value::Uuid(i), db.snapshot())
-        .expect("lookup")
-        .expect("row");
-    db.delete_row(tx2, "intentions", old_intention.row_id)
-        .expect("delete");
-    db.insert_row(
+    db.upsert_row(
         tx2,
         "intentions",
+        "id",
         HashMap::from([
             ("id".to_string(), Value::Uuid(i)),
-            ("description".to_string(), Value::Text("i".to_string())),
+            (
+                "description".to_string(),
+                Value::Text("detect anomaly".to_string()),
+            ),
             ("status".to_string(), Value::Text("archived".to_string())),
         ]),
     )
-    .expect("insert archived");
+    .expect("upsert intention to archived");
     db.commit(tx2).expect("commit");
 
-    // The DB allowed it, but an application-level guard should have prevented it.
-    // Verify the archive happened (proving the guard must be application-level):
+    // Assert: intention is archived
     let intention = db
         .point_lookup("intentions", "id", &Value::Uuid(i), db.snapshot())
         .expect("lookup")
-        .expect("row");
+        .expect("intention row");
     assert_eq!(text(&intention, "status"), "archived");
-    // Active decisions still serve this intention — demonstrates the guard is application-side.
-    assert!(!serving_decisions.is_empty());
+
+    // Assert: both decisions are invalidated by FK propagation
+    let decision1 = db
+        .point_lookup("decisions", "id", &Value::Uuid(d1), db.snapshot())
+        .expect("lookup")
+        .expect("d1 row");
+    assert_eq!(text(&decision1, "status"), "invalidated");
+
+    let decision2 = db
+        .point_lookup("decisions", "id", &Value::Uuid(d2), db.snapshot())
+        .expect("lookup")
+        .expect("d2 row");
+    assert_eq!(text(&decision2, "status"), "invalidated");
 }
 
 #[test]

@@ -139,6 +139,74 @@ pub fn setup_ontology_db_with_dag() -> Database {
     db
 }
 
+pub fn setup_propagation_ontology_db() -> Database {
+    let db = Database::open_memory();
+    let p = HashMap::new();
+
+    db.execute(
+        "CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT, description TEXT)",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL, embedding VECTOR(384)) STATE MACHINE (status: active -> [archived, paused, superseded])",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated, embedding VECTOR(384)) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated PROPAGATE ON STATE invalidated EXCLUDE VECTOR PROPAGATE ON STATE superseded EXCLUDE VECTOR",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT)",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, entity_id UUID, state JSON, valid_from INTEGER, valid_to INTEGER)",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, entity_id UUID, data JSON, embedding VECTOR(384)) IMMUTABLE",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID, success BOOLEAN)",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, affected_decision_id UUID, status TEXT, severity TEXT) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed])",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE approvals (id UUID PRIMARY KEY, decision_id UUID)",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE patterns (id UUID PRIMARY KEY, description TEXT)",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sync_state (id UUID PRIMARY KEY, push_watermark INTEGER, pull_watermark INTEGER)",
+        &p,
+    )
+    .unwrap();
+
+    db
+}
+
 pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
     let entity_id = Uuid::new_v4();
     let decision1_id = Uuid::new_v4();

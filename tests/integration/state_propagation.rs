@@ -46,7 +46,6 @@ fn vec128(x: f32) -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t01_fk_propagation_basic() {
     let db = setup_propagation_db();
     let intention_id = Uuid::new_v4();
@@ -110,7 +109,6 @@ fn t01_fk_propagation_basic() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t02_fk_propagation_multi_level() {
     let db = Database::open_memory();
     let p = HashMap::new();
@@ -192,7 +190,6 @@ fn t02_fk_propagation_multi_level() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t03_fk_propagation_depth_limit() {
     let db = Database::open_memory();
     let p = HashMap::new();
@@ -261,7 +258,6 @@ fn t03_fk_propagation_depth_limit() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t04_edge_propagation_basic() {
     let db = setup_propagation_db();
     let a = Uuid::new_v4();
@@ -320,7 +316,6 @@ fn t04_edge_propagation_basic() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t05_edge_propagation_respects_direction() {
     let db = setup_propagation_db();
     let a = Uuid::new_v4();
@@ -404,7 +399,6 @@ fn t05_edge_propagation_respects_direction() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t06_fk_plus_edge_combined() {
     let db = setup_propagation_db();
     let i = Uuid::new_v4();
@@ -470,7 +464,6 @@ fn t06_fk_plus_edge_combined() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t07_vector_exclusion_basic() {
     let db = setup_propagation_db();
     let d = Uuid::new_v4();
@@ -517,7 +510,6 @@ fn t07_vector_exclusion_basic() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t08_fk_propagation_plus_vector_exclusion() {
     let db = setup_propagation_db();
     let i = Uuid::new_v4();
@@ -635,7 +627,6 @@ fn t09_skip_and_warn_on_invalid_transition() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t10_cycle_detection() {
     let db = Database::open_memory();
     let p = HashMap::new();
@@ -726,7 +717,6 @@ fn t11_no_matching_rows_noop() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t12_abort_on_failure_policy() {
     let db = Database::open_memory();
     let p = HashMap::new();
@@ -813,7 +803,6 @@ fn t14_persistence_across_reopen() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t15_end_to_end_fk_edge_vector_full_chain() {
     let db = setup_propagation_db();
     let i = Uuid::new_v4();
@@ -891,7 +880,6 @@ fn t15_end_to_end_fk_edge_vector_full_chain() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t16_supersession_with_vector_exclusion() {
     let db = setup_propagation_db();
     let d = Uuid::new_v4();
@@ -939,7 +927,6 @@ fn t16_supersession_with_vector_exclusion() {
 }
 
 #[test]
-#[ignore = "requires propagation implementation"]
 fn t17_sync_propagation_server_archives_client_applies_and_propagates() {
     let server = setup_propagation_db();
     let client = setup_propagation_db();
