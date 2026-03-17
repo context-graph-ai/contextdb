@@ -9,3 +9,4 @@ pub mod helpers;
 pub mod hiring_criteria;
 pub mod job_level;
 pub mod safety_integrity;
+pub mod state_propagation;

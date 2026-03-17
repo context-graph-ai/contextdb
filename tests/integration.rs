@@ -20,3 +20,5 @@ mod hiring_criteria;
 mod job_level;
 #[path = "integration/safety_integrity.rs"]
 mod safety_integrity;
+#[path = "integration/state_propagation.rs"]
+mod state_propagation;
