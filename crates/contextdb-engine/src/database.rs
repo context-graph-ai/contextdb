@@ -14,7 +14,7 @@ use contextdb_tx::TxManager;
 use contextdb_vector::{MemVectorExecutor, VectorStore};
 use parking_lot::Mutex;
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -50,6 +50,30 @@ pub struct Database {
     vector: MemVectorExecutor<CompositeStore>,
     session_tx: Mutex<Option<TxId>>,
     instance_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone)]
+struct PropagationQueueEntry {
+    table: String,
+    uuid: uuid::Uuid,
+    target_state: String,
+    depth: u32,
+    abort_on_failure: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PropagationSource<'a> {
+    table: &'a str,
+    uuid: uuid::Uuid,
+    state: &'a str,
+    depth: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PropagationContext<'a> {
+    tx: TxId,
+    snapshot: SnapshotId,
+    metas: &'a HashMap<String, TableMeta>,
 }
 
 impl Database {
@@ -199,8 +223,330 @@ impl Database {
         conflict_col: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
-        self.relational
-            .upsert(tx, table, conflict_col, values, self.snapshot())
+        let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
+        let meta = self.table_meta(table);
+        let new_state = meta
+            .as_ref()
+            .and_then(|m| m.state_machine.as_ref())
+            .and_then(|sm| values.get(&sm.column))
+            .and_then(Value::as_text)
+            .map(std::borrow::ToOwned::to_owned);
+
+        let result = self
+            .relational
+            .upsert(tx, table, conflict_col, values, self.snapshot())?;
+
+        if let (Some(uuid), Some(state), Some(_meta)) =
+            (row_uuid, new_state.as_deref(), meta.as_ref())
+            && matches!(result, UpsertResult::Updated)
+        {
+            let already_propagating = self
+                .tx_mgr
+                .with_write_set(tx, |ws| ws.propagation_in_progress)?;
+            if !already_propagating {
+                self.tx_mgr
+                    .with_write_set(tx, |ws| ws.propagation_in_progress = true)?;
+                let propagate_result = self.propagate(tx, table, uuid, state);
+                self.tx_mgr
+                    .with_write_set(tx, |ws| ws.propagation_in_progress = false)?;
+                propagate_result?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn propagate(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_uuid: uuid::Uuid,
+        new_state: &str,
+    ) -> Result<()> {
+        let snapshot = self.snapshot();
+        let metas = self.relational_store().table_meta.read().clone();
+        let mut queue: VecDeque<PropagationQueueEntry> = VecDeque::new();
+        let mut visited: HashSet<(String, uuid::Uuid)> = HashSet::new();
+        let mut abort_violation: Option<Error> = None;
+        let ctx = PropagationContext {
+            tx,
+            snapshot,
+            metas: &metas,
+        };
+        let root = PropagationSource {
+            table,
+            uuid: row_uuid,
+            state: new_state,
+            depth: 0,
+        };
+
+        self.enqueue_fk_children(&ctx, &mut queue, root);
+        self.enqueue_edge_children(&ctx, &mut queue, root)?;
+        self.apply_vector_exclusions(&ctx, root)?;
+
+        while let Some(entry) = queue.pop_front() {
+            if !visited.insert((entry.table.clone(), entry.uuid)) {
+                continue;
+            }
+
+            let Some(meta) = metas.get(&entry.table) else {
+                continue;
+            };
+
+            let Some(state_machine) = &meta.state_machine else {
+                let msg = format!(
+                    "warning: propagation target table {} has no state machine",
+                    entry.table
+                );
+                eprintln!("{msg}");
+                if entry.abort_on_failure && abort_violation.is_none() {
+                    abort_violation = Some(Error::PropagationAborted {
+                        table: entry.table.clone(),
+                        column: String::new(),
+                        from: String::new(),
+                        to: entry.target_state.clone(),
+                    });
+                }
+                continue;
+            };
+
+            let state_column = state_machine.column.clone();
+            let Some(existing) = self.relational.point_lookup_with_tx(
+                Some(tx),
+                &entry.table,
+                "id",
+                &Value::Uuid(entry.uuid),
+                snapshot,
+            )?
+            else {
+                continue;
+            };
+
+            let from_state = existing
+                .values
+                .get(&state_column)
+                .and_then(Value::as_text)
+                .unwrap_or("")
+                .to_string();
+
+            let mut next_values = existing.values.clone();
+            next_values.insert(
+                state_column.clone(),
+                Value::Text(entry.target_state.clone()),
+            );
+
+            let upsert_outcome =
+                self.relational
+                    .upsert(tx, &entry.table, "id", next_values, snapshot);
+
+            let reached_state = match upsert_outcome {
+                Ok(UpsertResult::Updated) => entry.target_state.as_str(),
+                Ok(UpsertResult::NoOp) | Ok(UpsertResult::Inserted) => continue,
+                Err(Error::InvalidStateTransition(_)) => {
+                    eprintln!(
+                        "warning: skipped invalid propagated transition {}.{} {} -> {}",
+                        entry.table, state_column, from_state, entry.target_state
+                    );
+                    if entry.abort_on_failure && abort_violation.is_none() {
+                        abort_violation = Some(Error::PropagationAborted {
+                            table: entry.table.clone(),
+                            column: state_column.clone(),
+                            from: from_state,
+                            to: entry.target_state.clone(),
+                        });
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            self.enqueue_edge_children(
+                &ctx,
+                &mut queue,
+                PropagationSource {
+                    table: &entry.table,
+                    uuid: entry.uuid,
+                    state: reached_state,
+                    depth: entry.depth,
+                },
+            )?;
+            self.apply_vector_exclusions(
+                &ctx,
+                PropagationSource {
+                    table: &entry.table,
+                    uuid: entry.uuid,
+                    state: reached_state,
+                    depth: entry.depth,
+                },
+            )?;
+
+            self.enqueue_fk_children(
+                &ctx,
+                &mut queue,
+                PropagationSource {
+                    table: &entry.table,
+                    uuid: entry.uuid,
+                    state: reached_state,
+                    depth: entry.depth,
+                },
+            );
+        }
+
+        if let Some(err) = abort_violation {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn enqueue_fk_children(
+        &self,
+        ctx: &PropagationContext<'_>,
+        queue: &mut VecDeque<PropagationQueueEntry>,
+        source: PropagationSource<'_>,
+    ) {
+        for (owner_table, owner_meta) in ctx.metas {
+            for rule in &owner_meta.propagation_rules {
+                let PropagationRule::ForeignKey {
+                    fk_column,
+                    referenced_table,
+                    trigger_state,
+                    target_state,
+                    max_depth,
+                    abort_on_failure,
+                    ..
+                } = rule
+                else {
+                    continue;
+                };
+
+                if referenced_table != source.table || trigger_state != source.state {
+                    continue;
+                }
+
+                if source.depth >= *max_depth {
+                    continue;
+                }
+
+                let rows = match self.relational.scan_filter_with_tx(
+                    Some(ctx.tx),
+                    owner_table,
+                    ctx.snapshot,
+                    &|row| row.values.get(fk_column) == Some(&Value::Uuid(source.uuid)),
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        eprintln!(
+                            "warning: propagation scan failed for {owner_table}.{fk_column}: {err}"
+                        );
+                        continue;
+                    }
+                };
+
+                for row in rows {
+                    if let Some(id) = row.values.get("id").and_then(Value::as_uuid).copied() {
+                        queue.push_back(PropagationQueueEntry {
+                            table: owner_table.clone(),
+                            uuid: id,
+                            target_state: target_state.clone(),
+                            depth: source.depth + 1,
+                            abort_on_failure: *abort_on_failure,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn enqueue_edge_children(
+        &self,
+        ctx: &PropagationContext<'_>,
+        queue: &mut VecDeque<PropagationQueueEntry>,
+        source: PropagationSource<'_>,
+    ) -> Result<()> {
+        let Some(meta) = ctx.metas.get(source.table) else {
+            return Ok(());
+        };
+
+        for rule in &meta.propagation_rules {
+            let PropagationRule::Edge {
+                edge_type,
+                direction,
+                trigger_state,
+                target_state,
+                max_depth,
+                abort_on_failure,
+            } = rule
+            else {
+                continue;
+            };
+
+            if trigger_state != source.state || source.depth >= *max_depth {
+                continue;
+            }
+
+            let bfs = self.query_bfs(
+                source.uuid,
+                Some(std::slice::from_ref(edge_type)),
+                *direction,
+                1,
+                ctx.snapshot,
+            )?;
+
+            for node in bfs.nodes {
+                if self
+                    .relational
+                    .point_lookup_with_tx(
+                        Some(ctx.tx),
+                        source.table,
+                        "id",
+                        &Value::Uuid(node.id),
+                        ctx.snapshot,
+                    )?
+                    .is_some()
+                {
+                    queue.push_back(PropagationQueueEntry {
+                        table: source.table.to_string(),
+                        uuid: node.id,
+                        target_state: target_state.clone(),
+                        depth: source.depth + 1,
+                        abort_on_failure: *abort_on_failure,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_vector_exclusions(
+        &self,
+        ctx: &PropagationContext<'_>,
+        source: PropagationSource<'_>,
+    ) -> Result<()> {
+        let Some(meta) = ctx.metas.get(source.table) else {
+            return Ok(());
+        };
+
+        for rule in &meta.propagation_rules {
+            let PropagationRule::VectorExclusion { trigger_state } = rule else {
+                continue;
+            };
+            if trigger_state != source.state {
+                continue;
+            }
+            if let Some(row) = self.relational.point_lookup_with_tx(
+                Some(ctx.tx),
+                source.table,
+                "id",
+                &Value::Uuid(source.uuid),
+                ctx.snapshot,
+            )? {
+                self.delete_vector(ctx.tx, row.row_id)?;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {

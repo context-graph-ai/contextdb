@@ -9,6 +9,7 @@ pub struct WriteSet {
     pub vector_inserts: Vec<VectorEntry>,
     pub vector_deletes: Vec<(RowId, TxId)>,
     pub commit_lsn: Option<u64>,
+    pub propagation_in_progress: bool,
 }
 
 impl WriteSet {
