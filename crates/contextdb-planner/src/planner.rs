@@ -1,9 +1,12 @@
 use crate::plan::*;
-use contextdb_core::{Direction, Error, Result};
-use contextdb_parser::ast::{Cte, Expr, FromItem, SelectStatement, SortDirection, Statement};
+use contextdb_core::{Direction, Error, PropagationRule, Result};
+use contextdb_parser::ast::{
+    AstPropagationRule, Cte, Expr, FromItem, SelectStatement, SortDirection, Statement,
+};
 
 const DEFAULT_MATCH_DEPTH: u32 = 5;
 const ENGINE_MAX_BFS_DEPTH: u32 = 10;
+const DEFAULT_PROPAGATION_MAX_DEPTH: u32 = 10;
 
 pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
     match stmt {
@@ -13,7 +16,7 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             immutable: ct.immutable,
             state_machine: ct.state_machine.clone(),
             dag_edge_types: ct.dag_edge_types.clone(),
-            propagation_rules: Vec::new(),
+            propagation_rules: extract_propagation_rules(ct)?,
         })),
         Statement::DropTable(dt) => Ok(PhysicalPlan::DropTable(dt.name.clone())),
         Statement::CreateIndex(ci) => Ok(PhysicalPlan::CreateIndex(CreateIndexPlan {
@@ -41,6 +44,77 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             Ok(PhysicalPlan::Pipeline(vec![]))
         }
     }
+}
+
+fn extract_propagation_rules(
+    ct: &contextdb_parser::ast::CreateTable,
+) -> Result<Vec<PropagationRule>> {
+    let mut rules = Vec::new();
+
+    for column in &ct.columns {
+        if let Some(fk) = &column.references {
+            for rule in &fk.propagation_rules {
+                if let AstPropagationRule::FkState {
+                    trigger_state,
+                    target_state,
+                    max_depth,
+                    abort_on_failure,
+                } = rule
+                {
+                    rules.push(PropagationRule::ForeignKey {
+                        fk_column: column.name.clone(),
+                        referenced_table: fk.table.clone(),
+                        referenced_column: fk.column.clone(),
+                        trigger_state: trigger_state.clone(),
+                        target_state: target_state.clone(),
+                        max_depth: max_depth.unwrap_or(DEFAULT_PROPAGATION_MAX_DEPTH),
+                        abort_on_failure: *abort_on_failure,
+                    });
+                }
+            }
+        }
+    }
+
+    for rule in &ct.propagation_rules {
+        match rule {
+            AstPropagationRule::EdgeState {
+                edge_type,
+                direction,
+                trigger_state,
+                target_state,
+                max_depth,
+                abort_on_failure,
+            } => {
+                let direction = match direction.to_ascii_uppercase().as_str() {
+                    "OUTGOING" => Direction::Outgoing,
+                    "INCOMING" => Direction::Incoming,
+                    "BOTH" => Direction::Both,
+                    other => {
+                        return Err(Error::PlanError(format!(
+                            "invalid edge direction in propagation rule: {}",
+                            other
+                        )));
+                    }
+                };
+                rules.push(PropagationRule::Edge {
+                    edge_type: edge_type.clone(),
+                    direction,
+                    trigger_state: trigger_state.clone(),
+                    target_state: target_state.clone(),
+                    max_depth: max_depth.unwrap_or(DEFAULT_PROPAGATION_MAX_DEPTH),
+                    abort_on_failure: *abort_on_failure,
+                });
+            }
+            AstPropagationRule::VectorExclusion { trigger_state } => {
+                rules.push(PropagationRule::VectorExclusion {
+                    trigger_state: trigger_state.clone(),
+                });
+            }
+            AstPropagationRule::FkState { .. } => {}
+        }
+    }
+
+    Ok(rules)
 }
 
 fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
