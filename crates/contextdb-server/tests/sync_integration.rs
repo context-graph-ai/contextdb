@@ -147,7 +147,7 @@ async fn a2_connection_failure_actionable_error() {
     db.execute("INSERT INTO t (id, v) VALUES ($id, $v)", &params)
         .unwrap();
 
-    // Client pointing to unreachable port, no local server registered
+    // Client pointing to unreachable port
     let client = SyncClient::new(db, "nats://localhost:19999", "no-server-registered");
     let result = client.push().await;
 
@@ -158,11 +158,6 @@ async fn a2_connection_failure_actionable_error() {
         "error must contain the NATS port '19999', got: {}",
         err_msg
     );
-    assert!(
-        !err_msg.contains("tenant not registered"),
-        "error must NOT contain 'tenant not registered' (that's the local fallback error), got: {}",
-        err_msg
-    );
 }
 
 // A3: pull_default() uses runtime-configured policies
@@ -171,6 +166,7 @@ async fn a3_pull_default_uses_configured_policies() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -199,20 +195,18 @@ async fn a3_pull_default_uses_configured_policies() {
         .execute("INSERT INTO t (id, v) VALUES ($id, $v)", &edge_params)
         .unwrap();
 
-    // Register local server
     let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
-    let _server = SyncServer::new(
+    let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:19999",
+        &nats.nats_url,
         "pull-default-test",
         policies,
-    );
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(
-        edge_db.clone(),
-        "nats://localhost:19999",
-        "pull-default-test",
-    );
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "pull-default-test");
 
     // Configure EdgeWins — edge value should survive
     client.set_default_conflict_policy(ConflictPolicy::EdgeWins);
@@ -238,6 +232,7 @@ async fn a4_set_table_direction_blocks_pull() {
     use contextdb_engine::sync_types::SyncDirection;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -275,16 +270,18 @@ async fn a4_set_table_direction_blocks_pull() {
         .execute("CREATE TABLE blocked (id UUID PRIMARY KEY, v TEXT)", &empty)
         .unwrap();
 
-    // Register local server
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let _server = SyncServer::new(
+    let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:19999",
+        &nats.nats_url,
         "direction-test",
         policies.clone(),
-    );
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:19999", "direction-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "direction-test");
 
     // Block the "blocked" table
     client.set_table_direction("blocked", SyncDirection::None);
@@ -434,6 +431,7 @@ async fn a7_per_table_conflict_policy_override() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -484,20 +482,18 @@ async fn a7_per_table_conflict_policy_override() {
         .execute("INSERT INTO decisions (id, v) VALUES ($id, $v)", &p)
         .unwrap();
 
-    // Register local server
     let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
-    let _server = SyncServer::new(
+    let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:19999",
+        &nats.nats_url,
         "policy-override-test",
         policies,
-    );
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(
-        edge_db.clone(),
-        "nats://localhost:19999",
-        "policy-override-test",
-    );
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "policy-override-test");
 
     // Default = ServerWins, but observations = InsertIfNotExists (skip duplicates)
     client.set_default_conflict_policy(ConflictPolicy::ServerWins);
@@ -540,6 +536,7 @@ async fn a8_pull_watermark_advances() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -562,16 +559,18 @@ async fn a8_pull_watermark_advances() {
             .unwrap();
     }
 
-    // Register local server
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let _server = SyncServer::new(
+    let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:19999",
+        &nats.nats_url,
         "pull-wm-test",
         policies.clone(),
-    );
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:19999", "pull-wm-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "pull-wm-test");
 
     // First pull — gets 5 rows
     let result1 = client.pull(&policies).await.unwrap();
@@ -611,6 +610,7 @@ async fn a9_row_delete_events_synced() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -622,16 +622,18 @@ async fn a9_row_delete_events_synced() {
         .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
         .unwrap();
 
-    // Register local server
     let policies = ConflictPolicies::uniform(ConflictPolicy::EdgeWins);
-    let _server = SyncServer::new(
+    let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:19999",
+        &nats.nats_url,
         "rowdelete-test",
         policies.clone(),
-    );
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:19999", "rowdelete-test");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "rowdelete-test");
 
     // Insert row on edge and push to server
     let id = Uuid::new_v4();
@@ -880,9 +882,9 @@ async fn a11_tenant_id_validation() {
     SyncClient::new(db.clone(), "nats://x", "MyTenant");
 }
 
-// A12: NATS request timeout falls back to local
+// A12: NATS request timeout returns an error
 #[tokio::test]
-async fn a12_nats_request_timeout_falls_back() {
+async fn a12_nats_request_timeout_returns_error() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
@@ -898,7 +900,6 @@ async fn a12_nats_request_timeout_falls_back() {
         .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
         .unwrap();
 
-    // Register local server (for fallback)
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let _server = SyncServer::new(
         server_db.clone(),
@@ -906,7 +907,6 @@ async fn a12_nats_request_timeout_falls_back() {
         "timeout-test",
         policies.clone(),
     );
-    // Do NOT run server.run() — no subscriber to reply
 
     // Subscribe to push subject but never reply (simulating hung server)
     let nats_client = async_nats::connect(&nats.nats_url).await.unwrap();
@@ -930,12 +930,9 @@ async fn a12_nats_request_timeout_falls_back() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), client.push()).await;
 
     match result {
-        Ok(Ok(apply_result)) => {
-            // Green: push completed via local fallback after internal timeout
-            assert!(apply_result.applied_rows > 0);
-        }
-        Ok(Err(e)) => panic!("push failed unexpectedly: {e}"),
-        Err(_elapsed) => panic!("push hung — timeout not implemented"),
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("push should have failed after NATS timeout with no fallback"),
+        Err(_elapsed) => panic!("push hung — SYNC_TIMEOUT not firing"),
     }
 }
 
