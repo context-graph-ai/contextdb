@@ -485,4 +485,209 @@ mod tests {
             );
         }
     }
+
+    // A15: split_changeset handles a single row that alone exceeds MAX_BATCH_BYTES
+    #[test]
+    fn a15_split_changeset_single_oversized_row() {
+        let oversized_text = "x".repeat(600 * 1024);
+        let id = Uuid::new_v4();
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), Value::Uuid(id));
+        values.insert("data".to_string(), Value::Text(oversized_text));
+        let row = RowChange {
+            table: "observations".to_string(),
+            natural_key: NaturalKey {
+                column: "id".to_string(),
+                value: Value::Uuid(id),
+            },
+            values,
+            lsn: 1,
+        };
+        let changeset = ChangeSet {
+            rows: vec![row],
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: Vec::new(),
+        };
+
+        let batches = split_changeset(changeset);
+
+        assert!(
+            !batches.is_empty(),
+            "split_changeset must return at least one batch, got {}",
+            batches.len()
+        );
+        let total_rows: usize = batches.iter().map(|b| b.rows.len()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "the single oversized row must appear in exactly one batch, got {}",
+            total_rows
+        );
+    }
+
+    // A16: split_changeset preserves row/vector pairing across batch boundaries
+    #[test]
+    fn a16_split_changeset_preserves_row_vector_pairing() {
+        use contextdb_engine::sync_types::VectorChange;
+
+        let mut rows = Vec::new();
+        let mut vectors = Vec::new();
+        for i in 0..10usize {
+            let id = Uuid::new_v4();
+            let mut values = HashMap::new();
+            values.insert("id".to_string(), Value::Uuid(id));
+            values.insert("data".to_string(), Value::Text("x".repeat(60 * 1024)));
+            rows.push(RowChange {
+                table: "observations".to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values,
+                lsn: (i + 1) as u64,
+            });
+            vectors.push(VectorChange {
+                row_id: (i + 1) as u64,
+                vector: vec![i as f32; 3],
+                lsn: (i + 1) as u64,
+            });
+        }
+        let changeset = ChangeSet {
+            rows,
+            edges: Vec::new(),
+            vectors,
+            ddl: Vec::new(),
+        };
+
+        let batches = split_changeset(changeset);
+
+        assert!(
+            batches.len() >= 2,
+            "10 rows * ~60KB each must split into at least 2 batches, got {}",
+            batches.len()
+        );
+        let total_rows: usize = batches.iter().map(|b| b.rows.len()).sum();
+        let total_vecs: usize = batches.iter().map(|b| b.vectors.len()).sum();
+        assert_eq!(total_rows, 10, "all 10 rows must be present across batches");
+        assert_eq!(
+            total_vecs, 10,
+            "all 10 vectors must be present across batches"
+        );
+        for (i, batch) in batches.iter().enumerate() {
+            assert_eq!(
+                batch.rows.len(),
+                batch.vectors.len(),
+                "batch {} must have equal row and vector counts: rows={}, vectors={}",
+                i,
+                batch.rows.len(),
+                batch.vectors.len()
+            );
+            for j in 0..batch.rows.len() {
+                assert_eq!(
+                    batch.rows[j].lsn, batch.vectors[j].lsn,
+                    "batch {} position {}: row.lsn={} != vector.lsn={} — pairing is broken",
+                    i, j, batch.rows[j].lsn, batch.vectors[j].lsn
+                );
+            }
+        }
+    }
+
+    // A17: split_changeset on empty input returns exactly one empty batch
+    #[test]
+    fn a17_split_changeset_empty_input_returns_one_batch() {
+        let changeset = ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: Vec::new(),
+        };
+
+        let batches = split_changeset(changeset);
+
+        assert_eq!(
+            batches.len(),
+            1,
+            "empty changeset must produce exactly 1 batch (not 0), got {}",
+            batches.len()
+        );
+        assert!(
+            batches[0].rows.is_empty(),
+            "the single batch for an empty input must have no rows"
+        );
+    }
+
+    // A18: split_changeset with edge-only changeset must not return vec![]
+    #[test]
+    fn a18_split_changeset_edge_only_not_dropped() {
+        use contextdb_engine::sync_types::EdgeChange;
+
+        let mut edges = Vec::new();
+        for _ in 0..200 {
+            edges.push(EdgeChange {
+                source: Uuid::new_v4(),
+                target: Uuid::new_v4(),
+                edge_type: "x".repeat(5_000),
+                properties: HashMap::new(),
+                lsn: 1,
+            });
+        }
+        let changeset = ChangeSet {
+            rows: Vec::new(),
+            edges,
+            vectors: Vec::new(),
+            ddl: Vec::new(),
+        };
+
+        let batches = split_changeset(changeset);
+
+        assert!(
+            !batches.is_empty(),
+            "edge-only changeset must produce at least 1 batch, got {} — edges silently dropped",
+            batches.len()
+        );
+        let total_edges: usize = batches.iter().map(|b| b.edges.len()).sum();
+        assert_eq!(
+            total_edges, 200,
+            "all 200 edges must be present across batches, got {}",
+            total_edges
+        );
+    }
+
+    // A19: split_changeset with DDL-only changeset must not return vec![]
+    // Column names are padded to force estimated size > MAX_BATCH_BYTES
+    #[test]
+    fn a19_split_changeset_ddl_only_not_dropped() {
+        use contextdb_engine::sync_types::DdlChange;
+
+        let mut ddl = Vec::new();
+        for i in 0..20 {
+            ddl.push(DdlChange::CreateTable {
+                name: format!("table_{}", i),
+                columns: (0..100)
+                    .map(|j| (format!("col_{}_{}", j, "x".repeat(500)), "TEXT".to_string()))
+                    .collect(),
+                constraints: vec![format!("PRIMARY KEY (col_{})", "x".repeat(500))],
+            });
+        }
+        let changeset = ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl,
+        };
+
+        let batches = split_changeset(changeset);
+
+        assert!(
+            !batches.is_empty(),
+            "DDL-only changeset must produce at least 1 batch, got {} — DDL silently dropped",
+            batches.len()
+        );
+        let total_ddl: usize = batches.iter().map(|b| b.ddl.len()).sum();
+        assert_eq!(
+            total_ddl, 20,
+            "all 20 DDL entries must be present across batches, got {}",
+            total_ddl
+        );
+    }
 }

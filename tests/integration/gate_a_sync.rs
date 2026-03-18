@@ -3538,3 +3538,487 @@ async fn nt_10_invalidation_sync_round_trip() {
         "edge must receive resolution_decision_id"
     );
 }
+
+// =========================================================================
+// NT-11: push large mixed payload (400 rows × 384-dim vectors + 4KB text)
+// Distinct from nt_04: uses text+vectors to guarantee >1MB total wire size
+// =========================================================================
+#[tokio::test]
+async fn nt_11_push_large_mixed_payload_chunked() {
+    let nats = start_nats().await;
+    let edge_db = Arc::new(Database::open_memory());
+    let params = HashMap::new();
+    edge_db
+        .execute(
+            "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(384)) IMMUTABLE",
+            &params,
+        )
+        .unwrap();
+
+    let known_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+    let mut known_uuid: Option<Uuid> = None;
+
+    let tx = edge_db.begin();
+    for i in 0..400usize {
+        let uuid = Uuid::new_v4();
+        if i == 0 {
+            known_uuid = Some(uuid);
+        }
+        let vec: Vec<f32> = if i == 0 {
+            known_vector.clone()
+        } else {
+            (0..384).map(|j| ((i * 384 + j) as f32).sin()).collect()
+        };
+        let row_id = edge_db
+            .insert_row(
+                tx,
+                "observations",
+                make_params(vec![
+                    ("id", Value::Uuid(uuid)),
+                    ("data", Value::Text("x".repeat(4_000))),
+                    ("embedding", Value::Vector(vec.clone())),
+                ]),
+            )
+            .unwrap();
+        edge_db.insert_vector(tx, row_id, vec).unwrap();
+    }
+    edge_db.commit(tx).unwrap();
+
+    assert_eq!(
+        edge_db
+            .scan("observations", edge_db.snapshot())
+            .unwrap()
+            .len(),
+        400
+    );
+
+    {
+        use contextdb_server::protocol::WireChangeSet;
+        let wire = WireChangeSet::from(edge_db.changes_since(0));
+        let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
+        assert!(
+            encoded_len > 1_048_576,
+            "guard: changeset must exceed 1MB to validate chunking, got {} bytes",
+            encoded_len
+        );
+    }
+
+    let server_db = Arc::new(Database::open_memory());
+    server_db
+        .execute(
+            "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(384)) IMMUTABLE",
+            &params,
+        )
+        .unwrap();
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "test_tenant",
+        policies,
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
+    let result = client.push().await.unwrap();
+
+    assert_eq!(
+        result.applied_rows, 400,
+        "all 400 rows must reach the server"
+    );
+    assert_eq!(
+        server_db
+            .scan("observations", server_db.snapshot())
+            .unwrap()
+            .len(),
+        400,
+        "server must have all 400 rows"
+    );
+
+    let row = server_db
+        .point_lookup(
+            "observations",
+            "id",
+            &Value::Uuid(known_uuid.unwrap()),
+            server_db.snapshot(),
+        )
+        .unwrap()
+        .expect("planted row must be present on server");
+    assert_eq!(
+        row.values.get("data").and_then(Value::as_text),
+        Some("x".repeat(4_000).as_str()),
+        "text content must arrive intact"
+    );
+
+    let search = server_db
+        .query_vector(&known_vector, 1, None, server_db.snapshot())
+        .unwrap();
+    assert_eq!(search.len(), 1);
+    assert!(
+        search[0].1 > 0.999,
+        "planted vector must be found with cosine > 0.999, got {}",
+        search[0].1
+    );
+}
+
+// =========================================================================
+// NT-12: push single row with 1.1MB text blob, requires chunking
+// =========================================================================
+#[tokio::test]
+async fn nt_12_push_single_oversized_text_blob() {
+    let nats = start_nats().await;
+    let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_text"]));
+
+    let blob = "x".repeat(1_126_400);
+    let uuid_blob = Uuid::new_v4();
+
+    let tx = edge_db.begin();
+    edge_db
+        .insert_row(
+            tx,
+            "observations",
+            make_params(vec![
+                ("id", Value::Uuid(uuid_blob)),
+                ("data", Value::Text(blob.clone())),
+            ]),
+        )
+        .unwrap();
+    edge_db.commit(tx).unwrap();
+
+    assert_eq!(
+        edge_db
+            .scan("observations", edge_db.snapshot())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    {
+        use contextdb_server::protocol::WireChangeSet;
+        let wire = WireChangeSet::from(edge_db.changes_since(0));
+        let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
+        assert!(
+            encoded_len > 1_048_576,
+            "guard: 1-row blob changeset must exceed 1MB, got {} bytes",
+            encoded_len
+        );
+    }
+
+    let server_db = Arc::new(setup_sync_db_with_tables(&["observations_text"]));
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "test_tenant",
+        policies,
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
+    let result = client.push().await.unwrap();
+
+    assert_eq!(result.applied_rows, 1, "the blob row must reach the server");
+
+    let row = server_db
+        .point_lookup(
+            "observations",
+            "id",
+            &Value::Uuid(uuid_blob),
+            server_db.snapshot(),
+        )
+        .unwrap()
+        .expect("blob row must be present on server");
+
+    assert_eq!(
+        row.values.get("data").and_then(Value::as_text),
+        Some(blob.as_str()),
+        "blob must arrive byte-for-byte intact — full content equality"
+    );
+    assert!(result.conflicts.is_empty(), "no conflicts expected");
+}
+
+// =========================================================================
+// NT-13: pull large server-side dataset (600 rows × 2.5KB text), requires chunking
+// Uses 600 rows (not 500) to avoid PULL_PAGE_SIZE=500 exact boundary
+// =========================================================================
+#[tokio::test]
+async fn nt_13_pull_large_dataset_chunked() {
+    let nats = start_nats().await;
+    let server_db = Arc::new(Database::open_memory());
+    let params = HashMap::new();
+    server_db
+        .execute(
+            "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT) IMMUTABLE",
+            &params,
+        )
+        .unwrap();
+
+    let mut sentinel_uuids: Vec<Uuid> = Vec::new();
+    let tx = server_db.begin();
+    for i in 0..600usize {
+        let id = Uuid::new_v4();
+        if i % 60 == 0 {
+            sentinel_uuids.push(id);
+        }
+        server_db
+            .insert_row(
+                tx,
+                "observations",
+                make_params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("data", Value::Text("x".repeat(2_500))),
+                ]),
+            )
+            .unwrap();
+    }
+    server_db.commit(tx).unwrap();
+
+    assert_eq!(
+        server_db
+            .scan("observations", server_db.snapshot())
+            .unwrap()
+            .len(),
+        600
+    );
+
+    {
+        use contextdb_server::protocol::WireChangeSet;
+        let wire = WireChangeSet::from(server_db.changes_since(0));
+        let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
+        assert!(
+            encoded_len > 1_048_576,
+            "guard: 600-row server changeset must exceed 1MB, got {} bytes",
+            encoded_len
+        );
+    }
+
+    let edge_db = Arc::new(Database::open_memory());
+    assert!(
+        edge_db.table_names().is_empty(),
+        "guard: edge must start with no tables"
+    );
+
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "test_tenant",
+        policies.clone(),
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
+    client.pull(&policies).await.unwrap();
+
+    assert!(
+        edge_db.table_names().contains(&"observations".to_string()),
+        "DDL must be synced — edge must have observations table"
+    );
+    assert_eq!(
+        edge_db
+            .scan("observations", edge_db.snapshot())
+            .unwrap()
+            .len(),
+        600,
+        "all 600 rows must arrive at edge"
+    );
+
+    let expected_text = "x".repeat(2_500);
+    for uuid in &sentinel_uuids {
+        let row = edge_db
+            .point_lookup(
+                "observations",
+                "id",
+                &Value::Uuid(*uuid),
+                edge_db.snapshot(),
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("sentinel row {} must be present on edge", uuid));
+        assert_eq!(
+            row.values.get("data").and_then(Value::as_text),
+            Some(expected_text.as_str()),
+            "sentinel blob must arrive byte-for-byte intact for row {}",
+            uuid
+        );
+    }
+}
+
+// =========================================================================
+// NT-14: large bidirectional sync — push 400 rows (vectors+text), pull 400 rows
+// Uses same schema as NT-11 to guarantee >1MB per direction
+// =========================================================================
+#[tokio::test]
+async fn nt_14_large_bidirectional_vector_sync() {
+    let nats = start_nats().await;
+    let edge_db = Arc::new(Database::open_memory());
+    let server_db = Arc::new(Database::open_memory());
+    let params = HashMap::new();
+    let ddl = "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(384)) IMMUTABLE";
+    edge_db.execute(ddl, &params).unwrap();
+    server_db.execute(ddl, &params).unwrap();
+
+    let known_edge_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
+    let known_server_vector: Vec<f32> = (0..384).map(|i| 1.0 - (i as f32) / 384.0).collect();
+    let mut known_edge_uuid: Option<Uuid> = None;
+
+    let tx_e = edge_db.begin();
+    for i in 0..400usize {
+        let uuid = Uuid::new_v4();
+        if i == 0 {
+            known_edge_uuid = Some(uuid);
+        }
+        let vec: Vec<f32> = if i == 0 {
+            known_edge_vector.clone()
+        } else {
+            (0..384).map(|j| ((i * 384 + j) as f32).sin()).collect()
+        };
+        let row_id = edge_db
+            .insert_row(
+                tx_e,
+                "observations",
+                make_params(vec![
+                    ("id", Value::Uuid(uuid)),
+                    ("data", Value::Text("x".repeat(4_000))),
+                    ("embedding", Value::Vector(vec.clone())),
+                ]),
+            )
+            .unwrap();
+        edge_db.insert_vector(tx_e, row_id, vec).unwrap();
+    }
+    edge_db.commit(tx_e).unwrap();
+
+    let tx_s = server_db.begin();
+    for i in 0..400usize {
+        let uuid = Uuid::new_v4();
+        let vec: Vec<f32> = if i == 0 {
+            known_server_vector.clone()
+        } else {
+            (0..384)
+                .map(|j| ((i * 384 + j + 1_000) as f32).cos())
+                .collect()
+        };
+        let row_id = server_db
+            .insert_row(
+                tx_s,
+                "observations",
+                make_params(vec![
+                    ("id", Value::Uuid(uuid)),
+                    ("data", Value::Text("x".repeat(4_000))),
+                    ("embedding", Value::Vector(vec.clone())),
+                ]),
+            )
+            .unwrap();
+        server_db.insert_vector(tx_s, row_id, vec).unwrap();
+    }
+    server_db.commit(tx_s).unwrap();
+
+    assert_eq!(
+        edge_db
+            .scan("observations", edge_db.snapshot())
+            .unwrap()
+            .len(),
+        400,
+        "guard: edge starts with 400 rows"
+    );
+    assert_eq!(
+        server_db
+            .scan("observations", server_db.snapshot())
+            .unwrap()
+            .len(),
+        400,
+        "guard: server starts with 400 rows"
+    );
+
+    {
+        use contextdb_server::protocol::WireChangeSet;
+        let wire = WireChangeSet::from(edge_db.changes_since(0));
+        let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
+        assert!(
+            encoded_len > 1_048_576,
+            "guard: edge changeset must exceed 1MB, got {} bytes",
+            encoded_len
+        );
+    }
+
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "test_tenant",
+        policies.clone(),
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
+
+    let push_result = client.push().await.unwrap();
+    assert_eq!(
+        push_result.applied_rows, 400,
+        "push must deliver all 400 edge rows to server"
+    );
+
+    client.pull(&policies).await.unwrap();
+
+    assert_eq!(
+        server_db
+            .scan("observations", server_db.snapshot())
+            .unwrap()
+            .len(),
+        800,
+        "server must have 800 rows after push"
+    );
+    assert_eq!(
+        edge_db
+            .scan("observations", edge_db.snapshot())
+            .unwrap()
+            .len(),
+        800,
+        "edge must have 800 rows after pull"
+    );
+
+    let push_search = server_db
+        .query_vector(&known_edge_vector, 1, None, server_db.snapshot())
+        .unwrap();
+    assert_eq!(push_search.len(), 1);
+    assert!(
+        push_search[0].1 > 0.999,
+        "edge's planted vector must survive push, similarity={}",
+        push_search[0].1
+    );
+
+    let pull_search = edge_db
+        .query_vector(&known_server_vector, 1, None, edge_db.snapshot())
+        .unwrap();
+    assert_eq!(pull_search.len(), 1);
+    assert!(
+        pull_search[0].1 > 0.999,
+        "server's planted vector must survive pull, similarity={}",
+        pull_search[0].1
+    );
+
+    let edge_row_on_server = server_db
+        .point_lookup(
+            "observations",
+            "id",
+            &Value::Uuid(known_edge_uuid.unwrap()),
+            server_db.snapshot(),
+        )
+        .unwrap()
+        .expect("known edge row must be present on server after push");
+    assert_eq!(
+        edge_row_on_server
+            .values
+            .get("data")
+            .and_then(Value::as_text),
+        Some("x".repeat(4_000).as_str()),
+        "text data must arrive intact on server after push"
+    );
+}
