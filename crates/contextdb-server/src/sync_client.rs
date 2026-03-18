@@ -107,10 +107,7 @@ impl SyncClient {
             });
         }
 
-        let nats_client = self
-            .ensure_connected()
-            .await
-            .map_err(Error::SyncError)?;
+        let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
 
         let mut total = ApplyResult {
             applied_rows: 0,
@@ -173,10 +170,7 @@ impl SyncClient {
 
     /// Pull with explicit policies (frozen test contract, library consumers).
     pub async fn pull(&self, policies: &ConflictPolicies) -> Result<ApplyResult, Error> {
-        let nats_client = self
-            .ensure_connected()
-            .await
-            .map_err(Error::SyncError)?;
+        let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
         let directions = self.table_directions.read().unwrap().clone();
 
         let mut since_lsn = self.pull_watermark.load(Ordering::SeqCst);

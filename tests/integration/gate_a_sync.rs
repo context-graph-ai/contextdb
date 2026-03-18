@@ -16,11 +16,43 @@ use contextdb_engine::sync_types::{
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+struct NatsFixture {
+    _container: ContainerAsync<GenericImage>,
+    nats_url: String,
+}
+
+async fn start_nats() -> NatsFixture {
+    let nats_conf = format!(
+        "{}/../contextdb-server/tests/nats.conf",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    let image = GenericImage::new("nats", "latest")
+        .with_exposed_port(4222.tcp())
+        .with_exposed_port(9222.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
+
+    let request = image
+        .with_mount(Mount::bind_mount(&nats_conf, "/etc/nats/nats.conf"))
+        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
+
+    let container: ContainerAsync<GenericImage> = request.start().await.unwrap();
+    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
+
+    NatsFixture {
+        _container: container,
+        nats_url: format!("nats://127.0.0.1:{nats_port}"),
+    }
+}
 
 fn make_params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
@@ -2126,6 +2158,7 @@ fn a9_15_archive_not_delete_status_transition_sync() {
 // =========================================================================
 #[tokio::test]
 async fn nt_01_push_round_trip_via_nats() {
+    let nats = start_nats().await;
     let client_db = setup_sync_db_with_tables(&["observations"]);
 
     let uuid_1 = Uuid::new_v4();
@@ -2192,15 +2225,16 @@ async fn nt_01_push_round_trip_via_nats() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let client_db = Arc::new(client_db);
-    let client = SyncClient::new(client_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(client_db.clone(), &nats.nats_url, "test_tenant");
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 3);
 
@@ -2278,6 +2312,7 @@ async fn nt_01_push_round_trip_via_nats() {
 // =========================================================================
 #[tokio::test]
 async fn nt_02_pull_round_trip_via_nats() {
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
     server_db
@@ -2327,14 +2362,15 @@ async fn nt_02_pull_round_trip_via_nats() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(client_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(client_db.clone(), &nats.nats_url, "test_tenant");
     let _result = client.pull(&policies).await.unwrap();
 
     // Table was created via DDL sync
@@ -2366,6 +2402,7 @@ async fn nt_02_pull_round_trip_via_nats() {
 // =========================================================================
 #[tokio::test]
 async fn nt_03_bidirectional_sync_via_nats() {
+    let nats = start_nats().await;
     let edge_db = Arc::new(setup_sync_db_with_tables(&["items"]));
     let server_db = Arc::new(setup_sync_db_with_tables(&["items"]));
 
@@ -2432,14 +2469,15 @@ async fn nt_03_bidirectional_sync_via_nats() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
 
     // Push: edge -> server
     client.push().await.unwrap();
@@ -2470,6 +2508,7 @@ async fn nt_03_bidirectional_sync_via_nats() {
 // =========================================================================
 #[tokio::test]
 async fn nt_04_chunking_large_vector_payload() {
+    let nats = start_nats().await;
     let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_384"]));
 
     // Generate a known vector for later search assertion
@@ -2511,14 +2550,15 @@ async fn nt_04_chunking_large_vector_payload() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 200);
 
@@ -2544,8 +2584,7 @@ async fn nt_04_chunking_large_vector_payload() {
 // NT-05: Reconnection after NATS restart
 //
 // TODO(sync): This test currently validates watermark-based delta push
-// (only new rows sent on second push). The full NT-05 scenario requires
-// Docker control to stop/restart NATS between pushes:
+// (only new rows sent on second push). The full NT-05 scenario requires:
 //   1. Push batch_1 (succeeds, watermark advances)
 //   2. Insert batch_2
 //   3. Stop NATS container
@@ -2558,6 +2597,7 @@ async fn nt_04_chunking_large_vector_payload() {
 // =========================================================================
 #[tokio::test]
 async fn nt_05_reconnection_after_nats_restart() {
+    let nats = start_nats().await;
     let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_text"]));
 
     let uuid_1 = Uuid::new_v4();
@@ -2592,14 +2632,15 @@ async fn nt_05_reconnection_after_nats_restart() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
 
     // First push succeeds
     let result1 = client.push().await.unwrap();
@@ -2626,8 +2667,6 @@ async fn nt_05_reconnection_after_nats_restart() {
         .unwrap();
     edge_db.commit(tx2).unwrap();
 
-    // NOTE: In a real test, NATS would be stopped here (docker stop nats-test),
-    // causing push to fail, then restarted. Cannot control Docker from stub test.
     // The push below simulates the retry after reconnection.
 
     // Push again — should only add the new row from batch_2
@@ -2648,6 +2687,7 @@ async fn nt_05_reconnection_after_nats_restart() {
 // =========================================================================
 #[tokio::test]
 async fn nt_06_initial_sync_empty_edge() {
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
 
@@ -2789,14 +2829,15 @@ async fn nt_06_initial_sync_empty_edge() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
     let _result = client.initial_sync(&policies).await.unwrap();
 
     // DDL synced — all 3 tables created
@@ -2877,6 +2918,7 @@ async fn nt_06_initial_sync_empty_edge() {
 // =========================================================================
 #[tokio::test]
 async fn nt_07_offline_accumulate_batch_sync() {
+    let nats = start_nats().await;
     let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_seq"]));
 
     // Simulate 8 hours of offline recording: 1000 observations across separate txns
@@ -2920,14 +2962,15 @@ async fn nt_07_offline_accumulate_batch_sync() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 1000);
 
@@ -2960,6 +3003,7 @@ async fn nt_07_offline_accumulate_batch_sync() {
 // =========================================================================
 #[tokio::test]
 async fn nt_08_ddl_sync_with_state_machine() {
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
 
@@ -3000,14 +3044,15 @@ async fn nt_08_ddl_sync_with_state_machine() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
     client.pull(&policies).await.unwrap();
 
     // Table exists with state machine
@@ -3081,6 +3126,7 @@ async fn nt_08_ddl_sync_with_state_machine() {
 // =========================================================================
 #[tokio::test]
 async fn nt_09_cross_edge_embedding_clustering() {
+    let nats = start_nats().await;
     // 3 edges with similar face embeddings push to 1 server
     let base_embedding = vec![0.9f32, 0.1, 0.1];
     let edge_embeddings = [
@@ -3102,12 +3148,13 @@ async fn nt_09_cross_edge_embedding_clustering() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Set up 3 edge DBs and push each
     for i in 0..3 {
@@ -3149,7 +3196,7 @@ async fn nt_09_cross_edge_embedding_clustering() {
             1
         );
 
-        let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+        let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
         client.push().await.unwrap();
     }
 
@@ -3198,6 +3245,7 @@ async fn nt_09_cross_edge_embedding_clustering() {
 // =========================================================================
 #[tokio::test]
 async fn nt_10_invalidation_sync_round_trip() {
+    let nats = start_nats().await;
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
@@ -3339,14 +3387,15 @@ async fn nt_10_invalidation_sync_round_trip() {
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:4222",
+        &nats.nats_url,
         "test_tenant",
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), "nats://localhost:4222", "test_tenant");
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "test_tenant");
 
     // Push to server
     client.push().await.unwrap();

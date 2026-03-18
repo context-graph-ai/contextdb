@@ -486,6 +486,7 @@ dependencies = [
  "rmp-serde",
  "roaring",
  "serde",
+ "testcontainers",
  "tokio",
  "uuid",
 ]

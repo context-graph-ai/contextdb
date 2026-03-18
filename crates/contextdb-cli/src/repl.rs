@@ -115,7 +115,11 @@ fn handle_sync_command(
     match sub {
         "status" => {
             let connected = rt.block_on(client.ensure_connected()).is_ok();
-            let status = if connected { "connected" } else { "unreachable" };
+            let status = if connected {
+                "connected"
+            } else {
+                "unreachable"
+            };
             format!(
                 "Sync: tenant={}, url={}\nNATS: {status}\nDatabase LSN: {}\nPush watermark: LSN {}\nPull watermark: LSN {}",
                 client.tenant_id(),
