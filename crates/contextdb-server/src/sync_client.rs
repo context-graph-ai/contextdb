@@ -770,7 +770,7 @@ mod tests {
             let id = Uuid::new_v4();
             let mut values = HashMap::new();
             values.insert("id".to_string(), Value::Uuid(id));
-            values.insert("data".to_string(), Value::Text("x".repeat(60 * 1024)));
+            values.insert("data".to_string(), Value::Text("x".repeat(100 * 1024)));
             rows.push(RowChange {
                 table: "observations".to_string(),
                 natural_key: NaturalKey {
@@ -797,7 +797,7 @@ mod tests {
 
         assert!(
             batches.len() >= 2,
-            "10 rows * ~60KB each must split into at least 2 batches, got {}",
+            "10 rows * ~100KB each must split into at least 2 batches, got {}",
             batches.len()
         );
         let total_rows: usize = batches.iter().map(|b| b.rows.len()).sum();

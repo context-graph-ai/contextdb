@@ -69,17 +69,15 @@ impl SyncServer {
         loop {
             tokio::select! {
                 maybe_msg = push_sub.next() => {
-                    if let Some(msg) = maybe_msg {
-                        if let Err(e) = self.handle_push(&client, msg).await {
-                            tracing::error!(error = %e, "handle_push failed");
-                        }
+                    if let Some(msg) = maybe_msg
+                        && let Err(e) = self.handle_push(&client, msg).await {
+                        tracing::error!(error = %e, "handle_push failed");
                     }
                 }
                 maybe_msg = pull_sub.next() => {
-                    if let Some(msg) = maybe_msg {
-                        if let Err(e) = self.handle_pull(&client, msg).await {
-                            tracing::error!(error = %e, "handle_pull failed");
-                        }
+                    if let Some(msg) = maybe_msg
+                        && let Err(e) = self.handle_pull(&client, msg).await {
+                        tracing::error!(error = %e, "handle_pull failed");
                     }
                 }
                 _ = cleanup_interval.tick() => {

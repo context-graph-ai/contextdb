@@ -1042,6 +1042,7 @@ async fn a15_concurrent_push_and_pull() {
     use contextdb_core::Value;
     use uuid::Uuid;
 
+    let nats = start_nats().await;
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     let empty = HashMap::new();
@@ -1063,20 +1064,18 @@ async fn a15_concurrent_push_and_pull() {
         .execute("INSERT INTO t (id, v) VALUES ($id, $v)", &p)
         .unwrap();
 
-    // Register local server
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let _server = SyncServer::new(
+    let server = Arc::new(SyncServer::new(
         server_db.clone(),
-        "nats://localhost:19999",
+        &nats.nats_url,
         "concurrent-client-test",
         policies.clone(),
-    );
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(
-        edge_db.clone(),
-        "nats://localhost:19999",
-        "concurrent-client-test",
-    );
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "concurrent-client-test");
 
     // Insert data on edge (for push to send)
     let edge_id = Uuid::new_v4();
