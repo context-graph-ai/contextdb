@@ -5,13 +5,20 @@ use crate::subjects::{pull_subject, push_subject};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::ConflictPolicies;
 use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Max concurrent in-flight chunked push sessions. Rejects new chunk_ids past this limit.
+const MAX_CHUNK_SESSIONS: usize = 64;
 
 pub struct SyncServer {
     db: Arc<Database>,
     nats_url: String,
     tenant_id: String,
     policies: ConflictPolicies,
+    chunk_buffer:
+        std::sync::Mutex<HashMap<uuid::Uuid, (Instant, Vec<crate::protocol::ChunkMessage>)>>,
 }
 
 impl SyncServer {
@@ -33,6 +40,7 @@ impl SyncServer {
             nats_url: nats_url.to_string(),
             tenant_id: tenant_id.to_string(),
             policies,
+            chunk_buffer: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -56,17 +64,36 @@ impl SyncServer {
             .subscribe(pull_subject(&self.tenant_id))
             .await
             .expect("subscribe pull");
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
                 maybe_msg = push_sub.next() => {
                     if let Some(msg) = maybe_msg {
-                        let _ = self.handle_push(&client, msg).await;
+                        if let Err(e) = self.handle_push(&client, msg).await {
+                            tracing::error!(error = %e, "handle_push failed");
+                        }
                     }
                 }
                 maybe_msg = pull_sub.next() => {
                     if let Some(msg) = maybe_msg {
-                        let _ = self.handle_pull(&client, msg).await;
+                        if let Err(e) = self.handle_pull(&client, msg).await {
+                            tracing::error!(error = %e, "handle_pull failed");
+                        }
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    let mut buf = self.chunk_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    let before = buf.len();
+                    buf.retain(|id, (ts, _chunks)| {
+                        let keep = ts.elapsed() < std::time::Duration::from_secs(30);
+                        if !keep {
+                            tracing::warn!(%id, "evicting stale chunk session (30s TTL expired)");
+                        }
+                        keep
+                    });
+                    if buf.len() < before {
+                        tracing::info!(evicted = before - buf.len(), remaining = buf.len(), "chunk buffer cleanup");
                     }
                 }
             }
@@ -80,30 +107,118 @@ impl SyncServer {
     ) -> contextdb_core::Result<()> {
         let envelope =
             decode(&msg.payload).map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
-        if !matches!(envelope.message_type, MessageType::PushRequest) {
-            return Err(contextdb_core::Error::SyncError(
+
+        match envelope.message_type {
+            MessageType::Chunk => {
+                let chunk_msg: crate::protocol::ChunkMessage =
+                    rmp_serde::from_slice(&envelope.payload)
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                let mut buf = self.chunk_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                if !buf.contains_key(&chunk_msg.chunk_id) && buf.len() >= MAX_CHUNK_SESSIONS {
+                    tracing::warn!(
+                        chunk_id = %chunk_msg.chunk_id,
+                        active_sessions = buf.len(),
+                        "chunk buffer full, rejecting new chunk session"
+                    );
+                    return Err(contextdb_core::Error::SyncError(
+                        "chunk buffer full".to_string(),
+                    ));
+                }
+                buf.entry(chunk_msg.chunk_id)
+                    .or_insert_with(|| (std::time::Instant::now(), Vec::new()))
+                    .1
+                    .push(chunk_msg);
+                Ok(())
+            }
+            MessageType::ChunkAck => {
+                let ack: crate::protocol::ChunkAck = rmp_serde::from_slice(&envelope.payload)
+                    .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+
+                tracing::info!(
+                    chunk_id = %ack.chunk_id,
+                    total_chunks = ack.total_chunks,
+                    "received ChunkAck, attempting reassembly"
+                );
+
+                let process_result: contextdb_core::Result<Vec<u8>> = (|| {
+                    let mut chunks = {
+                        let mut buf = self.chunk_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        let (_ts, chunks) = buf.remove(&ack.chunk_id).ok_or_else(|| {
+                            contextdb_core::Error::SyncError(format!(
+                                "no chunks buffered for chunk_id {}",
+                                ack.chunk_id
+                            ))
+                        })?;
+                        chunks
+                    };
+
+                    if chunks.len() != ack.total_chunks as usize {
+                        return Err(contextdb_core::Error::SyncError(format!(
+                            "expected {} chunks for {}, got {}",
+                            ack.total_chunks,
+                            ack.chunk_id,
+                            chunks.len()
+                        )));
+                    }
+
+                    let assembled = crate::chunking::reassemble(&mut chunks);
+                    let inner_envelope = decode(&assembled)
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                    let request: PushRequest = rmp_serde::from_slice(&inner_envelope.payload)
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+
+                    let result = self
+                        .db
+                        .apply_changes(request.changeset.into(), &self.policies)?;
+                    let response = PushResponse {
+                        result: result.into(),
+                    };
+                    encode(MessageType::PushResponse, &response)
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))
+                })();
+
+                match process_result {
+                    Ok(payload) => {
+                        client
+                            .publish(ack.reply_inbox, payload.into())
+                            .await
+                            .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            chunk_id = %ack.chunk_id,
+                            error = %e,
+                            "chunked push processing failed, client will timeout"
+                        );
+                        Err(e)
+                    }
+                }
+            }
+            MessageType::PushRequest => {
+                let request: PushRequest = rmp_serde::from_slice(&envelope.payload)
+                    .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                let result = self
+                    .db
+                    .apply_changes(request.changeset.into(), &self.policies)?;
+                let response = PushResponse {
+                    result: result.into(),
+                };
+                let payload = encode(MessageType::PushResponse, &response)
+                    .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+
+                if let Some(reply) = msg.reply {
+                    client
+                        .publish(reply, payload.into())
+                        .await
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                }
+                Ok(())
+            }
+            _ => Err(contextdb_core::Error::SyncError(
                 "unexpected message type on push subject".to_string(),
-            ));
+            )),
         }
-
-        let request: PushRequest = rmp_serde::from_slice(&envelope.payload)
-            .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
-        let result = self
-            .db
-            .apply_changes(request.changeset.into(), &self.policies)?;
-        let response = PushResponse {
-            result: result.into(),
-        };
-        let payload = encode(MessageType::PushResponse, &response)
-            .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
-
-        if let Some(reply) = msg.reply {
-            client
-                .publish(reply, payload.into())
-                .await
-                .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
-        }
-        Ok(())
     }
 
     async fn handle_pull(
@@ -155,10 +270,31 @@ impl SyncServer {
             .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
 
         if let Some(reply) = msg.reply {
-            client
-                .publish(reply, payload.into())
-                .await
-                .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+            if crate::chunking::needs_chunking(&payload) {
+                let chunks = crate::chunking::chunk(&payload);
+                tracing::info!(
+                    total_chunks = chunks.len(),
+                    payload_size = payload.len(),
+                    "sending chunked pull response"
+                );
+                for chunk_msg in &chunks {
+                    let chunk_encoded = encode(MessageType::Chunk, chunk_msg)
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                    client
+                        .publish(reply.clone(), chunk_encoded.into())
+                        .await
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                }
+                client
+                    .flush()
+                    .await
+                    .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+            } else {
+                client
+                    .publish(reply, payload.into())
+                    .await
+                    .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+            }
         }
         Ok(())
     }

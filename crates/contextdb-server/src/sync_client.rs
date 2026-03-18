@@ -1,6 +1,5 @@
-use crate::chunking::needs_chunking;
 use crate::protocol::{
-    MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireChangeSet,
+    ChunkAck, MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireChangeSet,
     WireRowChange, decode, encode,
 };
 use crate::subjects::{pull_subject, push_subject};
@@ -9,12 +8,15 @@ use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, SyncDirection,
 };
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overall deadline for collecting all chunks in a chunked pull response.
+const CHUNK_COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const PULL_PAGE_SIZE: u32 = 500;
 const MAX_BATCH_BYTES: usize = 800 * 1024;
 
@@ -133,27 +135,93 @@ impl SyncClient {
             };
             let encoded = encode(MessageType::PushRequest, &request)
                 .map_err(|e| Error::SyncError(e.to_string()))?;
-            let _chunked = needs_chunking(&encoded);
-            let payload = encoded;
 
-            let result: ApplyResult = match tokio::time::timeout(
-                SYNC_TIMEOUT,
-                nats_client.request(push_subject(&self.tenant_id), payload.into()),
-            )
-            .await
-            {
-                Ok(Ok(msg)) => {
-                    let envelope =
-                        decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
-                    let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
+            let result: ApplyResult = if crate::chunking::needs_chunking(&encoded) {
+                use crate::chunking::chunk;
+
+                tracing::info!(
+                    payload_size = encoded.len(),
+                    "push payload exceeds chunking threshold, using chunked send"
+                );
+
+                let inbox = nats_client.new_inbox();
+                let mut inbox_sub = nats_client
+                    .subscribe(inbox.clone())
+                    .await
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                let subject = push_subject(&self.tenant_id);
+                let chunks = chunk(&encoded);
+                let chunk_id = chunks[0].chunk_id;
+                let total_chunks = chunks[0].total_chunks;
+
+                tracing::debug!(
+                    %chunk_id,
+                    total_chunks,
+                    "sending {} chunks for push request",
+                    total_chunks
+                );
+
+                for chunk_msg in &chunks {
+                    let chunk_encoded = encode(MessageType::Chunk, chunk_msg)
                         .map_err(|e| Error::SyncError(e.to_string()))?;
-                    response.result.into()
+                    nats_client
+                        .publish(subject.clone(), chunk_encoded.into())
+                        .await
+                        .map_err(|e| Error::SyncError(e.to_string()))?;
                 }
-                Ok(Err(e)) => return Err(Error::SyncError(e.to_string())),
-                Err(_) => {
-                    return Err(Error::SyncError(
-                        "NATS request timed out waiting for push response".to_string(),
-                    ));
+
+                nats_client
+                    .flush()
+                    .await
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                let ack = ChunkAck {
+                    chunk_id,
+                    total_chunks,
+                    reply_inbox: inbox.clone(),
+                };
+                let ack_encoded = encode(MessageType::ChunkAck, &ack)
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+                nats_client
+                    .publish(subject, ack_encoded.into())
+                    .await
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+                nats_client
+                    .flush()
+                    .await
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                let msg = tokio::time::timeout(SYNC_TIMEOUT, inbox_sub.next())
+                    .await
+                    .map_err(|_| Error::SyncError("chunked push timed out".to_string()))?
+                    .ok_or_else(|| {
+                        Error::SyncError("inbox closed before push response".to_string())
+                    })?;
+                let envelope = decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
+                let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+                response.result.into()
+            } else {
+                match tokio::time::timeout(
+                    SYNC_TIMEOUT,
+                    nats_client.request(push_subject(&self.tenant_id), encoded.into()),
+                )
+                .await
+                {
+                    Ok(Ok(msg)) => {
+                        let envelope =
+                            decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
+                        let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
+                            .map_err(|e| Error::SyncError(e.to_string()))?;
+                        response.result.into()
+                    }
+                    Ok(Err(e)) => return Err(Error::SyncError(e.to_string())),
+                    Err(_) => {
+                        return Err(Error::SyncError(
+                            "NATS request timed out waiting for push response".to_string(),
+                        ));
+                    }
                 }
             };
             last_successful_lsn = batch_max_lsn;
@@ -192,30 +260,102 @@ impl SyncClient {
             let (changes, has_more, cursor) = {
                 let encoded = encode(MessageType::PullRequest, &request)
                     .map_err(|e| Error::SyncError(e.to_string()))?;
-                match tokio::time::timeout(
-                    SYNC_TIMEOUT,
-                    nats_client.request(pull_subject(&self.tenant_id), encoded.into()),
-                )
-                .await
-                {
-                    Ok(Ok(msg)) => {
-                        let envelope =
-                            decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
-                        let response: PullResponse = rmp_serde::from_slice(&envelope.payload)
-                            .map_err(|e| Error::SyncError(e.to_string()))?;
-                        (
-                            ChangeSet::from(response.changeset),
-                            response.has_more,
-                            response.cursor,
-                        )
-                    }
-                    Ok(Err(e)) => return Err(Error::SyncError(e.to_string())),
-                    Err(_) => {
-                        return Err(Error::SyncError(
+
+                let inbox = nats_client.new_inbox();
+                let mut inbox_sub = nats_client
+                    .subscribe(inbox.clone())
+                    .await
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                nats_client
+                    .publish_with_reply(
+                        pull_subject(&self.tenant_id),
+                        inbox.clone(),
+                        encoded.into(),
+                    )
+                    .await
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                let first_msg = tokio::time::timeout(SYNC_TIMEOUT, inbox_sub.next())
+                    .await
+                    .map_err(|_| {
+                        Error::SyncError(
                             "NATS request timed out waiting for pull response".to_string(),
+                        )
+                    })?
+                    .ok_or_else(|| Error::SyncError("pull inbox closed".to_string()))?;
+
+                let first_envelope =
+                    decode(&first_msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
+
+                let response_envelope = match first_envelope.message_type {
+                    MessageType::PullResponse => first_envelope,
+                    MessageType::Chunk => {
+                        let first_chunk: crate::protocol::ChunkMessage =
+                            rmp_serde::from_slice(&first_envelope.payload)
+                                .map_err(|e| Error::SyncError(e.to_string()))?;
+                        let total = first_chunk.total_chunks;
+                        let mut collected = vec![first_chunk];
+
+                        tracing::debug!(
+                            total_chunks = total,
+                            "pull response is chunked, collecting chunks"
+                        );
+
+                        let deadline = tokio::time::Instant::now() + CHUNK_COLLECT_TIMEOUT;
+
+                        while collected.len() < total as usize {
+                            let remaining = deadline.duration_since(tokio::time::Instant::now());
+                            if remaining.is_zero() {
+                                return Err(Error::SyncError(format!(
+                                    "overall chunk collection deadline exceeded after {}/{} chunks",
+                                    collected.len(),
+                                    total
+                                )));
+                            }
+                            let chunk_msg = tokio::time::timeout_at(deadline, inbox_sub.next())
+                                .await
+                                .map_err(|_| {
+                                    Error::SyncError(format!(
+                                        "timeout collecting pull chunks ({}/{})",
+                                        collected.len(),
+                                        total
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    Error::SyncError("pull chunk stream ended".to_string())
+                                })?;
+                            let env = decode(&chunk_msg.payload)
+                                .map_err(|e| Error::SyncError(e.to_string()))?;
+                            if matches!(env.message_type, MessageType::Chunk) {
+                                let c: crate::protocol::ChunkMessage =
+                                    rmp_serde::from_slice(&env.payload)
+                                        .map_err(|e| Error::SyncError(e.to_string()))?;
+                                collected.push(c);
+                            } else {
+                                return Err(Error::SyncError(format!(
+                                    "unexpected message type {:?} while collecting pull chunks",
+                                    env.message_type
+                                )));
+                            }
+                        }
+                        let reassembled = crate::chunking::reassemble(&mut collected);
+                        decode(&reassembled).map_err(|e| Error::SyncError(e.to_string()))?
+                    }
+                    _ => {
+                        return Err(Error::SyncError(
+                            "unexpected message type in pull response".to_string(),
                         ));
                     }
-                }
+                };
+
+                let response: PullResponse = rmp_serde::from_slice(&response_envelope.payload)
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+                (
+                    ChangeSet::from(response.changeset),
+                    response.has_more,
+                    response.cursor,
+                )
             };
 
             // Extract server-side max LSN BEFORE filtering/applying
@@ -353,9 +493,37 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
             0
         };
 
-        if batch_size + row_size + vec_size_for_i + overhead > MAX_BATCH_BYTES
-            && !batch_rows.is_empty()
-        {
+        let should_flush = if batch_rows.is_empty() {
+            false
+        } else {
+            let mut trial_rows = batch_rows.clone();
+            trial_rows.push(row.clone());
+            let mut trial_vectors = batch_vectors.clone();
+            if i < changeset_vectors.len() {
+                trial_vectors.push(changeset_vectors[i].clone());
+            }
+            let trial = ChangeSet {
+                rows: trial_rows.clone(),
+                edges: if batches.is_empty() {
+                    changeset_edges.clone()
+                } else {
+                    Vec::new()
+                },
+                vectors: trial_vectors,
+                ddl: if batches.is_empty() {
+                    changeset_ddl.clone()
+                } else {
+                    Vec::new()
+                },
+            };
+            let actual_size = rmp_serde::to_vec(&WireChangeSet::from(trial))
+                .map(|v| v.len())
+                .unwrap_or(usize::MAX);
+            batch_size + row_size + vec_size_for_i + overhead > MAX_BATCH_BYTES
+                || actual_size > MAX_BATCH_BYTES
+        };
+
+        if should_flush {
             batches.push(ChangeSet {
                 rows: std::mem::take(&mut batch_rows),
                 edges: if batches.is_empty() {

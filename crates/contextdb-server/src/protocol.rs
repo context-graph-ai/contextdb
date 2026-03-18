@@ -53,6 +53,7 @@ pub struct ChunkMessage {
     pub chunk_id: uuid::Uuid,
     pub sequence: u32,
     pub total_chunks: u32,
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
 

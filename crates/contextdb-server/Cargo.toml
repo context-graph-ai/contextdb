@@ -16,6 +16,7 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 futures-util = "0.3"
+serde_bytes = "0.11"
 
 [dev-dependencies]
 tokio-test = "0.4"
