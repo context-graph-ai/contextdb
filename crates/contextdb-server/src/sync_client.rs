@@ -16,7 +16,7 @@ use std::time::Duration;
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 const PULL_PAGE_SIZE: u32 = 500;
-const MAX_BATCH_BYTES: usize = 512 * 1024;
+const MAX_BATCH_BYTES: usize = 800 * 1024;
 
 pub struct SyncClient {
     db: Arc<Database>,
@@ -313,6 +313,14 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
             rmp_serde::to_vec(&wire_row).map(|v| v.len()).unwrap_or(128)
         })
         .collect();
+    let vector_sizes: Vec<usize> = changeset
+        .vectors
+        .iter()
+        .map(|v| {
+            let wire_vec = crate::protocol::WireVectorChange::from(v.clone());
+            rmp_serde::to_vec(&wire_vec).map(|v| v.len()).unwrap_or(64)
+        })
+        .collect();
 
     let mut batches = Vec::new();
     let mut batch_rows = Vec::new();
@@ -324,27 +332,30 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
     let changeset_ddl = changeset.ddl;
 
     // Overhead for edges + DDL in first batch
-    let first_batch_overhead = {
-        let overhead_set = ChangeSet {
-            rows: Vec::new(),
-            edges: changeset_edges.clone(),
-            vectors: Vec::new(),
-            ddl: changeset_ddl.clone(),
-        };
-        rmp_serde::to_vec(&WireChangeSet::from(overhead_set))
-            .map(|v| v.len())
-            .unwrap_or(0)
+    let edges_size: usize = {
+        let edges_wire: Vec<crate::protocol::WireEdgeChange> =
+            changeset_edges.iter().cloned().map(Into::into).collect();
+        rmp_serde::to_vec(&edges_wire).map(|v| v.len()).unwrap_or(0)
     };
+    let ddl_size: usize = {
+        let ddl_wire: Vec<crate::protocol::WireDdlChange> =
+            changeset_ddl.iter().cloned().map(Into::into).collect();
+        rmp_serde::to_vec(&ddl_wire).map(|v| v.len()).unwrap_or(0)
+    };
+    let first_batch_overhead = edges_size + ddl_size;
 
     for (i, row) in changeset.rows.into_iter().enumerate() {
         let row_size = row_sizes.get(i).copied().unwrap_or(128);
+        let vec_size_for_i = vector_sizes.get(i).copied().unwrap_or(64);
         let overhead = if batches.is_empty() {
             first_batch_overhead
         } else {
             0
         };
 
-        if batch_size + row_size + overhead > MAX_BATCH_BYTES && !batch_rows.is_empty() {
+        if batch_size + row_size + vec_size_for_i + overhead > MAX_BATCH_BYTES
+            && !batch_rows.is_empty()
+        {
             batches.push(ChangeSet {
                 rows: std::mem::take(&mut batch_rows),
                 edges: if batches.is_empty() {
@@ -365,6 +376,7 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
         // Pair with vector at same index if available
         if i < changeset_vectors.len() {
             batch_vectors.push(changeset_vectors[i].clone());
+            batch_size += vector_sizes.get(i).copied().unwrap_or(64);
         }
         batch_rows.push(row);
         batch_size += row_size;
@@ -384,6 +396,13 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
             } else {
                 Vec::new()
             },
+        });
+    } else if batches.is_empty() && (!changeset_edges.is_empty() || !changeset_ddl.is_empty()) {
+        batches.push(ChangeSet {
+            rows: Vec::new(),
+            edges: changeset_edges,
+            vectors: Vec::new(),
+            ddl: changeset_ddl,
         });
     }
 
@@ -411,8 +430,7 @@ fn remap_pull_policies(policies: &ConflictPolicies) -> ConflictPolicies {
 mod tests {
     use super::*;
     use contextdb_core::Value;
-    use contextdb_engine::sync_types::NaturalKey;
-    use contextdb_engine::sync_types::RowChange;
+    use contextdb_engine::sync_types::{NaturalKey, RowChange, VectorChange};
     use uuid::Uuid;
 
     // A14: Batch splitting respects byte size limits
@@ -453,20 +471,20 @@ mod tests {
 
         let batches = split_changeset(changeset);
 
-        // Must split into 2+ batches (10 rows * ~100KB > 512KB)
+        // Must split into 2+ batches (10 rows * ~100KB > 800KB)
         assert!(
             batches.len() >= 2,
             "10 rows of ~100KB each (~1MB total) must split into at least 2 batches, got {}",
             batches.len()
         );
 
-        // Each batch's serialized size must be under 512KB
+        // Each batch's serialized size must be under 800KB
         for (i, batch) in batches.iter().enumerate() {
             let wire = WireChangeSet::from(batch.clone());
             let size = rmp_serde::to_vec(&wire).unwrap().len();
             assert!(
-                size <= 512 * 1024,
-                "batch {} serialized to {} bytes, exceeds 512KB limit",
+                size <= 800 * 1024,
+                "batch {} serialized to {} bytes, exceeds 800KB limit",
                 i,
                 size
             );
@@ -482,6 +500,54 @@ mod tests {
             assert!(
                 batch.edges.is_empty(),
                 "edges must NOT be in subsequent batches"
+            );
+        }
+    }
+
+    #[test]
+    fn a14b_batch_splitting_accounts_for_vector_sizes() {
+        let mut rows = Vec::new();
+        let mut vectors = Vec::new();
+        for _ in 0..200 {
+            let id = Uuid::new_v4();
+            let mut values = HashMap::new();
+            values.insert("id".to_string(), Value::Uuid(id));
+            values.insert("data".to_string(), Value::Text("x".repeat(3000)));
+            rows.push(RowChange {
+                table: "t".to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values,
+                lsn: 1,
+            });
+            vectors.push(VectorChange {
+                row_id: 0,
+                vector: (0..384).map(|j| j as f32).collect(),
+                lsn: 1,
+            });
+        }
+        let changeset = ChangeSet {
+            rows,
+            edges: Vec::new(),
+            vectors,
+            ddl: vec![],
+        };
+        let batches = split_changeset(changeset);
+        assert!(
+            batches.len() >= 2,
+            "200 rows with 384-dim vectors must split into 2+ batches with correct accounting, got {}",
+            batches.len()
+        );
+        for (i, batch) in batches.iter().enumerate() {
+            let wire = WireChangeSet::from(batch.clone());
+            let size = rmp_serde::to_vec(&wire).unwrap().len();
+            assert!(
+                size <= 800 * 1024,
+                "batch {} serialized to {} bytes, exceeds 800KB limit",
+                i,
+                size
             );
         }
     }

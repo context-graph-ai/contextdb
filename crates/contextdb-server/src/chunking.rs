@@ -1,9 +1,10 @@
 use crate::protocol::ChunkMessage;
 
 pub const CHUNK_SIZE: usize = 512 * 1024;
+pub const CHUNKING_THRESHOLD: usize = 900 * 1024;
 
 pub fn needs_chunking(data: &[u8]) -> bool {
-    data.len() > CHUNK_SIZE
+    data.len() > CHUNKING_THRESHOLD
 }
 
 pub fn chunk(data: &[u8]) -> Vec<ChunkMessage> {

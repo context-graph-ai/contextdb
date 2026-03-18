@@ -56,6 +56,13 @@ pub struct ChunkMessage {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkAck {
+    pub chunk_id: uuid::Uuid,
+    pub total_chunks: u32,
+    pub reply_inbox: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WireChangeSet {
     pub rows: Vec<WireRowChange>,
