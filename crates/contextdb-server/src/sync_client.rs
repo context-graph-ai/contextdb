@@ -4,7 +4,6 @@ use crate::protocol::{
     WireRowChange, decode, encode,
 };
 use crate::subjects::{pull_subject, push_subject};
-use crate::sync_server::{local_pull, local_push};
 use contextdb_core::Error;
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
@@ -57,7 +56,7 @@ impl SyncClient {
     /// Lazily connect to NATS, reuse existing connection.
     /// Returns cloned Client (cheap — Arc internally) so the mutex is not held during NATS ops.
     /// Returns Err with connection error message if NATS is unreachable.
-    pub async fn ensure_connected(&self) -> Result<Option<async_nats::Client>, String> {
+    pub async fn ensure_connected(&self) -> Result<async_nats::Client, String> {
         let mut guard = self.nats.lock().await;
         if guard.is_none() {
             match async_nats::connect(&self.nats_url).await {
@@ -65,7 +64,9 @@ impl SyncClient {
                 Err(e) => return Err(format!("cannot connect to NATS at {}: {e}", self.nats_url)),
             }
         }
-        Ok((*guard).clone())
+        guard
+            .clone()
+            .ok_or_else(|| format!("cannot connect to NATS at {}", self.nats_url))
     }
 
     /// Drop existing connection and reconnect.
@@ -106,11 +107,10 @@ impl SyncClient {
             });
         }
 
-        // Track NATS connection error for proper error reporting when local fallback also fails
-        let (nats_client, nats_conn_err) = match self.ensure_connected().await {
-            Ok(client) => (client, None),
-            Err(e) => (None, Some(e)),
-        };
+        let nats_client = self
+            .ensure_connected()
+            .await
+            .map_err(Error::SyncError)?;
 
         let mut total = ApplyResult {
             applied_rows: 0,
@@ -139,39 +139,24 @@ impl SyncClient {
             let _chunked = needs_chunking(&encoded);
             let payload = encoded;
 
-            let result = if let Some(client) = &nats_client {
-                match tokio::time::timeout(
-                    SYNC_TIMEOUT,
-                    client.request(push_subject(&self.tenant_id), payload.into()),
-                )
-                .await
-                {
-                    Ok(Ok(msg)) => {
-                        let envelope =
-                            decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
-                        let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
-                            .map_err(|e| Error::SyncError(e.to_string()))?;
-                        response.result.into()
-                    }
-                    Ok(Err(_)) | Err(_) => match local_push(&self.tenant_id, batch) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            return Err(Error::SyncError(
-                                "NATS request failed and local fallback unavailable".to_string(),
-                            ));
-                        }
-                    },
+            let result: ApplyResult = match tokio::time::timeout(
+                SYNC_TIMEOUT,
+                nats_client.request(push_subject(&self.tenant_id), payload.into()),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => {
+                    let envelope =
+                        decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
+                    let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
+                        .map_err(|e| Error::SyncError(e.to_string()))?;
+                    response.result.into()
                 }
-            } else {
-                match local_push(&self.tenant_id, batch) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // Return NATS error (actionable) instead of local fallback error
-                        let msg = nats_conn_err
-                            .as_deref()
-                            .unwrap_or("NATS not connected and local fallback unavailable");
-                        return Err(Error::SyncError(msg.to_string()));
-                    }
+                Ok(Err(e)) => return Err(Error::SyncError(e.to_string())),
+                Err(_) => {
+                    return Err(Error::SyncError(
+                        "NATS request timed out waiting for push response".to_string(),
+                    ));
                 }
             };
             last_successful_lsn = batch_max_lsn;
@@ -188,8 +173,10 @@ impl SyncClient {
 
     /// Pull with explicit policies (frozen test contract, library consumers).
     pub async fn pull(&self, policies: &ConflictPolicies) -> Result<ApplyResult, Error> {
-        let nats_client: Option<async_nats::Client> =
-            self.ensure_connected().await.unwrap_or_default();
+        let nats_client = self
+            .ensure_connected()
+            .await
+            .map_err(Error::SyncError)?;
         let directions = self.table_directions.read().unwrap().clone();
 
         let mut since_lsn = self.pull_watermark.load(Ordering::SeqCst);
@@ -208,12 +195,12 @@ impl SyncClient {
                 max_entries: Some(PULL_PAGE_SIZE),
             };
 
-            let (changes, has_more, cursor) = if let Some(client) = &nats_client {
+            let (changes, has_more, cursor) = {
                 let encoded = encode(MessageType::PullRequest, &request)
                     .map_err(|e| Error::SyncError(e.to_string()))?;
                 match tokio::time::timeout(
                     SYNC_TIMEOUT,
-                    client.request(pull_subject(&self.tenant_id), encoded.into()),
+                    nats_client.request(pull_subject(&self.tenant_id), encoded.into()),
                 )
                 .await
                 {
@@ -228,16 +215,13 @@ impl SyncClient {
                             response.cursor,
                         )
                     }
-                    Ok(Err(_)) | Err(_) => {
-                        let changes = local_pull(&self.tenant_id, since_lsn)
-                            .map_err(|e| Error::SyncError(e.to_string()))?;
-                        (changes, false, None)
+                    Ok(Err(e)) => return Err(Error::SyncError(e.to_string())),
+                    Err(_) => {
+                        return Err(Error::SyncError(
+                            "NATS request timed out waiting for pull response".to_string(),
+                        ));
                     }
                 }
-            } else {
-                let changes = local_pull(&self.tenant_id, since_lsn)
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-                (changes, false, None)
             };
 
             // Extract server-side max LSN BEFORE filtering/applying

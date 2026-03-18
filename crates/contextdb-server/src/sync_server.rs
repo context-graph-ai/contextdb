@@ -3,51 +3,9 @@ use crate::protocol::{
 };
 use crate::subjects::{pull_subject, push_subject};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ApplyResult, ChangeSet, ConflictPolicies};
+use contextdb_engine::sync_types::ConflictPolicies;
 use futures_util::StreamExt;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-
-#[derive(Clone)]
-struct LocalServer {
-    db: Arc<Database>,
-    policies: ConflictPolicies,
-}
-
-fn local_registry() -> &'static Mutex<HashMap<(String, String), LocalServer>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<(String, String), LocalServer>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(crate) fn runtime_scope_key() -> String {
-    tokio::runtime::Handle::try_current()
-        .map(|h| format!("{:?}", h.id()))
-        .unwrap_or_else(|_| "no-runtime".to_string())
-}
-
-pub(crate) fn local_push(tenant: &str, changes: ChangeSet) -> contextdb_core::Result<ApplyResult> {
-    let scope = runtime_scope_key();
-    let state = local_registry()
-        .lock()
-        .expect("local registry poisoned")
-        .get(&(tenant.to_string(), scope))
-        .cloned();
-    let state = state
-        .ok_or_else(|| contextdb_core::Error::SyncError("tenant not registered".to_string()))?;
-    state.db.apply_changes(changes, &state.policies)
-}
-
-pub(crate) fn local_pull(tenant: &str, since_lsn: u64) -> contextdb_core::Result<ChangeSet> {
-    let scope = runtime_scope_key();
-    let state = local_registry()
-        .lock()
-        .expect("local registry poisoned")
-        .get(&(tenant.to_string(), scope))
-        .cloned();
-    let state = state
-        .ok_or_else(|| contextdb_core::Error::SyncError("tenant not registered".to_string()))?;
-    Ok(state.db.changes_since(since_lsn))
-}
+use std::sync::Arc;
 
 pub struct SyncServer {
     db: Arc<Database>,
@@ -70,16 +28,6 @@ impl SyncServer {
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
         );
-        local_registry()
-            .lock()
-            .expect("local registry poisoned")
-            .insert(
-                (tenant_id.to_string(), runtime_scope_key()),
-                LocalServer {
-                    db: db.clone(),
-                    policies: policies.clone(),
-                },
-            );
         Self {
             db,
             nats_url: nats_url.to_string(),
