@@ -1,5 +1,6 @@
 use crate::composite_store::{ChangeLogEntry, CompositeStore};
 use crate::executor::execute_plan;
+use crate::plugin::{CorePlugin, DatabasePlugin, PluginHealth};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
@@ -50,6 +51,15 @@ pub struct Database {
     vector: MemVectorExecutor<CompositeStore>,
     session_tx: Mutex<Option<TxId>>,
     instance_id: uuid::Uuid,
+    plugin: Arc<dyn DatabasePlugin>,
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database")
+            .field("instance_id", &self.instance_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +103,7 @@ impl Database {
             tx_mgr,
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
+            plugin: Arc::new(CorePlugin),
         }
     }
 
@@ -647,6 +658,40 @@ impl Database {
 
     pub fn instance_id(&self) -> uuid::Uuid {
         self.instance_id
+    }
+
+    pub fn open_memory_with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Result<Self> {
+        let relational = Arc::new(RelationalStore::new());
+        let graph = Arc::new(GraphStore::new());
+        let vector = Arc::new(VectorStore::new());
+        let store = CompositeStore::new(relational.clone(), graph.clone(), vector.clone());
+        let tx_mgr = Arc::new(TxManager::new(store));
+        Ok(Self {
+            relational_store: relational.clone(),
+            relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
+            graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
+            vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
+            tx_mgr,
+            session_tx: Mutex::new(None),
+            instance_id: uuid::Uuid::new_v4(),
+            plugin,
+        })
+    }
+
+    pub fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn plugin(&self) -> &dyn DatabasePlugin {
+        self.plugin.as_ref()
+    }
+
+    pub fn plugin_health(&self) -> PluginHealth {
+        PluginHealth::Healthy
+    }
+
+    pub fn plugin_describe(&self) -> serde_json::Value {
+        serde_json::json!({})
     }
 
     pub(crate) fn graph(&self) -> &MemGraphExecutor<CompositeStore> {

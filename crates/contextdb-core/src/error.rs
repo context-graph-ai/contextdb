@@ -63,6 +63,8 @@ pub enum Error {
         source_node: uuid::Uuid,
         target_node: uuid::Uuid,
     },
+    #[error("plugin rejected at {hook}: {reason}")]
+    PluginRejected { hook: String, reason: String },
     #[error("{0}")]
     Other(String),
 }
