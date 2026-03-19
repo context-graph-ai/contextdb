@@ -1,6 +1,6 @@
 use crate::composite_store::{ChangeLogEntry, CompositeStore};
 use crate::executor::execute_plan;
-use crate::plugin::{CorePlugin, DatabasePlugin, PluginHealth};
+use crate::plugin::{CommitSource, CorePlugin, DatabasePlugin, PluginHealth, QueryOutcome};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
@@ -9,6 +9,7 @@ use crate::sync_types::{
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
 use contextdb_parser::Statement;
+use contextdb_parser::ast::{CreateTable, DataType};
 use contextdb_planner::PhysicalPlan;
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
 use contextdb_tx::TxManager;
@@ -17,6 +18,7 @@ use parking_lot::Mutex;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct QueryResult {
@@ -112,7 +114,7 @@ impl Database {
     }
 
     pub fn commit(&self, tx: TxId) -> Result<()> {
-        self.tx_mgr.commit(tx)
+        self.commit_with_source(tx, CommitSource::User)
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
@@ -136,9 +138,8 @@ impl Database {
             }
             Statement::Commit => {
                 let mut session = self.session_tx.lock();
-                if let Some(tx) = *session {
-                    self.commit(tx)?;
-                    *session = None;
+                if let Some(tx) = session.take() {
+                    self.commit_with_source(tx, CommitSource::User)?;
                 }
                 return Ok(QueryResult::empty());
             }
@@ -153,20 +154,8 @@ impl Database {
             _ => {}
         }
 
-        let plan = contextdb_planner::plan(&stmt)?;
-        validate_dml(&plan, self, params)?;
         let active_tx = *self.session_tx.lock();
-        let result = match active_tx {
-            Some(tx) => execute_plan(self, &plan, params, Some(tx)),
-            None => self.execute_autocommit(&plan, params),
-        };
-        if result.is_ok()
-            && let Statement::CreateTable(ct) = &stmt
-            && !ct.dag_edge_types.is_empty()
-        {
-            self.graph.register_dag_edge_types(&ct.dag_edge_types);
-        }
-        result
+        self.execute_statement(&stmt, sql, params, active_tx)
     }
 
     fn execute_autocommit(
@@ -180,7 +169,7 @@ impl Database {
                 let result = execute_plan(self, plan, params, Some(tx));
                 match result {
                     Ok(qr) => {
-                        self.commit(tx)?;
+                        self.commit_with_source(tx, CommitSource::AutoCommit)?;
                         Ok(qr)
                     }
                     Err(e) => {
@@ -206,16 +195,77 @@ impl Database {
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
         let stmt = contextdb_parser::parse(sql)?;
-        let plan = contextdb_planner::plan(&stmt)?;
-        validate_dml(&plan, self, params)?;
-        let result = execute_plan(self, &plan, params, Some(tx));
-        if result.is_ok()
-            && let Statement::CreateTable(ct) = &stmt
-            && !ct.dag_edge_types.is_empty()
+        self.execute_statement(&stmt, sql, params, Some(tx))
+    }
+
+    fn commit_with_source(&self, tx: TxId, source: CommitSource) -> Result<()> {
+        let mut ws = self.tx_mgr.cloned_write_set(tx)?;
+
+        if !ws.is_empty()
+            && let Err(err) = self.plugin.pre_commit(&ws, source)
         {
-            self.graph.register_dag_edge_types(&ct.dag_edge_types);
+            let _ = self.rollback(tx);
+            return Err(err);
         }
+
+        let lsn = self.tx_mgr.commit_with_lsn(tx)?;
+
+        if !ws.is_empty() {
+            ws.stamp_lsn(lsn);
+            self.plugin.post_commit(&ws, source);
+        }
+
+        Ok(())
+    }
+
+    fn execute_statement(
+        &self,
+        stmt: &Statement,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+    ) -> Result<QueryResult> {
+        self.plugin.on_query(sql)?;
+
+        if let Some(change) = self.ddl_change_for_statement(stmt).as_ref() {
+            self.plugin.on_ddl(change)?;
+        }
+
+        let started = Instant::now();
+        let result = (|| {
+            let plan = contextdb_planner::plan(stmt)?;
+            validate_dml(&plan, self, params)?;
+            let result = match tx {
+                Some(tx) => execute_plan(self, &plan, params, Some(tx)),
+                None => self.execute_autocommit(&plan, params),
+            };
+            if result.is_ok()
+                && let Statement::CreateTable(ct) = stmt
+                && !ct.dag_edge_types.is_empty()
+            {
+                self.graph.register_dag_edge_types(&ct.dag_edge_types);
+            }
+            result
+        })();
+        let duration = started.elapsed();
+        let outcome = query_outcome_from_result(&result);
+        self.plugin.post_query(sql, duration, &outcome);
         result
+    }
+
+    fn ddl_change_for_statement(&self, stmt: &Statement) -> Option<DdlChange> {
+        match stmt {
+            Statement::CreateTable(ct) => Some(DdlChange::CreateTable {
+                name: ct.name.clone(),
+                columns: ct
+                    .columns
+                    .iter()
+                    .map(|col| (col.name.clone(), sql_type_for(&col.data_type)))
+                    .collect(),
+                constraints: create_table_constraints(ct),
+            }),
+            _ => None,
+        }
     }
 
     pub fn insert_row(
@@ -666,7 +716,7 @@ impl Database {
         let vector = Arc::new(VectorStore::new());
         let store = CompositeStore::new(relational.clone(), graph.clone(), vector.clone());
         let tx_mgr = Arc::new(TxManager::new(store));
-        Ok(Self {
+        let db = Self {
             relational_store: relational.clone(),
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
@@ -675,11 +725,17 @@ impl Database {
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin,
-        })
+        };
+        db.plugin.on_open()?;
+        Ok(db)
     }
 
     pub fn close(&self) -> Result<()> {
-        Ok(())
+        let tx = self.session_tx.lock().take();
+        if let Some(tx) = tx {
+            self.rollback(tx)?;
+        }
+        self.plugin.on_close()
     }
 
     pub fn plugin(&self) -> &dyn DatabasePlugin {
@@ -687,11 +743,11 @@ impl Database {
     }
 
     pub fn plugin_health(&self) -> PluginHealth {
-        PluginHealth::Healthy
+        self.plugin.health()
     }
 
     pub fn plugin_describe(&self) -> serde_json::Value {
-        serde_json::json!({})
+        self.plugin.describe()
     }
 
     pub(crate) fn graph(&self) -> &MemGraphExecutor<CompositeStore> {
@@ -854,9 +910,11 @@ impl Database {
     /// Applies a ChangeSet to this database with the given conflict policies.
     pub fn apply_changes(
         &self,
-        changes: ChangeSet,
+        mut changes: ChangeSet,
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
+        self.plugin.on_sync_pull(&mut changes)?;
+
         let mut tx = self.begin();
         let mut result = ApplyResult {
             applied_rows: 0,
@@ -905,7 +963,7 @@ impl Database {
         for row in changes.rows {
             if row.values.is_empty() {
                 result.skipped_rows += 1;
-                self.commit(tx)?;
+                self.commit_with_source(tx, CommitSource::SyncPull)?;
                 tx = self.begin();
                 continue;
             }
@@ -939,7 +997,7 @@ impl Database {
                 } else {
                     result.skipped_rows += 1;
                 }
-                self.commit(tx)?;
+                self.commit_with_source(tx, CommitSource::SyncPull)?;
                 tx = self.begin();
                 continue;
             }
@@ -1071,7 +1129,7 @@ impl Database {
                 }
             }
 
-            self.commit(tx)?;
+            self.commit_with_source(tx, CommitSource::SyncPull)?;
             tx = self.begin();
         }
 
@@ -1105,7 +1163,7 @@ impl Database {
             }
         }
 
-        self.commit(tx)?;
+        self.commit_with_source(tx, CommitSource::SyncPull)?;
         result.new_lsn = self.current_lsn();
         Ok(result)
     }
@@ -1177,4 +1235,56 @@ impl Database {
             .find(|v| v.row_id == row_id && v.lsn == lsn)
             .map(|v| v.vector.clone())
     }
+}
+
+fn query_outcome_from_result(result: &Result<QueryResult>) -> QueryOutcome {
+    match result {
+        Ok(query_result) => QueryOutcome::Success {
+            row_count: if query_result.rows.is_empty() {
+                query_result.rows_affected as usize
+            } else {
+                query_result.rows.len()
+            },
+        },
+        Err(error) => QueryOutcome::Error {
+            error: error.to_string(),
+        },
+    }
+}
+
+fn sql_type_for(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Uuid => "UUID".to_string(),
+        DataType::Text => "TEXT".to_string(),
+        DataType::Integer => "INTEGER".to_string(),
+        DataType::Real => "REAL".to_string(),
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Timestamp => "TIMESTAMP".to_string(),
+        DataType::Json => "JSON".to_string(),
+        DataType::Vector(dim) => format!("VECTOR({dim})"),
+    }
+}
+
+fn create_table_constraints(ct: &CreateTable) -> Vec<String> {
+    let mut constraints = Vec::new();
+
+    if ct.immutable {
+        constraints.push("IMMUTABLE".to_string());
+    }
+
+    if let Some(sm) = &ct.state_machine {
+        let transitions = sm
+            .transitions
+            .iter()
+            .map(|(from, tos)| format!("{from} -> ({})", tos.join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        constraints.push(format!("STATE_MACHINE {} ({transitions})", sm.column));
+    }
+
+    if !ct.dag_edge_types.is_empty() {
+        constraints.push(format!("DAG ({})", ct.dag_edge_types.join(", ")));
+    }
+
+    constraints
 }

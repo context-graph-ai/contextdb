@@ -45,7 +45,16 @@ impl<S: WriteSetApplicator> TxManager<S> {
         Ok(f(ws))
     }
 
+    pub fn cloned_write_set(&self, tx: TxId) -> Result<WriteSet> {
+        let active = self.active_txs.lock();
+        active.get(&tx).cloned().ok_or(Error::TxNotFound(tx))
+    }
+
     pub fn commit(&self, tx: TxId) -> Result<()> {
+        self.commit_with_lsn(tx).map(|_| ())
+    }
+
+    pub fn commit_with_lsn(&self, tx: TxId) -> Result<u64> {
         let mut ws = {
             let mut active = self.active_txs.lock();
             active.remove(&tx).ok_or(Error::TxNotFound(tx))?
@@ -56,7 +65,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
         ws.stamp_lsn(lsn);
         self.store.apply(ws)?;
         self.committed_watermark.fetch_max(tx, Ordering::SeqCst);
-        Ok(())
+        Ok(lsn)
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {

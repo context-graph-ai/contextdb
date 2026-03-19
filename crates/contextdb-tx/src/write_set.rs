@@ -1,6 +1,6 @@
 use contextdb_core::*;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct WriteSet {
     pub relational_inserts: Vec<(TableName, VersionedRow)>,
     pub relational_deletes: Vec<(TableName, RowId, TxId)>,
