@@ -18,6 +18,8 @@ rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+redb = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 contextdb-server = { path = "../contextdb-server" }
