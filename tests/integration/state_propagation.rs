@@ -797,12 +797,6 @@ fn t13_propagation_immutable_interaction() {
 }
 
 #[test]
-#[ignore = "requires redb persistence"]
-fn t14_persistence_across_reopen() {
-    todo!("requires redb persistence");
-}
-
-#[test]
 fn t15_end_to_end_fk_edge_vector_full_chain() {
     let db = setup_propagation_db();
     let i = Uuid::new_v4();

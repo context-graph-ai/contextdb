@@ -2369,90 +2369,10 @@ fn a7_09_implicit_vector_coercion_rejected() {
 
 #[test]
 #[ignore = "requires redb persistence"]
-fn a8_01_open_write_close_reopen() {
-    let _db = setup_ontology_db();
-    // TODO: use Database::open(path) to verify persisted rows survive reopen.
-    todo!("requires Database::open(path)");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_02_crash_recovery_committed_survives() {
-    let _db = setup_ontology_db();
-    // TODO: commit data in file DB, drop process, reopen, validate committed state is present.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_03_crash_recovery_uncommitted_lost() {
-    let _db = setup_ontology_db();
-    // TODO: write uncommitted tx to file DB, simulate crash, reopen, assert uncommitted rows absent.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_04_table_schema_survives_reopen() {
-    let _db = setup_ontology_db();
-    // TODO: persist IMMUTABLE + STATE MACHINE table and verify metadata on reopen.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_05_graph_edges_survive_reopen() {
-    let _db = setup_ontology_db();
-    // TODO: persist edges, reopen, and assert BFS reaches expected nodes.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_06_vectors_survive_reopen() {
-    let _db = setup_ontology_db();
-    // TODO: persist vectors, reopen, and assert ANN results remain stable.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
 fn a8_07_hnsw_rebuilt_on_open() {
     let _db = setup_ontology_db();
     // TODO: verify rebuilt ANN index after reopen matches brute-force recall and excludes deleted vectors.
     todo!("requires redb persistence + hnsw");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_08_metadata_counters_survive_reopen() {
-    let _db = setup_ontology_db();
-    // TODO: persist tx/row-id counters and assert monotonic values after reopen.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_09_mixed_workload_survives_reopen() {
-    let _db = setup_ontology_db();
-    // TODO: persist relational+graph+vector in one tx and verify all subsystems after reopen.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_10_open_memory_still_works() {
-    let _db = setup_ontology_db();
-    // TODO: after persistence implementation, assert open_memory behavior unchanged.
-    todo!("requires redb persistence");
-}
-
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_11_single_file_operation() {
-    let _db = setup_ontology_db();
-    // TODO: verify file-backed mode uses a single .contextdb file (plus WAL while writing), no network process.
-    todo!("requires redb persistence");
 }
 
 #[test]
@@ -2508,13 +2428,5 @@ fn a11_01_cross_compile_check() {
 fn a12_01_cli_opens_memory_db() {
     let _db = setup_ontology_db();
     // TODO: spawn contextdb --memory REPL and assert SQL/MATCH/vector commands execute.
-    todo!("requires contextdb-cli");
-}
-
-#[test]
-#[ignore = "requires contextdb-cli"]
-fn a12_02_cli_opens_file_db() {
-    let _db = setup_ontology_db();
-    // TODO: spawn CLI against file DB, verify persisted reads/writes across process restart.
     todo!("requires contextdb-cli");
 }

@@ -6,6 +6,9 @@ use std::sync::Arc;
 
 #[derive(Parser)]
 struct Args {
+    /// Database path (:memory: for in-memory)
+    #[arg(long, env = "CONTEXTDB_DB_PATH", default_value = ":memory:")]
+    db_path: String,
     #[arg(
         long,
         env = "CONTEXTDB_NATS_URL",
@@ -20,7 +23,11 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let db = Arc::new(Database::open_memory());
+    let db = if args.db_path == ":memory:" {
+        Arc::new(Database::open_memory())
+    } else {
+        Arc::new(Database::open(std::path::Path::new(&args.db_path))?)
+    };
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let server = SyncServer::new(db, &args.nats_url, &args.tenant_id, policies);
     server.run().await;

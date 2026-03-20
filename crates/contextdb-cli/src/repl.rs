@@ -4,6 +4,7 @@ use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 use contextdb_server::SyncClient;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ pub fn run(
                     execute_sql(&db, line);
                 }
             }
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(_) => break,
         }
     }

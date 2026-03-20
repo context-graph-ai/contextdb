@@ -29,8 +29,13 @@ fn main() {
     let db = if args.path == ":memory:" {
         contextdb_engine::Database::open_memory()
     } else {
-        eprintln!("Note: disk-backed storage not yet implemented, using in-memory");
-        contextdb_engine::Database::open_memory()
+        match contextdb_engine::Database::open(std::path::Path::new(&args.path)) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Error: failed to open database at '{}': {e}", args.path);
+                std::process::exit(1);
+            }
+        }
     };
 
     let db = Arc::new(db);
@@ -54,7 +59,12 @@ fn main() {
         None => (None, None),
     };
 
-    repl::run(db, sync_client, rt);
+    repl::run(db.clone(), sync_client, rt);
+
+    if let Err(e) = db.close() {
+        eprintln!("Error: failed to close database: {e}");
+        std::process::exit(1);
+    }
 
     // Graceful shutdown: drop SyncClient within the runtime so the internal
     // async_nats::Client can flush its buffer via the still-running worker thread.

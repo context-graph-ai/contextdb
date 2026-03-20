@@ -1156,7 +1156,6 @@ fn p22_cli_bad_path_prints_clear_error() {
 }
 
 #[tokio::test]
-#[ignore = "awaits --db-path server flag"]
 async fn p23_server_started_with_db_path_survives_restart() {
     let _ = start_nats().await;
 }
