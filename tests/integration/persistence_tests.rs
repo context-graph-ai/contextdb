@@ -1450,3 +1450,493 @@ fn p30_two_paths_are_independent() {
     assert!(cross_a.is_none());
     assert!(cross_b.is_none());
 }
+
+#[test]
+fn p31_column_type_preservation_across_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("coltypes.db");
+    let db = Database::open(&path).unwrap();
+
+    db.execute(
+        "CREATE TABLE all_types (
+            pk UUID PRIMARY KEY,
+            t TEXT,
+            r REAL,
+            i INTEGER,
+            b BOOLEAN,
+            j JSON,
+            v VECTOR(384)
+        )",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let meta_before = db.table_meta("all_types").unwrap();
+
+    db.close().unwrap();
+
+    let db2 = Database::open(&path).unwrap();
+    let meta_after = db2.table_meta("all_types").unwrap();
+
+    assert_eq!(meta_before.columns.len(), meta_after.columns.len());
+
+    let expected: Vec<(&str, ColumnType)> = vec![
+        ("pk", ColumnType::Uuid),
+        ("t", ColumnType::Text),
+        ("r", ColumnType::Real),
+        ("i", ColumnType::Integer),
+        ("b", ColumnType::Boolean),
+        ("j", ColumnType::Json),
+        ("v", ColumnType::Vector(384)),
+    ];
+    for (name, expected_type) in &expected {
+        let col = meta_after
+            .columns
+            .iter()
+            .find(|c| c.name == *name)
+            .unwrap_or_else(|| panic!("column {name} missing after reopen"));
+        assert_eq!(
+            &col.column_type, expected_type,
+            "column {name} type changed: expected {expected_type:?}, got {:?}",
+            col.column_type
+        );
+    }
+
+    let pk_col = meta_after.columns.iter().find(|c| c.name == "pk").unwrap();
+    assert!(pk_col.primary_key);
+}
+
+#[test]
+fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("del-vec.db");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE obs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let tx = db.begin();
+    let mut row_ids = Vec::new();
+    let vectors: Vec<Vec<f32>> = vec![
+        vec![1.0, 0.0, 0.0],
+        vec![0.9, 0.1, 0.0],
+        vec![0.0, 1.0, 0.0],
+        vec![0.0, 0.0, 1.0],
+        vec![0.7, 0.7, 0.0],
+    ];
+    for v in &vectors {
+        let rid = db
+            .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
+            .unwrap();
+        db.insert_vector(tx, rid, v.clone()).unwrap();
+        row_ids.push(rid);
+    }
+    db.commit(tx).unwrap();
+
+    let tx2 = db.begin();
+    db.delete_row(tx2, "obs", row_ids[0]).unwrap();
+    db.delete_vector(tx2, row_ids[0]).unwrap();
+    db.delete_row(tx2, "obs", row_ids[1]).unwrap();
+    db.delete_vector(tx2, row_ids[1]).unwrap();
+    db.commit(tx2).unwrap();
+
+    db.close().unwrap();
+
+    let db2 = Database::open(&path).unwrap();
+
+    let results = db2
+        .query_vector(&[1.0, 0.0, 0.0], 5, None, db2.snapshot())
+        .unwrap();
+    let result_ids: HashSet<_> = results.iter().map(|(rid, _)| *rid).collect();
+
+    assert!(
+        !result_ids.contains(&row_ids[0]),
+        "deleted row_ids[0] appeared in ANN results"
+    );
+    assert!(
+        !result_ids.contains(&row_ids[1]),
+        "deleted row_ids[1] appeared in ANN results"
+    );
+
+    assert!(
+        result_ids.contains(&row_ids[2]),
+        "kept row_ids[2] missing from ANN results"
+    );
+    assert!(
+        result_ids.contains(&row_ids[3]),
+        "kept row_ids[3] missing from ANN results"
+    );
+    assert!(
+        result_ids.contains(&row_ids[4]),
+        "kept row_ids[4] missing from ANN results"
+    );
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(db2.scan("obs", db2.snapshot()).unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn p33_bidirectional_sync_with_persistence() {
+    let nats = start_nats().await;
+
+    let edge_tmp = TempDir::new().unwrap();
+    let server_tmp = TempDir::new().unwrap();
+    let edge_path = edge_tmp.path().join("edge.db");
+    let server_path = server_tmp.path().join("server.db");
+
+    let edge_db = Arc::new(Database::open(&edge_path).unwrap());
+    let server_db = Arc::new(Database::open(&server_path).unwrap());
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let empty = HashMap::new();
+
+    edge_db
+        .execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, source TEXT, seq INTEGER)",
+            &empty,
+        )
+        .unwrap();
+    server_db
+        .execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, source TEXT, seq INTEGER)",
+            &empty,
+        )
+        .unwrap();
+
+    let mut edge_ids = Vec::new();
+    for i in 0..50 {
+        let id = Uuid::new_v4();
+        edge_db
+            .execute(
+                "INSERT INTO t (id, source, seq) VALUES ($id, $source, $seq)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    ("source".to_string(), Value::Text("edge".to_string())),
+                    ("seq".to_string(), Value::Int64(i)),
+                ]),
+            )
+            .unwrap();
+        edge_ids.push(id);
+    }
+
+    let mut server_ids = Vec::new();
+    for i in 0..50 {
+        let id = Uuid::new_v4();
+        server_db
+            .execute(
+                "INSERT INTO t (id, source, seq) VALUES ($id, $source, $seq)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    ("source".to_string(), Value::Text("server".to_string())),
+                    ("seq".to_string(), Value::Int64(i)),
+                ]),
+            )
+            .unwrap();
+        server_ids.push(id);
+    }
+
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "p33",
+        policies.clone(),
+    ));
+    let handle = tokio::spawn({
+        let server = server.clone();
+        async move { server.run().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "p33");
+    client.push().await.unwrap();
+    client.pull(&policies).await.unwrap();
+
+    let edge_row_0 = edge_db
+        .point_lookup("t", "id", &Value::Uuid(edge_ids[0]), edge_db.snapshot())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edge_row_0.values.get("source"),
+        Some(&Value::Text("edge".to_string()))
+    );
+
+    let edge_lsn_pre = edge_db.current_lsn();
+    let server_lsn_pre = server_db.current_lsn();
+    let edge_persisted_lsn_pre = edge_db
+        .scan("t", edge_db.snapshot())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.lsn)
+        .max()
+        .unwrap();
+    let server_persisted_lsn_pre = server_db
+        .scan("t", server_db.snapshot())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.lsn)
+        .max()
+        .unwrap();
+
+    drop(server);
+    handle.abort();
+    let _ = handle.await;
+    drop(client);
+    Arc::try_unwrap(edge_db).unwrap().close().unwrap();
+    Arc::try_unwrap(server_db).unwrap().close().unwrap();
+
+    let edge_db2 = Arc::new(Database::open(&edge_path).unwrap());
+    let server_db2 = Arc::new(Database::open(&server_path).unwrap());
+
+    let edge_rows = edge_db2.scan("t", edge_db2.snapshot()).unwrap();
+    let server_rows = server_db2.scan("t", server_db2.snapshot()).unwrap();
+    assert_eq!(
+        edge_rows.len(),
+        100,
+        "edge should have 100 rows, got {}",
+        edge_rows.len()
+    );
+    assert_eq!(
+        server_rows.len(),
+        100,
+        "server should have 100 rows, got {}",
+        server_rows.len()
+    );
+
+    for id in &edge_ids {
+        let row = edge_db2
+            .point_lookup("t", "id", &Value::Uuid(*id), edge_db2.snapshot())
+            .unwrap();
+        assert!(
+            row.is_some(),
+            "edge-originated row missing from edge after reopen"
+        );
+        assert_eq!(
+            row.unwrap().values.get("source"),
+            Some(&Value::Text("edge".to_string()))
+        );
+    }
+    for id in &server_ids {
+        let row = edge_db2
+            .point_lookup("t", "id", &Value::Uuid(*id), edge_db2.snapshot())
+            .unwrap();
+        assert!(
+            row.is_some(),
+            "server-originated row missing from edge after reopen"
+        );
+        assert_eq!(
+            row.unwrap().values.get("source"),
+            Some(&Value::Text("server".to_string()))
+        );
+    }
+    for id in &edge_ids {
+        let row = server_db2
+            .point_lookup("t", "id", &Value::Uuid(*id), server_db2.snapshot())
+            .unwrap();
+        assert!(
+            row.is_some(),
+            "edge-originated row missing from server after reopen"
+        );
+        assert_eq!(
+            row.unwrap().values.get("source"),
+            Some(&Value::Text("edge".to_string()))
+        );
+    }
+    for id in &server_ids {
+        let row = server_db2
+            .point_lookup("t", "id", &Value::Uuid(*id), server_db2.snapshot())
+            .unwrap();
+        assert!(
+            row.is_some(),
+            "server-originated row missing from server after reopen"
+        );
+        assert_eq!(
+            row.unwrap().values.get("source"),
+            Some(&Value::Text("server".to_string()))
+        );
+    }
+
+    let edge_lsn_post = edge_db2.current_lsn();
+    let server_lsn_post = server_db2.current_lsn();
+    assert_eq!(
+        edge_lsn_post, edge_persisted_lsn_pre,
+        "edge LSN after reopen should match persisted row LSN watermark"
+    );
+    assert_eq!(
+        server_lsn_post, server_persisted_lsn_pre,
+        "server LSN after reopen should match persisted row LSN watermark"
+    );
+    assert!(
+        edge_lsn_post <= edge_lsn_pre,
+        "edge LSN inflated after reopen: pre={edge_lsn_pre}, post={edge_lsn_post}"
+    );
+    assert!(
+        server_lsn_post <= server_lsn_pre,
+        "server LSN inflated after reopen: pre={server_lsn_pre}, post={server_lsn_post}"
+    );
+
+    let delta_id_edge = Uuid::new_v4();
+    edge_db2
+        .execute(
+            "INSERT INTO t (id, source, seq) VALUES ($id, $source, $seq)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(delta_id_edge)),
+                (
+                    "source".to_string(),
+                    Value::Text("edge_post_reopen".to_string()),
+                ),
+                ("seq".to_string(), Value::Int64(999)),
+            ]),
+        )
+        .unwrap();
+
+    let delta_id_server = Uuid::new_v4();
+    server_db2
+        .execute(
+            "INSERT INTO t (id, source, seq) VALUES ($id, $source, $seq)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(delta_id_server)),
+                (
+                    "source".to_string(),
+                    Value::Text("server_post_reopen".to_string()),
+                ),
+                ("seq".to_string(), Value::Int64(998)),
+            ]),
+        )
+        .unwrap();
+
+    let server2 = Arc::new(SyncServer::new(
+        server_db2.clone(),
+        &nats.nats_url,
+        "p33",
+        policies.clone(),
+    ));
+    let handle2 = tokio::spawn({
+        let s = server2.clone();
+        async move { s.run().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client2 = SyncClient::new(edge_db2.clone(), &nats.nats_url, "p33");
+    client2.push().await.unwrap();
+    client2.pull(&policies).await.unwrap();
+
+    let server_rows2 = server_db2.scan("t", server_db2.snapshot()).unwrap();
+    assert_eq!(
+        server_rows2.len(),
+        102,
+        "server should have 102 rows after post-reopen sync"
+    );
+    let delta_row = server_db2
+        .point_lookup(
+            "t",
+            "id",
+            &Value::Uuid(delta_id_edge),
+            server_db2.snapshot(),
+        )
+        .unwrap();
+    assert!(
+        delta_row.is_some(),
+        "edge delta row missing from server after post-reopen sync"
+    );
+    assert_eq!(
+        delta_row.unwrap().values.get("source"),
+        Some(&Value::Text("edge_post_reopen".to_string()))
+    );
+
+    let edge_rows2 = edge_db2.scan("t", edge_db2.snapshot()).unwrap();
+    assert_eq!(
+        edge_rows2.len(),
+        102,
+        "edge should have 102 rows after post-reopen sync"
+    );
+    let delta_row2 = edge_db2
+        .point_lookup(
+            "t",
+            "id",
+            &Value::Uuid(delta_id_server),
+            edge_db2.snapshot(),
+        )
+        .unwrap();
+    assert!(
+        delta_row2.is_some(),
+        "server delta row missing from edge after post-reopen sync"
+    );
+    assert_eq!(
+        delta_row2.unwrap().values.get("source"),
+        Some(&Value::Text("server_post_reopen".to_string()))
+    );
+
+    drop(server2);
+    handle2.abort();
+    let _ = handle2.await;
+}
+
+#[test]
+fn p34_cli_memory_mode_smoke_test() {
+    let id = Uuid::new_v4();
+    let mut child1 = Command::new("cargo")
+        .args(["run", "-p", "contextdb-cli", "--", ":memory:"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child1.stdin.as_mut().unwrap();
+        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
+        writeln!(
+            stdin,
+            "INSERT INTO t (id, v) VALUES ('{}', 'memory_val')",
+            id
+        )
+        .unwrap();
+        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, ".quit").unwrap();
+    }
+    let output1 = child1.wait_with_output().unwrap();
+    assert!(
+        output1.status.success(),
+        "CLI session 1 exited with non-zero status"
+    );
+    let stdout1 = String::from_utf8_lossy(&output1.stdout);
+    assert!(
+        stdout1.contains("memory_val"),
+        "SELECT output should contain inserted value, got: {stdout1}"
+    );
+    assert!(
+        stdout1.contains(&id.to_string()),
+        "SELECT output should contain inserted UUID, got: {stdout1}"
+    );
+
+    let mut child2 = Command::new("cargo")
+        .args(["run", "-p", "contextdb-cli", "--", ":memory:"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child2.stdin.as_mut().unwrap();
+        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, ".quit").unwrap();
+    }
+    let output2 = child2.wait_with_output().unwrap();
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+
+    assert!(
+        !stdout2.is_empty() || !stderr2.is_empty(),
+        "CLI session 2 produced no output at all - process may not have started"
+    );
+    assert!(
+        !stdout2.contains(&id.to_string()),
+        "UUID from session 1 should not appear in session 2, stdout: {stdout2}"
+    );
+    assert!(
+        !stdout2.contains("memory_val"),
+        "memory_val should not persist across :memory: sessions, stdout: {stdout2}"
+    );
+}
