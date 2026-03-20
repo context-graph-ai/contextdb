@@ -47,3 +47,13 @@ pub trait WriteSetApplicator: Send + Sync {
     fn apply(&self, ws: WriteSet) -> Result<()>;
     fn new_row_id(&self) -> RowId;
 }
+
+impl WriteSetApplicator for Box<dyn WriteSetApplicator> {
+    fn apply(&self, ws: WriteSet) -> Result<()> {
+        (**self).apply(ws)
+    }
+
+    fn new_row_id(&self) -> RowId {
+        (**self).new_row_id()
+    }
+}

@@ -53,4 +53,11 @@ impl GraphStore {
             }
         }
     }
+
+    pub fn insert_loaded_edge(&self, entry: AdjEntry) {
+        let mut fwd = self.forward_adj.write();
+        let mut rev = self.reverse_adj.write();
+        rev.entry(entry.target).or_default().push(entry.clone());
+        fwd.entry(entry.source).or_default().push(entry);
+    }
 }

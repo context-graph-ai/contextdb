@@ -1,7 +1,5 @@
 use crate::sync_types::{DdlChange, NaturalKey};
-use contextdb_core::{
-    Direction, EdgeType, NodeId, PropagationRule, Result, RowId, TableMeta, TableName, Value,
-};
+use contextdb_core::{EdgeType, NodeId, Result, RowId, TableName, Value};
 use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
@@ -61,8 +59,8 @@ pub struct CompositeStore {
     pub relational: Arc<RelationalStore>,
     pub graph: Arc<GraphStore>,
     pub vector: Arc<VectorStore>,
-    pub change_log: RwLock<Vec<ChangeLogEntry>>,
-    pub ddl_log: RwLock<Vec<(u64, DdlChange)>>,
+    pub change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+    pub ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
 }
 
 impl CompositeStore {
@@ -70,149 +68,17 @@ impl CompositeStore {
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
         vector: Arc<VectorStore>,
+        change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+        ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
     ) -> Self {
         Self {
             relational,
             graph,
             vector,
-            change_log: RwLock::new(Vec::new()),
-            ddl_log: RwLock::new(Vec::new()),
+            change_log,
+            ddl_log,
         }
     }
-
-    pub fn log_create_table(&self, name: &str, meta: &TableMeta, lsn: u64) {
-        let columns = meta
-            .columns
-            .iter()
-            .map(|col| {
-                let mut ty = match col.column_type {
-                    contextdb_core::ColumnType::Integer => "INTEGER".to_string(),
-                    contextdb_core::ColumnType::Real => "REAL".to_string(),
-                    contextdb_core::ColumnType::Text => "TEXT".to_string(),
-                    contextdb_core::ColumnType::Boolean => "BOOLEAN".to_string(),
-                    contextdb_core::ColumnType::Json => "JSON".to_string(),
-                    contextdb_core::ColumnType::Uuid => "UUID".to_string(),
-                    contextdb_core::ColumnType::Vector(dim) => format!("VECTOR({dim})"),
-                };
-
-                let fk_rules = meta
-                    .propagation_rules
-                    .iter()
-                    .filter_map(|rule| match rule {
-                        PropagationRule::ForeignKey {
-                            fk_column,
-                            referenced_table,
-                            referenced_column,
-                            trigger_state,
-                            target_state,
-                            max_depth,
-                            abort_on_failure,
-                        } if fk_column == &col.name => Some((
-                            referenced_table,
-                            referenced_column,
-                            trigger_state,
-                            target_state,
-                            *max_depth,
-                            *abort_on_failure,
-                        )),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-
-                if let Some((referenced_table, referenced_column, ..)) = fk_rules.first() {
-                    ty.push_str(&format!(
-                        " REFERENCES {}({})",
-                        referenced_table, referenced_column
-                    ));
-                    for (_, _, trigger_state, target_state, max_depth, abort_on_failure) in fk_rules
-                    {
-                        ty.push_str(&format!(
-                            " ON STATE {} PROPAGATE SET {}",
-                            trigger_state, target_state
-                        ));
-                        if max_depth != 10 {
-                            ty.push_str(&format!(" MAX DEPTH {max_depth}"));
-                        }
-                        if abort_on_failure {
-                            ty.push_str(" ABORT ON FAILURE");
-                        }
-                    }
-                }
-
-                (col.name.clone(), ty)
-            })
-            .collect();
-
-        let mut constraints = Vec::new();
-        if meta.immutable {
-            constraints.push("IMMUTABLE".to_string());
-        }
-        if let Some(sm) = &meta.state_machine {
-            let states = sm
-                .transitions
-                .iter()
-                .map(|(from, to)| format!("{from} -> [{}]", to.join(", ")))
-                .collect::<Vec<_>>()
-                .join(", ");
-            constraints.push(format!("STATE MACHINE ({}: {})", sm.column, states));
-        }
-        if !meta.dag_edge_types.is_empty() {
-            let edge_types = meta
-                .dag_edge_types
-                .iter()
-                .map(|edge_type| format!("'{edge_type}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            constraints.push(format!("DAG({edge_types})"));
-        }
-        for rule in &meta.propagation_rules {
-            match rule {
-                PropagationRule::Edge {
-                    edge_type,
-                    direction,
-                    trigger_state,
-                    target_state,
-                    max_depth,
-                    abort_on_failure,
-                } => {
-                    let dir = match direction {
-                        Direction::Incoming => "INCOMING",
-                        Direction::Outgoing => "OUTGOING",
-                        Direction::Both => "BOTH",
-                    };
-                    let mut clause = format!(
-                        "PROPAGATE ON EDGE {} {} STATE {} SET {}",
-                        edge_type, dir, trigger_state, target_state
-                    );
-                    if *max_depth != 10 {
-                        clause.push_str(&format!(" MAX DEPTH {max_depth}"));
-                    }
-                    if *abort_on_failure {
-                        clause.push_str(" ABORT ON FAILURE");
-                    }
-                    constraints.push(clause);
-                }
-                PropagationRule::VectorExclusion { trigger_state } => {
-                    constraints.push(format!(
-                        "PROPAGATE ON STATE {} EXCLUDE VECTOR",
-                        trigger_state
-                    ));
-                }
-                PropagationRule::ForeignKey { .. } => {}
-            }
-        }
-
-        self.ddl_log.write().push((
-            lsn,
-            DdlChange::CreateTable {
-                name: name.to_string(),
-                columns,
-                constraints,
-            },
-        ));
-    }
-
-    pub fn log_drop_table(&self, _name: &str, _lsn: u64) {}
 }
 
 impl WriteSetApplicator for CompositeStore {

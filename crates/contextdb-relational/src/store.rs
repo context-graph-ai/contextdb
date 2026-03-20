@@ -53,6 +53,27 @@ impl RelationalStore {
         self.table_meta.write().insert(name.to_string(), meta);
     }
 
+    pub fn insert_loaded_row(&self, name: &str, row: VersionedRow) {
+        self.tables
+            .write()
+            .entry(name.to_string())
+            .or_default()
+            .push(row);
+    }
+
+    pub fn max_row_id(&self) -> RowId {
+        self.tables
+            .read()
+            .values()
+            .flat_map(|rows| rows.iter().map(|row| row.row_id))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn set_next_row_id(&self, next_row_id: RowId) {
+        self.next_row_id.store(next_row_id, Ordering::SeqCst);
+    }
+
     pub fn drop_table(&self, name: &str) {
         self.tables.write().remove(name);
         self.table_meta.write().remove(name);

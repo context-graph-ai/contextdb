@@ -15,10 +15,19 @@ pub struct TxManager<S: WriteSetApplicator> {
 
 impl<S: WriteSetApplicator> TxManager<S> {
     pub fn new(store: S) -> Self {
+        Self::new_with_counters(store, 1, 1, 0)
+    }
+
+    pub fn new_with_counters(
+        store: S,
+        next_tx: TxId,
+        next_lsn: u64,
+        committed_watermark: TxId,
+    ) -> Self {
         Self {
-            next_tx: AtomicU64::new(1),
-            committed_watermark: AtomicU64::new(0),
-            next_lsn: AtomicU64::new(1),
+            next_tx: AtomicU64::new(next_tx),
+            committed_watermark: AtomicU64::new(committed_watermark),
+            next_lsn: AtomicU64::new(next_lsn),
             active_txs: Mutex::new(HashMap::new()),
             commit_mutex: Mutex::new(()),
             store,

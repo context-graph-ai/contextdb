@@ -1,5 +1,7 @@
 use crate::composite_store::{ChangeLogEntry, CompositeStore};
 use crate::executor::execute_plan;
+use crate::persistence::RedbPersistence;
+use crate::persistent_store::PersistentCompositeStore;
 use crate::plugin::{CommitSource, CorePlugin, DatabasePlugin, PluginHealth, QueryOutcome};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
@@ -12,14 +14,16 @@ use contextdb_parser::Statement;
 use contextdb_parser::ast::{CreateTable, DataType};
 use contextdb_planner::PhysicalPlan;
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
-use contextdb_tx::TxManager;
+use contextdb_tx::{TxManager, WriteSetApplicator};
 use contextdb_vector::{MemVectorExecutor, VectorStore};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+
+type DynStore = Box<dyn WriteSetApplicator>;
 
 #[derive(Debug, Clone)]
 pub struct QueryResult {
@@ -47,11 +51,16 @@ impl QueryResult {
 }
 
 pub struct Database {
-    tx_mgr: Arc<TxManager<CompositeStore>>,
+    tx_mgr: Arc<TxManager<DynStore>>,
     relational_store: Arc<RelationalStore>,
-    relational: MemRelationalExecutor<CompositeStore>,
-    graph: MemGraphExecutor<CompositeStore>,
-    vector: MemVectorExecutor<CompositeStore>,
+    graph_store: Arc<GraphStore>,
+    vector_store: Arc<VectorStore>,
+    change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+    ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
+    persistence: Option<Arc<RedbPersistence>>,
+    relational: MemRelationalExecutor<DynStore>,
+    graph: MemGraphExecutor<DynStore>,
+    vector: MemVectorExecutor<DynStore>,
     session_tx: Mutex<Option<TxId>>,
     instance_id: uuid::Uuid,
     plugin: Arc<dyn DatabasePlugin>,
@@ -90,27 +99,116 @@ struct PropagationContext<'a> {
 }
 
 impl Database {
-    /// Open a persistent database at the given path.
-    /// STUB: currently returns an in-memory database (path ignored).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let _ = path;
-        Ok(Self::open_memory())
+        let path = path.as_ref();
+        let persistence = if path.exists() {
+            Arc::new(RedbPersistence::open(path)?)
+        } else {
+            Arc::new(RedbPersistence::create(path)?)
+        };
+
+        let all_meta = persistence.load_all_table_meta()?;
+
+        let relational = Arc::new(RelationalStore::new());
+        for (name, meta) in &all_meta {
+            relational.create_table(name, meta.clone());
+            for row in persistence.load_relational_table(name)? {
+                relational.insert_loaded_row(name, row);
+            }
+        }
+
+        let graph = Arc::new(GraphStore::new());
+        for edge in persistence.load_forward_edges()? {
+            graph.insert_loaded_edge(edge);
+        }
+
+        let vector = Arc::new(VectorStore::new());
+        for meta in all_meta.values() {
+            for column in &meta.columns {
+                if let ColumnType::Vector(dimension) = column.column_type {
+                    vector.set_dimension(dimension);
+                    break;
+                }
+            }
+        }
+        for entry in persistence.load_vectors()? {
+            vector.insert_loaded_vector(entry);
+        }
+
+        let max_row_id = relational.max_row_id();
+        let max_tx = max_tx_across_all(&relational, &graph, &vector);
+        let max_lsn = max_lsn_across_all(&relational, &graph, &vector);
+        relational.set_next_row_id(max_row_id.saturating_add(1));
+
+        let change_log = Arc::new(RwLock::new(Vec::new()));
+        let ddl_log = Arc::new(RwLock::new(Vec::new()));
+        let composite = CompositeStore::new(
+            relational.clone(),
+            graph.clone(),
+            vector.clone(),
+            change_log.clone(),
+            ddl_log.clone(),
+        );
+        let persistent = PersistentCompositeStore::new(composite, persistence.clone());
+        let store: DynStore = Box::new(persistent);
+        let tx_mgr = Arc::new(TxManager::new_with_counters(
+            store,
+            max_tx.saturating_add(1),
+            max_lsn.saturating_add(1),
+            max_tx,
+        ));
+
+        let db = Self {
+            tx_mgr: tx_mgr.clone(),
+            relational_store: relational.clone(),
+            graph_store: graph.clone(),
+            vector_store: vector.clone(),
+            change_log,
+            ddl_log,
+            persistence: Some(persistence),
+            relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
+            graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
+            vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
+            session_tx: Mutex::new(None),
+            instance_id: uuid::Uuid::new_v4(),
+            plugin: Arc::new(CorePlugin),
+        };
+
+        for meta in all_meta.values() {
+            if !meta.dag_edge_types.is_empty() {
+                db.graph.register_dag_edge_types(&meta.dag_edge_types);
+            }
+        }
+
+        Ok(db)
     }
 
     pub fn open_memory() -> Self {
         let relational = Arc::new(RelationalStore::new());
         let graph = Arc::new(GraphStore::new());
         let vector = Arc::new(VectorStore::new());
-
-        let store = CompositeStore::new(relational.clone(), graph.clone(), vector.clone());
+        let change_log = Arc::new(RwLock::new(Vec::new()));
+        let ddl_log = Arc::new(RwLock::new(Vec::new()));
+        let store: DynStore = Box::new(CompositeStore::new(
+            relational.clone(),
+            graph.clone(),
+            vector.clone(),
+            change_log.clone(),
+            ddl_log.clone(),
+        ));
         let tx_mgr = Arc::new(TxManager::new(store));
 
         Self {
+            tx_mgr: tx_mgr.clone(),
             relational_store: relational.clone(),
+            graph_store: graph.clone(),
+            vector_store: vector.clone(),
+            change_log,
+            ddl_log,
+            persistence: None,
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
             vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
-            tx_mgr,
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
@@ -263,15 +361,7 @@ impl Database {
 
     fn ddl_change_for_statement(&self, stmt: &Statement) -> Option<DdlChange> {
         match stmt {
-            Statement::CreateTable(ct) => Some(DdlChange::CreateTable {
-                name: ct.name.clone(),
-                columns: ct
-                    .columns
-                    .iter()
-                    .map(|col| (col.name.clone(), sql_type_for(&col.data_type)))
-                    .collect(),
-                constraints: create_table_constraints(ct),
-            }),
+            Statement::CreateTable(ct) => Some(ddl_change_from_create_table(ct)),
             _ => None,
         }
     }
@@ -696,9 +786,7 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Option<HashMap<String, Value>>> {
         let props = self
-            .tx_mgr
-            .store()
-            .graph
+            .graph_store
             .forward_adj
             .read()
             .get(&source)
@@ -750,14 +838,27 @@ impl Database {
         let relational = Arc::new(RelationalStore::new());
         let graph = Arc::new(GraphStore::new());
         let vector = Arc::new(VectorStore::new());
-        let store = CompositeStore::new(relational.clone(), graph.clone(), vector.clone());
+        let change_log = Arc::new(RwLock::new(Vec::new()));
+        let ddl_log = Arc::new(RwLock::new(Vec::new()));
+        let store: DynStore = Box::new(CompositeStore::new(
+            relational.clone(),
+            graph.clone(),
+            vector.clone(),
+            change_log.clone(),
+            ddl_log.clone(),
+        ));
         let tx_mgr = Arc::new(TxManager::new(store));
         let db = Self {
+            tx_mgr: tx_mgr.clone(),
             relational_store: relational.clone(),
+            graph_store: graph.clone(),
+            vector_store: vector.clone(),
+            change_log,
+            ddl_log,
+            persistence: None,
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
             vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
-            tx_mgr,
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin,
@@ -770,6 +871,9 @@ impl Database {
         let tx = self.session_tx.lock().take();
         if let Some(tx) = tx {
             self.rollback(tx)?;
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.close();
         }
         self.plugin.on_close()
     }
@@ -786,7 +890,7 @@ impl Database {
         self.plugin.describe()
     }
 
-    pub(crate) fn graph(&self) -> &MemGraphExecutor<CompositeStore> {
+    pub(crate) fn graph(&self) -> &MemGraphExecutor<DynStore> {
         &self.graph
     }
 
@@ -799,21 +903,38 @@ impl Database {
     }
 
     pub(crate) fn log_create_table_ddl(&self, name: &str, meta: &TableMeta, lsn: u64) {
-        self.tx_mgr.store().log_create_table(name, meta, lsn);
+        self.ddl_log
+            .write()
+            .push((lsn, ddl_change_from_meta(name, meta)));
     }
 
     pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: u64) {
-        self.tx_mgr.store().log_drop_table(name, lsn);
+        let _ = (name, lsn);
+    }
+
+    pub(crate) fn persist_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            persistence.flush_table_meta(name, meta)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_persisted_table(&self, name: &str) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            persistence.remove_table_meta(name)?;
+            persistence.remove_table_data(name)?;
+        }
+        Ok(())
     }
 
     pub fn change_log_since(&self, since_lsn: u64) -> Vec<ChangeLogEntry> {
-        let log = self.tx_mgr.store().change_log.read();
+        let log = self.change_log.read();
         let start = log.partition_point(|e| e.lsn() <= since_lsn);
         log[start..].to_vec()
     }
 
     pub fn ddl_log_since(&self, since_lsn: u64) -> Vec<DdlChange> {
-        let ddl = self.tx_mgr.store().ddl_log.read();
+        let ddl = self.ddl_log.read();
         let start = ddl.partition_point(|(lsn, _)| *lsn <= since_lsn);
         ddl[start..].iter().map(|(_, c)| c.clone()).collect()
     }
@@ -1247,9 +1368,7 @@ impl Database {
         edge_type: &str,
         lsn: u64,
     ) -> Option<HashMap<String, Value>> {
-        self.tx_mgr
-            .store()
-            .graph
+        self.graph_store
             .forward_adj
             .read()
             .get(&source)
@@ -1262,9 +1381,7 @@ impl Database {
     }
 
     fn vector_for_row_lsn(&self, row_id: RowId, lsn: u64) -> Option<Vec<f32>> {
-        self.tx_mgr
-            .store()
-            .vector
+        self.vector_store
             .vectors
             .read()
             .iter()
@@ -1288,7 +1405,103 @@ fn query_outcome_from_result(result: &Result<QueryResult>) -> QueryOutcome {
     }
 }
 
-fn sql_type_for(data_type: &DataType) -> String {
+fn max_tx_across_all(
+    relational: &RelationalStore,
+    graph: &GraphStore,
+    vector: &VectorStore,
+) -> TxId {
+    let relational_max = relational
+        .tables
+        .read()
+        .values()
+        .flat_map(|rows| rows.iter())
+        .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
+        .max()
+        .unwrap_or(0);
+    let graph_max = graph
+        .forward_adj
+        .read()
+        .values()
+        .flat_map(|entries| entries.iter())
+        .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
+        .max()
+        .unwrap_or(0);
+    let vector_max = vector
+        .vectors
+        .read()
+        .iter()
+        .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
+        .max()
+        .unwrap_or(0);
+
+    relational_max.max(graph_max).max(vector_max)
+}
+
+fn max_lsn_across_all(
+    relational: &RelationalStore,
+    graph: &GraphStore,
+    vector: &VectorStore,
+) -> u64 {
+    let relational_max = relational
+        .tables
+        .read()
+        .values()
+        .flat_map(|rows| rows.iter().map(|row| row.lsn))
+        .max()
+        .unwrap_or(0);
+    let graph_max = graph
+        .forward_adj
+        .read()
+        .values()
+        .flat_map(|entries| entries.iter().map(|entry| entry.lsn))
+        .max()
+        .unwrap_or(0);
+    let vector_max = vector
+        .vectors
+        .read()
+        .iter()
+        .map(|entry| entry.lsn)
+        .max()
+        .unwrap_or(0);
+
+    relational_max.max(graph_max).max(vector_max)
+}
+
+fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {
+    DdlChange::CreateTable {
+        name: ct.name.clone(),
+        columns: ct
+            .columns
+            .iter()
+            .map(|col| {
+                (
+                    col.name.clone(),
+                    sql_type_for_ast_column(col, &ct.propagation_rules),
+                )
+            })
+            .collect(),
+        constraints: create_table_constraints_from_ast(ct),
+    }
+}
+
+fn ddl_change_from_meta(name: &str, meta: &TableMeta) -> DdlChange {
+    DdlChange::CreateTable {
+        name: name.to_string(),
+        columns: meta
+            .columns
+            .iter()
+            .map(|col| {
+                (
+                    col.name.clone(),
+                    sql_type_for_meta_column(col, &meta.propagation_rules),
+                )
+            })
+            .collect(),
+        constraints: create_table_constraints_from_meta(meta),
+    }
+}
+
+fn sql_type_for_ast(data_type: &DataType) -> String {
     match data_type {
         DataType::Uuid => "UUID".to_string(),
         DataType::Text => "TEXT".to_string(),
@@ -1301,7 +1514,97 @@ fn sql_type_for(data_type: &DataType) -> String {
     }
 }
 
-fn create_table_constraints(ct: &CreateTable) -> Vec<String> {
+fn sql_type_for_ast_column(
+    col: &contextdb_parser::ast::ColumnDef,
+    _rules: &[contextdb_parser::ast::AstPropagationRule],
+) -> String {
+    let mut ty = sql_type_for_ast(&col.data_type);
+    if let Some(reference) = &col.references {
+        ty.push_str(&format!(
+            " REFERENCES {}({})",
+            reference.table, reference.column
+        ));
+        for rule in &reference.propagation_rules {
+            if let contextdb_parser::ast::AstPropagationRule::FkState {
+                trigger_state,
+                target_state,
+                max_depth,
+                abort_on_failure,
+            } = rule
+            {
+                ty.push_str(&format!(
+                    " ON STATE {} PROPAGATE SET {}",
+                    trigger_state, target_state
+                ));
+                if max_depth.unwrap_or(10) != 10 {
+                    ty.push_str(&format!(" MAX DEPTH {}", max_depth.unwrap_or(10)));
+                }
+                if *abort_on_failure {
+                    ty.push_str(" ABORT ON FAILURE");
+                }
+            }
+        }
+    }
+    ty
+}
+
+fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[PropagationRule]) -> String {
+    let mut ty = match col.column_type {
+        ColumnType::Integer => "INTEGER".to_string(),
+        ColumnType::Real => "REAL".to_string(),
+        ColumnType::Text => "TEXT".to_string(),
+        ColumnType::Boolean => "BOOLEAN".to_string(),
+        ColumnType::Json => "JSON".to_string(),
+        ColumnType::Uuid => "UUID".to_string(),
+        ColumnType::Vector(dim) => format!("VECTOR({dim})"),
+    };
+
+    let fk_rules = rules
+        .iter()
+        .filter_map(|rule| match rule {
+            PropagationRule::ForeignKey {
+                fk_column,
+                referenced_table,
+                referenced_column,
+                trigger_state,
+                target_state,
+                max_depth,
+                abort_on_failure,
+            } if fk_column == &col.name => Some((
+                referenced_table,
+                referenced_column,
+                trigger_state,
+                target_state,
+                *max_depth,
+                *abort_on_failure,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some((referenced_table, referenced_column, ..)) = fk_rules.first() {
+        ty.push_str(&format!(
+            " REFERENCES {}({})",
+            referenced_table, referenced_column
+        ));
+        for (_, _, trigger_state, target_state, max_depth, abort_on_failure) in fk_rules {
+            ty.push_str(&format!(
+                " ON STATE {} PROPAGATE SET {}",
+                trigger_state, target_state
+            ));
+            if max_depth != 10 {
+                ty.push_str(&format!(" MAX DEPTH {max_depth}"));
+            }
+            if abort_on_failure {
+                ty.push_str(" ABORT ON FAILURE");
+            }
+        }
+    }
+
+    ty
+}
+
+fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
     let mut constraints = Vec::new();
 
     if ct.immutable {
@@ -1312,14 +1615,119 @@ fn create_table_constraints(ct: &CreateTable) -> Vec<String> {
         let transitions = sm
             .transitions
             .iter()
-            .map(|(from, tos)| format!("{from} -> ({})", tos.join(", ")))
+            .map(|(from, tos)| format!("{from} -> [{}]", tos.join(", ")))
             .collect::<Vec<_>>()
             .join(", ");
-        constraints.push(format!("STATE_MACHINE {} ({transitions})", sm.column));
+        constraints.push(format!("STATE MACHINE ({}: {})", sm.column, transitions));
     }
 
     if !ct.dag_edge_types.is_empty() {
-        constraints.push(format!("DAG ({})", ct.dag_edge_types.join(", ")));
+        let edge_types = ct
+            .dag_edge_types
+            .iter()
+            .map(|edge_type| format!("'{edge_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        constraints.push(format!("DAG({edge_types})"));
+    }
+
+    for rule in &ct.propagation_rules {
+        match rule {
+            contextdb_parser::ast::AstPropagationRule::EdgeState {
+                edge_type,
+                direction,
+                trigger_state,
+                target_state,
+                max_depth,
+                abort_on_failure,
+            } => {
+                let mut clause = format!(
+                    "PROPAGATE ON EDGE {} {} STATE {} SET {}",
+                    edge_type, direction, trigger_state, target_state
+                );
+                if max_depth.unwrap_or(10) != 10 {
+                    clause.push_str(&format!(" MAX DEPTH {}", max_depth.unwrap_or(10)));
+                }
+                if *abort_on_failure {
+                    clause.push_str(" ABORT ON FAILURE");
+                }
+                constraints.push(clause);
+            }
+            contextdb_parser::ast::AstPropagationRule::VectorExclusion { trigger_state } => {
+                constraints.push(format!(
+                    "PROPAGATE ON STATE {} EXCLUDE VECTOR",
+                    trigger_state
+                ));
+            }
+            contextdb_parser::ast::AstPropagationRule::FkState { .. } => {}
+        }
+    }
+
+    constraints
+}
+
+fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
+    let mut constraints = Vec::new();
+
+    if meta.immutable {
+        constraints.push("IMMUTABLE".to_string());
+    }
+
+    if let Some(sm) = &meta.state_machine {
+        let states = sm
+            .transitions
+            .iter()
+            .map(|(from, to)| format!("{from} -> [{}]", to.join(", ")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        constraints.push(format!("STATE MACHINE ({}: {})", sm.column, states));
+    }
+
+    if !meta.dag_edge_types.is_empty() {
+        let edge_types = meta
+            .dag_edge_types
+            .iter()
+            .map(|edge_type| format!("'{edge_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        constraints.push(format!("DAG({edge_types})"));
+    }
+
+    for rule in &meta.propagation_rules {
+        match rule {
+            PropagationRule::Edge {
+                edge_type,
+                direction,
+                trigger_state,
+                target_state,
+                max_depth,
+                abort_on_failure,
+            } => {
+                let dir = match direction {
+                    Direction::Incoming => "INCOMING",
+                    Direction::Outgoing => "OUTGOING",
+                    Direction::Both => "BOTH",
+                };
+                let mut clause = format!(
+                    "PROPAGATE ON EDGE {} {} STATE {} SET {}",
+                    edge_type, dir, trigger_state, target_state
+                );
+                if *max_depth != 10 {
+                    clause.push_str(&format!(" MAX DEPTH {max_depth}"));
+                }
+                if *abort_on_failure {
+                    clause.push_str(" ABORT ON FAILURE");
+                }
+                constraints.push(clause);
+            }
+            PropagationRule::VectorExclusion { trigger_state } => {
+                constraints.push(format!(
+                    "PROPAGATE ON STATE {} EXCLUDE VECTOR",
+                    trigger_state
+                ));
+            }
+            PropagationRule::ForeignKey { .. } => {}
+        }
     }
 
     constraints

@@ -37,4 +37,21 @@ impl VectorStore {
             }
         }
     }
+
+    pub fn insert_loaded_vector(&self, entry: VectorEntry) {
+        let dimension = entry.vector.len();
+        let mut dim = self.dimension.write();
+        if dim.is_none() {
+            *dim = Some(dimension);
+        }
+        drop(dim);
+        self.vectors.write().push(entry);
+    }
+
+    pub fn set_dimension(&self, dimension: usize) {
+        let mut dim = self.dimension.write();
+        if dim.is_none() {
+            *dim = Some(dimension);
+        }
+    }
 }
