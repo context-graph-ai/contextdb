@@ -1,6 +1,7 @@
 pub mod composite_store;
 pub mod database;
 pub mod executor;
+pub mod persistence;
 pub mod plugin;
 pub mod schema_enforcer;
 pub mod sync;
