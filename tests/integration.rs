@@ -18,6 +18,8 @@ mod helpers;
 mod hiring_criteria;
 #[path = "integration/job_level.rs"]
 mod job_level;
+#[path = "integration/persistence_tests.rs"]
+mod persistence_tests;
 #[path = "integration/plugin_tests.rs"]
 mod plugin_tests;
 #[path = "integration/safety_integrity.rs"]

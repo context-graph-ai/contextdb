@@ -17,6 +17,7 @@ use contextdb_vector::{MemVectorExecutor, VectorStore};
 use parking_lot::Mutex;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -89,6 +90,13 @@ struct PropagationContext<'a> {
 }
 
 impl Database {
+    /// Open a persistent database at the given path.
+    /// STUB: currently returns an in-memory database (path ignored).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let _ = path;
+        Ok(Self::open_memory())
+    }
+
     pub fn open_memory() -> Self {
         let relational = Arc::new(RelationalStore::new());
         let graph = Arc::new(GraphStore::new());
@@ -678,6 +686,34 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<usize> {
         Ok(self.graph.edge_count(source, edge_type, snapshot))
+    }
+
+    pub fn get_edge_properties(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+        snapshot: SnapshotId,
+    ) -> Result<Option<HashMap<String, Value>>> {
+        let props = self
+            .tx_mgr
+            .store()
+            .graph
+            .forward_adj
+            .read()
+            .get(&source)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|entry| {
+                        entry.target == target
+                            && entry.edge_type == edge_type
+                            && entry.visible_at(snapshot)
+                    })
+                    .map(|entry| entry.properties.clone())
+            });
+        Ok(props)
     }
 
     pub fn insert_vector(&self, tx: TxId, row_id: RowId, vector: Vec<f32>) -> Result<()> {
