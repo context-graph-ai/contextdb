@@ -54,4 +54,16 @@ impl VectorStore {
             *dim = Some(dimension);
         }
     }
+
+    pub fn vector_count(&self) -> usize {
+        self.vectors.read().len()
+    }
+
+    pub fn all_entries(&self) -> Vec<VectorEntry> {
+        self.vectors.read().clone()
+    }
+
+    pub fn dimension(&self) -> Option<usize> {
+        *self.dimension.read()
+    }
 }
