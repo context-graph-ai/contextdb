@@ -8,3 +8,5 @@ contextdb-core = { path = "../contextdb-core" }
 contextdb-tx = { path = "../contextdb-tx" }
 roaring.workspace = true
 parking_lot.workspace = true
+hnsw_rs.workspace = true
+anndists.workspace = true

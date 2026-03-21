@@ -33,3 +33,5 @@ tracing-subscriber = "0.3"
 redb = "3"
 bincode = { version = "2", features = ["serde"] }
 tempfile = "3"
+hnsw_rs = "0.3"
+anndists = "0.1"
