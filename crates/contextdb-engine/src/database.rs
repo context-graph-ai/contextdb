@@ -15,7 +15,7 @@ use contextdb_parser::ast::{CreateTable, DataType};
 use contextdb_planner::PhysicalPlan;
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
 use contextdb_tx::{TxManager, WriteSetApplicator};
-use contextdb_vector::{MemVectorExecutor, VectorStore};
+use contextdb_vector::{HnswIndex, MemVectorExecutor, VectorStore};
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -181,6 +181,8 @@ impl Database {
             }
         }
 
+        maybe_prebuild_hnsw(&db.vector_store);
+
         Ok(db)
     }
 
@@ -200,7 +202,7 @@ impl Database {
         ));
         let tx_mgr = Arc::new(TxManager::new(store));
 
-        Self {
+        let db = Self {
             tx_mgr: tx_mgr.clone(),
             relational_store: relational.clone(),
             graph_store: graph.clone(),
@@ -214,7 +216,9 @@ impl Database {
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
-        }
+        };
+        maybe_prebuild_hnsw(&db.vector_store);
+        db
     }
 
     pub fn begin(&self) -> TxId {
@@ -866,6 +870,7 @@ impl Database {
             instance_id: uuid::Uuid::new_v4(),
             plugin,
         };
+        maybe_prebuild_hnsw(&db.vector_store);
         db.plugin.on_open()?;
         Ok(db)
     }
@@ -1405,6 +1410,18 @@ fn query_outcome_from_result(result: &Result<QueryResult>) -> QueryOutcome {
         Err(error) => QueryOutcome::Error {
             error: error.to_string(),
         },
+    }
+}
+
+fn maybe_prebuild_hnsw(vector_store: &VectorStore) {
+    if vector_store.vector_count() >= 1000 {
+        let entries = vector_store.all_entries();
+        let dim = vector_store.dimension().unwrap_or(0);
+        let hnsw_opt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            HnswIndex::new(&entries, dim)
+        }))
+        .ok();
+        let _ = vector_store.hnsw.set(RwLock::new(hnsw_opt));
     }
 }
 
