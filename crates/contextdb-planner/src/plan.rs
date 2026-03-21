@@ -33,6 +33,13 @@ pub enum PhysicalPlan {
         k: u64,
         candidates: Option<Box<PhysicalPlan>>,
     },
+    HnswSearch {
+        table: String,
+        column: String,
+        query_expr: Expr,
+        k: u64,
+        candidates: Option<Box<PhysicalPlan>>,
+    },
     Filter {
         input: Box<PhysicalPlan>,
         predicate: Expr,
@@ -87,6 +94,11 @@ impl PhysicalPlan {
                 table, column, k, ..
             } => {
                 format!("VectorSearch(table={}, column={}, k={})", table, column, k)
+            }
+            PhysicalPlan::HnswSearch {
+                table, column, k, ..
+            } => {
+                format!("HNSWSearch(table={}, column={}, k={})", table, column, k)
             }
             PhysicalPlan::Scan { table, .. } => format!("Scan(table={})", table),
             PhysicalPlan::Insert(p) => format!("Insert(table={})", p.table),

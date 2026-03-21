@@ -16,6 +16,8 @@ mod golden_output;
 mod helpers;
 #[path = "integration/hiring_criteria.rs"]
 mod hiring_criteria;
+#[path = "integration/hnsw_tests.rs"]
+mod hnsw_tests;
 #[path = "integration/job_level.rs"]
 mod job_level;
 #[path = "integration/persistence_tests.rs"]

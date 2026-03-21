@@ -1,3 +1,5 @@
+#![allow(clippy::assertions_on_constants)]
+
 #[path = "acceptance/cli_ux.rs"]
 mod cli_ux;
 #[path = "acceptance/common.rs"]

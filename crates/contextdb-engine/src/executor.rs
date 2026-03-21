@@ -98,6 +98,12 @@ pub(crate) fn execute_plan(
             k,
             candidates,
             ..
+        }
+        | PhysicalPlan::HnswSearch {
+            query_expr,
+            k,
+            candidates,
+            ..
         } => {
             let query_vec = resolve_vector_from_expr(query_expr, params)?;
             let candidate_bitmap = if let Some(cands_plan) = candidates {
