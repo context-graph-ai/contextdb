@@ -2,7 +2,7 @@ use contextdb_core::{Error, RowId, Value, VectorExecutor};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use contextdb_vector::{MemVectorExecutor, VectorStore, cosine_similarity};
 use roaring::RoaringTreemap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 struct TestStore {
     vector: Arc<VectorStore>,
@@ -21,11 +21,12 @@ impl WriteSetApplicator for TestStore {
 }
 
 fn setup() -> (Arc<TxManager<TestStore>>, MemVectorExecutor<TestStore>) {
-    let vector = Arc::new(VectorStore::new());
+    let hnsw = Arc::new(OnceLock::new());
+    let vector = Arc::new(VectorStore::new(hnsw.clone()));
     let tx_mgr = Arc::new(TxManager::new(TestStore {
         vector: vector.clone(),
     }));
-    let exec = MemVectorExecutor::new(vector, tx_mgr.clone());
+    let exec = MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw);
     (tx_mgr, exec)
 }
 

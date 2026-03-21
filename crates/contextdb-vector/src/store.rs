@@ -1,29 +1,46 @@
+use crate::HnswIndex;
 use contextdb_core::{RowId, VectorEntry};
 use parking_lot::RwLock;
+use std::sync::{Arc, OnceLock};
 
 pub struct VectorStore {
     pub vectors: RwLock<Vec<VectorEntry>>,
     pub dimension: RwLock<Option<usize>>,
+    pub hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
 }
 
 impl Default for VectorStore {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(OnceLock::new()))
     }
 }
 
 impl VectorStore {
-    pub fn new() -> Self {
+    pub fn new(hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>) -> Self {
         Self {
             vectors: RwLock::new(Vec::new()),
             dimension: RwLock::new(None),
+            hnsw,
         }
     }
 
     pub fn apply_inserts(&self, inserts: Vec<VectorEntry>) {
-        let mut vectors = self.vectors.write();
-        for entry in inserts {
-            vectors.push(entry);
+        {
+            let mut vectors = self.vectors.write();
+            for entry in &inserts {
+                vectors.push(entry.clone());
+            }
+        }
+
+        if let Some(rw_lock) = self.hnsw.get() {
+            let guard = rw_lock.write();
+            if let Some(hnsw) = guard.as_ref() {
+                for entry in &inserts {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        hnsw.insert(entry.row_id, &entry.vector);
+                    }));
+                }
+            }
         }
     }
 

@@ -20,7 +20,7 @@ use parking_lot::{Mutex, RwLock};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 type DynStore = Box<dyn WriteSetApplicator>;
@@ -122,7 +122,8 @@ impl Database {
             graph.insert_loaded_edge(edge);
         }
 
-        let vector = Arc::new(VectorStore::new());
+        let hnsw = Arc::new(OnceLock::new());
+        let vector = Arc::new(VectorStore::new(hnsw.clone()));
         for meta in all_meta.values() {
             for column in &meta.columns {
                 if let ColumnType::Vector(dimension) = column.column_type {
@@ -168,7 +169,7 @@ impl Database {
             persistence: Some(persistence),
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
-            vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
+            vector: MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw),
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
@@ -186,7 +187,8 @@ impl Database {
     pub fn open_memory() -> Self {
         let relational = Arc::new(RelationalStore::new());
         let graph = Arc::new(GraphStore::new());
-        let vector = Arc::new(VectorStore::new());
+        let hnsw = Arc::new(OnceLock::new());
+        let vector = Arc::new(VectorStore::new(hnsw.clone()));
         let change_log = Arc::new(RwLock::new(Vec::new()));
         let ddl_log = Arc::new(RwLock::new(Vec::new()));
         let store: DynStore = Box::new(CompositeStore::new(
@@ -208,7 +210,7 @@ impl Database {
             persistence: None,
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
-            vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
+            vector: MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw),
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
@@ -837,7 +839,8 @@ impl Database {
     pub fn open_memory_with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Result<Self> {
         let relational = Arc::new(RelationalStore::new());
         let graph = Arc::new(GraphStore::new());
-        let vector = Arc::new(VectorStore::new());
+        let hnsw = Arc::new(OnceLock::new());
+        let vector = Arc::new(VectorStore::new(hnsw.clone()));
         let change_log = Arc::new(RwLock::new(Vec::new()));
         let ddl_log = Arc::new(RwLock::new(Vec::new()));
         let store: DynStore = Box::new(CompositeStore::new(
@@ -858,7 +861,7 @@ impl Database {
             persistence: None,
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
-            vector: MemVectorExecutor::new(vector, tx_mgr.clone()),
+            vector: MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw),
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin,
