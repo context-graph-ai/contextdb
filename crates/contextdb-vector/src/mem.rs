@@ -1,7 +1,7 @@
 use crate::{HnswIndex, cosine::cosine_similarity, store::VectorStore};
-use parking_lot::RwLock;
 use contextdb_core::*;
 use contextdb_tx::{TxManager, WriteSetApplicator};
+use parking_lot::RwLock;
 use roaring::RoaringTreemap;
 use std::sync::{Arc, OnceLock};
 
@@ -74,11 +74,10 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             let once_lock = self.hnsw.get_or_init(|| {
                 let entries = self.store.all_entries();
                 let dim = self.store.dimension().unwrap_or(0);
-                let hnsw_opt =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        HnswIndex::new(&entries, dim)
-                    }))
-                    .ok();
+                let hnsw_opt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    HnswIndex::new(&entries, dim)
+                }))
+                .ok();
                 RwLock::new(hnsw_opt)
             });
 
@@ -86,23 +85,27 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             if let Some(hnsw) = guard.as_ref() {
                 let raw_candidates = hnsw.search(query, k)?;
                 let vectors = self.store.vectors.read();
-                let visible = raw_candidates
+                let mut visible = raw_candidates
                     .into_iter()
-                    .filter(|(rid, _)| {
+                    .filter_map(|(rid, _)| {
                         vectors
                             .iter()
-                            .find(|entry| entry.row_id == *rid && entry.visible_at(snapshot))
+                            .find(|entry| entry.row_id == rid && entry.visible_at(snapshot))
                             .map(|entry| {
-                                if let Some(cands) = candidates {
-                                    cands.contains(entry.row_id)
-                                } else {
-                                    true
+                                if let Some(cands) = candidates
+                                    && !cands.contains(entry.row_id)
+                                {
+                                    return None;
                                 }
+
+                                Some((entry.row_id, cosine_similarity(query, &entry.vector)))
                             })
-                            .unwrap_or(false)
+                            .unwrap_or(None)
                     })
-                    .take(k)
-                    .collect();
+                    .collect::<Vec<_>>();
+
+                visible.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                visible.truncate(k);
                 return Ok(visible);
             }
         }

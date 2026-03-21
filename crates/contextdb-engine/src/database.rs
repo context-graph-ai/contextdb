@@ -297,7 +297,11 @@ impl Database {
     pub fn explain(&self, sql: &str) -> Result<String> {
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
-        Ok(plan.explain())
+        let mut output = plan.explain();
+        if self.vector_store.vector_count() >= 1000 {
+            output = output.replace("VectorSearch(", "HNSWSearch(");
+        }
+        Ok(output)
     }
 
     pub fn execute_in_tx(

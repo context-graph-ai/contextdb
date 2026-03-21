@@ -21,8 +21,17 @@ impl HnswIndex {
         let hnsw = Hnsw::new(m, max_elements, 16, ef_construction, DistCosine);
         let id_to_row = RwLock::new(HashMap::with_capacity(entries.len()));
         let row_to_id = RwLock::new(HashMap::with_capacity(entries.len()));
+        let mut sorted_entries = entries.iter().collect::<Vec<_>>();
+        sorted_entries.sort_by_key(|entry| {
+            (
+                insertion_key(entry),
+                entry.lsn,
+                entry.created_tx,
+                entry.row_id,
+            )
+        });
 
-        for (data_id, entry) in entries.iter().enumerate() {
+        for (data_id, entry) in sorted_entries.into_iter().enumerate() {
             hnsw.insert((&entry.vector, data_id));
             id_to_row.write().insert(data_id, entry.row_id);
             row_to_id.write().insert(entry.row_id, data_id);
@@ -81,4 +90,12 @@ fn select_params(count: usize) -> (usize, usize, usize) {
         5001..=50000 => (24, 400, 400),
         _ => (16, 200, 200),
     }
+}
+
+fn insertion_key(entry: &VectorEntry) -> u64 {
+    let mut x = entry.row_id ^ entry.lsn ^ entry.created_tx;
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
