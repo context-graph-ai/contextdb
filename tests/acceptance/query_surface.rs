@@ -890,18 +890,21 @@ fn f113_explain_shows_graph_bfs_operator_for_graph_traversal() {
             "SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,3}(b) COLUMNS(b.id AS b_id))",
         )
         .expect("graph explain");
-    assert!(explain.contains("GraphBFS"));
+    assert!(explain.contains("GraphBfs"));
 }
 
-/// I ran EXPLAIN on a vector similarity query, and the plan showed an HNSWSearch operator.
+/// I inserted 1000+ vectors and ran EXPLAIN on a vector query, and the plan showed HNSWSearch instead of brute-force.
 #[test]
 fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
     let db = Database::open_memory();
     db.execute(
-        "CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(384))",
+        "CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(3))",
         &empty_params(),
     )
     .expect("create embeddings");
+    for _ in 0..1000 {
+        insert_embedding(&db, Uuid::new_v4(), vec![1.0, 0.0, 0.0]);
+    }
     let explain = db
         .explain("SELECT * FROM embeddings ORDER BY embedding <=> $query LIMIT 10")
         .expect("vector explain");
