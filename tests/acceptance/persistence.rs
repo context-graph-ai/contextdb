@@ -1,0 +1,489 @@
+use super::common::*;
+use contextdb_core::Value;
+use contextdb_engine::Database;
+use std::thread;
+use std::time::Duration;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+#[test]
+fn f01_create_insert_quit_reopen_query() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f01.db");
+
+    let mut script =
+        String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\n");
+    for idx in 0..50 {
+        script.push_str(&format!(
+            "INSERT INTO sensors (id, name, reading) VALUES ('{:08}-0000-0000-0000-000000000000', 'temp-{idx}', {})\n",
+            idx + 1,
+            idx as f64 + 0.25
+        ));
+    }
+    script.push_str(".quit\n");
+    let first = run_cli_script(&db_path, &[], &script);
+    assert!(first.status.success());
+
+    let second = run_cli_script(
+        &db_path,
+        &[],
+        "SELECT count(*) FROM sensors\nSELECT * FROM sensors WHERE name = 'temp-3'\n.quit\n",
+    );
+    let stdout = output_string(&second.stdout);
+    assert!(second.status.success());
+    assert!(stdout.contains("50"));
+    assert!(stdout.contains("temp-3"));
+    assert!(stdout.contains("3.25"));
+}
+
+#[test]
+fn f02_schema_survives_restart() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f02.db");
+    let create = "\
+CREATE TABLE workflows (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: draft -> [review], review -> [published])\n\
+CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON')\n\
+CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(384))\n\
+.quit\n";
+    assert!(run_cli_script(&db_path, &[], create).status.success());
+
+    let output = run_cli_script(
+        &db_path,
+        &[],
+        ".tables\n.schema workflows\n.schema edges\n.schema embeddings\n.quit\n",
+    );
+    let stdout = output_string(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("workflows"));
+    assert!(stdout.contains("edges"));
+    assert!(stdout.contains("embeddings"));
+    assert!(stdout.contains("STATE MACHINE"));
+    assert!(stdout.contains("DAG('DEPENDS_ON')") || stdout.contains("DAG('DEPENDS_ON"));
+    assert!(stdout.contains("VECTOR(384)"));
+}
+
+#[test]
+fn f03_kill_9_during_idle_does_not_corrupt() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f03.db");
+    let mut child = spawn_cli(&db_path, &[]);
+    let mut script = String::from("CREATE TABLE kill_test (id UUID PRIMARY KEY, name TEXT)\n");
+    for idx in 0..100 {
+        script.push_str(&format!(
+            "INSERT INTO kill_test (id, name) VALUES ('{:08}-0000-0000-0000-000000000000', 'row-{idx}')\n",
+            idx + 1
+        ));
+    }
+    write_child_stdin(&mut child, &script);
+    thread::sleep(Duration::from_millis(200));
+    stop_child(&mut child);
+
+    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM kill_test\n.quit\n");
+    assert!(reopened.status.success());
+    assert!(output_string(&reopened.stdout).contains("100"));
+}
+
+#[test]
+fn f04_empty_database_file_is_a_valid_starting_point() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f04.db");
+    let output = run_cli_script(
+        &db_path,
+        &[],
+        "\
+CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e')\n\
+.quit\n",
+    );
+    assert!(output.status.success());
+    assert!(db_path.exists());
+
+    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM sensors\n.quit\n");
+    assert!(reopened.status.success());
+    assert!(output_string(&reopened.stdout).contains("5"));
+}
+
+#[test]
+fn f05_two_processes_cannot_open_the_same_database_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05.db");
+    let mut first = spawn_cli(&db_path, &[]);
+    write_child_stdin(&mut first, "CREATE TABLE sensors (id UUID PRIMARY KEY)\n");
+    thread::sleep(Duration::from_millis(200));
+
+    let second = run_cli_script(&db_path, &[], ".quit\n");
+    stop_child(&mut first);
+
+    assert!(
+        !second.status.success(),
+        "second process should fail while first holds the database"
+    );
+    let stderr = output_string(&second.stderr).to_lowercase();
+    assert!(stderr.contains("locked") || stderr.contains("in use"));
+}
+
+#[test]
+fn f05b_graph_edges_survive_persistence_reopen() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05b.db");
+    let script = "\
+CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)\n\
+INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'A')\n\
+INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'B')\n\
+INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'C')\n\
+INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'EDGE')\n\
+INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003', 'EDGE')\n\
+.quit\n";
+    let _ = run_cli_script(&db_path, &[], script);
+
+    let query = "\
+SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,2}(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS(b.id AS target_id))\n\
+.quit\n";
+    let output = run_cli_script(&db_path, &[], query);
+    let stdout = output_string(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("00000000-0000-0000-0000-000000000002"));
+    assert!(stdout.contains("00000000-0000-0000-0000-000000000003"));
+}
+
+#[test]
+fn f05c_vector_data_survives_persistence_reopen() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05c.db");
+    let db = Database::open(&db_path).expect("open db");
+    setup_vector_table(&db, 384);
+    let target_id = Uuid::new_v4();
+    for idx in 0..5 {
+        let mut vector = vec![0.0_f32; 384];
+        vector[idx] = 1.0;
+        let id = if idx == 3 { target_id } else { Uuid::new_v4() };
+        insert_embedding(&db, id, vector);
+    }
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    let results = reopened
+        .query_vector(
+            &{
+                let mut v = vec![0.0_f32; 384];
+                v[3] = 1.0;
+                v
+            },
+            1,
+            None,
+            reopened.snapshot(),
+        )
+        .expect("ann query");
+    assert_eq!(results.len(), 1);
+    let row = reopened
+        .point_lookup(
+            "embeddings",
+            "id",
+            &Value::Uuid(target_id),
+            reopened.snapshot(),
+        )
+        .expect("lookup should work");
+    assert!(row.is_some());
+}
+
+#[test]
+fn f05d_constraint_enforcement_survives_persistence_reopen() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05d.db");
+    let db = Database::open(&db_path).expect("open db");
+    db.execute(
+        "CREATE TABLE workflows (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: draft -> [review], review -> [archived])",
+        &empty_params(),
+    )
+    .expect("create workflow table");
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO workflows (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text("draft".into())),
+        ]),
+    )
+    .expect("insert draft row");
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    let invalid = reopened.execute(
+        "INSERT INTO workflows (id, status) VALUES ($id, $status) ON CONFLICT (id) DO UPDATE SET status=$status",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text("archived".into())),
+        ]),
+    );
+    assert!(invalid.is_err());
+}
+
+#[test]
+fn f05e_propagation_rules_survive_persistence_reopen() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05e.db");
+    let db = Database::open(&db_path).expect("open db");
+    db.execute(
+        "CREATE TABLE parents (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [archived])",
+        &empty_params(),
+    )
+    .expect("create parent table");
+    db.execute(
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) ON STATE archived PROPAGATE SET archived, status TEXT) STATE MACHINE (status: active -> [archived])",
+        &empty_params(),
+    )
+    .expect("create child table");
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO parents (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(parent_id)),
+            ("status", Value::Text("active".into())),
+        ]),
+    )
+    .expect("insert parent");
+    db.execute(
+        "INSERT INTO children (id, parent_id, status) VALUES ($id, $parent_id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(child_id)),
+            ("parent_id", Value::Uuid(parent_id)),
+            ("status", Value::Text("active".into())),
+        ]),
+    )
+    .expect("insert child");
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    reopened
+        .execute(
+            "INSERT INTO parents (id, status) VALUES ($id, $status) ON CONFLICT (id) DO UPDATE SET status=$status",
+            &params(vec![
+                ("id", Value::Uuid(parent_id)),
+                ("status", Value::Text("archived".into())),
+            ]),
+        )
+        .expect("archive parent");
+    let child = reopened
+        .point_lookup(
+            "children",
+            "id",
+            &Value::Uuid(child_id),
+            reopened.snapshot(),
+        )
+        .expect("lookup child")
+        .expect("child row");
+    assert_eq!(text_value(&child, "status"), "archived");
+}
+
+#[test]
+fn f05f_all_data_types_round_trip_through_persistence() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05f.db");
+    let script = "\
+CREATE TABLE everything (id UUID PRIMARY KEY, note TEXT, count INTEGER, reading REAL, enabled BOOLEAN, embedding VECTOR(3))\n\
+INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('00000000-0000-0000-0000-000000000001', 'hello', 7, 3.5, true, [1.0, 2.0, 3.0])\n\
+.quit\n";
+    let _ = run_cli_script(&db_path, &[], script);
+
+    let reopened = run_cli_script(&db_path, &[], "SELECT * FROM everything\n.quit\n");
+    let stdout = output_string(&reopened.stdout);
+    assert!(reopened.status.success());
+    assert!(stdout.contains("hello"));
+    assert!(stdout.contains("7"));
+    assert!(stdout.contains("3.5"));
+    assert!(stdout.contains("true"));
+    assert!(stdout.contains("[1.0, 2.0, 3.0]"));
+}
+
+#[test]
+fn f05g_unified_cross_paradigm_data_survives_restart() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05g.db");
+    let script = "\
+CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, category TEXT, embedding VECTOR(384))\n\
+INSERT INTO entities (id, name, category) VALUES ('00000000-0000-0000-0000-000000000001', 'sensor-1', 'sensor')\n\
+INSERT INTO entities (id, name, category) VALUES ('00000000-0000-0000-0000-000000000002', 'sensor-2', 'sensor')\n\
+SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->(b) COLUMNS(b.id AS target_id))\n\
+.quit\n";
+    let _ = run_cli_script(&db_path, &[], script);
+    let query = "\
+WITH neighborhood AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->{1,2}(b) WHERE a.name = 'sensor-1' COLUMNS(b.id AS b_id))) \
+SELECT id, name FROM entities WHERE category = 'sensor' ORDER BY embedding <=> $query LIMIT 5\n\
+.quit\n";
+    let first = run_cli_script(
+        &db_path,
+        &[
+            "--tenant-id",
+            "unused",
+            "--nats-url",
+            "nats://127.0.0.1:65530",
+        ],
+        query,
+    );
+    let second = run_cli_script(
+        &db_path,
+        &[
+            "--tenant-id",
+            "unused",
+            "--nats-url",
+            "nats://127.0.0.1:65530",
+        ],
+        query,
+    );
+    assert_eq!(output_string(&first.stdout), output_string(&second.stdout));
+}
+
+#[test]
+fn f05h_delete_survives_persistence() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05h.db");
+    let db = Database::open(&db_path).expect("open db");
+    setup_simple_sensor_db(&db);
+    insert_sensor_rows(&db, 10);
+    db.execute(
+        "DELETE FROM sensors WHERE name IN ('temp-0', 'temp-1', 'temp-2')",
+        &empty_params(),
+    )
+    .expect("delete should succeed");
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    assert_eq!(query_count(&reopened, "SELECT count(*) FROM sensors"), 7);
+}
+
+#[test]
+fn f05i_rollback_does_not_persist_after_restart() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05i.db");
+    let output = run_cli_script(
+        &db_path,
+        &[],
+        "\
+CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+BEGIN\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b')\n\
+ROLLBACK\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000006', 'f')\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000007', 'g')\n\
+.quit\n",
+    );
+    assert!(output.status.success());
+
+    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM sensors\n.quit\n");
+    assert!(reopened.status.success());
+    assert!(output_string(&reopened.stdout).contains("5"));
+}
+
+#[test]
+fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05j.db");
+    let db = Database::open(&db_path).expect("open db");
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
+        &empty_params(),
+    )
+    .expect("create entities");
+    db.execute(
+        "CREATE TABLE edge_rows (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
+        &empty_params(),
+    )
+    .expect("create edge_rows");
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    setup_graph_entities(&db, &[a, b, c]);
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "CITES".into(), Default::default())
+        .expect("edge a->b");
+    db.insert_edge(tx, b, c, "CITES".into(), Default::default())
+        .expect("edge b->c");
+    db.commit(tx).expect("commit edges");
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    let tx = reopened.begin();
+    let result = reopened.insert_edge(tx, c, a, "CITES".into(), Default::default());
+    assert!(result.is_err());
+}
+
+#[test]
+fn f05k_drop_table_recreate_same_table_old_data_does_not_ghost_back() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05k.db");
+    let db = Database::open(&db_path).expect("open db");
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)",
+        &empty_params(),
+    )
+    .expect("create table");
+    for _ in 0..10 {
+        db.execute(
+            "INSERT INTO t (id, name) VALUES ($id, $name)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("name", Value::Text("ghost".into())),
+            ]),
+        )
+        .expect("insert");
+    }
+    db.execute("DROP TABLE t", &empty_params())
+        .expect("drop table");
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)",
+        &empty_params(),
+    )
+    .expect("recreate table");
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    assert_eq!(query_count(&reopened, "SELECT count(*) FROM t"), 0);
+}
+
+#[test]
+fn f05l_vector_index_correct_after_reopen_update_embedding() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05l.db");
+    let db = Database::open(&db_path).expect("open db");
+    db.execute(
+        "CREATE TABLE obs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty_params(),
+    )
+    .expect("create obs table");
+    let row_id = {
+        let tx = db.begin();
+        let row_id = db
+            .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
+            .expect("insert row");
+        db.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0])
+            .expect("insert vector");
+        db.commit(tx).expect("commit vector row");
+        row_id
+    };
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    reopened
+        .execute(
+            "UPDATE obs SET embedding = $embedding",
+            &params(vec![("embedding", Value::Vector(vec![0.0, 1.0, 0.0]))]),
+        )
+        .expect("update embedding");
+    let results = reopened
+        .query_vector(&[0.0, 1.0, 0.0], 1, None, reopened.snapshot())
+        .expect("query vector");
+    assert_eq!(results[0].0, row_id);
+    let old_results = reopened
+        .query_vector(&[1.0, 0.0, 0.0], 1, None, reopened.snapshot())
+        .expect("old vector query");
+    assert_ne!(old_results[0].0, row_id);
+}

@@ -30,3 +30,7 @@ tempfile = "3"
 [[test]]
 name = "integration"
 path = "../../tests/integration.rs"
+
+[[test]]
+name = "acceptance"
+path = "../../tests/acceptance.rs"

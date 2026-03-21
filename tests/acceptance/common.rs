@@ -1,0 +1,318 @@
+#![allow(dead_code)]
+
+use contextdb_core::{Direction, Value, VersionedRow};
+use contextdb_engine::{Database, QueryResult};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::Once;
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use uuid::Uuid;
+
+static BUILD_RELEASE_BINARIES: Once = Once::new();
+
+pub(crate) struct NatsFixture {
+    _container: ContainerAsync<GenericImage>,
+    pub(crate) nats_url: String,
+}
+
+pub(crate) fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn target_dir() -> PathBuf {
+    workspace_root().join("target").join("release")
+}
+
+pub(crate) fn cli_bin() -> PathBuf {
+    let mut path = target_dir().join("contextdb-cli");
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+    path
+}
+
+pub(crate) fn server_bin() -> PathBuf {
+    let mut path = target_dir().join("contextdb-server");
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+    path
+}
+
+pub(crate) fn ensure_release_binaries() {
+    BUILD_RELEASE_BINARIES.call_once(|| {
+        let status = Command::new("cargo")
+            .current_dir(workspace_root())
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "contextdb-cli",
+                "-p",
+                "contextdb-server",
+            ])
+            .status()
+            .expect("release build command should start");
+        assert!(
+            status.success(),
+            "release build for CLI/server should succeed"
+        );
+    });
+}
+
+pub(crate) fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
+    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+}
+
+pub(crate) fn empty_params() -> HashMap<String, Value> {
+    HashMap::new()
+}
+
+pub(crate) fn values(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
+    params(pairs)
+}
+
+pub(crate) fn output_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+pub(crate) fn run_cli_script(db_path: &Path, extra_args: &[&str], script: &str) -> Output {
+    ensure_release_binaries();
+    let mut command = Command::new(cli_bin());
+    command.arg(db_path);
+    command.args(extra_args);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().expect("CLI should spawn");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(script.as_bytes())
+        .expect("write script to CLI");
+    child.wait_with_output().expect("CLI should finish")
+}
+
+pub(crate) fn run_cli_script_from_file(
+    db_path: &Path,
+    extra_args: &[&str],
+    script_path: &Path,
+) -> Output {
+    ensure_release_binaries();
+    let input = File::open(script_path).expect("script file should open");
+    Command::new(cli_bin())
+        .arg(db_path)
+        .args(extra_args)
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("CLI should run")
+}
+
+pub(crate) fn spawn_cli(db_path: &Path, extra_args: &[&str]) -> Child {
+    ensure_release_binaries();
+    Command::new(cli_bin())
+        .arg(db_path)
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI should spawn")
+}
+
+pub(crate) fn spawn_server(db_path: &Path, tenant_id: &str, nats_url: &str) -> Child {
+    ensure_release_binaries();
+    Command::new(server_bin())
+        .args([
+            "--db-path",
+            db_path.to_str().expect("utf-8 db path"),
+            "--tenant-id",
+            tenant_id,
+            "--nats-url",
+            nats_url,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("server should spawn")
+}
+
+pub(crate) fn stop_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub(crate) fn write_child_stdin(child: &mut Child, script: &str) {
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(script.as_bytes())
+        .expect("write child stdin");
+}
+
+pub(crate) async fn start_nats() -> NatsFixture {
+    let conf = workspace_root()
+        .join("crates/contextdb-engine/tests/nats.conf")
+        .to_string_lossy()
+        .into_owned();
+    let image = GenericImage::new("nats", "latest")
+        .with_exposed_port(4222.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
+    let request = image
+        .with_mount(Mount::bind_mount(conf, "/etc/nats/nats.conf"))
+        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
+    let container: ContainerAsync<GenericImage> =
+        request.start().await.expect("NATS container should start");
+    let nats_port = container
+        .get_host_port_ipv4(4222.tcp())
+        .await
+        .expect("NATS port should be mapped");
+    NatsFixture {
+        _container: container,
+        nats_url: format!("nats://127.0.0.1:{nats_port}"),
+    }
+}
+
+pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if predicate() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+pub(crate) fn temp_db_file(tmp: &TempDir, name: &str) -> PathBuf {
+    tmp.path().join(name)
+}
+
+pub(crate) fn count_rows(db: &Database, table: &str) -> usize {
+    db.scan(table, db.snapshot())
+        .expect("scan should succeed")
+        .len()
+}
+
+pub(crate) fn count_rows_from_file(db_path: &Path, table: &str) -> usize {
+    let db = Database::open(db_path).expect("db should open");
+    let count = count_rows(&db, table);
+    db.close().expect("db close should succeed");
+    count
+}
+
+pub(crate) fn query_count(db: &Database, sql: &str) -> i64 {
+    let result = db
+        .execute(sql, &empty_params())
+        .expect("query should succeed");
+    extract_i64(&result, 0, 0)
+}
+
+pub(crate) fn extract_i64(result: &QueryResult, row: usize, col: usize) -> i64 {
+    match &result.rows[row][col] {
+        Value::Int64(value) => value.to_owned(),
+        other => panic!("expected integer cell, got {other:?}"),
+    }
+}
+
+pub(crate) fn extract_f64(result: &QueryResult, row: usize, col: usize) -> f64 {
+    match &result.rows[row][col] {
+        Value::Float64(value) => value.to_owned(),
+        other => panic!("expected float cell, got {other:?}"),
+    }
+}
+
+pub(crate) fn text_value<'a>(row: &'a VersionedRow, key: &str) -> &'a str {
+    row.values
+        .get(key)
+        .and_then(Value::as_text)
+        .expect("text value")
+}
+
+pub(crate) fn setup_simple_sensor_db(db: &Database) {
+    db.execute(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)",
+        &empty_params(),
+    )
+    .expect("create sensors table");
+}
+
+pub(crate) fn insert_sensor_rows(db: &Database, count: usize) {
+    for idx in 0..count {
+        db.execute(
+            "INSERT INTO sensors (id, name, reading) VALUES ($id, $name, $reading)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("name", Value::Text(format!("temp-{idx}"))),
+                ("reading", Value::Float64(idx as f64 + 0.5)),
+            ]),
+        )
+        .expect("insert sensor row");
+    }
+}
+
+pub(crate) fn setup_graph_entities(db: &Database, ids: &[Uuid]) {
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
+        &empty_params(),
+    )
+    .expect("create entities table");
+    let tx = db.begin();
+    for (index, id) in ids.iter().enumerate() {
+        db.insert_row(
+            tx,
+            "entities",
+            values(vec![
+                ("id", Value::Uuid(*id)),
+                ("name", Value::Text(format!("entity-{index}"))),
+            ]),
+        )
+        .expect("insert entity");
+    }
+    db.commit(tx).expect("commit entities");
+}
+
+pub(crate) fn setup_vector_table(db: &Database, dimension: usize) {
+    db.execute(
+        &format!("CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR({dimension}))"),
+        &empty_params(),
+    )
+    .expect("create vector table");
+}
+
+pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64 {
+    let tx = db.begin();
+    let row_id = db
+        .insert_row(tx, "embeddings", values(vec![("id", Value::Uuid(id))]))
+        .expect("insert embedding row");
+    db.insert_vector(tx, row_id, vector)
+        .expect("insert embedding vector");
+    db.commit(tx).expect("commit embedding row");
+    row_id as i64
+}
+
+pub(crate) fn bfs_ids(db: &Database, start: Uuid) -> Vec<Uuid> {
+    db.query_bfs(start, None, Direction::Outgoing, 5, db.snapshot())
+        .expect("bfs should succeed")
+        .nodes
+        .iter()
+        .map(|node| node.id)
+        .collect()
+}
