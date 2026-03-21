@@ -6,6 +6,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+/// I inserted 50 rows, quit, reopened the database, and all 50 rows were still there with correct values.
 #[test]
 fn f01_create_insert_quit_reopen_query() {
     let tmp = TempDir::new().expect("tempdir");
@@ -36,6 +37,7 @@ fn f01_create_insert_quit_reopen_query() {
     assert!(stdout.contains("3.25"));
 }
 
+/// I created tables with state machines, DAG constraints, and vector columns, quit, reopened, and all the schema details were still there.
 #[test]
 fn f02_schema_survives_restart() {
     let tmp = TempDir::new().expect("tempdir");
@@ -62,6 +64,7 @@ CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(384))\n\
     assert!(stdout.contains("VECTOR(384)"));
 }
 
+/// I killed the process while it was idle after inserting 100 rows, and when I reopened the database nothing was lost or corrupted.
 #[test]
 fn f03_kill_9_during_idle_does_not_corrupt() {
     let tmp = TempDir::new().expect("tempdir");
@@ -83,6 +86,7 @@ fn f03_kill_9_during_idle_does_not_corrupt() {
     assert!(output_string(&reopened.stdout).contains("100"));
 }
 
+/// I pointed the CLI at a path with no existing file, inserted rows, quit, reopened, and all my data was there.
 #[test]
 fn f04_empty_database_file_is_a_valid_starting_point() {
     let tmp = TempDir::new().expect("tempdir");
@@ -107,6 +111,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', '
     assert!(output_string(&reopened.stdout).contains("5"));
 }
 
+/// I tried to open the same database file from two processes at once, and the second one was refused with a clear "locked" error.
 #[test]
 fn f05_two_processes_cannot_open_the_same_database_file() {
     let tmp = TempDir::new().expect("tempdir");
@@ -126,6 +131,7 @@ fn f05_two_processes_cannot_open_the_same_database_file() {
     assert!(stderr.contains("locked") || stderr.contains("in use"));
 }
 
+/// I inserted graph edges, quit, reopened, and a multi-hop graph traversal still found the connected nodes.
 #[test]
 fn f05b_graph_edges_survive_persistence_reopen() {
     let tmp = TempDir::new().expect("tempdir");
@@ -150,6 +156,7 @@ SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,2}(b) WHERE a.id = '000000
     assert!(stdout.contains("00000000-0000-0000-0000-000000000003"));
 }
 
+/// I inserted embeddings, quit, reopened, and an ANN search still returned the correct nearest neighbor.
 #[test]
 fn f05c_vector_data_survives_persistence_reopen() {
     let tmp = TempDir::new().expect("tempdir");
@@ -190,6 +197,7 @@ fn f05c_vector_data_survives_persistence_reopen() {
     assert!(row.is_some());
 }
 
+/// I created a state machine with draft->review->archived, inserted a draft row, quit, reopened, and an illegal draft->archived transition was still rejected.
 #[test]
 fn f05d_constraint_enforcement_survives_persistence_reopen() {
     let tmp = TempDir::new().expect("tempdir");
@@ -222,6 +230,7 @@ fn f05d_constraint_enforcement_survives_persistence_reopen() {
     assert!(invalid.is_err());
 }
 
+/// I set up parent-child propagation rules, quit, reopened, archived the parent, and the child was automatically archived too.
 #[test]
 fn f05e_propagation_rules_survive_persistence_reopen() {
     let tmp = TempDir::new().expect("tempdir");
@@ -280,6 +289,7 @@ fn f05e_propagation_rules_survive_persistence_reopen() {
     assert_eq!(text_value(&child, "status"), "archived");
 }
 
+/// I inserted a row with every column type (UUID, TEXT, INTEGER, REAL, BOOLEAN, VECTOR), quit, reopened, and every value came back exactly right.
 #[test]
 fn f05f_all_data_types_round_trip_through_persistence() {
     let tmp = TempDir::new().expect("tempdir");
@@ -300,6 +310,7 @@ INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('0
     assert!(stdout.contains("[1.0, 2.0, 3.0]"));
 }
 
+/// I stored relational, graph, and vector data in the same table, quit, reopened, and a combined graph+vector query returned the same results both times.
 #[test]
 fn f05g_unified_cross_paradigm_data_survives_restart() {
     let tmp = TempDir::new().expect("tempdir");
@@ -338,6 +349,7 @@ SELECT id, name FROM entities WHERE category = 'sensor' ORDER BY embedding <=> $
     assert_eq!(output_string(&first.stdout), output_string(&second.stdout));
 }
 
+/// I deleted 3 out of 10 rows, quit, reopened, and the count was 7 — deleted rows stayed deleted.
 #[test]
 fn f05h_delete_survives_persistence() {
     let tmp = TempDir::new().expect("tempdir");
@@ -356,6 +368,7 @@ fn f05h_delete_survives_persistence() {
     assert_eq!(query_count(&reopened, "SELECT count(*) FROM sensors"), 7);
 }
 
+/// I rolled back a transaction with 2 inserts, then inserted 5 more rows outside the transaction, quit, reopened, and only the 5 committed rows were there.
 #[test]
 fn f05i_rollback_does_not_persist_after_restart() {
     let tmp = TempDir::new().expect("tempdir");
@@ -383,6 +396,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000007', '
     assert!(output_string(&reopened.stdout).contains("5"));
 }
 
+/// I inserted edges A->B->C with a DAG constraint, quit, reopened, and inserting C->A was still rejected as a cycle.
 #[test]
 fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
     let tmp = TempDir::new().expect("tempdir");
@@ -416,6 +430,7 @@ fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
     assert!(result.is_err());
 }
 
+/// I dropped a table with 10 rows, recreated it empty, quit, reopened, and the old rows did not come back.
 #[test]
 fn f05k_drop_table_recreate_same_table_old_data_does_not_ghost_back() {
     let tmp = TempDir::new().expect("tempdir");
@@ -449,6 +464,8 @@ fn f05k_drop_table_recreate_same_table_old_data_does_not_ghost_back() {
     assert_eq!(query_count(&reopened, "SELECT count(*) FROM t"), 0);
 }
 
+/// I updated my embedding, and search now finds the new one, not the old one,
+/// and no duplicates leaked through.
 #[test]
 fn f05l_vector_index_correct_after_reopen_update_embedding() {
     let tmp = TempDir::new().expect("tempdir");
@@ -459,31 +476,47 @@ fn f05l_vector_index_correct_after_reopen_update_embedding() {
         &empty_params(),
     )
     .expect("create obs table");
-    let row_id = {
-        let tx = db.begin();
-        let row_id = db
-            .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
-            .expect("insert row");
-        db.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0])
-            .expect("insert vector");
-        db.commit(tx).expect("commit vector row");
-        row_id
-    };
+
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+    let tx = db.begin();
+    // A starts near [1,0,0], B is also near [1,0,0] but slightly off
+    let row_a = db
+        .insert_row(tx, "obs", values(vec![("id", Value::Uuid(id_a))]))
+        .expect("insert A");
+    db.insert_vector(tx, row_a, vec![0.95, 0.05, 0.0])
+        .expect("vec A");
+    let row_b = db
+        .insert_row(tx, "obs", values(vec![("id", Value::Uuid(id_b))]))
+        .expect("insert B");
+    db.insert_vector(tx, row_b, vec![0.9, 0.1, 0.0])
+        .expect("vec B");
+    db.commit(tx).expect("commit");
     db.close().expect("close db");
 
+    // Reopen and move A to the opposite end of the space
     let reopened = Database::open(&db_path).expect("reopen db");
     reopened
         .execute(
-            "UPDATE obs SET embedding = $embedding",
-            &params(vec![("embedding", Value::Vector(vec![0.0, 1.0, 0.0]))]),
+            "UPDATE obs SET embedding = $embedding WHERE id = $id",
+            &params(vec![
+                ("id", Value::Uuid(id_a)),
+                ("embedding", Value::Vector(vec![-1.0, 0.0, 0.0])),
+            ]),
         )
         .expect("update embedding");
+
+    // Search for [1,0,0] — B should be nearest because A moved to [-1,0,0]
     let results = reopened
-        .query_vector(&[0.0, 1.0, 0.0], 1, None, reopened.snapshot())
+        .query_vector(&[1.0, 0.0, 0.0], 2, None, reopened.snapshot())
         .expect("query vector");
-    assert_eq!(results[0].0, row_id);
-    let old_results = reopened
-        .query_vector(&[1.0, 0.0, 0.0], 1, None, reopened.snapshot())
-        .expect("old vector query");
-    assert_ne!(old_results[0].0, row_id);
+    assert_eq!(
+        results.len(),
+        2,
+        "exactly 2 results — no ghost duplicate from old embedding"
+    );
+    assert_eq!(
+        results[0].0, row_b,
+        "B should be nearest to [1,0,0] after A moved to [-1,0,0]"
+    );
 }

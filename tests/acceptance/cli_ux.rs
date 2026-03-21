@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
+/// I piped a SQL script into the CLI, and it ran every command and showed me results.
 #[test]
 fn f28_scripted_usage_via_stdin_pipe() {
     let tmp = TempDir::new().expect("tempdir");
@@ -18,6 +19,7 @@ fn f28_scripted_usage_via_stdin_pipe() {
     assert!(output_string(&output.stdout).contains("hello"));
 }
 
+/// I asked for sync status while connected, and it showed me the tenant, URL, connection state, and LSN — not a cryptic blob.
 #[tokio::test]
 async fn f29_sync_status_shows_meaningful_info_when_connected() {
     let tmp = TempDir::new().expect("tempdir");
@@ -38,6 +40,7 @@ async fn f29_sync_status_shows_meaningful_info_when_connected() {
     assert!(stdout.contains("LSN"));
 }
 
+/// I asked for sync status when the server was down, and it told me "unreachable" instead of crashing.
 #[test]
 fn f30_sync_status_when_nats_is_unreachable() {
     let tmp = TempDir::new().expect("tempdir");
@@ -51,6 +54,7 @@ fn f30_sync_status_when_nats_is_unreachable() {
     assert!(output_string(&output.stdout).contains("unreachable"));
 }
 
+/// I typed a nonsense dot-command, and the CLI told me it was unknown instead of silently ignoring it.
 #[test]
 fn f31_unknown_commands_produce_helpful_errors() {
     let tmp = TempDir::new().expect("tempdir");
@@ -59,6 +63,7 @@ fn f31_unknown_commands_produce_helpful_errors() {
     assert!(output_string(&output.stdout).contains("Unknown command"));
 }
 
+/// I launched the CLI without any sync flags, and it still let me create tables, insert, and query locally.
 #[test]
 fn f31b_cli_works_without_sync_flags_graceful_degradation() {
     let tmp = TempDir::new().expect("tempdir");
@@ -71,6 +76,7 @@ fn f31b_cli_works_without_sync_flags_graceful_degradation() {
     assert!(output_string(&output.stdout).contains("ok"));
 }
 
+/// I tried to sync push without configuring a tenant, and it told me what flags I was missing.
 #[test]
 fn f31c_sync_push_without_sync_config_gives_helpful_error() {
     let tmp = TempDir::new().expect("tempdir");
@@ -81,6 +87,7 @@ fn f31c_sync_push_without_sync_config_gives_helpful_error() {
     assert!(stdout.contains("--tenant-id"));
 }
 
+/// I ran valid and invalid SQL in scripts, and the exit code was 0 for success and non-zero for errors, so my shell scripts can trust it.
 #[test]
 fn f31d_cli_exit_codes_are_reliable_for_scripting() {
     let tmp = TempDir::new().expect("tempdir");
@@ -104,6 +111,7 @@ fn f31d_cli_exit_codes_are_reliable_for_scripting() {
     assert!(!missing_table.status.success());
 }
 
+/// I ran bad SQL and good SQL, and errors went to stderr while results went to stdout, so piping works correctly.
 #[test]
 fn f31e_errors_go_to_stderr_results_to_stdout() {
     let tmp = TempDir::new().expect("tempdir");
@@ -124,6 +132,7 @@ fn f31e_errors_go_to_stderr_results_to_stdout() {
     assert!(output_string(&valid.stdout).contains("ok"));
 }
 
+/// I pointed the CLI at a directory I can't write to, and it told me "permission denied" instead of panicking.
 #[test]
 fn f31f_permission_denied_on_db_path_gives_clear_error() {
     let tmp = TempDir::new().expect("tempdir");
@@ -137,6 +146,7 @@ fn f31f_permission_denied_on_db_path_gives_clear_error() {
     assert!(stderr.contains("permission denied") || stderr.contains("failed to open database"));
 }
 
+/// I ran a SELECT, and the output came back in a pipe-delimited table I can parse with standard tools.
 #[test]
 fn f31g_select_output_format_is_parseable() {
     let tmp = TempDir::new().expect("tempdir");

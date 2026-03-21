@@ -1,6 +1,7 @@
 use super::common::*;
 use tempfile::TempDir;
 
+/// I killed the server mid-push, and when I reopened the database it had either all the data or none — no partial corruption.
 #[tokio::test]
 async fn f12_server_crash_mid_push_does_not_corrupt_server_data() {
     let tmp = TempDir::new().expect("tempdir");
@@ -18,6 +19,7 @@ async fn f12_server_crash_mid_push_does_not_corrupt_server_data() {
     assert!(count == 0 || count == 1000);
 }
 
+/// NATS went down and came back, and my edge CLI reconnected on its own without me restarting it.
 #[tokio::test]
 async fn f13_nats_restart_does_not_require_edge_restart() {
     let tmp = TempDir::new().expect("tempdir");
@@ -35,6 +37,7 @@ async fn f13_nats_restart_does_not_require_edge_restart() {
     assert!(output_string(&output.stdout).contains("Reconnected"));
 }
 
+/// The server restarted, and my edge CLI pushed data to the new instance without me restarting anything.
 #[tokio::test]
 async fn f14_server_restart_does_not_require_edge_restart() {
     let tmp = TempDir::new().expect("tempdir");
@@ -59,11 +62,13 @@ async fn f14_server_restart_does_not_require_edge_restart() {
     assert!(count_rows_from_file(&server_path, "sensors") >= 1);
 }
 
+/// My edge device ran out of disk, and the CLI gave me a clear error instead of silently corrupting my data.
 #[test]
 fn f15_disk_full_on_edge_produces_a_clear_error_not_corruption() {
     assert!(false, "requires special infrastructure");
 }
 
+/// The server ran out of memory during a push, and it told me something went wrong instead of silently dropping rows.
 #[test]
 fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
     assert!(false, "requires special infrastructure");

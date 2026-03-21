@@ -1,6 +1,7 @@
 use super::common::*;
 use tempfile::TempDir;
 
+/// I pushed different tables from two separate edges, and the server had both tables.
 #[tokio::test]
 async fn f17_two_edges_push_different_tables_to_same_server() {
     let tmp = TempDir::new().expect("tempdir");
@@ -35,6 +36,7 @@ async fn f17_two_edges_push_different_tables_to_same_server() {
     assert!(db.table_names().contains(&"pressures".to_string()));
 }
 
+/// I pushed rows to the same table from two edges, and the server had all distinct rows from both.
 #[tokio::test]
 async fn f18_two_edges_push_to_same_table_different_rows() {
     let tmp = TempDir::new().expect("tempdir");
@@ -66,6 +68,7 @@ async fn f18_two_edges_push_to_same_table_different_rows() {
     assert_eq!(count_rows_from_file(&server_path, "sensors"), 100);
 }
 
+/// I updated the same row from two edges with different values, and the second push got a "conflict" error instead of silently overwriting.
 #[tokio::test]
 async fn f19_two_edges_push_conflicting_updates_to_same_row() {
     let tmp = TempDir::new().expect("tempdir");
@@ -96,6 +99,7 @@ async fn f19_two_edges_push_conflicting_updates_to_same_row() {
     assert!(output_string(&b.stdout).contains("conflict"));
 }
 
+/// I pushed from one edge, pulled from another, and the second edge had all the data.
 #[tokio::test]
 async fn f20_edge_pulls_after_another_edge_pushed() {
     let tmp = TempDir::new().expect("tempdir");
@@ -118,6 +122,7 @@ async fn f20_edge_pulls_after_another_edge_pushed() {
     assert!(output_string(&pulled.stdout).contains("100"));
 }
 
+/// I pushed from two edges, both pulled, and each edge ended up with all rows from both.
 #[tokio::test]
 async fn f21_edge_a_pushes_edge_b_pushes_both_pull() {
     let tmp = TempDir::new().expect("tempdir");
@@ -146,6 +151,7 @@ async fn f21_edge_a_pushes_edge_b_pushes_both_pull() {
     assert_eq!(count_rows_from_file(&server_path, "sensors"), 100);
 }
 
+/// I created an entity on one edge and linked it to another entity on a second edge, then a third edge pulled and the graph traversal worked end-to-end.
 #[tokio::test]
 async fn f21b_cross_edge_graph_construction_via_sync() {
     let tmp = TempDir::new().expect("tempdir");

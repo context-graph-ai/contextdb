@@ -2,6 +2,7 @@ use super::common::*;
 use std::fs;
 use std::process::Command;
 
+/// I opened CONTRIBUTING.md, and it told me the exact verification commands (fmt, clippy, test) and the crate layout so I know how to submit a PR.
 #[test]
 fn f54_contributing_md_exists_and_is_accurate() {
     let path = workspace_root().join("CONTRIBUTING.md");
@@ -12,6 +13,7 @@ fn f54_contributing_md_exists_and_is_accurate() {
     assert!(text.contains("crates/"));
 }
 
+/// I listed the acceptance tests, and every ignored or skipped test had a reason — none were blank TODOs that leave me guessing.
 #[test]
 fn f55_ignored_tests_are_explained_to_contributors() {
     let output = Command::new("cargo")

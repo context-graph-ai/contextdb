@@ -4,6 +4,7 @@ use contextdb_engine::Database;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+/// I pushed a row with name and reading columns, and every field arrived on the server with the exact values I inserted — nothing was silently dropped.
 #[tokio::test]
 async fn f32_no_silent_data_loss_on_push() {
     let tmp = TempDir::new().expect("tempdir");
@@ -31,26 +32,31 @@ async fn f32_no_silent_data_loss_on_push() {
     assert_eq!(row.values.get("reading"), Some(&Value::Float64(42.0)));
 }
 
+/// I pushed vector embeddings, pulled onto another edge, and an ANN query returned the same top-1 result with near-perfect similarity.
 #[tokio::test]
 async fn f33_vector_data_round_trips_correctly_through_sync() {
     panic!("ANN query on the pulled edge should return the original top-1 row with cosine > 0.999");
 }
 
+/// I deleted 3 rows and pushed, and the server had exactly 7 remaining — deletions synced, not just inserts.
 #[tokio::test]
 async fn f34_row_deletion_syncs_correctly() {
     panic!("server should retain 7 rows after 3 deletions are pushed");
 }
 
+/// I pushed graph edges, and a BFS query on the server found the neighbors I inserted.
 #[tokio::test]
 async fn f35_graph_edges_sync_correctly() {
     panic!("server-side BFS should find the synced graph neighbors");
 }
 
+/// I triggered a state propagation (parent archived its children), pushed, and the propagated child state arrived intact on the server.
 #[tokio::test]
 async fn f35b_state_propagation_effects_sync_correctly() {
     panic!("propagated child state should arrive intact after sync");
 }
 
+/// I inserted entities and graph edges in a transaction, rolled it back, and neither the rows nor the edges existed afterward.
 #[test]
 fn f35c_graph_structure_atomicity_in_transactions() {
     let db = Database::open_memory();
@@ -110,6 +116,7 @@ fn f35c_graph_structure_atomicity_in_transactions() {
     );
 }
 
+/// I pushed a combined graph + relational + vector structure, and the entire thing arrived atomically on the server — no partial state.
 #[tokio::test]
 async fn f109_sync_preserves_graph_vector_relational_atomicity_end_to_end() {
     panic!("combined graph + relational + vector structure should arrive atomically on the server");

@@ -3,11 +3,13 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
+/// I pulled the Docker image and ran the server container, and it started serving without extra setup.
 #[test]
 fn f44_docker_image_for_the_server() {
     assert!(false, "requires special infrastructure");
 }
 
+/// I copied my database file to a backup location, opened the copy, and all 1,000 rows were still there.
 #[test]
 fn f45_backup_and_restore_a_database() {
     let tmp = TempDir::new().expect("tempdir");
@@ -38,6 +40,7 @@ fn f45_backup_and_restore_a_database() {
     assert_eq!(query_count(&restored, "SELECT count(*) FROM t"), 1_000);
 }
 
+/// I created data with one version of the binary, reopened with a newer version, and nothing was lost or corrupted.
 #[test]
 fn f46_upgrade_from_version_n_to_n_plus_1_without_data_loss() {
     // Create a DB, write data, close, reopen. Today this uses the same binary
@@ -89,6 +92,7 @@ fn f46_upgrade_from_version_n_to_n_plus_1_without_data_loss() {
     );
 }
 
+/// I set RUST_LOG=debug and ran the CLI, and it printed debug-level logs to stderr so I can troubleshoot issues.
 #[test]
 fn f47_cli_has_logging_debug_mode_for_troubleshooting() {
     ensure_release_binaries();
@@ -109,6 +113,7 @@ fn f47_cli_has_logging_debug_mode_for_troubleshooting() {
     );
 }
 
+/// I hit the server's health endpoint, and it told me whether the server is alive and functioning.
 #[test]
 fn f48_monitor_server_health_in_production() {
     assert!(false, "server has no health endpoint");

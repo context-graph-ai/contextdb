@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 fn assert_send_sync<T: Send + Sync>() {}
 
+/// I added contextdb-engine as a Rust dependency, created a table, inserted a row, and queried it back.
 #[test]
 fn f41_use_contextdb_engine_as_a_rust_dependency() {
     assert_send_sync::<Database>();
@@ -31,6 +32,7 @@ fn f41_use_contextdb_engine_as_a_rust_dependency() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// I shared one Database across 10 threads doing concurrent inserts, and all 100 rows landed without panics.
 #[test]
 fn f42_embed_contextdb_in_an_actix_or_axum_style_server() {
     let db = Arc::new(Database::open_memory());
@@ -61,6 +63,7 @@ fn f42_embed_contextdb_in_an_actix_or_axum_style_server() {
     assert_eq!(query_count(&db, "SELECT count(*) FROM t"), 100);
 }
 
+/// I triggered parse errors, immutable violations, missing tables, and dimension mismatches, and each came back as a distinct typed error variant.
 #[test]
 fn f43_library_user_gets_typed_errors_not_strings() {
     let db = Database::open_memory();
@@ -107,6 +110,7 @@ fn f43_library_user_gets_typed_errors_not_strings() {
     assert!(matches!(mismatch, Error::VectorDimensionMismatch { .. }));
 }
 
+/// I ran 10 threads each committing 100 rows in separate transactions, and all 1000 rows were visible afterward.
 #[test]
 fn f43c_mvcc_from_concurrent_threads() {
     let db = Arc::new(Database::open_memory());
@@ -140,6 +144,7 @@ fn f43c_mvcc_from_concurrent_threads() {
     assert_eq!(query_count(&db, "SELECT count(*) FROM t"), 1000);
 }
 
+/// I had one writer inserting 1000 rows while 10 readers queried concurrently, and nobody panicked or deadlocked.
 #[test]
 fn f98_concurrent_readers_and_one_writer_on_embedded_engine() {
     let db = Arc::new(Database::open_memory());
@@ -179,6 +184,7 @@ fn f98_concurrent_readers_and_one_writer_on_embedded_engine() {
     }
 }
 
+/// I inserted a row with every column type, queried it back, and each value came back as its proper typed variant, not a string.
 #[test]
 fn f99_database_execute_returns_structured_results_not_just_strings() {
     let db = Database::open_memory();
@@ -225,6 +231,7 @@ fn f99_database_execute_returns_structured_results_not_just_strings() {
     assert!(matches!(result.rows[0][6], Value::Vector(_)));
 }
 
+/// I created a table and called table_names/table_meta, and I got back the table name and its column definitions.
 #[test]
 fn f100_agent_can_introspect_schema_programmatically() {
     let db = Database::open_memory();
@@ -240,6 +247,7 @@ fn f100_agent_can_introspect_schema_programmatically() {
     assert_eq!(meta.columns[0].name, "id");
 }
 
+/// I inserted a 768-dim vector into a VECTOR(384) column, and the error message told me exactly which dimensions were expected vs. provided.
 #[test]
 fn f102_vector_dimension_mismatch_produces_a_clear_error() {
     let db = Database::open_memory();
@@ -262,6 +270,7 @@ fn f102_vector_dimension_mismatch_produces_a_clear_error() {
     assert!(message.contains("got 768"));
 }
 
+/// I opened two separate database files in one process, inserted different data, and each database had only its own rows.
 #[test]
 fn f106_multiple_database_instances_in_one_process() {
     let tmp = TempDir::new().expect("tempdir");
@@ -303,6 +312,7 @@ fn f106_multiple_database_instances_in_one_process() {
     assert_eq!(b_rows.rows[0][0], Value::Text("beta".into()));
 }
 
+/// I inserted a JSON object and queried it back, and the full structured payload round-tripped intact.
 #[test]
 fn f108_agent_can_store_and_query_json_payloads() {
     let db = Database::open_memory();
@@ -329,6 +339,7 @@ fn f108_agent_can_store_and_query_json_payloads() {
     assert_eq!(result.rows[0][0], Value::Json(payload));
 }
 
+/// I opened a database with a file path, with open_memory(), and with ":memory:", and all three worked without creating spurious files.
 #[test]
 fn f112_connection_string_api_is_obvious_for_common_cases() {
     let tmp = TempDir::new().expect("tempdir");

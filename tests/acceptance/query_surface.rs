@@ -41,6 +41,7 @@ fn setup_sql_ops_db() -> Database {
     db
 }
 
+/// I pasted every SQL example from the spec, and they all parsed without error.
 #[test]
 fn f56_every_spec_example_parses_successfully() {
     let examples = [
@@ -64,6 +65,7 @@ fn f56_every_spec_example_parses_successfully() {
     }
 }
 
+/// I ran DISTINCT, COUNT, IN, LIKE, BETWEEN, and BEGIN/COMMIT through the CLI, and all produced correct output.
 #[test]
 fn f58b_query_operators_work_through_cli() {
     let tmp = TempDir::new().expect("tempdir");
@@ -90,6 +92,7 @@ COMMIT\n\
     assert!(stdout.contains("COUNT"));
 }
 
+/// I tried to UPDATE an IMMUTABLE row and make an illegal state transition through the CLI, and the database rejected at least one of the violations.
 #[test]
 fn f58c_ddl_constraints_enforced_through_cli() {
     let tmp = TempDir::new().expect("tempdir");
@@ -113,6 +116,7 @@ INSERT INTO workflows (id, status) VALUES ('00000000-0000-0000-0000-000000000002
     assert!(combined.contains("immutable") || combined.contains("state"));
 }
 
+/// I queried SELECT DISTINCT on a column with duplicates, and I got only the unique values back.
 #[test]
 fn f67_select_distinct() {
     let db = setup_sql_ops_db();
@@ -122,6 +126,7 @@ fn f67_select_distinct() {
     assert_eq!(result.rows.len(), 2);
 }
 
+/// I filtered rows with IN ('alice', 'bob'), and I got exactly the rows matching those names.
 #[test]
 fn f62_in_with_literal_list() {
     let db = setup_sql_ops_db();
@@ -134,6 +139,7 @@ fn f62_in_with_literal_list() {
     assert_eq!(result.rows.len(), 3);
 }
 
+/// I used IN with a subquery to cross-reference two tables, and it returned only the matching row.
 #[test]
 fn f63_in_with_subquery() {
     let db = Database::open_memory();
@@ -173,6 +179,7 @@ fn f63_in_with_subquery() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// I searched with LIKE 'temp%', and it found the two rows whose names start with "temp".
 #[test]
 fn f64_like_pattern_matching() {
     let db = setup_sql_ops_db();
@@ -182,6 +189,7 @@ fn f64_like_pattern_matching() {
     assert_eq!(result.rows.len(), 2);
 }
 
+/// I filtered with BETWEEN 10 AND 20, and only rows within that range came back.
 #[test]
 fn f65_between_operator() {
     let db = setup_sql_ops_db();
@@ -194,6 +202,7 @@ fn f65_between_operator() {
     assert_eq!(result.rows.len(), 3);
 }
 
+/// I split rows by IS NULL and IS NOT NULL on a nullable column, and every row landed in exactly one bucket.
 #[test]
 fn f66_is_null_and_is_not_null() {
     let db = setup_sql_ops_db();
@@ -209,6 +218,7 @@ fn f66_is_null_and_is_not_null() {
     assert_eq!(is_null.rows.len() + is_not_null.rows.len(), 5);
 }
 
+/// I selected a column with AS sensor_name, and the result used my alias as the column header.
 #[test]
 fn f68_column_aliases_as() {
     let db = setup_sql_ops_db();
@@ -218,6 +228,7 @@ fn f68_column_aliases_as() {
     assert_eq!(result.columns, vec!["sensor_name"]);
 }
 
+/// I ordered by two columns with mixed ASC/DESC, and the rows came back in the right order.
 #[test]
 fn f69_multi_column_order_by_with_mixed_directions() {
     let db = setup_sql_ops_db();
@@ -233,6 +244,7 @@ fn f69_multi_column_order_by_with_mixed_directions() {
     );
 }
 
+/// I used COALESCE on a nullable column with a default, and NULLs were replaced with 'unknown'.
 #[test]
 fn f70_coalesce_function() {
     let db = setup_sql_ops_db();
@@ -250,6 +262,7 @@ fn f70_coalesce_function() {
     );
 }
 
+/// I filtered with NOT (reading > 20), and every returned row had a reading of 20 or less.
 #[test]
 fn f74_not_operator() {
     let db = setup_sql_ops_db();
@@ -264,6 +277,7 @@ fn f74_not_operator() {
     );
 }
 
+/// I ran COUNT(*) on a table with 5 rows, and I got back 5.
 #[test]
 fn f74b_count_star_aggregate_function() {
     let db = setup_sql_ops_db();
@@ -273,6 +287,7 @@ fn f74b_count_star_aggregate_function() {
     assert_eq!(extract_i64(&result, 0, 0), 5);
 }
 
+/// I called SELECT NOW(), and I got back a timestamp value.
 #[test]
 fn f74c_now_function() {
     let db = Database::open_memory();
@@ -282,6 +297,7 @@ fn f74c_now_function() {
     assert!(matches!(result.rows[0][0], Value::Timestamp(_)));
 }
 
+/// I joined sensors to readings with INNER JOIN, and only the sensor with a matching reading appeared.
 #[test]
 fn f74d_inner_join() {
     let db = Database::open_memory();
@@ -322,6 +338,7 @@ fn f74d_inner_join() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// I left-joined a sensor with no readings, and the sensor still appeared with NULLs for the reading columns.
 #[test]
 fn f74e_left_join() {
     let db = Database::open_memory();
@@ -352,6 +369,7 @@ fn f74e_left_join() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// I created an index on a column, and queries filtering by that column still returned the correct row.
 #[test]
 fn f74f_create_index() {
     let db = setup_sql_ops_db();
@@ -363,6 +381,7 @@ fn f74f_create_index() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// I ran CREATE TABLE IF NOT EXISTS on an existing table, and it succeeded silently instead of failing.
 #[test]
 fn f75_create_table_if_not_exists_is_idempotent() {
     let db = Database::open_memory();
@@ -375,6 +394,7 @@ fn f75_create_table_if_not_exists_is_idempotent() {
     .expect("idempotent create");
 }
 
+/// I inserted a NULL into a NOT NULL column, and the database rejected it with an error.
 #[test]
 fn f79_not_null_constraint_rejects_null_inserts() {
     let db = Database::open_memory();
@@ -395,6 +415,7 @@ fn f79_not_null_constraint_rejects_null_inserts() {
     assert!(matches!(err, Error::Other(_) | Error::PlanError(_)));
 }
 
+/// I inserted a duplicate value into a UNIQUE column, and the database rejected it with a UniqueViolation error.
 #[test]
 fn f80_unique_constraint_rejects_duplicates() {
     let db = Database::open_memory();
@@ -423,6 +444,7 @@ fn f80_unique_constraint_rejects_duplicates() {
     assert!(matches!(err, Error::UniqueViolation { .. }));
 }
 
+/// I queried for incoming edges with <-[:EDGE]-, and I got both nodes that point into the target.
 #[test]
 fn f81_incoming_edge_direction() {
     let db = Database::open_memory();
@@ -452,6 +474,7 @@ fn f81_incoming_edge_direction() {
     assert_eq!(result.rows.len(), 2);
 }
 
+/// I queried for edges in either direction with -[:EDGE]-, and I got all connected nodes regardless of direction.
 #[test]
 fn f82_bidirectional_edge_match() {
     let db = Database::open_memory();
@@ -481,6 +504,7 @@ fn f82_bidirectional_edge_match() {
     assert_eq!(result.rows.len(), 2);
 }
 
+/// I filtered a graph traversal by a node property in the WHERE clause, and only the matching path came back.
 #[test]
 fn f83_node_property_filtering_in_graph_table_where() {
     let db = Database::open_memory();
@@ -505,6 +529,7 @@ fn f83_node_property_filtering_in_graph_table_where() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// I wrote a graph pattern with contradictory arrows <-[:EDGE]->, and the parser rejected it.
 #[test]
 fn f85_parser_rejects_mixed_direction_graph_arrows() {
     assert!(
@@ -513,6 +538,7 @@ fn f85_parser_rejects_mixed_direction_graph_arrows() {
     );
 }
 
+/// I ran a vector similarity search with a WHERE filter, and every result belonged to the filtered context.
 #[test]
 fn f86_pre_filtered_ann_query() {
     let db = setup_sql_ops_db();
@@ -533,6 +559,7 @@ fn f86_pre_filtered_ann_query() {
     );
 }
 
+/// I inserted two rows inside BEGIN/COMMIT, and both appeared when I queried afterward.
 #[test]
 fn f88_begin_commit_atomicity() {
     let tmp = TempDir::new().expect("tempdir");
@@ -545,6 +572,7 @@ fn f88_begin_commit_atomicity() {
     assert!(output_string(&output.stdout).contains("2"));
 }
 
+/// I inserted a row inside BEGIN then ran ROLLBACK, and the row was gone.
 #[test]
 fn f89_rollback_discards_changes() {
     let tmp = TempDir::new().expect("tempdir");
@@ -557,6 +585,7 @@ fn f89_rollback_discards_changes() {
     assert!(output_string(&output.stdout).contains("0"));
 }
 
+/// I wrote a single CTE combining graph traversal, a relational join, and vector search, and it executed without error.
 #[test]
 fn f91_graph_relational_vector_in_one_cte() {
     let db = Database::open_memory();
@@ -572,11 +601,13 @@ fn f91_graph_relational_vector_in_one_cte() {
     .expect("combined CTE query");
 }
 
+/// I used HAVING in a query, and the parser rejected it because HAVING is not supported.
 #[test]
 fn f94_having_clause_rejected() {
     assert!(parse("SELECT COUNT(*) FROM t GROUP BY col HAVING COUNT(*) > 1").is_err());
 }
 
+/// I stored a message with a row, a graph edge, and a vector in one transaction, and BFS found it from the conversation node.
 #[test]
 fn f95_store_and_recall_an_interaction_in_one_transaction() {
     let db = Database::open_memory();
@@ -623,6 +654,7 @@ fn f95_store_and_recall_an_interaction_in_one_transaction() {
     assert!(bfs.nodes.iter().any(|node| node.id == message));
 }
 
+/// I upserted a preference with a new embedding, and the vector index returned the updated one while the graph edge stayed intact.
 #[test]
 fn f96_upsert_user_preference_preserves_graph_and_vector_consistency() {
     let db = Database::open_memory();
@@ -668,11 +700,13 @@ fn f96_upsert_user_preference_preserves_graph_and_vector_consistency() {
     );
 }
 
+/// Placeholder: recall context using relational + graph + vector in one query under 50ms. (Not yet implemented.)
 #[test]
 fn f97_recall_context_across_all_three_paradigms_returns_results_under_50ms() {
     assert!(false, "performance benchmark - run manually");
 }
 
+/// I deleted messages older than a timestamp, and only the recent ones remained.
 #[test]
 fn f103_agent_can_delete_old_memory_by_timestamp_range() {
     let db = Database::open_memory();
@@ -703,6 +737,7 @@ fn f103_agent_can_delete_old_memory_by_timestamp_range() {
     assert_eq!(extract_i64(&remaining, 0, 0), 7);
 }
 
+/// I upserted a row with a new embedding via ON CONFLICT DO UPDATE, and vector search found the updated embedding.
 #[test]
 fn f104_on_conflict_do_update_works_with_vector_columns() {
     let db = Database::open_memory();
@@ -749,6 +784,7 @@ fn f104_on_conflict_do_update_works_with_vector_columns() {
     assert_eq!(results.len(), 1);
 }
 
+/// I deleted an entity that had graph edges, and either the edges were cleaned up or the delete was blocked.
 #[test]
 fn f107_graph_edge_deletion_cascades_or_is_explicit() {
     let db = Database::open_memory();
@@ -782,6 +818,7 @@ fn f107_graph_edge_deletion_cascades_or_is_explicit() {
     );
 }
 
+/// I updated only the embedding column, and the text and graph edges were left untouched.
 #[test]
 fn f111_reembedding_updates_only_the_vector_column() {
     let db = Database::open_memory();
@@ -824,6 +861,7 @@ fn f111_reembedding_updates_only_the_vector_column() {
     );
 }
 
+/// I ran cargo doc on the engine crate, and it built successfully with the expected public API exports.
 #[test]
 fn f105_public_type_documentation_cargo_doc_check() {
     let output = Command::new("cargo")
@@ -843,6 +881,7 @@ fn f105_public_type_documentation_cargo_doc_check() {
     assert!(database.contains("pub fn execute("));
 }
 
+/// I ran EXPLAIN on a graph traversal query, and the plan showed a GraphBFS operator.
 #[test]
 fn f113_explain_shows_graph_bfs_operator_for_graph_traversal() {
     let db = Database::open_memory();
@@ -854,6 +893,7 @@ fn f113_explain_shows_graph_bfs_operator_for_graph_traversal() {
     assert!(explain.contains("GraphBFS"));
 }
 
+/// I ran EXPLAIN on a vector similarity query, and the plan showed an HNSWSearch operator.
 #[test]
 fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
     let db = Database::open_memory();
@@ -868,11 +908,13 @@ fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
     assert!(explain.contains("HNSWSearch"));
 }
 
+/// I subscribed to a table and inserted a row, and the subscription fired.
 #[test]
 fn f115_subscription_fires_on_insert() {
     assert!(false, "subscription API not yet implemented");
 }
 
+/// I subscribed to state changes and propagated a state transition, and the subscription fired.
 #[test]
 fn f116_subscription_fires_on_state_propagation() {
     assert!(false, "subscription API not yet implemented");

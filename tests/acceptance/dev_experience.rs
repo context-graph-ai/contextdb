@@ -2,6 +2,7 @@ use super::common::*;
 use std::fs;
 use std::process::Command;
 
+/// I copy-pasted every SQL example from the README into the CLI, and they all ran without errors.
 #[test]
 fn f37_readme_quick_start_actually_works() {
     let readme = fs::read_to_string(workspace_root().join("README.md")).expect("read README");
@@ -33,6 +34,7 @@ fn f37_readme_quick_start_actually_works() {
     }
 }
 
+/// I ran --help on both the CLI and server binaries, and each one listed all the flags I need (tenant-id, nats-url, db-path).
 #[test]
 fn f38_help_on_both_binaries_explains_all_options_clearly() {
     ensure_release_binaries();
@@ -55,6 +57,7 @@ fn f38_help_on_both_binaries_explains_all_options_clearly() {
     assert!(server_stdout.contains("--nats-url"));
 }
 
+/// I typed a misspelled SQL keyword, and the error said "parse error" or "syntax" — not a panic backtrace.
 #[test]
 fn f39_error_messages_on_bad_sql_are_actionable() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

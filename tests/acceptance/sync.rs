@@ -10,6 +10,7 @@ async fn setup_sync_env(name: &str) -> (TempDir, std::path::PathBuf, std::path::
     (tmp, edge_path, server_path, nats.nats_url)
 }
 
+/// I wrote data on an edge node, and it showed up on the server without me running any sync command.
 #[tokio::test]
 async fn f06a_data_written_on_edge_appears_on_server_automatically() {
     let (_tmp, edge_path, server_path, nats_url) = setup_sync_env("f06a").await;
@@ -68,6 +69,7 @@ macro_rules! sync_red_test {
     };
 }
 
+// I wrote data on one edge, and another edge saw it without any manual sync.
 sync_red_test!(
     f06b_data_from_another_edge_appears_on_this_edge_automatically,
     "\
@@ -89,6 +91,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I wrote data while the edge was offline, and when the network came back the backlog was synced automatically.
 sync_red_test!(
     f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog,
     "\
@@ -100,6 +103,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I pushed data from the edge, and the server had all the rows.
 sync_red_test!(
     f06_edge_pushes_data_server_has_it,
     "\
@@ -112,6 +116,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I pushed twice in a row, and the server had each row exactly once — no duplicates.
 sync_red_test!(
     f07_two_consecutive_pushes_do_not_duplicate_data,
     "\
@@ -126,6 +131,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', '
     }
 );
 
+// I pushed from one edge, then pulled onto a brand-new edge, and the fresh edge had all the data.
 sync_red_test!(
     f08_push_then_pull_on_a_fresh_edge,
     "\
@@ -149,6 +155,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I pushed data, the server restarted, and a pull from a fresh edge still returned everything.
 sync_red_test!(
     f09_pull_after_server_restart_returns_data,
     "\
@@ -178,6 +185,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I pushed, closed the edge, reopened it, inserted more rows, pushed again, and the server had everything.
 sync_red_test!(
     f09b_edge_closes_reopens_pushes_more_data,
     "\
@@ -201,6 +209,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I crashed the edge mid-session, reopened it, pushed, and the server received all the data including what was written before the crash.
 sync_red_test!(
     f09c_edge_crash_recovers_then_pushes,
     "\
@@ -238,6 +247,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I lost power during a sync, retried, and the server had each row exactly once — no duplicates from the interrupted attempt.
 sync_red_test!(
     f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry,
     "\
@@ -249,6 +259,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I pushed a row with every column type (UUID, TEXT, INTEGER, REAL, BOOLEAN, VECTOR), and the server had the full row with all values intact.
 sync_red_test!(
     f09e_all_data_types_round_trip_through_sync,
     "\
@@ -265,6 +276,7 @@ INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('0
     }
 );
 
+// I pushed data that violated a server-side constraint, and the edge got back a clear "constraint" error instead of silently dropping the data.
 sync_red_test!(
     f09f_server_side_constraint_violation_during_push_returns_error_to_edge,
     ".sync push\n.quit\n",
@@ -283,6 +295,7 @@ sync_red_test!(
     }
 );
 
+// I tried to push while a transaction was still open, and the uncommitted rows did not end up on the server.
 sync_red_test!(
     f09g_sync_push_during_open_transaction_is_rejected_or_queued,
     "\
@@ -296,6 +309,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I pulled data that conflicted with my local schema, and I got a clear "schema mismatch" message instead of a silent failure.
 sync_red_test!(
     f09h_constraint_violations_during_sync_pull_are_handled,
     ".quit\n",
@@ -314,6 +328,7 @@ sync_red_test!(
     }
 );
 
+// I made conflicting state machine transitions on two edges, and the sync rejected or resolved the conflict explicitly instead of silently picking one.
 sync_red_test!(
     f09i_conflicting_state_machine_transitions_across_edges_during_sync,
     ".quit\n",
@@ -322,6 +337,7 @@ sync_red_test!(
     }
 );
 
+// I accumulated data offline for an extended period, pushed, and the server received the entire backlog.
 sync_red_test!(
     f10_edge_offline_for_one_hour_then_pushes_backlog,
     "\
@@ -334,6 +350,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
+// I tried to push while NATS was down, and I got a clear "timed out" or "cannot connect" error instead of hanging or silently failing.
 sync_red_test!(
     f11_push_during_nats_outage_gives_a_clear_error,
     ".sync push\n.quit\n",

@@ -1,6 +1,7 @@
 use super::common::*;
 use tempfile::TempDir;
 
+/// I added a column to an existing table, and old rows showed NULL for the new column.
 #[test]
 fn f52_alter_table_add_column() {
     let tmp = TempDir::new().expect("tempdir");
@@ -14,6 +15,7 @@ fn f52_alter_table_add_column() {
     assert!(stdout.contains("NULL"));
 }
 
+/// I renamed a column, and queries using the new name worked while the old name was gone.
 #[test]
 fn f53_rename_a_column() {
     let tmp = TempDir::new().expect("tempdir");
