@@ -135,13 +135,7 @@ fn a1_04_drop_table_removes_schema_and_data() {
     assert!(matches!(result, Err(Error::TableNotFound(_))));
 }
 
-#[test]
-#[ignore = "requires redb persistence"]
-fn a1_05_create_table_columns_preserved() {
-    let _db = setup_ontology_db();
-    // TODO: open file-backed DB, create mixed-type table, close/reopen, verify exact column types.
-    todo!("requires Database::open(path)");
-}
+// a1_05 deleted — redundant with p31_column_type_preservation_across_reopen
 
 #[test]
 fn rt1_composite_store_ddl_round_trip_parse() {
@@ -2367,13 +2361,7 @@ fn a7_09_implicit_vector_coercion_rejected() {
     assert!(matches!(result, Err(Error::PlanError(_))));
 }
 
-#[test]
-#[ignore = "requires redb persistence"]
-fn a8_07_hnsw_rebuilt_on_open() {
-    let _db = setup_ontology_db();
-    // TODO: verify rebuilt ANN index after reopen matches brute-force recall and excludes deleted vectors.
-    todo!("requires redb persistence + hnsw");
-}
+// a8_07 deleted — redundant with p32_deleted_vectors_excluded_from_ann_after_reopen
 
 #[test]
 #[ignore = "requires memory accounting API"]
@@ -2408,25 +2396,17 @@ fn a10_04_bfs_aborts_on_frontier_overflow() {
 }
 
 #[test]
-#[ignore = "requires persistence + memory accounting"]
+#[ignore = "requires memory accounting API"]
 fn a10_05_peak_rss_within_2gb() {
     let _db = setup_ontology_db();
-    // TODO: run large persisted mixed workload and assert peak RSS <= 2GB.
-    todo!("requires persistence + memory accounting");
+    todo!("run large persisted mixed workload and assert peak RSS <= 2GB");
 }
 
 #[test]
-#[ignore = "requires redb persistence"]
+#[ignore = "requires ARM64 cross-compile CI gate"]
 fn a11_01_cross_compile_check() {
     let _db = setup_ontology_db();
-    // TODO: run cargo check --target aarch64-unknown-linux-gnu in CI and audit SIMD deps.
-    todo!("requires redb persistence / target toolchain gate");
+    todo!("run cargo check --target aarch64-unknown-linux-gnu in CI and audit SIMD deps");
 }
 
-#[test]
-#[ignore = "requires contextdb-cli"]
-fn a12_01_cli_opens_memory_db() {
-    let _db = setup_ontology_db();
-    // TODO: spawn contextdb --memory REPL and assert SQL/MATCH/vector commands execute.
-    todo!("requires contextdb-cli");
-}
+// a12_01 deleted — redundant with p34_cli_memory_mode_smoke_test
