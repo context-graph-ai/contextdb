@@ -2,6 +2,8 @@
 mod anti_tests;
 #[path = "integration/boundary_conditions.rs"]
 mod boundary_conditions;
+#[path = "integration/ddl_sync_tests.rs"]
+mod ddl_sync_tests;
 #[path = "integration/gate_a_primitives.rs"]
 mod gate_a_primitives;
 #[path = "integration/gate_a_sync.rs"]

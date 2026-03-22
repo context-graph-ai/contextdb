@@ -77,6 +77,8 @@ pub struct WireRowChange {
     pub table: String,
     pub natural_key: WireNaturalKey,
     pub values: HashMap<String, Value>,
+    #[serde(default)]
+    pub deleted: bool,
     pub lsn: u64,
 }
 
@@ -102,6 +104,9 @@ pub enum WireDdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+    },
+    DropTable {
+        name: String,
     },
 }
 
@@ -173,6 +178,7 @@ impl From<RowChange> for WireRowChange {
             table: value.table,
             natural_key: value.natural_key.into(),
             values: value.values,
+            deleted: value.deleted,
             lsn: value.lsn,
         }
     }
@@ -184,6 +190,7 @@ impl From<WireRowChange> for RowChange {
             table: value.table,
             natural_key: value.natural_key.into(),
             values: value.values,
+            deleted: value.deleted,
             lsn: value.lsn,
         }
     }
@@ -245,6 +252,7 @@ impl From<DdlChange> for WireDdlChange {
                 columns,
                 constraints,
             },
+            DdlChange::DropTable { name } => Self::DropTable { name },
         }
     }
 }
@@ -261,6 +269,7 @@ impl From<WireDdlChange> for DdlChange {
                 columns,
                 constraints,
             },
+            WireDdlChange::DropTable { name } => Self::DropTable { name },
         }
     }
 }

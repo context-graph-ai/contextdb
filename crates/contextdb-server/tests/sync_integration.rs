@@ -729,6 +729,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                     v.insert("embedding".to_string(), Value::Vector(vec![1.0, 0.0, 0.0]));
                     v
                 },
+                deleted: false,
                 lsn: 10,
             },
             RowChange {
@@ -745,6 +746,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                     v.insert("embedding".to_string(), Value::Vector(vec![0.0, 1.0, 0.0]));
                     v
                 },
+                deleted: false,
                 lsn: 11,
             },
             RowChange {
@@ -760,6 +762,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                     v.insert("embedding".to_string(), Value::Vector(vec![0.0, 0.0, 1.0]));
                     v
                 },
+                deleted: false,
                 lsn: 12,
             },
         ],
@@ -971,6 +974,7 @@ async fn a13_pull_pagination_fetches_all_pages() {
                 value: Value::Uuid(id),
             },
             values,
+            deleted: false,
             lsn: 0,
         });
     }

@@ -503,6 +503,7 @@ fn p05_pre_commit_source_sync_pull() {
                 ("id".to_string(), Value::Uuid(Uuid::new_v4())),
                 ("name".to_string(), Value::Text("synced".to_string())),
             ]),
+            deleted: false,
             lsn: 1,
         }],
         edges: vec![],
@@ -1067,6 +1068,7 @@ fn p24_on_sync_pull_rejects_batch() {
                 ("id".to_string(), Value::Uuid(Uuid::new_v4())),
                 ("name".to_string(), Value::Text("incoming".to_string())),
             ]),
+            deleted: false,
             lsn: 1,
         }],
         edges: vec![],
@@ -1106,6 +1108,7 @@ fn p25_on_sync_pull_filters_rows() {
                     ("id".to_string(), Value::Uuid(id1)),
                     ("name".to_string(), Value::Text("allowed".to_string())),
                 ]),
+                deleted: false,
                 lsn: 1,
             },
             RowChange {
@@ -1118,6 +1121,7 @@ fn p25_on_sync_pull_filters_rows() {
                     ("id".to_string(), Value::Uuid(id2)),
                     ("data".to_string(), Value::Text("nope".to_string())),
                 ]),
+                deleted: false,
                 lsn: 2,
             },
         ],
@@ -1291,6 +1295,7 @@ fn p34_apply_changes_per_row_sync_pull() {
                     ("id".to_string(), Value::Uuid(id)),
                     ("name".to_string(), Value::Text(format!("sync-{i}"))),
                 ]),
+                deleted: false,
                 lsn: (i + 1) as u64,
             }
         })

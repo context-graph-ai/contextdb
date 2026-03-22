@@ -42,6 +42,7 @@ fn ddl_sql_from_change(change: &DdlChange) -> String {
             }
             sql
         }
+        DdlChange::DropTable { .. } => panic!("unexpected DROP TABLE in DDL round-trip helper"),
     }
 }
 
@@ -171,7 +172,10 @@ fn rt1_composite_store_ddl_round_trip_parse() {
             name,
             columns,
             constraints,
-        } = change;
+        } = change
+        else {
+            panic!("expected CREATE TABLE");
+        };
 
         assert_eq!(parsed.name, name);
         assert_eq!(parsed.columns.len(), columns.len());

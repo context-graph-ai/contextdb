@@ -1981,6 +1981,7 @@ fn a9_15_archive_not_delete_status_transition_sync() {
             value: Value::Uuid(uuid_d),
         },
         values: HashMap::new(), // deliberately empty
+        deleted: false,
         lsn: 999,
     };
     let poison_cs = ChangeSet {

@@ -45,6 +45,7 @@ impl ChangeSet {
                 .iter()
                 .filter(|d| match d {
                     DdlChange::CreateTable { name, .. } => include_dir(name),
+                    DdlChange::DropTable { name } => include_dir(name),
                 })
                 .cloned()
                 .collect(),
@@ -57,6 +58,7 @@ pub struct RowChange {
     pub table: String,
     pub natural_key: NaturalKey,
     pub values: HashMap<String, Value>,
+    pub deleted: bool,
     pub lsn: u64,
 }
 
@@ -82,6 +84,9 @@ pub enum DdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+    },
+    DropTable {
+        name: String,
     },
 }
 

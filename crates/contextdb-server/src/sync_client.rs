@@ -619,6 +619,7 @@ mod tests {
                     value: Value::Uuid(id),
                 },
                 values,
+                deleted: false,
                 lsn: 1,
             });
         }
@@ -688,6 +689,7 @@ mod tests {
                     value: Value::Uuid(id),
                 },
                 values,
+                deleted: false,
                 lsn: 1,
             });
             vectors.push(VectorChange {
@@ -735,6 +737,7 @@ mod tests {
                 value: Value::Uuid(id),
             },
             values,
+            deleted: false,
             lsn: 1,
         };
         let changeset = ChangeSet {
@@ -778,6 +781,7 @@ mod tests {
                     value: Value::Uuid(id),
                 },
                 values,
+                deleted: false,
                 lsn: (i + 1) as u64,
             });
             vectors.push(VectorChange {

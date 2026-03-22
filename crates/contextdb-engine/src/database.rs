@@ -921,7 +921,12 @@ impl Database {
     }
 
     pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: u64) {
-        let _ = (name, lsn);
+        self.ddl_log.write().push((
+            lsn,
+            DdlChange::DropTable {
+                name: name.to_string(),
+            },
+        ));
     }
 
     pub(crate) fn persist_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
@@ -966,6 +971,7 @@ impl Database {
                             table,
                             natural_key,
                             values,
+                            deleted: false,
                             lsn,
                         });
                     }
@@ -982,6 +988,7 @@ impl Database {
                         table,
                         natural_key,
                         values,
+                        deleted: true,
                         lsn,
                     });
                 }
@@ -1040,7 +1047,7 @@ impl Database {
         // Build a set of (table, natural_key) that have a non-delete entry.
         let insert_keys: HashSet<(String, String, String)> = rows
             .iter()
-            .filter(|r| !matches!(r.values.get("__deleted"), Some(Value::Bool(true))))
+            .filter(|r| !r.deleted)
             .map(|r| {
                 (
                     r.table.clone(),
@@ -1050,7 +1057,7 @@ impl Database {
             })
             .collect();
         rows.retain(|r| {
-            if matches!(r.values.get("__deleted"), Some(Value::Bool(true))) {
+            if r.deleted {
                 // Keep the delete only if there's no subsequent insert for this key
                 let key = (
                     r.table.clone(),
@@ -1126,6 +1133,7 @@ impl Database {
                     }
                     self.execute_in_tx(tx, &sql, &HashMap::new())?;
                 }
+                DdlChange::DropTable { .. } => {}
             }
         }
 
@@ -1149,7 +1157,7 @@ impl Database {
                 &row.natural_key.value,
                 self.snapshot(),
             )?;
-            let is_delete = matches!(row.values.get("__deleted"), Some(Value::Bool(true)));
+            let is_delete = row.deleted;
 
             if is_delete {
                 if let Some(local) = existing {
