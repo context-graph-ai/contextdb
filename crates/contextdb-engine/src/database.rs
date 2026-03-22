@@ -956,8 +956,151 @@ impl Database {
         ddl[start..].iter().map(|(_, c)| c.clone()).collect()
     }
 
+    /// Builds a complete snapshot of all live data as a ChangeSet.
+    /// Used as fallback when change_log/ddl_log cannot serve a watermark.
+    fn full_state_snapshot(&self) -> ChangeSet {
+        let mut rows = Vec::new();
+        let mut edges = Vec::new();
+        let mut vectors = Vec::new();
+        let mut ddl = Vec::new();
+
+        let meta_guard = self.relational_store.table_meta.read();
+        let tables_guard = self.relational_store.tables.read();
+
+        // DDL
+        for (name, meta) in meta_guard.iter() {
+            ddl.push(ddl_change_from_meta(name, meta));
+        }
+
+        // Rows (live only) — collect row_ids that have live rows for orphan vector filtering
+        let mut live_row_ids: HashSet<RowId> = HashSet::new();
+        for (table_name, table_rows) in tables_guard.iter() {
+            let meta = match meta_guard.get(table_name) {
+                Some(m) => m,
+                None => continue,
+            };
+            let key_col = meta.natural_key_column.clone().unwrap_or_else(|| {
+                if meta
+                    .columns
+                    .iter()
+                    .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
+                {
+                    "id".to_string()
+                } else {
+                    String::new()
+                }
+            });
+            if key_col.is_empty() {
+                continue;
+            }
+            for row in table_rows.iter().filter(|r| r.deleted_tx.is_none()) {
+                let key_val = match row.values.get(&key_col) {
+                    Some(v) => v.clone(),
+                    None => continue,
+                };
+                live_row_ids.insert(row.row_id);
+                rows.push(RowChange {
+                    table: table_name.clone(),
+                    natural_key: NaturalKey {
+                        column: key_col.clone(),
+                        value: key_val,
+                    },
+                    values: row.values.clone(),
+                    deleted: false,
+                    lsn: row.lsn,
+                });
+            }
+        }
+
+        drop(tables_guard);
+        drop(meta_guard);
+
+        // Edges (live only)
+        let fwd = self.graph_store.forward_adj.read();
+        for (_source, entries) in fwd.iter() {
+            for entry in entries.iter().filter(|e| e.deleted_tx.is_none()) {
+                edges.push(EdgeChange {
+                    source: entry.source,
+                    target: entry.target,
+                    edge_type: entry.edge_type.clone(),
+                    properties: entry.properties.clone(),
+                    lsn: entry.lsn,
+                });
+            }
+        }
+        drop(fwd);
+
+        // Vectors (live only, skip orphans, first entry per row_id)
+        let mut seen_vector_rows: HashSet<RowId> = HashSet::new();
+        let vecs = self.vector_store.vectors.read();
+        for entry in vecs.iter().filter(|v| v.deleted_tx.is_none()) {
+            if !live_row_ids.contains(&entry.row_id) {
+                continue; // skip orphan vectors
+            }
+            if !seen_vector_rows.insert(entry.row_id) {
+                continue; // first live entry per row_id only
+            }
+            vectors.push(VectorChange {
+                row_id: entry.row_id,
+                vector: entry.vector.clone(),
+                lsn: entry.lsn,
+            });
+        }
+        drop(vecs);
+
+        ChangeSet {
+            rows,
+            edges,
+            vectors,
+            ddl,
+        }
+    }
+
     /// Extracts changes from this database since the given LSN.
     pub fn changes_since(&self, since_lsn: u64) -> ChangeSet {
+        // Future watermark guard
+        if since_lsn > self.current_lsn() {
+            return ChangeSet::default();
+        }
+
+        // Check if the ephemeral logs can serve the requested watermark.
+        // After restart, both logs are empty but stores may have data — fall back to snapshot.
+        let log = self.change_log.read();
+        let change_first_lsn = log.first().map(|e| e.lsn());
+        let change_log_empty = log.is_empty();
+        drop(log);
+
+        let ddl = self.ddl_log.read();
+        let ddl_first_lsn = ddl.first().map(|(lsn, _)| *lsn);
+        let ddl_log_empty = ddl.is_empty();
+        drop(ddl);
+
+        let has_table_data = !self
+            .relational_store
+            .tables
+            .read()
+            .values()
+            .all(|rows| rows.is_empty());
+        let has_table_meta = !self.relational_store.table_meta.read().is_empty();
+
+        // If both logs are empty but stores have data → post-restart, fall back
+        if change_log_empty && ddl_log_empty && (has_table_data || has_table_meta) {
+            return self.full_state_snapshot();
+        }
+
+        // If logs have entries, check the minimum first-LSN across both covers since_lsn
+        let min_first_lsn = match (change_first_lsn, ddl_first_lsn) {
+            (Some(c), Some(d)) => Some(c.min(d)),
+            (Some(c), None) => Some(c),
+            (None, Some(d)) => Some(d),
+            (None, None) => None, // both empty, stores empty — nothing to serve
+        };
+
+        if min_first_lsn.is_some_and(|min_lsn| min_lsn > since_lsn + 1) {
+            // Log doesn't cover since_lsn — fall back to snapshot
+            return self.full_state_snapshot();
+        }
+
         let mut rows = Vec::new();
         let mut edges = Vec::new();
         let mut vectors = Vec::new();
@@ -1116,6 +1259,18 @@ impl Database {
                     constraints,
                 } => {
                     if self.table_meta(&name).is_some() {
+                        // Check for schema divergence
+                        if let Some(local_meta) = self.table_meta(&name) {
+                            let local_col_count = local_meta.columns.len();
+                            if local_col_count != columns.len() {
+                                tracing::warn!(
+                                    table = name,
+                                    local_columns = local_col_count,
+                                    remote_columns = columns.len(),
+                                    "schema divergence detected — keeping local schema"
+                                );
+                            }
+                        }
                         continue;
                     }
                     let mut sql = format!(
@@ -1133,7 +1288,12 @@ impl Database {
                     }
                     self.execute_in_tx(tx, &sql, &HashMap::new())?;
                 }
-                DdlChange::DropTable { .. } => {}
+                DdlChange::DropTable { name } => {
+                    if self.table_meta(&name).is_some() {
+                        self.relational_store().drop_table(&name);
+                        self.remove_persisted_table(&name)?;
+                    }
+                }
             }
         }
 
@@ -1325,6 +1485,15 @@ impl Database {
             }
         }
 
+        let existing_vector_rows: HashSet<RowId> = self
+            .vector_store
+            .vectors
+            .read()
+            .iter()
+            .filter(|v| v.deleted_tx.is_none())
+            .map(|v| v.row_id)
+            .collect();
+
         for vector in changes.vectors {
             if failed_row_ids.contains(&vector.row_id) {
                 continue; // skip vectors for rows that failed to insert
@@ -1336,6 +1505,9 @@ impl Database {
             if vector.vector.is_empty() {
                 let _ = self.vector.delete_vector(tx, local_row_id);
             } else {
+                if existing_vector_rows.contains(&local_row_id) {
+                    continue;
+                }
                 let _ = self.insert_vector(tx, local_row_id, vector.vector);
             }
         }
