@@ -637,7 +637,7 @@ fn exec_update(
     for row in &matched {
         let mut values = row.values.clone();
         for (k, vexpr) in &p.assignments {
-            values.insert(k.clone(), resolve_expr(vexpr, params)?);
+            values.insert(k.clone(), eval_assignment_expr(vexpr, &row.values, params)?);
         }
         db.delete_row(txid, &p.table, row.row_id)?;
         db.insert_row(txid, &p.table, values)?;
@@ -1009,6 +1009,108 @@ fn compare_sort_values(left: &Value, right: &Value, direction: SortDirection) ->
     }
 }
 
+fn eval_assignment_expr(
+    expr: &Expr,
+    row_values: &HashMap<String, Value>,
+    params: &HashMap<String, Value>,
+) -> Result<Value> {
+    match expr {
+        Expr::Literal(lit) => literal_to_value(lit),
+        Expr::Parameter(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::Other(format!("unknown parameter: {}", name))),
+        Expr::Column(col_ref) => row_values
+            .get(&col_ref.column)
+            .cloned()
+            .ok_or_else(|| Error::Other(format!("column not found: {}", col_ref.column))),
+        Expr::BinaryOp { left, op, right } => {
+            let left = eval_assignment_expr(left, row_values, params)?;
+            let right = eval_assignment_expr(right, row_values, params)?;
+            eval_binary_op(op, &left, &right)
+        }
+        Expr::UnaryOp { op, operand } => match op {
+            UnaryOp::Neg => match eval_assignment_expr(operand, row_values, params)? {
+                Value::Int64(value) => Ok(Value::Int64(-value)),
+                Value::Float64(value) => Ok(Value::Float64(-value)),
+                _ => Err(Error::Other(format!(
+                    "unsupported expression in UPDATE SET: {:?}",
+                    expr
+                ))),
+            },
+            UnaryOp::Not => Err(Error::Other(format!(
+                "unsupported expression in UPDATE SET: {:?}",
+                expr
+            ))),
+        },
+        Expr::FunctionCall { name, args } => {
+            let evaluated = args
+                .iter()
+                .map(|arg| eval_assignment_expr(arg, row_values, params))
+                .collect::<Result<Vec<_>>>()?;
+            eval_function(name, &evaluated)
+        }
+        _ => Err(Error::Other(format!(
+            "unsupported expression in UPDATE SET: {:?}",
+            expr
+        ))),
+    }
+}
+
+fn literal_to_value(lit: &Literal) -> Result<Value> {
+    Ok(match lit {
+        Literal::Null => Value::Null,
+        Literal::Bool(v) => Value::Bool(*v),
+        Literal::Integer(v) => Value::Int64(*v),
+        Literal::Real(v) => Value::Float64(*v),
+        Literal::Text(v) => Value::Text(v.clone()),
+    })
+}
+
+fn eval_arithmetic(name: &str, args: &[Value]) -> Result<Value> {
+    let [left, right] = args else {
+        return Err(Error::PlanError(format!(
+            "function {} expects 2 arguments",
+            name
+        )));
+    };
+
+    match (left, right) {
+        (Value::Int64(left), Value::Int64(right)) => match name {
+            "__add" => Ok(Value::Int64(left + right)),
+            "__sub" => Ok(Value::Int64(left - right)),
+            "__mul" => Ok(Value::Int64(left * right)),
+            "__div" => Ok(Value::Int64(left / right)),
+            _ => Err(Error::PlanError(format!("unknown function: {}", name))),
+        },
+        (Value::Float64(left), Value::Float64(right)) => match name {
+            "__add" => Ok(Value::Float64(left + right)),
+            "__sub" => Ok(Value::Float64(left - right)),
+            "__mul" => Ok(Value::Float64(left * right)),
+            "__div" => Ok(Value::Float64(left / right)),
+            _ => Err(Error::PlanError(format!("unknown function: {}", name))),
+        },
+        (Value::Int64(left), Value::Float64(right)) => match name {
+            "__add" => Ok(Value::Float64(*left as f64 + right)),
+            "__sub" => Ok(Value::Float64(*left as f64 - right)),
+            "__mul" => Ok(Value::Float64(*left as f64 * right)),
+            "__div" => Ok(Value::Float64(*left as f64 / right)),
+            _ => Err(Error::PlanError(format!("unknown function: {}", name))),
+        },
+        (Value::Float64(left), Value::Int64(right)) => match name {
+            "__add" => Ok(Value::Float64(left + *right as f64)),
+            "__sub" => Ok(Value::Float64(left - *right as f64)),
+            "__mul" => Ok(Value::Float64(left * *right as f64)),
+            "__div" => Ok(Value::Float64(left / *right as f64)),
+            _ => Err(Error::PlanError(format!("unknown function: {}", name))),
+        },
+        _ => Err(Error::PlanError(format!(
+            "function {} expects numeric arguments",
+            name
+        ))),
+    }
+}
+
 fn eval_function_in_row_context(
     row: &VersionedRow,
     name: &str,
@@ -1024,6 +1126,7 @@ fn eval_function_in_row_context(
 
 fn eval_function(name: &str, args: &[Value]) -> Result<Value> {
     match name.to_ascii_lowercase().as_str() {
+        "__add" | "__sub" | "__mul" | "__div" => eval_arithmetic(name, args),
         "coalesce" => Ok(args
             .iter()
             .find(|value| **value != Value::Null)

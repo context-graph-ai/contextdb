@@ -1,4 +1,6 @@
-WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" | line_comment | block_comment }
+line_comment = _{ "--" ~ (!"\n" ~ ANY)* }
+block_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
 statement = { SOI ~ stmt ~ semicolon? ~ EOI }
 semicolon = _{ ";" }
