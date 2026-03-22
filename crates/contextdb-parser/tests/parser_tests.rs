@@ -78,7 +78,7 @@ fn anti_tests_rejected_constructs() {
     ));
     assert!(matches!(
         parse("SELECT * FROM d WHERE id IN (SELECT id FROM edges WHERE x = 1)"),
-        Err(Error::SubqueryNotSupported)
+        Ok(Statement::Select(_))
     ));
 }
 
@@ -861,7 +861,7 @@ fn rejection_subquery_support_boundary() {
         parse(
             "SELECT * FROM decisions WHERE id IN (SELECT id FROM edges WHERE edge_type = 'CITES')"
         ),
-        Err(Error::SubqueryNotSupported)
+        Ok(Statement::Select(_))
     ));
     assert!(matches!(
         parse(

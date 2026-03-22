@@ -102,6 +102,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     let mut distinct = false;
     let mut columns = Vec::new();
     let mut from = Vec::new();
+    let mut joins = Vec::new();
     let mut where_clause = None;
     let mut order_by = Vec::new();
     let mut limit = None;
@@ -114,6 +115,9 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
             }
             Rule::from_clause => {
                 from = build_from_clause(p)?;
+            }
+            Rule::join_clause => {
+                joins.push(build_join_clause(p)?);
             }
             Rule::where_clause => {
                 where_clause = Some(build_where_clause(p)?);
@@ -132,7 +136,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
         distinct,
         columns,
         from,
-        joins: Vec::new(),
+        joins,
         where_clause,
         order_by,
         limit,
@@ -199,6 +203,44 @@ fn build_from_item(pair: Pair<'_, Rule>) -> Result<FromItem> {
         Rule::graph_table => build_graph_table(inner),
         _ => Err(Error::ParseError("invalid FROM item".to_string())),
     }
+}
+
+fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
+    let mut join_type = None;
+    let mut table = None;
+    let mut alias = None;
+    let mut on = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::join_type => {
+                join_type = Some(if p.as_str().to_ascii_uppercase().starts_with("LEFT") {
+                    JoinType::Left
+                } else {
+                    JoinType::Inner
+                });
+            }
+            Rule::table_ref => {
+                if let FromItem::Table {
+                    name,
+                    alias: table_alias,
+                } = build_table_ref(p)?
+                {
+                    table = Some(name);
+                    alias = table_alias;
+                }
+            }
+            Rule::expr => on = Some(build_expr(p)?),
+            _ => {}
+        }
+    }
+
+    Ok(JoinClause {
+        join_type: join_type.ok_or_else(|| Error::ParseError("JOIN missing type".to_string()))?,
+        table: table.ok_or_else(|| Error::ParseError("JOIN missing table".to_string()))?,
+        alias,
+        on: on.ok_or_else(|| Error::ParseError("JOIN missing ON expression".to_string()))?,
+    })
 }
 
 fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
@@ -860,6 +902,10 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::star => args.push(Expr::Column(ColumnRef {
+                table: None,
+                column: "*".to_string(),
+            })),
             Rule::expr => args.push(build_expr(p)?),
             _ => {}
         }
@@ -1525,13 +1571,18 @@ fn validate_expr(expr: &Expr) -> Result<()> {
 fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
     match expr {
         Expr::InSubquery { subquery, .. } => {
+            if subquery.columns.len() != 1 || subquery.from.is_empty() {
+                return Err(Error::SubqueryNotSupported);
+            }
+
             let referenced = subquery.from.iter().find_map(|f| match f {
                 FromItem::Table { name, .. } => Some(name.as_str()),
                 FromItem::GraphTable { .. } => None,
             });
-            if let Some(name) = referenced
-                && cte_names.iter().any(|n| n.eq_ignore_ascii_case(name))
-            {
+            if let Some(name) = referenced {
+                if cte_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                    return Ok(());
+                }
                 return Ok(());
             }
             return Err(Error::SubqueryNotSupported);

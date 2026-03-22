@@ -172,6 +172,12 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
         }
     };
 
+    let uses_vector_search = sel
+        .body
+        .order_by
+        .first()
+        .is_some_and(|order| matches!(order.direction, SortDirection::CosineDistance));
+
     if let Some(order) = sel.body.order_by.first()
         && matches!(order.direction, SortDirection::CosineDistance)
     {
@@ -190,6 +196,58 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
             query_expr: order.expr.clone(),
             k,
             candidates: Some(Box::new(current)),
+        };
+    }
+
+    if !sel.body.order_by.is_empty() && !uses_vector_search {
+        current = PhysicalPlan::Sort {
+            input: Box::new(current),
+            keys: sel
+                .body
+                .order_by
+                .iter()
+                .map(|item| SortKey {
+                    expr: item.expr.clone(),
+                    direction: item.direction,
+                })
+                .collect(),
+        };
+    }
+
+    let is_select_star = matches!(
+        sel.body.columns.as_slice(),
+        [contextdb_parser::ast::SelectColumn {
+            expr: Expr::Column(contextdb_parser::ast::ColumnRef { table: None, column }),
+            alias: None
+        }] if column == "*"
+    );
+    if !is_select_star {
+        current = PhysicalPlan::Project {
+            input: Box::new(current),
+            columns: sel
+                .body
+                .columns
+                .iter()
+                .map(|column| ProjectColumn {
+                    expr: column.expr.clone(),
+                    alias: column.alias.clone(),
+                })
+                .collect(),
+        };
+    }
+
+    if sel.body.distinct {
+        current = PhysicalPlan::Distinct {
+            input: Box::new(current),
+        };
+    }
+
+    if let Some(limit) = sel.body.limit
+        && !uses_vector_search
+    {
+        current = PhysicalPlan::Limit {
+            input: Box::new(current),
+            count: limit,
         };
     }
 

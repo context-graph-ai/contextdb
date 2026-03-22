@@ -1,5 +1,5 @@
 use contextdb_core::{Direction, PropagationRule};
-use contextdb_parser::ast::{ColumnDef, Expr, OnConflict, StateMachineDef};
+use contextdb_parser::ast::{ColumnDef, Expr, OnConflict, SortDirection, StateMachineDef};
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
@@ -47,6 +47,9 @@ pub enum PhysicalPlan {
     Project {
         input: Box<PhysicalPlan>,
         columns: Vec<ProjectColumn>,
+    },
+    Distinct {
+        input: Box<PhysicalPlan>,
     },
     Join {
         left: Box<PhysicalPlan>,
@@ -167,6 +170,7 @@ pub struct ProjectColumn {
 #[derive(Debug, Clone)]
 pub struct SortKey {
     pub expr: Expr,
+    pub direction: SortDirection,
 }
 
 #[derive(Debug, Clone, Copy)]

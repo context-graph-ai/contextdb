@@ -30,6 +30,7 @@ select_core = {
     ~ distinct_kw?
     ~ select_list
     ~ from_clause?
+    ~ join_clause*
     ~ where_clause?
     ~ order_by_clause?
     ~ limit_clause?
@@ -41,10 +42,14 @@ star = { "*" }
 select_item = { expr ~ (^"AS" ~ identifier)? }
 
 from_clause = { ^"FROM" ~ from_item ~ ("," ~ from_item)* }
+join_clause = { join_type ~ table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | order_by_start | limit_start | clause_end) }
+join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") }
 from_item = { graph_table | table_ref }
-table_ref = { identifier ~ (^"AS" ~ identifier)? }
+table_ref = { identifier ~ ((^"AS")? ~ table_alias)? }
+table_alias = { !(join_type | where_start | order_by_start | limit_start | clause_end) ~ identifier }
 
 where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | limit_start | clause_end) }
+where_start = _{ ^"WHERE" }
 order_by_start = _{ ^"ORDER" ~ ^"BY" }
 limit_start = _{ ^"LIMIT" }
 clause_end = _{ EOI | ")" | "," }
@@ -270,7 +275,7 @@ primary_expr = {
     | column_ref
     | "(" ~ expr ~ ")"
 }
-function_call = { identifier ~ "(" ~ (expr ~ ("," ~ expr)*)? ~ ")" }
+function_call = { identifier ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
 column_ref = { identifier ~ ("." ~ identifier)? }
 
 parameter = @{ "$" ~ ident }
