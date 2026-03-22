@@ -1,5 +1,18 @@
 use super::common::*;
 use tempfile::TempDir;
+use uuid::Uuid;
+
+fn gen_sensor_inserts(count: usize) -> String {
+    let mut s = String::new();
+    for i in 0..count {
+        s.push_str(&format!(
+            "INSERT INTO sensors (id, name) VALUES ('{}', 'sensor-{}')\n",
+            Uuid::new_v4(),
+            i
+        ));
+    }
+    s
+}
 
 /// I pushed different tables from two separate edges, and the server had both tables.
 #[tokio::test]
@@ -45,12 +58,17 @@ async fn f18_two_edges_push_to_same_table_different_rows() {
     let edge_b = temp_db_file(&tmp, "f18-edge-b.db");
     let nats = start_nats().await;
     let mut server = spawn_server(&server_path, "f18", &nats.nats_url);
-    let script = "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n.sync push\n.quit\n";
+    let mut script_a = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    script_a.push_str(&gen_sensor_inserts(50));
+    script_a.push_str(".sync push\n.quit\n");
+    let mut script_b = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    script_b.push_str(&gen_sensor_inserts(50));
+    script_b.push_str(".sync push\n.quit\n");
     assert!(
         run_cli_script(
             &edge_a,
             &["--tenant-id", "f18", "--nats-url", &nats.nats_url],
-            script
+            &script_a
         )
         .status
         .success()
@@ -59,7 +77,7 @@ async fn f18_two_edges_push_to_same_table_different_rows() {
         run_cli_script(
             &edge_b,
             &["--tenant-id", "f18", "--nats-url", &nats.nats_url],
-            script
+            &script_b
         )
         .status
         .success()
@@ -108,10 +126,13 @@ async fn f20_edge_pulls_after_another_edge_pushed() {
     let edge_b = temp_db_file(&tmp, "f20-edge-b.db");
     let nats = start_nats().await;
     let mut server = spawn_server(&server_path, "f20", &nats.nats_url);
+    let mut script_a = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    script_a.push_str(&gen_sensor_inserts(100));
+    script_a.push_str(".sync push\n.quit\n");
     let _ = run_cli_script(
         &edge_a,
         &["--tenant-id", "f20", "--nats-url", &nats.nats_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n.sync push\n.quit\n",
+        &script_a,
     );
     let pulled = run_cli_script(
         &edge_b,
@@ -131,15 +152,21 @@ async fn f21_edge_a_pushes_edge_b_pushes_both_pull() {
     let edge_b = temp_db_file(&tmp, "f21-edge-b.db");
     let nats = start_nats().await;
     let mut server = spawn_server(&server_path, "f21", &nats.nats_url);
+    let mut script_a = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    script_a.push_str(&gen_sensor_inserts(50));
+    script_a.push_str(".sync push\n.quit\n");
     let _ = run_cli_script(
         &edge_a,
         &["--tenant-id", "f21", "--nats-url", &nats.nats_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n.sync push\n.quit\n",
+        &script_a,
     );
+    let mut script_b = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    script_b.push_str(&gen_sensor_inserts(50));
+    script_b.push_str(".sync push\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n");
     let _ = run_cli_script(
         &edge_b,
         &["--tenant-id", "f21", "--nats-url", &nats.nats_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b')\n.sync push\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n",
+        &script_b,
     );
     let pulled_a = run_cli_script(
         &edge_a,
