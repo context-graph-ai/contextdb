@@ -244,18 +244,20 @@ fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
 }
 
 fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
-    let mut names: Vec<String> = pair
-        .into_inner()
-        .filter(|p| p.as_rule() == Rule::identifier)
-        .map(|p| parse_identifier(p.as_str()))
-        .collect();
+    let mut name = None;
+    let mut alias = None;
 
-    if names.is_empty() {
-        return Err(Error::ParseError("table name missing".to_string()));
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(part.as_str())),
+            Rule::identifier | Rule::table_alias if alias.is_none() => {
+                alias = Some(parse_identifier(part.as_str()))
+            }
+            _ => {}
+        }
     }
 
-    let name = names.remove(0);
-    let alias = names.into_iter().next();
+    let name = name.ok_or_else(|| Error::ParseError("table name missing".to_string()))?;
 
     Ok(FromItem::Table { name, alias })
 }

@@ -11,6 +11,7 @@ pub enum PhysicalPlan {
     Update(UpdatePlan),
     Scan {
         table: String,
+        alias: Option<String>,
         filter: Option<Expr>,
     },
     IndexScan {
@@ -56,6 +57,8 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         condition: Expr,
         join_type: JoinType,
+        left_alias: Option<String>,
+        right_alias: Option<String>,
     },
     Sort {
         input: Box<PhysicalPlan>,

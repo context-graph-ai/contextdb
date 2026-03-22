@@ -1,7 +1,7 @@
 use crate::database::{Database, QueryResult};
 use contextdb_core::*;
 use contextdb_parser::ast::{
-    BinOp, DataType, Expr, Literal, SelectStatement, SortDirection, Statement, UnaryOp,
+    BinOp, ColumnRef, DataType, Expr, Literal, SelectStatement, SortDirection, Statement, UnaryOp,
 };
 use contextdb_planner::{DeletePlan, InsertPlan, PhysicalPlan, UpdatePlan, plan};
 use roaring::RoaringTreemap;
@@ -59,14 +59,32 @@ pub(crate) fn execute_plan(
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
         PhysicalPlan::Delete(p) => exec_delete(db, p, params, tx),
         PhysicalPlan::Update(p) => exec_update(db, p, params, tx),
-        PhysicalPlan::Scan { table, filter } => {
+        PhysicalPlan::Scan { table, filter, .. } => {
+            if table == "dual" {
+                return Ok(QueryResult {
+                    columns: vec![],
+                    rows: vec![vec![]],
+                    rows_affected: 0,
+                });
+            }
             let snapshot = db.snapshot();
             let rows = db.scan(table, snapshot)?;
+            let schema_columns = db.table_meta(table).map(|meta| {
+                meta.columns
+                    .into_iter()
+                    .map(|column| column.name)
+                    .collect::<Vec<_>>()
+            });
             let resolved_filter = filter
                 .as_ref()
                 .map(|expr| resolve_in_subqueries(db, expr, params, tx))
                 .transpose()?;
-            materialize_rows(rows, resolved_filter.as_ref(), params)
+            materialize_rows(
+                rows,
+                resolved_filter.as_ref(),
+                params,
+                schema_columns.as_deref(),
+            )
         }
         PhysicalPlan::GraphBfs {
             start_expr,
@@ -76,7 +94,25 @@ pub(crate) fn execute_plan(
             max_depth,
             ..
         } => {
-            let start = resolve_uuid(start_expr, params)?;
+            let start = match resolve_uuid(start_expr, params) {
+                Ok(start) => Some(start),
+                Err(Error::PlanError(_))
+                    if matches!(
+                        start_expr,
+                        Expr::Column(contextdb_parser::ast::ColumnRef { table: None, .. })
+                    ) =>
+                {
+                    None
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(start) = start else {
+                return Ok(QueryResult {
+                    columns: vec!["id".to_string(), "depth".to_string()],
+                    rows: vec![],
+                    rows_affected: 0,
+                });
+            };
             let edge_types_ref = if edge_types.is_empty() {
                 None
             } else {
@@ -309,6 +345,69 @@ pub(crate) fn execute_plan(
                 rows_affected: input_result.rows_affected,
             })
         }
+        PhysicalPlan::Join {
+            left,
+            right,
+            condition,
+            join_type,
+            left_alias,
+            right_alias,
+        } => {
+            let left_result = execute_plan(db, left, params, tx)?;
+            let right_result = execute_plan(db, right, params, tx)?;
+            let right_duplicate_names =
+                duplicate_column_names(&left_result.columns, &right_result.columns);
+            let right_prefix = right_alias
+                .clone()
+                .unwrap_or_else(|| right_table_name(right));
+            let right_columns = right_result
+                .columns
+                .iter()
+                .map(|column| {
+                    if right_duplicate_names.contains(column) {
+                        format!("{right_prefix}.{column}")
+                    } else {
+                        column.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut columns = left_result.columns.clone();
+            columns.extend(right_columns);
+
+            let mut rows = Vec::new();
+            for left_row in &left_result.rows {
+                let mut matched = false;
+                for right_row in &right_result.rows {
+                    let combined = concatenate_rows(left_row, right_row);
+                    if query_result_row_matches(&combined, &columns, condition, params)? {
+                        matched = true;
+                        rows.push(combined);
+                    }
+                }
+
+                if !matched && matches!(join_type, contextdb_planner::JoinType::Left) {
+                    let mut combined = left_row.clone();
+                    combined.extend(std::iter::repeat_n(Value::Null, right_result.columns.len()));
+                    rows.push(combined);
+                }
+            }
+
+            let output_columns = qualify_join_columns(
+                &columns,
+                &left_result.columns,
+                &right_result.columns,
+                left_alias,
+                &right_prefix,
+            );
+
+            Ok(QueryResult {
+                columns: output_columns,
+                rows,
+                rows_affected: 0,
+            })
+        }
+        PhysicalPlan::CreateIndex(_) => Ok(QueryResult::empty_with_affected(0)),
         PhysicalPlan::Pipeline(plans) => {
             let mut last = QueryResult::empty();
             for p in plans {
@@ -329,26 +428,75 @@ fn eval_project_expr(
     params: &HashMap<String, Value>,
 ) -> Result<Value> {
     match expr {
-        Expr::Column(c) => {
-            let idx = input_columns
-                .iter()
-                .position(|name| name == &c.column)
-                .ok_or_else(|| {
-                    Error::PlanError(format!("project column not found: {}", c.column))
-                })?;
-            Ok(row.get(idx).cloned().unwrap_or(Value::Null))
-        }
+        Expr::Column(c) => lookup_query_result_column(row, input_columns, c),
         Expr::Literal(lit) => resolve_expr(&Expr::Literal(lit.clone()), params),
         Expr::Parameter(name) => params
             .get(name)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", name))),
+        Expr::BinaryOp { left, op, right } => {
+            let left = eval_query_result_expr(left, row, input_columns, params)?;
+            let right = eval_query_result_expr(right, row, input_columns, params)?;
+            eval_binary_op(op, &left, &right)
+        }
+        Expr::UnaryOp { op, operand } => {
+            let value = eval_query_result_expr(operand, row, input_columns, params)?;
+            match op {
+                UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
+                UnaryOp::Neg => match value {
+                    Value::Int64(v) => Ok(Value::Int64(-v)),
+                    Value::Float64(v) => Ok(Value::Float64(-v)),
+                    _ => Err(Error::PlanError(
+                        "cannot negate non-numeric value".to_string(),
+                    )),
+                },
+            }
+        }
         Expr::FunctionCall { name, args } => {
             let values = args
                 .iter()
                 .map(|arg| eval_query_result_expr(arg, row, input_columns, params))
                 .collect::<Result<Vec<_>>>()?;
             eval_function(name, &values)
+        }
+        Expr::IsNull { expr, negated } => {
+            let is_null = eval_query_result_expr(expr, row, input_columns, params)? == Value::Null;
+            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = eval_query_result_expr(expr, row, input_columns, params)?;
+            let matched = list.iter().try_fold(false, |found, item| {
+                if found {
+                    Ok(true)
+                } else {
+                    let candidate = eval_query_result_expr(item, row, input_columns, params)?;
+                    Ok(
+                        matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
+                            || (needle != Value::Null
+                                && candidate != Value::Null
+                                && needle == candidate),
+                    )
+                }
+            })?;
+            Ok(Value::Bool(if *negated { !matched } else { matched }))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let matches = match (
+                eval_query_result_expr(expr, row, input_columns, params)?,
+                eval_query_result_expr(pattern, row, input_columns, params)?,
+            ) {
+                (Value::Text(value), Value::Text(pattern)) => like_matches(&value, &pattern),
+                _ => false,
+            };
+            Ok(Value::Bool(if *negated { !matches } else { matches }))
         }
         _ => resolve_expr(expr, params),
     }
@@ -361,15 +509,7 @@ fn eval_query_result_expr(
     params: &HashMap<String, Value>,
 ) -> Result<Value> {
     match expr {
-        Expr::Column(c) => {
-            let idx = input_columns
-                .iter()
-                .position(|name| name == &c.column)
-                .ok_or_else(|| {
-                    Error::PlanError(format!("project column not found: {}", c.column))
-                })?;
-            Ok(row.get(idx).cloned().unwrap_or(Value::Null))
-        }
+        Expr::Column(c) => lookup_query_result_column(row, input_columns, c),
         Expr::Literal(lit) => resolve_expr(&Expr::Literal(lit.clone()), params),
         Expr::Parameter(name) => params
             .get(name)
@@ -508,18 +648,24 @@ fn materialize_rows(
     rows: Vec<VersionedRow>,
     filter: Option<&Expr>,
     params: &HashMap<String, Value>,
+    schema_columns: Option<&[String]>,
 ) -> Result<QueryResult> {
-    let mut keys = BTreeSet::new();
     let filtered: Vec<VersionedRow> = rows
         .into_iter()
         .filter(|r| filter.is_none_or(|f| row_matches(r, f, params).unwrap_or(false)))
         .collect();
 
-    for r in &filtered {
-        for k in r.values.keys() {
-            keys.insert(k.clone());
+    let keys = if let Some(schema_columns) = schema_columns {
+        schema_columns.to_vec()
+    } else {
+        let mut keys = BTreeSet::new();
+        for r in &filtered {
+            for k in r.values.keys() {
+                keys.insert(k.clone());
+            }
         }
-    }
+        keys.into_iter().collect::<Vec<_>>()
+    };
 
     let mut columns = vec!["row_id".to_string()];
     columns.extend(keys.iter().cloned());
@@ -1028,31 +1174,224 @@ fn query_result_row_matches(
     expr: &Expr,
     params: &HashMap<String, Value>,
 ) -> Result<bool> {
-    let versioned = query_result_row_to_versioned_row(row, columns);
-    row_matches(&versioned, expr, params)
+    Ok(eval_query_result_bool_expr(row, columns, expr, params)?.unwrap_or(false))
 }
 
-fn query_result_row_to_versioned_row(row: &[Value], columns: &[String]) -> VersionedRow {
-    let mut row_id = 0u64;
-    let mut values = HashMap::new();
+fn eval_query_result_bool_expr(
+    row: &[Value],
+    columns: &[String],
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+) -> Result<Option<bool>> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
+                let left = eval_query_result_expr(left, row, columns, params)?;
+                let right = eval_query_result_expr(right, row, columns, params)?;
+                if left == Value::Null || right == Value::Null {
+                    return Ok(None);
+                }
 
-    for (idx, column) in columns.iter().enumerate() {
-        let value = row.get(idx).cloned().unwrap_or(Value::Null);
-        if column == "row_id" {
-            if let Value::Int64(id) = value {
-                row_id = id as u64;
+                let result = match op {
+                    BinOp::Eq => {
+                        compare_values(&left, &right) == Some(Ordering::Equal) || left == right
+                    }
+                    BinOp::Neq => {
+                        !(compare_values(&left, &right) == Some(Ordering::Equal) || left == right)
+                    }
+                    BinOp::Lt => compare_values(&left, &right) == Some(Ordering::Less),
+                    BinOp::Lte => matches!(
+                        compare_values(&left, &right),
+                        Some(Ordering::Less | Ordering::Equal)
+                    ),
+                    BinOp::Gt => compare_values(&left, &right) == Some(Ordering::Greater),
+                    BinOp::Gte => matches!(
+                        compare_values(&left, &right),
+                        Some(Ordering::Greater | Ordering::Equal)
+                    ),
+                    BinOp::And | BinOp::Or => unreachable!(),
+                };
+                Ok(Some(result))
             }
-        } else {
-            values.insert(column.clone(), value);
+            BinOp::And => {
+                let left = eval_query_result_bool_expr(row, columns, left, params)?;
+                if left == Some(false) {
+                    return Ok(Some(false));
+                }
+                let right = eval_query_result_bool_expr(row, columns, right, params)?;
+                Ok(match (left, right) {
+                    (Some(true), Some(true)) => Some(true),
+                    (Some(true), other) => other,
+                    (None, Some(false)) => Some(false),
+                    (None, Some(true)) | (None, None) => None,
+                    (Some(false), _) => Some(false),
+                })
+            }
+            BinOp::Or => {
+                let left = eval_query_result_bool_expr(row, columns, left, params)?;
+                if left == Some(true) {
+                    return Ok(Some(true));
+                }
+                let right = eval_query_result_bool_expr(row, columns, right, params)?;
+                Ok(match (left, right) {
+                    (Some(false), Some(false)) => Some(false),
+                    (Some(false), other) => other,
+                    (None, Some(true)) => Some(true),
+                    (None, Some(false)) | (None, None) => None,
+                    (Some(true), _) => Some(true),
+                })
+            }
+        },
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            operand,
+        } => Ok(eval_query_result_bool_expr(row, columns, operand, params)?.map(|value| !value)),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = eval_query_result_expr(expr, row, columns, params)?;
+            if needle == Value::Null {
+                return Ok(None);
+            }
+
+            let matched = list.iter().try_fold(false, |found, item| {
+                if found {
+                    Ok(true)
+                } else {
+                    let candidate = eval_query_result_expr(item, row, columns, params)?;
+                    Ok(
+                        matches!(compare_values(&needle, &candidate), Some(Ordering::Equal))
+                            || (candidate != Value::Null && needle == candidate),
+                    )
+                }
+            })?;
+            Ok(Some(if *negated { !matched } else { matched }))
         }
+        Expr::InSubquery { .. } => Err(Error::PlanError(
+            "IN (subquery) must be resolved before execution".to_string(),
+        )),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let left = eval_query_result_expr(expr, row, columns, params)?;
+            let right = eval_query_result_expr(pattern, row, columns, params)?;
+            let matched = match (left, right) {
+                (Value::Text(value), Value::Text(pattern)) => like_matches(&value, &pattern),
+                _ => false,
+            };
+            Ok(Some(if *negated { !matched } else { matched }))
+        }
+        Expr::IsNull { expr, negated } => {
+            let is_null = eval_query_result_expr(expr, row, columns, params)? == Value::Null;
+            Ok(Some(if *negated { !is_null } else { is_null }))
+        }
+        Expr::FunctionCall { .. } => match eval_query_result_expr(expr, row, columns, params)? {
+            Value::Bool(value) => Ok(Some(value)),
+            Value::Null => Ok(None),
+            _ => Err(Error::PlanError(format!(
+                "unsupported WHERE expression: {:?}",
+                expr
+            ))),
+        },
+        _ => Err(Error::PlanError(format!(
+            "unsupported WHERE expression: {:?}",
+            expr
+        ))),
+    }
+}
+
+fn lookup_query_result_column(
+    row: &[Value],
+    input_columns: &[String],
+    column_ref: &ColumnRef,
+) -> Result<Value> {
+    if let Some(table) = &column_ref.table {
+        let qualified = format!("{table}.{}", column_ref.column);
+        let idx = input_columns
+            .iter()
+            .position(|name| name == &qualified || name == &column_ref.column)
+            .ok_or_else(|| Error::PlanError(format!("project column not found: {}", qualified)))?;
+        return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
     }
 
-    VersionedRow {
-        row_id,
-        values,
-        created_tx: 0,
-        deleted_tx: None,
-        lsn: 0,
+    let idx = input_columns
+        .iter()
+        .position(|name| {
+            name == &column_ref.column
+                || name.rsplit('.').next() == Some(column_ref.column.as_str())
+        })
+        .ok_or_else(|| {
+            Error::PlanError(format!("project column not found: {}", column_ref.column))
+        })?;
+    Ok(row.get(idx).cloned().unwrap_or(Value::Null))
+}
+
+fn concatenate_rows(left: &[Value], right: &[Value]) -> Vec<Value> {
+    let mut combined = Vec::with_capacity(left.len() + right.len());
+    combined.extend_from_slice(left);
+    combined.extend_from_slice(right);
+    combined
+}
+
+fn duplicate_column_names(left: &[String], right: &[String]) -> BTreeSet<String> {
+    let left_names = left
+        .iter()
+        .map(|column| column.rsplit('.').next().unwrap_or(column.as_str()))
+        .collect::<BTreeSet<_>>();
+    right
+        .iter()
+        .filter_map(|column| {
+            let bare = column.rsplit('.').next().unwrap_or(column.as_str());
+            left_names.contains(bare).then(|| bare.to_string())
+        })
+        .collect()
+}
+
+fn qualify_join_columns(
+    columns: &[String],
+    left_columns: &[String],
+    right_columns: &[String],
+    left_alias: &Option<String>,
+    right_prefix: &str,
+) -> Vec<String> {
+    let left_prefix = left_alias.as_deref();
+    columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            if idx < left_columns.len() {
+                if let Some(prefix) = left_prefix {
+                    format!(
+                        "{prefix}.{}",
+                        left_columns[idx].rsplit('.').next().unwrap_or(column)
+                    )
+                } else {
+                    left_columns[idx].clone()
+                }
+            } else {
+                let right_idx = idx - left_columns.len();
+                let bare = right_columns[right_idx]
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(right_columns[right_idx].as_str());
+                if column == bare {
+                    format!("{right_prefix}.{bare}")
+                } else {
+                    column.clone()
+                }
+            }
+        })
+        .collect()
+}
+
+fn right_table_name(plan: &PhysicalPlan) -> String {
+    match plan {
+        PhysicalPlan::Scan { table, alias, .. } => alias.clone().unwrap_or_else(|| table.clone()),
+        _ => "right".to_string(),
     }
 }
 

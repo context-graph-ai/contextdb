@@ -1,8 +1,10 @@
 use crate::plan::*;
 use contextdb_core::{Direction, Error, PropagationRule, Result};
 use contextdb_parser::ast::{
-    AstPropagationRule, Cte, Expr, FromItem, SelectStatement, SortDirection, Statement,
+    AstPropagationRule, BinOp, Cte, Expr, FromItem, MatchClause, SelectBody, SelectStatement,
+    SortDirection, Statement,
 };
+use std::collections::HashMap;
 
 const DEFAULT_MATCH_DEPTH: u32 = 5;
 const ENGINE_MAX_BFS_DEPTH: u32 = 10;
@@ -118,37 +120,27 @@ fn extract_propagation_rules(
 }
 
 fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
-    let mut pipeline = Vec::new();
+    let mut cte_env = HashMap::new();
 
     for cte in &sel.ctes {
         match cte {
             Cte::MatchCte { name, match_clause } => {
-                let bfs = graph_bfs_from_match(match_clause)?;
-                pipeline.push(PhysicalPlan::MaterializeCte {
-                    name: name.clone(),
-                    input: Box::new(bfs),
-                });
+                cte_env.insert(name.clone(), graph_bfs_from_match(match_clause)?);
             }
             Cte::SqlCte { name, query } => {
-                let cte_input = if let Some(from) = query
-                    .from
-                    .iter()
-                    .find(|f| matches!(f, FromItem::GraphTable { .. }))
-                {
-                    graph_plan_from_from_item(from)?
-                } else {
-                    PhysicalPlan::CteRef { name: name.clone() }
-                };
-                pipeline.push(PhysicalPlan::MaterializeCte {
-                    name: name.clone(),
-                    input: Box::new(cte_input),
-                });
+                cte_env.insert(name.clone(), plan_select_body(query, &cte_env)?);
             }
         }
     }
 
-    let graph_from = sel
-        .body
+    plan_select_body(&sel.body, &cte_env)
+}
+
+fn plan_select_body(
+    body: &SelectBody,
+    cte_env: &HashMap<String, PhysicalPlan>,
+) -> Result<PhysicalPlan> {
+    let graph_from = body
         .from
         .iter()
         .find(|f| matches!(f, FromItem::GraphTable { .. }));
@@ -156,35 +148,84 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     let mut current = if let Some(from_item) = graph_from {
         graph_plan_from_from_item(from_item)?
     } else {
-        let from_table = sel
-            .body
-            .from
-            .iter()
-            .find_map(|item| match item {
-                FromItem::Table { name, .. } => Some(name.clone()),
-                FromItem::GraphTable { .. } => None,
-            })
-            .unwrap_or_else(|| "dual".to_string());
+        let from_item = body.from.iter().find_map(|item| match item {
+            FromItem::Table { name, alias } => Some((name.clone(), alias.clone())),
+            FromItem::GraphTable { .. } => None,
+        });
 
-        PhysicalPlan::Scan {
-            table: from_table,
-            filter: sel.body.where_clause.clone(),
+        match from_item {
+            Some((from_table, from_alias)) => {
+                if let Some(cte_plan) = cte_env.get(&from_table) {
+                    cte_plan.clone()
+                } else {
+                    PhysicalPlan::Scan {
+                        table: from_table,
+                        alias: from_alias.clone(),
+                        filter: if body.joins.is_empty() {
+                            body.where_clause.clone()
+                        } else {
+                            None
+                        },
+                    }
+                }
+            }
+            None => PhysicalPlan::Scan {
+                table: "dual".to_string(),
+                alias: None,
+                filter: None,
+            },
         }
     };
 
-    let uses_vector_search = sel
-        .body
+    if !body.joins.is_empty() {
+        let left_alias = body.from.iter().find_map(|item| match item {
+            FromItem::Table { alias, name } => alias.clone().or_else(|| Some(name.clone())),
+            FromItem::GraphTable { .. } => None,
+        });
+
+        for join in &body.joins {
+            let right = if let Some(cte_plan) = cte_env.get(&join.table) {
+                cte_plan.clone()
+            } else {
+                PhysicalPlan::Scan {
+                    table: join.table.clone(),
+                    alias: join.alias.clone(),
+                    filter: None,
+                }
+            };
+
+            current = PhysicalPlan::Join {
+                left: Box::new(current),
+                right: Box::new(right),
+                condition: join.on.clone(),
+                join_type: match join.join_type {
+                    contextdb_parser::ast::JoinType::Inner => JoinType::Inner,
+                    contextdb_parser::ast::JoinType::Left => JoinType::Left,
+                },
+                left_alias: left_alias.clone(),
+                right_alias: join.alias.clone().or_else(|| Some(join.table.clone())),
+            };
+        }
+
+        if let Some(where_clause) = &body.where_clause {
+            current = PhysicalPlan::Filter {
+                input: Box::new(current),
+                predicate: where_clause.clone(),
+            };
+        }
+    }
+
+    let uses_vector_search = body
         .order_by
         .first()
         .is_some_and(|order| matches!(order.direction, SortDirection::CosineDistance));
 
-    if let Some(order) = sel.body.order_by.first()
+    if let Some(order) = body.order_by.first()
         && matches!(order.direction, SortDirection::CosineDistance)
     {
-        let k = sel.body.limit.ok_or(Error::UnboundedVectorSearch)?;
+        let k = body.limit.ok_or(Error::UnboundedVectorSearch)?;
         current = PhysicalPlan::VectorSearch {
-            table: sel
-                .body
+            table: body
                 .from
                 .iter()
                 .find_map(|item| match item {
@@ -199,11 +240,10 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
         };
     }
 
-    if !sel.body.order_by.is_empty() && !uses_vector_search {
+    if !body.order_by.is_empty() && !uses_vector_search {
         current = PhysicalPlan::Sort {
             input: Box::new(current),
-            keys: sel
-                .body
+            keys: body
                 .order_by
                 .iter()
                 .map(|item| SortKey {
@@ -215,7 +255,7 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     }
 
     let is_select_star = matches!(
-        sel.body.columns.as_slice(),
+        body.columns.as_slice(),
         [contextdb_parser::ast::SelectColumn {
             expr: Expr::Column(contextdb_parser::ast::ColumnRef { table: None, column }),
             alias: None
@@ -224,8 +264,7 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     if !is_select_star {
         current = PhysicalPlan::Project {
             input: Box::new(current),
-            columns: sel
-                .body
+            columns: body
                 .columns
                 .iter()
                 .map(|column| ProjectColumn {
@@ -236,13 +275,13 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
         };
     }
 
-    if sel.body.distinct {
+    if body.distinct {
         current = PhysicalPlan::Distinct {
             input: Box::new(current),
         };
     }
 
-    if let Some(limit) = sel.body.limit
+    if let Some(limit) = body.limit
         && !uses_vector_search
     {
         current = PhysicalPlan::Limit {
@@ -251,22 +290,7 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
         };
     }
 
-    if sel.ctes.iter().any(|c| matches!(c, Cte::MatchCte { .. }))
-        && matches!(
-            current,
-            PhysicalPlan::VectorSearch { .. } | PhysicalPlan::Scan { .. }
-        )
-    {
-        pipeline.push(current);
-        return Ok(PhysicalPlan::Pipeline(pipeline));
-    }
-
-    if pipeline.is_empty() {
-        Ok(current)
-    } else {
-        pipeline.push(current);
-        Ok(PhysicalPlan::Pipeline(pipeline))
-    }
+    Ok(current)
 }
 
 fn graph_plan_from_from_item(from_item: &FromItem) -> Result<PhysicalPlan> {
@@ -294,6 +318,7 @@ fn graph_plan_from_from_item(from_item: &FromItem) -> Result<PhysicalPlan> {
         }
         FromItem::Table { name, .. } => Ok(PhysicalPlan::Scan {
             table: name.clone(),
+            alias: None,
             filter: None,
         }),
     }
@@ -315,10 +340,7 @@ fn graph_bfs_from_match(match_clause: &contextdb_parser::ast::MatchClause) -> Re
     }
 
     Ok(PhysicalPlan::GraphBfs {
-        start_expr: Expr::Column(contextdb_parser::ast::ColumnRef {
-            table: None,
-            column: match_clause.pattern.start.alias.clone(),
-        }),
+        start_expr: extract_graph_start_expr(match_clause)?,
         edge_types: step.edge_type.clone().map(|t| vec![t]).unwrap_or_default(),
         direction: match step.direction {
             contextdb_parser::ast::EdgeDirection::Outgoing => Direction::Outgoing,
@@ -329,4 +351,50 @@ fn graph_bfs_from_match(match_clause: &contextdb_parser::ast::MatchClause) -> Re
         max_depth,
         filter: match_clause.where_clause.clone(),
     })
+}
+
+fn extract_graph_start_expr(match_clause: &MatchClause) -> Result<Expr> {
+    let start_alias = &match_clause.pattern.start.alias;
+    if let Some(where_clause) = &match_clause.where_clause
+        && let Some(expr) = find_graph_start_expr(where_clause, start_alias)
+    {
+        return Ok(expr);
+    }
+
+    Ok(Expr::Column(contextdb_parser::ast::ColumnRef {
+        table: None,
+        column: start_alias.clone(),
+    }))
+}
+
+fn find_graph_start_expr(expr: &Expr, start_alias: &str) -> Option<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            if is_graph_start_id_ref(left, start_alias) {
+                Some((**right).clone())
+            } else if is_graph_start_id_ref(right, start_alias) {
+                Some((**left).clone())
+            } else {
+                None
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => find_graph_start_expr(left, start_alias)
+            .or_else(|| find_graph_start_expr(right, start_alias)),
+        Expr::UnaryOp { operand, .. } => find_graph_start_expr(operand, start_alias),
+        _ => None,
+    }
+}
+
+fn is_graph_start_id_ref(expr: &Expr, start_alias: &str) -> bool {
+    matches!(
+        expr,
+        Expr::Column(contextdb_parser::ast::ColumnRef {
+            table: Some(table),
+            column
+        }) if table == start_alias && column == "id"
+    )
 }
