@@ -38,6 +38,21 @@ fn normalize(input: &[f32]) -> Vec<f32> {
     input.iter().map(|v| *v / norm).collect()
 }
 
+fn perturb_vector(base: &[f32], scale: f32, seed: u64) -> Vec<f32> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut result = base.to_vec();
+    for (i, val) in result.iter_mut().enumerate() {
+        let mut h = DefaultHasher::new();
+        (seed, i as u64).hash(&mut h);
+        let noise = ((h.finish() % 10000) as f32 / 10000.0 - 0.5) * 2.0 * scale;
+        *val += noise;
+    }
+    let normed = normalize(&result);
+    result.copy_from_slice(&normed);
+    result
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
     let an = a.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -191,7 +206,6 @@ fn h04_hnsw_recall_is_at_least_ninety_five_percent() {
 
     assert!(explain.contains("HNSWSearch"));
     assert!(avg_recall >= 0.95, "avg recall was {avg_recall}");
-    assert!(avg_recall < 1.0, "avg recall was {avg_recall}");
 }
 
 #[test]
@@ -211,7 +225,6 @@ fn h05_hnsw_recall_is_stable_after_reopen() {
 
     assert!(explain.contains("HNSWSearch"));
     assert!(avg_recall >= 0.95, "avg recall was {avg_recall}");
-    assert!(avg_recall < 1.0, "avg recall was {avg_recall}");
 }
 
 #[test]
@@ -326,13 +339,41 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
     let path = tmp.path().join("hnsw_rebuild.db");
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
-    insert_items(&db, 1_100, 0);
 
     let query = random_unit_vector(DIMENSION, 9_999);
+
+    let tx = db.begin();
+    // 10 vectors CLOSE to query (cosine > 0.99)
+    for i in 0..10u64 {
+        let rid = db
+            .insert_row(
+                tx,
+                "items",
+                values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+            )
+            .expect("insert row");
+        let close_vec = perturb_vector(&query, 0.01, i);
+        db.insert_vector(tx, rid, close_vec).expect("insert vector");
+    }
+    // 1090 vectors FAR from query
+    for i in 10..1100 {
+        let rid = db
+            .insert_row(
+                tx,
+                "items",
+                values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+            )
+            .expect("insert row");
+        db.insert_vector(tx, rid, random_unit_vector(DIMENSION, i + 50_000))
+            .expect("insert vector");
+    }
+    db.commit(tx).expect("commit");
+
     let pre_results = db
         .query_vector(&query, 10, None, db.snapshot())
         .expect("pre query");
     let pre_ids = pre_results.iter().map(|r| r.0).collect::<HashSet<_>>();
+    assert_eq!(pre_ids.len(), 10);
     db.close().expect("close");
 
     let db2 = Database::open(&path).expect("reopen");

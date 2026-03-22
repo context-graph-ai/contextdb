@@ -67,7 +67,7 @@ impl HnswIndex {
             });
         }
 
-        let knbn = k.saturating_mul(3).max(1);
+        let knbn = k.saturating_mul(10).max(1);
         let ef = self.ef_search.max(knbn);
         let neighbors = self.hnsw.search(query, knbn, ef);
         let id_to_row = self.id_to_row.read();
