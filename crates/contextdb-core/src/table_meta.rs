@@ -50,6 +50,10 @@ pub struct ColumnDef {
     pub column_type: ColumnType,
     pub nullable: bool,
     pub primary_key: bool,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

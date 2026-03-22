@@ -26,6 +26,8 @@ pub(crate) fn execute_plan(
                         column_type: map_column_type(&c.data_type),
                         nullable: c.nullable,
                         primary_key: c.primary_key,
+                        unique: c.unique,
+                        default: c.default.as_ref().map(|expr| format!("{expr:?}")),
                     })
                     .collect(),
                 immutable: p.immutable,

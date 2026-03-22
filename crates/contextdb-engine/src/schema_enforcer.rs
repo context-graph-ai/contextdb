@@ -17,6 +17,11 @@ pub fn validate_dml(
             Err(Error::ImmutableTable(p.table.clone()))
         }
         PhysicalPlan::Insert(p) => {
+            let table_meta = db
+                .table_meta(&p.table)
+                .ok_or_else(|| Error::NotFound(format!("table metadata not found: {}", p.table)))?;
+            let existing_rows = db.scan(&p.table, db.snapshot())?;
+
             if p.on_conflict.is_none()
                 && let Some(id_idx) = p.columns.iter().position(|c| c == "id")
             {
@@ -33,6 +38,62 @@ pub fn validate_dml(
                                 column: "id".to_string(),
                             });
                         }
+                    }
+                }
+            }
+
+            for row in &p.values {
+                for column in table_meta
+                    .columns
+                    .iter()
+                    .filter(|column| !column.nullable && !column.primary_key)
+                {
+                    if let Some(index) = p.columns.iter().position(|name| name == &column.name) {
+                        let value = row
+                            .get(index)
+                            .ok_or_else(|| {
+                                Error::PlanError("column/value count mismatch".to_string())
+                            })
+                            .and_then(|expr| resolve_expr(expr, params))?;
+                        if value == Value::Null {
+                            return Err(Error::Other(format!(
+                                "NOT NULL constraint violated: {}.{}",
+                                p.table, column.name
+                            )));
+                        }
+                    } else if column.default.is_none() {
+                        return Err(Error::Other(format!(
+                            "NOT NULL constraint violated: {}.{}",
+                            p.table, column.name
+                        )));
+                    }
+                }
+            }
+
+            for row in &p.values {
+                for column in table_meta
+                    .columns
+                    .iter()
+                    .filter(|column| column.unique && !column.primary_key)
+                {
+                    let Some(index) = p.columns.iter().position(|name| name == &column.name) else {
+                        continue;
+                    };
+                    let value = row
+                        .get(index)
+                        .ok_or_else(|| Error::PlanError("column/value count mismatch".to_string()))
+                        .and_then(|expr| resolve_expr(expr, params))?;
+                    if value == Value::Null {
+                        continue;
+                    }
+                    if existing_rows
+                        .iter()
+                        .any(|existing| existing.values.get(&column.name) == Some(&value))
+                    {
+                        return Err(Error::UniqueViolation {
+                            table: p.table.clone(),
+                            column: column.name.clone(),
+                        });
                     }
                 }
             }
