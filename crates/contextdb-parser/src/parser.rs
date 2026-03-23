@@ -41,6 +41,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::commit_stmt => Statement::Commit,
         Rule::rollback_stmt => Statement::Rollback,
         Rule::create_table_stmt => Statement::CreateTable(build_create_table(inner)?),
+        Rule::alter_table_stmt => Statement::AlterTable(build_alter_table(inner)?),
         Rule::drop_table_stmt => Statement::DropTable(build_drop_table(inner)?),
         Rule::create_index_stmt => Statement::CreateIndex(build_create_index(inner)?),
         Rule::insert_stmt => Statement::Insert(build_insert(inner)?),
@@ -1020,6 +1021,69 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         dag_edge_types,
         propagation_rules,
     })
+}
+
+fn build_alter_table(pair: Pair<'_, Rule>) -> Result<AlterTable> {
+    let mut table = None;
+    let mut action = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if table.is_none() => table = Some(parse_identifier(p.as_str())),
+            Rule::alter_action => action = Some(build_alter_action(p)?),
+            _ => {}
+        }
+    }
+
+    Ok(AlterTable {
+        table: table.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
+        action: action
+            .ok_or_else(|| Error::ParseError("missing ALTER TABLE action".to_string()))?,
+    })
+}
+
+fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
+    let action = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("missing ALTER TABLE action".to_string()))?;
+
+    match action.as_rule() {
+        Rule::add_column_action => {
+            let column = action
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::column_def)
+                .ok_or_else(|| {
+                    Error::ParseError("ADD COLUMN missing column definition".to_string())
+                })
+                .and_then(build_column_def)?;
+            Ok(AlterAction::AddColumn(column))
+        }
+        Rule::drop_column_action => {
+            let column = action
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::identifier)
+                .map(|part| parse_identifier(part.as_str()))
+                .ok_or_else(|| Error::ParseError("DROP COLUMN missing column name".to_string()))?;
+            Ok(AlterAction::DropColumn(column))
+        }
+        Rule::rename_column_action => {
+            let mut identifiers = action
+                .into_inner()
+                .filter(|part| part.as_rule() == Rule::identifier)
+                .map(|part| parse_identifier(part.as_str()));
+            let from = identifiers.next().ok_or_else(|| {
+                Error::ParseError("RENAME COLUMN missing source name".to_string())
+            })?;
+            let to = identifiers.next().ok_or_else(|| {
+                Error::ParseError("RENAME COLUMN missing target name".to_string())
+            })?;
+            Ok(AlterAction::RenameColumn { from, to })
+        }
+        _ => Err(Error::ParseError(
+            "unsupported ALTER TABLE action".to_string(),
+        )),
+    }
 }
 
 fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {

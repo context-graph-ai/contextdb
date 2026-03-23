@@ -20,6 +20,10 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             dag_edge_types: ct.dag_edge_types.clone(),
             propagation_rules: extract_propagation_rules(ct)?,
         })),
+        Statement::AlterTable(at) => Ok(PhysicalPlan::AlterTable(AlterTablePlan {
+            table: at.table.clone(),
+            action: at.action.clone(),
+        })),
         Statement::DropTable(dt) => Ok(PhysicalPlan::DropTable(dt.name.clone())),
         Statement::CreateIndex(ci) => Ok(PhysicalPlan::CreateIndex(CreateIndexPlan {
             name: ci.name.clone(),

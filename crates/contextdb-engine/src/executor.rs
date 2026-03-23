@@ -59,6 +59,7 @@ pub(crate) fn execute_plan(
             db.log_drop_table_ddl(name, lsn);
             Ok(QueryResult::empty_with_affected(0))
         }
+        PhysicalPlan::AlterTable(_) => Ok(QueryResult::empty_with_affected(0)),
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
         PhysicalPlan::Delete(p) => exec_delete(db, p, params, tx),
         PhysicalPlan::Update(p) => exec_update(db, p, params, tx),

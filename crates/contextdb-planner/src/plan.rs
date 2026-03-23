@@ -1,9 +1,12 @@
 use contextdb_core::{Direction, PropagationRule};
-use contextdb_parser::ast::{ColumnDef, Expr, OnConflict, SortDirection, StateMachineDef};
+use contextdb_parser::ast::{
+    AlterAction, ColumnDef, Expr, OnConflict, SortDirection, StateMachineDef,
+};
 
 #[derive(Debug, Clone)]
 pub enum PhysicalPlan {
     CreateTable(CreateTablePlan),
+    AlterTable(AlterTablePlan),
     DropTable(String),
     CreateIndex(CreateIndexPlan),
     Insert(InsertPlan),
@@ -107,6 +110,7 @@ impl PhysicalPlan {
                 format!("HNSWSearch(table={}, column={}, k={})", table, column, k)
             }
             PhysicalPlan::Scan { table, .. } => format!("Scan(table={})", table),
+            PhysicalPlan::AlterTable(p) => format!("AlterTable(table={})", p.table),
             PhysicalPlan::Insert(p) => format!("Insert(table={})", p.table),
             PhysicalPlan::Delete(p) => format!("Delete(table={})", p.table),
             PhysicalPlan::Update(p) => format!("Update(table={})", p.table),
@@ -128,6 +132,12 @@ pub struct CreateTablePlan {
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
     pub propagation_rules: Vec<PropagationRule>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterTablePlan {
+    pub table: String,
+    pub action: AlterAction,
 }
 
 #[derive(Debug, Clone)]

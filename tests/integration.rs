@@ -1,3 +1,5 @@
+#[path = "integration/alter_table_tests.rs"]
+mod alter_table_tests;
 #[path = "integration/anti_tests.rs"]
 mod anti_tests;
 #[path = "integration/boundary_conditions.rs"]

@@ -1,6 +1,7 @@
 #[derive(Debug, Clone)]
 pub enum Statement {
     CreateTable(CreateTable),
+    AlterTable(AlterTable),
     DropTable(DropTable),
     CreateIndex(CreateIndex),
     Insert(Insert),
@@ -236,6 +237,19 @@ pub struct CreateTable {
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
     pub propagation_rules: Vec<AstPropagationRule>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterTable {
+    pub table: String,
+    pub action: AlterAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterAction {
+    AddColumn(ColumnDef),
+    DropColumn(String),
+    RenameColumn { from: String, to: String },
 }
 
 #[derive(Debug, Clone)]
