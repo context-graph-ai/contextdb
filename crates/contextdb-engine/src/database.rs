@@ -349,14 +349,16 @@ impl Database {
 
         let started = Instant::now();
         let result = (|| {
-            let plan = contextdb_planner::plan(stmt)?;
+            // Pre-resolve InSubquery expressions with CTE context before planning
+            let stmt = self.pre_resolve_cte_subqueries(stmt, params, tx)?;
+            let plan = contextdb_planner::plan(&stmt)?;
             validate_dml(&plan, self, params)?;
             let result = match tx {
                 Some(tx) => execute_plan(self, &plan, params, Some(tx)),
                 None => self.execute_autocommit(&plan, params),
             };
             if result.is_ok()
-                && let Statement::CreateTable(ct) = stmt
+                && let Statement::CreateTable(ct) = &stmt
                 && !ct.dag_edge_types.is_empty()
             {
                 self.graph.register_dag_edge_types(&ct.dag_edge_types);
@@ -366,13 +368,43 @@ impl Database {
         let duration = started.elapsed();
         let outcome = query_outcome_from_result(&result);
         self.plugin.post_query(sql, duration, &outcome);
-        result
+        result.map(strip_internal_row_id)
     }
 
     fn ddl_change_for_statement(&self, stmt: &Statement) -> Option<DdlChange> {
         match stmt {
             Statement::CreateTable(ct) => Some(ddl_change_from_create_table(ct)),
             _ => None,
+        }
+    }
+
+    /// Pre-resolve InSubquery expressions within SELECT statements that have CTEs.
+    /// This allows CTE-backed subqueries in WHERE clauses to be evaluated before planning.
+    fn pre_resolve_cte_subqueries(
+        &self,
+        stmt: &Statement,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+    ) -> Result<Statement> {
+        if let Statement::Select(sel) = stmt
+            && !sel.ctes.is_empty()
+            && sel.body.where_clause.is_some()
+        {
+            use crate::executor::resolve_in_subqueries_with_ctes;
+            let resolved_where = sel
+                .body
+                .where_clause
+                .as_ref()
+                .map(|expr| resolve_in_subqueries_with_ctes(self, expr, params, tx, &sel.ctes))
+                .transpose()?;
+            let mut new_body = sel.body.clone();
+            new_body.where_clause = resolved_where;
+            Ok(Statement::Select(contextdb_parser::ast::SelectStatement {
+                ctes: sel.ctes.clone(),
+                body: new_body,
+            }))
+        } else {
+            Ok(stmt.clone())
         }
     }
 
@@ -1580,6 +1612,18 @@ impl Database {
             .find(|v| v.row_id == row_id && v.lsn == lsn)
             .map(|v| v.vector.clone())
     }
+}
+
+fn strip_internal_row_id(mut qr: QueryResult) -> QueryResult {
+    if let Some(pos) = qr.columns.iter().position(|c| c == "row_id") {
+        qr.columns.remove(pos);
+        for row in &mut qr.rows {
+            if pos < row.len() {
+                row.remove(pos);
+            }
+        }
+    }
+    qr
 }
 
 fn query_outcome_from_result(result: &Result<QueryResult>) -> QueryOutcome {

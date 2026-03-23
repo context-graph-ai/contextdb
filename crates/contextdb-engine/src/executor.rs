@@ -1,7 +1,8 @@
 use crate::database::{Database, QueryResult};
 use contextdb_core::*;
 use contextdb_parser::ast::{
-    BinOp, ColumnRef, DataType, Expr, Literal, SelectStatement, SortDirection, Statement, UnaryOp,
+    BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement, SortDirection, Statement,
+    UnaryOp,
 };
 use contextdb_planner::{DeletePlan, InsertPlan, PhysicalPlan, UpdatePlan, plan};
 use roaring::RoaringTreemap;
@@ -140,12 +141,14 @@ pub(crate) fn execute_plan(
             })
         }
         PhysicalPlan::VectorSearch {
+            table,
             query_expr,
             k,
             candidates,
             ..
         }
         | PhysicalPlan::HnswSearch {
+            table,
             query_expr,
             k,
             candidates,
@@ -171,14 +174,52 @@ pub(crate) fn execute_plan(
                 candidate_bitmap.as_ref(),
                 db.snapshot(),
             )?;
-            Ok(QueryResult {
-                columns: vec!["row_id".to_string(), "score".to_string()],
-                rows: res
+
+            // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
+            let snapshot = db.snapshot();
+            let all_rows = db.scan(table, snapshot)?;
+            let schema_columns = db.table_meta(table).map(|meta| {
+                meta.columns
                     .into_iter()
-                    .map(|(rid, score)| {
-                        vec![Value::Int64(rid as i64), Value::Float64(score as f64)]
+                    .map(|column| column.name)
+                    .collect::<Vec<_>>()
+            });
+            let keys = if let Some(ref sc) = schema_columns {
+                sc.clone()
+            } else {
+                let mut ks = BTreeSet::new();
+                for r in &all_rows {
+                    for k in r.values.keys() {
+                        ks.insert(k.clone());
+                    }
+                }
+                ks.into_iter().collect::<Vec<_>>()
+            };
+
+            let row_map: HashMap<u64, &VersionedRow> =
+                all_rows.iter().map(|r| (r.row_id, r)).collect();
+
+            let mut columns = vec!["row_id".to_string()];
+            columns.extend(keys.iter().cloned());
+            columns.push("score".to_string());
+
+            let rows = res
+                .into_iter()
+                .filter_map(|(rid, score)| {
+                    row_map.get(&rid).map(|row| {
+                        let mut out = vec![Value::Int64(rid as i64)];
+                        for k in &keys {
+                            out.push(row.values.get(k).cloned().unwrap_or(Value::Null));
+                        }
+                        out.push(Value::Float64(score as f64));
+                        out
                     })
-                    .collect(),
+                })
+                .collect();
+
+            Ok(QueryResult {
+                columns,
+                rows,
                 rows_affected: 0,
             })
         }
@@ -818,6 +859,21 @@ fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Timestamp(left), Value::Int64(right)) => Some(left.cmp(right)),
         (Value::Int64(left), Value::Timestamp(right)) => Some(left.cmp(right)),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
+        (Value::Uuid(left), Value::Uuid(right)) => Some(left.cmp(right)),
+        (Value::Uuid(u), Value::Text(t)) => {
+            if let Ok(parsed) = t.parse::<uuid::Uuid>() {
+                Some(u.cmp(&parsed))
+            } else {
+                None
+            }
+        }
+        (Value::Text(t), Value::Uuid(u)) => {
+            if let Ok(parsed) = t.parse::<uuid::Uuid>() {
+                Some(parsed.cmp(u))
+            } else {
+                None
+            }
+        }
         (Value::Null, _) | (_, Value::Null) => None,
         _ => None,
     }
@@ -1180,14 +1236,49 @@ fn resolve_in_subqueries(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
 ) -> Result<Expr> {
+    resolve_in_subqueries_with_ctes(db, expr, params, tx, &[])
+}
+
+pub(crate) fn resolve_in_subqueries_with_ctes(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    ctes: &[Cte],
+) -> Result<Expr> {
     match expr {
         Expr::InSubquery {
             expr,
             subquery,
             negated,
         } => {
+            // Detect correlated subqueries: WHERE references to outer tables
+            let mut subquery_tables: std::collections::HashSet<String> = subquery
+                .from
+                .iter()
+                .filter_map(|item| match item {
+                    contextdb_parser::ast::FromItem::Table { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            // CTE names are valid table references within the subquery
+            for cte in ctes {
+                match cte {
+                    Cte::SqlCte { name, .. } | Cte::MatchCte { name, .. } => {
+                        subquery_tables.insert(name.clone());
+                    }
+                }
+            }
+            if let Some(where_clause) = &subquery.where_clause
+                && has_outer_table_ref(where_clause, &subquery_tables)
+            {
+                return Err(Error::Other(
+                    "correlated subqueries are not supported".to_string(),
+                ));
+            }
+
             let query_plan = plan(&Statement::Select(SelectStatement {
-                ctes: Vec::new(),
+                ctes: ctes.to_vec(),
                 body: (**subquery).clone(),
             }))?;
             let result = execute_plan(db, &query_plan, params, tx)?;
@@ -1205,29 +1296,33 @@ fn resolve_in_subqueries(
                 .map(value_to_literal)
                 .collect::<Result<Vec<_>>>()?;
             Ok(Expr::InList {
-                expr: Box::new(resolve_in_subqueries(db, expr, params, tx)?),
+                expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
                 list,
                 negated: *negated,
             })
         }
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(resolve_in_subqueries(db, left, params, tx)?),
+            left: Box::new(resolve_in_subqueries_with_ctes(db, left, params, tx, ctes)?),
             op: *op,
-            right: Box::new(resolve_in_subqueries(db, right, params, tx)?),
+            right: Box::new(resolve_in_subqueries_with_ctes(
+                db, right, params, tx, ctes,
+            )?),
         }),
         Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
             op: *op,
-            operand: Box::new(resolve_in_subqueries(db, operand, params, tx)?),
+            operand: Box::new(resolve_in_subqueries_with_ctes(
+                db, operand, params, tx, ctes,
+            )?),
         }),
         Expr::InList {
             expr,
             list,
             negated,
         } => Ok(Expr::InList {
-            expr: Box::new(resolve_in_subqueries(db, expr, params, tx)?),
+            expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
             list: list
                 .iter()
-                .map(|item| resolve_in_subqueries(db, item, params, tx))
+                .map(|item| resolve_in_subqueries_with_ctes(db, item, params, tx, ctes))
                 .collect::<Result<Vec<_>>>()?,
             negated: *negated,
         }),
@@ -1236,22 +1331,52 @@ fn resolve_in_subqueries(
             pattern,
             negated,
         } => Ok(Expr::Like {
-            expr: Box::new(resolve_in_subqueries(db, expr, params, tx)?),
-            pattern: Box::new(resolve_in_subqueries(db, pattern, params, tx)?),
+            expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
+            pattern: Box::new(resolve_in_subqueries_with_ctes(
+                db, pattern, params, tx, ctes,
+            )?),
             negated: *negated,
         }),
         Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-            expr: Box::new(resolve_in_subqueries(db, expr, params, tx)?),
+            expr: Box::new(resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)?),
             negated: *negated,
         }),
         Expr::FunctionCall { name, args } => Ok(Expr::FunctionCall {
             name: name.clone(),
             args: args
                 .iter()
-                .map(|arg| resolve_in_subqueries(db, arg, params, tx))
+                .map(|arg| resolve_in_subqueries_with_ctes(db, arg, params, tx, ctes))
                 .collect::<Result<Vec<_>>>()?,
         }),
         _ => Ok(expr.clone()),
+    }
+}
+
+fn has_outer_table_ref(expr: &Expr, subquery_tables: &std::collections::HashSet<String>) -> bool {
+    match expr {
+        Expr::Column(ColumnRef {
+            table: Some(table), ..
+        }) => !subquery_tables.contains(table),
+        Expr::BinaryOp { left, right, .. } => {
+            has_outer_table_ref(left, subquery_tables)
+                || has_outer_table_ref(right, subquery_tables)
+        }
+        Expr::UnaryOp { operand, .. } => has_outer_table_ref(operand, subquery_tables),
+        Expr::InList { expr, list, .. } => {
+            has_outer_table_ref(expr, subquery_tables)
+                || list
+                    .iter()
+                    .any(|item| has_outer_table_ref(item, subquery_tables))
+        }
+        Expr::IsNull { expr, .. } => has_outer_table_ref(expr, subquery_tables),
+        Expr::Like { expr, pattern, .. } => {
+            has_outer_table_ref(expr, subquery_tables)
+                || has_outer_table_ref(pattern, subquery_tables)
+        }
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .any(|arg| has_outer_table_ref(arg, subquery_tables)),
+        _ => false,
     }
 }
 
