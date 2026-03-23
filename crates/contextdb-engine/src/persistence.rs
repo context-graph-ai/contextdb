@@ -202,6 +202,34 @@ impl RedbPersistence {
         })
     }
 
+    pub fn rewrite_table_rows(&self, name: &str, rows: &[VersionedRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let table_name = Self::rel_table_name(name);
+                let table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut redb_table = match write_txn.open_table(table_def) {
+                    Ok(table) => table,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                    Err(err) => return Err(Self::storage_error(err)),
+                };
+                for row in rows {
+                    let encoded = Self::encode(row)?;
+                    redb_table
+                        .insert(row.row_id, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
     pub fn load_all_table_meta(&self) -> Result<HashMap<String, TableMeta>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;

@@ -1,8 +1,8 @@
 use crate::database::{Database, QueryResult};
 use contextdb_core::*;
 use contextdb_parser::ast::{
-    BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement, SortDirection, Statement,
-    UnaryOp,
+    AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement, SortDirection,
+    Statement, UnaryOp,
 };
 use contextdb_planner::{DeletePlan, InsertPlan, PhysicalPlan, UpdatePlan, plan};
 use roaring::RoaringTreemap;
@@ -59,7 +59,49 @@ pub(crate) fn execute_plan(
             db.log_drop_table_ddl(name, lsn);
             Ok(QueryResult::empty_with_affected(0))
         }
-        PhysicalPlan::AlterTable(_) => Ok(QueryResult::empty_with_affected(0)),
+        PhysicalPlan::AlterTable(p) => {
+            let store = db.relational_store();
+            match &p.action {
+                AlterAction::AddColumn(col) => {
+                    if col.primary_key {
+                        return Err(Error::Other(
+                            "adding a primary key column via ALTER TABLE is not supported"
+                                .to_string(),
+                        ));
+                    }
+                    let core_col = contextdb_core::ColumnDef {
+                        name: col.name.clone(),
+                        column_type: map_column_type(&col.data_type),
+                        nullable: col.nullable,
+                        primary_key: col.primary_key,
+                        unique: col.unique,
+                        default: col.default.as_ref().map(|expr| format!("{expr:?}")),
+                    };
+                    store
+                        .alter_table_add_column(&p.table, core_col)
+                        .map_err(Error::Other)?;
+                }
+                AlterAction::DropColumn(name) => {
+                    store
+                        .alter_table_drop_column(&p.table, name)
+                        .map_err(Error::Other)?;
+                }
+                AlterAction::RenameColumn { from, to } => {
+                    store
+                        .alter_table_rename_column(&p.table, from, to)
+                        .map_err(Error::Other)?;
+                }
+            }
+            if let Some(table_meta) = db.table_meta(&p.table) {
+                db.persist_table_meta(&p.table, &table_meta)?;
+                if !matches!(p.action, AlterAction::AddColumn(_)) {
+                    db.persist_table_rows(&p.table)?;
+                }
+                let lsn = db.next_lsn_for_ddl();
+                db.log_alter_table_ddl(&p.table, &table_meta, lsn);
+            }
+            Ok(QueryResult::empty_with_affected(0))
+        }
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
         PhysicalPlan::Delete(p) => exec_delete(db, p, params, tx),
         PhysicalPlan::Update(p) => exec_update(db, p, params, tx),

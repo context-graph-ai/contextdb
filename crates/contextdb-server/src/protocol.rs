@@ -108,6 +108,11 @@ pub enum WireDdlChange {
     DropTable {
         name: String,
     },
+    AlterTable {
+        name: String,
+        columns: Vec<(String, String)>,
+        constraints: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +258,15 @@ impl From<DdlChange> for WireDdlChange {
                 constraints,
             },
             DdlChange::DropTable { name } => Self::DropTable { name },
+            DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+            } => Self::AlterTable {
+                name,
+                columns,
+                constraints,
+            },
         }
     }
 }
@@ -270,6 +284,15 @@ impl From<WireDdlChange> for DdlChange {
                 constraints,
             },
             WireDdlChange::DropTable { name } => Self::DropTable { name },
+            WireDdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+            } => Self::AlterTable {
+                name,
+                columns,
+                constraints,
+            },
         }
     }
 }

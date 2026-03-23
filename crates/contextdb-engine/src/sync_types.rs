@@ -46,6 +46,7 @@ impl ChangeSet {
                 .filter(|d| match d {
                     DdlChange::CreateTable { name, .. } => include_dir(name),
                     DdlChange::DropTable { name } => include_dir(name),
+                    DdlChange::AlterTable { name, .. } => include_dir(name),
                 })
                 .cloned()
                 .collect(),
@@ -87,6 +88,11 @@ pub enum DdlChange {
     },
     DropTable {
         name: String,
+    },
+    AlterTable {
+        name: String,
+        columns: Vec<(String, String)>,
+        constraints: Vec<String>,
     },
 }
 

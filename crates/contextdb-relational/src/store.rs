@@ -79,6 +79,94 @@ impl RelationalStore {
         self.table_meta.write().remove(name);
     }
 
+    pub fn alter_table_add_column(
+        &self,
+        table: &str,
+        col: contextdb_core::ColumnDef,
+    ) -> Result<(), String> {
+        let mut meta = self.table_meta.write();
+        let m = meta
+            .get_mut(table)
+            .ok_or_else(|| format!("table '{}' not found", table))?;
+        if m.columns.iter().any(|c| c.name == col.name) {
+            return Err(format!(
+                "column '{}' already exists in table '{}'",
+                col.name, table
+            ));
+        }
+        m.columns.push(col);
+        Ok(())
+    }
+
+    pub fn alter_table_drop_column(&self, table: &str, column: &str) -> Result<(), String> {
+        {
+            let mut meta = self.table_meta.write();
+            let m = meta
+                .get_mut(table)
+                .ok_or_else(|| format!("table '{}' not found", table))?;
+            let pos = m
+                .columns
+                .iter()
+                .position(|c| c.name == column)
+                .ok_or_else(|| {
+                    format!("column '{}' does not exist in table '{}'", column, table)
+                })?;
+            if m.columns[pos].primary_key {
+                return Err(format!("cannot drop primary key column '{}'", column));
+            }
+            m.columns.remove(pos);
+        }
+        {
+            let mut tables = self.tables.write();
+            if let Some(rows) = tables.get_mut(table) {
+                for row in rows.iter_mut() {
+                    row.values.remove(column);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn alter_table_rename_column(
+        &self,
+        table: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), String> {
+        {
+            let mut meta = self.table_meta.write();
+            let m = meta
+                .get_mut(table)
+                .ok_or_else(|| format!("table '{}' not found", table))?;
+            if m.columns.iter().any(|c| c.name == to) {
+                return Err(format!(
+                    "column '{}' already exists in table '{}'",
+                    to, table
+                ));
+            }
+            let col = m
+                .columns
+                .iter_mut()
+                .find(|c| c.name == from)
+                .ok_or_else(|| format!("column '{}' does not exist in table '{}'", from, table))?;
+            if col.primary_key {
+                return Err(format!("cannot rename primary key column '{}'", from));
+            }
+            col.name = to.to_string();
+        }
+        {
+            let mut tables = self.tables.write();
+            if let Some(rows) = tables.get_mut(table) {
+                for row in rows.iter_mut() {
+                    if let Some(val) = row.values.remove(from) {
+                        row.values.insert(to.to_string(), val);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_immutable(&self, table: &str) -> bool {
         self.table_meta
             .read()

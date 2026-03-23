@@ -961,9 +961,39 @@ impl Database {
         ));
     }
 
+    pub(crate) fn log_alter_table_ddl(&self, name: &str, meta: &TableMeta, lsn: u64) {
+        self.ddl_log.write().push((
+            lsn,
+            DdlChange::AlterTable {
+                name: name.to_string(),
+                columns: meta
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.name.clone(),
+                            sql_type_for_meta_column(c, &meta.propagation_rules),
+                        )
+                    })
+                    .collect(),
+                constraints: create_table_constraints_from_meta(meta),
+            },
+        ));
+    }
+
     pub(crate) fn persist_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             persistence.flush_table_meta(name, meta)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_table_rows(&self, name: &str) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            let tables = self.relational_store.tables.read();
+            if let Some(rows) = tables.get(name) {
+                persistence.rewrite_table_rows(name, rows)?;
+            }
         }
         Ok(())
     }
@@ -1325,6 +1355,30 @@ impl Database {
                         self.relational_store().drop_table(&name);
                         self.remove_persisted_table(&name)?;
                     }
+                }
+                DdlChange::AlterTable {
+                    name,
+                    columns,
+                    constraints,
+                } => {
+                    if self.table_meta(&name).is_none() {
+                        continue;
+                    }
+                    self.relational_store().table_meta.write().remove(&name);
+                    let mut sql = format!(
+                        "CREATE TABLE {} ({})",
+                        name,
+                        columns
+                            .iter()
+                            .map(|(col, ty)| format!("{col} {ty}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    if !constraints.is_empty() {
+                        sql.push(' ');
+                        sql.push_str(&constraints.join(" "));
+                    }
+                    self.execute_in_tx(tx, &sql, &HashMap::new())?;
                 }
             }
         }

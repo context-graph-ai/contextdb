@@ -43,6 +43,7 @@ fn ddl_sql_from_change(change: &DdlChange) -> String {
             sql
         }
         DdlChange::DropTable { .. } => panic!("unexpected DROP TABLE in DDL round-trip helper"),
+        DdlChange::AlterTable { .. } => panic!("unexpected ALTER TABLE in DDL round-trip helper"),
     }
 }
 

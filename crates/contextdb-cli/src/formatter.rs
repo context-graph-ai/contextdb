@@ -5,6 +5,9 @@ pub fn format_query_result(result: &QueryResult) -> String {
     if result.columns.is_empty() {
         return String::new();
     }
+    if result.rows.is_empty() {
+        return String::new();
+    }
 
     let mut widths: Vec<usize> = result.columns.iter().map(|c| c.len()).collect();
 

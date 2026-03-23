@@ -124,6 +124,7 @@ fn ds02_ddl_in_changeset_after_reopen() {
             );
         }
         DdlChange::DropTable { .. } => unreachable!(),
+        DdlChange::AlterTable { .. } => unreachable!(),
     }
     let workflows_ddl = cs
         .ddl
@@ -144,6 +145,7 @@ fn ds02_ddl_in_changeset_after_reopen() {
             );
         }
         DdlChange::DropTable { .. } => unreachable!(),
+        DdlChange::AlterTable { .. } => unreachable!(),
     }
 }
 
