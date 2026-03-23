@@ -1381,16 +1381,18 @@ fn a4_13_vector_search_with_context_prefilter() {
         )
         .expect("query");
     assert_eq!(out.rows.len(), 3);
-    for row in out.rows {
-        let row_id = match row.first() {
-            Some(Value::Int64(id)) => *id as u64,
-            _ => panic!("expected row id in vector search output"),
-        };
-        let matched = db
-            .scan_filter("observations_ctx", db.snapshot(), &|r| r.row_id == row_id)
-            .expect("scan by row id");
-        assert_eq!(matched.len(), 1);
-        assert_eq!(text(&matched[0], "context_id"), "ctx1");
+    // SELECT * must return user columns (no internal row_id), verify context_id directly
+    let ctx_idx = out
+        .columns
+        .iter()
+        .position(|c| c == "context_id")
+        .expect("context_id column must exist in output");
+    for row in &out.rows {
+        assert_eq!(
+            row[ctx_idx],
+            Value::Text("ctx1".to_string()),
+            "all results must be from ctx1"
+        );
     }
 }
 
@@ -2318,7 +2320,8 @@ fn a7_06_correlated_subquery_rejected() {
         "SELECT * FROM t WHERE id IN (SELECT id FROM s WHERE s.x = t.y)",
         &HashMap::new(),
     );
-    assert!(matches!(result, Err(Error::SubqueryNotSupported)));
+    // Correlated subqueries are banned per spec — must fail at execution
+    assert!(result.is_err(), "correlated subquery must be rejected");
 }
 
 #[test]
@@ -2329,9 +2332,12 @@ fn a7_07_cte_reference_in_where_allowed() {
         &HashMap::new(),
     );
 
-    // parser accepts CTE ref, executor support pending.
-    assert!(result.is_ok() || matches!(result, Err(Error::PlanError(_))));
-    assert!(!matches!(result, Err(Error::SubqueryNotSupported)));
+    // Plain SQL CTEs are supported per spec
+    assert!(
+        result.is_ok(),
+        "CTE-backed IN subquery must succeed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
