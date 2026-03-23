@@ -18,7 +18,9 @@ impl HnswIndex {
     pub fn new(entries: &[VectorEntry], dimension: usize) -> Self {
         let (m, ef_construction, ef_search) = select_params(entries.len());
         let max_elements = entries.len().max(1);
-        let hnsw = Hnsw::new(m, max_elements, 16, ef_construction, DistCosine);
+        let mut hnsw = Hnsw::new(m, max_elements, 16, ef_construction, DistCosine);
+        hnsw.set_extend_candidates(true);
+        hnsw.set_keeping_pruned(true);
         let id_to_row = RwLock::new(HashMap::with_capacity(entries.len()));
         let row_to_id = RwLock::new(HashMap::with_capacity(entries.len()));
         let mut sorted_entries = entries.iter().collect::<Vec<_>>();
@@ -54,6 +56,15 @@ impl HnswIndex {
         self.row_to_id.write().insert(row_id, data_id);
     }
 
+    /// Number of vectors currently indexed in the HNSW graph.
+    pub fn len(&self) -> usize {
+        self.next_id.load(Ordering::Relaxed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(RowId, f32)>> {
         if k == 0 {
             return Ok(Vec::new());
@@ -67,9 +78,8 @@ impl HnswIndex {
             });
         }
 
-        let knbn = k.saturating_mul(10).max(1);
-        let ef = self.ef_search.max(knbn);
-        let neighbors = self.hnsw.search(query, knbn, ef);
+        let ef = self.ef_search.max(k.saturating_mul(10)).max(1);
+        let neighbors = self.hnsw.search(query, ef, ef);
         let id_to_row = self.id_to_row.read();
 
         Ok(neighbors
@@ -86,7 +96,7 @@ impl HnswIndex {
 
 fn select_params(count: usize) -> (usize, usize, usize) {
     match count {
-        0..=5000 => (16, 200, 200),
+        0..=5000 => (16, 200, count.max(200)),
         5001..=50000 => (24, 400, 400),
         _ => (16, 200, 200),
     }

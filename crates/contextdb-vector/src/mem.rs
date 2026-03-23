@@ -84,6 +84,14 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             let guard = once_lock.read();
             if let Some(hnsw) = guard.as_ref() {
                 let raw_candidates = hnsw.search(query, k)?;
+
+                // If the HNSW graph has disconnected components, the search
+                // may not reach all indexed vectors. Detect this and fall back
+                // to brute-force so we never silently drop results.
+                if raw_candidates.len() < hnsw.len() {
+                    return Ok(self.brute_force_search(query, k, candidates, snapshot));
+                }
+
                 let vectors = self.store.vectors.read();
                 let mut visible = raw_candidates
                     .into_iter()
