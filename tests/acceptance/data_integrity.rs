@@ -23,9 +23,7 @@ async fn f32_no_silent_data_loss_on_push() {
         .point_lookup(
             "sensors",
             "id",
-            &Value::Uuid(
-                Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
-            ),
+            &Value::Uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("uuid")),
             db.snapshot(),
         )
         .expect("lookup")
@@ -44,9 +42,8 @@ async fn f33_vector_data_round_trips_correctly_through_sync() {
     let mut server = spawn_server(&server_path, "f33", &nats.nats_url);
 
     // Insert 10 vectors on edge, each with VECTOR(3)
-    let mut script = String::from(
-        "CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(3))\n",
-    );
+    let mut script =
+        String::from("CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(3))\n");
     let vectors: Vec<[f32; 3]> = vec![
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
@@ -108,8 +105,7 @@ async fn f34_row_deletion_syncs_correctly() {
     let mut server = spawn_server(&server_path, "f34", &nats.nats_url);
 
     // Insert 10 rows with deterministic UUIDs
-    let mut script =
-        String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
     for i in 1..=10 {
         script.push_str(&format!(
             "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-{:012}', 'sensor-{}')\n",
@@ -596,9 +592,7 @@ async fn sf03_not_null_constraint_enforced_on_server_during_push() {
     // The push output must report a conflict/constraint violation
     let stdout = output_string(&violation.stdout).to_lowercase();
     assert!(
-        stdout.contains("constraint")
-            || stdout.contains("not null")
-            || stdout.contains("conflict"),
+        stdout.contains("constraint") || stdout.contains("not null") || stdout.contains("conflict"),
         "push of NULL into NOT NULL column must be rejected by server, got: {}",
         stdout
     );
@@ -648,9 +642,7 @@ async fn sf04_unique_constraint_enforced_on_server_during_push() {
     // The push output must report a conflict/constraint violation
     let stdout = output_string(&violation.stdout).to_lowercase();
     assert!(
-        stdout.contains("constraint")
-            || stdout.contains("unique")
-            || stdout.contains("conflict"),
+        stdout.contains("constraint") || stdout.contains("unique") || stdout.contains("conflict"),
         "push of duplicate UNIQUE value must be rejected by server, got: {}",
         stdout
     );

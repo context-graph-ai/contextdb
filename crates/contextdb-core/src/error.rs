@@ -65,7 +65,9 @@ pub enum Error {
     },
     #[error("plugin rejected at {hook}: {reason}")]
     PluginRejected { hook: String, reason: String },
-    #[error("memory budget exceeded: {subsystem}/{operation} requested {requested_bytes} bytes, {available_bytes} available of {budget_limit_bytes} budget. Hint: {hint}")]
+    #[error(
+        "memory budget exceeded: {subsystem}/{operation} requested {requested_bytes} bytes, {available_bytes} available of {budget_limit_bytes} budget. Hint: {hint}"
+    )]
     MemoryBudgetExceeded {
         subsystem: String,
         operation: String,

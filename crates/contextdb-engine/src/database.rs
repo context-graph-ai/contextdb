@@ -2,7 +2,10 @@ use crate::composite_store::{ChangeLogEntry, CompositeStore};
 use crate::executor::execute_plan;
 use crate::persistence::RedbPersistence;
 use crate::persistent_store::PersistentCompositeStore;
-use crate::plugin::{CommitSource, CorePlugin, DatabasePlugin, PluginHealth, QueryOutcome};
+use crate::plugin::{
+    CommitEvent, CommitSource, CorePlugin, DatabasePlugin, PluginHealth, QueryOutcome,
+    SubscriptionMetrics,
+};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
@@ -1038,7 +1041,10 @@ impl Database {
     }
 
     /// File-backed database with custom plugin.
-    pub fn open_with_plugin(path: impl AsRef<Path>, _plugin: Arc<dyn DatabasePlugin>) -> Result<Self> {
+    pub fn open_with_plugin(
+        path: impl AsRef<Path>,
+        _plugin: Arc<dyn DatabasePlugin>,
+    ) -> Result<Self> {
         // Stub: delegates to open() ignoring plugin.
         Self::open(path)
     }
@@ -1428,6 +1434,33 @@ impl Database {
     /// Returns the current LSN of this database.
     pub fn current_lsn(&self) -> u64 {
         self.tx_mgr.current_lsn()
+    }
+
+    /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
+    /// after each commit.
+    pub fn subscribe(&self) -> std::sync::mpsc::Receiver<CommitEvent> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        // stub: sender immediately dropped — receiver gets Disconnected on recv
+        rx
+    }
+
+    /// Subscribe with a custom channel capacity.
+    pub fn subscribe_with_capacity(
+        &self,
+        _capacity: usize,
+    ) -> std::sync::mpsc::Receiver<CommitEvent> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        // stub: sender immediately dropped — receiver gets Disconnected on recv
+        rx
+    }
+
+    /// Returns health metrics for the subscription system.
+    pub fn subscription_health(&self) -> SubscriptionMetrics {
+        SubscriptionMetrics {
+            active_channels: 0,
+            events_sent: 0,
+            events_dropped: 0,
+        }
     }
 
     /// Applies a ChangeSet to this database with the given conflict policies.

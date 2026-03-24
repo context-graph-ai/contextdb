@@ -13,7 +13,10 @@ fn a_ma1_memory_limit_flag_sets_ceiling() {
         &["--memory-limit", "4G"],
         "SHOW MEMORY_LIMIT\n.quit\n",
     );
-    assert!(output.status.success(), "CLI must not crash with --memory-limit");
+    assert!(
+        output.status.success(),
+        "CLI must not crash with --memory-limit"
+    );
     let stdout = output_string(&output.stdout);
     // 4G = 4294967296 bytes.
     assert!(
@@ -98,7 +101,10 @@ fn a_ma4_set_higher_than_ceiling_errors() {
     assert!(output.status.success(), "CLI must not crash on SET error");
     let stdout = output_string(&output.stdout);
     assert!(
-        stdout.contains("Error") || stdout.contains("error") || stdout.contains("exceed") || stdout.contains("ceiling"),
+        stdout.contains("Error")
+            || stdout.contains("error")
+            || stdout.contains("exceed")
+            || stdout.contains("ceiling"),
         "SET above ceiling must produce error: {stdout}"
     );
 }
@@ -199,7 +205,10 @@ fn a_ma8_no_memory_limit_flag_works() {
     );
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
-    assert!(stdout.contains("works"), "basic operations must work without limit flag");
+    assert!(
+        stdout.contains("works"),
+        "basic operations must work without limit flag"
+    );
     assert!(
         stdout.contains("none"),
         "SHOW MEMORY_LIMIT must report 'none' when no limit set: {stdout}"

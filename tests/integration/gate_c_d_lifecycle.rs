@@ -1,6 +1,7 @@
-use super::helpers::setup_ontology_db;
+use super::helpers::{setup_ontology_db, setup_propagation_ontology_db};
 use contextdb_core::{Direction, Value};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use uuid::Uuid;
 
 fn text<'a>(row: &'a contextdb_core::VersionedRow, key: &str) -> &'a str {
@@ -290,35 +291,245 @@ fn c2_02_entity_context_empty() {
 }
 
 #[test]
-#[ignore = "requires subscription API"]
 fn c2_03_subscribe_new_decision() {
-    let _db = setup_ontology_db();
-    // TODO: subscribe(new_decision on entity), create decision BASED_ON entity, assert callback payload.
-    todo!("requires subscription API");
+    let db = setup_ontology_db();
+
+    let rx = db.subscribe();
+
+    let entity_id = Uuid::new_v4();
+    let decision_id = Uuid::new_v4();
+    let tx = db.begin();
+    db.insert_row(
+        tx,
+        "entities",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(entity_id)),
+            ("name".to_string(), Value::Text("e1".to_string())),
+            (
+                "entity_type".to_string(),
+                Value::Text("SERVICE".to_string()),
+            ),
+        ]),
+    )
+    .unwrap();
+    db.insert_row(
+        tx,
+        "decisions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(decision_id)),
+            ("description".to_string(), Value::Text("d1".to_string())),
+        ]),
+    )
+    .unwrap();
+    db.insert_edge(
+        tx,
+        decision_id,
+        entity_id,
+        "BASED_ON".to_string(),
+        HashMap::new(),
+    )
+    .unwrap();
+    db.commit(tx).unwrap();
+
+    let event = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("should receive CommitEvent for decision creation");
+    assert!(event.row_count >= 3, "2 rows + 1 edge = at least 3");
+    assert!(event.tables_changed.contains(&"entities".to_string()));
+    assert!(event.tables_changed.contains(&"decisions".to_string()));
 }
 
 #[test]
-#[ignore = "requires subscription API"]
 fn c2_04_subscribe_invalidation_detected() {
-    let _db = setup_ontology_db();
-    // TODO: subscribe(invalidation_detected), trigger observation->invalidation, assert callback payload.
-    todo!("requires subscription API");
+    let db = setup_propagation_ontology_db();
+
+    // Create an active intention and active decision referencing it
+    let intention_id = Uuid::new_v4();
+    let decision_id = Uuid::new_v4();
+    let p = HashMap::new();
+
+    db.execute("BEGIN", &p).unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO intentions (id, description, status) VALUES ('{}', 'i1', 'active')",
+            intention_id
+        ),
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO decisions (id, description, status, intention_id) VALUES ('{}', 'd1', 'active', '{}')",
+            decision_id, intention_id
+        ),
+        &p,
+    )
+    .unwrap();
+    db.execute("COMMIT", &p).unwrap();
+
+    let rx = db.subscribe();
+
+    // Archive the intention — should propagate invalidation to the decision
+    db.execute(
+        &format!(
+            "UPDATE intentions SET status = 'archived' WHERE id = '{}'",
+            intention_id
+        ),
+        &p,
+    )
+    .unwrap();
+
+    let event = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("should receive CommitEvent for propagation");
+    assert!(event.row_count > 0, "propagation must affect rows");
+    assert!(
+        event.tables_changed.contains(&"intentions".to_string())
+            || event.tables_changed.contains(&"decisions".to_string()),
+        "tables_changed must include at least one propagated table, got: {:?}",
+        event.tables_changed
+    );
+    assert!(event.lsn > 0, "LSN must be positive");
 }
 
 #[test]
-#[ignore = "requires subscription API"]
 fn c2_05_subscribe_conflict_detected() {
-    let _db = setup_ontology_db();
-    // TODO: subscribe(conflict event), insert conflicting decisions, assert callback invoked.
-    todo!("requires subscription API");
+    let db = setup_ontology_db();
+
+    // Subscribe, fill channel, commit again — commit must succeed
+    let _rx = db.subscribe();
+
+    // Multiple commits to exercise the path
+    for i in 0..5 {
+        let tx = db.begin();
+        db.insert_row(
+            tx,
+            "entities",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+                ("name".to_string(), Value::Text(format!("e{}", i))),
+                (
+                    "entity_type".to_string(),
+                    Value::Text("SERVICE".to_string()),
+                ),
+            ]),
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+    }
+
+    // Verify data is accessible
+    let result = db
+        .execute("SELECT COUNT(*) FROM entities", &HashMap::new())
+        .unwrap();
+    let count = match &result.rows[0][0] {
+        Value::Int64(n) => *n,
+        _ => panic!("expected integer"),
+    };
+    assert_eq!(count, 5, "all 5 entities must be committed");
+
+    // Now verify a subscriber can still receive
+    let rx2 = db.subscribe();
+    let tx = db.begin();
+    db.insert_row(
+        tx,
+        "entities",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+            ("name".to_string(), Value::Text("final".to_string())),
+            (
+                "entity_type".to_string(),
+                Value::Text("SERVICE".to_string()),
+            ),
+        ]),
+    )
+    .unwrap();
+    db.commit(tx).unwrap();
+
+    let event = rx2
+        .recv_timeout(Duration::from_secs(2))
+        .expect("new subscriber should still receive events");
+    assert!(event.row_count > 0);
 }
 
 #[test]
-#[ignore = "requires subscription API"]
 fn c2_06_callback_exception_isolated() {
-    let _db = setup_ontology_db();
-    // TODO: register callback that errors, perform operation, assert operation succeeds and error is isolated.
-    todo!("requires subscription API");
+    let db = setup_ontology_db();
+
+    let rx = db.subscribe();
+
+    // First commit
+    let tx = db.begin();
+    db.insert_row(
+        tx,
+        "entities",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+            ("name".to_string(), Value::Text("before".to_string())),
+            (
+                "entity_type".to_string(),
+                Value::Text("SERVICE".to_string()),
+            ),
+        ]),
+    )
+    .unwrap();
+    db.commit(tx).unwrap();
+
+    // Drop the receiver (simulates callback failure / abandoned subscriber)
+    drop(rx);
+
+    // Second commit must succeed without error
+    let tx = db.begin();
+    db.insert_row(
+        tx,
+        "entities",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+            ("name".to_string(), Value::Text("after".to_string())),
+            (
+                "entity_type".to_string(),
+                Value::Text("SERVICE".to_string()),
+            ),
+        ]),
+    )
+    .unwrap();
+    db.commit(tx).unwrap();
+
+    // Verify both rows exist
+    let result = db
+        .execute("SELECT COUNT(*) FROM entities", &HashMap::new())
+        .unwrap();
+    let count = match &result.rows[0][0] {
+        Value::Int64(n) => *n,
+        _ => panic!("expected integer"),
+    };
+    assert_eq!(
+        count, 2,
+        "both commits must succeed despite dropped receiver"
+    );
+
+    // Subscribe again after the dropped receiver — must still work
+    let rx2 = db.subscribe();
+    let tx = db.begin();
+    db.insert_row(
+        tx,
+        "entities",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+            ("name".to_string(), Value::Text("verify".to_string())),
+            (
+                "entity_type".to_string(),
+                Value::Text("SERVICE".to_string()),
+            ),
+        ]),
+    )
+    .unwrap();
+    db.commit(tx).unwrap();
+
+    let event = rx2
+        .recv_timeout(Duration::from_secs(2))
+        .expect("new subscriber after dropped receiver must receive events");
+    assert!(event.row_count > 0);
 }
 
 #[test]

@@ -60,6 +60,23 @@ pub trait DatabasePlugin: Send + Sync {
     }
 }
 
+/// Lightweight summary of each commit, delivered to subscribers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitEvent {
+    pub source: CommitSource,
+    pub lsn: u64,
+    pub tables_changed: Vec<String>,
+    pub row_count: usize,
+}
+
+/// Health metrics for the subscription system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionMetrics {
+    pub active_channels: usize,
+    pub events_sent: u64,
+    pub events_dropped: u64,
+}
+
 /// Default plugin — all no-ops. Every Database gets this automatically.
 pub struct CorePlugin;
 impl DatabasePlugin for CorePlugin {}

@@ -31,13 +31,24 @@ fn m01_insert_succeeds_under_budget() {
             ("name", Value::Text("hello".to_string())),
         ]),
     );
-    assert!(result.is_ok(), "INSERT under budget must succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "INSERT under budget must succeed: {result:?}"
+    );
 
     // Memory used must reflect the actual row size (UUID=16 + "hello"=5 + overhead).
     // A single row with a UUID and short TEXT should use between 32 and 1024 bytes.
     let usage = accountant.usage();
-    assert!(usage.used >= 32, "used bytes must be >= 32 after INSERT, got {}", usage.used);
-    assert!(usage.used <= 1024, "used bytes must be <= 1024 for a single small row, got {}", usage.used);
+    assert!(
+        usage.used >= 32,
+        "used bytes must be >= 32 after INSERT, got {}",
+        usage.used
+    );
+    assert!(
+        usage.used <= 1024,
+        "used bytes must be <= 1024 for a single small row, got {}",
+        usage.used
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +69,10 @@ fn m02_insert_rejected_when_budget_exceeded() {
         "INSERT INTO items (id, name) VALUES ($id, $name)",
         &make_params(vec![
             ("id", Value::Uuid(Uuid::new_v4())),
-            ("name", Value::Text("this string is long enough to exceed 64 bytes budget".to_string())),
+            (
+                "name",
+                Value::Text("this string is long enough to exceed 64 bytes budget".to_string()),
+            ),
         ]),
     );
     assert!(result.is_err(), "INSERT must fail when budget exceeded");
@@ -149,12 +163,18 @@ fn m03_delete_reclaims_memory_for_insert() {
     );
 
     // Verify the row actually exists with correct value.
-    let select = db.execute(
-        "SELECT name FROM items WHERE id = $id",
-        &make_params(vec![("id", Value::Uuid(id3))]),
-    ).expect("SELECT after re-insert must succeed");
+    let select = db
+        .execute(
+            "SELECT name FROM items WHERE id = $id",
+            &make_params(vec![("id", Value::Uuid(id3))]),
+        )
+        .expect("SELECT after re-insert must succeed");
     assert_eq!(select.rows.len(), 1, "must find exactly one row");
-    assert_eq!(select.rows[0][0], Value::Text("third".to_string()), "row must contain 'third'");
+    assert_eq!(
+        select.rows[0][0],
+        Value::Text("third".to_string()),
+        "row must contain 'third'"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -186,11 +206,12 @@ fn m04_vector_search_succeeds_under_budget() {
     // Vector search under budget must succeed.
     let result = db.execute(
         "SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 3",
-        &make_params(vec![
-            ("q", Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
-        ]),
+        &make_params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]),
     );
-    assert!(result.is_ok(), "vector search under budget must succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "vector search under budget must succeed: {result:?}"
+    );
     assert_eq!(result.unwrap().rows.len(), 3);
 }
 
@@ -221,11 +242,12 @@ fn m05_vector_search_rejected_over_budget() {
     // Budget is 128 bytes — must fail.
     let result = db.execute(
         "SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 10",
-        &make_params(vec![
-            ("q", Value::Vector(vec![1.0; 384])),
-        ]),
+        &make_params(vec![("q", Value::Vector(vec![1.0; 384]))]),
     );
-    assert!(result.is_err(), "vector search must fail when budget exceeded");
+    assert!(
+        result.is_err(),
+        "vector search must fail when budget exceeded"
+    );
     let err = result.unwrap_err();
     match &err {
         Error::MemoryBudgetExceeded { subsystem, .. } => {
@@ -267,9 +289,7 @@ fn m06_hnsw_fallback_to_brute_force_under_budget() {
     }
 
     // EXPLAIN should show brute-force, not HNSW — budget prevented HNSW build.
-    let explain_output = db.explain(
-        "SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 5",
-    );
+    let explain_output = db.explain("SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 5");
     assert!(explain_output.is_ok(), "explain must succeed");
     let explain_output = explain_output.unwrap();
     // After implementation: tight budget prevents HNSW build → BruteForce scan.
@@ -328,7 +348,11 @@ fn m07_bfs_succeeds_under_budget() {
         &make_params(vec![("start", Value::Uuid(a))]),
     );
     assert!(result.is_ok(), "BFS under budget must succeed: {result:?}");
-    assert_eq!(result.unwrap().rows.len(), 2, "BFS from A must find exactly B and C");
+    assert_eq!(
+        result.unwrap().rows.len(),
+        2,
+        "BFS from A must find exactly B and C"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -390,11 +414,17 @@ fn m09_set_and_show_memory_limit() {
 
     // SET MEMORY_LIMIT '512M' (536870912 bytes).
     let set_result = db.execute("SET MEMORY_LIMIT '512M'", &empty());
-    assert!(set_result.is_ok(), "SET MEMORY_LIMIT must succeed: {set_result:?}");
+    assert!(
+        set_result.is_ok(),
+        "SET MEMORY_LIMIT must succeed: {set_result:?}"
+    );
 
     // SHOW MEMORY_LIMIT must reflect the set value.
     let show_result = db.execute("SHOW MEMORY_LIMIT", &empty()).unwrap();
-    assert_eq!(show_result.columns, vec!["limit", "used", "available", "startup_ceiling"]);
+    assert_eq!(
+        show_result.columns,
+        vec!["limit", "used", "available", "startup_ceiling"]
+    );
     assert_eq!(show_result.rows.len(), 1);
 
     let limit_val = &show_result.rows[0][0];
@@ -460,7 +490,10 @@ fn m11_set_above_startup_ceiling_rejected() {
 
     // SET lower than ceiling must succeed.
     let result2 = db.execute("SET MEMORY_LIMIT '2G'", &empty());
-    assert!(result2.is_ok(), "SET below ceiling must succeed: {result2:?}");
+    assert!(
+        result2.is_ok(),
+        "SET below ceiling must succeed: {result2:?}"
+    );
 
     // SET 'none' must be rejected when ceiling exists.
     let result3 = db.execute("SET MEMORY_LIMIT 'none'", &empty());
@@ -494,10 +527,19 @@ fn m12_open_with_config_wires_accountant() {
         "INSERT INTO items (id, name) VALUES ($id, $name)",
         &make_params(vec![
             ("id", Value::Uuid(Uuid::new_v4())),
-            ("name", Value::Text("a long enough string to exceed sixty four bytes of budget for sure".to_string())),
+            (
+                "name",
+                Value::Text(
+                    "a long enough string to exceed sixty four bytes of budget for sure"
+                        .to_string(),
+                ),
+            ),
         ]),
     );
-    assert!(result.is_err(), "INSERT must fail with tight budget via open_with_config");
+    assert!(
+        result.is_err(),
+        "INSERT must fail with tight budget via open_with_config"
+    );
     assert!(
         matches!(result.unwrap_err(), Error::MemoryBudgetExceeded { .. }),
         "error must be MemoryBudgetExceeded"
@@ -538,9 +580,7 @@ fn m13_default_no_limit_allows_everything() {
     // Vector search
     let result = db.execute(
         "SELECT id FROM items ORDER BY embedding <=> $q LIMIT 1",
-        &make_params(vec![
-            ("q", Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
-        ]),
+        &make_params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]),
     );
     assert!(result.is_ok(), "vector search must succeed with no limit");
 
@@ -571,7 +611,10 @@ fn m13_default_no_limit_allows_everything() {
 
     // Accountant usage shows no limit.
     let usage = db.accountant().usage();
-    assert!(usage.limit.is_none(), "no-limit accountant must report None limit");
+    assert!(
+        usage.limit.is_none(),
+        "no-limit accountant must report None limit"
+    );
 }
 
 // ---------------------------------------------------------------------------

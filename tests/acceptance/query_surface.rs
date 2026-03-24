@@ -914,11 +914,90 @@ fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
 /// I subscribed to a table and inserted a row, and the subscription fired.
 #[test]
 fn f115_subscription_fires_on_insert() {
-    assert!(false, "subscription API not yet implemented");
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)",
+        &empty_params(),
+    )
+    .unwrap();
+
+    let rx = db.subscribe();
+
+    db.execute(
+        "INSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'temp', 22.5)",
+        &empty_params(),
+    )
+    .unwrap();
+
+    let event = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("subscription must fire after insert");
+    assert!(event.lsn > 0);
+    assert!(event.row_count > 0);
+    assert!(event.tables_changed.contains(&"sensors".to_string()));
 }
 
 /// I subscribed to state changes and propagated a state transition, and the subscription fired.
 #[test]
 fn f116_subscription_fires_on_state_propagation() {
-    assert!(false, "subscription API not yet implemented");
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL) STATE MACHINE (status: active -> [archived, paused, superseded])",
+        &empty_params(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated) STATE MACHINE (status: active -> [invalidated, superseded])",
+        &empty_params(),
+    )
+    .unwrap();
+
+    let intention_id = uuid::Uuid::new_v4();
+    let decision_id = uuid::Uuid::new_v4();
+
+    db.execute(
+        &format!(
+            "INSERT INTO intentions (id, description, status) VALUES ('{}', 'i1', 'active')",
+            intention_id
+        ),
+        &empty_params(),
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO decisions (id, description, status, intention_id) VALUES ('{}', 'd1', 'active', '{}')",
+            decision_id, intention_id
+        ),
+        &empty_params(),
+    )
+    .unwrap();
+
+    let rx = db.subscribe();
+
+    // Trigger propagation: archive intention -> decision should be invalidated
+    db.execute(
+        &format!(
+            "UPDATE intentions SET status = 'archived' WHERE id = '{}'",
+            intention_id
+        ),
+        &empty_params(),
+    )
+    .unwrap();
+
+    let event = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("subscription must fire after state propagation");
+    assert!(event.row_count > 0, "propagation must affect rows");
+    assert!(
+        event.tables_changed.contains(&"intentions".to_string())
+            || event.tables_changed.contains(&"decisions".to_string()),
+        "tables_changed must include the propagated table, got: {:?}",
+        event.tables_changed
+    );
+    assert!(event.lsn > 0, "LSN must be positive");
+    assert_eq!(
+        event.source,
+        contextdb_engine::plugin::CommitSource::AutoCommit,
+        "autocommit UPDATE must report AutoCommit source"
+    );
 }

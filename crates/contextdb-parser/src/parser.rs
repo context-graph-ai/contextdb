@@ -1837,9 +1837,10 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
         .find(|p| p.as_rule() == Rule::memory_limit_value)
         .ok_or_else(|| Error::ParseError("missing memory_limit_value".to_string()))?;
 
-    let value_inner = inner.into_inner().next().ok_or_else(|| {
-        Error::ParseError("empty memory_limit_value".to_string())
-    })?;
+    let value_inner = inner
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("empty memory_limit_value".to_string()))?;
 
     match value_inner.as_rule() {
         Rule::size_with_unit => {
@@ -1852,11 +1853,7 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
                 "G" | "g" => 1024 * 1024 * 1024,
                 "M" | "m" => 1024 * 1024,
                 "K" | "k" => 1024,
-                _ => {
-                    return Err(Error::ParseError(format!(
-                        "unknown size suffix: {suffix}"
-                    )))
-                }
+                _ => return Err(Error::ParseError(format!("unknown size suffix: {suffix}"))),
             };
             Ok(SetMemoryLimitValue::Bytes(base * multiplier))
         }

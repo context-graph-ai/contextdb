@@ -20,6 +20,8 @@ mod embedding;
 mod infra_failures;
 #[path = "acceptance/long_running.rs"]
 mod long_running;
+#[path = "acceptance/memory_accounting.rs"]
+mod memory_accounting;
 #[path = "acceptance/multi_edge.rs"]
 mod multi_edge;
 #[path = "acceptance/persistence.rs"]
@@ -32,5 +34,3 @@ mod schema_evolution;
 mod schema_lifecycle;
 #[path = "acceptance/sync.rs"]
 mod sync;
-#[path = "acceptance/memory_accounting.rs"]
-mod memory_accounting;
