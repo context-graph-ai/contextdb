@@ -32,3 +32,5 @@ mod plugin_tests;
 mod safety_integrity;
 #[path = "integration/state_propagation.rs"]
 mod state_propagation;
+#[path = "integration/memory_accounting_tests.rs"]
+mod memory_accounting_tests;

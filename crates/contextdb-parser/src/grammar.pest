@@ -16,8 +16,15 @@ stmt = _{
     | insert_stmt
     | delete_stmt
     | update_stmt
+    | set_memory_limit
+    | show_memory_limit
     | select_stmt
 }
+
+set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "'" ~ memory_limit_value ~ "'" }
+show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
+memory_limit_value = { ^"none" | size_with_unit }
+size_with_unit = { ASCII_DIGIT+ ~ ("G" | "M" | "K") }
 
 begin_stmt = { ^"BEGIN" }
 commit_stmt = { ^"COMMIT" }

@@ -505,6 +505,28 @@ pub(crate) fn execute_plan(
             })
         }
         PhysicalPlan::CreateIndex(_) => Ok(QueryResult::empty_with_affected(0)),
+        PhysicalPlan::SetMemoryLimit(_val) => {
+            // Stub: returns empty result without calling set_budget.
+            Ok(QueryResult::empty())
+        }
+        PhysicalPlan::ShowMemoryLimit => {
+            // Stub: returns hardcoded zeros.
+            Ok(QueryResult {
+                columns: vec![
+                    "limit".to_string(),
+                    "used".to_string(),
+                    "available".to_string(),
+                    "startup_ceiling".to_string(),
+                ],
+                rows: vec![vec![
+                    Value::Text("none".to_string()),
+                    Value::Int64(0),
+                    Value::Text("none".to_string()),
+                    Value::Text("none".to_string()),
+                ]],
+                rows_affected: 0,
+            })
+        }
         PhysicalPlan::Pipeline(plans) => {
             let mut last = QueryResult::empty();
             for p in plans {

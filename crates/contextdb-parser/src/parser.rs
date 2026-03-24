@@ -48,6 +48,8 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
         Rule::update_stmt => Statement::Update(build_update(inner)?),
         Rule::select_stmt => Statement::Select(build_select(inner)?),
+        Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
+        Rule::show_memory_limit => Statement::ShowMemoryLimit,
         _ => return Err(Error::ParseError("unsupported statement".to_string())),
     };
 
@@ -1827,4 +1829,40 @@ fn is_word_boundary(s: &str, idx: usize) -> bool {
         return true;
     }
     !s.as_bytes()[idx].is_ascii_alphanumeric() && s.as_bytes()[idx] != b'_'
+}
+
+fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
+    let inner = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::memory_limit_value)
+        .ok_or_else(|| Error::ParseError("missing memory_limit_value".to_string()))?;
+
+    let value_inner = inner.into_inner().next().ok_or_else(|| {
+        Error::ParseError("empty memory_limit_value".to_string())
+    })?;
+
+    match value_inner.as_rule() {
+        Rule::size_with_unit => {
+            let text = value_inner.as_str();
+            let (digits, suffix) = text.split_at(text.len() - 1);
+            let base: usize = digits
+                .parse()
+                .map_err(|e| Error::ParseError(format!("invalid size number: {e}")))?;
+            let multiplier = match suffix {
+                "G" | "g" => 1024 * 1024 * 1024,
+                "M" | "m" => 1024 * 1024,
+                "K" | "k" => 1024,
+                _ => {
+                    return Err(Error::ParseError(format!(
+                        "unknown size suffix: {suffix}"
+                    )))
+                }
+            };
+            Ok(SetMemoryLimitValue::Bytes(base * multiplier))
+        }
+        _ => {
+            // "none" keyword
+            Ok(SetMemoryLimitValue::None)
+        }
+    }
 }

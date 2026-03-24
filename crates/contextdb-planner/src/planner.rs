@@ -46,6 +46,8 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             where_clause: u.where_clause.clone(),
         })),
         Statement::Select(sel) => plan_select(sel),
+        Statement::SetMemoryLimit(val) => Ok(PhysicalPlan::SetMemoryLimit(val.clone())),
+        Statement::ShowMemoryLimit => Ok(PhysicalPlan::ShowMemoryLimit),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Ok(PhysicalPlan::Pipeline(vec![]))
         }

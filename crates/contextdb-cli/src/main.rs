@@ -22,6 +22,10 @@ struct Args {
     /// Tenant ID for sync
     #[arg(long, env = "CONTEXTDB_TENANT_ID")]
     tenant_id: Option<String>,
+
+    /// Memory limit (e.g. 4G, 512M). Sets startup ceiling.
+    #[arg(long, env = "CONTEXTDB_MEMORY_LIMIT")]
+    memory_limit: Option<String>,
 }
 
 fn main() {
@@ -30,6 +34,11 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+
+    if let Some(ref _limit_str) = args.memory_limit {
+        // Stub: flag is parsed but not applied.
+        // A-MA1 fails because SHOW MEMORY_LIMIT still returns "none".
+    }
 
     debug!(path = %args.path, "opening database");
     let db = if args.path == ":memory:" {

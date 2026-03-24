@@ -1,6 +1,6 @@
 use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
-    AlterAction, ColumnDef, Expr, OnConflict, SortDirection, StateMachineDef,
+    AlterAction, ColumnDef, Expr, OnConflict, SetMemoryLimitValue, SortDirection, StateMachineDef,
 };
 
 #[derive(Debug, Clone)]
@@ -83,6 +83,8 @@ pub enum PhysicalPlan {
         all: bool,
     },
     Pipeline(Vec<PhysicalPlan>),
+    SetMemoryLimit(SetMemoryLimitValue),
+    ShowMemoryLimit,
 }
 
 impl PhysicalPlan {

@@ -64,6 +64,7 @@ pub struct Database {
     session_tx: Mutex<Option<TxId>>,
     instance_id: uuid::Uuid,
     plugin: Arc<dyn DatabasePlugin>,
+    accountant: Arc<MemoryAccountant>,
 }
 
 impl std::fmt::Debug for Database {
@@ -173,6 +174,7 @@ impl Database {
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
+            accountant: Arc::new(MemoryAccountant::no_limit()),
         };
 
         for meta in all_meta.values() {
@@ -216,6 +218,7 @@ impl Database {
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
+            accountant: Arc::new(MemoryAccountant::no_limit()),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db
@@ -1016,6 +1019,7 @@ impl Database {
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin,
+            accountant: Arc::new(MemoryAccountant::no_limit()),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db.plugin.on_open()?;
@@ -1031,6 +1035,33 @@ impl Database {
             persistence.close();
         }
         self.plugin.on_close()
+    }
+
+    /// File-backed database with custom plugin.
+    pub fn open_with_plugin(path: impl AsRef<Path>, _plugin: Arc<dyn DatabasePlugin>) -> Result<Self> {
+        // Stub: delegates to open() ignoring plugin.
+        Self::open(path)
+    }
+
+    /// Full constructor with budget.
+    pub fn open_with_config(
+        path: impl AsRef<Path>,
+        _plugin: Arc<dyn DatabasePlugin>,
+        _accountant: Arc<MemoryAccountant>,
+    ) -> Result<Self> {
+        // Stub: delegates to open() ignoring plugin and accountant.
+        Self::open(path)
+    }
+
+    /// In-memory database with budget.
+    pub fn open_memory_with_accountant(_accountant: Arc<MemoryAccountant>) -> Self {
+        // Stub: delegates to open_memory() ignoring accountant.
+        Self::open_memory()
+    }
+
+    /// Access the memory accountant.
+    pub fn accountant(&self) -> &MemoryAccountant {
+        &self.accountant
     }
 
     pub fn plugin(&self) -> &dyn DatabasePlugin {

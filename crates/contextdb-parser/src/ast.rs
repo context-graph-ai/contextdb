@@ -11,6 +11,14 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    SetMemoryLimit(SetMemoryLimitValue),
+    ShowMemoryLimit,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetMemoryLimitValue {
+    Bytes(usize),
+    None,
 }
 
 #[derive(Debug, Clone)]

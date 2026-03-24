@@ -32,3 +32,5 @@ mod schema_evolution;
 mod schema_lifecycle;
 #[path = "acceptance/sync.rs"]
 mod sync;
+#[path = "acceptance/memory_accounting.rs"]
+mod memory_accounting;
