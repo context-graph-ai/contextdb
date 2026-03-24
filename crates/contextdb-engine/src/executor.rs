@@ -1702,7 +1702,7 @@ fn coerce_uuid_if_needed(col: &str, v: Value) -> Value {
     v
 }
 
-fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
+pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
     match dtype {
         DataType::Uuid => contextdb_core::ColumnType::Uuid,
         DataType::Text => contextdb_core::ColumnType::Text,

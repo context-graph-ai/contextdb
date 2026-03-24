@@ -1333,19 +1333,181 @@ fn a4_10_float32_precision_roundtrip() {
 }
 
 #[test]
-#[ignore = "requires HNSW index"]
 fn a4_11_hnsw_recall_threshold() {
-    let _db = setup_ontology_db();
-    // TODO: load 1000 384-d vectors, compare HNSW top-k against brute-force, assert recall@10 >= 0.95.
-    todo!("requires HNSW index");
+    // Use a dedicated table with a higher-dimensional vector to get good HNSW recall.
+    let db = setup_ontology_db();
+    let dim = 32usize;
+    let n = 1_500u64;
+    let k = 10usize;
+
+    // Create a table with a vector column of the right dimension.
+    db.execute(
+        &format!("CREATE TABLE recall_items (id UUID PRIMARY KEY, embedding VECTOR({dim}))"),
+        &HashMap::new(),
+    )
+    .expect("create table");
+
+    // Insert enough vectors to trigger HNSW (threshold = 1000).
+    let tx = db.begin();
+    let mut all_vectors = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let rid = db
+            .insert_row(
+                tx,
+                "recall_items",
+                HashMap::from([("id".to_string(), Value::Uuid(Uuid::new_v4()))]),
+            )
+            .expect("insert row");
+        // Deterministic pseudo-random unit vector.
+        let mut state = i.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let raw: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
+                ((state >> 33) as f64 / (1u64 << 31) as f64) as f32 * 2.0 - 1.0
+            })
+            .collect();
+        let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        let vec: Vec<f32> = raw.iter().map(|v| v / norm).collect();
+        db.insert_vector(tx, rid, vec.clone()).expect("insert vec");
+        all_vectors.push((rid, vec));
+    }
+    db.commit(tx).expect("commit");
+
+    // Run 20 queries, measure average recall@k vs brute-force.
+    let mut total_recall = 0.0f64;
+    let queries = 20u64;
+    for q_seed in 5000..(5000 + queries) {
+        let mut state = q_seed
+            .wrapping_mul(2862933555777941757)
+            .wrapping_add(3037000493);
+        let raw: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
+                ((state >> 33) as f64 / (1u64 << 31) as f64) as f32 * 2.0 - 1.0
+            })
+            .collect();
+        let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        let query: Vec<f32> = raw.iter().map(|v| v / norm).collect();
+
+        let results = db
+            .query_vector(&query, k, None, db.snapshot())
+            .expect("vector search");
+        let result_ids: HashSet<_> = results.iter().map(|r| r.0).collect();
+
+        // Brute-force top-k by cosine similarity (dot product on unit vectors).
+        let mut scored: Vec<_> = all_vectors
+            .iter()
+            .map(|(rid, vec)| {
+                let dot: f32 = vec.iter().zip(&query).map(|(a, b)| a * b).sum();
+                (*rid, dot)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let truth_ids: HashSet<_> = scored.iter().take(k).map(|(rid, _)| *rid).collect();
+
+        let matches = result_ids.intersection(&truth_ids).count();
+        total_recall += matches as f64 / k as f64;
+    }
+    let avg_recall = total_recall / queries as f64;
+    assert!(
+        avg_recall >= 0.95,
+        "avg HNSW recall@{k} was {avg_recall}, expected >= 0.95"
+    );
 }
 
 #[test]
-#[ignore = "requires HNSW index"]
 fn a4_12_hnsw_with_mvcc_visibility() {
-    let _db = setup_ontology_db();
-    // TODO: insert vectors in phases, query at older snapshot with ANN overfetch, assert visibility + recall.
-    todo!("requires HNSW index");
+    let db = setup_ontology_db();
+    let dim = 32usize;
+
+    // Create a table with a vector column of the right dimension.
+    db.execute(
+        &format!("CREATE TABLE mvcc_items (id UUID PRIMARY KEY, embedding VECTOR({dim}))"),
+        &HashMap::new(),
+    )
+    .expect("create table");
+
+    // Phase 1: insert 1000 vectors and commit.
+    let tx1 = db.begin();
+    let mut phase1_rids = HashSet::new();
+    for i in 0..1_000u64 {
+        let rid = db
+            .insert_row(
+                tx1,
+                "mvcc_items",
+                HashMap::from([("id".to_string(), Value::Uuid(Uuid::new_v4()))]),
+            )
+            .expect("insert row");
+        let mut state = i.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let raw: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
+                ((state >> 33) as f64 / (1u64 << 31) as f64) as f32 * 2.0 - 1.0
+            })
+            .collect();
+        let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        let vec: Vec<f32> = raw.iter().map(|v| v / norm).collect();
+        db.insert_vector(tx1, rid, vec).expect("insert vec");
+        phase1_rids.insert(rid);
+    }
+    db.commit(tx1).expect("commit phase 1");
+    let snap_after_phase1 = db.snapshot();
+
+    // Phase 2: insert 200 more vectors and commit.
+    let tx2 = db.begin();
+    for i in 1_000..1_200u64 {
+        let rid = db
+            .insert_row(
+                tx2,
+                "mvcc_items",
+                HashMap::from([("id".to_string(), Value::Uuid(Uuid::new_v4()))]),
+            )
+            .expect("insert row");
+        let mut state = i.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let raw: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
+                ((state >> 33) as f64 / (1u64 << 31) as f64) as f32 * 2.0 - 1.0
+            })
+            .collect();
+        let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+        let vec: Vec<f32> = raw.iter().map(|v| v / norm).collect();
+        db.insert_vector(tx2, rid, vec).expect("insert vec");
+    }
+    db.commit(tx2).expect("commit phase 2");
+
+    // Query at the older snapshot — all results must be from phase 1 only.
+    let mut state = 9999u64
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
+    let raw: Vec<f32> = (0..dim)
+        .map(|_| {
+            state = state
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
+            ((state >> 33) as f64 / (1u64 << 31) as f64) as f32 * 2.0 - 1.0
+        })
+        .collect();
+    let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
+    let query: Vec<f32> = raw.iter().map(|v| v / norm).collect();
+
+    let results = db
+        .query_vector(&query, 10, None, snap_after_phase1)
+        .expect("query at old snapshot");
+    for (rid, _) in &results {
+        assert!(
+            phase1_rids.contains(rid),
+            "row {rid} should only be from phase 1 at old snapshot"
+        );
+    }
 }
 
 #[test]

@@ -17,7 +17,6 @@ fn hc_f01_ontology_ops() {
 }
 
 #[test]
-#[ignore = "requires HNSW ANN"]
 fn hc_f03_ignored_hnsw_recall() {}
 
 #[test]

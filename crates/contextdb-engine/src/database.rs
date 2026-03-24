@@ -11,7 +11,7 @@ use crate::sync_types::{
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
 use contextdb_parser::Statement;
-use contextdb_parser::ast::{CreateTable, DataType};
+use contextdb_parser::ast::{AlterAction, CreateTable, DataType};
 use contextdb_planner::PhysicalPlan;
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
 use contextdb_tx::{TxManager, WriteSetApplicator};
@@ -374,6 +374,47 @@ impl Database {
     fn ddl_change_for_statement(&self, stmt: &Statement) -> Option<DdlChange> {
         match stmt {
             Statement::CreateTable(ct) => Some(ddl_change_from_create_table(ct)),
+            Statement::DropTable(dt) => Some(DdlChange::DropTable {
+                name: dt.name.clone(),
+            }),
+            Statement::AlterTable(at) => {
+                let mut meta = self.table_meta(&at.table).unwrap_or_default();
+                // Simulate the alter action on a cloned meta to get post-alteration columns
+                match &at.action {
+                    AlterAction::AddColumn(col) => {
+                        meta.columns.push(contextdb_core::ColumnDef {
+                            name: col.name.clone(),
+                            column_type: crate::executor::map_column_type(&col.data_type),
+                            nullable: col.nullable,
+                            primary_key: col.primary_key,
+                            unique: col.unique,
+                            default: col.default.as_ref().map(|expr| format!("{expr:?}")),
+                        });
+                    }
+                    AlterAction::DropColumn(name) => {
+                        meta.columns.retain(|c| c.name != *name);
+                    }
+                    AlterAction::RenameColumn { from, to } => {
+                        if let Some(c) = meta.columns.iter_mut().find(|c| c.name == *from) {
+                            c.name = to.clone();
+                        }
+                    }
+                }
+                Some(DdlChange::AlterTable {
+                    name: at.table.clone(),
+                    columns: meta
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.name.clone(),
+                                sql_type_for_meta_column(c, &meta.propagation_rules),
+                            )
+                        })
+                        .collect(),
+                    constraints: create_table_constraints_from_meta(&meta),
+                })
+            }
             _ => None,
         }
     }

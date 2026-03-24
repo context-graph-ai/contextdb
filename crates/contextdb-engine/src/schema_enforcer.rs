@@ -22,6 +22,16 @@ pub fn validate_dml(
                 .ok_or_else(|| Error::NotFound(format!("table metadata not found: {}", p.table)))?;
             let existing_rows = db.scan(&p.table, db.snapshot())?;
 
+            // Validate that all INSERT columns exist in the table schema
+            for col_name in &p.columns {
+                if !table_meta.columns.iter().any(|c| c.name == *col_name) {
+                    return Err(Error::Other(format!(
+                        "column '{}' does not exist in table '{}'",
+                        col_name, p.table
+                    )));
+                }
+            }
+
             if p.on_conflict.is_none()
                 && let Some(id_idx) = p.columns.iter().position(|c| c == "id")
             {

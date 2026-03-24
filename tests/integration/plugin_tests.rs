@@ -359,6 +359,43 @@ impl DatabasePlugin for DecoratorPlugin {
     }
 }
 
+// ── DdlCapturingPlugin ───────────────────────────────────────────
+// Captures actual DdlChange values for precise variant assertions.
+struct DdlCapturingPlugin {
+    changes: Arc<Mutex<Vec<DdlChange>>>,
+}
+
+impl DatabasePlugin for DdlCapturingPlugin {
+    fn on_ddl(&self, change: &DdlChange) -> Result<()> {
+        self.changes.lock().unwrap().push(change.clone());
+        Ok(())
+    }
+}
+
+// ── DdlVetoPlugin ────────────────────────────────────────────────
+// Rejects on_ddl for a specific DdlChange variant (by name).
+struct DdlVetoPlugin {
+    reject_variant: String,
+}
+
+impl DatabasePlugin for DdlVetoPlugin {
+    fn on_ddl(&self, change: &DdlChange) -> Result<()> {
+        let variant_name = match change {
+            DdlChange::CreateTable { .. } => "CreateTable",
+            DdlChange::DropTable { .. } => "DropTable",
+            DdlChange::AlterTable { .. } => "AlterTable",
+        };
+        if variant_name == self.reject_variant {
+            Err(Error::PluginRejected {
+                hook: "on_ddl".to_string(),
+                reason: format!("{} is blocked by policy", variant_name),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Test Functions
 // ══════════════════════════════════════════════════════════════════
@@ -789,10 +826,249 @@ fn p14_on_ddl_fires_create_table() {
 }
 
 #[test]
-#[ignore = "requires DROP TABLE support and DdlChange::DropTable variant"]
 fn p15_on_ddl_fires_drop_table() {
-    // Placeholder — enable when DROP TABLE DDL tracking is implemented
-    panic!("not yet implemented: DROP TABLE DDL hook test");
+    let ddl_log: Arc<Mutex<Vec<DdlChange>>> = Arc::new(Mutex::new(Vec::new()));
+    let plugin = DdlCapturingPlugin {
+        changes: ddl_log.clone(),
+    };
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let p = HashMap::new();
+    db.execute("CREATE TABLE widgets (id UUID PRIMARY KEY, label TEXT)", &p)
+        .unwrap();
+
+    // Verify CREATE TABLE fired on_ddl
+    {
+        let log = ddl_log.lock().unwrap();
+        assert_eq!(log.len(), 1, "on_ddl must fire once for CREATE TABLE");
+        match &log[0] {
+            DdlChange::CreateTable { name, columns, .. } => {
+                assert_eq!(name, "widgets");
+                let col_names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(col_names.contains(&"id"), "must contain column 'id'");
+                assert!(col_names.contains(&"label"), "must contain column 'label'");
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    db.execute("DROP TABLE widgets", &p).unwrap();
+
+    // Verify DROP TABLE fired on_ddl
+    let log = ddl_log.lock().unwrap();
+    assert_eq!(log.len(), 2, "on_ddl must fire for both CREATE and DROP");
+    match &log[1] {
+        DdlChange::DropTable { name } => {
+            assert_eq!(name, "widgets", "DropTable must reference 'widgets'");
+        }
+        other => panic!("expected DropTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn p15b_on_ddl_fires_alter_table_add_column() {
+    let ddl_log: Arc<Mutex<Vec<DdlChange>>> = Arc::new(Mutex::new(Vec::new()));
+    let plugin = DdlCapturingPlugin {
+        changes: ddl_log.clone(),
+    };
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let p = HashMap::new();
+    db.execute("CREATE TABLE people (id UUID PRIMARY KEY, name TEXT)", &p)
+        .unwrap();
+
+    // Clear so we only see ALTER
+    ddl_log.lock().unwrap().clear();
+
+    db.execute("ALTER TABLE people ADD COLUMN age INTEGER", &p)
+        .unwrap();
+
+    let log = ddl_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "on_ddl must fire exactly once for ALTER TABLE ADD COLUMN"
+    );
+    match &log[0] {
+        DdlChange::AlterTable { name, columns, .. } => {
+            assert_eq!(name, "people", "AlterTable must reference 'people'");
+            // After ADD COLUMN age, the columns list should contain 'age'
+            let col_names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(
+                col_names.contains(&"age"),
+                "AlterTable columns must include added column 'age', got: {col_names:?}"
+            );
+        }
+        other => panic!("expected AlterTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn p15c_on_ddl_fires_alter_table_drop_column() {
+    let ddl_log: Arc<Mutex<Vec<DdlChange>>> = Arc::new(Mutex::new(Vec::new()));
+    let plugin = DdlCapturingPlugin {
+        changes: ddl_log.clone(),
+    };
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let p = HashMap::new();
+    db.execute(
+        "CREATE TABLE people (id UUID PRIMARY KEY, name TEXT, age INTEGER)",
+        &p,
+    )
+    .unwrap();
+
+    ddl_log.lock().unwrap().clear();
+
+    db.execute("ALTER TABLE people DROP COLUMN age", &p)
+        .unwrap();
+
+    let log = ddl_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "on_ddl must fire exactly once for ALTER TABLE DROP COLUMN"
+    );
+    match &log[0] {
+        DdlChange::AlterTable { name, columns, .. } => {
+            assert_eq!(name, "people", "AlterTable must reference 'people'");
+            // After DROP COLUMN age, the columns list should reflect the
+            // post-alteration schema (id, name) — 'age' should be absent.
+            let col_names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(
+                !col_names.contains(&"age"),
+                "AlterTable columns must NOT include dropped column 'age', got: {col_names:?}"
+            );
+            assert!(
+                col_names.contains(&"name"),
+                "AlterTable columns must still include 'name', got: {col_names:?}"
+            );
+        }
+        other => panic!("expected AlterTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn p15d_on_ddl_fires_alter_table_rename_column() {
+    let ddl_log: Arc<Mutex<Vec<DdlChange>>> = Arc::new(Mutex::new(Vec::new()));
+    let plugin = DdlCapturingPlugin {
+        changes: ddl_log.clone(),
+    };
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let p = HashMap::new();
+    db.execute("CREATE TABLE people (id UUID PRIMARY KEY, name TEXT)", &p)
+        .unwrap();
+
+    ddl_log.lock().unwrap().clear();
+
+    db.execute("ALTER TABLE people RENAME COLUMN name TO full_name", &p)
+        .unwrap();
+
+    let log = ddl_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "on_ddl must fire exactly once for ALTER TABLE RENAME COLUMN"
+    );
+    match &log[0] {
+        DdlChange::AlterTable { name, columns, .. } => {
+            assert_eq!(name, "people", "AlterTable must reference 'people'");
+            // After RENAME COLUMN name -> full_name, columns should contain
+            // 'full_name' and not 'name'.
+            let col_names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+            assert!(
+                col_names.contains(&"full_name"),
+                "AlterTable columns must include renamed column 'full_name', got: {col_names:?}"
+            );
+            assert!(
+                !col_names.contains(&"name"),
+                "AlterTable columns must NOT include old name 'name' after rename, got: {col_names:?}"
+            );
+        }
+        other => panic!("expected AlterTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn p15e_on_ddl_veto_drop_table() {
+    let plugin = DdlVetoPlugin {
+        reject_variant: "DropTable".to_string(),
+    };
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let p = HashMap::new();
+
+    // CREATE TABLE is AlterTable/CreateTable — not vetoed by this plugin
+    // (plugin only rejects DropTable)
+    db.execute("CREATE TABLE widgets (id UUID PRIMARY KEY, label TEXT)", &p)
+        .unwrap();
+
+    let result = db.execute("DROP TABLE widgets", &p);
+    assert!(
+        result.is_err(),
+        "DROP TABLE must be rejected when plugin vetoes DropTable"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, Error::PluginRejected { ref hook, .. } if hook == "on_ddl"),
+        "error must be PluginRejected at on_ddl hook, got: {err:?}"
+    );
+
+    // Table must still exist after veto
+    assert!(
+        db.table_names().contains(&"widgets".to_string()),
+        "table 'widgets' must still exist after vetoed DROP"
+    );
+
+    // Verify we can still query the table
+    let result = db.execute("SELECT * FROM widgets", &p).unwrap();
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "table must be queryable after vetoed DROP"
+    );
+}
+
+#[test]
+fn p15f_on_ddl_veto_alter_table() {
+    let plugin = DdlVetoPlugin {
+        reject_variant: "AlterTable".to_string(),
+    };
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let p = HashMap::new();
+
+    db.execute("CREATE TABLE people (id UUID PRIMARY KEY, name TEXT)", &p)
+        .unwrap();
+
+    let result = db.execute("ALTER TABLE people ADD COLUMN age INTEGER", &p);
+    assert!(
+        result.is_err(),
+        "ALTER TABLE must be rejected when plugin vetoes AlterTable"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, Error::PluginRejected { ref hook, .. } if hook == "on_ddl"),
+        "error must be PluginRejected at on_ddl hook, got: {err:?}"
+    );
+
+    // Schema must be unchanged — inserting with 'age' column should fail
+    let insert_result = db.execute(
+        "INSERT INTO people (id, name, age) VALUES ('00000000-0000-0000-0000-000000000001', 'alice', 30)",
+        &p,
+    );
+    assert!(
+        insert_result.is_err(),
+        "insert with 'age' column must fail because ALTER was vetoed"
+    );
+
+    // Original schema must work
+    db.execute(
+        "INSERT INTO people (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'bob')",
+        &p,
+    )
+    .unwrap();
+    let result = db.execute("SELECT * FROM people", &p).unwrap();
+    assert_eq!(
+        result.columns.len(),
+        2,
+        "schema must still have exactly 2 columns (id, name)"
+    );
 }
 
 #[test]
