@@ -330,24 +330,47 @@ INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('0
     }
 );
 
-// I pushed data that violated a server-side constraint, and the edge got back a clear "constraint" error instead of silently dropping the data.
-sync_red_test!(
-    f09f_server_side_constraint_violation_during_push_returns_error_to_edge,
-    ".sync push\n.quit\n",
-    |edge_path: &std::path::Path, _server_path: &std::path::Path, nats_url: &str| {
-        let output = run_cli_script(
-            edge_path,
-            &[
-                "--tenant-id",
-                "f09f_server_side_constraint_violation_during_push_returns_error_to_edge",
-                "--nats-url",
-                nats_url,
-            ],
-            ".sync push\n.quit\n",
-        );
-        assert!(output_string(&output.stdout).contains("constraint"));
-    }
-);
+/// I pushed a row with NULL in a NOT NULL column, and the CLI displayed the constraint violation reason.
+#[tokio::test]
+async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge() {
+    let (_tmp, edge_path, server_path, nats_url) =
+        setup_sync_env("f09f_server_side_constraint_violation_during_push_returns_error_to_edge")
+            .await;
+    let tenant = "f09f_server_side_constraint_violation_during_push_returns_error_to_edge";
+    let mut server = spawn_server(&server_path, tenant, &nats_url);
+
+    // Edge 1: create table WITH NOT NULL, insert a valid row, push to server via NATS
+    let edge1_path = edge_path.with_file_name("f09f-edge1.db");
+    let edge1_output = run_cli_script(
+        &edge1_path,
+        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL)\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid')\n\
+         .sync push\n\
+         .quit\n",
+    );
+    assert!(edge1_output.status.success());
+
+    // Edge 2: create table WITHOUT NOT NULL, insert a row with NULL name, push to server via NATS.
+    // The server (which received NOT NULL from edge1) should reject the NULL value.
+    let edge2_path = edge_path.with_file_name("f09f-edge2.db");
+    let violation_output = run_cli_script(
+        &edge2_path,
+        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+         INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002')\n\
+         .sync push\n\
+         .quit\n",
+    );
+    stop_child(&mut server);
+
+    let stdout = output_string(&violation_output.stdout).to_lowercase();
+    assert!(
+        stdout.contains("constraint") || stdout.contains("not null"),
+        "push output must contain constraint violation reason, got: {}",
+        stdout
+    );
+}
 
 // I tried to push while a transaction was still open, and the uncommitted rows did not end up on the server.
 sync_red_test!(
@@ -363,24 +386,44 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
     }
 );
 
-// I pulled data that conflicted with my local schema, and I got a clear "schema mismatch" message instead of a silent failure.
-sync_red_test!(
-    f09h_constraint_violations_during_sync_pull_are_handled,
-    ".quit\n",
-    |edge_path: &std::path::Path, _server_path: &std::path::Path, nats_url: &str| {
-        let pulled = run_cli_script(
-            edge_path,
-            &[
-                "--tenant-id",
-                "f09h_constraint_violations_during_sync_pull_are_handled",
-                "--nats-url",
-                nats_url,
-            ],
-            ".sync pull\n.quit\n",
-        );
-        assert!(output_string(&pulled.stdout).contains("schema mismatch"));
-    }
-);
+/// I pulled data whose schema differed from my local table, and the CLI showed "schema mismatch".
+#[tokio::test]
+async fn f09h_constraint_violations_during_sync_pull_are_handled() {
+    let (_tmp, edge_path, server_path, nats_url) =
+        setup_sync_env("f09h_constraint_violations_during_sync_pull_are_handled").await;
+    let tenant = "f09h_constraint_violations_during_sync_pull_are_handled";
+    let mut server = spawn_server(&server_path, tenant, &nats_url);
+
+    // Edge A pushes a table with columns (id UUID PK, name TEXT, reading REAL)
+    let edge_a_path = edge_path.with_file_name("f09h-edge-a.db");
+    let push_output = run_cli_script(
+        &edge_a_path,
+        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\n\
+         INSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 1.0)\n\
+         .sync push\n\
+         .quit\n",
+    );
+    assert!(push_output.status.success());
+
+    // Edge B has a DIFFERENT local schema (id UUID PK, label TEXT, score INTEGER)
+    let edge_b_path = edge_path.with_file_name("f09h-edge-b.db");
+    let pull_output = run_cli_script(
+        &edge_b_path,
+        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, label TEXT, score INTEGER)\n\
+         .sync pull\n\
+         .quit\n",
+    );
+    stop_child(&mut server);
+
+    let stdout = output_string(&pull_output.stdout).to_lowercase();
+    assert!(
+        stdout.contains("schema mismatch"),
+        "pull output must contain 'schema mismatch' when local and remote schemas differ, got: {}",
+        stdout
+    );
+}
 
 // I made conflicting state machine transitions on two edges, and the sync rejected or resolved the conflict explicitly instead of silently picking one.
 sync_red_test!(
