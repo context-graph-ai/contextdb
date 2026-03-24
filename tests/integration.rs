@@ -36,3 +36,7 @@ mod safety_integrity;
 mod state_propagation;
 #[path = "integration/subscription_tests.rs"]
 mod subscription_tests;
+#[path = "integration/retention_tests.rs"]
+mod retention_tests;
+#[path = "integration/acceptance_retention.rs"]
+mod acceptance_retention;

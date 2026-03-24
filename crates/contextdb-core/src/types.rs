@@ -69,6 +69,8 @@ pub struct VersionedRow {
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
     pub lsn: u64,
+    #[serde(default)]
+    pub created_at: Option<u64>,
 }
 
 impl VersionedRow {

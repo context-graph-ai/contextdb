@@ -245,6 +245,13 @@ pub struct CreateTable {
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
     pub propagation_rules: Vec<AstPropagationRule>,
+    pub retain: Option<RetainOption>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetainOption {
+    pub duration_seconds: u64,
+    pub sync_safe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +265,8 @@ pub enum AlterAction {
     AddColumn(ColumnDef),
     DropColumn(String),
     RenameColumn { from: String, to: String },
+    SetRetain { duration_seconds: u64, sync_safe: bool },
+    DropRetain,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +297,7 @@ pub struct ColumnDef {
     pub unique: bool,
     pub default: Option<Expr>,
     pub references: Option<ForeignKey>,
+    pub expires: bool,
 }
 
 #[derive(Debug, Clone)]

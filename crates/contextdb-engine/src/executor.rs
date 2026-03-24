@@ -29,6 +29,7 @@ pub(crate) fn execute_plan(
                         primary_key: c.primary_key,
                         unique: c.unique,
                         default: c.default.as_ref().map(|expr| format!("{expr:?}")),
+                        expires: false,
                     })
                     .collect(),
                 immutable: p.immutable,
@@ -43,6 +44,9 @@ pub(crate) fn execute_plan(
                 dag_edge_types: p.dag_edge_types.clone(),
                 natural_key_column: None,
                 propagation_rules: p.propagation_rules.clone(),
+                default_ttl_seconds: None,
+                sync_safe: false,
+                expires_column: None,
             };
             db.relational_store().create_table(&p.name, meta);
             if let Some(table_meta) = db.table_meta(&p.name) {
@@ -76,6 +80,7 @@ pub(crate) fn execute_plan(
                         primary_key: col.primary_key,
                         unique: col.unique,
                         default: col.default.as_ref().map(|expr| format!("{expr:?}")),
+                        expires: false,
                     };
                     store
                         .alter_table_add_column(&p.table, core_col)
@@ -91,10 +96,12 @@ pub(crate) fn execute_plan(
                         .alter_table_rename_column(&p.table, from, to)
                         .map_err(Error::Other)?;
                 }
+                AlterAction::SetRetain { .. } => { /* stub: no-op */ }
+                AlterAction::DropRetain => { /* stub: no-op */ }
             }
             if let Some(table_meta) = db.table_meta(&p.table) {
                 db.persist_table_meta(&p.table, &table_meta)?;
-                if !matches!(p.action, AlterAction::AddColumn(_)) {
+                if !matches!(p.action, AlterAction::AddColumn(_) | AlterAction::SetRetain { .. } | AlterAction::DropRetain) {
                     db.persist_table_rows(&p.table)?;
                 }
                 let lsn = db.next_lsn_for_ddl();
@@ -1800,7 +1807,7 @@ pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
         DataType::Integer => contextdb_core::ColumnType::Integer,
         DataType::Real => contextdb_core::ColumnType::Real,
         DataType::Boolean => contextdb_core::ColumnType::Boolean,
-        DataType::Timestamp => contextdb_core::ColumnType::Text,
+        DataType::Timestamp => contextdb_core::ColumnType::Timestamp,
         DataType::Json => contextdb_core::ColumnType::Json,
         DataType::Vector(dim) => contextdb_core::ColumnType::Vector(*dim as usize),
     }

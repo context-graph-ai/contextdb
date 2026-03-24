@@ -275,6 +275,7 @@ fn render_column_type(col_type: &ColumnType) -> String {
         ColumnType::Json => "JSON".to_string(),
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
+        ColumnType::Timestamp => "TIMESTAMP".to_string(),
     }
 }
 

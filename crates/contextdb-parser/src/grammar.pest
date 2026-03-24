@@ -116,7 +116,9 @@ create_table_stmt = {
 if_not_exists = { ^"IF" ~ ^"NOT" ~ ^"EXISTS" }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
-alter_action = { add_column_action | drop_column_action | rename_column_action }
+alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action }
+set_retain_action = { ^"SET" ~ ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
+drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
 add_column_action = { ^"ADD" ~ (^"COLUMN")? ~ column_def }
 drop_column_action = { ^"DROP" ~ ^"COLUMN" ~ identifier }
 rename_column_action = { ^"RENAME" ~ ^"COLUMN" ~ identifier ~ ^"TO" ~ identifier }
@@ -145,7 +147,9 @@ column_constraint = {
     | default_clause
     | references_clause
     | fk_propagation_clause
+    | expires_constraint
 }
+expires_constraint = { ^"EXPIRES" }
 not_null = { ^"NOT" ~ ^"NULL" }
 primary_key = { ^"PRIMARY" ~ ^"KEY" }
 unique = { ^"UNIQUE" }
@@ -168,7 +172,11 @@ table_option = {
     | dag_option
     | propagate_edge_option
     | propagate_state_option
+    | retain_option
 }
+retain_option = { ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
+retain_unit = { ^"SECONDS" | ^"MINUTES" | ^"HOURS" | ^"DAYS" }
+sync_safe_option = { ^"SYNC" ~ ^"SAFE" }
 immutable_option = { ^"IMMUTABLE" }
 state_machine_option = { ^"STATE" ~ ^"MACHINE" ~ "(" ~ state_machine_entries ~ ")" }
 state_machine_entries = { state_machine_entry ~ ("," ~ state_machine_entry)* }

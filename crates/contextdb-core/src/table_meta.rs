@@ -12,6 +12,12 @@ pub struct TableMeta {
     pub natural_key_column: Option<String>,
     #[serde(default)]
     pub propagation_rules: Vec<PropagationRule>,
+    #[serde(default)]
+    pub default_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub sync_safe: bool,
+    #[serde(default)]
+    pub expires_column: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +60,8 @@ pub struct ColumnDef {
     pub unique: bool,
     #[serde(default)]
     pub default: Option<String>,
+    #[serde(default)]
+    pub expires: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,4 +73,5 @@ pub enum ColumnType {
     Json,
     Uuid,
     Vector(usize),
+    Timestamp,
 }

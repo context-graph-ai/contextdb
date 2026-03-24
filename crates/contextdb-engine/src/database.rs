@@ -465,6 +465,7 @@ impl Database {
                             primary_key: col.primary_key,
                             unique: col.unique,
                             default: col.default.as_ref().map(|expr| format!("{expr:?}")),
+                            expires: false,
                         });
                     }
                     AlterAction::DropColumn(name) => {
@@ -475,6 +476,8 @@ impl Database {
                             c.name = to.clone();
                         }
                     }
+                    AlterAction::SetRetain { .. } => { /* stub: no-op */ }
+                    AlterAction::DropRetain => { /* stub: no-op */ }
                 }
                 Some(DdlChange::AlterTable {
                     name: at.table.clone(),
@@ -987,6 +990,24 @@ impl Database {
 
     pub fn table_meta(&self, table: &str) -> Option<TableMeta> {
         self.relational_store.table_meta(table)
+    }
+
+    /// Run one pruning cycle. Called by the background loop or manually in tests.
+    pub fn run_pruning_cycle(&self) -> u64 {
+        0 // stub: never prunes anything — all pruning tests fail
+    }
+
+    /// Set the pruning loop interval. Test-only API.
+    pub fn set_pruning_interval(&self, _interval: std::time::Duration) {
+        // stub: no background loop exists
+    }
+
+    pub fn sync_watermark(&self) -> u64 {
+        0 // stub: always 0
+    }
+
+    pub fn set_sync_watermark(&self, _watermark: u64) {
+        // stub: no-op
     }
 
     pub fn instance_id(&self) -> uuid::Uuid {
@@ -2034,6 +2055,7 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
         ColumnType::Json => "JSON".to_string(),
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
+        ColumnType::Timestamp => "TIMESTAMP".to_string(),
     };
 
     let fk_rules = rules

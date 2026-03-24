@@ -126,6 +126,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             created_tx: tx,
             deleted_tx: None,
             lsn: 0,
+            created_at: None, // stub: never stamped
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {

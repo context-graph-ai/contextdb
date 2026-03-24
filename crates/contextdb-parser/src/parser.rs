@@ -1022,6 +1022,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         state_machine,
         dag_edge_types,
         propagation_rules,
+        retain: None, // stub: grammar accepts RETAIN but AST builder discards it
     })
 }
 
@@ -1081,6 +1082,13 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
                 Error::ParseError("RENAME COLUMN missing target name".to_string())
             })?;
             Ok(AlterAction::RenameColumn { from, to })
+        }
+        Rule::set_retain_action => {
+            // stub: parse but return dummy values
+            Ok(AlterAction::SetRetain { duration_seconds: 0, sync_safe: false })
+        }
+        Rule::drop_retain_action => {
+            Ok(AlterAction::DropRetain)
         }
         _ => Err(Error::ParseError(
             "unsupported ALTER TABLE action".to_string(),
@@ -1146,6 +1154,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
         unique,
         default,
         references,
+        expires: false, // stub: grammar accepts EXPIRES but AST builder discards it
     })
 }
 
