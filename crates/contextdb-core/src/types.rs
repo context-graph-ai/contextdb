@@ -19,8 +19,24 @@ pub enum Value {
     Text(String),
     Uuid(Uuid),
     Timestamp(i64),
-    Json(serde_json::Value),
+    /// JSON values are serialized as strings for bincode compatibility.
+    /// `serde_json::Value` uses `deserialize_any` which bincode does not support.
+    Json(#[serde(with = "json_as_string")] serde_json::Value),
     Vector(Vec<f32>),
+}
+
+mod json_as_string {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &serde_json::Value, ser: S) -> Result<S::Ok, S::Error> {
+        let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+        s.serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<serde_json::Value, D::Error> {
+        let s = String::deserialize(de)?;
+        serde_json::from_str(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Value {

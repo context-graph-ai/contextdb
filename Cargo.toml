@@ -29,7 +29,7 @@ async-nats = "0.46"
 tokio = { version = "1", features = ["full"] }
 rmp-serde = "1"
 clap = { version = "4", features = ["derive", "env"] }
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 redb = "3"
 bincode = { version = "2", features = ["serde"] }
 tempfile = "3"

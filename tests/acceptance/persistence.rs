@@ -289,25 +289,64 @@ fn f05e_propagation_rules_survive_persistence_reopen() {
     assert_eq!(text_value(&child, "status"), "archived");
 }
 
-/// I inserted a row with every column type (UUID, TEXT, INTEGER, REAL, BOOLEAN, VECTOR), quit, reopened, and every value came back exactly right.
+/// I inserted a row with every column type (UUID, TEXT, INTEGER, REAL, BOOLEAN, TIMESTAMP, VECTOR), quit, reopened, and every value came back exactly right.
 #[test]
 fn f05f_all_data_types_round_trip_through_persistence() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f05f.db");
-    let script = "\
-CREATE TABLE everything (id UUID PRIMARY KEY, note TEXT, count INTEGER, reading REAL, enabled BOOLEAN, embedding VECTOR(3))\n\
-INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('00000000-0000-0000-0000-000000000001', 'hello', 7, 3.5, true, [1.0, 2.0, 3.0])\n\
-.quit\n";
-    let _ = run_cli_script(&db_path, &[], script);
+    let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
 
-    let reopened = run_cli_script(&db_path, &[], "SELECT * FROM everything\n.quit\n");
-    let stdout = output_string(&reopened.stdout);
-    assert!(reopened.status.success());
-    assert!(stdout.contains("hello"));
-    assert!(stdout.contains("7"));
-    assert!(stdout.contains("3.5"));
-    assert!(stdout.contains("true"));
-    assert!(stdout.contains("[1.0, 2.0, 3.0]"));
+    // Insert a row with every persistable column type
+    {
+        let db = Database::open(&db_path).expect("open db");
+        db.execute(
+            "CREATE TABLE everything (id UUID PRIMARY KEY, note TEXT, count INTEGER, reading REAL, enabled BOOLEAN, happened_at TIMESTAMP, embedding VECTOR(3))",
+            &empty_params(),
+        )
+        .expect("create everything table");
+        db.execute(
+            "INSERT INTO everything (id, note, count, reading, enabled, happened_at, embedding) VALUES ($id, $note, $count, $reading, $enabled, $ts, $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("note", Value::Text("hello".into())),
+                ("count", Value::Int64(7)),
+                ("reading", Value::Float64(3.5)),
+                ("enabled", Value::Bool(true)),
+                ("ts", Value::Timestamp(1700000000)),
+                ("embedding", Value::Vector(vec![1.0, 2.0, 3.0])),
+            ]),
+        )
+        .expect("insert row with all types");
+        db.close().expect("close db");
+    }
+
+    // Reopen and verify every value round-tripped correctly
+    let reopened = Database::open(&db_path).expect("reopen db");
+    let result = reopened
+        .execute("SELECT * FROM everything", &empty_params())
+        .expect("select everything");
+    assert_eq!(result.rows.len(), 1, "expected exactly one row");
+    let row = &result.rows[0];
+
+    // Map columns to values for easier assertions
+    let col_idx = |name: &str| {
+        result
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("column {name} not found"))
+    };
+
+    assert_eq!(row[col_idx("id")], Value::Uuid(id));
+    assert_eq!(row[col_idx("note")], Value::Text("hello".into()));
+    assert_eq!(row[col_idx("count")], Value::Int64(7));
+    assert_eq!(row[col_idx("reading")], Value::Float64(3.5));
+    assert_eq!(row[col_idx("enabled")], Value::Bool(true));
+    assert_eq!(row[col_idx("happened_at")], Value::Timestamp(1700000000));
+    assert_eq!(
+        row[col_idx("embedding")],
+        Value::Vector(vec![1.0, 2.0, 3.0])
+    );
 }
 
 /// I stored relational, graph, and vector data in the same table, quit, reopened, and a combined graph+vector query returned the same results both times.

@@ -347,6 +347,13 @@ impl Database {
             self.plugin.on_ddl(change)?;
         }
 
+        // Handle INSERT INTO GRAPH as a virtual table routing to the graph store.
+        if let Statement::Insert(ins) = stmt
+            && ins.table.eq_ignore_ascii_case("GRAPH")
+        {
+            return self.execute_graph_insert(ins, params, tx);
+        }
+
         let started = Instant::now();
         let result = (|| {
             // Pre-resolve InSubquery expressions with CTE context before planning
@@ -369,6 +376,69 @@ impl Database {
         let outcome = query_outcome_from_result(&result);
         self.plugin.post_query(sql, duration, &outcome);
         result.map(strip_internal_row_id)
+    }
+
+    /// Handle `INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES (...)`.
+    fn execute_graph_insert(
+        &self,
+        ins: &contextdb_parser::ast::Insert,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+    ) -> Result<QueryResult> {
+        use crate::executor::resolve_expr;
+
+        let col_index = |name: &str| {
+            ins.columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+        };
+        let source_idx = col_index("source_id")
+            .ok_or_else(|| Error::PlanError("GRAPH INSERT requires source_id column".into()))?;
+        let target_idx = col_index("target_id")
+            .ok_or_else(|| Error::PlanError("GRAPH INSERT requires target_id column".into()))?;
+        let edge_type_idx = col_index("edge_type")
+            .ok_or_else(|| Error::PlanError("GRAPH INSERT requires edge_type column".into()))?;
+
+        let auto_commit = tx.is_none();
+        let tx = tx.unwrap_or_else(|| self.begin());
+        let mut count = 0u64;
+        for row_exprs in &ins.values {
+            let source = resolve_expr(&row_exprs[source_idx], params)?;
+            let target = resolve_expr(&row_exprs[target_idx], params)?;
+            let edge_type = resolve_expr(&row_exprs[edge_type_idx], params)?;
+
+            let source_uuid = match &source {
+                Value::Uuid(u) => *u,
+                Value::Text(t) => uuid::Uuid::parse_str(t)
+                    .map_err(|e| Error::PlanError(format!("invalid source_id uuid: {e}")))?,
+                _ => return Err(Error::PlanError("source_id must be UUID".into())),
+            };
+            let target_uuid = match &target {
+                Value::Uuid(u) => *u,
+                Value::Text(t) => uuid::Uuid::parse_str(t)
+                    .map_err(|e| Error::PlanError(format!("invalid target_id uuid: {e}")))?,
+                _ => return Err(Error::PlanError("target_id must be UUID".into())),
+            };
+            let edge_type_str = match &edge_type {
+                Value::Text(t) => t.clone(),
+                _ => return Err(Error::PlanError("edge_type must be TEXT".into())),
+            };
+
+            self.insert_edge(
+                tx,
+                source_uuid,
+                target_uuid,
+                edge_type_str,
+                Default::default(),
+            )?;
+            count += 1;
+        }
+
+        if auto_commit {
+            self.commit_with_source(tx, CommitSource::AutoCommit)?;
+        }
+
+        Ok(QueryResult::empty_with_affected(count))
     }
 
     fn ddl_change_for_statement(&self, stmt: &Statement) -> Option<DdlChange> {

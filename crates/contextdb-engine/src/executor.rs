@@ -138,48 +138,59 @@ pub(crate) fn execute_plan(
             direction,
             min_depth,
             max_depth,
-            ..
+            filter,
         } => {
-            let start = match resolve_uuid(start_expr, params) {
-                Ok(start) => Some(start),
+            let start_uuids = match resolve_uuid(start_expr, params) {
+                Ok(start) => vec![start],
                 Err(Error::PlanError(_))
                     if matches!(
                         start_expr,
                         Expr::Column(contextdb_parser::ast::ColumnRef { table: None, .. })
                     ) =>
                 {
-                    None
+                    // Start node not directly specified — check if the filter can help
+                    if let Some(filter_expr) = filter {
+                        resolve_graph_start_nodes_from_filter(db, filter_expr, params)?
+                    } else {
+                        vec![]
+                    }
                 }
                 Err(err) => return Err(err),
             };
-            let Some(start) = start else {
+            if start_uuids.is_empty() {
                 return Ok(QueryResult {
                     columns: vec!["id".to_string(), "depth".to_string()],
                     rows: vec![],
                     rows_affected: 0,
                 });
-            };
+            }
             let edge_types_ref = if edge_types.is_empty() {
                 None
             } else {
                 Some(edge_types.as_slice())
             };
-            let res = db.graph().bfs(
-                start,
-                edge_types_ref,
-                *direction,
-                *min_depth,
-                *max_depth,
-                db.snapshot(),
-            )?;
+
+            let mut all_rows = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for start in &start_uuids {
+                let res = db.graph().bfs(
+                    *start,
+                    edge_types_ref,
+                    *direction,
+                    *min_depth,
+                    *max_depth,
+                    db.snapshot(),
+                )?;
+                for n in res.nodes {
+                    if seen.insert(n.id) {
+                        all_rows.push(vec![Value::Uuid(n.id), Value::Int64(n.depth as i64)]);
+                    }
+                }
+            }
 
             Ok(QueryResult {
                 columns: vec!["id".to_string(), "depth".to_string()],
-                rows: res
-                    .nodes
-                    .into_iter()
-                    .map(|n| vec![Value::Uuid(n.id), Value::Int64(n.depth as i64)])
-                    .collect(),
+                rows: all_rows,
                 rows_affected: 0,
             })
         }
@@ -853,7 +864,7 @@ fn eval_expr_value(
     }
 }
 
-fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
+pub fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
     match expr {
         Expr::Literal(l) => Ok(match l {
             Literal::Null => Value::Null,
@@ -1676,6 +1687,64 @@ fn resolve_uuid(expr: &Expr, params: &HashMap<String, Value>) -> Result<uuid::Uu
         _ => Err(Error::PlanError(
             "graph start node must be UUID".to_string(),
         )),
+    }
+}
+
+/// Resolve start nodes for a graph BFS from a WHERE filter like `a.name = 'entity-0'`.
+/// Scans all relational tables for rows matching the filter condition.
+fn resolve_graph_start_nodes_from_filter(
+    db: &Database,
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<uuid::Uuid>> {
+    // Extract column name and expected value from the filter (e.g., a.name = 'entity-0')
+    let (col_name, expected_value) = match filter {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            if let Some(col) = extract_column_name(left) {
+                (col, resolve_expr(right, params)?)
+            } else if let Some(col) = extract_column_name(right) {
+                (col, resolve_expr(left, params)?)
+            } else {
+                return Ok(vec![]);
+            }
+        }
+        _ => return Ok(vec![]),
+    };
+
+    let snapshot = db.snapshot();
+    let mut uuids = Vec::new();
+    for table_name in db.table_names() {
+        let meta = match db.table_meta(&table_name) {
+            Some(m) => m,
+            None => continue,
+        };
+        // Only scan tables that have the referenced column and an id column
+        let has_col = meta.columns.iter().any(|c| c.name == col_name);
+        let has_id = meta.columns.iter().any(|c| c.name == "id");
+        if !has_col || !has_id {
+            continue;
+        }
+        let rows = db.scan_filter(&table_name, snapshot, &|row| {
+            row.values.get(&col_name) == Some(&expected_value)
+        })?;
+        for row in rows {
+            if let Some(Value::Uuid(id)) = row.values.get("id") {
+                uuids.push(*id);
+            }
+        }
+    }
+    Ok(uuids)
+}
+
+/// Extract a bare column name from an Expr::Column, ignoring table alias.
+fn extract_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(contextdb_parser::ast::ColumnRef { column, .. }) => Some(column.clone()),
+        _ => None,
     }
 }
 

@@ -88,6 +88,9 @@ impl SyncClient {
     }
 
     pub async fn push(&self) -> Result<ApplyResult, Error> {
+        // Verify NATS connectivity early so users get a clear error even for empty pushes.
+        let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
+
         let since = self.push_watermark.load(Ordering::SeqCst);
         // Clone directions out of RwLock BEFORE any .await
         let directions = self.table_directions.read().unwrap().clone();
@@ -108,8 +111,6 @@ impl SyncClient {
                 new_lsn: self.db.current_lsn(),
             });
         }
-
-        let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
 
         let mut total = ApplyResult {
             applied_rows: 0,

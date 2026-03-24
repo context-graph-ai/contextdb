@@ -6,16 +6,22 @@ use contextdb_server::SyncClient;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::Arc;
 
+/// Run the REPL loop. Returns `true` if all commands succeeded, `false` if any error occurred.
 pub fn run(
     db: Arc<Database>,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
-) {
+) -> bool {
     let mut rl = DefaultEditor::new().expect("failed to initialize readline");
-    println!("ContextDB v{}", env!("CARGO_PKG_VERSION"));
-    println!("Enter .help for usage hints.");
+    if std::io::stdin().is_terminal() {
+        eprintln!("ContextDB v{}", env!("CARGO_PKG_VERSION"));
+        eprintln!("Enter .help for usage hints.");
+    }
+
+    let mut had_error = false;
 
     loop {
         let readline = rl.readline("contextdb> ");
@@ -31,14 +37,16 @@ pub fn run(
                     if !handle_meta_command(&db, sync_client, rt, line) {
                         break;
                     }
-                } else {
-                    execute_sql(&db, line);
+                } else if !execute_sql(&db, line) {
+                    had_error = true;
                 }
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(_) => break,
         }
     }
+
+    !had_error
 }
 
 pub(crate) fn handle_meta_command(
@@ -76,16 +84,16 @@ pub(crate) fn handle_meta_command(
         }
         ".schema" | "\\d" => {
             if rest.is_empty() {
-                println!("Usage: .schema <table> or \\d <table>");
+                eprintln!("Usage: .schema <table> or \\d <table>");
             } else if let Some(meta) = db.table_meta(rest) {
                 print_table_meta(rest, &meta);
             } else {
-                println!("Table not found: {rest}");
+                eprintln!("Table not found: {rest}");
             }
         }
         ".explain" => {
             if rest.is_empty() {
-                println!("Usage: .explain <sql>");
+                eprintln!("Usage: .explain <sql>");
             } else {
                 match db.explain(rest) {
                     Ok(plan) => println!("{}", plan),
@@ -270,7 +278,8 @@ fn render_column_type(col_type: &ColumnType) -> String {
     }
 }
 
-fn execute_sql(db: &Database, sql: &str) {
+/// Execute a SQL statement and print the result. Returns `true` on success, `false` on error.
+fn execute_sql(db: &Database, sql: &str) -> bool {
     match db.execute(sql, &HashMap::new()) {
         Ok(result) => {
             if result.columns.is_empty() {
@@ -278,8 +287,12 @@ fn execute_sql(db: &Database, sql: &str) {
             } else {
                 println!("{}", format_query_result(&result));
             }
+            true
         }
-        Err(e) => eprintln!("Error: {}", e),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            false
+        }
     }
 }
 

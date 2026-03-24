@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::sync::Arc;
+use tracing::debug;
 
 mod formatter;
 mod repl;
@@ -24,8 +25,13 @@ struct Args {
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let args = Args::parse();
 
+    debug!(path = %args.path, "opening database");
     let db = if args.path == ":memory:" {
         contextdb_engine::Database::open_memory()
     } else {
@@ -59,7 +65,7 @@ fn main() {
         None => (None, None),
     };
 
-    repl::run(db.clone(), sync_client, rt);
+    let all_ok = repl::run(db.clone(), sync_client, rt);
 
     if let Err(e) = db.close() {
         eprintln!("Error: failed to close database: {e}");
@@ -72,5 +78,9 @@ fn main() {
         rt.block_on(async {
             drop(client);
         });
+    }
+
+    if !all_ok {
+        std::process::exit(1);
     }
 }

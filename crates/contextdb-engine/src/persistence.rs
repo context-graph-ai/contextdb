@@ -2,7 +2,7 @@ use contextdb_core::{AdjEntry, Error, Result, TableMeta, VectorEntry, VersionedR
 use contextdb_tx::WriteSet;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const GRAPH_FWD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_fwd");
@@ -10,25 +10,54 @@ const GRAPH_REV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("gra
 const VECTORS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("vectors");
 
 pub struct RedbPersistence {
-    path: PathBuf,
+    path: std::path::PathBuf,
 }
 
 impl RedbPersistence {
     pub fn create(path: &Path) -> Result<Self> {
-        redb::Database::create(path).map_err(Self::storage_error)?;
+        let _db = redb::Database::create(path).map_err(Self::storage_error)?;
+        Self::acquire_pid_lock(path)?;
         Ok(Self {
             path: path.to_path_buf(),
         })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        redb::Database::open(path).map_err(Self::storage_error)?;
+        Self::acquire_pid_lock(path)?;
+        let _db = redb::Database::open(path).map_err(Self::storage_error)?;
         Ok(Self {
             path: path.to_path_buf(),
         })
     }
 
-    pub fn close(&self) {}
+    pub fn close(&self) {
+        Self::release_pid_lock(&self.path);
+    }
+
+    /// PID-based advisory lock. Writes current PID to a .lock file.
+    /// On open, checks if the .lock file exists and if the PID in it is still alive.
+    fn acquire_pid_lock(path: &Path) -> Result<()> {
+        let lock_path = path.with_extension("lock");
+        if lock_path.exists()
+            && let Ok(contents) = std::fs::read_to_string(&lock_path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            let proc_path = format!("/proc/{}", pid);
+            if std::path::Path::new(&proc_path).exists() && pid != std::process::id() {
+                return Err(Error::Other(
+                    "database is locked (another process may have it open)".to_string(),
+                ));
+            }
+            // Either PID not running (stale lock) or same process — overwrite
+        }
+        std::fs::write(&lock_path, std::process::id().to_string()).map_err(Self::storage_error)?;
+        Ok(())
+    }
+
+    fn release_pid_lock(path: &Path) {
+        let lock_path = path.with_extension("lock");
+        let _ = std::fs::remove_file(&lock_path);
+    }
 
     pub fn flush_data(&self, ws: &WriteSet) -> Result<()> {
         self.with_db(|db| {
@@ -368,11 +397,24 @@ impl RedbPersistence {
     }
 
     fn storage_error(err: impl std::fmt::Display) -> Error {
-        Error::Other(format!("redb error: {err}"))
+        let msg = err.to_string();
+        if msg.contains("lock") || msg.contains("already open") {
+            Error::Other(format!(
+                "database is locked (another process may have it open): {msg}"
+            ))
+        } else {
+            Error::Other(format!("redb error: {msg}"))
+        }
     }
 
     fn with_db<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
         let db = redb::Database::open(&self.path).map_err(Self::storage_error)?;
         f(&db)
+    }
+}
+
+impl Drop for RedbPersistence {
+    fn drop(&mut self) {
+        Self::release_pid_lock(&self.path);
     }
 }
