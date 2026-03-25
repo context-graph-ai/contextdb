@@ -1085,11 +1085,12 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
         }
         Rule::set_retain_action => {
             // stub: parse but return dummy values
-            Ok(AlterAction::SetRetain { duration_seconds: 0, sync_safe: false })
+            Ok(AlterAction::SetRetain {
+                duration_seconds: 0,
+                sync_safe: false,
+            })
         }
-        Rule::drop_retain_action => {
-            Ok(AlterAction::DropRetain)
-        }
+        Rule::drop_retain_action => Ok(AlterAction::DropRetain),
         _ => Err(Error::ParseError(
             "unsupported ALTER TABLE action".to_string(),
         )),

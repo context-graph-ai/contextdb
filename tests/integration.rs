@@ -1,3 +1,5 @@
+#[path = "integration/acceptance_retention.rs"]
+mod acceptance_retention;
 #[path = "integration/alter_table_tests.rs"]
 mod alter_table_tests;
 #[path = "integration/anti_tests.rs"]
@@ -30,13 +32,11 @@ mod memory_accounting_tests;
 mod persistence_tests;
 #[path = "integration/plugin_tests.rs"]
 mod plugin_tests;
+#[path = "integration/retention_tests.rs"]
+mod retention_tests;
 #[path = "integration/safety_integrity.rs"]
 mod safety_integrity;
 #[path = "integration/state_propagation.rs"]
 mod state_propagation;
 #[path = "integration/subscription_tests.rs"]
 mod subscription_tests;
-#[path = "integration/retention_tests.rs"]
-mod retention_tests;
-#[path = "integration/acceptance_retention.rs"]
-mod acceptance_retention;

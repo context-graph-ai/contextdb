@@ -52,9 +52,12 @@ fn a_rt2_rows_disappear_after_ttl() {
 #[test]
 fn a_rt3_alter_table_set_retain() {
     let db = Database::open_memory();
-    db.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT)", &p()).unwrap();
-    db.execute("INSERT INTO logs (id, msg) VALUES (1, 'a')", &p()).unwrap();
-    db.execute("ALTER TABLE logs SET RETAIN 1 SECONDS", &p()).unwrap();
+    db.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT)", &p())
+        .unwrap();
+    db.execute("INSERT INTO logs (id, msg) VALUES (1, 'a')", &p())
+        .unwrap();
+    db.execute("ALTER TABLE logs SET RETAIN 1 SECONDS", &p())
+        .unwrap();
     thread::sleep(Duration::from_secs(2));
     db.run_pruning_cycle();
     assert_eq!(
@@ -75,7 +78,8 @@ fn a_rt4_alter_table_drop_retain() {
     )
     .unwrap();
     db.execute("ALTER TABLE logs DROP RETAIN", &p()).unwrap();
-    db.execute("INSERT INTO logs (id, msg) VALUES (1, 'a')", &p()).unwrap();
+    db.execute("INSERT INTO logs (id, msg) VALUES (1, 'a')", &p())
+        .unwrap();
     thread::sleep(Duration::from_secs(2));
     db.run_pruning_cycle();
     assert_eq!(

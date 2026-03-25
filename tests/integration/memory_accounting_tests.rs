@@ -89,8 +89,14 @@ fn m02_insert_rejected_when_budget_exceeded() {
             assert_eq!(subsystem, "insert");
             assert!(!operation.is_empty());
             assert!(*requested_bytes > 0);
-            assert!(*budget_limit_bytes == 64);
-            assert!(*available_bytes <= 64);
+            assert_eq!(
+                *budget_limit_bytes, 4096,
+                "budget_limit_bytes must be the total budget"
+            );
+            assert!(
+                *available_bytes < *requested_bytes,
+                "available must be less than requested for rejection"
+            );
             assert!(!hint.is_empty(), "hint must be non-empty for AI agents");
         }
         other => panic!("expected MemoryBudgetExceeded, got: {other:?}"),
@@ -204,7 +210,10 @@ fn m04_vector_search_succeeds_under_budget() {
     }
 
     // Accountant must track vector memory from the inserts above.
-    assert!(db.accountant().usage().used > 0, "accountant must track vector memory");
+    assert!(
+        db.accountant().usage().used > 0,
+        "accountant must track vector memory"
+    );
 
     // Vector search under budget must succeed.
     let result = db.execute(
@@ -346,7 +355,10 @@ fn m07_bfs_succeeds_under_budget() {
     db.commit(tx).unwrap();
 
     // Accountant must track BFS frontier memory.
-    assert!(db.accountant().usage().used > 0, "accountant must track BFS frontier memory");
+    assert!(
+        db.accountant().usage().used > 0,
+        "accountant must track BFS frontier memory"
+    );
 
     // BFS from A should reach B and C.
     let result = db.execute(
@@ -817,5 +829,266 @@ fn m18_ddl_memory_accounted() {
     assert!(
         used_after_create > used_before,
         "CREATE TABLE must increase used: before={used_before}, after={used_after_create}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MT1 — RED: DROP TABLE releases accounting for rows + metadata
+// ---------------------------------------------------------------------------
+#[test]
+fn mt1_drop_table_releases_accounting() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(10 * 1024 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    // Insert several rows to build up accounting.
+    for i in 0..20 {
+        db.execute(
+            "INSERT INTO items (id, name) VALUES ($id, $name)",
+            &make_params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("name", Value::Text(format!("row-{i}"))),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let used_before_drop = accountant.usage().used;
+    assert!(
+        used_before_drop > 0,
+        "must have accounted bytes before DROP"
+    );
+
+    // DROP TABLE must release all row + metadata bytes.
+    db.execute("DROP TABLE items", &empty()).unwrap();
+
+    let used_after_drop = accountant.usage().used;
+    assert!(
+        used_after_drop < used_before_drop,
+        "DROP TABLE must release accounting: before={used_before_drop}, after={used_after_drop}"
+    );
+
+    // Re-create and re-insert should succeed — freed memory is reusable.
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let result = db.execute(
+        "INSERT INTO items (id, name) VALUES ($id, $name)",
+        &make_params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("name", Value::Text("after-drop".to_string())),
+        ]),
+    );
+    assert!(
+        result.is_ok(),
+        "INSERT after DROP TABLE must succeed: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MT2 — RED: UPDATE rejection leaves accounting unchanged
+// ---------------------------------------------------------------------------
+#[test]
+fn mt2_update_rejection_leaves_accounting_unchanged() {
+    // Budget tight enough that a large UPDATE will be rejected.
+    let accountant = Arc::new(MemoryAccountant::with_budget(2048));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO items (id, name) VALUES ($id, $name)",
+        &make_params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("small".to_string())),
+        ]),
+    )
+    .unwrap();
+
+    let used_before_update = accountant.usage().used;
+
+    // Attempt an UPDATE to a very large value — should fail.
+    let result = db.execute(
+        "UPDATE items SET name = $name WHERE id = $id",
+        &make_params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("x".repeat(4096))),
+        ]),
+    );
+    assert!(result.is_err(), "UPDATE exceeding budget must fail");
+
+    let used_after_update = accountant.usage().used;
+    assert_eq!(
+        used_after_update, used_before_update,
+        "failed UPDATE must not change accounting: before={used_before_update}, after={used_after_update}"
+    );
+
+    // Verify original row data is unchanged.
+    let select = db
+        .execute(
+            "SELECT name FROM items WHERE id = $id",
+            &make_params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(select.rows.len(), 1);
+    assert_eq!(
+        select.rows[0][0],
+        Value::Text("small".to_string()),
+        "original row must be unchanged after failed UPDATE"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MT3 — RED: Vector bytes released on DELETE
+// ---------------------------------------------------------------------------
+#[test]
+fn mt3_vector_bytes_released_on_delete() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(10 * 1024 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(384))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, $emb)",
+        &make_params(vec![
+            ("id", Value::Uuid(id)),
+            ("emb", Value::Vector(vec![0.1; 384])),
+        ]),
+    )
+    .unwrap();
+
+    let used_after_insert = accountant.usage().used;
+    assert!(used_after_insert > 0);
+
+    db.execute(
+        "DELETE FROM docs WHERE id = $id",
+        &make_params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let used_after_delete = accountant.usage().used;
+    assert!(
+        used_after_delete < used_after_insert,
+        "DELETE must release vector bytes: before={used_after_insert}, after={used_after_delete}"
+    );
+
+    // The difference should include vector bytes (24 + 384 * 4 = 1560 bytes).
+    let freed = used_after_insert - used_after_delete;
+    assert!(
+        freed >= 1560,
+        "freed bytes must include vector bytes (>= 1560): freed={freed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MT4 — RED: Failed vector allocation releases pre-allocated row bytes
+// ---------------------------------------------------------------------------
+#[test]
+fn mt4_failed_vector_alloc_releases_row_bytes() {
+    // Budget just enough for CREATE TABLE + row bytes, but not row + vector.
+    // VECTOR(384) = 24 + 384*4 = 1560 bytes. Row ~200 bytes. Total ~1760.
+    // Budget 1200 after CREATE TABLE overhead leaves room for row but not row+vector.
+    let accountant = Arc::new(MemoryAccountant::with_budget(1500));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(384))",
+        &empty(),
+    )
+    .unwrap();
+
+    let used_before = accountant.usage().used;
+
+    let result = db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, $emb)",
+        &make_params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("emb", Value::Vector(vec![0.1; 384])),
+        ]),
+    );
+    assert!(
+        result.is_err(),
+        "INSERT with vector exceeding budget must fail"
+    );
+
+    let used_after = accountant.usage().used;
+    assert_eq!(
+        used_after, used_before,
+        "failed INSERT must not leak row bytes: before={used_before}, after={used_after}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MT5 — RED: HNSW build failure does not leak accounting bytes
+// ---------------------------------------------------------------------------
+#[test]
+fn mt5_hnsw_build_failure_no_leaked_bytes() {
+    // Budget allows inserts but not the HNSW index build.
+    // HNSW needs ~entries * dim * 4 * 3 bytes.
+    // 1000 entries * 4 dims * 4 bytes * 3 = 48000 bytes for HNSW.
+    // Budget allows all rows but not the HNSW structure.
+    let accountant = Arc::new(MemoryAccountant::with_budget(40_000));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(4))",
+        &empty(),
+    )
+    .unwrap();
+
+    // Insert enough vectors to trigger HNSW build attempt (>= 1000).
+    let mut inserted = 0;
+    for i in 0..1100 {
+        let mut vec = vec![0.0f32; 4];
+        vec[0] = i as f32;
+        let result = db.execute(
+            "INSERT INTO docs (id, embedding) VALUES ($id, $emb)",
+            &make_params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("emb", Value::Vector(vec)),
+            ]),
+        );
+        if result.is_ok() {
+            inserted += 1;
+        }
+    }
+
+    // Some inserts must succeed.
+    assert!(inserted > 0, "at least some inserts must succeed");
+
+    // HNSW build should have been skipped due to budget.
+    // Verify no phantom HNSW bytes leaked: usage should reflect only
+    // actual rows + vectors + metadata, not the HNSW structure.
+    let usage = accountant.usage();
+    assert!(
+        usage.used <= 40_000,
+        "usage must not exceed budget (no HNSW leak): used={}",
+        usage.used
+    );
+
+    // EXPLAIN should show BruteForce, not Hnsw.
+    let explain = db.explain("SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 5");
+    assert!(explain.is_ok(), "explain must succeed");
+    let explain_text = explain.unwrap();
+    assert!(
+        explain_text.contains("BruteForce"),
+        "HNSW build must be skipped under budget: {explain_text}"
     );
 }

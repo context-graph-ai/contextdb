@@ -9,9 +9,7 @@ fn p() -> HashMap<String, Value> {
 }
 
 fn row_count(db: &Database, table: &str) -> usize {
-    let result = db
-        .execute(&format!("SELECT * FROM {table}"), &p())
-        .unwrap();
+    let result = db.execute(&format!("SELECT * FROM {table}"), &p()).unwrap();
     result.rows.len()
 }
 
@@ -79,11 +77,7 @@ fn r02_short_ttl_prunes_old_not_new() {
 
     let pruned = db.run_pruning_cycle();
     assert!(pruned > 0, "at least the old row must be pruned");
-    assert_eq!(
-        row_count(&db, "obs"),
-        1,
-        "only the new row survives"
-    );
+    assert_eq!(row_count(&db, "obs"), 1, "only the new row survives");
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
@@ -244,11 +238,8 @@ fn r07_null_expires_uses_default_ttl() {
 #[test]
 fn r08_alter_table_set_retain() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)",
-        &p(),
-    )
-    .unwrap();
+    db.execute("CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)", &p())
+        .unwrap();
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'old')", &p())
         .unwrap();
 
@@ -268,7 +259,10 @@ fn r08_alter_table_set_retain() {
 
     let pruned = db.run_pruning_cycle();
 
-    assert!(pruned > 0, "old row must be pruned after ALTER TABLE SET RETAIN");
+    assert!(
+        pruned > 0,
+        "old row must be pruned after ALTER TABLE SET RETAIN"
+    );
     assert_eq!(row_count(&db, "obs"), 1, "only the young row survives");
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
@@ -312,17 +306,11 @@ fn r09_alter_table_drop_retain() {
 #[test]
 fn r10_alter_table_set_retain_sync_safe() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)",
-        &p(),
-    )
-    .unwrap();
+    db.execute("CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)", &p())
+        .unwrap();
 
-    db.execute(
-        "ALTER TABLE obs SET RETAIN 2 SECONDS SYNC SAFE",
-        &p(),
-    )
-    .unwrap();
+    db.execute("ALTER TABLE obs SET RETAIN 2 SECONDS SYNC SAFE", &p())
+        .unwrap();
 
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'a')", &p())
         .unwrap();
@@ -380,11 +368,8 @@ fn r11_immutable_retain_mutual_exclusion_create() {
 #[test]
 fn r12_immutable_retain_mutual_exclusion_alter() {
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE obs (id INTEGER PRIMARY KEY) IMMUTABLE",
-        &p(),
-    )
-    .unwrap();
+    db.execute("CREATE TABLE obs (id INTEGER PRIMARY KEY) IMMUTABLE", &p())
+        .unwrap();
 
     let result = db.execute("ALTER TABLE obs SET RETAIN 14 DAYS", &p());
 
@@ -432,7 +417,9 @@ fn r14_timestamp_iso8601_round_trip() {
     )
     .unwrap();
 
-    let result = db.execute("SELECT * FROM events WHERE id = 1", &p()).unwrap();
+    let result = db
+        .execute("SELECT * FROM events WHERE id = 1", &p())
+        .unwrap();
     let idx = col_idx(&result, "ts");
     match &result.rows[0][idx] {
         Value::Timestamp(millis) => {
@@ -469,17 +456,11 @@ fn r15_infinity_sentinel_value() {
     )
     .unwrap();
 
-    let result = db
-        .execute("SELECT * FROM obs WHERE id = 1", &p())
-        .unwrap();
+    let result = db.execute("SELECT * FROM obs WHERE id = 1", &p()).unwrap();
     let idx = col_idx(&result, "expires_at");
     match &result.rows[0][idx] {
         Value::Timestamp(millis) => {
-            assert_eq!(
-                *millis,
-                i64::MAX,
-                "'infinity' must be stored as i64::MAX"
-            );
+            assert_eq!(*millis, i64::MAX, "'infinity' must be stored as i64::MAX");
         }
         other => panic!("expected Value::Timestamp(i64::MAX), got {other:?}"),
     }
@@ -502,17 +483,12 @@ fn r16_describe_shows_retain() {
     // \d is exposed via the meta-command handler which ultimately calls
     // Database::describe_table or similar. We test via SQL-level introspection.
     // The engine returns schema info that includes retention metadata.
-    let _result = db
-        .execute("SELECT * FROM obs", &p())
-        .unwrap();
+    let _result = db.execute("SELECT * FROM obs", &p()).unwrap();
 
     // For introspection, we rely on the internal table_meta access.
     // The test verifies the metadata is stored correctly.
     let meta = db.table_meta("obs");
-    assert!(
-        meta.is_some(),
-        "table 'obs' must have metadata"
-    );
+    assert!(meta.is_some(), "table 'obs' must have metadata");
     let meta = meta.unwrap();
     assert_eq!(
         meta.default_ttl_seconds,
@@ -597,30 +573,23 @@ fn r18_pruning_removes_graph_edges() {
 
     // Insert edge between node1 and node2
     let tx = db.begin();
-    db.insert_edge(
-        tx,
-        id1,
-        id2,
-        "RELATES_TO".to_string(),
-        HashMap::new(),
-    )
-    .unwrap();
+    db.insert_edge(tx, id1, id2, "RELATES_TO".to_string(), HashMap::new())
+        .unwrap();
     db.commit(tx).unwrap();
 
     thread::sleep(Duration::from_secs(3));
     db.run_pruning_cycle();
 
-    assert_eq!(
-        row_count(&db, "nodes"),
-        0,
-        "both nodes must be pruned"
-    );
+    assert_eq!(row_count(&db, "nodes"), 0, "both nodes must be pruned");
 
     // Verify edges are also removed by attempting a graph traversal
     // that previously would have returned results
     let snapshot = db.snapshot();
     let edge_count = db.edge_count(id1, "RELATES_TO", snapshot).unwrap();
-    assert_eq!(edge_count, 0, "graph edges must be removed when source rows are pruned");
+    assert_eq!(
+        edge_count, 0,
+        "graph edges must be removed when source rows are pruned"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -649,16 +618,19 @@ fn r19_pruning_removes_vector_entries() {
     .unwrap();
 
     // Verify vector search finds the row
-    let search_params = super::helpers::make_params(vec![
-        ("q", Value::Vector(vec![1.0, 0.0, 0.0])),
-    ]);
+    let search_params =
+        super::helpers::make_params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0]))]);
     let result = db
         .execute(
             "SELECT id FROM obs ORDER BY embedding <=> $q LIMIT 5",
             &search_params,
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1, "vector search must find the row before pruning");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "vector search must find the row before pruning"
+    );
 
     thread::sleep(Duration::from_secs(3));
     db.run_pruning_cycle();
@@ -727,7 +699,8 @@ fn r20_legacy_rows_without_created_at_survive() {
         .as_millis() as u64;
 
     // Legacy row: created_at is None → NOT eligible for age-based pruning
-    let legacy_eligible = legacy_row.created_at
+    let legacy_eligible = legacy_row
+        .created_at
         .map(|ts| now_millis.saturating_sub(ts) > ttl_millis)
         .unwrap_or(false);
     assert!(
@@ -736,7 +709,8 @@ fn r20_legacy_rows_without_created_at_survive() {
     );
 
     // Old row: created_at is 0, now is far past TTL → eligible
-    let old_eligible = old_row.created_at
+    let old_eligible = old_row
+        .created_at
         .map(|ts| now_millis.saturating_sub(ts) > ttl_millis)
         .unwrap_or(false);
     assert!(
@@ -746,11 +720,8 @@ fn r20_legacy_rows_without_created_at_survive() {
 
     // --- Part B: integration test — ALTER TABLE SET RETAIN prunes old rows ---
     let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)",
-        &p(),
-    )
-    .unwrap();
+    db.execute("CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)", &p())
+        .unwrap();
 
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'pre-retain')", &p())
         .unwrap();
@@ -809,8 +780,8 @@ fn r21_in_memory_retention_works() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r22_pruning_does_not_fire_commit_event() {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let commit_count = Arc::new(AtomicU64::new(0));
     let counter = commit_count.clone();
@@ -825,13 +796,12 @@ fn r22_pruning_does_not_fire_commit_event() {
             _ws: &contextdb_tx::WriteSet,
             _source: contextdb_engine::plugin::CommitSource,
         ) {
-            self.commits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
-    let plugin = Arc::new(CountingPlugin {
-        commits: counter,
-    });
+    let plugin = Arc::new(CountingPlugin { commits: counter });
 
     let db = Database::open_memory_with_plugin(plugin).unwrap();
     db.execute(
@@ -878,17 +848,12 @@ fn r23_retain_all_units() {
 
     for (clause, expected_seconds) in cases {
         let db = Database::open_memory();
-        let sql = format!(
-            "CREATE TABLE t_{expected_seconds} (id INTEGER PRIMARY KEY) {clause}"
-        );
+        let sql = format!("CREATE TABLE t_{expected_seconds} (id INTEGER PRIMARY KEY) {clause}");
         db.execute(&sql, &p()).unwrap();
 
         let table_name = format!("t_{expected_seconds}");
         let meta = db.table_meta(&table_name);
-        assert!(
-            meta.is_some(),
-            "table '{table_name}' must have metadata"
-        );
+        assert!(meta.is_some(), "table '{table_name}' must have metadata");
         let meta = meta.unwrap();
         assert_eq!(
             meta.default_ttl_seconds,
@@ -1075,4 +1040,303 @@ fn r28_concurrent_prune_and_insert() {
         count >= 10,
         "at least 10 newly inserted rows must survive, got {count}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MR1 — RED: ANN search accuracy after vector pruning
+// Pruned vectors must not appear in ANN results; remaining vectors rank correctly.
+// RED: run_pruning_cycle is a no-op, so pruned vectors remain in search results.
+// ---------------------------------------------------------------------------
+#[test]
+fn mr1_ann_accuracy_after_vector_pruning() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+
+    // Insert 10 vectors: 5 "old" (will be pruned) and 5 "new" (will survive).
+    let mut old_ids = Vec::new();
+    for i in 0..5 {
+        let id = uuid::Uuid::new_v4();
+        old_ids.push(id);
+        let params = super::helpers::make_params(vec![
+            ("id", Value::Uuid(id)),
+            ("data", Value::Text(format!("old-{i}"))),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ]);
+        db.execute(
+            "INSERT INTO docs (id, data, embedding) VALUES ($id, $data, $embedding)",
+            &params,
+        )
+        .unwrap();
+    }
+
+    thread::sleep(Duration::from_secs(2));
+
+    // Insert young vectors AFTER sleep — they survive pruning.
+    let mut new_ids = Vec::new();
+    for i in 0..5 {
+        let id = uuid::Uuid::new_v4();
+        new_ids.push(id);
+        let params = super::helpers::make_params(vec![
+            ("id", Value::Uuid(id)),
+            ("data", Value::Text(format!("new-{i}"))),
+            ("embedding", Value::Vector(vec![0.0, 1.0, 0.0])),
+        ]);
+        db.execute(
+            "INSERT INTO docs (id, data, embedding) VALUES ($id, $data, $embedding)",
+            &params,
+        )
+        .unwrap();
+    }
+
+    db.run_pruning_cycle();
+
+    assert_eq!(row_count(&db, "docs"), 5, "only 5 new rows survive");
+
+    // ANN search: query close to new vectors [0, 1, 0].
+    let search_params =
+        super::helpers::make_params(vec![("q", Value::Vector(vec![0.0, 1.0, 0.0]))]);
+    let result = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 10",
+            &search_params,
+        )
+        .unwrap();
+
+    // Must return exactly 5 results (the surviving new vectors).
+    assert_eq!(
+        result.rows.len(),
+        5,
+        "ANN search must return only surviving vectors, got {}",
+        result.rows.len()
+    );
+
+    // None of the old IDs should appear in results.
+    let result_ids: Vec<uuid::Uuid> = result
+        .rows
+        .iter()
+        .filter_map(|row| match &row[0] {
+            Value::Uuid(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for old_id in &old_ids {
+        assert!(
+            !result_ids.contains(old_id),
+            "pruned vector {old_id} must NOT appear in ANN results"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MR2 — RED: Graph edge cleanup after prune + reopen (file-backed)
+// Pruned row's edges must be removed from in-memory graph AND from redb
+// on reopen. RED: run_pruning_cycle is a no-op.
+// ---------------------------------------------------------------------------
+#[test]
+fn mr2_graph_edge_cleanup_after_prune_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mr2.db");
+
+    let id1 = uuid::Uuid::new_v4();
+    let id2 = uuid::Uuid::new_v4();
+
+    // Phase 1: create, insert, prune.
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT) RETAIN 1 SECONDS",
+            &p(),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+            &p(),
+        )
+        .unwrap();
+
+        let params1 = super::helpers::make_params(vec![
+            ("id", Value::Uuid(id1)),
+            ("name", Value::Text("node1".to_string())),
+        ]);
+        let params2 = super::helpers::make_params(vec![
+            ("id", Value::Uuid(id2)),
+            ("name", Value::Text("node2".to_string())),
+        ]);
+        db.execute("INSERT INTO nodes (id, name) VALUES ($id, $name)", &params1)
+            .unwrap();
+        db.execute("INSERT INTO nodes (id, name) VALUES ($id, $name)", &params2)
+            .unwrap();
+
+        let tx = db.begin();
+        db.insert_edge(tx, id1, id2, "LINKS".to_string(), HashMap::new())
+            .unwrap();
+        db.commit(tx).unwrap();
+
+        // Verify edge exists.
+        let snapshot = db.snapshot();
+        let edge_count = db.edge_count(id1, "LINKS", snapshot).unwrap();
+        assert_eq!(edge_count, 1, "edge must exist before pruning");
+
+        thread::sleep(Duration::from_secs(2));
+        let pruned = db.run_pruning_cycle();
+        assert!(pruned > 0, "nodes must be pruned");
+
+        // In-memory edges must be removed.
+        let snapshot = db.snapshot();
+        let edge_count = db.edge_count(id1, "LINKS", snapshot).unwrap();
+        assert_eq!(
+            edge_count, 0,
+            "in-memory edges must be removed after pruning"
+        );
+    }
+
+    // Phase 2: reopen and verify edges are not reloaded from redb.
+    {
+        let db = Database::open(&path).unwrap();
+        let snapshot = db.snapshot();
+        let edge_count = db.edge_count(id1, "LINKS", snapshot).unwrap();
+        assert_eq!(
+            edge_count, 0,
+            "pruned row's edges must NOT be reloaded from redb after reopen"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MR3 — RED: LSN stamped and sync-safe pruning semantics
+// Verifies that rows get LSN stamped at commit, and that sync_safe pruning
+// respects the watermark correctly (lsn >= watermark → skip).
+// RED: run_pruning_cycle is a no-op.
+// ---------------------------------------------------------------------------
+#[test]
+fn mr3_lsn_stamped_and_sync_safe_pruning() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS SYNC SAFE",
+        &p(),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO obs (id, data) VALUES (1, 'row1')", &p())
+        .unwrap();
+
+    thread::sleep(Duration::from_secs(2));
+
+    // With watermark at 0 and row lsn at 0, the row is "unsynced" (lsn >= watermark).
+    // Sync-safe must NOT prune it.
+    db.set_sync_watermark(0);
+    db.run_pruning_cycle();
+    assert_eq!(
+        row_count(&db, "obs"),
+        1,
+        "row with lsn=0, watermark=0 must NOT be pruned (unsynced)"
+    );
+
+    // Set watermark high enough that the row's LSN is below it.
+    // This means the row has been synced → eligible for pruning.
+    db.set_sync_watermark(u64::MAX);
+    let pruned = db.run_pruning_cycle();
+    assert!(pruned > 0, "row must be pruned when watermark > lsn");
+    assert_eq!(row_count(&db, "obs"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// MR4 — RED: Pruning under concurrent read
+// A SELECT running during pruning must see a consistent snapshot.
+// RED: run_pruning_cycle is a no-op.
+// ---------------------------------------------------------------------------
+#[test]
+fn mr4_pruning_under_concurrent_read() {
+    use std::sync::Arc;
+
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+
+    // Insert rows that will expire.
+    for i in 0..100 {
+        db.execute(
+            &format!("INSERT INTO obs (id, data) VALUES ({i}, 'data-{i}')"),
+            &p(),
+        )
+        .unwrap();
+    }
+
+    thread::sleep(Duration::from_secs(2));
+
+    // Spawn reader that does SELECT while pruning runs.
+    let db2 = db.clone();
+    let reader = thread::spawn(move || {
+        let mut read_count = 0;
+        for _ in 0..20 {
+            let result = db2.execute("SELECT * FROM obs", &p());
+            assert!(
+                result.is_ok(),
+                "SELECT must not error during concurrent prune"
+            );
+            read_count += 1;
+            thread::sleep(Duration::from_millis(10));
+        }
+        read_count
+    });
+
+    // Run pruning concurrently.
+    let pruned = db.run_pruning_cycle();
+    assert!(pruned > 0, "old rows must be pruned");
+
+    let reads = reader.join().expect("reader thread must not panic");
+    assert!(reads > 0, "reader must have completed reads");
+
+    // After pruning + reads complete, rows should be gone.
+    assert_eq!(row_count(&db, "obs"), 0, "all expired rows must be pruned");
+}
+
+// ---------------------------------------------------------------------------
+// MR5 — RED: Persistence round-trip with pruning (file-backed)
+// After pruning, reopened DB must not contain pruned rows.
+// RED: run_pruning_cycle is a no-op.
+// ---------------------------------------------------------------------------
+#[test]
+fn mr5_persistence_round_trip_with_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mr5.db");
+
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
+            &p(),
+        )
+        .unwrap();
+
+        for i in 0..50 {
+            db.execute(
+                &format!("INSERT INTO obs (id, data) VALUES ({i}, 'row-{i}')"),
+                &p(),
+            )
+            .unwrap();
+        }
+
+        thread::sleep(Duration::from_secs(2));
+        let pruned = db.run_pruning_cycle();
+        assert!(pruned > 0, "rows must be pruned");
+        assert_eq!(row_count(&db, "obs"), 0, "all rows must be pruned");
+    }
+
+    // Reopen and verify pruned rows did not come back.
+    {
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            row_count(&db, "obs"),
+            0,
+            "pruned rows must not be reloaded from persistence after reopen"
+        );
+    }
 }

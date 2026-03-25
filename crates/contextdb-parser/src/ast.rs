@@ -264,8 +264,14 @@ pub struct AlterTable {
 pub enum AlterAction {
     AddColumn(ColumnDef),
     DropColumn(String),
-    RenameColumn { from: String, to: String },
-    SetRetain { duration_seconds: u64, sync_safe: bool },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    SetRetain {
+        duration_seconds: u64,
+        sync_safe: bool,
+    },
     DropRetain,
 }
 

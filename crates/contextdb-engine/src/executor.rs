@@ -101,7 +101,12 @@ pub(crate) fn execute_plan(
             }
             if let Some(table_meta) = db.table_meta(&p.table) {
                 db.persist_table_meta(&p.table, &table_meta)?;
-                if !matches!(p.action, AlterAction::AddColumn(_) | AlterAction::SetRetain { .. } | AlterAction::DropRetain) {
+                if !matches!(
+                    p.action,
+                    AlterAction::AddColumn(_)
+                        | AlterAction::SetRetain { .. }
+                        | AlterAction::DropRetain
+                ) {
                     db.persist_table_rows(&p.table)?;
                 }
                 let lsn = db.next_lsn_for_ddl();
