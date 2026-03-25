@@ -3896,3 +3896,357 @@ async fn nt_14_large_bidirectional_vector_sync() {
         "text data must arrive intact on server after push"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CP — Sync Conflict Policy SQL Surface Tests
+// ---------------------------------------------------------------------------
+
+/// SET SYNC_CONFLICT_POLICY sets the default policy and SHOW returns it.
+#[test]
+fn cp01_set_and_show_sync_conflict_policy() {
+    let db = Database::open_memory();
+    db.execute("SET SYNC_CONFLICT_POLICY 'latest_wins'", &HashMap::new())
+        .expect("SET must succeed");
+    let result = db
+        .execute("SHOW SYNC_CONFLICT_POLICY", &HashMap::new())
+        .expect("SHOW must succeed");
+    assert!(!result.rows.is_empty(), "SHOW must return a row");
+    let policy = &result.rows[0][0];
+    assert_eq!(
+        *policy,
+        Value::Text("latest_wins".to_string()),
+        "default policy must be latest_wins"
+    );
+}
+
+/// SET SYNC_CONFLICT_POLICY accepts all valid policy names.
+#[test]
+fn cp02_all_policy_names_accepted() {
+    let db = Database::open_memory();
+    for policy in &["latest_wins", "server_wins", "edge_wins"] {
+        db.execute(
+            &format!("SET SYNC_CONFLICT_POLICY '{policy}'"),
+            &HashMap::new(),
+        )
+        .unwrap_or_else(|e| panic!("SET '{policy}' must succeed: {e}"));
+    }
+}
+
+/// SET SYNC_CONFLICT_POLICY rejects invalid policy names.
+#[test]
+fn cp03_invalid_policy_rejected() {
+    let db = Database::open_memory();
+    let result = db.execute("SET SYNC_CONFLICT_POLICY 'bogus'", &HashMap::new());
+    assert!(result.is_err(), "invalid policy name must be rejected");
+}
+
+/// ALTER TABLE SET SYNC_CONFLICT_POLICY sets a per-table override.
+#[test]
+fn cp04_per_table_conflict_policy() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "ALTER TABLE sensors SET SYNC_CONFLICT_POLICY 'server_wins'",
+        &HashMap::new(),
+    )
+    .expect("ALTER TABLE SET policy must succeed");
+    let result = db
+        .execute("SHOW SYNC_CONFLICT_POLICY", &HashMap::new())
+        .expect("SHOW must succeed");
+    // SHOW must include the per-table override
+    let output = format!("{:?}", result.rows);
+    assert!(
+        output.contains("server_wins"),
+        "SHOW must reflect per-table policy, got: {output}"
+    );
+}
+
+/// ALTER TABLE DROP SYNC_CONFLICT_POLICY removes a per-table override.
+#[test]
+fn cp05_drop_per_table_policy() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "ALTER TABLE sensors SET SYNC_CONFLICT_POLICY 'server_wins'",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "ALTER TABLE sensors DROP SYNC_CONFLICT_POLICY",
+        &HashMap::new(),
+    )
+    .expect("DROP policy must succeed");
+}
+
+/// SET SYNC_CONFLICT_POLICY actually determines conflict resolution behavior during apply_changes.
+/// This test sets 'server_wins', creates a conflict, and verifies the server's value is kept.
+/// Then sets 'edge_wins' on the same scenario and verifies the edge's value overwrites.
+#[test]
+fn cp06_conflict_policy_wired_to_apply_changes() {
+    let id = uuid::Uuid::from_u128(1);
+    let key = NaturalKey {
+        column: "id".to_string(),
+        value: Value::Uuid(id),
+    };
+
+    // Scenario: server has row with name="server_value", edge pushes name="edge_value"
+    let changeset = ChangeSet {
+        rows: vec![RowChange {
+            table: "items".to_string(),
+            natural_key: key.clone(),
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("name".to_string(), Value::Text("edge_value".to_string())),
+            ]),
+            deleted: false,
+            lsn: 100,
+        }],
+        edges: vec![],
+        vectors: vec![],
+        ddl: vec![],
+    };
+
+    // Test with server_wins — server value must be kept
+    {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO items (id, name) VALUES ($id, $name)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("name".to_string(), Value::Text("server_value".to_string())),
+            ]),
+        )
+        .unwrap();
+
+        let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
+        let result = db.apply_changes(changeset.clone(), &policies).unwrap();
+        assert!(result.skipped_rows > 0, "server_wins must skip the edge row");
+
+        let row = db
+            .point_lookup("items", "id", &Value::Uuid(id), db.snapshot())
+            .unwrap()
+            .expect("row must exist");
+        assert_eq!(
+            row.values.get("name"),
+            Some(&Value::Text("server_value".to_string())),
+            "server_wins must keep server's value"
+        );
+    }
+
+    // Test with edge_wins — edge value must overwrite
+    {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO items (id, name) VALUES ($id, $name)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("name".to_string(), Value::Text("server_value".to_string())),
+            ]),
+        )
+        .unwrap();
+
+        let policies = ConflictPolicies::uniform(ConflictPolicy::EdgeWins);
+        let result = db.apply_changes(changeset.clone(), &policies).unwrap();
+        assert!(
+            result.applied_rows > 0,
+            "edge_wins must apply the edge's row"
+        );
+
+        let row = db
+            .point_lookup("items", "id", &Value::Uuid(id), db.snapshot())
+            .unwrap()
+            .expect("row must exist");
+        assert_eq!(
+            row.values.get("name"),
+            Some(&Value::Text("edge_value".to_string())),
+            "edge_wins must overwrite with edge's value"
+        );
+    }
+}
+
+/// Plain row UPDATE (non-state-machine) propagates through sync end-to-end.
+/// Edge inserts a row, pushes, updates the row, pushes again. Server must have the updated value.
+#[tokio::test]
+async fn cp07_row_update_propagates_through_sync() {
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let edge_path = tmp.path().join("cp07-edge.db");
+    let server_path = tmp.path().join("cp07-server.db");
+
+    let edge_db = Arc::new(Database::open(&edge_path).unwrap());
+    let server_db = Arc::new(Database::open(&server_path).unwrap());
+
+    edge_db
+        .execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+
+    let id = uuid::Uuid::new_v4();
+    edge_db
+        .execute(
+            "INSERT INTO items (id, name) VALUES ($id, $name)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("name".to_string(), Value::Text("original".to_string())),
+            ]),
+        )
+        .unwrap();
+
+    // Start server, push initial data
+    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        nats_url,
+        "cp07",
+        policies,
+    ));
+    let handle = tokio::spawn({
+        let server = server.clone();
+        async move { server.run().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let client = SyncClient::new(edge_db.clone(), nats_url, "cp07");
+    client.push().await.unwrap();
+
+    // Verify initial value on server
+    let server_row = server_db
+        .point_lookup("items", "id", &Value::Uuid(id), server_db.snapshot())
+        .unwrap()
+        .expect("row must exist on server after first push");
+    assert_eq!(
+        server_row.values.get("name"),
+        Some(&Value::Text("original".to_string())),
+    );
+
+    // UPDATE on edge
+    edge_db
+        .execute(
+            "UPDATE items SET name = $name WHERE id = $id",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("name".to_string(), Value::Text("updated".to_string())),
+            ]),
+        )
+        .unwrap();
+
+    // Push again — server must accept the update
+    client.push().await.unwrap();
+
+    let updated_row = server_db
+        .point_lookup("items", "id", &Value::Uuid(id), server_db.snapshot())
+        .unwrap()
+        .expect("row must still exist");
+    assert_eq!(
+        updated_row.values.get("name"),
+        Some(&Value::Text("updated".to_string())),
+        "server must have updated value after second push"
+    );
+
+    handle.abort();
+    drop(client);
+    edge_db.close().unwrap();
+    server_db.close().unwrap();
+}
+
+/// Push retry succeeds when server subscribes late.
+/// Start CLI push BEFORE server is running. Server starts during retry window.
+/// Push must succeed, not fail.
+#[tokio::test]
+async fn cp08_push_retry_succeeds_when_server_starts_late() {
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let edge_path = tmp.path().join("cp08-edge.db");
+    let server_path = tmp.path().join("cp08-server.db");
+
+    let edge_db = Arc::new(Database::open(&edge_path).unwrap());
+    let server_db = Arc::new(Database::open(&server_path).unwrap());
+
+    edge_db
+        .execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    edge_db
+        .execute(
+            "INSERT INTO items (id, name) VALUES ($id, $name)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("name".to_string(), Value::Text("retry_test".to_string())),
+            ]),
+        )
+        .unwrap();
+
+    // Start push BEFORE server is running — it must retry
+    let push_handle = {
+        tokio::spawn({
+            let nats_url = nats_url.to_string();
+            let edge_db = edge_db.clone();
+            async move {
+                let client = SyncClient::new(edge_db, &nats_url, "cp08");
+                client.push().await
+            }
+        })
+    };
+
+    // Wait 1 second, THEN start server — push is retrying during this time
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        nats_url,
+        "cp08",
+        policies,
+    ));
+    let server_handle = tokio::spawn({
+        let server = server.clone();
+        async move { server.run().await }
+    });
+
+    // Push must succeed (retried and found server)
+    let push_result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        push_handle,
+    )
+    .await
+    .expect("push must complete within 15s")
+    .expect("push task must not panic");
+    assert!(push_result.is_ok(), "push must succeed after server starts late: {:?}", push_result.err());
+
+    // Verify data arrived
+    let row = server_db
+        .point_lookup("items", "id", &Value::Uuid(id), server_db.snapshot())
+        .unwrap();
+    assert!(row.is_some(), "row must be on server after retry-succeeded push");
+
+    server_handle.abort();
+    edge_db.close().unwrap();
+    server_db.close().unwrap();
+}

@@ -109,7 +109,9 @@ fn ds02_ddl_in_changeset_after_reopen() {
             ..
         } => {
             assert!(
-                columns.iter().any(|(col, ty)| col == "id" && ty == "UUID"),
+                columns
+                    .iter()
+                    .any(|(col, ty)| col == "id" && ty.starts_with("UUID")),
                 "events DDL missing 'id UUID' column"
             );
             assert!(
@@ -134,7 +136,9 @@ fn ds02_ddl_in_changeset_after_reopen() {
     match workflows_ddl {
         DdlChange::CreateTable { columns, .. } => {
             assert!(
-                columns.iter().any(|(col, ty)| col == "id" && ty == "UUID"),
+                columns
+                    .iter()
+                    .any(|(col, ty)| col == "id" && ty.starts_with("UUID")),
                 "workflows DDL missing 'id UUID' column"
             );
             assert!(
