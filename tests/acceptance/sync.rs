@@ -333,17 +333,19 @@ INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('0
 /// I pushed a row with NULL in a NOT NULL column, and the CLI displayed the constraint violation reason.
 #[tokio::test]
 async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge() {
-    let (_tmp, edge_path, server_path, nats_url) =
-        setup_sync_env("f09f_server_side_constraint_violation_during_push_returns_error_to_edge")
-            .await;
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f09f-edge.db");
+    let server_path = temp_db_file(&tmp, "f09f-server.db");
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
     let tenant = "f09f_server_side_constraint_violation_during_push_returns_error_to_edge";
-    let mut server = spawn_server(&server_path, tenant, &nats_url);
+    let mut server = spawn_server(&server_path, tenant, nats_url);
 
     // Edge 1: create table WITH NOT NULL, insert a valid row, push to server via NATS
     let edge1_path = edge_path.with_file_name("f09f-edge1.db");
     let edge1_output = run_cli_script(
         &edge1_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", nats_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL)\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid')\n\
          .sync push\n\
@@ -356,7 +358,7 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let edge2_path = edge_path.with_file_name("f09f-edge2.db");
     let violation_output = run_cli_script(
         &edge2_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", nats_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
          INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002')\n\
          .sync push\n\
@@ -389,16 +391,19 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', '
 /// I pulled data whose schema differed from my local table, and the CLI showed "schema mismatch".
 #[tokio::test]
 async fn f09h_constraint_violations_during_sync_pull_are_handled() {
-    let (_tmp, edge_path, server_path, nats_url) =
-        setup_sync_env("f09h_constraint_violations_during_sync_pull_are_handled").await;
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f09h-edge.db");
+    let server_path = temp_db_file(&tmp, "f09h-server.db");
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
     let tenant = "f09h_constraint_violations_during_sync_pull_are_handled";
-    let mut server = spawn_server(&server_path, tenant, &nats_url);
+    let mut server = spawn_server(&server_path, tenant, nats_url);
 
     // Edge A pushes a table with columns (id UUID PK, name TEXT, reading REAL)
     let edge_a_path = edge_path.with_file_name("f09h-edge-a.db");
     let push_output = run_cli_script(
         &edge_a_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", nats_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\n\
          INSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 1.0)\n\
          .sync push\n\
@@ -410,7 +415,7 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let edge_b_path = edge_path.with_file_name("f09h-edge-b.db");
     let pull_output = run_cli_script(
         &edge_b_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", nats_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, label TEXT, score INTEGER)\n\
          .sync pull\n\
          .quit\n",

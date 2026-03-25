@@ -203,6 +203,9 @@ fn m04_vector_search_succeeds_under_budget() {
         .unwrap();
     }
 
+    // Accountant must track vector memory from the inserts above.
+    assert!(db.accountant().usage().used > 0, "accountant must track vector memory");
+
     // Vector search under budget must succeed.
     let result = db.execute(
         "SELECT id FROM docs ORDER BY embedding <=> $q LIMIT 3",
@@ -341,6 +344,9 @@ fn m07_bfs_succeeds_under_budget() {
     db.insert_edge(tx, b, c, "LINKS".to_string(), HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();
+
+    // Accountant must track BFS frontier memory.
+    assert!(db.accountant().usage().used > 0, "accountant must track BFS frontier memory");
 
     // BFS from A should reach B and C.
     let result = db.execute(
@@ -622,6 +628,7 @@ fn m13_default_no_limit_allows_everything() {
 // ---------------------------------------------------------------------------
 #[test]
 fn m14_concurrent_allocation_accounting() {
+    let alloc_size = 100usize;
     let accountant = Arc::new(MemoryAccountant::with_budget(1_000_000));
     let threads: Vec<_> = (0..10)
         .map(|_| {
@@ -629,27 +636,31 @@ fn m14_concurrent_allocation_accounting() {
             std::thread::spawn(move || {
                 let mut succeeded = 0usize;
                 for _ in 0..100 {
-                    if acc.try_allocate(100).is_ok() {
+                    if acc.try_allocate(alloc_size).is_ok() {
                         succeeded += 1;
                     }
                 }
-                // Release only the allocations that succeeded.
-                for _ in 0..succeeded {
-                    acc.release(100);
-                }
+                succeeded
             })
         })
         .collect();
 
-    for t in threads {
-        t.join().unwrap();
-    }
+    let total_succeeded: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
 
-    // After all threads allocate and release the same amount, used should be 0.
+    // Some allocations must succeed — budget is 1MB, each alloc is 100 bytes.
+    assert!(
+        total_succeeded > 0,
+        "at least some concurrent allocations must succeed, got 0 successes"
+    );
+
+    // The accountant must track the outstanding allocations.
     let usage = accountant.usage();
     assert_eq!(
-        usage.used, 0,
-        "after balanced alloc/release across threads, used must be 0"
+        usage.used,
+        total_succeeded * alloc_size,
+        "used bytes must equal succeeded * alloc_size: expected {}, got {}",
+        total_succeeded * alloc_size,
+        usage.used
     );
 }
 
