@@ -1419,6 +1419,87 @@ fn jn_05_inner_join_no_matches_empty() {
     assert_eq!(result.rows.len(), 0, "no matching keys means empty result");
 }
 
+#[test]
+fn jn_06_cte_filtered_vector_ordering_executes() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, embedding VECTOR(3), is_deprecated BOOLEAN)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let root = Uuid::new_v4();
+    let near = Uuid::new_v4();
+    let far = Uuid::new_v4();
+
+    for (id, name, embedding) in [
+        (root, "root", vec![0.0, 0.0, 1.0]),
+        (near, "near", vec![1.0, 0.0, 0.0]),
+        (far, "far", vec![0.0, 1.0, 0.0]),
+    ] {
+        db.execute(
+            "INSERT INTO entities (id, name, embedding, is_deprecated) VALUES ($id, $name, $embedding, $deprecated)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text(name.into())),
+                ("embedding", Value::Vector(embedding)),
+                ("deprecated", Value::Bool(false)),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let tx = db.begin();
+    for target in [near, far] {
+        db.insert_edge(tx, root, target, "RELATES_TO".into(), HashMap::new())
+            .unwrap();
+        db.insert_row(tx, "edges", {
+            let mut m = HashMap::new();
+            m.insert("id".to_string(), Value::Uuid(Uuid::new_v4()));
+            m.insert("source_id".to_string(), Value::Uuid(root));
+            m.insert("target_id".to_string(), Value::Uuid(target));
+            m.insert("edge_type".to_string(), Value::Text("RELATES_TO".into()));
+            m
+        })
+        .unwrap();
+    }
+    db.commit(tx).unwrap();
+
+    let result = db
+        .execute(
+            "WITH neighborhood AS (
+                SELECT b_id FROM GRAPH_TABLE(
+                    edges MATCH (a)-[:RELATES_TO]->(b)
+                    WHERE a.id = $root_id
+                    COLUMNS (b.id AS b_id)
+                )
+            ),
+            filtered AS (
+                SELECT id, name, embedding
+                FROM entities e
+                INNER JOIN neighborhood n ON e.id = n.b_id
+                WHERE e.is_deprecated = FALSE
+            )
+            SELECT id, name FROM filtered ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![
+                ("root_id", Value::Uuid(root)),
+                ("query", Value::Vector(vec![1.0, 0.0, 0.0])),
+            ]),
+        )
+        .expect("CTE-backed vector ordering should execute");
+
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], Value::Uuid(near));
+    assert_eq!(result.rows[0][1], Value::Text("near".into()));
+    assert_eq!(result.rows[1][0], Value::Uuid(far));
+    assert_eq!(result.rows[1][1], Value::Text("far".into()));
+}
+
 // ============================================================
 // Group 8: Constraints
 // ============================================================
@@ -1688,4 +1769,61 @@ fn upd_02_update_with_now() {
         Some(Value::Timestamp(t)) => assert!(*t > 0, "NOW() must produce a timestamp > 0"),
         other => panic!("expected Timestamp, got {:?}", other),
     }
+}
+
+#[test]
+fn upd_03_update_embedding_changes_vector_recall_immediately() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id_a = Uuid::new_v4();
+    let id_b = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO observations (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id_a)),
+            ("embedding", Value::Vector(vec![0.95, 0.05, 0.0])),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO observations (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id_b)),
+            ("embedding", Value::Vector(vec![0.9, 0.1, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let before = db
+        .execute(
+            "SELECT id FROM observations ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        )
+        .unwrap();
+    assert_eq!(before.rows.len(), 1);
+    assert_eq!(before.rows[0][0], Value::Uuid(id_a));
+
+    db.execute(
+        "UPDATE observations SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(id_a)),
+            ("embedding", Value::Vector(vec![-1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let after = db
+        .execute(
+            "SELECT id FROM observations ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        )
+        .unwrap();
+    assert_eq!(after.rows.len(), 2);
+    assert_eq!(after.rows[0][0], Value::Uuid(id_b));
+    assert_eq!(after.rows[1][0], Value::Uuid(id_a));
 }
