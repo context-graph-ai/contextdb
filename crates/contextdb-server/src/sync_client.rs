@@ -61,9 +61,25 @@ impl SyncClient {
     pub async fn ensure_connected(&self) -> Result<async_nats::Client, String> {
         let mut guard = self.nats.lock().await;
         if guard.is_none() {
-            match async_nats::connect(&self.nats_url).await {
-                Ok(client) => *guard = Some(client),
-                Err(e) => return Err(format!("cannot connect to NATS at {}: {e}", self.nats_url)),
+            let mut last_err = None;
+            for attempt in 0..10u32 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+                }
+                match async_nats::connect(&self.nats_url).await {
+                    Ok(client) => {
+                        *guard = Some(client);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e.to_string()),
+                }
+            }
+            if guard.is_none() {
+                let err = last_err.unwrap_or_else(|| "unknown error".to_string());
+                return Err(format!(
+                    "cannot connect to NATS at {}: {err}",
+                    self.nats_url
+                ));
             }
         }
         guard
@@ -204,26 +220,53 @@ impl SyncClient {
                     .map_err(|e| Error::SyncError(e.to_string()))?;
                 response.result.into()
             } else {
-                match tokio::time::timeout(
-                    SYNC_TIMEOUT,
-                    nats_client.request(push_subject(&self.tenant_id), encoded.into()),
-                )
-                .await
-                {
-                    Ok(Ok(msg)) => {
-                        let envelope =
-                            decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
-                        let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
-                            .map_err(|e| Error::SyncError(e.to_string()))?;
-                        response.result.into()
+                let mut push_result = None;
+                for attempt in 0..5u32 {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
                     }
-                    Ok(Err(e)) => return Err(Error::SyncError(e.to_string())),
-                    Err(_) => {
-                        return Err(Error::SyncError(
-                            "NATS request timed out waiting for push response".to_string(),
-                        ));
+                    let timeout = if attempt < 2 {
+                        Duration::from_secs(2)
+                    } else {
+                        SYNC_TIMEOUT
+                    };
+                    match tokio::time::timeout(
+                        timeout,
+                        nats_client.request(push_subject(&self.tenant_id), encoded.clone().into()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(msg)) => {
+                            let envelope = decode(&msg.payload)
+                                .map_err(|e| Error::SyncError(e.to_string()))?;
+                            let response: PushResponse =
+                                rmp_serde::from_slice(&envelope.payload)
+                                    .map_err(|e| Error::SyncError(e.to_string()))?;
+                            push_result = Some(response.result.into());
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("no responders") && attempt < 4 {
+                                tracing::debug!(attempt, "push got no responders, retrying");
+                                continue;
+                            }
+                            return Err(Error::SyncError(err_str));
+                        }
+                        Err(_) if attempt < 4 => {
+                            tracing::debug!(attempt, "push timed out, retrying");
+                            continue;
+                        }
+                        Err(_) => {
+                            return Err(Error::SyncError(
+                                "NATS request timed out waiting for push response".to_string(),
+                            ));
+                        }
                     }
                 }
+                push_result.ok_or_else(|| {
+                    Error::SyncError("push failed after retries: no responders".to_string())
+                })?
             };
             last_successful_lsn = batch_max_lsn;
             total.applied_rows += result.applied_rows;
@@ -268,23 +311,45 @@ impl SyncClient {
                     .await
                     .map_err(|e| Error::SyncError(e.to_string()))?;
 
-                nats_client
-                    .publish_with_reply(
-                        pull_subject(&self.tenant_id),
-                        inbox.clone(),
-                        encoded.into(),
-                    )
-                    .await
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
+                let mut first_msg = None;
+                for attempt in 0..5u32 {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+                    }
+                    let timeout = if attempt < 2 {
+                        Duration::from_secs(2)
+                    } else {
+                        SYNC_TIMEOUT
+                    };
 
-                let first_msg = tokio::time::timeout(SYNC_TIMEOUT, inbox_sub.next())
-                    .await
-                    .map_err(|_| {
-                        Error::SyncError(
-                            "NATS request timed out waiting for pull response".to_string(),
+                    nats_client
+                        .publish_with_reply(
+                            pull_subject(&self.tenant_id),
+                            inbox.clone(),
+                            encoded.clone().into(),
                         )
-                    })?
-                    .ok_or_else(|| Error::SyncError("pull inbox closed".to_string()))?;
+                        .await
+                        .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                    match tokio::time::timeout(timeout, inbox_sub.next()).await {
+                        Ok(Some(msg)) => {
+                            first_msg = Some(msg);
+                            break;
+                        }
+                        Ok(None) => {
+                            return Err(Error::SyncError("pull inbox closed".to_string()));
+                        }
+                        Err(_) if attempt < 4 => {
+                            tracing::debug!(attempt, "pull timed out, retrying");
+                            continue;
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                let first_msg = first_msg.ok_or_else(|| {
+                    Error::SyncError("NATS request timed out waiting for pull response".to_string())
+                })?;
 
                 let first_envelope =
                     decode(&first_msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;

@@ -48,6 +48,16 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
         Rule::update_stmt => Statement::Update(build_update(inner)?),
         Rule::select_stmt => Statement::Select(build_select(inner)?),
+        Rule::set_sync_conflict_policy => {
+            let policy = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::conflict_policy_value)
+                .ok_or_else(|| Error::ParseError("missing conflict policy value".to_string()))?
+                .as_str()
+                .to_lowercase();
+            Statement::SetSyncConflictPolicy(policy)
+        }
+        Rule::show_sync_conflict_policy => Statement::ShowSyncConflictPolicy,
         Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
         Rule::show_memory_limit => Statement::ShowMemoryLimit,
         _ => return Err(Error::ParseError("unsupported statement".to_string())),
@@ -892,6 +902,17 @@ fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
         Rule::string => Ok(Expr::Literal(Literal::Text(parse_string_literal(
             first.as_str(),
         )))),
+        Rule::vector_lit => {
+            let values: Vec<f32> = first
+                .into_inner()
+                .map(|p| {
+                    p.as_str()
+                        .parse::<f32>()
+                        .map_err(|_| Error::ParseError("invalid vector component".to_string()))
+                })
+                .collect::<Result<_>>()?;
+            Ok(Expr::Literal(Literal::Vector(values)))
+        }
         Rule::column_ref => build_column_ref(first),
         Rule::expr => build_expr(first),
         _ => Err(Error::ParseError(
@@ -957,7 +978,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
             Rule::if_not_exists => if_not_exists = true,
             Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
             Rule::column_def => {
-                let col = build_column_def(p)?;
+                let (col, inline_sm) = build_column_def(p)?;
                 if col
                     .references
                     .as_ref()
@@ -966,6 +987,9 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                     has_propagation = true;
                 }
                 columns.push(col);
+                if let Some(sm) = inline_sm {
+                    state_machine = Some(sm);
+                }
             }
             Rule::table_option => {
                 let opt = p
@@ -1053,7 +1077,7 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
 
     match action.as_rule() {
         Rule::add_column_action => {
-            let column = action
+            let (column, _) = action
                 .into_inner()
                 .find(|part| part.as_rule() == Rule::column_def)
                 .ok_or_else(|| {
@@ -1091,13 +1115,23 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             })
         }
         Rule::drop_retain_action => Ok(AlterAction::DropRetain),
+        Rule::set_table_conflict_policy => {
+            let policy = action
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::conflict_policy_value)
+                .ok_or_else(|| Error::ParseError("missing conflict policy value".to_string()))?
+                .as_str()
+                .to_lowercase();
+            Ok(AlterAction::SetSyncConflictPolicy(policy))
+        }
+        Rule::drop_table_conflict_policy => Ok(AlterAction::DropSyncConflictPolicy),
         _ => Err(Error::ParseError(
             "unsupported ALTER TABLE action".to_string(),
         )),
     }
 }
 
-fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
+fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMachineDef>)> {
     let mut name = None;
     let mut data_type = None;
     let mut nullable = true;
@@ -1106,6 +1140,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
     let mut default = None;
     let mut references = None;
     let mut fk_propagation_rules = Vec::new();
+    let mut inline_state_machine = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1133,6 +1168,9 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
                     Rule::fk_propagation_clause => {
                         fk_propagation_rules.push(build_fk_propagation_clause(c)?);
                     }
+                    Rule::state_machine_option => {
+                        inline_state_machine = Some(build_state_machine_option(c)?);
+                    }
                     _ => {}
                 }
             }
@@ -1147,16 +1185,20 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<ColumnDef> {
         fk.propagation_rules = fk_propagation_rules;
     }
 
-    Ok(ColumnDef {
-        name: name.ok_or_else(|| Error::ParseError("column name missing".to_string()))?,
-        data_type: data_type.ok_or_else(|| Error::ParseError("column type missing".to_string()))?,
-        nullable,
-        primary_key,
-        unique,
-        default,
-        references,
-        expires: false, // stub: grammar accepts EXPIRES but AST builder discards it
-    })
+    Ok((
+        ColumnDef {
+            name: name.ok_or_else(|| Error::ParseError("column name missing".to_string()))?,
+            data_type: data_type
+                .ok_or_else(|| Error::ParseError("column type missing".to_string()))?,
+            nullable,
+            primary_key,
+            unique,
+            default,
+            references,
+            expires: false,
+        },
+        inline_state_machine,
+    ))
 }
 
 fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {

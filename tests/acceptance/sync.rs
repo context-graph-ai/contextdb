@@ -500,23 +500,25 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     assert!(edge_b.status.success());
 
     // Confirm precondition: server must have "review" after Edge B's push
+    // Use a checker CLI via pull (can't open server DB directly — server holds the lock)
     {
-        let db = Database::open(&server_path).expect("server db for precondition check");
-        let row = db
-            .point_lookup(
-                "tasks",
-                "id",
-                &Value::Uuid(Uuid::parse_str(row_id).expect("uuid")),
-                db.snapshot(),
-            )
-            .expect("lookup")
-            .expect("row must exist after Edge B push");
-        assert_eq!(
-            row.values.get("status"),
-            Some(&Value::Text("review".to_string())),
-            "precondition: server must have 'review' after Edge B's push"
+        let checker_path = temp_db_file(&tmp, "f09i-checker.db");
+        let check = run_cli_script(
+            &checker_path,
+            &["--tenant-id", tenant, "--nats-url", nats_url],
+            &format!(
+                "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT)\n\
+                 .sync pull\n\
+                 SELECT status FROM tasks WHERE id = '{row_id}'\n\
+                 .quit\n"
+            ),
         );
-        db.close().unwrap();
+        let stdout = output_string(&check.stdout);
+        assert!(
+            stdout.contains("review"),
+            "precondition: server must have 'review' after Edge B's push, got: {}",
+            stdout
+        );
     }
 
     // Edge A: transition same row to "archived" (from stale "active" state), push
@@ -551,10 +553,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
         )
         .expect("lookup")
         .expect("row must exist");
-    let status = row
-        .values
-        .get("status")
-        .expect("status column");
+    let status = row.values.get("status").expect("status column");
     assert_eq!(
         *status,
         Value::Text("review".to_string()),
@@ -595,16 +594,13 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
     // Start CLI with spawn_cli (keeps process alive)
-    let mut child = spawn_cli(
-        &edge_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
-    );
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
 
     // Enable auto-sync, create table, insert a row
     write_child_stdin(
         &mut child,
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-         .sync auto\n\
+         .sync auto on\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'probe')\n",
     );
 
@@ -649,17 +645,14 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     let tenant = "f12b_auto_sync_pushes_updates_not_just_inserts";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
-    let mut child = spawn_cli(
-        &edge_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
-    );
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
 
     // Create table, insert, enable auto-sync, then UPDATE
     write_child_stdin(
         &mut child,
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'original')\n\
-         .sync auto\n\
+         .sync auto on\n\
          .sync push\n\
          UPDATE sensors SET name = 'updated' WHERE id = '00000000-0000-0000-0000-000000000001'\n",
     );
@@ -700,10 +693,7 @@ async fn f12c_auto_sync_pushes_deletes() {
     let tenant = "f12c_auto_sync_pushes_deletes";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
-    let mut child = spawn_cli(
-        &edge_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
-    );
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
 
     // Create table, insert 2 rows, push, enable auto-sync, then DELETE one
     write_child_stdin(
@@ -712,13 +702,16 @@ async fn f12c_auto_sync_pushes_deletes() {
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep')\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me')\n\
          .sync push\n\
-         .sync auto\n\
+         .sync auto on\n\
          DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002'\n",
     );
 
     // Wait for DELETE to propagate — server should have 1 row, not 2
+    // Each checker uses a unique path to avoid stale local data from previous pulls
+    let mut checker_idx = 0u32;
     let found = wait_until(Duration::from_secs(10), || {
-        let fresh_path = edge_path.with_file_name("f12c-checker.db");
+        checker_idx += 1;
+        let fresh_path = edge_path.with_file_name(format!("f12c-checker-{checker_idx}.db"));
         let check = run_cli_script(
             &fresh_path,
             &["--tenant-id", tenant, "--nats-url", nats_url],

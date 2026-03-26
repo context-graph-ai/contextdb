@@ -127,6 +127,7 @@ fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
                     Value::Text(v.clone())
                 }
             }
+            Literal::Vector(v) => Value::Vector(v.clone()),
         }),
         Expr::Parameter(p) => params
             .get(p)

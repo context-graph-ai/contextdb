@@ -64,6 +64,7 @@ impl SyncServer {
             .subscribe(pull_subject(&self.tenant_id))
             .await
             .expect("subscribe pull");
+        client.flush().await.expect("flush subscriptions");
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {

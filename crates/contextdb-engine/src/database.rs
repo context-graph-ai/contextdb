@@ -68,6 +68,7 @@ pub struct Database {
     instance_id: uuid::Uuid,
     plugin: Arc<dyn DatabasePlugin>,
     accountant: Arc<MemoryAccountant>,
+    conflict_policies: RwLock<ConflictPolicies>,
 }
 
 impl std::fmt::Debug for Database {
@@ -178,6 +179,7 @@ impl Database {
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
             accountant: Arc::new(MemoryAccountant::no_limit()),
+            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
         };
 
         for meta in all_meta.values() {
@@ -222,6 +224,7 @@ impl Database {
             instance_id: uuid::Uuid::new_v4(),
             plugin: Arc::new(CorePlugin),
             accountant: Arc::new(MemoryAccountant::no_limit()),
+            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db
@@ -353,9 +356,10 @@ impl Database {
             self.plugin.on_ddl(change)?;
         }
 
-        // Handle INSERT INTO GRAPH as a virtual table routing to the graph store.
+        // Handle INSERT INTO GRAPH / __edges as a virtual table routing to the graph store.
         if let Statement::Insert(ins) = stmt
-            && ins.table.eq_ignore_ascii_case("GRAPH")
+            && (ins.table.eq_ignore_ascii_case("GRAPH")
+                || ins.table.eq_ignore_ascii_case("__edges"))
         {
             return self.execute_graph_insert(ins, params, tx);
         }
@@ -478,6 +482,8 @@ impl Database {
                     }
                     AlterAction::SetRetain { .. } => { /* stub: no-op */ }
                     AlterAction::DropRetain => { /* stub: no-op */ }
+                    AlterAction::SetSyncConflictPolicy(_) | AlterAction::DropSyncConflictPolicy => { /* handled in executor */
+                    }
                 }
                 Some(DdlChange::AlterTable {
                     name: at.table.clone(),
@@ -1044,6 +1050,7 @@ impl Database {
             instance_id: uuid::Uuid::new_v4(),
             plugin,
             accountant: Arc::new(MemoryAccountant::no_limit()),
+            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db.plugin.on_open()?;
@@ -1064,10 +1071,12 @@ impl Database {
     /// File-backed database with custom plugin.
     pub fn open_with_plugin(
         path: impl AsRef<Path>,
-        _plugin: Arc<dyn DatabasePlugin>,
+        plugin: Arc<dyn DatabasePlugin>,
     ) -> Result<Self> {
-        // Stub: delegates to open() ignoring plugin.
-        Self::open(path)
+        let mut db = Self::open(path)?;
+        db.plugin = plugin;
+        db.plugin.on_open()?;
+        Ok(db)
     }
 
     /// Full constructor with budget.
@@ -1089,6 +1098,29 @@ impl Database {
     /// Access the memory accountant.
     pub fn accountant(&self) -> &MemoryAccountant {
         &self.accountant
+    }
+
+    /// Get a clone of the current conflict policies.
+    pub fn conflict_policies(&self) -> ConflictPolicies {
+        self.conflict_policies.read().clone()
+    }
+
+    /// Set the default conflict policy.
+    pub fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
+        self.conflict_policies.write().default = policy;
+    }
+
+    /// Set a per-table conflict policy.
+    pub fn set_table_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
+        self.conflict_policies
+            .write()
+            .per_table
+            .insert(table.to_string(), policy);
+    }
+
+    /// Remove a per-table conflict policy override.
+    pub fn drop_table_conflict_policy(&self, table: &str) {
+        self.conflict_policies.write().per_table.remove(table);
     }
 
     pub fn plugin(&self) -> &dyn DatabasePlugin {
@@ -1418,27 +1450,37 @@ impl Database {
 
         // Deduplicate upserts: when a RowDelete is followed by a RowInsert for the same
         // (table, natural_key), the delete is part of an upsert — remove it.
-        // Build a set of (table, natural_key) that have a non-delete entry.
-        let insert_keys: HashSet<(String, String, String)> = rows
-            .iter()
-            .filter(|r| !r.deleted)
-            .map(|r| {
-                (
-                    r.table.clone(),
-                    r.natural_key.column.clone(),
-                    format!("{:?}", r.natural_key.value),
-                )
-            })
-            .collect();
-        rows.retain(|r| {
-            if r.deleted {
-                // Keep the delete only if there's no subsequent insert for this key
+        // Only remove a delete if there is a non-delete entry with a HIGHER LSN
+        // (i.e., the insert came after the delete, indicating an upsert).
+        // If the insert has a lower LSN, the delete is genuine and must be kept.
+        let insert_max_lsn: HashMap<(String, String, String), u64> = {
+            let mut map: HashMap<(String, String, String), u64> = HashMap::new();
+            for r in rows.iter().filter(|r| !r.deleted) {
                 let key = (
                     r.table.clone(),
                     r.natural_key.column.clone(),
                     format!("{:?}", r.natural_key.value),
                 );
-                !insert_keys.contains(&key)
+                let entry = map.entry(key).or_insert(0);
+                if r.lsn > *entry {
+                    *entry = r.lsn;
+                }
+            }
+            map
+        };
+        rows.retain(|r| {
+            if r.deleted {
+                let key = (
+                    r.table.clone(),
+                    r.natural_key.column.clone(),
+                    format!("{:?}", r.natural_key.value),
+                );
+                // Keep the delete unless there is a subsequent insert (higher or equal LSN).
+                // Equal LSN means the delete+insert are part of the same upsert transaction.
+                match insert_max_lsn.get(&key) {
+                    Some(&insert_lsn) => insert_lsn < r.lsn,
+                    None => true,
+                }
             } else {
                 true
             }
@@ -1517,16 +1559,51 @@ impl Database {
                     constraints,
                 } => {
                     if self.table_meta(&name).is_some() {
-                        // Check for schema divergence
                         if let Some(local_meta) = self.table_meta(&name) {
-                            let local_col_count = local_meta.columns.len();
-                            if local_col_count != columns.len() {
-                                tracing::warn!(
-                                    table = name,
-                                    local_columns = local_col_count,
-                                    remote_columns = columns.len(),
-                                    "schema divergence detected — keeping local schema"
-                                );
+                            let local_cols: Vec<(String, String)> = local_meta
+                                .columns
+                                .iter()
+                                .map(|c| {
+                                    let ty = match c.column_type {
+                                        ColumnType::Integer => "INTEGER".to_string(),
+                                        ColumnType::Real => "REAL".to_string(),
+                                        ColumnType::Text => "TEXT".to_string(),
+                                        ColumnType::Boolean => "BOOLEAN".to_string(),
+                                        ColumnType::Json => "JSON".to_string(),
+                                        ColumnType::Uuid => "UUID".to_string(),
+                                        ColumnType::Vector(dim) => format!("VECTOR({dim})"),
+                                        ColumnType::Timestamp => "TIMESTAMP".to_string(),
+                                    };
+                                    (c.name.clone(), ty)
+                                })
+                                .collect();
+                            let remote_cols: Vec<(String, String)> = columns
+                                .iter()
+                                .map(|(col_name, col_type)| {
+                                    let base_type = col_type
+                                        .split_whitespace()
+                                        .next()
+                                        .unwrap_or(col_type)
+                                        .to_string();
+                                    (col_name.clone(), base_type)
+                                })
+                                .collect();
+                            let mut local_sorted = local_cols.clone();
+                            local_sorted.sort();
+                            let mut remote_sorted = remote_cols.clone();
+                            remote_sorted.sort();
+                            if local_sorted != remote_sorted {
+                                result.conflicts.push(Conflict {
+                                    natural_key: NaturalKey {
+                                        column: "table".to_string(),
+                                        value: Value::Text(name.clone()),
+                                    },
+                                    resolution: ConflictPolicy::ServerWins,
+                                    reason: Some(format!(
+                                        "schema mismatch: local columns {:?} differ from remote {:?}",
+                                        local_cols, remote_cols
+                                    )),
+                                });
                             }
                         }
                         continue;
@@ -1625,27 +1702,89 @@ impl Database {
             values.remove("__deleted");
 
             match (existing, policy) {
-                (None, _) => match self.insert_row(tx, &row.table, values.clone()) {
-                    Ok(new_row_id) => {
-                        result.applied_rows += 1;
-                        if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
-                            vector_row_map.insert(*remote_row_id, new_row_id);
-                            vector_row_idx += 1;
+                (None, _) => {
+                    if let Some(meta) = self.table_meta(&row.table) {
+                        let mut constraint_error: Option<String> = None;
+
+                        for col_def in &meta.columns {
+                            if !col_def.nullable
+                                && !col_def.primary_key
+                                && col_def.default.is_none()
+                            {
+                                match values.get(&col_def.name) {
+                                    None | Some(Value::Null) => {
+                                        constraint_error = Some(format!(
+                                            "NOT NULL constraint violated: {}.{}",
+                                            row.table, col_def.name
+                                        ));
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        let has_unique = meta.columns.iter().any(|c| c.unique && !c.primary_key);
+                        if constraint_error.is_none() && has_unique {
+                            let existing_rows =
+                                self.scan(&row.table, self.snapshot()).unwrap_or_default();
+                            for col_def in &meta.columns {
+                                if col_def.unique
+                                    && !col_def.primary_key
+                                    && let Some(new_val) = values.get(&col_def.name)
+                                    && *new_val != Value::Null
+                                    && existing_rows
+                                        .iter()
+                                        .any(|r| r.values.get(&col_def.name) == Some(new_val))
+                                {
+                                    constraint_error = Some(format!(
+                                        "UNIQUE constraint violated: {}.{}",
+                                        row.table, col_def.name
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(err_msg) = constraint_error {
+                            result.skipped_rows += 1;
+                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                                failed_row_ids.insert(*remote_row_id);
+                                vector_row_idx += 1;
+                            }
+                            result.conflicts.push(Conflict {
+                                natural_key: row.natural_key.clone(),
+                                resolution: policy,
+                                reason: Some(err_msg),
+                            });
+                            self.commit_with_source(tx, CommitSource::SyncPull)?;
+                            tx = self.begin();
+                            continue;
                         }
                     }
-                    Err(err) => {
-                        result.skipped_rows += 1;
-                        if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
-                            failed_row_ids.insert(*remote_row_id);
-                            vector_row_idx += 1;
+
+                    match self.insert_row(tx, &row.table, values.clone()) {
+                        Ok(new_row_id) => {
+                            result.applied_rows += 1;
+                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                                vector_row_map.insert(*remote_row_id, new_row_id);
+                                vector_row_idx += 1;
+                            }
                         }
-                        result.conflicts.push(Conflict {
-                            natural_key: row.natural_key.clone(),
-                            resolution: policy,
-                            reason: Some(format!("{err}")),
-                        });
+                        Err(err) => {
+                            result.skipped_rows += 1;
+                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                                failed_row_ids.insert(*remote_row_id);
+                                vector_row_idx += 1;
+                            }
+                            result.conflicts.push(Conflict {
+                                natural_key: row.natural_key.clone(),
+                                resolution: policy,
+                                reason: Some(format!("{err}")),
+                            });
+                        }
                     }
-                },
+                }
                 (Some(local), ConflictPolicy::InsertIfNotExists) => {
                     if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
                         vector_row_map.insert(*remote_row_id, local.row_id);
@@ -1678,6 +1817,48 @@ impl Database {
                             reason: Some("local_lsn_newer_or_equal".to_string()),
                         });
                     } else {
+                        // State machine conflict detection
+                        if let Some(meta) = self.table_meta(&row.table)
+                            && let Some(sm) = &meta.state_machine
+                        {
+                            let sm_col = sm.column.clone();
+                            let transitions = sm.transitions.clone();
+                            let incoming_state = values.get(&sm_col).and_then(|v| match v {
+                                Value::Text(s) => Some(s.clone()),
+                                _ => None,
+                            });
+                            let local_state = local.values.get(&sm_col).and_then(|v| match v {
+                                Value::Text(s) => Some(s.clone()),
+                                _ => None,
+                            });
+
+                            if let (Some(incoming), Some(current)) = (incoming_state, local_state) {
+                                // Check if the transition from current to incoming is valid
+                                let valid = transitions
+                                    .get(&current)
+                                    .is_some_and(|targets| targets.contains(&incoming));
+                                if !valid && incoming != current {
+                                    result.skipped_rows += 1;
+                                    if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                                    {
+                                        failed_row_ids.insert(*remote_row_id);
+                                        vector_row_idx += 1;
+                                    }
+                                    result.conflicts.push(Conflict {
+                                        natural_key: row.natural_key.clone(),
+                                        resolution: ConflictPolicy::LatestWins,
+                                        reason: Some(format!(
+                                            "state_machine: invalid transition {} -> {} (current: {})",
+                                            current, incoming, current
+                                        )),
+                                    });
+                                    self.commit_with_source(tx, CommitSource::SyncPull)?;
+                                    tx = self.begin();
+                                    continue;
+                                }
+                            }
+                        }
+
                         match self.upsert_row(
                             tx,
                             &row.table,
@@ -2043,6 +2224,15 @@ fn sql_type_for_ast_column(
             }
         }
     }
+    if col.primary_key {
+        ty.push_str(" PRIMARY KEY");
+    }
+    if !col.nullable && !col.primary_key {
+        ty.push_str(" NOT NULL");
+    }
+    if col.unique {
+        ty.push_str(" UNIQUE");
+    }
     ty
 }
 
@@ -2098,6 +2288,15 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
                 ty.push_str(" ABORT ON FAILURE");
             }
         }
+    }
+    if col.primary_key {
+        ty.push_str(" PRIMARY KEY");
+    }
+    if !col.nullable && !col.primary_key {
+        ty.push_str(" NOT NULL");
+    }
+    if col.unique {
+        ty.push_str(" UNIQUE");
     }
 
     ty

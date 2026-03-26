@@ -48,6 +48,10 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::Select(sel) => plan_select(sel),
         Statement::SetMemoryLimit(val) => Ok(PhysicalPlan::SetMemoryLimit(val.clone())),
         Statement::ShowMemoryLimit => Ok(PhysicalPlan::ShowMemoryLimit),
+        Statement::SetSyncConflictPolicy(policy) => {
+            Ok(PhysicalPlan::SetSyncConflictPolicy(policy.clone()))
+        }
+        Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Ok(PhysicalPlan::Pipeline(vec![]))
         }

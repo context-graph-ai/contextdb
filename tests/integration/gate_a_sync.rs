@@ -4033,7 +4033,10 @@ fn cp06_conflict_policy_wired_to_apply_changes() {
 
         let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
         let result = db.apply_changes(changeset.clone(), &policies).unwrap();
-        assert!(result.skipped_rows > 0, "server_wins must skip the edge row");
+        assert!(
+            result.skipped_rows > 0,
+            "server_wins must skip the edge row"
+        );
 
         let row = db
             .point_lookup("items", "id", &Value::Uuid(id), db.snapshot())
@@ -4231,20 +4234,24 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
     });
 
     // Push must succeed (retried and found server)
-    let push_result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        push_handle,
-    )
-    .await
-    .expect("push must complete within 15s")
-    .expect("push task must not panic");
-    assert!(push_result.is_ok(), "push must succeed after server starts late: {:?}", push_result.err());
+    let push_result = tokio::time::timeout(std::time::Duration::from_secs(15), push_handle)
+        .await
+        .expect("push must complete within 15s")
+        .expect("push task must not panic");
+    assert!(
+        push_result.is_ok(),
+        "push must succeed after server starts late: {:?}",
+        push_result.err()
+    );
 
     // Verify data arrived
     let row = server_db
         .point_lookup("items", "id", &Value::Uuid(id), server_db.snapshot())
         .unwrap();
-    assert!(row.is_some(), "row must be on server after retry-succeeded push");
+    assert!(
+        row.is_some(),
+        "row must be on server after retry-succeeded push"
+    );
 
     server_handle.abort();
     edge_db.close().unwrap();

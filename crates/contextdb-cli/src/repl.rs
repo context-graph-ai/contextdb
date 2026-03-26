@@ -2,7 +2,7 @@ use crate::formatter::format_query_result;
 use contextdb_core::{ColumnType, TableMeta};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
-use contextdb_server::SyncClient;
+use contextdb_server::{SyncClient, SyncPlugin};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ pub fn run(
     db: Arc<Database>,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
+    sync_plugin: Option<&SyncPlugin>,
 ) -> bool {
     let mut rl = DefaultEditor::new().expect("failed to initialize readline");
     if std::io::stdin().is_terminal() {
@@ -34,11 +35,26 @@ pub fn run(
                 let _ = rl.add_history_entry(line);
 
                 if line.starts_with('.') || line.starts_with('\\') {
-                    if !handle_meta_command(&db, sync_client, rt, line) {
+                    if !handle_meta_command(&db, sync_client, rt, line, sync_plugin) {
                         break;
                     }
-                } else if !execute_sql(&db, line) {
-                    had_error = true;
+                } else {
+                    let is_dml = {
+                        let upper = line.trim_start().to_uppercase();
+                        upper.starts_with("INSERT")
+                            || upper.starts_with("UPDATE")
+                            || upper.starts_with("DELETE")
+                    };
+                    if !execute_sql(&db, line) {
+                        had_error = true;
+                    }
+                    // Auto-sync: notify background push task after DML
+                    if is_dml
+                        && let Some(plugin) = sync_plugin
+                        && plugin.is_auto()
+                    {
+                        plugin.notify_change();
+                    }
                 }
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
@@ -54,6 +70,7 @@ pub(crate) fn handle_meta_command(
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     line: &str,
+    sync_plugin: Option<&SyncPlugin>,
 ) -> bool {
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
@@ -102,7 +119,10 @@ pub(crate) fn handle_meta_command(
             }
         }
         ".sync" | "\\sync" => {
-            println!("{}", handle_sync_command(sync_client, rt, rest));
+            println!(
+                "{}",
+                handle_sync_command(sync_client, rt, rest, sync_plugin)
+            );
         }
         _ => println!("Unknown command: {}. Type \\? for help.", cmd),
     }
@@ -114,6 +134,7 @@ fn handle_sync_command(
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     args: &str,
+    sync_plugin: Option<&SyncPlugin>,
 ) -> String {
     let (Some(client), Some(rt)) = (sync_client, rt) else {
         return "Sync not configured. Start with --tenant-id to enable.".to_string();
@@ -140,21 +161,37 @@ fn handle_sync_command(
             )
         }
         "push" => match rt.block_on(client.push()) {
-            Ok(result) => format!(
-                "Pushed: {} applied, {} skipped, {} conflicts",
-                result.applied_rows,
-                result.skipped_rows,
-                result.conflicts.len()
-            ),
+            Ok(result) => {
+                let mut msg = format!(
+                    "Pushed: {} applied, {} skipped, {} conflicts",
+                    result.applied_rows,
+                    result.skipped_rows,
+                    result.conflicts.len()
+                );
+                for conflict in &result.conflicts {
+                    if let Some(reason) = &conflict.reason {
+                        msg.push_str(&format!("\n  conflict: {}", reason));
+                    }
+                }
+                msg
+            }
             Err(e) => format!("Push failed: {e}"),
         },
         "pull" => match rt.block_on(client.pull_default()) {
-            Ok(result) => format!(
-                "Pulled: {} applied, {} skipped, {} conflicts",
-                result.applied_rows,
-                result.skipped_rows,
-                result.conflicts.len()
-            ),
+            Ok(result) => {
+                let mut msg = format!(
+                    "Pulled: {} applied, {} skipped, {} conflicts",
+                    result.applied_rows,
+                    result.skipped_rows,
+                    result.conflicts.len()
+                );
+                for conflict in &result.conflicts {
+                    if let Some(reason) = &conflict.reason {
+                        msg.push_str(&format!("\n  conflict: {}", reason));
+                    }
+                }
+                msg
+            }
             Err(e) => format!("Pull failed: {e}"),
         },
         "reconnect" => {
@@ -206,8 +243,29 @@ fn handle_sync_command(
                 format!("{} -> {policy:?}", parts[1])
             }
         }
+        "auto" => {
+            let Some(plugin) = sync_plugin else {
+                return "Auto-sync not available (no sync plugin)".to_string();
+            };
+            let toggle = parts.get(1).copied().unwrap_or("");
+            match toggle {
+                "on" => {
+                    plugin.set_auto(true);
+                    "Auto-sync enabled".to_string()
+                }
+                "off" => {
+                    plugin.set_auto(false);
+                    "Auto-sync disabled".to_string()
+                }
+                "" => {
+                    let state = if plugin.is_auto() { "on" } else { "off" };
+                    format!("Auto-sync: {state}")
+                }
+                other => format!("Unknown auto-sync option: {other}. Use: on, off"),
+            }
+        }
         _ => format!(
-            "Unknown sync command: {sub}. Try: status, push, pull, reconnect, direction, policy"
+            "Unknown sync command: {sub}. Try: status, push, pull, reconnect, direction, policy, auto"
         ),
     }
 }
@@ -308,7 +366,7 @@ mod tests {
         let db = Database::open_memory();
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
             .unwrap();
-        assert!(handle_meta_command(&db, None, None, "\\dt"));
+        assert!(handle_meta_command(&db, None, None, "\\dt", None));
     }
 
     // B1: Existing \dt works with new handle_meta_command signature
@@ -318,11 +376,11 @@ mod tests {
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
             .unwrap();
         // Pass None for sync_client and rt — existing commands must work without sync
-        assert!(handle_meta_command(&db, None, None, "\\dt"));
+        assert!(handle_meta_command(&db, None, None, "\\dt", None));
         // Also verify .tables works
-        assert!(handle_meta_command(&db, None, None, ".tables"));
+        assert!(handle_meta_command(&db, None, None, ".tables", None));
         // .quit returns false
-        assert!(!handle_meta_command(&db, None, None, ".quit"));
+        assert!(!handle_meta_command(&db, None, None, ".quit", None));
     }
 
     // B2: .sync subcommands handle missing sync configuration
@@ -336,7 +394,7 @@ mod tests {
             "direction t Push",
             "policy t ServerWins",
         ] {
-            let result = handle_sync_command(None, None, subcmd);
+            let result = handle_sync_command(None, None, subcmd, None);
             assert!(
                 result.contains("Sync not configured"),
                 "subcmd '{}' should return 'Sync not configured', got: {}",
@@ -369,7 +427,7 @@ mod tests {
             ("scratch", "None"),
         ] {
             let args = format!("direction {} {}", table, dir);
-            let result = handle_sync_command(Some(&client), Some(&rt), &args);
+            let result = handle_sync_command(Some(&client), Some(&rt), &args, None);
             assert!(
                 result.contains(table),
                 "direction command for '{}' should contain table name, got: {}",
@@ -395,14 +453,20 @@ mod tests {
             ConflictPolicy::LatestWins,
         ];
 
-        let result = handle_sync_command(Some(&client), Some(&rt), "policy obs InsertIfNotExists");
+        let result = handle_sync_command(
+            Some(&client),
+            Some(&rt),
+            "policy obs InsertIfNotExists",
+            None,
+        );
         assert!(
             result.contains("InsertIfNotExists"),
             "policy command should contain 'InsertIfNotExists', got: {}",
             result
         );
 
-        let result = handle_sync_command(Some(&client), Some(&rt), "policy default ServerWins");
+        let result =
+            handle_sync_command(Some(&client), Some(&rt), "policy default ServerWins", None);
         assert!(
             result.contains("Default") || result.contains("default"),
             "default policy command should reference 'default', got: {}",
@@ -427,7 +491,7 @@ mod tests {
             "policy table_only",
             "policy t InvalidPolicy",
         ] {
-            let result = handle_sync_command(Some(&client), Some(&rt), bad_input);
+            let result = handle_sync_command(Some(&client), Some(&rt), bad_input, None);
             assert!(
                 !result.contains("not implemented"),
                 "bad input '{}' should not return 'not implemented', got: {}",

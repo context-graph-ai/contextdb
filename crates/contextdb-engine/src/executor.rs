@@ -1,4 +1,5 @@
 use crate::database::{Database, QueryResult};
+use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
 use contextdb_parser::ast::{
     AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement, SortDirection,
@@ -98,6 +99,13 @@ pub(crate) fn execute_plan(
                 }
                 AlterAction::SetRetain { .. } => { /* stub: no-op */ }
                 AlterAction::DropRetain => { /* stub: no-op */ }
+                AlterAction::SetSyncConflictPolicy(policy) => {
+                    let cp = parse_conflict_policy(policy)?;
+                    db.set_table_conflict_policy(&p.table, cp);
+                }
+                AlterAction::DropSyncConflictPolicy => {
+                    db.drop_table_conflict_policy(&p.table);
+                }
             }
             if let Some(table_meta) = db.table_meta(&p.table) {
                 db.persist_table_meta(&p.table, &table_meta)?;
@@ -106,6 +114,8 @@ pub(crate) fn execute_plan(
                     AlterAction::AddColumn(_)
                         | AlterAction::SetRetain { .. }
                         | AlterAction::DropRetain
+                        | AlterAction::SetSyncConflictPolicy(_)
+                        | AlterAction::DropSyncConflictPolicy
                 ) {
                     db.persist_table_rows(&p.table)?;
                 }
@@ -539,6 +549,28 @@ pub(crate) fn execute_plan(
                 rows_affected: 0,
             })
         }
+        PhysicalPlan::SetSyncConflictPolicy(policy) => {
+            let cp = parse_conflict_policy(policy)?;
+            db.set_default_conflict_policy(cp);
+            Ok(QueryResult::empty())
+        }
+        PhysicalPlan::ShowSyncConflictPolicy => {
+            let policies = db.conflict_policies();
+            let default_str = conflict_policy_to_string(policies.default);
+            let mut rows = vec![vec![Value::Text(default_str)]];
+            for (table, policy) in &policies.per_table {
+                rows.push(vec![Value::Text(format!(
+                    "{}={}",
+                    table,
+                    conflict_policy_to_string(*policy)
+                ))]);
+            }
+            Ok(QueryResult {
+                columns: vec!["policy".to_string()],
+                rows,
+                rows_affected: 0,
+            })
+        }
         PhysicalPlan::Pipeline(plans) => {
             let mut last = QueryResult::empty();
             for p in plans {
@@ -906,6 +938,7 @@ pub fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Valu
             Literal::Integer(v) => Value::Int64(*v),
             Literal::Real(v) => Value::Float64(*v),
             Literal::Text(v) => Value::Text(v.clone()),
+            Literal::Vector(v) => Value::Vector(v.clone()),
         }),
         Expr::Parameter(p) => params
             .get(p)
@@ -1208,6 +1241,7 @@ fn literal_to_value(lit: &Literal) -> Result<Value> {
         Literal::Integer(v) => Value::Int64(*v),
         Literal::Real(v) => Value::Float64(*v),
         Literal::Text(v) => Value::Text(v.clone()),
+        Literal::Vector(v) => Value::Vector(v.clone()),
     })
 }
 
@@ -1815,5 +1849,24 @@ pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
         DataType::Timestamp => contextdb_core::ColumnType::Timestamp,
         DataType::Json => contextdb_core::ColumnType::Json,
         DataType::Vector(dim) => contextdb_core::ColumnType::Vector(*dim as usize),
+    }
+}
+
+fn parse_conflict_policy(s: &str) -> Result<ConflictPolicy> {
+    match s {
+        "latest_wins" => Ok(ConflictPolicy::LatestWins),
+        "server_wins" => Ok(ConflictPolicy::ServerWins),
+        "edge_wins" => Ok(ConflictPolicy::EdgeWins),
+        "insert_if_not_exists" => Ok(ConflictPolicy::InsertIfNotExists),
+        _ => Err(Error::Other(format!("unknown conflict policy: {s}"))),
+    }
+}
+
+fn conflict_policy_to_string(p: ConflictPolicy) -> String {
+    match p {
+        ConflictPolicy::LatestWins => "latest_wins".to_string(),
+        ConflictPolicy::ServerWins => "server_wins".to_string(),
+        ConflictPolicy::EdgeWins => "edge_wins".to_string(),
+        ConflictPolicy::InsertIfNotExists => "insert_if_not_exists".to_string(),
     }
 }

@@ -629,6 +629,7 @@ dependencies = [
  "clap",
  "contextdb-core",
  "contextdb-engine",
+ "contextdb-tx",
  "futures-util",
  "rmp-serde",
  "serde",

@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Arc::new(Database::open(std::path::Path::new(&args.db_path))?)
     };
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
     let server = SyncServer::new(db, &args.nats_url, &args.tenant_id, policies);
     server.run().await;
     Ok(())

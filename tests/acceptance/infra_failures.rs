@@ -91,7 +91,7 @@ fn f15_disk_full_on_edge_produces_a_clear_error_not_corruption() {
         &format!(
             "CREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)\n{}.quit\n",
             (0..500)
-                .map(|i| format!(
+                .map(|_i| format!(
                     "INSERT INTO big (id, payload) VALUES ('{}', '{}')\n",
                     uuid::Uuid::new_v4(),
                     "x".repeat(4000)

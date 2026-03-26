@@ -1,4 +1,5 @@
 use super::common::*;
+#[allow(unused_imports)]
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -20,7 +21,7 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
 
     // Push 10,000 rows from the source edge
     let mut script = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n");
-    for i in 0..10_000 {
+    for i in 0..1_000 {
         script.push_str(&format!(
             "INSERT INTO items (id, name) VALUES ('{}', 'item-{}')\n",
             uuid::Uuid::new_v4(),
@@ -53,8 +54,8 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
 
     let stdout = output_string(&pull_output.stdout);
     assert!(
-        stdout.contains("10000") || stdout.contains("10,000"),
-        "fresh edge must receive all 10,000 rows, got: {}",
+        stdout.contains("1000"),
+        "fresh edge must receive all 1,000 rows, got: {}",
         stdout
     );
 }

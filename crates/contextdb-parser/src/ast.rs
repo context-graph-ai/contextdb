@@ -13,6 +13,8 @@ pub enum Statement {
     Rollback,
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
+    SetSyncConflictPolicy(String),
+    ShowSyncConflictPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +204,7 @@ pub enum Literal {
     Integer(i64),
     Real(f64),
     Text(String),
+    Vector(Vec<f32>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +276,8 @@ pub enum AlterAction {
         sync_safe: bool,
     },
     DropRetain,
+    SetSyncConflictPolicy(String),
+    DropSyncConflictPolicy,
 }
 
 #[derive(Debug, Clone)]

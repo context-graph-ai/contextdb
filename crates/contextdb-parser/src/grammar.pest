@@ -16,11 +16,16 @@ stmt = _{
     | insert_stmt
     | delete_stmt
     | update_stmt
+    | set_sync_conflict_policy
+    | show_sync_conflict_policy
     | set_memory_limit
     | show_memory_limit
     | select_stmt
 }
 
+set_sync_conflict_policy = { ^"SET" ~ ^"SYNC_CONFLICT_POLICY" ~ "'" ~ conflict_policy_value ~ "'" }
+show_sync_conflict_policy = { ^"SHOW" ~ ^"SYNC_CONFLICT_POLICY" }
+conflict_policy_value = { ^"latest_wins" | ^"server_wins" | ^"edge_wins" | ^"insert_if_not_exists" }
 set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "'" ~ memory_limit_value ~ "'" }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }
@@ -116,9 +121,11 @@ create_table_stmt = {
 if_not_exists = { ^"IF" ~ ^"NOT" ~ ^"EXISTS" }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
-alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action }
+alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_table_conflict_policy | drop_table_conflict_policy }
 set_retain_action = { ^"SET" ~ ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
+set_table_conflict_policy = { ^"SET" ~ ^"SYNC_CONFLICT_POLICY" ~ "'" ~ conflict_policy_value ~ "'" }
+drop_table_conflict_policy = { ^"DROP" ~ ^"SYNC_CONFLICT_POLICY" }
 add_column_action = { ^"ADD" ~ (^"COLUMN")? ~ column_def }
 drop_column_action = { ^"DROP" ~ ^"COLUMN" ~ identifier }
 rename_column_action = { ^"RENAME" ~ ^"COLUMN" ~ identifier ~ ^"TO" ~ identifier }
@@ -148,6 +155,7 @@ column_constraint = {
     | references_clause
     | fk_propagation_clause
     | expires_constraint
+    | state_machine_option
 }
 expires_constraint = { ^"EXPIRES" }
 not_null = { ^"NOT" ~ ^"NULL" }
@@ -178,9 +186,9 @@ retain_option = { ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 retain_unit = { ^"SECONDS" | ^"MINUTES" | ^"HOURS" | ^"DAYS" }
 sync_safe_option = { ^"SYNC" ~ ^"SAFE" }
 immutable_option = { ^"IMMUTABLE" }
-state_machine_option = { ^"STATE" ~ ^"MACHINE" ~ "(" ~ state_machine_entries ~ ")" }
+state_machine_option = { (^"STATE_MACHINE" | (^"STATE" ~ ^"MACHINE")) ~ "(" ~ state_machine_entries ~ ")" }
 state_machine_entries = { state_machine_entry ~ ("," ~ state_machine_entry)* }
-state_machine_entry = { (identifier ~ ":")? ~ identifier ~ "->" ~ "[" ~ identifier ~ ("," ~ identifier)* ~ "]" }
+state_machine_entry = { (identifier ~ ":")? ~ identifier ~ "->" ~ (("[" ~ identifier ~ ("," ~ identifier)* ~ "]") | identifier) }
 dag_option = { ^"DAG" ~ "(" ~ string ~ ("," ~ string)* ~ ")" }
 propagate_edge_option = {
     ^"PROPAGATE"
@@ -296,9 +304,12 @@ primary_expr = {
     | float
     | integer
     | string
+    | vector_lit
     | column_ref
     | "(" ~ expr ~ ")"
 }
+vector_lit = { "[" ~ vector_component ~ ("," ~ vector_component)* ~ "]" }
+vector_component = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 function_call = { identifier ~ "(" ~ (star | (expr ~ ("," ~ expr)*))? ~ ")" }
 column_ref = { identifier ~ ("." ~ identifier)? }
 

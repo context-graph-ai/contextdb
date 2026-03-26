@@ -85,6 +85,8 @@ pub enum PhysicalPlan {
     Pipeline(Vec<PhysicalPlan>),
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
+    SetSyncConflictPolicy(String),
+    ShowSyncConflictPolicy,
 }
 
 impl PhysicalPlan {
