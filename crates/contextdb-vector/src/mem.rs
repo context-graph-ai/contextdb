@@ -55,6 +55,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         scored.truncate(k);
         scored
     }
+
+    fn build_hnsw_from_store(&self) -> Option<HnswIndex> {
+        let entries = self.store.all_entries();
+        let dim = self.store.dimension().unwrap_or(0);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            HnswIndex::new(&entries, dim)
+        }))
+        .ok()
+    }
 }
 
 impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
@@ -71,15 +80,16 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
 
         let use_hnsw = self.store.vector_count() >= HNSW_THRESHOLD;
         if use_hnsw {
-            let once_lock = self.hnsw.get_or_init(|| {
-                let entries = self.store.all_entries();
-                let dim = self.store.dimension().unwrap_or(0);
-                let hnsw_opt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    HnswIndex::new(&entries, dim)
-                }))
-                .ok();
-                RwLock::new(hnsw_opt)
-            });
+            let once_lock = self
+                .hnsw
+                .get_or_init(|| RwLock::new(self.build_hnsw_from_store()));
+
+            {
+                let mut guard = once_lock.write();
+                if guard.is_none() {
+                    *guard = self.build_hnsw_from_store();
+                }
+            }
 
             let guard = once_lock.read();
             if let Some(hnsw) = guard.as_ref() {

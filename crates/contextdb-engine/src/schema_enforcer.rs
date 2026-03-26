@@ -19,7 +19,7 @@ pub fn validate_dml(
         PhysicalPlan::Insert(p) => {
             let table_meta = db
                 .table_meta(&p.table)
-                .ok_or_else(|| Error::NotFound(format!("table metadata not found: {}", p.table)))?;
+                .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
             let existing_rows = db.scan(&p.table, db.snapshot())?;
 
             // Validate that all INSERT columns exist in the table schema

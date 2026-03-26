@@ -234,15 +234,11 @@ fn plan_select_body(
         && matches!(order.direction, SortDirection::CosineDistance)
     {
         let k = body.limit.ok_or(Error::UnboundedVectorSearch)?;
+        let vector_table = vector_base_table(&current)?.ok_or_else(|| {
+            Error::PlanError("unable to resolve physical vector source table".to_string())
+        })?;
         current = PhysicalPlan::VectorSearch {
-            table: body
-                .from
-                .iter()
-                .find_map(|item| match item {
-                    FromItem::Table { name, .. } => Some(name.clone()),
-                    FromItem::GraphTable { .. } => None,
-                })
-                .unwrap_or_else(|| "observations".to_string()),
+            table: vector_table,
             column: "embedding".to_string(),
             query_expr: order.expr.clone(),
             k,
@@ -301,6 +297,44 @@ fn plan_select_body(
     }
 
     Ok(current)
+}
+
+fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {
+    match plan {
+        PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
+            Ok(Some(table.clone()))
+        }
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. } => vector_base_table(input),
+        PhysicalPlan::Join { left, right, .. } => {
+            let left_table = vector_base_table(left)?;
+            let right_table = vector_base_table(right)?;
+            match (left_table, right_table) {
+                (Some(left), Some(right)) if left == right => Ok(Some(left)),
+                (Some(_), Some(_)) => Err(Error::PlanError(
+                    "ambiguous physical vector source table in join".to_string(),
+                )),
+                (Some(table), None) | (None, Some(table)) => Ok(Some(table)),
+                (None, None) => Ok(None),
+            }
+        }
+        PhysicalPlan::Pipeline(plans) => {
+            for plan in plans.iter().rev() {
+                if let Some(table) = vector_base_table(plan)? {
+                    return Ok(Some(table));
+                }
+            }
+            Ok(None)
+        }
+        PhysicalPlan::GraphBfs { .. }
+        | PhysicalPlan::CteRef { .. }
+        | PhysicalPlan::Union { .. } => Ok(None),
+        _ => Ok(None),
+    }
 }
 
 fn graph_plan_from_from_item(from_item: &FromItem) -> Result<PhysicalPlan> {

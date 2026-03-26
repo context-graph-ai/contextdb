@@ -14,6 +14,14 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Self { store, tx_mgr }
     }
 
+    fn ensure_table_exists(&self, table: &str) -> Result<()> {
+        if self.store.table_meta.read().contains_key(table) {
+            Ok(())
+        } else {
+            Err(Error::TableNotFound(table.to_string()))
+        }
+    }
+
     pub fn scan_with_tx(
         &self,
         tx: Option<TxId>,
@@ -117,6 +125,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         values: HashMap<ColName, Value>,
         snapshot: SnapshotId,
     ) -> Result<RowId> {
+        self.ensure_table_exists(table)?;
         self.validate_state_transition(tx, table, &values, snapshot)?;
 
         let row_id = self.store.new_row_id();
@@ -144,6 +153,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         values: HashMap<ColName, Value>,
         snapshot: SnapshotId,
     ) -> Result<UpsertResult> {
+        self.ensure_table_exists(table)?;
         if self.store.is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }
@@ -220,6 +230,7 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
     }
 
     fn delete(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
+        self.ensure_table_exists(table)?;
         if self.store.is_immutable(table) {
             return Err(Error::ImmutableTable(table.to_string()));
         }

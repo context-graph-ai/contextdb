@@ -990,6 +990,14 @@ impl Database {
         self.vector.search(query, k, candidates, snapshot)
     }
 
+    pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
+        self.vector_store
+            .vectors
+            .read()
+            .iter()
+            .any(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
+    }
+
     pub fn table_names(&self) -> Vec<String> {
         self.relational_store.table_names()
     }

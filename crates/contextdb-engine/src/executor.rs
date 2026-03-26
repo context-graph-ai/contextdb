@@ -231,12 +231,39 @@ pub(crate) fn execute_plan(
             ..
         } => {
             let query_vec = resolve_vector_from_expr(query_expr, params)?;
+            let snapshot = db.snapshot();
+            let all_rows = db.scan(table, snapshot)?;
             let candidate_bitmap = if let Some(cands_plan) = candidates {
                 let qr = execute_plan(db, cands_plan, params, tx)?;
                 let mut bm = RoaringTreemap::new();
-                for row in qr.rows {
-                    if let Some(Value::Int64(id)) = row.first() {
-                        bm.insert(*id as u64);
+                let row_id_idx = qr.columns.iter().position(|column| {
+                    column == "row_id" || column.rsplit('.').next() == Some("row_id")
+                });
+                let id_idx = qr
+                    .columns
+                    .iter()
+                    .position(|column| column == "id" || column.rsplit('.').next() == Some("id"));
+
+                if let Some(idx) = row_id_idx {
+                    for row in qr.rows {
+                        if let Some(Value::Int64(id)) = row.get(idx) {
+                            bm.insert(*id as u64);
+                        }
+                    }
+                } else if let Some(idx) = id_idx {
+                    let uuid_to_row_id: HashMap<uuid::Uuid, u64> = all_rows
+                        .iter()
+                        .filter_map(|row| match row.values.get("id") {
+                            Some(Value::Uuid(uuid)) => Some((*uuid, row.row_id)),
+                            _ => None,
+                        })
+                        .collect();
+                    for row in qr.rows {
+                        if let Some(Value::Uuid(uuid)) = row.get(idx)
+                            && let Some(row_id) = uuid_to_row_id.get(uuid)
+                        {
+                            bm.insert(*row_id);
+                        }
                     }
                 }
                 Some(bm)
@@ -252,8 +279,6 @@ pub(crate) fn execute_plan(
             )?;
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
-            let snapshot = db.snapshot();
-            let all_rows = db.scan(table, snapshot)?;
             let schema_columns = db.table_meta(table).map(|meta| {
                 meta.columns
                     .into_iter()
@@ -800,8 +825,22 @@ fn exec_update(
         for (k, vexpr) in &p.assignments {
             values.insert(k.clone(), eval_assignment_expr(vexpr, &row.values, params)?);
         }
+
+        let old_has_vector = db.has_live_vector(row.row_id, snapshot);
+        let new_vector = values.get("embedding").and_then(|value| match value {
+            Value::Vector(vector) => Some(vector.clone()),
+            _ => None,
+        });
+
         db.delete_row(txid, &p.table, row.row_id)?;
-        db.insert_row(txid, &p.table, values)?;
+        if old_has_vector {
+            db.delete_vector(txid, row.row_id)?;
+        }
+
+        let new_row_id = db.insert_row(txid, &p.table, values)?;
+        if let Some(vector) = new_vector {
+            db.insert_vector(txid, new_row_id, vector)?;
+        }
     }
 
     Ok(QueryResult::empty_with_affected(matched.len() as u64))

@@ -53,6 +53,11 @@ impl VectorStore {
                 }
             }
         }
+        drop(vectors);
+
+        if let Some(rw_lock) = self.hnsw.get() {
+            *rw_lock.write() = None;
+        }
     }
 
     pub fn insert_loaded_vector(&self, entry: VectorEntry) {
