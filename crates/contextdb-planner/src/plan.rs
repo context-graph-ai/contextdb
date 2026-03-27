@@ -24,10 +24,8 @@ pub enum PhysicalPlan {
     },
     GraphBfs {
         start_expr: Expr,
-        edge_types: Vec<String>,
-        direction: Direction,
-        min_depth: u32,
-        max_depth: u32,
+        start_candidates: Option<Box<PhysicalPlan>>,
+        steps: Vec<GraphStepPlan>,
         filter: Option<Expr>,
     },
     VectorSearch {
@@ -92,15 +90,17 @@ pub enum PhysicalPlan {
 impl PhysicalPlan {
     pub fn explain(&self) -> String {
         match self {
-            PhysicalPlan::GraphBfs {
-                min_depth,
-                max_depth,
-                edge_types,
-                ..
-            } => {
+            PhysicalPlan::GraphBfs { steps, .. } => {
                 format!(
-                    "GraphBfs(depth={}..{}, types={:?})",
-                    min_depth, max_depth, edge_types
+                    "GraphBfs(steps={})",
+                    steps
+                        .iter()
+                        .map(|step| format!(
+                            "{}..{}:{:?}",
+                            step.min_depth, step.max_depth, step.edge_types
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
                 )
             }
             PhysicalPlan::VectorSearch {
@@ -126,6 +126,14 @@ impl PhysicalPlan {
             _ => format!("{:?}", self),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphStepPlan {
+    pub edge_types: Vec<String>,
+    pub direction: Direction,
+    pub min_depth: u32,
+    pub max_depth: u32,
 }
 
 #[derive(Debug, Clone)]

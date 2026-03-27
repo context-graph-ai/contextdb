@@ -156,10 +156,8 @@ pub(crate) fn execute_plan(
         }
         PhysicalPlan::GraphBfs {
             start_expr,
-            edge_types,
-            direction,
-            min_depth,
-            max_depth,
+            start_candidates,
+            steps,
             filter,
         } => {
             let start_uuids = match resolve_uuid(start_expr, params) {
@@ -170,9 +168,12 @@ pub(crate) fn execute_plan(
                         Expr::Column(contextdb_parser::ast::ColumnRef { table: None, .. })
                     ) =>
                 {
-                    // Start node not directly specified — check if the filter can help
-                    if let Some(filter_expr) = filter {
-                        resolve_graph_start_nodes_from_filter(db, filter_expr, params)?
+                    // Start node not directly specified — check if a subquery or filter can help
+                    if let Some(candidate_plan) = start_candidates {
+                        resolve_graph_start_nodes_from_plan(db, candidate_plan, params, tx)?
+                    } else if let Some(filter_expr) = filter {
+                        let resolved_filter = resolve_in_subqueries(db, filter_expr, params, tx)?;
+                        resolve_graph_start_nodes_from_filter(db, &resolved_filter, params)?
                     } else {
                         vec![]
                     }
@@ -186,33 +187,49 @@ pub(crate) fn execute_plan(
                     rows_affected: 0,
                 });
             }
-            let edge_types_ref = if edge_types.is_empty() {
-                None
-            } else {
-                Some(edge_types.as_slice())
-            };
+            let snapshot = db.snapshot();
+            let mut frontier = start_uuids
+                .into_iter()
+                .map(|id| (id, 0_u32))
+                .collect::<Vec<_>>();
 
-            let mut all_rows = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for start in &start_uuids {
-                let res = db.graph().bfs(
-                    *start,
-                    edge_types_ref,
-                    *direction,
-                    *min_depth,
-                    *max_depth,
-                    db.snapshot(),
-                )?;
-                for n in res.nodes {
-                    if seen.insert(n.id) {
-                        all_rows.push(vec![Value::Uuid(n.id), Value::Int64(n.depth as i64)]);
+            for step in steps {
+                let edge_types_ref = if step.edge_types.is_empty() {
+                    None
+                } else {
+                    Some(step.edge_types.as_slice())
+                };
+                let mut next = HashMap::<uuid::Uuid, u32>::new();
+
+                for (start, base_depth) in &frontier {
+                    let res = db.graph().bfs(
+                        *start,
+                        edge_types_ref,
+                        step.direction,
+                        step.min_depth,
+                        step.max_depth,
+                        snapshot,
+                    )?;
+                    for node in res.nodes {
+                        let total_depth = base_depth.saturating_add(node.depth);
+                        next.entry(node.id)
+                            .and_modify(|depth| *depth = (*depth).min(total_depth))
+                            .or_insert(total_depth);
                     }
+                }
+
+                frontier = next.into_iter().collect();
+                if frontier.is_empty() {
+                    break;
                 }
             }
 
             Ok(QueryResult {
                 columns: vec!["id".to_string(), "depth".to_string()],
-                rows: all_rows,
+                rows: frontier
+                    .into_iter()
+                    .map(|(id, depth)| vec![Value::Uuid(id), Value::Int64(depth as i64)])
+                    .collect(),
                 rows_affected: 0,
             })
         }
@@ -734,6 +751,8 @@ fn exec_insert(
             values.insert(col.clone(), coerce_uuid_if_needed(col, v));
         }
 
+        validate_vector_columns(db, &p.table, &values)?;
+
         let row_id = if let Some(on_conflict) = &p.on_conflict {
             db.upsert_row(txid, &p.table, &on_conflict.columns[0], values.clone())?;
             0
@@ -755,7 +774,7 @@ fn exec_insert(
             db.insert_edge(txid, *source, *target, edge_type.clone(), HashMap::new())?;
         }
 
-        if let Some(Value::Vector(v)) = values.get("embedding")
+        if let Some(v) = vector_value_for_table(db, &p.table, &values)
             && row_id != 0
         {
             db.insert_vector(txid, row_id, v.clone())?;
@@ -827,10 +846,8 @@ fn exec_update(
         }
 
         let old_has_vector = db.has_live_vector(row.row_id, snapshot);
-        let new_vector = values.get("embedding").and_then(|value| match value {
-            Value::Vector(vector) => Some(vector.clone()),
-            _ => None,
-        });
+        validate_vector_columns(db, &p.table, &values)?;
+        let new_vector = vector_value_for_table(db, &p.table, &values).cloned();
 
         db.delete_row(txid, &p.table, row.row_id)?;
         if old_has_vector {
@@ -1804,6 +1821,10 @@ fn resolve_graph_start_nodes_from_filter(
     filter: &Expr,
     params: &HashMap<String, Value>,
 ) -> Result<Vec<uuid::Uuid>> {
+    if let Some(ids) = resolve_graph_start_ids_from_filter(filter, params)? {
+        return Ok(ids);
+    }
+
     // Extract column name and expected value from the filter (e.g., a.name = 'entity-0')
     let (col_name, expected_value) = match filter {
         Expr::BinaryOp {
@@ -1847,6 +1868,88 @@ fn resolve_graph_start_nodes_from_filter(
     Ok(uuids)
 }
 
+fn resolve_graph_start_nodes_from_plan(
+    db: &Database,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+) -> Result<Vec<uuid::Uuid>> {
+    let result = execute_plan(db, plan, params, tx)?;
+    result
+        .rows
+        .into_iter()
+        .filter_map(|row| row.into_iter().next())
+        .map(|value| match value {
+            Value::Uuid(id) => Ok(id),
+            Value::Text(text) => uuid::Uuid::parse_str(&text)
+                .map_err(|_| Error::PlanError(format!("invalid UUID in graph start plan: {text}"))),
+            other => Err(Error::PlanError(format!(
+                "invalid graph start identifier from plan: {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn resolve_graph_start_ids_from_filter(
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+) -> Result<Option<Vec<uuid::Uuid>>> {
+    match filter {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } if is_graph_id_ref(left) || is_graph_id_ref(right) => {
+            let value = if is_graph_id_ref(left) {
+                resolve_expr(right, params)?
+            } else {
+                resolve_expr(left, params)?
+            };
+            let id = match value {
+                Value::Uuid(id) => id,
+                Value::Text(text) => uuid::Uuid::parse_str(&text)
+                    .map_err(|_| Error::PlanError(format!("invalid UUID in graph filter: {text}")))?,
+                other => {
+                    return Err(Error::PlanError(format!(
+                        "invalid graph start identifier in filter: {other:?}"
+                    )));
+                }
+            };
+            Ok(Some(vec![id]))
+        }
+        Expr::InList { expr, list, .. } if is_graph_id_ref(expr) => {
+            let ids = list
+                .iter()
+                .map(|item| resolve_expr(item, params))
+                .map(|value| match value? {
+                    Value::Uuid(id) => Ok(id),
+                    Value::Text(text) => uuid::Uuid::parse_str(&text)
+                        .map_err(|_| Error::PlanError(format!("invalid UUID in graph filter: {text}"))),
+                    other => Err(Error::PlanError(format!(
+                        "invalid graph start identifier in filter: {other:?}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(ids))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            if let Some(ids) = resolve_graph_start_ids_from_filter(left, params)? {
+                return Ok(Some(ids));
+            }
+            resolve_graph_start_ids_from_filter(right, params)
+        }
+        Expr::UnaryOp { operand, .. } => resolve_graph_start_ids_from_filter(operand, params),
+        _ => Ok(None),
+    }
+}
+
+fn is_graph_id_ref(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Column(contextdb_parser::ast::ColumnRef { column, .. }) if column == "id"
+    )
+}
+
 /// Extract a bare column name from an Expr::Column, ignoring table alias.
 fn extract_column_name(expr: &Expr) -> Option<String> {
     match expr {
@@ -1866,6 +1969,44 @@ fn resolve_vector_from_expr(expr: &Expr, params: &HashMap<String, Value>) -> Res
             "invalid vector query expression".to_string(),
         )),
     }
+}
+
+fn validate_vector_columns(
+    db: &Database,
+    table: &str,
+    values: &HashMap<String, Value>,
+) -> Result<()> {
+    let Some(meta) = db.table_meta(table) else {
+        return Ok(());
+    };
+
+    for column in &meta.columns {
+        if let contextdb_core::ColumnType::Vector(expected) = column.column_type
+            && let Some(Value::Vector(vector)) = values.get(&column.name)
+        {
+            let got = vector.len();
+            if got != expected {
+                return Err(Error::VectorDimensionMismatch { expected, got });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn vector_value_for_table<'a>(
+    db: &Database,
+    table: &str,
+    values: &'a HashMap<String, Value>,
+) -> Option<&'a Vec<f32>> {
+    let meta = db.table_meta(table)?;
+    meta.columns.iter().find_map(|column| match column.column_type {
+        contextdb_core::ColumnType::Vector(_) => match values.get(&column.name) {
+            Some(Value::Vector(vector)) => Some(vector),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 fn coerce_uuid_if_needed(col: &str, v: Value) -> Value {

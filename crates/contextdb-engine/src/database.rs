@@ -106,6 +106,9 @@ struct PropagationContext<'a> {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        if path.as_os_str() == ":memory:" {
+            return Ok(Self::open_memory());
+        }
         let persistence = if path.exists() {
             Arc::new(RedbPersistence::open(path)?)
         } else {

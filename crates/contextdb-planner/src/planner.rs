@@ -135,7 +135,7 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     for cte in &sel.ctes {
         match cte {
             Cte::MatchCte { name, match_clause } => {
-                cte_env.insert(name.clone(), graph_bfs_from_match(match_clause)?);
+                cte_env.insert(name.clone(), graph_bfs_from_match(match_clause, &cte_env)?);
             }
             Cte::SqlCte { name, query } => {
                 cte_env.insert(name.clone(), plan_select_body(query, &cte_env)?);
@@ -156,7 +156,7 @@ fn plan_select_body(
         .find(|f| matches!(f, FromItem::GraphTable { .. }));
 
     let mut current = if let Some(from_item) = graph_from {
-        graph_plan_from_from_item(from_item)?
+        graph_plan_from_from_item(from_item, cte_env)?
     } else {
         let from_item = body.from.iter().find_map(|item| match item {
             FromItem::Table { name, alias } => Some((name.clone(), alias.clone())),
@@ -337,14 +337,17 @@ fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {
     }
 }
 
-fn graph_plan_from_from_item(from_item: &FromItem) -> Result<PhysicalPlan> {
+fn graph_plan_from_from_item(
+    from_item: &FromItem,
+    cte_env: &HashMap<String, PhysicalPlan>,
+) -> Result<PhysicalPlan> {
     match from_item {
         FromItem::GraphTable {
             match_clause,
             columns,
             ..
         } => {
-            let bfs = graph_bfs_from_match(match_clause)?;
+            let bfs = graph_bfs_from_match(match_clause, cte_env)?;
             if columns.is_empty() {
                 Ok(bfs)
             } else {
@@ -368,33 +371,76 @@ fn graph_plan_from_from_item(from_item: &FromItem) -> Result<PhysicalPlan> {
     }
 }
 
-fn graph_bfs_from_match(match_clause: &contextdb_parser::ast::MatchClause) -> Result<PhysicalPlan> {
-    let step = match_clause
+fn graph_bfs_from_match(
+    match_clause: &contextdb_parser::ast::MatchClause,
+    cte_env: &HashMap<String, PhysicalPlan>,
+) -> Result<PhysicalPlan> {
+    let steps = match_clause
         .pattern
         .edges
-        .first()
-        .ok_or_else(|| Error::PlanError("MATCH must include at least one edge".into()))?;
-    let max_depth = if step.max_hops == 0 {
-        DEFAULT_MATCH_DEPTH
-    } else {
-        step.max_hops
-    };
-    if max_depth > ENGINE_MAX_BFS_DEPTH {
-        return Err(Error::BfsDepthExceeded(max_depth));
+        .iter()
+        .map(|step| {
+            let max_depth = if step.max_hops == 0 {
+                DEFAULT_MATCH_DEPTH
+            } else {
+                step.max_hops
+            };
+            if max_depth > ENGINE_MAX_BFS_DEPTH {
+                return Err(Error::BfsDepthExceeded(max_depth));
+            }
+
+            Ok(GraphStepPlan {
+                edge_types: step.edge_type.clone().map(|t| vec![t]).unwrap_or_default(),
+                direction: match step.direction {
+                    contextdb_parser::ast::EdgeDirection::Outgoing => Direction::Outgoing,
+                    contextdb_parser::ast::EdgeDirection::Incoming => Direction::Incoming,
+                    contextdb_parser::ast::EdgeDirection::Both => Direction::Both,
+                },
+                min_depth: step.min_hops.max(1),
+                max_depth,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if steps.is_empty() {
+        return Err(Error::PlanError("MATCH must include at least one edge".into()));
     }
 
     Ok(PhysicalPlan::GraphBfs {
         start_expr: extract_graph_start_expr(match_clause)?,
-        edge_types: step.edge_type.clone().map(|t| vec![t]).unwrap_or_default(),
-        direction: match step.direction {
-            contextdb_parser::ast::EdgeDirection::Outgoing => Direction::Outgoing,
-            contextdb_parser::ast::EdgeDirection::Incoming => Direction::Incoming,
-            contextdb_parser::ast::EdgeDirection::Both => Direction::Both,
-        },
-        min_depth: step.min_hops.max(1),
-        max_depth,
+        start_candidates: extract_graph_start_candidates(match_clause, cte_env)?,
+        steps,
         filter: match_clause.where_clause.clone(),
     })
+}
+
+fn extract_graph_start_candidates(
+    match_clause: &MatchClause,
+    cte_env: &HashMap<String, PhysicalPlan>,
+) -> Result<Option<Box<PhysicalPlan>>> {
+    let Some(where_clause) = &match_clause.where_clause else {
+        return Ok(None);
+    };
+    find_graph_start_candidates(where_clause, &match_clause.pattern.start.alias, cte_env)
+}
+
+fn find_graph_start_candidates(
+    expr: &Expr,
+    start_alias: &str,
+    cte_env: &HashMap<String, PhysicalPlan>,
+) -> Result<Option<Box<PhysicalPlan>>> {
+    match expr {
+        Expr::InSubquery { expr, subquery, .. } if is_graph_start_id_ref(expr, start_alias) => Ok(
+            Some(Box::new(plan_select_body(subquery, cte_env)?)),
+        ),
+        Expr::BinaryOp { left, right, .. } => {
+            if let Some(plan) = find_graph_start_candidates(left, start_alias, cte_env)? {
+                return Ok(Some(plan));
+            }
+            find_graph_start_candidates(right, start_alias, cte_env)
+        }
+        Expr::UnaryOp { operand, .. } => find_graph_start_candidates(operand, start_alias, cte_env),
+        _ => Ok(None),
+    }
 }
 
 fn extract_graph_start_expr(match_clause: &MatchClause) -> Result<Expr> {
