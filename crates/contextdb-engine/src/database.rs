@@ -23,10 +23,12 @@ use parking_lot::{Mutex, RwLock};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 type DynStore = Box<dyn WriteSetApplicator>;
+const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct QueryResult {
@@ -69,6 +71,7 @@ pub struct Database {
     plugin: Arc<dyn DatabasePlugin>,
     accountant: Arc<MemoryAccountant>,
     conflict_policies: RwLock<ConflictPolicies>,
+    subscriptions: Mutex<SubscriptionState>,
 }
 
 impl std::fmt::Debug for Database {
@@ -101,6 +104,23 @@ struct PropagationContext<'a> {
     tx: TxId,
     snapshot: SnapshotId,
     metas: &'a HashMap<String, TableMeta>,
+}
+
+#[derive(Debug)]
+struct SubscriptionState {
+    subscribers: Vec<SyncSender<CommitEvent>>,
+    events_sent: u64,
+    events_dropped: u64,
+}
+
+impl SubscriptionState {
+    fn new() -> Self {
+        Self {
+            subscribers: Vec::new(),
+            events_sent: 0,
+            events_dropped: 0,
+        }
+    }
 }
 
 impl Database {
@@ -183,6 +203,7 @@ impl Database {
             plugin: Arc::new(CorePlugin),
             accountant: Arc::new(MemoryAccountant::no_limit()),
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
+            subscriptions: Mutex::new(SubscriptionState::new()),
         };
 
         for meta in all_meta.values() {
@@ -228,6 +249,7 @@ impl Database {
             plugin: Arc::new(CorePlugin),
             accountant: Arc::new(MemoryAccountant::no_limit()),
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
+            subscriptions: Mutex::new(SubscriptionState::new()),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db
@@ -341,9 +363,64 @@ impl Database {
         if !ws.is_empty() {
             ws.stamp_lsn(lsn);
             self.plugin.post_commit(&ws, source);
+            self.publish_commit_event(Self::build_commit_event(&ws, source, lsn));
         }
 
         Ok(())
+    }
+
+    fn build_commit_event(
+        ws: &contextdb_tx::WriteSet,
+        source: CommitSource,
+        lsn: u64,
+    ) -> CommitEvent {
+        let mut tables_changed: Vec<String> = ws
+            .relational_inserts
+            .iter()
+            .map(|(table, _)| table.clone())
+            .chain(
+                ws.relational_deletes
+                    .iter()
+                    .map(|(table, _, _)| table.clone()),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        tables_changed.sort();
+
+        CommitEvent {
+            source,
+            lsn,
+            tables_changed,
+            row_count: ws.relational_inserts.len()
+                + ws.relational_deletes.len()
+                + ws.adj_inserts.len()
+                + ws.adj_deletes.len()
+                + ws.vector_inserts.len()
+                + ws.vector_deletes.len(),
+        }
+    }
+
+    fn publish_commit_event(&self, event: CommitEvent) {
+        let mut subscriptions = self.subscriptions.lock();
+        let subscribers = std::mem::take(&mut subscriptions.subscribers);
+        let mut live_subscribers = Vec::with_capacity(subscribers.len());
+
+        for sender in subscribers {
+            match sender.try_send(event.clone()) {
+                Ok(()) => {
+                    subscriptions.events_sent += 1;
+                    live_subscribers.push(sender);
+                }
+                Err(TrySendError::Full(_)) => {
+                    subscriptions.events_dropped += 1;
+                    live_subscribers.push(sender);
+                }
+                Err(TrySendError::Disconnected(_)) => {}
+            }
+        }
+
+        subscriptions.subscribers = live_subscribers;
     }
 
     fn execute_statement(
@@ -1062,6 +1139,7 @@ impl Database {
             plugin,
             accountant: Arc::new(MemoryAccountant::no_limit()),
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
+            subscriptions: Mutex::new(SubscriptionState::new()),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db.plugin.on_open()?;
@@ -1512,28 +1590,24 @@ impl Database {
 
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
     /// after each commit.
-    pub fn subscribe(&self) -> std::sync::mpsc::Receiver<CommitEvent> {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        // stub: sender immediately dropped — receiver gets Disconnected on recv
-        rx
+    pub fn subscribe(&self) -> Receiver<CommitEvent> {
+        self.subscribe_with_capacity(DEFAULT_SUBSCRIPTION_CAPACITY)
     }
 
     /// Subscribe with a custom channel capacity.
-    pub fn subscribe_with_capacity(
-        &self,
-        _capacity: usize,
-    ) -> std::sync::mpsc::Receiver<CommitEvent> {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        // stub: sender immediately dropped — receiver gets Disconnected on recv
+    pub fn subscribe_with_capacity(&self, capacity: usize) -> Receiver<CommitEvent> {
+        let (tx, rx) = mpsc::sync_channel(capacity.max(1));
+        self.subscriptions.lock().subscribers.push(tx);
         rx
     }
 
     /// Returns health metrics for the subscription system.
     pub fn subscription_health(&self) -> SubscriptionMetrics {
+        let subscriptions = self.subscriptions.lock();
         SubscriptionMetrics {
-            active_channels: 0,
-            events_sent: 0,
-            events_dropped: 0,
+            active_channels: subscriptions.subscribers.len(),
+            events_sent: subscriptions.events_sent,
+            events_dropped: subscriptions.events_dropped,
         }
     }
 
@@ -2092,6 +2166,12 @@ fn maybe_prebuild_hnsw(vector_store: &VectorStore) {
         }))
         .ok();
         let _ = vector_store.hnsw.set(RwLock::new(hnsw_opt));
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        self.subscriptions.lock().subscribers.clear();
     }
 }
 

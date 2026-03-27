@@ -695,7 +695,6 @@ fn s19_ddl_only_commit_create_table() {
 }
 
 #[test]
-#[ignore] // requires NATS — run with: cargo test -- --ignored s20
 fn s20_auto_sync_fires_commit_event() {
     // This test covers the `.sync auto` path from the intent.
     // It requires a running NATS server. When auto-sync pulls changes from a
