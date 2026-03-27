@@ -22,3 +22,12 @@ serde_bytes = "0.11"
 [dev-dependencies]
 tokio-test = "0.4"
 testcontainers = "0.27"
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
+tempfile = "3"
+uuid = { workspace = true }
+tokio.workspace = true
+
+[[bench]]
+name = "server_throughput"
+harness = false
+path = "../../benches/server_throughput.rs"

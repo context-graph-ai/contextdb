@@ -26,6 +26,7 @@ contextdb-server = { path = "../contextdb-server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 testcontainers = "0.27"
 tempfile = "3"
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[test]]
 name = "integration"
@@ -34,3 +35,8 @@ path = "../../tests/integration.rs"
 [[test]]
 name = "acceptance"
 path = "../../tests/acceptance.rs"
+
+[[bench]]
+name = "engine_throughput"
+harness = false
+path = "../../benches/engine_throughput.rs"

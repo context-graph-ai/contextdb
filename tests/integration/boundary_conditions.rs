@@ -35,6 +35,4 @@ fn bc_02_depth_bound() {
     assert_eq!(out.nodes.len(), 3);
 }
 
-#[test]
-#[ignore = "requires 1M row scale harness"]
-fn bc_06_ignored_scale() {}
+// bc_06 scale test moved to benches/engine_throughput.rs — run with `cargo bench`

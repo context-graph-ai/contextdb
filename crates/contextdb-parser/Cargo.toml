@@ -7,3 +7,11 @@ edition = "2024"
 contextdb-core = { path = "../contextdb-core" }
 pest.workspace = true
 pest_derive.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "parser_throughput"
+harness = false
+path = "../../benches/parser_throughput.rs"

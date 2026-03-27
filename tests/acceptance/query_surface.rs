@@ -700,10 +700,332 @@ fn f96_upsert_user_preference_preserves_graph_and_vector_consistency() {
     );
 }
 
-/// Placeholder: recall context using relational + graph + vector in one query under 50ms. (Not yet implemented.)
+/// Vigil scenario: camera detects unknown person at gate. Agent recalls active security
+/// decisions by chaining vector similarity (find nearby past observations) → graph traversal
+/// (OBSERVED_ON → entity → BASED_ON → decision, multi-edge-type MATCH) → relational filter
+/// (active decisions only). Tests the flagship combined query from query-surface-spec.md § Combined.
 #[test]
 fn f97_recall_context_across_all_three_paradigms_returns_results_under_50ms() {
-    assert!(false, "performance benchmark - run manually");
+    let db = Database::open_memory();
+
+    // --- Schema: Vigil security monitoring tables ---
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, obs_type TEXT NOT NULL, source TEXT NOT NULL, embedding VECTOR(3))",
+        &empty_params(),
+    ).expect("create observations");
+    db.execute(
+        "CREATE TABLE entities (id UUID PRIMARY KEY, entity_type TEXT NOT NULL, name TEXT NOT NULL)",
+        &empty_params(),
+    ).expect("create entities");
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT NOT NULL, status TEXT NOT NULL)",
+        &empty_params(),
+    ).expect("create decisions");
+
+    // --- Entities: two monitored locations ---
+    let gate = Uuid::from_u128(1);
+    let parking = Uuid::from_u128(2);
+    db.execute(
+        "INSERT INTO entities (id, entity_type, name) VALUES ($id, 'LOCATION', 'main-gate')",
+        &params(vec![("id", Value::Uuid(gate))]),
+    )
+    .expect("insert gate entity");
+    db.execute(
+        "INSERT INTO entities (id, entity_type, name) VALUES ($id, 'LOCATION', 'parking-lot')",
+        &params(vec![("id", Value::Uuid(parking))]),
+    )
+    .expect("insert parking entity");
+
+    // --- Decisions: gate alert (active), parking logger (superseded) ---
+    let dec_gate = Uuid::from_u128(10);
+    let dec_park = Uuid::from_u128(11);
+    db.execute(
+        "INSERT INTO decisions (id, description, status) VALUES ($id, 'Alert on unknown person at gate', 'active')",
+        &params(vec![("id", Value::Uuid(dec_gate))]),
+    ).expect("insert gate decision");
+    db.execute(
+        "INSERT INTO decisions (id, description, status) VALUES ($id, 'Log vehicle plates in parking', 'superseded')",
+        &params(vec![("id", Value::Uuid(dec_park))]),
+    ).expect("insert parking decision");
+
+    // --- Graph: decisions BASED_ON entities ---
+    db.execute(
+        "INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ($src, $tgt, 'BASED_ON')",
+        &params(vec![
+            ("src", Value::Uuid(dec_gate)),
+            ("tgt", Value::Uuid(gate)),
+        ]),
+    )
+    .expect("edge: gate decision BASED_ON gate entity");
+    db.execute(
+        "INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ($src, $tgt, 'BASED_ON')",
+        &params(vec![
+            ("src", Value::Uuid(dec_park)),
+            ("tgt", Value::Uuid(parking)),
+        ]),
+    )
+    .expect("edge: parking decision BASED_ON parking entity");
+
+    // --- Observations: past detections with vision embeddings ---
+    // Gate observations cluster near [1.0, 0.0, 0.0]
+    // Parking observations cluster near [0.0, 1.0, 0.0]
+    let obs_g1 = Uuid::from_u128(20);
+    let obs_g2 = Uuid::from_u128(21);
+    let obs_p1 = Uuid::from_u128(22);
+    db.execute(
+        "INSERT INTO observations (id, obs_type, source, embedding) VALUES ($id, 'person_detected', 'cam-gate', [0.9, 0.1, 0.0])",
+        &params(vec![("id", Value::Uuid(obs_g1))]),
+    ).expect("insert gate observation 1");
+    db.execute(
+        "INSERT INTO observations (id, obs_type, source, embedding) VALUES ($id, 'person_detected', 'cam-gate', [0.95, 0.05, 0.0])",
+        &params(vec![("id", Value::Uuid(obs_g2))]),
+    ).expect("insert gate observation 2");
+    db.execute(
+        "INSERT INTO observations (id, obs_type, source, embedding) VALUES ($id, 'vehicle_detected', 'cam-parking', [0.0, 0.95, 0.05])",
+        &params(vec![("id", Value::Uuid(obs_p1))]),
+    ).expect("insert parking observation");
+
+    // --- Graph: observations OBSERVED_ON entities ---
+    db.execute(
+        "INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ($src, $tgt, 'OBSERVED_ON')",
+        &params(vec![
+            ("src", Value::Uuid(obs_g1)),
+            ("tgt", Value::Uuid(gate)),
+        ]),
+    )
+    .expect("edge: obs_g1 OBSERVED_ON gate");
+    db.execute(
+        "INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ($src, $tgt, 'OBSERVED_ON')",
+        &params(vec![
+            ("src", Value::Uuid(obs_g2)),
+            ("tgt", Value::Uuid(gate)),
+        ]),
+    )
+    .expect("edge: obs_g2 OBSERVED_ON gate");
+    db.execute(
+        "INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ($src, $tgt, 'OBSERVED_ON')",
+        &params(vec![
+            ("src", Value::Uuid(obs_p1)),
+            ("tgt", Value::Uuid(parking)),
+        ]),
+    )
+    .expect("edge: obs_p1 OBSERVED_ON parking");
+
+    // --- The combined query: new detection at gate, recall relevant active decisions ---
+    // 1. Vector: find observations with similar embeddings to the new detection
+    // 2. Graph: chained multi-edge-type traversal OBSERVED_ON → entity, then reverse BASED_ON → decision
+    // 3. Relational: JOIN + filter to active decisions only
+    let start = std::time::Instant::now();
+    let result = db
+        .execute(
+            "WITH similar_obs AS (\
+            SELECT id FROM observations \
+            ORDER BY embedding <=> $query_vec \
+            LIMIT 5\
+        ), \
+        reached AS (\
+            SELECT b_id FROM GRAPH_TABLE(\
+                edges MATCH (a)-[:OBSERVED_ON]->{1,1}(entity)<-[:BASED_ON]-(b) \
+                WHERE a.id IN (SELECT id FROM similar_obs) \
+                COLUMNS (b.id AS b_id)\
+            )\
+        ) \
+        SELECT d.id, d.description \
+        FROM decisions d \
+        INNER JOIN reached r ON d.id = r.b_id \
+        WHERE d.status = 'active'",
+            &params(vec![("query_vec", Value::Vector(vec![1.0, 0.0, 0.0]))]),
+        )
+        .expect("combined three-paradigm query");
+    let elapsed = start.elapsed();
+
+    // Correctness: the gate decision is active and reachable from gate observations
+    assert!(
+        !result.rows.is_empty(),
+        "combined query returned no results"
+    );
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "expected exactly one active decision reachable from gate observations"
+    );
+    let desc = match &result.rows[0][1] {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected Text for description, got: {other:?}"),
+    };
+    assert!(desc.contains("gate"), "expected gate decision, got: {desc}");
+
+    // The superseded parking decision must NOT appear — it's either unreachable
+    // (parking observations are far from query vector) or filtered by status = 'active'
+    for row in &result.rows {
+        let d = match &row[1] {
+            Value::Text(s) => s.clone(),
+            _ => continue,
+        };
+        assert!(
+            !d.contains("parking"),
+            "superseded parking decision should not appear"
+        );
+    }
+
+    // Performance: under 50ms for this small dataset
+    assert!(
+        elapsed.as_millis() < 50,
+        "query took {}ms, expected < 50ms",
+        elapsed.as_millis()
+    );
+}
+
+/// Agent working on a task needs relevant context. Starts from a known task node, traverses
+/// the graph to build a neighborhood (RELATES_TO edges), joins against digests table filtered
+/// by context, then ranks by vector similarity. This is the proactive "search within my
+/// neighborhood" pattern — graph-first, then vector — the inverse of f97's vector-first flow.
+/// Exercises: graph traversal feeds relational JOIN feeds vector ORDER BY on a CTE result.
+#[test]
+fn f98_graph_neighborhood_scoped_vector_search() {
+    let db = Database::open_memory();
+
+    // --- Schema: agent memory tables from the ontology ---
+    db.execute(
+        "CREATE TABLE tasks (id UUID PRIMARY KEY, name TEXT NOT NULL, context_id UUID NOT NULL)",
+        &empty_params(),
+    )
+    .expect("create tasks");
+    db.execute(
+        "CREATE TABLE digests (id UUID PRIMARY KEY, summary TEXT NOT NULL, embedding VECTOR(3), context_id UUID NOT NULL)",
+        &empty_params(),
+    )
+    .expect("create digests");
+
+    // --- A task the agent is working on ---
+    let task = Uuid::from_u128(1);
+    let ctx = Uuid::from_u128(100);
+    db.execute(
+        "INSERT INTO tasks (id, name, context_id) VALUES ($id, 'migrate auth service', $ctx)",
+        &params(vec![("id", Value::Uuid(task)), ("ctx", Value::Uuid(ctx))]),
+    )
+    .expect("insert task");
+
+    // --- Digests: conversation summaries with embeddings ---
+    // d1-d3 are in the graph neighborhood (connected to task via RELATES_TO)
+    // d4 is semantically similar but NOT in the neighborhood (no graph edge)
+    // d5 is in the neighborhood but different context (should be filtered)
+    let d1 = Uuid::from_u128(10); // auth discussion, relevant embedding
+    let d2 = Uuid::from_u128(11); // retry logic discussion, relevant embedding
+    let d3 = Uuid::from_u128(12); // rate limiter discussion, less relevant embedding
+    let d4 = Uuid::from_u128(13); // auth discussion but NOT connected via graph
+    let d5 = Uuid::from_u128(14); // connected but wrong context
+    let other_ctx = Uuid::from_u128(200);
+
+    db.execute(
+        "INSERT INTO digests (id, summary, embedding, context_id) VALUES ($id, 'discussed auth service migration strategy', [0.9, 0.1, 0.0], $ctx)",
+        &params(vec![("id", Value::Uuid(d1)), ("ctx", Value::Uuid(ctx))]),
+    )
+    .expect("insert digest d1");
+    db.execute(
+        "INSERT INTO digests (id, summary, embedding, context_id) VALUES ($id, 'retry logic interacts with rate limiter', [0.8, 0.2, 0.0], $ctx)",
+        &params(vec![("id", Value::Uuid(d2)), ("ctx", Value::Uuid(ctx))]),
+    )
+    .expect("insert digest d2");
+    db.execute(
+        "INSERT INTO digests (id, summary, embedding, context_id) VALUES ($id, 'rate limiter capacity planning', [0.1, 0.3, 0.9], $ctx)",
+        &params(vec![("id", Value::Uuid(d3)), ("ctx", Value::Uuid(ctx))]),
+    )
+    .expect("insert digest d3");
+    db.execute(
+        "INSERT INTO digests (id, summary, embedding, context_id) VALUES ($id, 'auth patterns in microservices', [0.95, 0.05, 0.0], $ctx)",
+        &params(vec![("id", Value::Uuid(d4)), ("ctx", Value::Uuid(ctx))]),
+    )
+    .expect("insert digest d4 — no graph edge");
+    db.execute(
+        "INSERT INTO digests (id, summary, embedding, context_id) VALUES ($id, 'auth migration for client B', [0.9, 0.1, 0.0], $ctx)",
+        &params(vec![
+            ("id", Value::Uuid(d5)),
+            ("ctx", Value::Uuid(other_ctx)),
+        ]),
+    )
+    .expect("insert digest d5 — wrong context");
+
+    // --- Graph: task RELATES_TO digests d1, d2, d3, d5 (not d4) ---
+    for digest_id in [d1, d2, d3, d5] {
+        db.execute(
+            "INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ($src, $tgt, 'RELATES_TO')",
+            &params(vec![
+                ("src", Value::Uuid(task)),
+                ("tgt", Value::Uuid(digest_id)),
+            ]),
+        )
+        .expect("insert RELATES_TO edge");
+    }
+
+    // --- The combined query: graph → relational → vector ---
+    let result = db
+        .execute(
+            "WITH neighborhood AS (\
+                SELECT b_id FROM GRAPH_TABLE(\
+                    edges MATCH (a)-[:RELATES_TO]->{1,1}(b) \
+                    WHERE a.id = $task_id \
+                    COLUMNS (b.id AS b_id)\
+                )\
+            ), \
+            candidates AS (\
+                SELECT d.id, d.summary, d.embedding \
+                FROM digests d \
+                INNER JOIN neighborhood n ON d.id = n.b_id \
+                WHERE d.context_id = $ctx\
+            ) \
+            SELECT id, summary \
+            FROM candidates \
+            ORDER BY embedding <=> $query_vec \
+            LIMIT 5",
+            &params(vec![
+                ("task_id", Value::Uuid(task)),
+                ("ctx", Value::Uuid(ctx)),
+                ("query_vec", Value::Vector(vec![1.0, 0.0, 0.0])),
+            ]),
+        )
+        .expect("graph-first combined query");
+
+    // --- Assertions ---
+
+    // d4 must NOT appear — it's semantically the closest but has no graph edge to the task
+    // d5 must NOT appear — it's in the neighborhood but wrong context
+    // d1, d2, d3 should appear, ordered by similarity to [1.0, 0.0, 0.0]:
+    //   d1 [0.9, 0.1, 0.0] closest, then d2 [0.8, 0.2, 0.0], then d3 [0.1, 0.3, 0.9]
+    assert_eq!(
+        result.rows.len(),
+        3,
+        "expected 3 results (d1, d2, d3), got {}",
+        result.rows.len()
+    );
+
+    let summaries: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| match &row[1] {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected Text, got: {other:?}"),
+        })
+        .collect();
+
+    // d4 (no graph edge) must be excluded even though it's the most similar
+    assert!(
+        !summaries.iter().any(|s| s.contains("patterns in micro")),
+        "d4 should be excluded — no graph edge to task"
+    );
+
+    // d5 (wrong context) must be excluded even though it's in the neighborhood
+    assert!(
+        !summaries.iter().any(|s| s.contains("client B")),
+        "d5 should be excluded — wrong context_id"
+    );
+
+    // First result should be d1 (most similar to query vector among neighborhood)
+    assert!(
+        summaries[0].contains("auth service migration"),
+        "first result should be d1 (auth service migration), got: {}",
+        summaries[0]
+    );
 }
 
 /// I deleted messages older than a timestamp, and only the recent ones remained.

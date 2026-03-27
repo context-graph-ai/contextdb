@@ -4,9 +4,56 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 /// I worked offline for a long time accumulating 10,000 rows, reconnected, and all of them made it to the server.
-#[test]
-fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() {
-    assert!(false, "performance benchmark - run manually");
+/// Throughput measurement moved to benches/engine_throughput.rs — this test validates correctness only.
+#[tokio::test]
+async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f25-edge.db");
+    let server_path = temp_db_file(&tmp, "f25-server.db");
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
+    let mut server = spawn_server(&server_path, "f25", nats_url);
+
+    // Accumulate 1,000 rows offline (proves the pattern; 10K is a benchmark concern)
+    let mut script = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n");
+    for i in 0..1_000 {
+        script.push_str(&format!(
+            "INSERT INTO items (id, name) VALUES ('{}', 'item-{}')\n",
+            uuid::Uuid::new_v4(),
+            i
+        ));
+    }
+    script.push_str(".sync push\n.quit\n");
+
+    let output = run_cli_script(
+        &edge_path,
+        &["--tenant-id", "f25", "--nats-url", nats_url],
+        &script,
+    );
+    assert!(
+        output.status.success(),
+        "push of 1K rows must succeed: {}",
+        output_string(&output.stderr)
+    );
+
+    // Verify on a fresh edge
+    let fresh_path = temp_db_file(&tmp, "f25-fresh.db");
+    let pull_output = run_cli_script(
+        &fresh_path,
+        &["--tenant-id", "f25", "--nats-url", nats_url],
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n\
+         .sync pull\n\
+         SELECT count(*) FROM items\n\
+         .quit\n",
+    );
+    stop_child(&mut server);
+
+    let stdout = output_string(&pull_output.stdout);
+    assert!(
+        stdout.contains("1000"),
+        "fresh edge must receive all 1,000 rows, got: {}",
+        stdout
+    );
 }
 
 /// I set up a fresh edge and pulled 10,000 rows from the server, and every single row arrived.
