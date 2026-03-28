@@ -144,25 +144,41 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
     }
     script.push_str(".sync push\n.quit\n");
 
-    let output = run_cli_script(
+    let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
         &["--tenant-id", "f16", "--nats-url", &nats.nats_url],
         &script,
+        std::time::Duration::from_secs(30),
     );
     stop_child(&mut server);
 
     let stdout = output_string(&output.stdout).to_lowercase();
-    let count = count_rows_from_file(&server_path, "big");
+    let stderr = output_string(&output.stderr).to_lowercase();
+    let reported_error = stdout.contains("error")
+        || stdout.contains("memory")
+        || stdout.contains("limit")
+        || stderr.contains("error")
+        || stderr.contains("memory")
+        || stderr.contains("limit");
 
-    // Either: all rows arrived (server handled memory gracefully) OR
-    // push reports an error (memory limit exceeded). Must NOT silently drop rows.
-    if stdout.contains("error") || stdout.contains("memory") || stdout.contains("limit") {
-        // Error reported — acceptable, not silent
-    } else {
+    // Either the push succeeds cleanly and all rows arrive, or it fails clearly.
+    if output.status.success() {
+        assert!(
+            !reported_error,
+            "successful push must not report an error; stdout={stdout}, stderr={stderr}"
+        );
+        let count = try_count_rows_from_file(&server_path, "big")
+            .expect("count rows from server db")
+            .expect("successful push must materialize the big table");
         assert_eq!(
             count, 500,
-            "if push reports success with no memory error, all 500 rows must be on server, got {}",
+            "successful push must persist all 500 rows, got {}",
             count
+        );
+    } else {
+        assert!(
+            reported_error,
+            "failed push must report a clear error; stdout={stdout}, stderr={stderr}"
         );
     }
 }

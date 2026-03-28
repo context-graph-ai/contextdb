@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-use contextdb_core::{Direction, Value, VersionedRow};
+use contextdb_core::{Direction, Error, Value, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Once;
@@ -106,6 +106,48 @@ pub(crate) fn run_cli_script(db_path: &Path, extra_args: &[&str], script: &str) 
     child.wait_with_output().expect("CLI should finish")
 }
 
+pub(crate) fn run_cli_script_allow_startup_failure(
+    db_path: &Path,
+    extra_args: &[&str],
+    script: &str,
+) -> Output {
+    run_cli_script_allow_startup_failure_with_timeout(
+        db_path,
+        extra_args,
+        script,
+        Duration::from_secs(30),
+    )
+}
+
+pub(crate) fn run_cli_script_allow_startup_failure_with_timeout(
+    db_path: &Path,
+    extra_args: &[&str],
+    script: &str,
+    timeout: Duration,
+) -> Output {
+    ensure_release_binaries();
+    let mut command = Command::new(cli_bin());
+    command.arg(db_path);
+    command.args(extra_args);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().expect("CLI should spawn");
+    let stdin = child.stdin.take().expect("stdin pipe");
+    let script = script.as_bytes().to_vec();
+    let writer = thread::spawn(move || {
+        let mut stdin = stdin;
+        stdin.write_all(&script)
+    });
+    let output = wait_for_child_output(child, timeout, "CLI should finish");
+    match writer.join().expect("stdin writer thread should join") {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("write script to CLI: {err}"),
+    }
+    output
+}
+
 pub(crate) fn run_cli_script_from_file(
     db_path: &Path,
     extra_args: &[&str],
@@ -201,6 +243,24 @@ pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool)
     false
 }
 
+fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
+    let start = Instant::now();
+    loop {
+        match child.try_wait().expect("CLI status poll") {
+            Some(_) => return child.wait_with_output().expect(context),
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    return child
+                        .wait_with_output()
+                        .expect("CLI should finish after timeout kill");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 pub(crate) fn temp_db_file(tmp: &TempDir, name: &str) -> PathBuf {
     tmp.path().join(name)
 }
@@ -216,6 +276,20 @@ pub(crate) fn count_rows_from_file(db_path: &Path, table: &str) -> usize {
     let count = count_rows(&db, table);
     db.close().expect("db close should succeed");
     count
+}
+
+pub(crate) fn try_count_rows_from_file(db_path: &Path, table: &str) -> Result<Option<usize>, Error> {
+    let db = Database::open(db_path)?;
+    let count = match db.scan(table, db.snapshot()) {
+        Ok(rows) => Some(rows.len()),
+        Err(Error::TableNotFound(_)) => None,
+        Err(err) => {
+            let _ = db.close();
+            return Err(err);
+        }
+    };
+    db.close()?;
+    Ok(count)
 }
 
 pub(crate) fn query_count(db: &Database, sql: &str) -> i64 {

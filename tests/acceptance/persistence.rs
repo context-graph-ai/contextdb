@@ -120,7 +120,7 @@ fn f05_two_processes_cannot_open_the_same_database_file() {
     write_child_stdin(&mut first, "CREATE TABLE sensors (id UUID PRIMARY KEY)\n");
     thread::sleep(Duration::from_millis(200));
 
-    let second = run_cli_script(&db_path, &[], ".quit\n");
+    let second = run_cli_script_allow_startup_failure(&db_path, &[], ".quit\n");
     stop_child(&mut first);
 
     assert!(

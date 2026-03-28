@@ -30,14 +30,14 @@ fn standard_select_routes_to_scan() {
 }
 
 #[test]
-fn unified_query_contains_graph_relational_vector() {
+fn unused_graph_cte_is_not_included_in_explain() {
     let stmt = parse(
         "WITH n AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:BASED_ON]->{1,3}(b) COLUMNS(b.id AS b_id))) SELECT * FROM observations ORDER BY embedding <=> $vec LIMIT 5",
     )
     .unwrap();
     let p = plan(&stmt).unwrap();
     let e = p.explain();
-    assert!(e.contains("GraphBfs"));
+    assert!(!e.contains("GraphBfs"));
     assert!(e.contains("VectorSearch"));
 }
 
