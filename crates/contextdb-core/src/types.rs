@@ -40,6 +40,26 @@ mod json_as_string {
 }
 
 impl Value {
+    pub fn estimated_bytes(&self) -> usize {
+        match self {
+            Value::Null => 8,
+            Value::Bool(_) => 8,
+            Value::Int64(_) => 16,
+            Value::Float64(_) => 16,
+            Value::Text(s) => {
+                if s.len() <= 16 {
+                    32 + s.len().saturating_mul(8)
+                } else {
+                    160 + s.len().saturating_mul(72)
+                }
+            }
+            Value::Uuid(_) => 32,
+            Value::Timestamp(_) => 16,
+            Value::Json(v) => 96 + v.to_string().len().saturating_mul(32),
+            Value::Vector(values) => 24 + values.len().saturating_mul(std::mem::size_of::<f32>()),
+        }
+    }
+
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Value::Text(s) => Some(s),
@@ -74,6 +94,10 @@ pub struct VersionedRow {
 }
 
 impl VersionedRow {
+    pub fn estimated_bytes(&self) -> usize {
+        64 + estimate_row_value_bytes(&self.values) + self.created_at.map(|_| 8).unwrap_or(0)
+    }
+
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
         self.created_tx <= snapshot
             && (self.deleted_tx.is_none() || self.deleted_tx.unwrap() > snapshot)
@@ -92,6 +116,10 @@ pub struct AdjEntry {
 }
 
 impl AdjEntry {
+    pub fn estimated_bytes(&self) -> usize {
+        96 + self.edge_type.len().saturating_mul(16) + estimate_row_value_bytes(&self.properties)
+    }
+
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
         self.created_tx <= snapshot
             && (self.deleted_tx.is_none() || self.deleted_tx.unwrap() > snapshot)
@@ -108,10 +136,20 @@ pub struct VectorEntry {
 }
 
 impl VectorEntry {
+    pub fn estimated_bytes(&self) -> usize {
+        24 + self.vector.len().saturating_mul(std::mem::size_of::<f32>())
+    }
+
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
         self.created_tx <= snapshot
             && (self.deleted_tx.is_none() || self.deleted_tx.unwrap() > snapshot)
     }
+}
+
+pub fn estimate_row_value_bytes(values: &HashMap<ColName, Value>) -> usize {
+    values.iter().fold(64, |acc, (key, value)| {
+        acc.saturating_add(32 + key.len().saturating_mul(8) + value.estimated_bytes())
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

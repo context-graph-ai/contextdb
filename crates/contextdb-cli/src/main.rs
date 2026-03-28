@@ -35,11 +35,17 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
-
-    if let Some(ref _limit_str) = args.memory_limit {
-        // Stub: flag is parsed but not applied.
-        // A-MA1 fails because SHOW MEMORY_LIMIT still returns "none".
-    }
+    let accountant = args
+        .memory_limit
+        .as_ref()
+        .map(|limit| parse_memory_limit(limit).map(contextdb_core::MemoryAccountant::with_budget))
+        .transpose()
+        .unwrap_or_else(|err| {
+            eprintln!("Error: invalid --memory-limit: {err}");
+            std::process::exit(1);
+        })
+        .map(Arc::new)
+        .unwrap_or_else(|| Arc::new(contextdb_core::MemoryAccountant::no_limit()));
 
     // If sync is configured, create the SyncPlugin before opening the DB.
     // Keep the rx end alive — a background task will consume it for debounced pushes.
@@ -56,15 +62,19 @@ fn main() {
     debug!(path = %args.path, "opening database");
     let db = if args.path == ":memory:" {
         if let Some(ref plugin) = sync_plugin_arc {
-            contextdb_engine::Database::open_memory_with_plugin(plugin.clone())
-                .expect("failed to open memory database with plugin")
+            contextdb_engine::Database::open_memory_with_plugin_and_accountant(
+                plugin.clone(),
+                accountant.clone(),
+            )
+            .expect("failed to open memory database with plugin")
         } else {
-            contextdb_engine::Database::open_memory()
+            contextdb_engine::Database::open_memory_with_accountant(accountant.clone())
         }
     } else if let Some(ref plugin) = sync_plugin_arc {
-        match contextdb_engine::Database::open_with_plugin(
+        match contextdb_engine::Database::open_with_config(
             std::path::Path::new(&args.path),
             plugin.clone(),
+            accountant.clone(),
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -73,7 +83,11 @@ fn main() {
             }
         }
     } else {
-        match contextdb_engine::Database::open(std::path::Path::new(&args.path)) {
+        match contextdb_engine::Database::open_with_config(
+            std::path::Path::new(&args.path),
+            Arc::new(contextdb_engine::plugin::CorePlugin),
+            accountant.clone(),
+        ) {
             Ok(db) => db,
             Err(e) => {
                 eprintln!("Error: failed to open database at '{}': {e}", args.path);
@@ -158,4 +172,29 @@ fn main() {
     if !all_ok {
         std::process::exit(1);
     }
+}
+
+fn parse_memory_limit(value: &str) -> Result<usize, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("memory limit cannot be empty".to_string());
+    }
+
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(split_at);
+    let base = digits
+        .parse::<usize>()
+        .map_err(|_| format!("invalid byte value '{trimmed}'"))?;
+    let multiplier = match suffix.trim().to_ascii_uppercase().as_str() {
+        "" => 1usize,
+        "K" => 1024usize,
+        "M" => 1024usize * 1024,
+        "G" => 1024usize * 1024 * 1024,
+        other => return Err(format!("unsupported memory suffix '{other}'")),
+    };
+
+    base.checked_mul(multiplier)
+        .ok_or_else(|| format!("memory limit '{trimmed}' is too large"))
 }

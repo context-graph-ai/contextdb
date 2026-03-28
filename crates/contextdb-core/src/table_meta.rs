@@ -75,3 +75,106 @@ pub enum ColumnType {
     Vector(usize),
     Timestamp,
 }
+
+impl TableMeta {
+    pub fn estimated_bytes(&self) -> usize {
+        let columns_bytes = self.columns.iter().fold(0usize, |acc, column| {
+            acc.saturating_add(column.estimated_bytes())
+        });
+        let state_machine_bytes = self
+            .state_machine
+            .as_ref()
+            .map(StateMachineConstraint::estimated_bytes)
+            .unwrap_or(0);
+        let dag_bytes = self.dag_edge_types.iter().fold(0usize, |acc, edge_type| {
+            acc.saturating_add(32 + edge_type.len() * 16)
+        });
+        let natural_key_bytes = self
+            .natural_key_column
+            .as_ref()
+            .map(|column| 32 + column.len() * 16)
+            .unwrap_or(0);
+        let propagation_bytes = self.propagation_rules.iter().fold(0usize, |acc, rule| {
+            acc.saturating_add(rule.estimated_bytes())
+        });
+        let expires_bytes = self
+            .expires_column
+            .as_ref()
+            .map(|column| 32 + column.len() * 16)
+            .unwrap_or(0);
+
+        16 + columns_bytes
+            + state_machine_bytes
+            + dag_bytes
+            + natural_key_bytes
+            + propagation_bytes
+            + expires_bytes
+            + self.default_ttl_seconds.map(|_| 8).unwrap_or(0)
+            + 8
+    }
+}
+
+impl PropagationRule {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            PropagationRule::ForeignKey {
+                fk_column,
+                referenced_table,
+                referenced_column,
+                trigger_state,
+                target_state,
+                ..
+            } => {
+                24 + fk_column.len() * 16
+                    + referenced_table.len() * 16
+                    + referenced_column.len() * 16
+                    + trigger_state.len() * 16
+                    + target_state.len() * 16
+            }
+            PropagationRule::Edge {
+                edge_type,
+                trigger_state,
+                target_state,
+                ..
+            } => 24 + edge_type.len() * 16 + trigger_state.len() * 16 + target_state.len() * 16,
+            PropagationRule::VectorExclusion { trigger_state } => 16 + trigger_state.len() * 16,
+        }
+    }
+}
+
+impl StateMachineConstraint {
+    fn estimated_bytes(&self) -> usize {
+        let transitions_bytes = self.transitions.iter().fold(0usize, |acc, (from, tos)| {
+            acc.saturating_add(
+                32 + from.len() * 16 + tos.iter().map(|to| 16 + to.len() * 16).sum::<usize>(),
+            )
+        });
+        24 + self.column.len() * 16 + transitions_bytes
+    }
+}
+
+impl ColumnDef {
+    fn estimated_bytes(&self) -> usize {
+        let default_bytes = self
+            .default
+            .as_ref()
+            .map(|value| 32 + value.len() * 16)
+            .unwrap_or(0);
+        8 + self.name.len() * 16 + self.column_type.estimated_bytes() + default_bytes + 8
+    }
+}
+
+impl ColumnType {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            ColumnType::Integer => 16,
+            ColumnType::Real => 16,
+            ColumnType::Text => 16,
+            ColumnType::Boolean => 16,
+            ColumnType::Json => 24,
+            ColumnType::Uuid => 16,
+            ColumnType::Vector(_) => 24,
+            ColumnType::Timestamp => 16,
+        }
+    }
+}

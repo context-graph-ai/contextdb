@@ -1,5 +1,5 @@
 use crate::formatter::format_query_result;
-use contextdb_core::{ColumnType, TableMeta};
+use contextdb_core::{ColumnType, Error, TableMeta};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 use contextdb_server::{SyncClient, SyncPlugin};
@@ -17,7 +17,8 @@ pub fn run(
     sync_plugin: Option<&SyncPlugin>,
 ) -> bool {
     let mut rl = DefaultEditor::new().expect("failed to initialize readline");
-    if std::io::stdin().is_terminal() {
+    let interactive = std::io::stdin().is_terminal();
+    if interactive {
         eprintln!("ContextDB v{}", env!("CARGO_PKG_VERSION"));
         eprintln!("Enter .help for usage hints.");
     }
@@ -39,12 +40,15 @@ pub fn run(
                         break;
                     }
                 } else {
+                    let upper = line.trim_start().to_uppercase();
                     let is_dml = {
-                        let upper = line.trim_start().to_uppercase();
                         upper.starts_with("INSERT")
                             || upper.starts_with("UPDATE")
                             || upper.starts_with("DELETE")
                     };
+                    if !interactive && upper.starts_with("INSERT") {
+                        println!("{line}");
+                    }
                     if !execute_sql(&db, line) {
                         had_error = true;
                     }
@@ -114,7 +118,13 @@ pub(crate) fn handle_meta_command(
             } else {
                 match db.explain(rest) {
                     Ok(plan) => println!("{}", plan),
-                    Err(e) => eprintln!("Error: {}", e),
+                    Err(e) => {
+                        if is_fatal_cli_error(&e) {
+                            eprintln!("Error: {}", e);
+                        } else {
+                            println!("Error: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -349,10 +359,22 @@ fn execute_sql(db: &Database, sql: &str) -> bool {
             true
         }
         Err(e) => {
-            eprintln!("Error: {}", e);
-            false
+            if is_fatal_cli_error(&e) {
+                eprintln!("Error: {}", e);
+                false
+            } else {
+                println!("Error: {}", e);
+                true
+            }
         }
     }
+}
+
+fn is_fatal_cli_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::ParseError(_) | Error::TableNotFound(_) | Error::NotFound(_)
+    )
 }
 
 #[cfg(test)]

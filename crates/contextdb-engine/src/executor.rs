@@ -2,8 +2,8 @@ use crate::database::{Database, QueryResult};
 use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
 use contextdb_parser::ast::{
-    AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement, SortDirection,
-    Statement, UnaryOp,
+    AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
+    SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
 };
 use contextdb_planner::{DeletePlan, InsertPlan, PhysicalPlan, UpdatePlan, plan};
 use roaring::RoaringTreemap;
@@ -52,6 +52,13 @@ pub(crate) fn execute_plan(
                 sync_safe: p.retain.as_ref().is_some_and(|r| r.sync_safe),
                 expires_column,
             };
+            let metadata_bytes = meta.estimated_bytes();
+            db.accountant().try_allocate_for(
+                metadata_bytes,
+                "ddl",
+                "create_table",
+                "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
+            )?;
             db.relational_store().create_table(&p.name, meta);
             if let Some(table_meta) = db.table_meta(&p.name) {
                 db.persist_table_meta(&p.name, &table_meta)?;
@@ -61,10 +68,12 @@ pub(crate) fn execute_plan(
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::DropTable(name) => {
+            let bytes_to_release = estimate_drop_table_bytes(db, name);
             db.relational_store().drop_table(name);
             db.remove_persisted_table(name)?;
             let lsn = db.next_lsn_for_ddl();
             db.log_drop_table_ddl(name, lsn);
+            db.accountant().release(bytes_to_release);
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::AlterTable(p) => {
@@ -237,46 +246,58 @@ pub(crate) fn execute_plan(
                 .into_iter()
                 .map(|id| (id, 0_u32))
                 .collect::<Vec<_>>();
+            let bfs_bytes = estimate_bfs_working_bytes(&frontier, steps);
+            db.accountant().try_allocate_for(
+                bfs_bytes,
+                "bfs_frontier",
+                "graph_bfs",
+                "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
+            )?;
 
-            for step in steps {
-                let edge_types_ref = if step.edge_types.is_empty() {
-                    None
-                } else {
-                    Some(step.edge_types.as_slice())
-                };
-                let mut next = HashMap::<uuid::Uuid, u32>::new();
+            let result = (|| {
+                for step in steps {
+                    let edge_types_ref = if step.edge_types.is_empty() {
+                        None
+                    } else {
+                        Some(step.edge_types.as_slice())
+                    };
+                    let mut next = HashMap::<uuid::Uuid, u32>::new();
 
-                for (start, base_depth) in &frontier {
-                    let res = db.graph().bfs(
-                        *start,
-                        edge_types_ref,
-                        step.direction,
-                        step.min_depth,
-                        step.max_depth,
-                        snapshot,
-                    )?;
-                    for node in res.nodes {
-                        let total_depth = base_depth.saturating_add(node.depth);
-                        next.entry(node.id)
-                            .and_modify(|depth| *depth = (*depth).min(total_depth))
-                            .or_insert(total_depth);
+                    for (start, base_depth) in &frontier {
+                        let res = db.graph().bfs(
+                            *start,
+                            edge_types_ref,
+                            step.direction,
+                            step.min_depth,
+                            step.max_depth,
+                            snapshot,
+                        )?;
+                        for node in res.nodes {
+                            let total_depth = base_depth.saturating_add(node.depth);
+                            next.entry(node.id)
+                                .and_modify(|depth| *depth = (*depth).min(total_depth))
+                                .or_insert(total_depth);
+                        }
+                    }
+
+                    frontier = next.into_iter().collect();
+                    if frontier.is_empty() {
+                        break;
                     }
                 }
 
-                frontier = next.into_iter().collect();
-                if frontier.is_empty() {
-                    break;
-                }
-            }
+                Ok(QueryResult {
+                    columns: vec!["id".to_string(), "depth".to_string()],
+                    rows: frontier
+                        .into_iter()
+                        .map(|(id, depth)| vec![Value::Uuid(id), Value::Int64(depth as i64)])
+                        .collect(),
+                    rows_affected: 0,
+                })
+            })();
+            db.accountant().release(bfs_bytes);
 
-            Ok(QueryResult {
-                columns: vec!["id".to_string(), "depth".to_string()],
-                rows: frontier
-                    .into_iter()
-                    .map(|(id, depth)| vec![Value::Uuid(id), Value::Int64(depth as i64)])
-                    .collect(),
-                rows_affected: 0,
-            })
+            result
         }
         PhysicalPlan::VectorSearch {
             table,
@@ -333,12 +354,21 @@ pub(crate) fn execute_plan(
                 None
             };
 
+            let vector_bytes = estimate_vector_search_bytes(query_vec.len(), *k as usize);
+            db.accountant().try_allocate_for(
+                vector_bytes,
+                "vector_search",
+                "search",
+                "Reduce LIMIT/dimensionality or raise MEMORY_LIMIT before vector search.",
+            )?;
             let res = db.query_vector(
                 &query_vec,
                 *k as usize,
                 candidate_bitmap.as_ref(),
                 db.snapshot(),
-            )?;
+            );
+            db.accountant().release(vector_bytes);
+            let res = res?;
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
             let schema_columns = db.table_meta(table).map(|meta| {
@@ -614,12 +644,16 @@ pub(crate) fn execute_plan(
             })
         }
         PhysicalPlan::CreateIndex(_) => Ok(QueryResult::empty_with_affected(0)),
-        PhysicalPlan::SetMemoryLimit(_val) => {
-            // Stub: returns empty result without calling set_budget.
+        PhysicalPlan::SetMemoryLimit(val) => {
+            let limit = match val {
+                SetMemoryLimitValue::Bytes(bytes) => Some(*bytes),
+                SetMemoryLimitValue::None => None,
+            };
+            db.accountant().set_budget(limit)?;
             Ok(QueryResult::empty())
         }
         PhysicalPlan::ShowMemoryLimit => {
-            // Stub: returns hardcoded zeros.
+            let usage = db.accountant().usage();
             Ok(QueryResult {
                 columns: vec![
                     "limit".to_string(),
@@ -628,10 +662,19 @@ pub(crate) fn execute_plan(
                     "startup_ceiling".to_string(),
                 ],
                 rows: vec![vec![
-                    Value::Text("none".to_string()),
-                    Value::Int64(0),
-                    Value::Text("none".to_string()),
-                    Value::Text("none".to_string()),
+                    usage
+                        .limit
+                        .map(|value| Value::Int64(value as i64))
+                        .unwrap_or_else(|| Value::Text("none".to_string())),
+                    Value::Int64(usage.used as i64),
+                    usage
+                        .available
+                        .map(|value| Value::Int64(value as i64))
+                        .unwrap_or_else(|| Value::Text("none".to_string())),
+                    usage
+                        .startup_ceiling
+                        .map(|value| Value::Int64(value as i64))
+                        .unwrap_or_else(|| Value::Text("none".to_string())),
                 ]],
                 rows_affected: 0,
             })
@@ -797,12 +840,31 @@ fn exec_insert(
         }
 
         validate_vector_columns(db, &p.table, &values)?;
+        let row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
+        db.accountant().try_allocate_for(
+            row_bytes,
+            "insert",
+            "row_insert",
+            "Reduce row size or raise MEMORY_LIMIT before inserting more data.",
+        )?;
+        let checkpoint = db.write_set_checkpoint(txid)?;
 
         let row_id = if let Some(on_conflict) = &p.on_conflict {
-            db.upsert_row(txid, &p.table, &on_conflict.columns[0], values.clone())?;
-            0
+            match db.upsert_row(txid, &p.table, &on_conflict.columns[0], values.clone()) {
+                Ok(_) => 0,
+                Err(err) => {
+                    db.accountant().release(row_bytes);
+                    return Err(err);
+                }
+            }
         } else {
-            db.insert_row(txid, &p.table, values.clone())?
+            match db.insert_row(txid, &p.table, values.clone()) {
+                Ok(row_id) => row_id,
+                Err(err) => {
+                    db.accountant().release(row_bytes);
+                    return Err(err);
+                }
+            }
         };
 
         if p.table == "edges"
@@ -815,14 +877,21 @@ fn exec_insert(
                 values.get("target_id"),
                 values.get("edge_type"),
             )
+            && let Err(err) =
+                db.insert_edge(txid, *source, *target, edge_type.clone(), HashMap::new())
         {
-            db.insert_edge(txid, *source, *target, edge_type.clone(), HashMap::new())?;
+            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+            db.accountant().release(row_bytes);
+            return Err(err);
         }
 
         if let Some(v) = vector_value_for_table(db, &p.table, &values)
             && row_id != 0
+            && let Err(err) = db.insert_vector(txid, row_id, v.clone())
         {
-            db.insert_vector(txid, row_id, v.clone())?;
+            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+            db.accountant().release(row_bytes);
+            return Err(err);
         }
 
         rows_affected += 1;
@@ -855,6 +924,9 @@ fn exec_delete(
         .collect();
 
     for row in &matched {
+        if db.has_live_vector(row.row_id, snapshot) {
+            db.delete_vector(txid, row.row_id)?;
+        }
         db.delete_row(txid, &p.table, row.row_id)?;
     }
 
@@ -894,19 +966,118 @@ fn exec_update(
         let old_has_vector = db.has_live_vector(row.row_id, snapshot);
         validate_vector_columns(db, &p.table, &values)?;
         let new_vector = vector_value_for_table(db, &p.table, &values).cloned();
+        let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
+        db.accountant().try_allocate_for(
+            new_row_bytes,
+            "update",
+            "row_replace",
+            "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
+        )?;
+        let checkpoint = db.write_set_checkpoint(txid)?;
 
-        db.delete_row(txid, &p.table, row.row_id)?;
-        if old_has_vector {
-            db.delete_vector(txid, row.row_id)?;
+        if let Err(err) = db.delete_row(txid, &p.table, row.row_id) {
+            db.accountant().release(new_row_bytes);
+            return Err(err);
+        }
+        if old_has_vector && let Err(err) = db.delete_vector(txid, row.row_id) {
+            db.accountant().release(new_row_bytes);
+            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+            return Err(err);
         }
 
-        let new_row_id = db.insert_row(txid, &p.table, values)?;
-        if let Some(vector) = new_vector {
-            db.insert_vector(txid, new_row_id, vector)?;
+        let new_row_id = match db.insert_row(txid, &p.table, values) {
+            Ok(row_id) => row_id,
+            Err(err) => {
+                db.accountant().release(new_row_bytes);
+                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                return Err(err);
+            }
+        };
+        if let Some(vector) = new_vector
+            && let Err(err) = db.insert_vector(txid, new_row_id, vector)
+        {
+            db.accountant().release(new_row_bytes);
+            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+            return Err(err);
         }
     }
 
     Ok(QueryResult::empty_with_affected(matched.len() as u64))
+}
+
+fn estimate_table_row_bytes(
+    db: &Database,
+    table: &str,
+    values: &HashMap<String, Value>,
+) -> Result<usize> {
+    let meta = db
+        .table_meta(table)
+        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+    Ok(estimate_row_bytes_for_meta(values, &meta, false))
+}
+
+fn estimate_row_bytes_for_meta(
+    values: &HashMap<String, Value>,
+    meta: &TableMeta,
+    include_vectors: bool,
+) -> usize {
+    let mut bytes = 96usize;
+    for column in &meta.columns {
+        let Some(value) = values.get(&column.name) else {
+            continue;
+        };
+        if !include_vectors && matches!(column.column_type, ColumnType::Vector(_)) {
+            continue;
+        }
+        bytes = bytes.saturating_add(32 + column.name.len() * 8 + value.estimated_bytes());
+    }
+    bytes
+}
+
+fn estimate_vector_search_bytes(dimension: usize, k: usize) -> usize {
+    k.saturating_mul(3)
+        .saturating_mul(dimension)
+        .saturating_mul(std::mem::size_of::<f32>())
+}
+
+fn estimate_bfs_working_bytes(
+    frontier: &[(uuid::Uuid, u32)],
+    steps: &[contextdb_planner::GraphStepPlan],
+) -> usize {
+    let max_hops = steps.iter().fold(0usize, |acc, step| {
+        acc.saturating_add(step.max_depth as usize)
+    });
+    frontier
+        .len()
+        .saturating_mul(2048)
+        .saturating_mul(max_hops.max(1))
+}
+
+fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
+    let meta = db.table_meta(table);
+    let metadata_bytes = meta.as_ref().map(TableMeta::estimated_bytes).unwrap_or(0);
+    let snapshot = db.snapshot();
+    let row_bytes = db
+        .scan(table, snapshot)
+        .unwrap_or_default()
+        .into_iter()
+        .fold(0usize, |acc, row| {
+            acc.saturating_add(meta.as_ref().map_or_else(
+                || row.estimated_bytes(),
+                |meta| estimate_row_bytes_for_meta(&row.values, meta, false),
+            ))
+        });
+    let vector_bytes = db
+        .scan(table, snapshot)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| db.live_vector_entry(row.row_id, snapshot))
+        .fold(0usize, |acc, entry| {
+            acc.saturating_add(entry.estimated_bytes())
+        });
+    metadata_bytes
+        .saturating_add(row_bytes)
+        .saturating_add(vector_bytes)
 }
 
 fn materialize_rows(

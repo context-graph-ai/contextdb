@@ -1940,6 +1940,10 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
         .find(|p| p.as_rule() == Rule::memory_limit_value)
         .ok_or_else(|| Error::ParseError("missing memory_limit_value".to_string()))?;
 
+    if inner.as_str().eq_ignore_ascii_case("none") {
+        return Ok(SetMemoryLimitValue::None);
+    }
+
     let value_inner = inner
         .into_inner()
         .next()
@@ -1960,9 +1964,6 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
             };
             Ok(SetMemoryLimitValue::Bytes(base * multiplier))
         }
-        _ => {
-            // "none" keyword
-            Ok(SetMemoryLimitValue::None)
-        }
+        _ => Ok(SetMemoryLimitValue::None),
     }
 }

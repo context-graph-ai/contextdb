@@ -145,11 +145,70 @@ impl PruningRuntime {
 }
 
 impl Database {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        if path.as_os_str() == ":memory:" {
-            return Ok(Self::open_memory());
+    #[allow(clippy::too_many_arguments)]
+    fn build_db(
+        tx_mgr: Arc<TxManager<DynStore>>,
+        relational: Arc<RelationalStore>,
+        graph: Arc<GraphStore>,
+        vector_store: Arc<VectorStore>,
+        hnsw: Arc<OnceLock<parking_lot::RwLock<Option<HnswIndex>>>>,
+        change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+        ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
+        persistence: Option<Arc<RedbPersistence>>,
+        plugin: Arc<dyn DatabasePlugin>,
+        accountant: Arc<MemoryAccountant>,
+    ) -> Self {
+        Self {
+            tx_mgr: tx_mgr.clone(),
+            relational_store: relational.clone(),
+            graph_store: graph.clone(),
+            vector_store: vector_store.clone(),
+            change_log,
+            ddl_log,
+            persistence,
+            relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
+            graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
+            vector: MemVectorExecutor::new_with_accountant(
+                vector_store,
+                tx_mgr.clone(),
+                hnsw,
+                accountant.clone(),
+            ),
+            session_tx: Mutex::new(None),
+            instance_id: uuid::Uuid::new_v4(),
+            plugin,
+            accountant,
+            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
+            subscriptions: Mutex::new(SubscriptionState::new()),
+            pruning_runtime: Mutex::new(PruningRuntime::new()),
+            pruning_guard: Arc::new(Mutex::new(())),
+            sync_watermark: Arc::new(AtomicU64::new(0)),
+            closed: AtomicBool::new(false),
         }
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_config(
+            path,
+            Arc::new(CorePlugin),
+            Arc::new(MemoryAccountant::no_limit()),
+        )
+    }
+
+    pub fn open_memory() -> Self {
+        Self::open_memory_with_plugin_and_accountant(
+            Arc::new(CorePlugin),
+            Arc::new(MemoryAccountant::no_limit()),
+        )
+        .expect("failed to open in-memory database")
+    }
+
+    fn open_loaded(
+        path: impl AsRef<Path>,
+        plugin: Arc<dyn DatabasePlugin>,
+        accountant: Arc<MemoryAccountant>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
         let persistence = if path.exists() {
             Arc::new(RedbPersistence::open(path)?)
         } else {
@@ -208,28 +267,18 @@ impl Database {
             max_tx,
         ));
 
-        let db = Self {
-            tx_mgr: tx_mgr.clone(),
-            relational_store: relational.clone(),
-            graph_store: graph.clone(),
-            vector_store: vector.clone(),
+        let db = Self::build_db(
+            tx_mgr,
+            relational,
+            graph,
+            vector,
+            hnsw,
             change_log,
             ddl_log,
-            persistence: Some(persistence),
-            relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
-            graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
-            vector: MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw),
-            session_tx: Mutex::new(None),
-            instance_id: uuid::Uuid::new_v4(),
-            plugin: Arc::new(CorePlugin),
-            accountant: Arc::new(MemoryAccountant::no_limit()),
-            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
-            subscriptions: Mutex::new(SubscriptionState::new()),
-            pruning_runtime: Mutex::new(PruningRuntime::new()),
-            pruning_guard: Arc::new(Mutex::new(())),
-            sync_watermark: Arc::new(AtomicU64::new(0)),
-            closed: AtomicBool::new(false),
-        };
+            Some(persistence),
+            plugin,
+            accountant,
+        );
 
         for meta in all_meta.values() {
             if !meta.dag_edge_types.is_empty() {
@@ -237,12 +286,16 @@ impl Database {
             }
         }
 
-        maybe_prebuild_hnsw(&db.vector_store);
+        db.account_loaded_state()?;
+        maybe_prebuild_hnsw(&db.vector_store, db.accountant());
 
         Ok(db)
     }
 
-    pub fn open_memory() -> Self {
+    fn open_memory_internal(
+        plugin: Arc<dyn DatabasePlugin>,
+        accountant: Arc<MemoryAccountant>,
+    ) -> Result<Self> {
         let relational = Arc::new(RelationalStore::new());
         let graph = Arc::new(GraphStore::new());
         let hnsw = Arc::new(OnceLock::new());
@@ -258,30 +311,11 @@ impl Database {
         ));
         let tx_mgr = Arc::new(TxManager::new(store));
 
-        let db = Self {
-            tx_mgr: tx_mgr.clone(),
-            relational_store: relational.clone(),
-            graph_store: graph.clone(),
-            vector_store: vector.clone(),
-            change_log,
-            ddl_log,
-            persistence: None,
-            relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
-            graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
-            vector: MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw),
-            session_tx: Mutex::new(None),
-            instance_id: uuid::Uuid::new_v4(),
-            plugin: Arc::new(CorePlugin),
-            accountant: Arc::new(MemoryAccountant::no_limit()),
-            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
-            subscriptions: Mutex::new(SubscriptionState::new()),
-            pruning_runtime: Mutex::new(PruningRuntime::new()),
-            pruning_guard: Arc::new(Mutex::new(())),
-            sync_watermark: Arc::new(AtomicU64::new(0)),
-            closed: AtomicBool::new(false),
-        };
-        maybe_prebuild_hnsw(&db.vector_store);
-        db
+        let db = Self::build_db(
+            tx_mgr, relational, graph, vector, hnsw, change_log, ddl_log, None, plugin, accountant,
+        );
+        maybe_prebuild_hnsw(&db.vector_store, db.accountant());
+        Ok(db)
     }
 
     pub fn begin(&self) -> TxId {
@@ -293,6 +327,8 @@ impl Database {
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
+        let ws = self.tx_mgr.cloned_write_set(tx)?;
+        self.release_insert_allocations(&ws);
         self.tx_mgr.rollback(tx)
     }
 
@@ -361,8 +397,12 @@ impl Database {
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
         let mut output = plan.explain();
-        if self.vector_store.vector_count() >= 1000 {
+        if self.vector_store.has_hnsw_index() {
             output = output.replace("VectorSearch(", "HNSWSearch(");
+            output = output.replace("VectorSearch {", "HNSWSearch {");
+        } else {
+            output = output.replace("VectorSearch(", "BruteForce(");
+            output = output.replace("VectorSearch {", "BruteForce {");
         }
         Ok(output)
     }
@@ -390,6 +430,7 @@ impl Database {
         let lsn = self.tx_mgr.commit_with_lsn(tx)?;
 
         if !ws.is_empty() {
+            self.release_delete_allocations(&ws);
             ws.stamp_lsn(lsn);
             self.plugin.post_commit(&ws, source);
             self.publish_commit_event(Self::build_commit_event(&ws, source, lsn));
@@ -1052,8 +1093,17 @@ impl Database {
         edge_type: EdgeType,
         properties: HashMap<String, Value>,
     ) -> Result<()> {
+        let bytes = estimate_edge_bytes(source, target, &edge_type, &properties);
+        self.accountant.try_allocate_for(
+            bytes,
+            "graph_insert",
+            "insert_edge",
+            "Reduce edge fan-out or raise MEMORY_LIMIT before inserting more graph edges.",
+        )?;
+
         self.graph
             .insert_edge(tx, source, target, edge_type, properties)
+            .inspect_err(|_| self.accountant.release(bytes))
     }
 
     pub fn delete_edge(
@@ -1114,7 +1164,16 @@ impl Database {
     }
 
     pub fn insert_vector(&self, tx: TxId, row_id: RowId, vector: Vec<f32>) -> Result<()> {
-        self.vector.insert_vector(tx, row_id, vector)
+        let bytes = estimate_vector_bytes(&vector);
+        self.accountant.try_allocate_for(
+            bytes,
+            "insert",
+            "vector_insert",
+            "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
+        )?;
+        self.vector
+            .insert_vector(tx, row_id, vector)
+            .inspect_err(|_| self.accountant.release(bytes))
     }
 
     pub fn delete_vector(&self, tx: TxId, row_id: RowId) -> Result<()> {
@@ -1137,6 +1196,16 @@ impl Database {
             .read()
             .iter()
             .any(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
+    }
+
+    pub fn live_vector_entry(&self, row_id: RowId, snapshot: SnapshotId) -> Option<VectorEntry> {
+        self.vector_store
+            .vectors
+            .read()
+            .iter()
+            .rev()
+            .find(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
+            .cloned()
     }
 
     pub fn table_names(&self) -> Vec<String> {
@@ -1205,44 +1274,18 @@ impl Database {
         self.instance_id
     }
 
+    pub fn open_memory_with_plugin_and_accountant(
+        plugin: Arc<dyn DatabasePlugin>,
+        accountant: Arc<MemoryAccountant>,
+    ) -> Result<Self> {
+        Self::open_memory_internal(plugin, accountant)
+    }
+
     pub fn open_memory_with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Result<Self> {
-        let relational = Arc::new(RelationalStore::new());
-        let graph = Arc::new(GraphStore::new());
-        let hnsw = Arc::new(OnceLock::new());
-        let vector = Arc::new(VectorStore::new(hnsw.clone()));
-        let change_log = Arc::new(RwLock::new(Vec::new()));
-        let ddl_log = Arc::new(RwLock::new(Vec::new()));
-        let store: DynStore = Box::new(CompositeStore::new(
-            relational.clone(),
-            graph.clone(),
-            vector.clone(),
-            change_log.clone(),
-            ddl_log.clone(),
-        ));
-        let tx_mgr = Arc::new(TxManager::new(store));
-        let db = Self {
-            tx_mgr: tx_mgr.clone(),
-            relational_store: relational.clone(),
-            graph_store: graph.clone(),
-            vector_store: vector.clone(),
-            change_log,
-            ddl_log,
-            persistence: None,
-            relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
-            graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
-            vector: MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw),
-            session_tx: Mutex::new(None),
-            instance_id: uuid::Uuid::new_v4(),
+        let db = Self::open_memory_with_plugin_and_accountant(
             plugin,
-            accountant: Arc::new(MemoryAccountant::no_limit()),
-            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
-            subscriptions: Mutex::new(SubscriptionState::new()),
-            pruning_runtime: Mutex::new(PruningRuntime::new()),
-            pruning_guard: Arc::new(Mutex::new(())),
-            sync_watermark: Arc::new(AtomicU64::new(0)),
-            closed: AtomicBool::new(false),
-        };
-        maybe_prebuild_hnsw(&db.vector_store);
+            Arc::new(MemoryAccountant::no_limit()),
+        )?;
         db.plugin.on_open()?;
         Ok(db)
     }
@@ -1268,8 +1311,7 @@ impl Database {
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
     ) -> Result<Self> {
-        let mut db = Self::open(path)?;
-        db.plugin = plugin;
+        let db = Self::open_loaded(path, plugin, Arc::new(MemoryAccountant::no_limit()))?;
         db.plugin.on_open()?;
         Ok(db)
     }
@@ -1277,22 +1319,187 @@ impl Database {
     /// Full constructor with budget.
     pub fn open_with_config(
         path: impl AsRef<Path>,
-        _plugin: Arc<dyn DatabasePlugin>,
-        _accountant: Arc<MemoryAccountant>,
+        plugin: Arc<dyn DatabasePlugin>,
+        accountant: Arc<MemoryAccountant>,
     ) -> Result<Self> {
-        // Stub: delegates to open() ignoring plugin and accountant.
-        Self::open(path)
+        let path = path.as_ref();
+        if path.as_os_str() == ":memory:" {
+            return Self::open_memory_with_plugin_and_accountant(plugin, accountant);
+        }
+        let db = Self::open_loaded(path, plugin, accountant)?;
+        db.plugin.on_open()?;
+        Ok(db)
     }
 
     /// In-memory database with budget.
-    pub fn open_memory_with_accountant(_accountant: Arc<MemoryAccountant>) -> Self {
-        // Stub: delegates to open_memory() ignoring accountant.
-        Self::open_memory()
+    pub fn open_memory_with_accountant(accountant: Arc<MemoryAccountant>) -> Self {
+        Self::open_memory_internal(Arc::new(CorePlugin), accountant)
+            .expect("failed to open in-memory database with accountant")
     }
 
     /// Access the memory accountant.
     pub fn accountant(&self) -> &MemoryAccountant {
         &self.accountant
+    }
+
+    fn account_loaded_state(&self) -> Result<()> {
+        let metadata_bytes = self
+            .relational_store
+            .table_meta
+            .read()
+            .values()
+            .fold(0usize, |acc, meta| {
+                acc.saturating_add(meta.estimated_bytes())
+            });
+        self.accountant.try_allocate_for(
+            metadata_bytes,
+            "open",
+            "load_table_metadata",
+            "Open the database with a larger MEMORY_LIMIT or reduce stored schema metadata.",
+        )?;
+
+        let row_bytes =
+            self.relational_store
+                .tables
+                .read()
+                .iter()
+                .fold(0usize, |acc, (table, rows)| {
+                    let meta = self.table_meta(table);
+                    acc.saturating_add(rows.iter().fold(0usize, |inner, row| {
+                        inner.saturating_add(meta.as_ref().map_or_else(
+                            || row.estimated_bytes(),
+                            |meta| estimate_row_bytes_for_meta(&row.values, meta, false),
+                        ))
+                    }))
+                });
+        self.accountant.try_allocate_for(
+            row_bytes,
+            "open",
+            "load_rows",
+            "Open the database with a larger MEMORY_LIMIT or prune retained rows first.",
+        )?;
+
+        let edge_bytes = self
+            .graph_store
+            .forward_adj
+            .read()
+            .values()
+            .flatten()
+            .filter(|edge| edge.deleted_tx.is_none())
+            .fold(0usize, |acc, edge| {
+                acc.saturating_add(edge.estimated_bytes())
+            });
+        self.accountant.try_allocate_for(
+            edge_bytes,
+            "open",
+            "load_edges",
+            "Open the database with a larger MEMORY_LIMIT or reduce graph edge volume.",
+        )?;
+
+        let vector_bytes = self
+            .vector_store
+            .vectors
+            .read()
+            .iter()
+            .filter(|entry| entry.deleted_tx.is_none())
+            .fold(0usize, |acc, entry| {
+                acc.saturating_add(entry.estimated_bytes())
+            });
+        self.accountant.try_allocate_for(
+            vector_bytes,
+            "open",
+            "load_vectors",
+            "Open the database with a larger MEMORY_LIMIT or reduce stored vector data.",
+        )?;
+
+        Ok(())
+    }
+
+    fn release_insert_allocations(&self, ws: &contextdb_tx::WriteSet) {
+        for (table, row) in &ws.relational_inserts {
+            let bytes = self
+                .table_meta(table)
+                .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                .unwrap_or_else(|| row.estimated_bytes());
+            self.accountant.release(bytes);
+        }
+
+        for edge in &ws.adj_inserts {
+            self.accountant.release(edge.estimated_bytes());
+        }
+
+        for entry in &ws.vector_inserts {
+            self.accountant.release(entry.estimated_bytes());
+        }
+    }
+
+    fn release_delete_allocations(&self, ws: &contextdb_tx::WriteSet) {
+        for (table, row_id, _) in &ws.relational_deletes {
+            if let Some(row) = self.find_row_by_id(table, *row_id) {
+                let bytes = self
+                    .table_meta(table)
+                    .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                    .unwrap_or_else(|| row.estimated_bytes());
+                self.accountant.release(bytes);
+            }
+        }
+
+        for (row_id, _) in &ws.vector_deletes {
+            if let Some(vector) = self.find_vector_by_row_id(*row_id) {
+                self.accountant.release(vector.estimated_bytes());
+            }
+        }
+
+        if !ws.vector_deletes.is_empty() {
+            self.vector_store.clear_hnsw(self.accountant());
+        }
+    }
+
+    fn find_row_by_id(&self, table: &str, row_id: RowId) -> Option<VersionedRow> {
+        self.relational_store
+            .tables
+            .read()
+            .get(table)
+            .and_then(|rows| rows.iter().find(|row| row.row_id == row_id))
+            .cloned()
+    }
+
+    fn find_vector_by_row_id(&self, row_id: RowId) -> Option<VectorEntry> {
+        self.vector_store
+            .vectors
+            .read()
+            .iter()
+            .find(|entry| entry.row_id == row_id)
+            .cloned()
+    }
+
+    pub(crate) fn write_set_checkpoint(
+        &self,
+        tx: TxId,
+    ) -> Result<(usize, usize, usize, usize, usize)> {
+        self.tx_mgr.with_write_set(tx, |ws| {
+            (
+                ws.relational_inserts.len(),
+                ws.relational_deletes.len(),
+                ws.adj_inserts.len(),
+                ws.vector_inserts.len(),
+                ws.vector_deletes.len(),
+            )
+        })
+    }
+
+    pub(crate) fn restore_write_set_checkpoint(
+        &self,
+        tx: TxId,
+        checkpoint: (usize, usize, usize, usize, usize),
+    ) -> Result<()> {
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.relational_inserts.truncate(checkpoint.0);
+            ws.relational_deletes.truncate(checkpoint.1);
+            ws.adj_inserts.truncate(checkpoint.2);
+            ws.vector_inserts.truncate(checkpoint.3);
+            ws.vector_deletes.truncate(checkpoint.4);
+        })
     }
 
     /// Get a clone of the current conflict policies.
@@ -2263,16 +2470,81 @@ fn query_outcome_from_result(result: &Result<QueryResult>) -> QueryOutcome {
     }
 }
 
-fn maybe_prebuild_hnsw(vector_store: &VectorStore) {
+fn maybe_prebuild_hnsw(vector_store: &VectorStore, accountant: &MemoryAccountant) {
     if vector_store.vector_count() >= 1000 {
         let entries = vector_store.all_entries();
         let dim = vector_store.dimension().unwrap_or(0);
+        let estimated_bytes = estimate_hnsw_index_bytes(entries.len(), dim);
+        if accountant
+            .try_allocate_for(
+                estimated_bytes,
+                "vector_index",
+                "prebuild_hnsw",
+                "Open the database with a larger MEMORY_LIMIT to enable HNSW indexing.",
+            )
+            .is_err()
+        {
+            return;
+        }
+
         let hnsw_opt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             HnswIndex::new(&entries, dim)
         }))
         .ok();
+        if hnsw_opt.is_some() {
+            vector_store.set_hnsw_bytes(estimated_bytes);
+        } else {
+            accountant.release(estimated_bytes);
+        }
         let _ = vector_store.hnsw.set(RwLock::new(hnsw_opt));
     }
+}
+
+fn estimate_row_bytes_for_meta(
+    values: &HashMap<ColName, Value>,
+    meta: &TableMeta,
+    include_vectors: bool,
+) -> usize {
+    let mut bytes = 96usize;
+    for column in &meta.columns {
+        let Some(value) = values.get(&column.name) else {
+            continue;
+        };
+        if !include_vectors && matches!(column.column_type, ColumnType::Vector(_)) {
+            continue;
+        }
+        bytes = bytes.saturating_add(32 + column.name.len() * 8 + value.estimated_bytes());
+    }
+    bytes
+}
+
+fn estimate_vector_bytes(vector: &[f32]) -> usize {
+    24 + vector.len().saturating_mul(std::mem::size_of::<f32>())
+}
+
+fn estimate_edge_bytes(
+    source: NodeId,
+    target: NodeId,
+    edge_type: &str,
+    properties: &HashMap<String, Value>,
+) -> usize {
+    AdjEntry {
+        source,
+        target,
+        edge_type: edge_type.to_string(),
+        properties: properties.clone(),
+        created_tx: 0,
+        deleted_tx: None,
+        lsn: 0,
+    }
+    .estimated_bytes()
+}
+
+fn estimate_hnsw_index_bytes(entry_count: usize, dimension: usize) -> usize {
+    entry_count
+        .saturating_mul(dimension)
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_mul(3)
 }
 
 impl Drop for Database {

@@ -1,12 +1,14 @@
 use crate::HnswIndex;
-use contextdb_core::{RowId, VectorEntry};
+use contextdb_core::{MemoryAccountant, RowId, VectorEntry};
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub struct VectorStore {
     pub vectors: RwLock<Vec<VectorEntry>>,
     pub dimension: RwLock<Option<usize>>,
     pub hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
+    hnsw_bytes: AtomicUsize,
 }
 
 impl Default for VectorStore {
@@ -21,6 +23,7 @@ impl VectorStore {
             vectors: RwLock::new(Vec::new()),
             dimension: RwLock::new(None),
             hnsw,
+            hnsw_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -60,6 +63,16 @@ impl VectorStore {
         }
     }
 
+    pub fn clear_hnsw(&self, accountant: &MemoryAccountant) {
+        let bytes = self.hnsw_bytes.swap(0, Ordering::SeqCst);
+        if bytes > 0 {
+            accountant.release(bytes);
+        }
+        if let Some(rw_lock) = self.hnsw.get() {
+            *rw_lock.write() = None;
+        }
+    }
+
     pub fn insert_loaded_vector(&self, entry: VectorEntry) {
         let dimension = entry.vector.len();
         let mut dim = self.dimension.write();
@@ -87,5 +100,15 @@ impl VectorStore {
 
     pub fn dimension(&self) -> Option<usize> {
         *self.dimension.read()
+    }
+
+    pub fn has_hnsw_index(&self) -> bool {
+        self.hnsw
+            .get()
+            .is_some_and(|rw_lock| rw_lock.read().as_ref().is_some())
+    }
+
+    pub fn set_hnsw_bytes(&self, bytes: usize) {
+        self.hnsw_bytes.store(bytes, Ordering::SeqCst);
     }
 }

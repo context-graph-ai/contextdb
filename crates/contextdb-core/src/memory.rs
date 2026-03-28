@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// Budget enforcer for memory-constrained edge devices.
@@ -44,36 +45,129 @@ impl MemoryAccountant {
     }
 
     /// Attempt to allocate bytes. CAS-based, no TOCTOU.
-    pub fn try_allocate(&self, _bytes: usize) -> crate::Result<()> {
-        // Stub: always returns Err. Makes M01 fail (INSERT under budget still errors).
-        // Makes M04 fail (vector search under budget still errors).
-        // Makes M07 fail (BFS under budget still errors).
-        // A no-op returning Ok(()) would make M02, M05, M08 pass incorrectly.
-        Err(crate::Error::Other("memory accounting stub".into()))
+    pub fn try_allocate(&self, bytes: usize) -> crate::Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        loop {
+            let used = self.used.load(Ordering::SeqCst);
+            if self.has_limit.load(Ordering::SeqCst) {
+                let limit = self.limit.load(Ordering::SeqCst);
+                let available = limit.saturating_sub(used);
+                if bytes > available {
+                    return Err(crate::Error::MemoryBudgetExceeded {
+                        subsystem: "memory".to_string(),
+                        operation: "allocate".to_string(),
+                        requested_bytes: bytes,
+                        available_bytes: available,
+                        budget_limit_bytes: limit,
+                        hint:
+                            "Reduce retained data, lower working-set size, or raise MEMORY_LIMIT."
+                                .to_string(),
+                    });
+                }
+            }
+
+            let next = used.saturating_add(bytes);
+            if self
+                .used
+                .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
     }
 
     /// Return freed bytes to the budget.
-    pub fn release(&self, _bytes: usize) {
-        // Stub: no-op. Makes M03 fail (reclaimed memory not tracked).
+    pub fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+
+        let _ = self
+            .used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                Some(used.saturating_sub(bytes))
+            });
     }
 
     /// Runtime budget adjustment. None removes limit.
     /// Returns Err if new limit exceeds startup ceiling.
-    pub fn set_budget(&self, _limit: Option<usize>) -> crate::Result<()> {
-        // Stub: always returns Err.
-        // Makes M09 fail (SET MEMORY_LIMIT errors instead of succeeding).
-        // Makes M10 fail (SET 'none' errors instead of succeeding).
-        Err(crate::Error::Other("set_budget stub".into()))
+    pub fn set_budget(&self, limit: Option<usize>) -> crate::Result<()> {
+        if self.has_ceiling.load(Ordering::SeqCst) {
+            let ceiling = self.startup_ceiling.load(Ordering::SeqCst);
+            match limit {
+                Some(bytes) if bytes > ceiling => {
+                    return Err(crate::Error::Other(format!(
+                        "memory limit {bytes} exceeds startup ceiling {ceiling}"
+                    )));
+                }
+                None => {
+                    return Err(crate::Error::Other(
+                        "cannot remove memory limit when a startup ceiling is set".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        match limit {
+            Some(bytes) => {
+                self.limit.store(bytes, Ordering::SeqCst);
+                self.has_limit.store(true, Ordering::SeqCst);
+            }
+            None => {
+                self.limit.store(0, Ordering::SeqCst);
+                self.has_limit.store(false, Ordering::SeqCst);
+            }
+        }
+
+        Ok(())
     }
 
     /// Snapshot of current memory state.
     pub fn usage(&self) -> MemoryUsage {
-        // Stub: returns zeros. Makes M09 fail (SHOW returns wrong limit).
+        let limit = self
+            .has_limit
+            .load(Ordering::SeqCst)
+            .then(|| self.limit.load(Ordering::SeqCst));
+        let used = self.used.load(Ordering::SeqCst);
+        let startup_ceiling = self
+            .has_ceiling
+            .load(Ordering::SeqCst)
+            .then(|| self.startup_ceiling.load(Ordering::SeqCst));
         MemoryUsage {
-            limit: None,
-            used: 0,
-            available: None,
-            startup_ceiling: None,
+            limit,
+            used,
+            available: limit.map(|limit| limit.saturating_sub(used)),
+            startup_ceiling,
         }
+    }
+
+    pub fn try_allocate_for(
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> crate::Result<()> {
+        self.try_allocate(bytes).map_err(|err| match err {
+            crate::Error::MemoryBudgetExceeded {
+                requested_bytes,
+                budget_limit_bytes,
+                available_bytes,
+                ..
+            } => crate::Error::MemoryBudgetExceeded {
+                subsystem: subsystem.to_string(),
+                operation: operation.to_string(),
+                requested_bytes,
+                budget_limit_bytes,
+                available_bytes,
+                hint: hint.to_string(),
+            },
+            other => other,
+        })
     }
 }

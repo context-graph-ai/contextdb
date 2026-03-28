@@ -11,6 +11,7 @@ pub struct MemVectorExecutor<S: WriteSetApplicator> {
     store: Arc<VectorStore>,
     tx_mgr: Arc<TxManager<S>>,
     hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
+    accountant: Arc<MemoryAccountant>,
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
@@ -19,10 +20,20 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         tx_mgr: Arc<TxManager<S>>,
         hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
     ) -> Self {
+        Self::new_with_accountant(store, tx_mgr, hnsw, Arc::new(MemoryAccountant::no_limit()))
+    }
+
+    pub fn new_with_accountant(
+        store: Arc<VectorStore>,
+        tx_mgr: Arc<TxManager<S>>,
+        hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
+        accountant: Arc<MemoryAccountant>,
+    ) -> Self {
         Self {
             store,
             tx_mgr,
             hnsw,
+            accountant,
         }
     }
 
@@ -59,10 +70,29 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     fn build_hnsw_from_store(&self) -> Option<HnswIndex> {
         let entries = self.store.all_entries();
         let dim = self.store.dimension().unwrap_or(0);
+        let estimated_bytes = estimate_hnsw_bytes(entries.len(), dim);
+        if self
+            .accountant
+            .try_allocate_for(
+                estimated_bytes,
+                "vector_index",
+                "build_hnsw",
+                "Reduce vector volume or raise MEMORY_LIMIT so the HNSW index can be built.",
+            )
+            .is_err()
+        {
+            return None;
+        }
+
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             HnswIndex::new(&entries, dim)
         }))
         .ok()
+        .inspect(|_| self.store.set_hnsw_bytes(estimated_bytes))
+        .or_else(|| {
+            self.accountant.release(estimated_bytes);
+            None
+        })
     }
 }
 
@@ -167,4 +197,11 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
 
         Ok(())
     }
+}
+
+fn estimate_hnsw_bytes(entry_count: usize, dimension: usize) -> usize {
+    entry_count
+        .saturating_mul(dimension)
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_mul(3)
 }
