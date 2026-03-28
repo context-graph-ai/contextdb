@@ -1907,6 +1907,10 @@ fn contains_where_match_operator(input: &str) -> bool {
         if !word.is_empty() {
             if word.eq_ignore_ascii_case("WHERE") {
                 seen_where = true;
+            } else if seen_where && word.eq_ignore_ascii_case("GRAPH_TABLE") {
+                // A later graph traversal can legitimately contain MATCH; do not
+                // keep a prior WHERE active across that boundary.
+                seen_where = false;
             } else if seen_where && word.eq_ignore_ascii_case("MATCH") {
                 return true;
             } else if seen_where

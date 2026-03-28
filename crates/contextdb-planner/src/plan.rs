@@ -24,6 +24,7 @@ pub enum PhysicalPlan {
         range: ScanRange,
     },
     GraphBfs {
+        start_alias: String,
         start_expr: Expr,
         start_candidates: Option<Box<PhysicalPlan>>,
         steps: Vec<GraphStepPlan>,
@@ -135,6 +136,7 @@ pub struct GraphStepPlan {
     pub direction: Direction,
     pub min_depth: u32,
     pub max_depth: u32,
+    pub target_alias: String,
 }
 
 #[derive(Debug, Clone)]

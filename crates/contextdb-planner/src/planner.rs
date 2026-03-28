@@ -399,6 +399,7 @@ fn graph_bfs_from_match(
                 },
                 min_depth: step.min_hops.max(1),
                 max_depth,
+                target_alias: step.target.alias.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -409,6 +410,7 @@ fn graph_bfs_from_match(
     }
 
     Ok(PhysicalPlan::GraphBfs {
+        start_alias: match_clause.pattern.start.alias.clone(),
         start_expr: extract_graph_start_expr(match_clause)?,
         start_candidates: extract_graph_start_candidates(match_clause, cte_env)?,
         steps,

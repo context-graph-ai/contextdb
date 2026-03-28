@@ -209,6 +209,7 @@ pub(crate) fn execute_plan(
             )
         }
         PhysicalPlan::GraphBfs {
+            start_alias,
             start_expr,
             start_candidates,
             steps,
@@ -244,7 +245,7 @@ pub(crate) fn execute_plan(
             let snapshot = db.snapshot();
             let mut frontier = start_uuids
                 .into_iter()
-                .map(|id| (id, 0_u32))
+                .map(|id| (HashMap::from([(start_alias.clone(), id)]), id, 0_u32))
                 .collect::<Vec<_>>();
             let bfs_bytes = estimate_bfs_working_bytes(&frontier, steps);
             db.accountant().try_allocate_for(
@@ -261,9 +262,9 @@ pub(crate) fn execute_plan(
                     } else {
                         Some(step.edge_types.as_slice())
                     };
-                    let mut next = HashMap::<uuid::Uuid, u32>::new();
+                    let mut next = Vec::new();
 
-                    for (start, base_depth) in &frontier {
+                    for (bindings, start, base_depth) in &frontier {
                         let res = db.graph().bfs(
                             *start,
                             edge_types_ref,
@@ -274,23 +275,50 @@ pub(crate) fn execute_plan(
                         )?;
                         for node in res.nodes {
                             let total_depth = base_depth.saturating_add(node.depth);
-                            next.entry(node.id)
-                                .and_modify(|depth| *depth = (*depth).min(total_depth))
-                                .or_insert(total_depth);
+                            let mut next_bindings = bindings.clone();
+                            next_bindings.insert(step.target_alias.clone(), node.id);
+                            next.push((next_bindings, node.id, total_depth));
                         }
                     }
 
-                    frontier = next.into_iter().collect();
+                    frontier = dedupe_graph_frontier(next, steps);
                     if frontier.is_empty() {
                         break;
                     }
                 }
 
+                let mut columns =
+                    steps
+                        .iter()
+                        .fold(vec![format!("{start_alias}.id")], |mut cols, step| {
+                            cols.push(format!("{}.id", step.target_alias));
+                            cols
+                        });
+                columns.push("id".to_string());
+                columns.push("depth".to_string());
+
                 Ok(QueryResult {
-                    columns: vec!["id".to_string(), "depth".to_string()],
+                    columns,
                     rows: frontier
                         .into_iter()
-                        .map(|(id, depth)| vec![Value::Uuid(id), Value::Int64(depth as i64)])
+                        .map(|(bindings, id, depth)| {
+                            let mut row = Vec::with_capacity(steps.len() + 3);
+                            row.push(Value::Uuid(
+                                *bindings
+                                    .get(start_alias)
+                                    .expect("graph frontier must keep start alias binding"),
+                            ));
+                            for step in steps {
+                                row.push(Value::Uuid(
+                                    *bindings
+                                        .get(&step.target_alias)
+                                        .expect("graph frontier must keep target alias binding"),
+                                ));
+                            }
+                            row.push(Value::Uuid(id));
+                            row.push(Value::Int64(depth as i64));
+                            row
+                        })
                         .collect(),
                     rows_affected: 0,
                 })
@@ -529,16 +557,20 @@ pub(crate) fn execute_plan(
                     let Expr::Column(column_ref) = &key.expr else {
                         return Ordering::Equal;
                     };
-                    let Some(idx) = input_result
-                        .columns
-                        .iter()
-                        .position(|name| name == &column_ref.column)
-                    else {
-                        return Ordering::Equal;
+                    let left_value =
+                        match lookup_query_result_column(left, &input_result.columns, column_ref) {
+                            Ok(value) => value,
+                            Err(_) => return Ordering::Equal,
+                        };
+                    let right_value = match lookup_query_result_column(
+                        right,
+                        &input_result.columns,
+                        column_ref,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => return Ordering::Equal,
                     };
-                    let left_value = left.get(idx).unwrap_or(&Value::Null);
-                    let right_value = right.get(idx).unwrap_or(&Value::Null);
-                    let ordering = compare_sort_values(left_value, right_value, key.direction);
+                    let ordering = compare_sort_values(&left_value, &right_value, key.direction);
                     if ordering != Ordering::Equal {
                         return ordering;
                     }
@@ -1040,8 +1072,8 @@ fn estimate_vector_search_bytes(dimension: usize, k: usize) -> usize {
         .saturating_mul(std::mem::size_of::<f32>())
 }
 
-fn estimate_bfs_working_bytes(
-    frontier: &[(uuid::Uuid, u32)],
+fn estimate_bfs_working_bytes<T>(
+    frontier: &[T],
     steps: &[contextdb_planner::GraphStepPlan],
 ) -> usize {
     let max_hops = steps.iter().fold(0usize, |acc, step| {
@@ -1051,6 +1083,33 @@ fn estimate_bfs_working_bytes(
         .len()
         .saturating_mul(2048)
         .saturating_mul(max_hops.max(1))
+}
+
+fn dedupe_graph_frontier(
+    frontier: Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)>,
+    steps: &[contextdb_planner::GraphStepPlan],
+) -> Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)> {
+    let mut best =
+        HashMap::<Vec<uuid::Uuid>, (HashMap<String, uuid::Uuid>, uuid::Uuid, u32)>::new();
+
+    for (bindings, current_id, depth) in frontier {
+        let mut key = Vec::with_capacity(steps.len());
+        for step in steps {
+            if let Some(id) = bindings.get(&step.target_alias) {
+                key.push(*id);
+            }
+        }
+
+        best.entry(key)
+            .and_modify(|existing| {
+                if depth < existing.2 {
+                    *existing = (bindings.clone(), current_id, depth);
+                }
+            })
+            .or_insert((bindings, current_id, depth));
+    }
+
+    best.into_values().collect()
 }
 
 fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
