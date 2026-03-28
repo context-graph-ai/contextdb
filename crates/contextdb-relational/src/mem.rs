@@ -3,6 +3,7 @@ use contextdb_core::*;
 use contextdb_tx::{TxManager, WriteSetApplicator};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct MemRelationalExecutor<S: WriteSetApplicator> {
     store: Arc<RelationalStore>,
@@ -135,7 +136,12 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             created_tx: tx,
             deleted_tx: None,
             lsn: 0,
-            created_at: None, // stub: never stamped
+            created_at: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {

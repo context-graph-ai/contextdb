@@ -35,3 +35,4 @@ bincode = { version = "2", features = ["serde"] }
 tempfile = "3"
 hnsw_rs = "0.3"
 anndists = "0.1"
+time = { version = "0.3", features = ["formatting", "parsing"] }

@@ -19,6 +19,7 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             state_machine: ct.state_machine.clone(),
             dag_edge_types: ct.dag_edge_types.clone(),
             propagation_rules: extract_propagation_rules(ct)?,
+            retain: ct.retain.clone(),
         })),
         Statement::AlterTable(at) => Ok(PhysicalPlan::AlterTable(AlterTablePlan {
             table: at.table.clone(),
@@ -402,7 +403,9 @@ fn graph_bfs_from_match(
         })
         .collect::<Result<Vec<_>>>()?;
     if steps.is_empty() {
-        return Err(Error::PlanError("MATCH must include at least one edge".into()));
+        return Err(Error::PlanError(
+            "MATCH must include at least one edge".into(),
+        ));
     }
 
     Ok(PhysicalPlan::GraphBfs {
@@ -429,9 +432,9 @@ fn find_graph_start_candidates(
     cte_env: &HashMap<String, PhysicalPlan>,
 ) -> Result<Option<Box<PhysicalPlan>>> {
     match expr {
-        Expr::InSubquery { expr, subquery, .. } if is_graph_start_id_ref(expr, start_alias) => Ok(
-            Some(Box::new(plan_select_body(subquery, cte_env)?)),
-        ),
+        Expr::InSubquery { expr, subquery, .. } if is_graph_start_id_ref(expr, start_alias) => {
+            Ok(Some(Box::new(plan_select_body(subquery, cte_env)?)))
+        }
         Expr::BinaryOp { left, right, .. } => {
             if let Some(plan) = find_graph_start_candidates(left, start_alias, cte_env)? {
                 return Ok(Some(plan));

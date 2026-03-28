@@ -10,6 +10,8 @@ use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 pub(crate) fn execute_plan(
     db: &Database,
@@ -19,6 +21,7 @@ pub(crate) fn execute_plan(
 ) -> Result<QueryResult> {
     match plan {
         PhysicalPlan::CreateTable(p) => {
+            let expires_column = expires_column_name(&p.columns)?;
             let meta = TableMeta {
                 columns: p
                     .columns
@@ -30,7 +33,7 @@ pub(crate) fn execute_plan(
                         primary_key: c.primary_key,
                         unique: c.unique,
                         default: c.default.as_ref().map(|expr| format!("{expr:?}")),
-                        expires: false,
+                        expires: c.expires,
                     })
                     .collect(),
                 immutable: p.immutable,
@@ -45,9 +48,9 @@ pub(crate) fn execute_plan(
                 dag_edge_types: p.dag_edge_types.clone(),
                 natural_key_column: None,
                 propagation_rules: p.propagation_rules.clone(),
-                default_ttl_seconds: None,
-                sync_safe: false,
-                expires_column: None,
+                default_ttl_seconds: p.retain.as_ref().map(|r| r.duration_seconds),
+                sync_safe: p.retain.as_ref().is_some_and(|r| r.sync_safe),
+                expires_column,
             };
             db.relational_store().create_table(&p.name, meta);
             if let Some(table_meta) = db.table_meta(&p.name) {
@@ -74,6 +77,7 @@ pub(crate) fn execute_plan(
                                 .to_string(),
                         ));
                     }
+                    validate_expires_column(col)?;
                     let core_col = contextdb_core::ColumnDef {
                         name: col.name.clone(),
                         column_type: map_column_type(&col.data_type),
@@ -81,24 +85,65 @@ pub(crate) fn execute_plan(
                         primary_key: col.primary_key,
                         unique: col.unique,
                         default: col.default.as_ref().map(|expr| format!("{expr:?}")),
-                        expires: false,
+                        expires: col.expires,
                     };
                     store
                         .alter_table_add_column(&p.table, core_col)
                         .map_err(Error::Other)?;
+                    if col.expires {
+                        let mut meta = store.table_meta.write();
+                        let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
+                            Error::Other(format!("table '{}' not found", p.table))
+                        })?;
+                        table_meta.expires_column = Some(col.name.clone());
+                    }
                 }
                 AlterAction::DropColumn(name) => {
                     store
                         .alter_table_drop_column(&p.table, name)
                         .map_err(Error::Other)?;
+                    let mut meta = store.table_meta.write();
+                    if let Some(table_meta) = meta.get_mut(&p.table)
+                        && table_meta.expires_column.as_deref() == Some(name.as_str())
+                    {
+                        table_meta.expires_column = None;
+                    }
                 }
                 AlterAction::RenameColumn { from, to } => {
                     store
                         .alter_table_rename_column(&p.table, from, to)
                         .map_err(Error::Other)?;
+                    let mut meta = store.table_meta.write();
+                    if let Some(table_meta) = meta.get_mut(&p.table)
+                        && table_meta.expires_column.as_deref() == Some(from.as_str())
+                    {
+                        table_meta.expires_column = Some(to.clone());
+                    }
                 }
-                AlterAction::SetRetain { .. } => { /* stub: no-op */ }
-                AlterAction::DropRetain => { /* stub: no-op */ }
+                AlterAction::SetRetain {
+                    duration_seconds,
+                    sync_safe,
+                } => {
+                    let mut meta = store.table_meta.write();
+                    let table_meta = meta
+                        .get_mut(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    if table_meta.immutable {
+                        return Err(Error::Other(
+                            "IMMUTABLE and RETAIN are mutually exclusive".to_string(),
+                        ));
+                    }
+                    table_meta.default_ttl_seconds = Some(*duration_seconds);
+                    table_meta.sync_safe = *sync_safe;
+                }
+                AlterAction::DropRetain => {
+                    let mut meta = store.table_meta.write();
+                    let table_meta = meta
+                        .get_mut(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    table_meta.default_ttl_seconds = None;
+                    table_meta.sync_safe = false;
+                }
                 AlterAction::SetSyncConflictPolicy(policy) => {
                     let cp = parse_conflict_policy(policy)?;
                     db.set_table_conflict_policy(&p.table, cp);
@@ -748,7 +793,7 @@ fn exec_insert(
                 .get(idx)
                 .ok_or_else(|| Error::PlanError("column/value count mismatch".to_string()))?;
             let v = resolve_expr(expr, params)?;
-            values.insert(col.clone(), coerce_uuid_if_needed(col, v));
+            values.insert(col.clone(), coerce_value_for_column(db, &p.table, col, v)?);
         }
 
         validate_vector_columns(db, &p.table, &values)?;
@@ -842,7 +887,8 @@ fn exec_update(
     for row in &matched {
         let mut values = row.values.clone();
         for (k, vexpr) in &p.assignments {
-            values.insert(k.clone(), eval_assignment_expr(vexpr, &row.values, params)?);
+            let value = eval_assignment_expr(vexpr, &row.values, params)?;
+            values.insert(k.clone(), coerce_value_for_column(db, &p.table, k, value)?);
         }
 
         let old_has_vector = db.has_live_vector(row.row_id, snapshot);
@@ -1907,8 +1953,9 @@ fn resolve_graph_start_ids_from_filter(
             };
             let id = match value {
                 Value::Uuid(id) => id,
-                Value::Text(text) => uuid::Uuid::parse_str(&text)
-                    .map_err(|_| Error::PlanError(format!("invalid UUID in graph filter: {text}")))?,
+                Value::Text(text) => uuid::Uuid::parse_str(&text).map_err(|_| {
+                    Error::PlanError(format!("invalid UUID in graph filter: {text}"))
+                })?,
                 other => {
                     return Err(Error::PlanError(format!(
                         "invalid graph start identifier in filter: {other:?}"
@@ -1923,8 +1970,9 @@ fn resolve_graph_start_ids_from_filter(
                 .map(|item| resolve_expr(item, params))
                 .map(|value| match value? {
                     Value::Uuid(id) => Ok(id),
-                    Value::Text(text) => uuid::Uuid::parse_str(&text)
-                        .map_err(|_| Error::PlanError(format!("invalid UUID in graph filter: {text}"))),
+                    Value::Text(text) => uuid::Uuid::parse_str(&text).map_err(|_| {
+                        Error::PlanError(format!("invalid UUID in graph filter: {text}"))
+                    }),
                     other => Err(Error::PlanError(format!(
                         "invalid graph start identifier in filter: {other:?}"
                     ))),
@@ -2000,13 +2048,29 @@ fn vector_value_for_table<'a>(
     values: &'a HashMap<String, Value>,
 ) -> Option<&'a Vec<f32>> {
     let meta = db.table_meta(table)?;
-    meta.columns.iter().find_map(|column| match column.column_type {
-        contextdb_core::ColumnType::Vector(_) => match values.get(&column.name) {
-            Some(Value::Vector(vector)) => Some(vector),
+    meta.columns
+        .iter()
+        .find_map(|column| match column.column_type {
+            contextdb_core::ColumnType::Vector(_) => match values.get(&column.name) {
+                Some(Value::Vector(vector)) => Some(vector),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    })
+        })
+}
+
+fn coerce_value_for_column(db: &Database, table: &str, col: &str, v: Value) -> Result<Value> {
+    let Some(meta) = db.table_meta(table) else {
+        return Ok(coerce_uuid_if_needed(col, v));
+    };
+    let Some(column) = meta.columns.iter().find(|c| c.name == col) else {
+        return Ok(coerce_uuid_if_needed(col, v));
+    };
+
+    match column.column_type {
+        contextdb_core::ColumnType::Timestamp => coerce_timestamp_value(v),
+        _ => Ok(coerce_uuid_if_needed(col, v)),
+    }
 }
 
 fn coerce_uuid_if_needed(col: &str, v: Value) -> Value {
@@ -2017,6 +2081,48 @@ fn coerce_uuid_if_needed(col: &str, v: Value) -> Value {
         return Value::Uuid(u);
     }
     v
+}
+
+fn coerce_timestamp_value(v: Value) -> Result<Value> {
+    match v {
+        Value::Text(text) if text.eq_ignore_ascii_case("infinity") => {
+            Ok(Value::Timestamp(i64::MAX))
+        }
+        Value::Text(text) => {
+            let parsed = OffsetDateTime::parse(&text, &Rfc3339).map_err(|err| {
+                Error::Other(format!("invalid TIMESTAMP literal '{text}': {err}"))
+            })?;
+            Ok(Value::Timestamp(
+                parsed.unix_timestamp_nanos() as i64 / 1_000_000,
+            ))
+        }
+        other => Ok(other),
+    }
+}
+
+fn validate_expires_column(col: &contextdb_parser::ast::ColumnDef) -> Result<()> {
+    if col.expires && !matches!(col.data_type, DataType::Timestamp) {
+        return Err(Error::Other(
+            "EXPIRES is only valid on TIMESTAMP columns".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn expires_column_name(columns: &[contextdb_parser::ast::ColumnDef]) -> Result<Option<String>> {
+    let mut expires_column = None;
+    for col in columns {
+        validate_expires_column(col)?;
+        if col.expires {
+            if expires_column.is_some() {
+                return Err(Error::Other(
+                    "only one EXPIRES column is supported per table".to_string(),
+                ));
+            }
+            expires_column = Some(col.name.clone());
+        }
+    }
+    Ok(expires_column)
 }
 
 pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {

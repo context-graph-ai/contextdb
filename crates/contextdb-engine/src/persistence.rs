@@ -232,25 +232,70 @@ impl RedbPersistence {
     }
 
     pub fn rewrite_table_rows(&self, name: &str, rows: &[VersionedRow]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             {
                 let table_name = Self::rel_table_name(name);
                 let table_def: TableDefinition<u64, &[u8]> =
                     TableDefinition::new(table_name.as_str());
-                let mut redb_table = match write_txn.open_table(table_def) {
-                    Ok(table) => table,
-                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                    Err(err) => return Err(Self::storage_error(err)),
-                };
+                let _ = write_txn.delete_table(table_def);
+                let mut redb_table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
                 for row in rows {
                     let encoded = Self::encode(row)?;
                     redb_table
                         .insert(row.row_id, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn rewrite_vectors(&self, vectors: &[VectorEntry]) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let _ = write_txn.delete_table(VECTORS_TABLE);
+            {
+                let mut table = write_txn
+                    .open_table(VECTORS_TABLE)
+                    .map_err(Self::storage_error)?;
+                for entry in vectors {
+                    let encoded = Self::encode(entry)?;
+                    table
+                        .insert(entry.row_id, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn rewrite_graph_edges(&self, edges: &[AdjEntry]) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let _ = write_txn.delete_table(GRAPH_FWD_TABLE);
+            let _ = write_txn.delete_table(GRAPH_REV_TABLE);
+            {
+                let mut fwd_table = write_txn
+                    .open_table(GRAPH_FWD_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rev_table = write_txn
+                    .open_table(GRAPH_REV_TABLE)
+                    .map_err(Self::storage_error)?;
+
+                for entry in edges {
+                    let encoded = Self::encode(entry)?;
+                    let fwd_key = Self::graph_fwd_key(entry);
+                    let rev_key = Self::graph_rev_key(entry);
+                    fwd_table
+                        .insert(fwd_key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    rev_table
+                        .insert(rev_key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
             }

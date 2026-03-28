@@ -23,9 +23,11 @@ use parking_lot::{Mutex, RwLock};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 type DynStore = Box<dyn WriteSetApplicator>;
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
@@ -72,6 +74,10 @@ pub struct Database {
     accountant: Arc<MemoryAccountant>,
     conflict_policies: RwLock<ConflictPolicies>,
     subscriptions: Mutex<SubscriptionState>,
+    pruning_runtime: Mutex<PruningRuntime>,
+    pruning_guard: Arc<Mutex<()>>,
+    sync_watermark: Arc<AtomicU64>,
+    closed: AtomicBool,
 }
 
 impl std::fmt::Debug for Database {
@@ -119,6 +125,21 @@ impl SubscriptionState {
             subscribers: Vec::new(),
             events_sent: 0,
             events_dropped: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PruningRuntime {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PruningRuntime {
+    fn new() -> Self {
+        Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            handle: None,
         }
     }
 }
@@ -204,6 +225,10 @@ impl Database {
             accountant: Arc::new(MemoryAccountant::no_limit()),
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
             subscriptions: Mutex::new(SubscriptionState::new()),
+            pruning_runtime: Mutex::new(PruningRuntime::new()),
+            pruning_guard: Arc::new(Mutex::new(())),
+            sync_watermark: Arc::new(AtomicU64::new(0)),
+            closed: AtomicBool::new(false),
         };
 
         for meta in all_meta.values() {
@@ -250,6 +275,10 @@ impl Database {
             accountant: Arc::new(MemoryAccountant::no_limit()),
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
             subscriptions: Mutex::new(SubscriptionState::new()),
+            pruning_runtime: Mutex::new(PruningRuntime::new()),
+            pruning_guard: Arc::new(Mutex::new(())),
+            sync_watermark: Arc::new(AtomicU64::new(0)),
+            closed: AtomicBool::new(false),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db
@@ -423,6 +452,20 @@ impl Database {
         subscriptions.subscribers = live_subscribers;
     }
 
+    fn stop_pruning_thread(&self) {
+        let handle = {
+            let mut runtime = self.pruning_runtime.lock();
+            runtime.shutdown.store(true, Ordering::SeqCst);
+            let handle = runtime.handle.take();
+            runtime.shutdown = Arc::new(AtomicBool::new(false));
+            handle
+        };
+
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
     fn execute_statement(
         &self,
         stmt: &Statement,
@@ -549,19 +592,37 @@ impl Database {
                             primary_key: col.primary_key,
                             unique: col.unique,
                             default: col.default.as_ref().map(|expr| format!("{expr:?}")),
-                            expires: false,
+                            expires: col.expires,
                         });
+                        if col.expires {
+                            meta.expires_column = Some(col.name.clone());
+                        }
                     }
                     AlterAction::DropColumn(name) => {
                         meta.columns.retain(|c| c.name != *name);
+                        if meta.expires_column.as_deref() == Some(name.as_str()) {
+                            meta.expires_column = None;
+                        }
                     }
                     AlterAction::RenameColumn { from, to } => {
                         if let Some(c) = meta.columns.iter_mut().find(|c| c.name == *from) {
                             c.name = to.clone();
                         }
+                        if meta.expires_column.as_deref() == Some(from.as_str()) {
+                            meta.expires_column = Some(to.clone());
+                        }
                     }
-                    AlterAction::SetRetain { .. } => { /* stub: no-op */ }
-                    AlterAction::DropRetain => { /* stub: no-op */ }
+                    AlterAction::SetRetain {
+                        duration_seconds,
+                        sync_safe,
+                    } => {
+                        meta.default_ttl_seconds = Some(*duration_seconds);
+                        meta.sync_safe = *sync_safe;
+                    }
+                    AlterAction::DropRetain => {
+                        meta.default_ttl_seconds = None;
+                        meta.sync_safe = false;
+                    }
                     AlterAction::SetSyncConflictPolicy(_) | AlterAction::DropSyncConflictPolicy => { /* handled in executor */
                     }
                 }
@@ -1088,20 +1149,56 @@ impl Database {
 
     /// Run one pruning cycle. Called by the background loop or manually in tests.
     pub fn run_pruning_cycle(&self) -> u64 {
-        0 // stub: never prunes anything — all pruning tests fail
+        let _guard = self.pruning_guard.lock();
+        prune_expired_rows(
+            &self.relational_store,
+            &self.graph_store,
+            &self.vector_store,
+            self.persistence.as_ref(),
+            self.sync_watermark(),
+        )
     }
 
     /// Set the pruning loop interval. Test-only API.
-    pub fn set_pruning_interval(&self, _interval: std::time::Duration) {
-        // stub: no background loop exists
+    pub fn set_pruning_interval(&self, interval: Duration) {
+        self.stop_pruning_thread();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let relational = self.relational_store.clone();
+        let graph = self.graph_store.clone();
+        let vector = self.vector_store.clone();
+        let persistence = self.persistence.clone();
+        let sync_watermark = self.sync_watermark.clone();
+        let pruning_guard = self.pruning_guard.clone();
+        let thread_shutdown = shutdown.clone();
+
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::SeqCst) {
+                {
+                    let _guard = pruning_guard.lock();
+                    let _ = prune_expired_rows(
+                        &relational,
+                        &graph,
+                        &vector,
+                        persistence.as_ref(),
+                        sync_watermark.load(Ordering::SeqCst),
+                    );
+                }
+                sleep_with_shutdown(&thread_shutdown, interval);
+            }
+        });
+
+        let mut runtime = self.pruning_runtime.lock();
+        runtime.shutdown = shutdown;
+        runtime.handle = Some(handle);
     }
 
     pub fn sync_watermark(&self) -> u64 {
-        0 // stub: always 0
+        self.sync_watermark.load(Ordering::SeqCst)
     }
 
-    pub fn set_sync_watermark(&self, _watermark: u64) {
-        // stub: no-op
+    pub fn set_sync_watermark(&self, watermark: u64) {
+        self.sync_watermark.store(watermark, Ordering::SeqCst);
     }
 
     pub fn instance_id(&self) -> uuid::Uuid {
@@ -1140,6 +1237,10 @@ impl Database {
             accountant: Arc::new(MemoryAccountant::no_limit()),
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
             subscriptions: Mutex::new(SubscriptionState::new()),
+            pruning_runtime: Mutex::new(PruningRuntime::new()),
+            pruning_guard: Arc::new(Mutex::new(())),
+            sync_watermark: Arc::new(AtomicU64::new(0)),
+            closed: AtomicBool::new(false),
         };
         maybe_prebuild_hnsw(&db.vector_store);
         db.plugin.on_open()?;
@@ -1147,10 +1248,15 @@ impl Database {
     }
 
     pub fn close(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         let tx = self.session_tx.lock().take();
         if let Some(tx) = tx {
             self.rollback(tx)?;
         }
+        self.stop_pruning_thread();
+        self.subscriptions.lock().subscribers.clear();
         if let Some(persistence) = &self.persistence {
             persistence.close();
         }
@@ -2171,8 +2277,167 @@ fn maybe_prebuild_hnsw(vector_store: &VectorStore) {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let runtime = self.pruning_runtime.get_mut();
+        runtime.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = runtime.handle.take() {
+            let _ = handle.join();
+        }
         self.subscriptions.lock().subscribers.clear();
+        if let Some(persistence) = &self.persistence {
+            persistence.close();
+        }
     }
+}
+
+fn sleep_with_shutdown(shutdown: &AtomicBool, interval: Duration) {
+    let deadline = Instant::now() + interval;
+    while !shutdown.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+fn prune_expired_rows(
+    relational_store: &Arc<RelationalStore>,
+    graph_store: &Arc<GraphStore>,
+    vector_store: &Arc<VectorStore>,
+    persistence: Option<&Arc<RedbPersistence>>,
+    sync_watermark: u64,
+) -> u64 {
+    let now_millis = current_epoch_millis();
+    let metas = relational_store.table_meta.read().clone();
+    let mut pruned_by_table: HashMap<String, Vec<RowId>> = HashMap::new();
+    let mut pruned_node_ids = HashSet::new();
+
+    {
+        let mut tables = relational_store.tables.write();
+        for (table_name, rows) in tables.iter_mut() {
+            let Some(meta) = metas.get(table_name) else {
+                continue;
+            };
+            if meta.default_ttl_seconds.is_none() {
+                continue;
+            }
+
+            rows.retain(|row| {
+                if !row_is_prunable(row, meta, now_millis, sync_watermark) {
+                    return true;
+                }
+
+                pruned_by_table
+                    .entry(table_name.clone())
+                    .or_default()
+                    .push(row.row_id);
+                if let Some(Value::Uuid(id)) = row.values.get("id") {
+                    pruned_node_ids.insert(*id);
+                }
+                false
+            });
+        }
+    }
+
+    let pruned_row_ids: HashSet<RowId> = pruned_by_table
+        .values()
+        .flat_map(|rows| rows.iter().copied())
+        .collect();
+    if pruned_row_ids.is_empty() {
+        return 0;
+    }
+
+    {
+        let mut vectors = vector_store.vectors.write();
+        vectors.retain(|entry| !pruned_row_ids.contains(&entry.row_id));
+    }
+    if let Some(hnsw) = vector_store.hnsw.get() {
+        *hnsw.write() = None;
+    }
+
+    {
+        let mut forward = graph_store.forward_adj.write();
+        for entries in forward.values_mut() {
+            entries.retain(|entry| {
+                !pruned_node_ids.contains(&entry.source) && !pruned_node_ids.contains(&entry.target)
+            });
+        }
+        forward.retain(|_, entries| !entries.is_empty());
+    }
+    {
+        let mut reverse = graph_store.reverse_adj.write();
+        for entries in reverse.values_mut() {
+            entries.retain(|entry| {
+                !pruned_node_ids.contains(&entry.source) && !pruned_node_ids.contains(&entry.target)
+            });
+        }
+        reverse.retain(|_, entries| !entries.is_empty());
+    }
+
+    if let Some(persistence) = persistence {
+        for table_name in pruned_by_table.keys() {
+            let rows = relational_store
+                .tables
+                .read()
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default();
+            let _ = persistence.rewrite_table_rows(table_name, &rows);
+        }
+
+        let vectors = vector_store.vectors.read().clone();
+        let edges = graph_store
+            .forward_adj
+            .read()
+            .values()
+            .flat_map(|entries| entries.iter().cloned())
+            .collect::<Vec<_>>();
+        let _ = persistence.rewrite_vectors(&vectors);
+        let _ = persistence.rewrite_graph_edges(&edges);
+    }
+
+    pruned_row_ids.len() as u64
+}
+
+fn row_is_prunable(
+    row: &VersionedRow,
+    meta: &TableMeta,
+    now_millis: u64,
+    sync_watermark: u64,
+) -> bool {
+    if meta.sync_safe && row.lsn >= sync_watermark {
+        return false;
+    }
+
+    let Some(default_ttl_seconds) = meta.default_ttl_seconds else {
+        return false;
+    };
+
+    if let Some(expires_column) = &meta.expires_column {
+        match row.values.get(expires_column) {
+            Some(Value::Timestamp(millis)) if *millis == i64::MAX => return false,
+            Some(Value::Timestamp(millis)) if *millis < 0 => return true,
+            Some(Value::Timestamp(millis)) => return (*millis as u64) <= now_millis,
+            Some(Value::Null) | None => {}
+            Some(_) => {}
+        }
+    }
+
+    let ttl_millis = default_ttl_seconds.saturating_mul(1000);
+    row.created_at
+        .map(|created_at| now_millis.saturating_sub(created_at) > ttl_millis)
+        .unwrap_or(false)
+}
+
+fn current_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn max_tx_across_all(
@@ -2389,6 +2654,9 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
     if col.unique {
         ty.push_str(" UNIQUE");
     }
+    if col.expires {
+        ty.push_str(" EXPIRES");
+    }
 
     ty
 }
@@ -2418,6 +2686,14 @@ fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(", ");
         constraints.push(format!("DAG({edge_types})"));
+    }
+
+    if let Some(retain) = &ct.retain {
+        let mut clause = format!("RETAIN {}", ttl_seconds_to_sql(retain.duration_seconds));
+        if retain.sync_safe {
+            clause.push_str(" SYNC SAFE");
+        }
+        constraints.push(clause);
     }
 
     for rule in &ct.propagation_rules {
@@ -2482,6 +2758,14 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
         constraints.push(format!("DAG({edge_types})"));
     }
 
+    if let Some(ttl_seconds) = meta.default_ttl_seconds {
+        let mut clause = format!("RETAIN {}", ttl_seconds_to_sql(ttl_seconds));
+        if meta.sync_safe {
+            clause.push_str(" SYNC SAFE");
+        }
+        constraints.push(clause);
+    }
+
     for rule in &meta.propagation_rules {
         match rule {
             PropagationRule::Edge {
@@ -2520,4 +2804,16 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
     }
 
     constraints
+}
+
+fn ttl_seconds_to_sql(seconds: u64) -> String {
+    if seconds.is_multiple_of(24 * 60 * 60) {
+        format!("{} DAYS", seconds / (24 * 60 * 60))
+    } else if seconds.is_multiple_of(60 * 60) {
+        format!("{} HOURS", seconds / (60 * 60))
+    } else if seconds.is_multiple_of(60) {
+        format!("{} MINUTES", seconds / 60)
+    } else {
+        format!("{seconds} SECONDS")
+    }
 }

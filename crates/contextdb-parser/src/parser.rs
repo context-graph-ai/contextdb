@@ -972,6 +972,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut dag_edge_types = Vec::new();
     let mut propagation_rules = Vec::new();
     let mut has_propagation = false;
+    let mut retain = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1010,6 +1011,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                         has_propagation = true;
                         propagation_rules.push(build_vector_propagation_option(opt)?);
                     }
+                    Rule::retain_option => retain = Some(build_retain_option(opt)?),
                     _ => {}
                 }
             }
@@ -1038,6 +1040,12 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         ));
     }
 
+    if immutable && retain.is_some() {
+        return Err(Error::ParseError(
+            "IMMUTABLE and RETAIN are mutually exclusive".to_string(),
+        ));
+    }
+
     Ok(CreateTable {
         name: name.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
         columns,
@@ -1046,7 +1054,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         state_machine,
         dag_edge_types,
         propagation_rules,
-        retain: None, // stub: grammar accepts RETAIN but AST builder discards it
+        retain,
     })
 }
 
@@ -1108,10 +1116,10 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             Ok(AlterAction::RenameColumn { from, to })
         }
         Rule::set_retain_action => {
-            // stub: parse but return dummy values
+            let retain = build_retain_option(action)?;
             Ok(AlterAction::SetRetain {
-                duration_seconds: 0,
-                sync_safe: false,
+                duration_seconds: retain.duration_seconds,
+                sync_safe: retain.sync_safe,
             })
         }
         Rule::drop_retain_action => Ok(AlterAction::DropRetain),
@@ -1141,6 +1149,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut references = None;
     let mut fk_propagation_rules = Vec::new();
     let mut inline_state_machine = None;
+    let mut expires = false;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1168,6 +1177,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                     Rule::fk_propagation_clause => {
                         fk_propagation_rules.push(build_fk_propagation_clause(c)?);
                     }
+                    Rule::expires_constraint => expires = true,
                     Rule::state_machine_option => {
                         inline_state_machine = Some(build_state_machine_option(c)?);
                     }
@@ -1195,10 +1205,51 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             unique,
             default,
             references,
-            expires: false,
+            expires,
         },
         inline_state_machine,
     ))
+}
+
+fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
+    let mut amount = None;
+    let mut unit = None;
+    let mut sync_safe = false;
+
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::integer => {
+                amount = Some(part.as_str().parse::<u64>().map_err(|err| {
+                    Error::ParseError(format!(
+                        "invalid RETAIN duration '{}': {err}",
+                        part.as_str()
+                    ))
+                })?);
+            }
+            Rule::retain_unit => unit = Some(part.as_str().to_ascii_uppercase()),
+            Rule::sync_safe_option => sync_safe = true,
+            _ => {}
+        }
+    }
+
+    let amount = amount.ok_or_else(|| Error::ParseError("RETAIN missing duration".to_string()))?;
+    let unit = unit.ok_or_else(|| Error::ParseError("RETAIN missing unit".to_string()))?;
+    let duration_seconds = match unit.as_str() {
+        "SECONDS" => amount,
+        "MINUTES" => amount.saturating_mul(60),
+        "HOURS" => amount.saturating_mul(60 * 60),
+        "DAYS" => amount.saturating_mul(24 * 60 * 60),
+        _ => {
+            return Err(Error::ParseError(format!(
+                "unsupported RETAIN unit: {unit}"
+            )));
+        }
+    };
+
+    Ok(RetainOption {
+        duration_seconds,
+        sync_safe,
+    })
 }
 
 fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {

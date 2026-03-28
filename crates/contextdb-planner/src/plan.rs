@@ -1,6 +1,7 @@
 use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
-    AlterAction, ColumnDef, Expr, OnConflict, SetMemoryLimitValue, SortDirection, StateMachineDef,
+    AlterAction, ColumnDef, Expr, OnConflict, RetainOption, SetMemoryLimitValue, SortDirection,
+    StateMachineDef,
 };
 
 #[derive(Debug, Clone)]
@@ -144,6 +145,7 @@ pub struct CreateTablePlan {
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
     pub propagation_rules: Vec<PropagationRule>,
+    pub retain: Option<RetainOption>,
 }
 
 #[derive(Debug, Clone)]
