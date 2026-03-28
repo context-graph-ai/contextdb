@@ -396,13 +396,16 @@ impl Database {
     pub fn explain(&self, sql: &str) -> Result<String> {
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
+        if self.vector_store.vector_count() >= 1000 && !self.vector_store.has_hnsw_index() {
+            maybe_prebuild_hnsw(&self.vector_store, self.accountant());
+        }
         let mut output = plan.explain();
         if self.vector_store.has_hnsw_index() {
             output = output.replace("VectorSearch(", "HNSWSearch(");
             output = output.replace("VectorSearch {", "HNSWSearch {");
         } else {
-            output = output.replace("VectorSearch(", "BruteForce(");
-            output = output.replace("VectorSearch {", "BruteForce {");
+            output = output.replace("VectorSearch(", "VectorSearch(strategy=BruteForce, ");
+            output = output.replace("VectorSearch {", "VectorSearch { strategy: BruteForce,");
         }
         Ok(output)
     }
