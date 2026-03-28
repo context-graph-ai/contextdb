@@ -1,9 +1,10 @@
 use super::helpers::{make_params, setup_ontology_db, setup_ontology_db_with_dag};
-use contextdb_core::{Direction, Error, UpsertResult, Value, VersionedRow};
+use contextdb_core::{Direction, Error, MemoryAccountant, UpsertResult, Value, VersionedRow};
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use contextdb_parser::{Statement as AstStatement, parse as parse_sql};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn text<'a>(row: &'a VersionedRow, key: &str) -> &'a str {
@@ -1247,8 +1248,18 @@ fn a4_07_cosine_similarity_ordering() {
 #[test]
 fn a4_08_vector_search_via_sql() {
     let db = setup_ontology_db();
-    let v = vec![1.0, 0.0];
-    for embed in [vec![1.0, 0.0], vec![0.8, 0.2], vec![0.0, 1.0]] {
+    let embed_384 = |x: f32, y: f32| {
+        let mut v = vec![0.0; 384];
+        v[0] = x;
+        v[1] = y;
+        v
+    };
+    let v = embed_384(1.0, 0.0);
+    for embed in [
+        embed_384(1.0, 0.0),
+        embed_384(0.8, 0.2),
+        embed_384(0.0, 1.0),
+    ] {
         db.execute(
             "INSERT INTO observations (id, entity_id, data, embedding) VALUES ($id, $entity_id, $data, $embedding)",
             &make_params(vec![
@@ -2537,39 +2548,116 @@ fn a7_09_implicit_vector_coercion_rejected() {
 // a8_07 deleted — redundant with p32_deleted_vectors_excluded_from_ann_after_reopen
 
 #[test]
-#[ignore = "requires memory accounting API"]
 fn a10_01_budget_tracks_allocations() {
-    let _db = setup_ontology_db();
-    // TODO: SubsystemBudget::try_allocate(1000) then assert used()==1000.
-    todo!("requires memory accounting API");
+    let accountant = MemoryAccountant::with_budget(4096);
+    accountant
+        .try_allocate(1000)
+        .expect("allocation within budget should succeed");
+
+    let usage = accountant.usage();
+    assert_eq!(usage.limit, Some(4096));
+    assert_eq!(usage.used, 1000);
+    assert_eq!(usage.available, Some(3096));
 }
 
 #[test]
-#[ignore = "requires memory accounting API"]
 fn a10_02_budget_rejects_over_limit() {
-    let _db = setup_ontology_db();
-    // TODO: enforce hard budget and assert allocation over limit fails.
-    todo!("requires memory accounting API");
+    let accountant = MemoryAccountant::with_budget(128);
+    accountant
+        .try_allocate(96)
+        .expect("initial allocation should fit");
+
+    let err = accountant
+        .try_allocate(64)
+        .expect_err("allocation over remaining budget must fail");
+    match err {
+        Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            ..
+        } => {
+            assert_eq!(subsystem, "memory");
+            assert_eq!(operation, "allocate");
+            assert_eq!(requested_bytes, 64);
+            assert_eq!(available_bytes, 32);
+            assert_eq!(budget_limit_bytes, 128);
+        }
+        other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+    }
 }
 
 #[test]
-#[ignore = "requires memory accounting API"]
 fn a10_03_budget_release_frees_capacity() {
-    let _db = setup_ontology_db();
-    // TODO: allocate/release cycle then assert capacity restored.
-    todo!("requires memory accounting API");
+    let accountant = MemoryAccountant::with_budget(256);
+    accountant.try_allocate(200).expect("initial allocate");
+    accountant.release(160);
+
+    let usage = accountant.usage();
+    assert_eq!(usage.used, 40);
+    assert_eq!(usage.available, Some(216));
+
+    accountant
+        .try_allocate(200)
+        .expect("released capacity should be reusable");
+    assert_eq!(accountant.usage().used, 240);
 }
 
 #[test]
-#[ignore = "requires memory accounting API"]
 fn a10_04_bfs_aborts_on_frontier_overflow() {
-    let _db = setup_ontology_db();
-    // TODO: configure frontier budget and assert BFS stops with bounded-memory error path.
-    todo!("requires memory accounting API");
+    let accountant = Arc::new(MemoryAccountant::with_budget(4096));
+    let db = contextdb_engine::Database::open_memory_with_accountant(accountant);
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    for (id, name) in [(a, "A"), (b, "B")] {
+        let _ = db.execute(
+            "INSERT INTO nodes (id, name) VALUES ($id, $name)",
+            &make_params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text(name.to_string())),
+            ]),
+        );
+    }
+
+    let tx = db.begin();
+    let _ = db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new());
+    let _ = db.commit(tx);
+
+    let err = db
+        .execute(
+            "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->{1,3}(b) WHERE a.id = $start COLUMNS (b.id AS b_id))",
+            &make_params(vec![("start", Value::Uuid(a))]),
+        )
+        .expect_err("BFS should fail when frontier allocation exceeds budget");
+
+    match err {
+        Error::MemoryBudgetExceeded {
+            subsystem,
+            operation,
+            ..
+        } => {
+            assert_eq!(subsystem, "bfs_frontier");
+            assert_eq!(operation, "graph_bfs");
+        }
+        other => panic!("expected MemoryBudgetExceeded, got {other:?}"),
+    }
 }
 
 #[test]
-#[ignore = "requires memory accounting API"]
+#[ignore = "requires external RSS harness for deterministic process-memory assertion"]
 fn a10_05_peak_rss_within_2gb() {
     let _db = setup_ontology_db();
     todo!("run large persisted mixed workload and assert peak RSS <= 2GB");

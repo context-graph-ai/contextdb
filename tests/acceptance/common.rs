@@ -278,7 +278,10 @@ pub(crate) fn count_rows_from_file(db_path: &Path, table: &str) -> usize {
     count
 }
 
-pub(crate) fn try_count_rows_from_file(db_path: &Path, table: &str) -> Result<Option<usize>, Error> {
+pub(crate) fn try_count_rows_from_file(
+    db_path: &Path,
+    table: &str,
+) -> Result<Option<usize>, Error> {
     let db = Database::open(db_path)?;
     let count = match db.scan(table, db.snapshot()) {
         Ok(rows) => Some(rows.len()),
