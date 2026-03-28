@@ -2535,6 +2535,47 @@ fn a7_08b_graph_match_still_works() {
 }
 
 #[test]
+fn a7_10_graph_table_cte_chain_with_later_match_stays_graph_query() {
+    let db = contextdb_engine::Database::open_memory();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+
+    let tx = db.begin();
+    db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new())
+        .expect("insert edge a->b");
+    db.insert_edge(tx, b, c, "LINKS".to_string(), HashMap::new())
+        .expect("insert edge b->c");
+    db.commit(tx).expect("commit edges");
+
+    let result = db.execute(
+        "WITH first_hop AS (\
+            SELECT b_id FROM GRAPH_TABLE(\
+                edges MATCH (a)-[:LINKS]->(b) \
+                WHERE a.id = $start \
+                COLUMNS (b.id AS b_id)\
+            )\
+        ), second_hop AS (\
+            SELECT b_id FROM GRAPH_TABLE(\
+                edges MATCH (a)-[:LINKS]->(b) \
+                WHERE a.id IN (SELECT b_id FROM first_hop) \
+                COLUMNS (b.id AS b_id)\
+            )\
+        )\
+        SELECT b_id FROM second_hop",
+        &make_params(vec![("start", Value::Uuid(a))]),
+    );
+
+    assert!(
+        result.is_ok(),
+        "multi-CTE graph query should not be rejected as full-text search: {result:?}"
+    );
+    let result = result.expect("graph query should succeed");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Uuid(c));
+}
+
+#[test]
 fn a7_09_implicit_vector_coercion_rejected() {
     let db = setup_ontology_db();
     let result = db.execute(

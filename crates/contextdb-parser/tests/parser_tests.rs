@@ -824,6 +824,16 @@ fn rejection_full_text_match_operator() {
 }
 
 #[test]
+fn rejection_full_text_match_operator_with_cte_context() {
+    assert!(matches!(
+        parse(
+            "WITH baseline AS (SELECT id FROM entities) SELECT * FROM entities WHERE name MATCH 'foo'"
+        ),
+        Err(Error::FullTextSearchNotSupported)
+    ));
+}
+
+#[test]
 fn rejection_unbounded_vector_search() {
     assert!(matches!(
         parse("SELECT * FROM observations ORDER BY embedding <=> $q"),
