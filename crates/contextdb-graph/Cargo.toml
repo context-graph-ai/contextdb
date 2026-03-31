@@ -2,6 +2,10 @@
 name = "contextdb-graph"
 version = "0.2.0"
 edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Graph executor for contextdb — bounded BFS, DAG enforcement, typed edges"
 
 [dependencies]
 contextdb-core = { path = "../contextdb-core" }

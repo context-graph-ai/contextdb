@@ -2,6 +2,10 @@
 name = "contextdb-core"
 version = "0.2.0"
 edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types, traits, and error types for contextdb"
 
 [dependencies]
 uuid.workspace = true

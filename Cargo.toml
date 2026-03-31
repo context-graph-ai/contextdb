@@ -14,6 +14,12 @@ members = [
 ]
 default-members = ["crates/contextdb-engine", "crates/contextdb-cli", "crates/contextdb-server"]
 
+[workspace.package]
+authors = ["John Cyriac <lucidprogrammer@hotmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/context-graph-ai/contextdb"
+description = "Embedded database for agentic memory — relational, graph, and vector under unified MVCC transactions"
+
 [workspace.dependencies]
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }

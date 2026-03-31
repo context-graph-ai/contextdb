@@ -2,6 +2,10 @@
 name = "contextdb-vector"
 version = "0.2.0"
 edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vector executor for contextdb — cosine similarity, HNSW indexing, pre-filtered search"
 
 [dependencies]
 contextdb-core = { path = "../contextdb-core" }
