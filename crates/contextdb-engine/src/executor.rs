@@ -859,12 +859,22 @@ fn exec_insert(
 ) -> Result<QueryResult> {
     let txid = tx.ok_or_else(|| Error::Other("missing tx for insert".to_string()))?;
 
+    // When no column list is provided (INSERT INTO t VALUES (...)),
+    // infer column names from table metadata in declaration order.
+    let columns: Vec<String> = if p.columns.is_empty() {
+        let meta = db
+            .table_meta(&p.table)
+            .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+        meta.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        p.columns.clone()
+    };
+
     let mut rows_affected = 0;
     for row in &p.values {
         let mut values = HashMap::new();
         for (idx, expr) in row.iter().enumerate() {
-            let col = p
-                .columns
+            let col = columns
                 .get(idx)
                 .ok_or_else(|| Error::PlanError("column/value count mismatch".to_string()))?;
             let v = resolve_expr(expr, params)?;
@@ -1995,9 +2005,16 @@ fn lookup_query_result_column(
 ) -> Result<Value> {
     if let Some(table) = &column_ref.table {
         let qualified = format!("{table}.{}", column_ref.column);
+        // Prioritize qualified match (e.g., "e.id") over unqualified (e.g., "id")
+        // to avoid picking the wrong table's column in JOINs.
         let idx = input_columns
             .iter()
-            .position(|name| name == &qualified || name == &column_ref.column)
+            .position(|name| name == &qualified)
+            .or_else(|| {
+                input_columns
+                    .iter()
+                    .position(|name| name == &column_ref.column)
+            })
             .ok_or_else(|| Error::PlanError(format!("project column not found: {}", qualified)))?;
         return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
     }

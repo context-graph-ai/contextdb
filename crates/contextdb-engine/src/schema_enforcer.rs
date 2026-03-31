@@ -22,8 +22,15 @@ pub fn validate_dml(
                 .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
             let existing_rows = db.scan(&p.table, db.snapshot())?;
 
+            // When no column list is provided, infer from table metadata.
+            let columns: Vec<String> = if p.columns.is_empty() {
+                table_meta.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                p.columns.clone()
+            };
+
             // Validate that all INSERT columns exist in the table schema
-            for col_name in &p.columns {
+            for col_name in &columns {
                 if !table_meta.columns.iter().any(|c| c.name == *col_name) {
                     return Err(Error::Other(format!(
                         "column '{}' does not exist in table '{}'",
@@ -33,7 +40,7 @@ pub fn validate_dml(
             }
 
             if p.on_conflict.is_none()
-                && let Some(id_idx) = p.columns.iter().position(|c| c == "id")
+                && let Some(id_idx) = columns.iter().position(|c| c == "id")
             {
                 for row in &p.values {
                     let id_value = row
@@ -58,7 +65,7 @@ pub fn validate_dml(
                     .iter()
                     .filter(|column| !column.nullable && !column.primary_key)
                 {
-                    if let Some(index) = p.columns.iter().position(|name| name == &column.name) {
+                    if let Some(index) = columns.iter().position(|name| name == &column.name) {
                         let value = row
                             .get(index)
                             .ok_or_else(|| {
@@ -86,7 +93,7 @@ pub fn validate_dml(
                     .iter()
                     .filter(|column| column.unique && !column.primary_key)
                 {
-                    let Some(index) = p.columns.iter().position(|name| name == &column.name) else {
+                    let Some(index) = columns.iter().position(|name| name == &column.name) else {
                         continue;
                     };
                     let value = row

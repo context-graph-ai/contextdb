@@ -97,6 +97,7 @@ pub(crate) fn handle_meta_command(
                 ".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)"
             );
             println!(".sync policy default <p>  Set default conflict policy");
+            println!(".sync auto [on|off]       Toggle auto-sync after DML");
         }
         ".tables" | "\\dt" => {
             for t in db.table_names() {

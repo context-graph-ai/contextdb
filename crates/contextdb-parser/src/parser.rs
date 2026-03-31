@@ -233,14 +233,11 @@ fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
                     JoinType::Inner
                 });
             }
-            Rule::table_ref => {
-                if let FromItem::Table {
-                    name,
-                    alias: table_alias,
-                } = build_table_ref(p)?
-                {
-                    table = Some(name);
-                    alias = table_alias;
+            Rule::join_table_ref => {
+                let mut inner = p.into_inner();
+                table = Some(parse_identifier(inner.next().unwrap().as_str()));
+                if let Some(alias_pair) = inner.next() {
+                    alias = Some(parse_identifier(alias_pair.as_str()));
                 }
             }
             Rule::expr => on = Some(build_expr(p)?),

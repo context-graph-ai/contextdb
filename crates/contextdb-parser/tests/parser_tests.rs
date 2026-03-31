@@ -1362,3 +1362,19 @@ fn anti_string_scan_whitespace_variations() {
         );
     }
 }
+
+#[test]
+fn insert_without_column_list() {
+    let stmt =
+        parse("INSERT INTO test VALUES ('550e8400-e29b-41d4-a716-446655440000', 'hello')").unwrap();
+    let Statement::Insert(ins) = stmt else {
+        panic!("expected Insert");
+    };
+    assert_eq!(ins.table, "test");
+    assert!(
+        ins.columns.is_empty(),
+        "INSERT without column list should produce empty columns"
+    );
+    assert_eq!(ins.values.len(), 1);
+    assert_eq!(ins.values[0].len(), 2);
+}
