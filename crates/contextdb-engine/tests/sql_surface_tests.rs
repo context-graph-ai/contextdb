@@ -1827,3 +1827,290 @@ fn upd_03_update_embedding_changes_vector_recall_immediately() {
     assert_eq!(after.rows[0][0], Value::Uuid(id_b));
     assert_eq!(after.rows[1][0], Value::Uuid(id_a));
 }
+
+fn setup_cte_sensor_db() -> Database {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, status TEXT, reading REAL)",
+        &empty(),
+    )
+    .unwrap();
+
+    for (id, name, status, reading) in [
+        (
+            Uuid::from_u128(1),
+            "sensor-north",
+            "active",
+            Value::Float64(42.0),
+        ),
+        (
+            Uuid::from_u128(2),
+            "sensor-south",
+            "inactive",
+            Value::Float64(10.0),
+        ),
+        (
+            Uuid::from_u128(3),
+            "widget-east",
+            "active",
+            Value::Float64(99.0),
+        ),
+    ] {
+        db.execute(
+            "INSERT INTO sensors (id, name, status, reading) VALUES ($id, $name, $status, $reading)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("name", Value::Text(name.to_string())),
+                ("status", Value::Text(status.to_string())),
+                ("reading", reading),
+            ]),
+        )
+        .unwrap();
+    }
+
+    db
+}
+
+#[test]
+fn cte_01_outer_where_filters_cte_rows() {
+    let db = setup_cte_sensor_db();
+
+    let result = db
+        .execute(
+            "WITH active AS (SELECT id, name, reading FROM sensors WHERE status = 'active') \
+             SELECT id, name FROM active WHERE name LIKE 'sensor%'",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "outer WHERE on CTE should keep only sensor-prefixed active rows"
+    );
+    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
+    let names: Vec<_> = result
+        .rows
+        .iter()
+        .map(|row| row[name_idx].clone())
+        .collect();
+    assert_eq!(names, vec![Value::Text("sensor-north".to_string())]);
+    assert!(
+        !names.contains(&Value::Text("widget-east".to_string())),
+        "widget-east is active but should be filtered out by outer LIKE predicate"
+    );
+}
+
+#[test]
+fn cte_02_outer_where_comparison_filters_cte_rows() {
+    let db = setup_cte_sensor_db();
+
+    let result = db
+        .execute(
+            "WITH high AS (SELECT id, name, reading FROM sensors WHERE status = 'active') \
+             SELECT id, name, reading FROM high WHERE reading > 50.0",
+            &empty(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "outer WHERE on CTE should keep only rows above the reading threshold"
+    );
+    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
+    let reading_idx = result.columns.iter().position(|c| c == "reading").unwrap();
+    assert_eq!(
+        result.rows[0][name_idx],
+        Value::Text("widget-east".to_string())
+    );
+    assert_eq!(result.rows[0][reading_idx], Value::Float64(99.0));
+}
+
+#[test]
+fn dag_01_cycle_rejected_via_insert_sql() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE dependencies (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON')",
+        &empty(),
+    )
+    .unwrap();
+
+    let a = Uuid::from_u128(101);
+    let b = Uuid::from_u128(102);
+
+    db.execute(
+        "INSERT INTO dependencies (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(201))),
+            ("source", Value::Uuid(a)),
+            ("target", Value::Uuid(b)),
+            ("edge_type", Value::Text("DEPENDS_ON".to_string())),
+        ]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "INSERT INTO dependencies (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(202))),
+                ("source", Value::Uuid(b)),
+                ("target", Value::Uuid(a)),
+                ("edge_type", Value::Text("DEPENDS_ON".to_string())),
+            ]),
+        )
+        .unwrap_err();
+
+    assert!(
+        err.to_string().to_lowercase().contains("cycle"),
+        "expected cycle rejection on reverse insert, got {err}"
+    );
+}
+
+#[test]
+fn dag_02_self_loop_rejected_via_insert_sql() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE dependencies (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON')",
+        &empty(),
+    )
+    .unwrap();
+
+    let node = Uuid::from_u128(103);
+    let err = db
+        .execute(
+            "INSERT INTO dependencies (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, $edge_type)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(203))),
+                ("source", Value::Uuid(node)),
+                ("target", Value::Uuid(node)),
+                ("edge_type", Value::Text("DEPENDS_ON".to_string())),
+            ]),
+        )
+        .unwrap_err();
+
+    assert!(
+        err.to_string().to_lowercase().contains("cycle"),
+        "expected self-loop insert to be rejected as a cycle, got {err}"
+    );
+}
+
+#[test]
+fn prop_01_fk_propagate_fires_on_update() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [archived, completed])",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated, status TEXT) STATE MACHINE (status: active -> [invalidated, superseded])",
+        &empty(),
+    )
+    .unwrap();
+
+    let intention_id = Uuid::from_u128(301);
+    let decision_id = Uuid::from_u128(302);
+
+    db.execute(
+        "INSERT INTO intentions (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(intention_id)),
+            ("status", Value::Text("active".to_string())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, intention_id, status) VALUES ($id, $intention_id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(decision_id)),
+            ("intention_id", Value::Uuid(intention_id)),
+            ("status", Value::Text("active".to_string())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE intentions SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(intention_id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT status FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(decision_id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        result.rows[0][0],
+        Value::Text("invalidated".to_string()),
+        "child decision should be invalidated after parent UPDATE archives intention"
+    );
+}
+
+#[test]
+fn prop_02_fk_propagate_cascades_multiple_children() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: active -> [archived, completed])",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated, status TEXT) STATE MACHINE (status: active -> [invalidated, superseded])",
+        &empty(),
+    )
+    .unwrap();
+
+    let intention_id = Uuid::from_u128(401);
+    let decision_a = Uuid::from_u128(402);
+    let decision_b = Uuid::from_u128(403);
+
+    db.execute(
+        "INSERT INTO intentions (id, status) VALUES ($id, $status)",
+        &params(vec![
+            ("id", Value::Uuid(intention_id)),
+            ("status", Value::Text("active".to_string())),
+        ]),
+    )
+    .unwrap();
+
+    for decision_id in [decision_a, decision_b] {
+        db.execute(
+            "INSERT INTO decisions (id, intention_id, status) VALUES ($id, $intention_id, $status)",
+            &params(vec![
+                ("id", Value::Uuid(decision_id)),
+                ("intention_id", Value::Uuid(intention_id)),
+                ("status", Value::Text("active".to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+
+    db.execute(
+        "UPDATE intentions SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(intention_id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute("SELECT id, status FROM decisions ORDER BY id", &empty())
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
+    let status_idx = result.columns.iter().position(|c| c == "status").unwrap();
+
+    assert_eq!(result.rows[0][id_idx], Value::Uuid(decision_a));
+    assert_eq!(
+        result.rows[0][status_idx],
+        Value::Text("invalidated".to_string())
+    );
+    assert_eq!(result.rows[1][id_idx], Value::Uuid(decision_b));
+    assert_eq!(
+        result.rows[1][status_idx],
+        Value::Text("invalidated".to_string())
+    );
+}
