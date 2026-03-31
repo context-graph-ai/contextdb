@@ -909,7 +909,9 @@ fn exec_insert(
             }
         };
 
-        if p.table == "edges"
+        if db
+            .table_meta(&p.table)
+            .is_some_and(|table_meta| !table_meta.dag_edge_types.is_empty())
             && let (
                 Some(Value::Uuid(source)),
                 Some(Value::Uuid(target)),
@@ -1004,6 +1006,14 @@ fn exec_update(
             let value = eval_assignment_expr(vexpr, &row.values, params)?;
             values.insert(k.clone(), coerce_value_for_column(db, &p.table, k, value)?);
         }
+        let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
+        let new_state = db
+            .table_meta(&p.table)
+            .as_ref()
+            .and_then(|meta| meta.state_machine.as_ref())
+            .and_then(|sm| values.get(&sm.column))
+            .and_then(Value::as_text)
+            .map(std::borrow::ToOwned::to_owned);
 
         let old_has_vector = db.has_live_vector(row.row_id, snapshot);
         validate_vector_columns(db, &p.table, &values)?;
@@ -1037,6 +1047,13 @@ fn exec_update(
         };
         if let Some(vector) = new_vector
             && let Err(err) = db.insert_vector(txid, new_row_id, vector)
+        {
+            db.accountant().release(new_row_bytes);
+            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+            return Err(err);
+        }
+        if let Err(err) =
+            db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
         {
             db.accountant().release(new_row_bytes);
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);

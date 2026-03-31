@@ -752,6 +752,20 @@ impl Database {
             (row_uuid, new_state.as_deref(), meta.as_ref())
             && matches!(result, UpsertResult::Updated)
         {
+            self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
+        }
+
+        Ok(result)
+    }
+
+    pub(crate) fn propagate_state_change_if_needed(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_uuid: Option<uuid::Uuid>,
+        new_state: Option<&str>,
+    ) -> Result<()> {
+        if let (Some(uuid), Some(state)) = (row_uuid, new_state) {
             let already_propagating = self
                 .tx_mgr
                 .with_write_set(tx, |ws| ws.propagation_in_progress)?;
@@ -765,7 +779,7 @@ impl Database {
             }
         }
 
-        Ok(result)
+        Ok(())
     }
 
     fn propagate(

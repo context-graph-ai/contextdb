@@ -167,7 +167,16 @@ fn plan_select_body(
         match from_item {
             Some((from_table, from_alias)) => {
                 if let Some(cte_plan) = cte_env.get(&from_table) {
-                    cte_plan.clone()
+                    let mut cte_plan = cte_plan.clone();
+                    if body.joins.is_empty()
+                        && let Some(where_clause) = &body.where_clause
+                    {
+                        cte_plan = PhysicalPlan::Filter {
+                            input: Box::new(cte_plan),
+                            predicate: where_clause.clone(),
+                        };
+                    }
+                    cte_plan
                 } else {
                     PhysicalPlan::Scan {
                         table: from_table,
