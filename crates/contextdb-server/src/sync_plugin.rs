@@ -46,3 +46,27 @@ impl DatabasePlugin for SyncPlugin {
         // No-op: auto-push is driven from the REPL loop, not from the plugin hook.
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn sync_03_plugin_survives_poisoned_mutex() {
+        let (tx, _rx) = mpsc::channel(4);
+        let plugin = Arc::new(SyncPlugin::new(tx));
+        let poison_plugin = plugin.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_plugin.tx.lock().unwrap();
+            panic!("poison sync_plugin mutex");
+        })
+        .join();
+
+        let panic = std::panic::catch_unwind(|| plugin.notify_change());
+        assert!(
+            panic.is_ok(),
+            "notify_change should not panic on a poisoned sync plugin mutex"
+        );
+    }
+}

@@ -664,8 +664,96 @@ fn remap_pull_policies(policies: &ConflictPolicies) -> ConflictPolicies {
 mod tests {
     use super::*;
     use contextdb_core::Value;
+    use contextdb_engine::Database;
     use contextdb_engine::sync_types::{NaturalKey, RowChange, VectorChange};
+    use std::sync::Arc;
+    use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
     use uuid::Uuid;
+
+    struct NatsFixture {
+        _container: ContainerAsync<GenericImage>,
+        nats_url: String,
+    }
+
+    async fn start_nats() -> NatsFixture {
+        let nats_conf = format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"));
+
+        let image = GenericImage::new("nats", "latest")
+            .with_exposed_port(4222.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
+
+        let request = image
+            .with_mount(Mount::bind_mount(&nats_conf, "/etc/nats/nats.conf"))
+            .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
+
+        let container: ContainerAsync<GenericImage> = request.start().await.unwrap();
+        let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
+
+        NatsFixture {
+            _container: container,
+            nats_url: format!("nats://127.0.0.1:{nats_port}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_01_client_push_survives_poisoned_direction_lock() {
+        let nats = start_nats().await;
+        let client = Arc::new(SyncClient::new(
+            Arc::new(Database::open_memory()),
+            &nats.nats_url,
+            "sync-01",
+        ));
+
+        client.ensure_connected().await.expect("connect NATS");
+        let poison_client = client.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_client.table_directions.write().unwrap();
+            panic!("poison sync_client directions lock");
+        })
+        .join();
+
+        let join = tokio::spawn({
+            let client = client.clone();
+            async move { client.push().await }
+        })
+        .await;
+
+        assert!(
+            matches!(join, Ok(Err(Error::SyncError(_)))),
+            "push should return a sync error instead of panicking on poisoned table_directions, got {join:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_02_client_pull_default_survives_poisoned_policy_lock() {
+        let nats = start_nats().await;
+        let client = Arc::new(SyncClient::new(
+            Arc::new(Database::open_memory()),
+            &nats.nats_url,
+            "sync-02",
+        ));
+
+        client.ensure_connected().await.expect("connect NATS");
+        let poison_client = client.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_client.conflict_policies.write().unwrap();
+            panic!("poison sync_client policies lock");
+        })
+        .join();
+
+        let join = tokio::spawn({
+            let client = client.clone();
+            async move { client.pull_default().await }
+        })
+        .await;
+
+        assert!(
+            matches!(join, Ok(Err(Error::SyncError(_)))),
+            "pull_default should return a sync error instead of panicking on poisoned conflict_policies, got {join:?}"
+        );
+    }
 
     // A14: Batch splitting respects byte size limits
     #[test]
