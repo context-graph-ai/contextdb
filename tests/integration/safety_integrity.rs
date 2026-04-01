@@ -1,5 +1,9 @@
 use super::helpers::*;
 use contextdb_core::{Error, Value};
+use contextdb_engine::Database;
+use std::collections::HashMap;
+use tempfile::TempDir;
+use uuid::Uuid;
 
 #[test]
 fn si_02_invalidation_transitions() {
@@ -53,5 +57,35 @@ fn si_07_ignored_graph_crash_recovery() {}
 fn si_08_ignored_vector_crash_recovery() {}
 
 #[test]
-#[ignore = "requires memory accounting"]
-fn si_09_ignored_memory_accounting() {}
+fn si_09_reopen_preserves_configured_memory_limit() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("memory-limit.db");
+    let db = Database::open(&path).unwrap();
+    db.execute("SET MEMORY_LIMIT '1K'", &HashMap::new())
+        .unwrap();
+    db.close().unwrap();
+
+    let reopened = Database::open(&path).unwrap();
+    let show = reopened
+        .execute("SHOW MEMORY_LIMIT", &HashMap::new())
+        .unwrap();
+    assert_eq!(show.rows.len(), 1);
+    assert_eq!(show.rows[0][0], Value::Int64(1024));
+
+    let err = reopened
+        .execute(
+            "CREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)",
+            &HashMap::new(),
+        )
+        .and_then(|_| {
+            reopened.execute(
+                "INSERT INTO big (id, payload) VALUES ($id, $payload)",
+                &make_params(vec![
+                    ("id", Value::Uuid(Uuid::new_v4())),
+                    ("payload", Value::Text("x".repeat(4096))),
+                ]),
+            )
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::MemoryBudgetExceeded { .. }));
+}

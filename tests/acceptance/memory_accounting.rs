@@ -214,3 +214,48 @@ fn a_ma8_no_memory_limit_flag_works() {
         "SHOW MEMORY_LIMIT must report 'none' when no limit set: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A-MA9 — RED: file-backed MEMORY_LIMIT survives restart
+// ---------------------------------------------------------------------------
+#[test]
+fn a_ma9_memory_limit_survives_restart() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "a_ma9.db");
+
+    let configured = run_cli_script(
+        &db_path,
+        &[],
+        "SET MEMORY_LIMIT '1K'\nSHOW MEMORY_LIMIT\n.quit\n",
+    );
+    assert!(configured.status.success());
+    let configured_stdout = output_string(&configured.stdout);
+    assert!(
+        configured_stdout.contains("1024"),
+        "SHOW MEMORY_LIMIT must report the configured limit before restart: {configured_stdout}"
+    );
+
+    let reopened = run_cli_script(
+        &db_path,
+        &[],
+        &format!(
+            "SHOW MEMORY_LIMIT\nCREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)\nINSERT INTO big (id, payload) VALUES ('00000000-0000-0000-0000-000000000001', '{}')\n.quit\n",
+            "x".repeat(4096)
+        ),
+    );
+    assert!(
+        reopened.status.success(),
+        "CLI must stay alive across OOM errors"
+    );
+    let reopened_stdout = output_string(&reopened.stdout);
+    assert!(
+        reopened_stdout.contains("1024"),
+        "reopened database must still report the configured MEMORY_LIMIT: {reopened_stdout}"
+    );
+    assert!(
+        reopened_stdout
+            .to_lowercase()
+            .contains("memory budget exceeded"),
+        "reopened database must still enforce the persisted limit: {reopened_stdout}"
+    );
+}

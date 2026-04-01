@@ -4,10 +4,10 @@ use contextdb_core::{Direction, Error, Value, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Once;
+use std::sync::{Once, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -207,6 +207,50 @@ pub(crate) fn write_child_stdin(child: &mut Child, script: &str) {
         .expect("stdin pipe")
         .write_all(script.as_bytes())
         .expect("write child stdin");
+}
+
+pub(crate) fn wait_for_child_stdout_contains(
+    child: &mut Child,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let (tx, rx) = mpsc::channel();
+    let needle = needle.to_string();
+    let reader_needle = needle.clone();
+
+    thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut chunk = [0_u8; 1024];
+        let mut seen = Vec::new();
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => {
+                    let _ = tx.send(output_string(&seen));
+                    break;
+                }
+                Ok(read) => {
+                    seen.extend_from_slice(&chunk[..read]);
+                    let rendered = output_string(&seen);
+                    if rendered.contains(&reader_needle) {
+                        let _ = tx.send(rendered);
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(format!(
+                        "stdout read error: {err}; partial={}",
+                        output_string(&seen)
+                    ));
+                    break;
+                }
+            }
+        }
+    });
+
+    rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        panic!("timed out waiting for child stdout to contain {needle:?}");
+    })
 }
 
 pub(crate) async fn start_nats() -> NatsFixture {

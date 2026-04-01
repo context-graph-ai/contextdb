@@ -160,6 +160,9 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
         || stderr.contains("error")
         || stderr.contains("memory")
         || stderr.contains("limit");
+    let count = try_count_rows_from_file(&server_path, "big")
+        .expect("count rows from server db")
+        .unwrap_or(0);
 
     // Either the push succeeds cleanly and all rows arrive, or it fails clearly.
     if output.status.success() {
@@ -167,9 +170,6 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
             !reported_error,
             "successful push must not report an error; stdout={stdout}, stderr={stderr}"
         );
-        let count = try_count_rows_from_file(&server_path, "big")
-            .expect("count rows from server db")
-            .expect("successful push must materialize the big table");
         assert_eq!(
             count, 500,
             "successful push must persist all 500 rows, got {}",
@@ -180,5 +180,74 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
             reported_error,
             "failed push must report a clear error; stdout={stdout}, stderr={stderr}"
         );
+        assert_eq!(
+            count, 0,
+            "failed push must not leave partially visible rows on the server; got {}",
+            count
+        );
     }
+}
+
+/// The server restarted with a persisted low memory limit, and an oversized push still failed clearly without leaving visible partial state.
+#[tokio::test]
+async fn f16c_server_restart_preserves_constrained_memory_push_behavior() {
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f16c-edge.db");
+    let server_path = temp_db_file(&tmp, "f16c-server.db");
+    let nats = start_nats().await;
+
+    {
+        let db = contextdb_engine::Database::open(&server_path).expect("open server db");
+        db.execute("SET MEMORY_LIMIT '1M'", &std::collections::HashMap::new())
+            .expect("SET MEMORY_LIMIT");
+        db.close().expect("close");
+    }
+
+    let mut first_server = spawn_server(&server_path, "f16c", &nats.nats_url);
+    stop_child(&mut first_server);
+    let mut restarted_server = spawn_server(&server_path, "f16c", &nats.nats_url);
+
+    let mut script = String::from("CREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)\n");
+    for _ in 0..500 {
+        script.push_str(&format!(
+            "INSERT INTO big (id, payload) VALUES ('{}', '{}')\n",
+            uuid::Uuid::new_v4(),
+            "x".repeat(4000)
+        ));
+    }
+    script.push_str(".sync push\n.quit\n");
+
+    let output = run_cli_script_allow_startup_failure_with_timeout(
+        &edge_path,
+        &["--tenant-id", "f16c", "--nats-url", &nats.nats_url],
+        &script,
+        std::time::Duration::from_secs(30),
+    );
+    stop_child(&mut restarted_server);
+
+    let stdout = output_string(&output.stdout).to_lowercase();
+    let stderr = output_string(&output.stderr).to_lowercase();
+    let reported_error = stdout.contains("error")
+        || stdout.contains("memory")
+        || stdout.contains("limit")
+        || stderr.contains("error")
+        || stderr.contains("memory")
+        || stderr.contains("limit");
+    let count = try_count_rows_from_file(&server_path, "big")
+        .expect("count rows from server db")
+        .unwrap_or(0);
+
+    assert!(
+        !output.status.success(),
+        "restarted constrained server should reject oversized push; stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        reported_error,
+        "restart-preserved OOM path must report a clear error; stdout={stdout}, stderr={stderr}"
+    );
+    assert_eq!(
+        count, 0,
+        "failed oversized push after restart must not leave visible partial rows; got {}",
+        count
+    );
 }

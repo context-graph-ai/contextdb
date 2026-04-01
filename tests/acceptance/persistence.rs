@@ -78,7 +78,13 @@ fn f03_kill_9_during_idle_does_not_corrupt() {
         ));
     }
     write_child_stdin(&mut child, &script);
-    thread::sleep(Duration::from_millis(200));
+    write_child_stdin(&mut child, "SELECT count(*) FROM kill_test\n");
+    let barrier_output =
+        wait_for_child_stdout_contains(&mut child, "| 100", Duration::from_secs(10));
+    assert!(
+        barrier_output.contains("| 100"),
+        "CLI must report the 100-row commit barrier before the kill: {barrier_output}"
+    );
     stop_child(&mut child);
 
     let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM kill_test\n.quit\n");
