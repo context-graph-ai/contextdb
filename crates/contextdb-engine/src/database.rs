@@ -206,7 +206,7 @@ impl Database {
     fn open_loaded(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
-        accountant: Arc<MemoryAccountant>,
+        mut accountant: Arc<MemoryAccountant>,
     ) -> Result<Self> {
         let path = path.as_ref();
         let persistence = if path.exists() {
@@ -214,6 +214,11 @@ impl Database {
         } else {
             Arc::new(RedbPersistence::create(path)?)
         };
+        if accountant.usage().limit.is_none()
+            && let Some(limit) = persistence.load_config_value::<usize>("memory_limit")?
+        {
+            accountant = Arc::new(MemoryAccountant::with_budget(limit));
+        }
 
         let all_meta = persistence.load_all_table_meta()?;
 
@@ -249,8 +254,8 @@ impl Database {
         let max_lsn = max_lsn_across_all(&relational, &graph, &vector);
         relational.set_next_row_id(max_row_id.saturating_add(1));
 
-        let change_log = Arc::new(RwLock::new(Vec::new()));
-        let ddl_log = Arc::new(RwLock::new(Vec::new()));
+        let change_log = Arc::new(RwLock::new(persistence.load_change_log()?));
+        let ddl_log = Arc::new(RwLock::new(persistence.load_ddl_log()?));
         let composite = CompositeStore::new(
             relational.clone(),
             graph.clone(),
@@ -1346,6 +1351,16 @@ impl Database {
         if path.as_os_str() == ":memory:" {
             return Self::open_memory_with_plugin_and_accountant(plugin, accountant);
         }
+        let accountant = if let Some(limit) = persisted_memory_limit(path)? {
+            let usage = accountant.usage();
+            if usage.limit.is_none() && usage.startup_ceiling.is_none() {
+                Arc::new(MemoryAccountant::with_budget(limit))
+            } else {
+                accountant
+            }
+        } else {
+            accountant
+        };
         let db = Self::open_loaded(path, plugin, accountant)?;
         db.plugin.on_open()?;
         Ok(db)
@@ -1570,43 +1585,86 @@ impl Database {
     }
 
     pub(crate) fn log_create_table_ddl(&self, name: &str, meta: &TableMeta, lsn: u64) {
-        self.ddl_log
-            .write()
-            .push((lsn, ddl_change_from_meta(name, meta)));
+        let change = ddl_change_from_meta(name, meta);
+        self.ddl_log.write().push((lsn, change.clone()));
+        if let Some(persistence) = &self.persistence {
+            let _ = persistence.append_ddl_log(lsn, &change);
+        }
     }
 
     pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: u64) {
-        self.ddl_log.write().push((
-            lsn,
-            DdlChange::DropTable {
-                name: name.to_string(),
-            },
-        ));
+        let change = DdlChange::DropTable {
+            name: name.to_string(),
+        };
+        self.ddl_log.write().push((lsn, change.clone()));
+        if let Some(persistence) = &self.persistence {
+            let _ = persistence.append_ddl_log(lsn, &change);
+        }
     }
 
     pub(crate) fn log_alter_table_ddl(&self, name: &str, meta: &TableMeta, lsn: u64) {
-        self.ddl_log.write().push((
-            lsn,
-            DdlChange::AlterTable {
-                name: name.to_string(),
-                columns: meta
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.name.clone(),
-                            sql_type_for_meta_column(c, &meta.propagation_rules),
-                        )
-                    })
-                    .collect(),
-                constraints: create_table_constraints_from_meta(meta),
-            },
-        ));
+        let change = DdlChange::AlterTable {
+            name: name.to_string(),
+            columns: meta
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        sql_type_for_meta_column(c, &meta.propagation_rules),
+                    )
+                })
+                .collect(),
+            constraints: create_table_constraints_from_meta(meta),
+        };
+        self.ddl_log.write().push((lsn, change.clone()));
+        if let Some(persistence) = &self.persistence {
+            let _ = persistence.append_ddl_log(lsn, &change);
+        }
     }
 
     pub(crate) fn persist_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             persistence.flush_table_meta(name, meta)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_memory_limit(&self, limit: Option<usize>) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            match limit {
+                Some(limit) => persistence.flush_config_value("memory_limit", &limit)?,
+                None => persistence.remove_config_value("memory_limit")?,
+            }
+        }
+        Ok(())
+    }
+
+    pub fn persisted_sync_watermarks(&self, tenant_id: &str) -> Result<(u64, u64)> {
+        let Some(persistence) = &self.persistence else {
+            return Ok((0, 0));
+        };
+        let push = persistence
+            .load_config_value::<u64>(&format!("sync_push_watermark:{tenant_id}"))?
+            .unwrap_or(0);
+        let pull = persistence
+            .load_config_value::<u64>(&format!("sync_pull_watermark:{tenant_id}"))?
+            .unwrap_or(0);
+        Ok((push, pull))
+    }
+
+    pub fn persist_sync_push_watermark(&self, tenant_id: &str, watermark: u64) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .flush_config_value(&format!("sync_push_watermark:{tenant_id}"), &watermark)?;
+        }
+        Ok(())
+    }
+
+    pub fn persist_sync_pull_watermark(&self, tenant_id: &str, watermark: u64) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .flush_config_value(&format!("sync_pull_watermark:{tenant_id}"), &watermark)?;
         }
         Ok(())
     }
@@ -1643,6 +1701,7 @@ impl Database {
 
     /// Builds a complete snapshot of all live data as a ChangeSet.
     /// Used as fallback when change_log/ddl_log cannot serve a watermark.
+    #[allow(dead_code)]
     fn full_state_snapshot(&self) -> ChangeSet {
         let mut rows = Vec::new();
         let mut edges = Vec::new();
@@ -1741,6 +1800,188 @@ impl Database {
         }
     }
 
+    fn persisted_state_since(&self, since_lsn: u64) -> ChangeSet {
+        if since_lsn == 0 {
+            return self.full_state_snapshot();
+        }
+
+        let mut rows = Vec::new();
+        let mut edges = Vec::new();
+        let mut vectors = Vec::new();
+        let ddl = Vec::new();
+
+        let meta_guard = self.relational_store.table_meta.read();
+        let tables_guard = self.relational_store.tables.read();
+
+        let mut live_row_ids: HashSet<RowId> = HashSet::new();
+        for (table_name, table_rows) in tables_guard.iter() {
+            let meta = match meta_guard.get(table_name) {
+                Some(meta) => meta,
+                None => continue,
+            };
+            let key_col = meta.natural_key_column.clone().unwrap_or_else(|| {
+                if meta
+                    .columns
+                    .iter()
+                    .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
+                {
+                    "id".to_string()
+                } else {
+                    String::new()
+                }
+            });
+            if key_col.is_empty() {
+                continue;
+            }
+            for row in table_rows.iter().filter(|row| row.deleted_tx.is_none()) {
+                live_row_ids.insert(row.row_id);
+                if row.lsn <= since_lsn {
+                    continue;
+                }
+                let key_val = match row.values.get(&key_col) {
+                    Some(value) => value.clone(),
+                    None => continue,
+                };
+                rows.push(RowChange {
+                    table: table_name.clone(),
+                    natural_key: NaturalKey {
+                        column: key_col.clone(),
+                        value: key_val,
+                    },
+                    values: row.values.clone(),
+                    deleted: false,
+                    lsn: row.lsn,
+                });
+            }
+        }
+        drop(tables_guard);
+        drop(meta_guard);
+
+        let fwd = self.graph_store.forward_adj.read();
+        for entries in fwd.values() {
+            for entry in entries
+                .iter()
+                .filter(|entry| entry.deleted_tx.is_none() && entry.lsn > since_lsn)
+            {
+                edges.push(EdgeChange {
+                    source: entry.source,
+                    target: entry.target,
+                    edge_type: entry.edge_type.clone(),
+                    properties: entry.properties.clone(),
+                    lsn: entry.lsn,
+                });
+            }
+        }
+        drop(fwd);
+
+        let mut seen_vector_rows: HashSet<RowId> = HashSet::new();
+        let vecs = self.vector_store.vectors.read();
+        for entry in vecs
+            .iter()
+            .filter(|entry| entry.deleted_tx.is_none() && entry.lsn > since_lsn)
+        {
+            if !live_row_ids.contains(&entry.row_id) {
+                continue;
+            }
+            if !seen_vector_rows.insert(entry.row_id) {
+                continue;
+            }
+            vectors.push(VectorChange {
+                row_id: entry.row_id,
+                vector: entry.vector.clone(),
+                lsn: entry.lsn,
+            });
+        }
+        drop(vecs);
+
+        ChangeSet {
+            rows,
+            edges,
+            vectors,
+            ddl,
+        }
+    }
+
+    fn preflight_sync_apply_memory(
+        &self,
+        changes: &ChangeSet,
+        policies: &ConflictPolicies,
+    ) -> Result<()> {
+        let usage = self.accountant.usage();
+        let Some(limit) = usage.limit else {
+            return Ok(());
+        };
+        let available = usage.available.unwrap_or(limit);
+        let mut required = 0usize;
+
+        for row in &changes.rows {
+            if row.deleted || row.values.is_empty() {
+                continue;
+            }
+
+            let policy = policies
+                .per_table
+                .get(&row.table)
+                .copied()
+                .unwrap_or(policies.default);
+            let existing = self.point_lookup(
+                &row.table,
+                &row.natural_key.column,
+                &row.natural_key.value,
+                self.snapshot(),
+            )?;
+
+            if existing.is_some()
+                && matches!(
+                    policy,
+                    ConflictPolicy::InsertIfNotExists | ConflictPolicy::ServerWins
+                )
+            {
+                continue;
+            }
+
+            required = required.saturating_add(
+                self.table_meta(&row.table)
+                    .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                    .unwrap_or_else(|| estimate_row_value_bytes(&row.values)),
+            );
+        }
+
+        for edge in &changes.edges {
+            required = required.saturating_add(
+                96 + edge.edge_type.len().saturating_mul(16)
+                    + estimate_row_value_bytes(&edge.properties),
+            );
+        }
+
+        for vector in &changes.vectors {
+            if vector.vector.is_empty() {
+                continue;
+            }
+            required = required.saturating_add(
+                24 + vector
+                    .vector
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>()),
+            );
+        }
+
+        if required > available {
+            return Err(Error::MemoryBudgetExceeded {
+                subsystem: "sync".to_string(),
+                operation: "apply_changes".to_string(),
+                requested_bytes: required,
+                available_bytes: available,
+                budget_limit_bytes: limit,
+                hint:
+                    "Reduce sync batch size, split the push, or raise MEMORY_LIMIT on the server."
+                        .to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Extracts changes from this database since the given LSN.
     pub fn changes_since(&self, since_lsn: u64) -> ChangeSet {
         // Future watermark guard
@@ -1768,9 +2009,10 @@ impl Database {
             .all(|rows| rows.is_empty());
         let has_table_meta = !self.relational_store.table_meta.read().is_empty();
 
-        // If both logs are empty but stores have data → post-restart, fall back
+        // If both logs are empty but stores have data → post-restart, derive deltas from
+        // persisted row/edge/vector LSNs instead of replaying a full snapshot.
         if change_log_empty && ddl_log_empty && (has_table_data || has_table_meta) {
-            return self.full_state_snapshot();
+            return self.persisted_state_since(since_lsn);
         }
 
         // If logs have entries, check the minimum first-LSN across both covers since_lsn
@@ -1782,8 +2024,8 @@ impl Database {
         };
 
         if min_first_lsn.is_some_and(|min_lsn| min_lsn > since_lsn + 1) {
-            // Log doesn't cover since_lsn — fall back to snapshot
-            return self.full_state_snapshot();
+            // Log doesn't cover since_lsn — derive the delta from persisted state.
+            return self.persisted_state_since(since_lsn);
         }
 
         let mut rows = Vec::new();
@@ -1969,7 +2211,7 @@ impl Database {
         let mut vector_row_idx = 0usize;
         let mut failed_row_ids: HashSet<u64> = HashSet::new();
 
-        for ddl in changes.ddl {
+        for ddl in changes.ddl.clone() {
             match ddl {
                 DdlChange::CreateTable {
                     name,
@@ -2073,6 +2315,8 @@ impl Database {
                 }
             }
         }
+
+        self.preflight_sync_apply_memory(&changes, policies)?;
 
         for row in changes.rows {
             if row.values.is_empty() {
@@ -2190,6 +2434,9 @@ impl Database {
                             }
                         }
                         Err(err) => {
+                            if is_fatal_sync_apply_error(&err) {
+                                return Err(err);
+                            }
                             result.skipped_rows += 1;
                             if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
                                 failed_row_ids.insert(*remote_row_id);
@@ -2298,6 +2545,9 @@ impl Database {
                                 }
                             }
                             Err(err) => {
+                                if is_fatal_sync_apply_error(&err) {
+                                    return Err(err);
+                                }
                                 result.skipped_rows += 1;
                                 if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
                                     failed_row_ids.insert(*remote_row_id);
@@ -2334,6 +2584,9 @@ impl Database {
                             }
                         }
                         Err(err) => {
+                            if is_fatal_sync_apply_error(&err) {
+                                return Err(err);
+                            }
                             result.skipped_rows += 1;
                             if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
                                 failed_row_ids.insert(*remote_row_id);
@@ -2389,7 +2642,11 @@ impl Database {
                 if existing_vector_rows.contains(&local_row_id) {
                     continue;
                 }
-                let _ = self.insert_vector(tx, local_row_id, vector.vector);
+                if let Err(err) = self.insert_vector(tx, local_row_id, vector.vector)
+                    && is_fatal_sync_apply_error(&err)
+                {
+                    return Err(err);
+                }
             }
         }
 
@@ -2792,6 +3049,20 @@ fn max_lsn_across_all(
         .unwrap_or(0);
 
     relational_max.max(graph_max).max(vector_max)
+}
+
+fn persisted_memory_limit(path: &Path) -> Result<Option<usize>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let persistence = RedbPersistence::open(path)?;
+    let limit = persistence.load_config_value::<usize>("memory_limit")?;
+    persistence.close();
+    Ok(limit)
+}
+
+fn is_fatal_sync_apply_error(err: &Error) -> bool {
+    matches!(err, Error::MemoryBudgetExceeded { .. })
 }
 
 fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {

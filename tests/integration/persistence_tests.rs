@@ -600,7 +600,7 @@ fn p10_uncommitted_data_lost_after_crash() {
 }
 
 #[test]
-fn p11_change_log_is_ephemeral_after_reopen() {
+fn p11_change_log_survives_reopen() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("change-log.db");
     let db = Database::open(&path).unwrap();
@@ -618,7 +618,10 @@ fn p11_change_log_is_ephemeral_after_reopen() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    assert!(db2.change_log_since(0).is_empty());
+    assert!(
+        !db2.change_log_since(0).is_empty(),
+        "durable sync restart semantics require the change log after reopen"
+    );
 }
 
 #[test]

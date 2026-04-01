@@ -1,5 +1,26 @@
 use super::common::*;
+use contextdb_core::Value;
 use tempfile::TempDir;
+
+fn seed_edge_big_table(edge_path: &std::path::Path, rows: usize) {
+    let db = contextdb_engine::Database::open(edge_path).expect("open edge db");
+    db.execute(
+        "CREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)",
+        &std::collections::HashMap::new(),
+    )
+    .expect("create big table");
+    for _ in 0..rows {
+        db.execute(
+            "INSERT INTO big (id, payload) VALUES ($id, $payload)",
+            &std::collections::HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+                ("payload".to_string(), Value::Text("x".repeat(4000))),
+            ]),
+        )
+        .expect("seed edge row");
+    }
+    db.close().expect("close edge db");
+}
 
 /// I killed the server mid-push, and when I reopened the database it had either all the data or none — no partial corruption.
 #[tokio::test]
@@ -122,6 +143,7 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
     let edge_path = temp_db_file(&tmp, "f16-edge.db");
     let server_path = temp_db_file(&tmp, "f16-server.db");
     let nats = start_nats().await;
+    seed_edge_big_table(&edge_path, 500);
 
     // Pre-configure server DB with a tiny memory limit
     {
@@ -133,21 +155,10 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
 
     let mut server = spawn_server(&server_path, "f16", &nats.nats_url);
 
-    // Push 500 rows with large payloads to exceed 1MB
-    let mut script = String::from("CREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)\n");
-    for _ in 0..500 {
-        script.push_str(&format!(
-            "INSERT INTO big (id, payload) VALUES ('{}', '{}')\n",
-            uuid::Uuid::new_v4(),
-            "x".repeat(4000)
-        ));
-    }
-    script.push_str(".sync push\n.quit\n");
-
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
         &["--tenant-id", "f16", "--nats-url", &nats.nats_url],
-        &script,
+        ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );
     stop_child(&mut server);
@@ -195,6 +206,7 @@ async fn f16c_server_restart_preserves_constrained_memory_push_behavior() {
     let edge_path = temp_db_file(&tmp, "f16c-edge.db");
     let server_path = temp_db_file(&tmp, "f16c-server.db");
     let nats = start_nats().await;
+    seed_edge_big_table(&edge_path, 500);
 
     {
         let db = contextdb_engine::Database::open(&server_path).expect("open server db");
@@ -207,20 +219,10 @@ async fn f16c_server_restart_preserves_constrained_memory_push_behavior() {
     stop_child(&mut first_server);
     let mut restarted_server = spawn_server(&server_path, "f16c", &nats.nats_url);
 
-    let mut script = String::from("CREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)\n");
-    for _ in 0..500 {
-        script.push_str(&format!(
-            "INSERT INTO big (id, payload) VALUES ('{}', '{}')\n",
-            uuid::Uuid::new_v4(),
-            "x".repeat(4000)
-        ));
-    }
-    script.push_str(".sync push\n.quit\n");
-
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
         &["--tenant-id", "f16c", "--nats-url", &nats.nats_url],
-        &script,
+        ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );
     stop_child(&mut restarted_server);

@@ -166,14 +166,27 @@ impl SyncServer {
                     let request: PushRequest = rmp_serde::from_slice(&inner_envelope.payload)
                         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
 
-                    let result = self
+                    match self
                         .db
-                        .apply_changes(request.changeset.into(), &self.policies)?;
-                    let response = PushResponse {
-                        result: result.into(),
-                    };
-                    encode(MessageType::PushResponse, &response)
-                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))
+                        .apply_changes(request.changeset.into(), &self.policies)
+                    {
+                        Ok(result) => {
+                            let response = PushResponse {
+                                result: Some(result.into()),
+                                error: None,
+                            };
+                            encode(MessageType::PushResponse, &response)
+                                .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))
+                        }
+                        Err(err) => {
+                            let response = PushResponse {
+                                result: None,
+                                error: Some(err.to_string()),
+                            };
+                            encode(MessageType::PushResponse, &response)
+                                .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))
+                        }
+                    }
                 })();
 
                 match process_result {
@@ -197,11 +210,18 @@ impl SyncServer {
             MessageType::PushRequest => {
                 let request: PushRequest = rmp_serde::from_slice(&envelope.payload)
                     .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
-                let result = self
+                let response = match self
                     .db
-                    .apply_changes(request.changeset.into(), &self.policies)?;
-                let response = PushResponse {
-                    result: result.into(),
+                    .apply_changes(request.changeset.into(), &self.policies)
+                {
+                    Ok(result) => PushResponse {
+                        result: Some(result.into()),
+                        error: None,
+                    },
+                    Err(err) => PushResponse {
+                        result: None,
+                        error: Some(err.to_string()),
+                    },
                 };
                 let payload = encode(MessageType::PushResponse, &response)
                     .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;

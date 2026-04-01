@@ -4,11 +4,12 @@
 //! implementations are pending (all methods currently `unimplemented!()`).
 
 use contextdb_core::Value;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 /// A set of changes extracted from a database since a given LSN.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeSet {
     pub rows: Vec<RowChange>,
     pub edges: Vec<EdgeChange>,
@@ -54,7 +55,7 @@ impl ChangeSet {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowChange {
     pub table: String,
     pub natural_key: NaturalKey,
@@ -63,7 +64,7 @@ pub struct RowChange {
     pub lsn: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeChange {
     pub source: Uuid,
     pub target: Uuid,
@@ -72,14 +73,14 @@ pub struct EdgeChange {
     pub lsn: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorChange {
     pub row_id: u64,
     pub vector: Vec<f32>,
     pub lsn: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DdlChange {
     CreateTable {
         name: String,
@@ -96,13 +97,13 @@ pub enum DdlChange {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NaturalKey {
     pub column: String,
     pub value: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictPolicy {
     InsertIfNotExists,
     ServerWins,
@@ -110,7 +111,7 @@ pub enum ConflictPolicy {
     LatestWins,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictPolicies {
     pub per_table: HashMap<String, ConflictPolicy>,
     pub default: ConflictPolicy,
@@ -125,7 +126,7 @@ impl ConflictPolicies {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyResult {
     pub applied_rows: usize,
     pub skipped_rows: usize,
@@ -133,14 +134,14 @@ pub struct ApplyResult {
     pub new_lsn: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conflict {
     pub natural_key: NaturalKey,
     pub resolution: ConflictPolicy,
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncDirection {
     Push,
     Pull,

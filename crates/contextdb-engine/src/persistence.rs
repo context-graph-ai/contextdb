@@ -1,3 +1,5 @@
+use crate::composite_store::ChangeLogEntry;
+use crate::sync_types::DdlChange;
 use contextdb_core::{AdjEntry, Error, Result, TableMeta, VectorEntry, VersionedRow};
 use contextdb_tx::WriteSet;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
@@ -5,6 +7,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
+const CHANGE_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("change_log");
+const DDL_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ddl_log");
 const GRAPH_FWD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_fwd");
 const GRAPH_REV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_rev");
 const VECTORS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("vectors");
@@ -60,6 +65,10 @@ impl RedbPersistence {
     }
 
     pub fn flush_data(&self, ws: &WriteSet) -> Result<()> {
+        self.flush_data_with_logs(ws, &[])
+    }
+
+    pub fn flush_data_with_logs(&self, ws: &WriteSet, change_log: &[ChangeLogEntry]) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
 
@@ -178,6 +187,20 @@ impl RedbPersistence {
                 }
             }
 
+            if !change_log.is_empty() {
+                let mut table = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let lsn = ws.commit_lsn.unwrap_or(0);
+                for (index, entry) in change_log.iter().enumerate() {
+                    let key = Self::change_log_key(lsn, index);
+                    let encoded = Self::encode(entry)?;
+                    table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -211,6 +234,78 @@ impl RedbPersistence {
                 let key = Self::meta_key(name);
                 meta_table
                     .remove(key.as_str())
+                    .map_err(Self::storage_error)?;
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn flush_config_value<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let encoded = Self::encode(value)?;
+                config_table
+                    .insert(key, encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_config_value(&self, key: &str) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                config_table.remove(key).map_err(Self::storage_error)?;
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn append_change_log(&self, lsn: u64, entries: &[ChangeLogEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut table = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, entry) in entries.iter().enumerate() {
+                    let key = Self::change_log_key(lsn, index);
+                    let encoded = Self::encode(entry)?;
+                    table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn append_ddl_log(&self, lsn: u64, change: &DdlChange) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::ddl_log_key(lsn);
+                let encoded = Self::encode(change)?;
+                table
+                    .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
             }
             write_txn.commit().map_err(Self::storage_error)?;
@@ -325,6 +420,25 @@ impl RedbPersistence {
         })
     }
 
+    pub fn load_config_value<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let config_table = match read_txn.open_table(CONFIG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let value = match config_table.get(key).map_err(Self::storage_error)? {
+                Some(value) => Some(Self::decode(value.value())?),
+                None => None,
+            };
+            Ok(value)
+        })
+    }
+
     pub fn load_relational_table(&self, name: &str) -> Result<Vec<VersionedRow>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -380,6 +494,46 @@ impl RedbPersistence {
         })
     }
 
+    pub fn load_change_log(&self) -> Result<Vec<ChangeLogEntry>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read_txn.open_table(CHANGE_LOG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+
+            let mut entries = Vec::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (_, value) = entry.map_err(Self::storage_error)?;
+                entries.push(Self::decode(value.value())?);
+            }
+            Ok(entries)
+        })
+    }
+
+    pub fn load_ddl_log(&self) -> Result<Vec<(u64, DdlChange)>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read_txn.open_table(DDL_LOG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+
+            let mut entries = Vec::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                let lsn = key
+                    .value()
+                    .parse::<u64>()
+                    .map_err(|err| Error::Other(format!("invalid ddl log key: {err}")))?;
+                entries.push((lsn, Self::decode(value.value())?));
+            }
+            Ok(entries)
+        })
+    }
+
     fn load_graph_table(&self, definition: TableDefinition<&[u8], &[u8]>) -> Result<Vec<AdjEntry>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -404,6 +558,14 @@ impl RedbPersistence {
 
     fn meta_key(name: &str) -> String {
         format!("table:{name}")
+    }
+
+    fn change_log_key(lsn: u64, index: usize) -> String {
+        format!("{lsn:020}:{index:06}")
+    }
+
+    fn ddl_log_key(lsn: u64) -> String {
+        format!("{lsn:020}")
     }
 
     fn graph_fwd_key(entry: &AdjEntry) -> Vec<u8> {

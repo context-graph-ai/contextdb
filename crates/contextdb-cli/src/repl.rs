@@ -35,7 +35,16 @@ pub fn run(
                 }
                 let _ = rl.add_history_entry(line);
 
-                if line.starts_with('.') || line.starts_with('\\') {
+                if line.starts_with(".sync") || line.starts_with("\\sync") {
+                    let mut parts = line.splitn(2, ' ');
+                    let _cmd = parts.next();
+                    let rest = parts.next().unwrap_or("").trim();
+                    let outcome = run_sync_command(sync_client, rt, rest, sync_plugin);
+                    println!("{}", outcome.message);
+                    if !outcome.ok {
+                        had_error = true;
+                    }
+                } else if line.starts_with('.') || line.starts_with('\\') {
                     if !handle_meta_command(&db, sync_client, rt, line, sync_plugin) {
                         break;
                     }
@@ -67,6 +76,11 @@ pub fn run(
     }
 
     !had_error
+}
+
+struct SyncCommandOutcome {
+    message: String,
+    ok: bool,
 }
 
 pub(crate) fn handle_meta_command(
@@ -147,8 +161,20 @@ fn handle_sync_command(
     args: &str,
     sync_plugin: Option<&SyncPlugin>,
 ) -> String {
+    run_sync_command(sync_client, rt, args, sync_plugin).message
+}
+
+fn run_sync_command(
+    sync_client: Option<&SyncClient>,
+    rt: Option<&tokio::runtime::Runtime>,
+    args: &str,
+    sync_plugin: Option<&SyncPlugin>,
+) -> SyncCommandOutcome {
     let (Some(client), Some(rt)) = (sync_client, rt) else {
-        return "Sync not configured. Start with --tenant-id to enable.".to_string();
+        return SyncCommandOutcome {
+            message: "Sync not configured. Start with --tenant-id to enable.".to_string(),
+            ok: true,
+        };
     };
 
     let parts: Vec<&str> = args.split_whitespace().collect();
@@ -162,14 +188,17 @@ fn handle_sync_command(
             } else {
                 "unreachable"
             };
-            format!(
-                "Sync: tenant={}, url={}\nNATS: {status}\nDatabase LSN: {}\nPush watermark: LSN {}\nPull watermark: LSN {}",
-                client.tenant_id(),
-                client.nats_url(),
-                client.db().current_lsn(),
-                client.push_watermark(),
-                client.pull_watermark()
-            )
+            SyncCommandOutcome {
+                message: format!(
+                    "Sync: tenant={}, url={}\nNATS: {status}\nDatabase LSN: {}\nPush watermark: LSN {}\nPull watermark: LSN {}",
+                    client.tenant_id(),
+                    client.nats_url(),
+                    client.db().current_lsn(),
+                    client.push_watermark(),
+                    client.pull_watermark()
+                ),
+                ok: true,
+            }
         }
         "push" => match rt.block_on(client.push()) {
             Ok(result) => {
@@ -184,9 +213,15 @@ fn handle_sync_command(
                         msg.push_str(&format!("\n  conflict: {}", reason));
                     }
                 }
-                msg
+                SyncCommandOutcome {
+                    message: msg,
+                    ok: true,
+                }
             }
-            Err(e) => format!("Push failed: {e}"),
+            Err(e) => SyncCommandOutcome {
+                message: format!("Push failed: {e}"),
+                ok: false,
+            },
         },
         "pull" => match rt.block_on(client.pull_default()) {
             Ok(result) => {
@@ -201,22 +236,37 @@ fn handle_sync_command(
                         msg.push_str(&format!("\n  conflict: {}", reason));
                     }
                 }
-                msg
+                SyncCommandOutcome {
+                    message: msg,
+                    ok: true,
+                }
             }
-            Err(e) => format!("Pull failed: {e}"),
+            Err(e) => SyncCommandOutcome {
+                message: format!("Pull failed: {e}"),
+                ok: false,
+            },
         },
         "reconnect" => {
             rt.block_on(client.reconnect());
             let connected = rt.block_on(client.is_connected());
             if connected {
-                "Reconnected to NATS".to_string()
+                SyncCommandOutcome {
+                    message: "Reconnected to NATS".to_string(),
+                    ok: true,
+                }
             } else {
-                "Reconnection failed — NATS unreachable".to_string()
+                SyncCommandOutcome {
+                    message: "Reconnection failed — NATS unreachable".to_string(),
+                    ok: false,
+                }
             }
         }
         "direction" => {
             if parts.len() != 3 {
-                return "Usage: .sync direction <table> <Push|Pull|Both|None>".to_string();
+                return SyncCommandOutcome {
+                    message: "Usage: .sync direction <table> <Push|Pull|Both|None>".to_string(),
+                    ok: true,
+                };
             }
             let table = parts[1];
             let dir = match parts[2] {
@@ -225,15 +275,24 @@ fn handle_sync_command(
                 "Both" | "both" => SyncDirection::Both,
                 "None" | "none" => SyncDirection::None,
                 other => {
-                    return format!("Unknown direction: {other}. Use: Push, Pull, Both, None");
+                    return SyncCommandOutcome {
+                        message: format!("Unknown direction: {other}. Use: Push, Pull, Both, None"),
+                        ok: true,
+                    };
                 }
             };
             client.set_table_direction(table, dir);
-            format!("{table} -> {dir:?}")
+            SyncCommandOutcome {
+                message: format!("{table} -> {dir:?}"),
+                ok: true,
+            }
         }
         "policy" => {
             if parts.len() != 3 {
-                return "Usage: .sync policy <table> <InsertIfNotExists|ServerWins|EdgeWins|LatestWins>\n       .sync policy default <policy>".to_string();
+                return SyncCommandOutcome {
+                    message: "Usage: .sync policy <table> <InsertIfNotExists|ServerWins|EdgeWins|LatestWins>\n       .sync policy default <policy>".to_string(),
+                    ok: true,
+                };
             }
             let policy = match parts[2] {
                 "InsertIfNotExists" => ConflictPolicy::InsertIfNotExists,
@@ -241,43 +300,70 @@ fn handle_sync_command(
                 "EdgeWins" => ConflictPolicy::EdgeWins,
                 "LatestWins" => ConflictPolicy::LatestWins,
                 other => {
-                    return format!(
-                        "Unknown policy: {other}. Use: InsertIfNotExists, ServerWins, EdgeWins, LatestWins"
-                    );
+                    return SyncCommandOutcome {
+                        message: format!(
+                            "Unknown policy: {other}. Use: InsertIfNotExists, ServerWins, EdgeWins, LatestWins"
+                        ),
+                        ok: true,
+                    };
                 }
             };
             if parts[1] == "default" {
                 client.set_default_conflict_policy(policy);
-                format!("Default conflict policy -> {policy:?}")
+                SyncCommandOutcome {
+                    message: format!("Default conflict policy -> {policy:?}"),
+                    ok: true,
+                }
             } else {
                 client.set_conflict_policy(parts[1], policy);
-                format!("{} -> {policy:?}", parts[1])
+                SyncCommandOutcome {
+                    message: format!("{} -> {policy:?}", parts[1]),
+                    ok: true,
+                }
             }
         }
         "auto" => {
             let Some(plugin) = sync_plugin else {
-                return "Auto-sync not available (no sync plugin)".to_string();
+                return SyncCommandOutcome {
+                    message: "Auto-sync not available (no sync plugin)".to_string(),
+                    ok: true,
+                };
             };
             let toggle = parts.get(1).copied().unwrap_or("");
             match toggle {
                 "on" => {
                     plugin.set_auto(true);
-                    "Auto-sync enabled".to_string()
+                    SyncCommandOutcome {
+                        message: "Auto-sync enabled".to_string(),
+                        ok: true,
+                    }
                 }
                 "off" => {
                     plugin.set_auto(false);
-                    "Auto-sync disabled".to_string()
+                    SyncCommandOutcome {
+                        message: "Auto-sync disabled".to_string(),
+                        ok: true,
+                    }
                 }
                 "" => {
                     let state = if plugin.is_auto() { "on" } else { "off" };
-                    format!("Auto-sync: {state}")
+                    SyncCommandOutcome {
+                        message: format!("Auto-sync: {state}"),
+                        ok: true,
+                    }
                 }
-                other => format!("Unknown auto-sync option: {other}. Use: on, off"),
+                other => SyncCommandOutcome {
+                    message: format!("Unknown auto-sync option: {other}. Use: on, off"),
+                    ok: true,
+                },
             }
         }
-        _ => format!(
-            "Unknown sync command: {sub}. Try: status, push, pull, reconnect, direction, policy, auto"
-        ),
+        _ => SyncCommandOutcome {
+            message: format!(
+                "Unknown sync command: {sub}. Try: status, push, pull, reconnect, direction, policy, auto"
+            ),
+            ok: true,
+        },
     }
 }
 

@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Overall deadline for collecting all chunks in a chunked pull response.
-const CHUNK_COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
+const CHUNK_COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
 const PULL_PAGE_SIZE: u32 = 500;
 const MAX_BATCH_BYTES: usize = 800 * 1024;
 
@@ -40,13 +40,19 @@ impl SyncClient {
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
         );
+        let (push_watermark, pull_watermark) = db
+            .persisted_sync_watermarks(tenant_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(%tenant_id, error = %err, "failed to load persisted sync watermarks");
+                (0, 0)
+            });
         Self {
             db,
             nats: tokio::sync::Mutex::new(None),
             nats_url: nats_url.to_string(),
             tenant_id: tenant_id.to_string(),
-            push_watermark: AtomicU64::new(0),
-            pull_watermark: AtomicU64::new(0),
+            push_watermark: AtomicU64::new(push_watermark),
+            pull_watermark: AtomicU64::new(pull_watermark),
             table_directions: std::sync::RwLock::new(HashMap::new()),
             conflict_policies: std::sync::RwLock::new(ConflictPolicies {
                 per_table: HashMap::new(),
@@ -218,7 +224,13 @@ impl SyncClient {
                 let envelope = decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
                 let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
                     .map_err(|e| Error::SyncError(e.to_string()))?;
-                response.result.into()
+                if let Some(err) = response.error {
+                    return Err(Error::SyncError(err));
+                }
+                response
+                    .result
+                    .ok_or_else(|| Error::SyncError("push response missing result".to_string()))?
+                    .into()
             } else {
                 let mut push_result = None;
                 for attempt in 0..5u32 {
@@ -242,7 +254,17 @@ impl SyncClient {
                             let response: PushResponse =
                                 rmp_serde::from_slice(&envelope.payload)
                                     .map_err(|e| Error::SyncError(e.to_string()))?;
-                            push_result = Some(response.result.into());
+                            if let Some(err) = response.error {
+                                return Err(Error::SyncError(err));
+                            }
+                            push_result = Some(
+                                response
+                                    .result
+                                    .ok_or_else(|| {
+                                        Error::SyncError("push response missing result".to_string())
+                                    })?
+                                    .into(),
+                            );
                             break;
                         }
                         Ok(Err(e)) => {
@@ -277,6 +299,9 @@ impl SyncClient {
 
         self.push_watermark
             .store(last_successful_lsn, Ordering::SeqCst);
+        self.db
+            .persist_sync_push_watermark(&self.tenant_id, last_successful_lsn)
+            .map_err(|err| Error::SyncError(err.to_string()))?;
         Ok(total)
     }
 
@@ -453,6 +478,9 @@ impl SyncClient {
         }
 
         self.pull_watermark.store(last_server_lsn, Ordering::SeqCst);
+        self.db
+            .persist_sync_pull_watermark(&self.tenant_id, last_server_lsn)
+            .map_err(|err| Error::SyncError(err.to_string()))?;
         Ok(total)
     }
 

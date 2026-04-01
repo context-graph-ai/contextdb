@@ -675,6 +675,7 @@ pub(crate) fn execute_plan(
                 SetMemoryLimitValue::None => None,
             };
             db.accountant().set_budget(limit)?;
+            db.persist_memory_limit(limit)?;
             Ok(QueryResult::empty())
         }
         PhysicalPlan::ShowMemoryLimit => {

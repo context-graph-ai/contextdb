@@ -5,9 +5,10 @@ use contextdb_relational::RelationalStore;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
 use contextdb_vector::VectorStore;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChangeLogEntry {
     RowInsert {
         table: TableName,
@@ -79,10 +80,8 @@ impl CompositeStore {
             ddl_log,
         }
     }
-}
 
-impl WriteSetApplicator for CompositeStore {
-    fn apply(&self, ws: WriteSet) -> Result<()> {
+    pub(crate) fn build_change_log_entries(&self, ws: &WriteSet) -> Vec<ChangeLogEntry> {
         let lsn = ws.commit_lsn.unwrap_or(0);
         let mut log_entries = Vec::new();
 
@@ -151,6 +150,14 @@ impl WriteSetApplicator for CompositeStore {
                 lsn,
             });
         }
+
+        log_entries
+    }
+}
+
+impl WriteSetApplicator for CompositeStore {
+    fn apply(&self, ws: WriteSet) -> Result<()> {
+        let log_entries = self.build_change_log_entries(&ws);
 
         self.relational.apply_inserts(ws.relational_inserts);
         self.relational.apply_deletes(ws.relational_deletes);

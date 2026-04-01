@@ -32,7 +32,8 @@ pub struct PushRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushResponse {
-    pub result: WireApplyResult,
+    pub result: Option<WireApplyResult>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
