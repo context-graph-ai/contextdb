@@ -24,8 +24,12 @@ fn mem_01_set_budget_none_concurrent_allocate() {
         let allocator = thread::spawn(move || {
             alloc_barrier.wait();
             let mut failures = 0usize;
+            let mut observed_unbounded = false;
             for _ in 0..20_000 {
-                if alloc_acc.try_allocate(1).is_err() {
+                if alloc_acc.usage().limit.is_none() {
+                    observed_unbounded = true;
+                }
+                if observed_unbounded && alloc_acc.try_allocate(1).is_err() {
                     failures += 1;
                 }
             }

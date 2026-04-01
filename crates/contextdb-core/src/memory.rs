@@ -53,6 +53,9 @@ impl MemoryAccountant {
             if limit != 0 {
                 let available = limit.saturating_sub(used);
                 if bytes > available {
+                    if self.limit.load(Ordering::SeqCst) != limit {
+                        continue;
+                    }
                     return Err(crate::Error::MemoryBudgetExceeded {
                         subsystem: "memory".to_string(),
                         operation: "allocate".to_string(),
