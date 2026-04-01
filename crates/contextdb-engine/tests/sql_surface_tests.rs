@@ -2432,3 +2432,207 @@ fn prop_02_fk_propagate_cascades_multiple_children() {
         Value::Text("invalidated".to_string())
     );
 }
+
+#[test]
+fn sql_09_vector_text_coercion() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id_a = Uuid::from_u128(9001);
+    let id_b = Uuid::from_u128(9002);
+
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id_a)),
+            ("embedding", Value::Vector(vec![0.1, 0.2, 0.3])),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[0.4, 0.5, 0.6]')",
+        &params(vec![("id", Value::Uuid(id_b))]),
+    )
+    .unwrap();
+
+    let rows = db
+        .execute("SELECT id, embedding FROM docs ORDER BY id", &empty())
+        .unwrap();
+    let id_idx = rows.columns.iter().position(|c| c == "id").unwrap();
+    let embedding_idx = rows.columns.iter().position(|c| c == "embedding").unwrap();
+
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(rows.rows[0][id_idx], Value::Uuid(id_a));
+    assert!(matches!(rows.rows[0][embedding_idx], Value::Vector(_)));
+    assert_eq!(rows.rows[1][id_idx], Value::Uuid(id_b));
+    assert!(
+        matches!(rows.rows[1][embedding_idx], Value::Vector(_)),
+        "quoted vector literal should be coerced to Value::Vector, got {:?}",
+        rows.rows[1][embedding_idx]
+    );
+
+    let search = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![("query", Value::Vector(vec![0.4, 0.5, 0.6]))]),
+        )
+        .unwrap();
+    let search_id_idx = search.columns.iter().position(|c| c == "id").unwrap();
+    let ids: Vec<Value> = search
+        .rows
+        .iter()
+        .map(|r| r[search_id_idx].clone())
+        .collect();
+    assert!(ids.contains(&Value::Uuid(id_a)));
+    assert!(ids.contains(&Value::Uuid(id_b)));
+}
+
+#[test]
+fn sql_10_edge_dedup_no_relational_leak() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let source = Uuid::from_u128(9101);
+    let target = Uuid::from_u128(9102);
+
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, 'CITES')",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(9103))),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+        ]),
+    )
+    .unwrap();
+
+    let second = db
+        .execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, 'CITES')",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(9104))),
+                ("source", Value::Uuid(source)),
+                ("target", Value::Uuid(target)),
+            ]),
+        )
+        .unwrap();
+
+    let count = db
+        .execute(
+            "SELECT COUNT(*) FROM edges WHERE source_id = $source AND target_id = $target AND edge_type = 'CITES'",
+            &params(vec![
+                ("source", Value::Uuid(source)),
+                ("target", Value::Uuid(target)),
+            ]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        count.rows[0][0],
+        Value::Int64(1),
+        "duplicate logical edge should not leave a second relational row"
+    );
+    assert_eq!(
+        second.rows_affected, 0,
+        "deduped second edge insert should report zero affected rows"
+    );
+}
+
+#[test]
+fn sql_11_upsert_set_clause_values() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE kv (id UUID PRIMARY KEY, val TEXT)", &empty())
+        .unwrap();
+
+    let id = Uuid::from_u128(9201);
+    db.execute(
+        "INSERT INTO kv (id, val) VALUES ($id, 'original')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO kv (id, val) VALUES ($id, 'from-insert') ON CONFLICT (id) DO UPDATE SET val = 'from-update'",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let out = db
+        .execute(
+            "SELECT val FROM kv WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(
+        out.rows[0][0],
+        Value::Text("from-update".to_string()),
+        "upsert should apply SET clause values, not the INSERT value map"
+    );
+}
+
+#[test]
+fn sql_12_not_between() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE scores (id UUID PRIMARY KEY, val REAL)",
+        &empty(),
+    )
+    .unwrap();
+
+    for (id, val) in [
+        (Uuid::from_u128(9301), 0.1_f64),
+        (Uuid::from_u128(9302), 0.5_f64),
+        (Uuid::from_u128(9303), 0.9_f64),
+    ] {
+        db.execute(
+            "INSERT INTO scores (id, val) VALUES ($id, $val)",
+            &params(vec![("id", Value::Uuid(id)), ("val", Value::Float64(val))]),
+        )
+        .unwrap();
+    }
+
+    let out = db
+        .execute(
+            "SELECT val FROM scores WHERE val NOT BETWEEN 0.3 AND 0.7 ORDER BY val",
+            &empty(),
+        )
+        .unwrap();
+
+    let vals: Vec<Value> = out.rows.into_iter().map(|r| r[0].clone()).collect();
+    assert_eq!(vals, vec![Value::Float64(0.1), Value::Float64(0.9)]);
+}
+
+#[test]
+fn sql_13_null_in_nullable_uuid() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE refs (id UUID PRIMARY KEY, parent_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::from_u128(9401);
+    db.execute(
+        "INSERT INTO refs (id, parent_id) VALUES ($id, NULL)",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let out = db
+        .execute(
+            "SELECT parent_id FROM refs WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][0], Value::Null);
+}
