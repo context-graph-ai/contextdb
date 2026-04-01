@@ -22,7 +22,7 @@ async fn start_nats() -> NatsFixture {
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
 
     let request = image
-        .with_mount(Mount::bind_mount(&nats_conf, "/etc/nats/nats.conf"))
+        .with_mount(Mount::bind_mount(nats_conf, "/etc/nats/nats.conf"))
         .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
 
     let container: ContainerAsync<GenericImage> = request.start().await.unwrap();
@@ -34,6 +34,64 @@ async fn start_nats() -> NatsFixture {
         _container: container,
         nats_url: format!("nats://127.0.0.1:{nats_port}"),
         ws_url: format!("ws://127.0.0.1:{ws_port}"),
+    }
+}
+
+struct RestrictedNatsFixture {
+    _container: ContainerAsync<GenericImage>,
+    _config_dir: tempfile::TempDir,
+    nats_url: String,
+}
+
+async fn start_restricted_nats() -> RestrictedNatsFixture {
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let nats_conf = config_dir.path().join("nats.conf");
+    std::fs::write(
+        &nats_conf,
+        r#"
+max_payload: 1048576
+
+authorization {
+  users = [
+    {
+      user: "sync"
+      password: "sync"
+      permissions: {
+        subscribe: {
+          deny: ["sync.>"]
+        }
+      }
+    }
+  ]
+}
+
+websocket {
+  port: 9222
+  no_tls: true
+}
+"#,
+    )
+    .unwrap();
+
+    let image = GenericImage::new("nats", "latest")
+        .with_exposed_port(4222.tcp())
+        .with_exposed_port(9222.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
+
+    let request = image
+        .with_mount(Mount::bind_mount(
+            nats_conf.to_string_lossy().into_owned(),
+            "/etc/nats/nats.conf",
+        ))
+        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
+
+    let container: ContainerAsync<GenericImage> = request.start().await.unwrap();
+    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
+
+    RestrictedNatsFixture {
+        _container: container,
+        _config_dir: config_dir,
+        nats_url: format!("nats://sync:sync@127.0.0.1:{nats_port}"),
     }
 }
 
@@ -54,6 +112,33 @@ async fn sync_round_trip_smoke() {
 
     let client = SyncClient::new(edge, &nats.nats_url, "test_tenant");
     let _ = client.pull(&policies).await;
+}
+
+/// I connected the sync server to a NATS account that denies its sync subscriptions,
+/// and the server task stayed alive instead of panicking during bootstrap.
+#[tokio::test]
+async fn sync_00_server_bootstrap_survives_permission_denied_subscribe() {
+    let nats = start_restricted_nats().await;
+    let server_db = Arc::new(Database::open_memory());
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let server = Arc::new(SyncServer::new(
+        server_db,
+        &nats.nats_url,
+        "bootstrap-denied",
+        policies,
+    ));
+    let server_handle = server.clone();
+    let handle = tokio::spawn(async move { server_handle.run().await });
+
+    for _ in 0..10 {
+        if handle.is_finished() {
+            panic!("sync server finished early while bootstrap subscriptions were denied");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    handle.abort();
+    let _ = handle.await;
 }
 
 // A1: Lazy connection and reuse

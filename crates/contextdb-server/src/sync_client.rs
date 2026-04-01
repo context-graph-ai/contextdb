@@ -881,7 +881,9 @@ mod tests {
         // Each batch's serialized size must be under 800KB
         for (i, batch) in batches.iter().enumerate() {
             let wire = WireChangeSet::from(batch.clone());
-            let size = rmp_serde::to_vec(&wire).unwrap().len();
+            let size = rmp_serde::to_vec(&wire)
+                .expect("a14 batch should serialize for byte-size accounting")
+                .len();
             assert!(
                 size <= 800 * 1024,
                 "batch {} serialized to {} bytes, exceeds 800KB limit",
@@ -943,7 +945,9 @@ mod tests {
         );
         for (i, batch) in batches.iter().enumerate() {
             let wire = WireChangeSet::from(batch.clone());
-            let size = rmp_serde::to_vec(&wire).unwrap().len();
+            let size = rmp_serde::to_vec(&wire)
+                .expect("a14b batch should serialize for byte-size accounting")
+                .len();
             assert!(
                 size <= 800 * 1024,
                 "batch {} serialized to {} bytes, exceeds 800KB limit",
