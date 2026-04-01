@@ -326,7 +326,7 @@ Sync is bidirectional, per-table configurable:
 
 ```sql
 -- This table only pushes (observations flow up, never down)
-ALTER TABLE observations SET SYNC_CONFLICT_POLICY 'InsertIfNotExists'
+ALTER TABLE observations SET SYNC_CONFLICT_POLICY 'insert_if_not_exists'
 ```
 
 ```
@@ -370,7 +370,7 @@ CREATE TABLE observations (
   id UUID PRIMARY KEY,
   data JSON,
   embedding VECTOR(384)
-) IMMUTABLE RETAIN 30 DAYS SYNC SAFE
+) RETAIN 30 DAYS SYNC SAFE
 ```
 
 The background pruning loop handles cleanup. `SYNC SAFE` ensures no data is lost before it reaches the server.
@@ -677,13 +677,12 @@ CREATE TABLE edit_log (
   editor TEXT NOT NULL,
   diff JSON,
   edited_at TIMESTAMP DEFAULT NOW()
-) IMMUTABLE RETAIN 365 DAYS
+) RETAIN 365 DAYS
 ```
 
 Same enforceable policies, completely different domain:
 - `STATE MACHINE` enforces the editorial workflow — no application code can jump from draft to published
 - `DAG` prevents circular category hierarchies — no insert can create a cycle
-- `IMMUTABLE` ensures edit history can't be rewritten — no UPDATE or DELETE succeeds
 - `RETAIN` expires old edit logs after a year — no external cron job needed
 - `PROPAGATE ON STATE archived EXCLUDE VECTOR` removes archived articles from similarity search — no manual cleanup
 
@@ -720,7 +719,7 @@ CREATE TABLE entities (
   properties JSON
 )
 
--- What happened (immutable facts)
+-- What happened (append-only facts, auto-expire after 90 days)
 CREATE TABLE observations (
   id UUID PRIMARY KEY,
   observation_type TEXT NOT NULL,
@@ -729,7 +728,7 @@ CREATE TABLE observations (
   source TEXT NOT NULL,
   embedding VECTOR(384),
   recorded_at TIMESTAMP DEFAULT NOW()
-) IMMUTABLE RETAIN 90 DAYS SYNC SAFE
+) RETAIN 90 DAYS SYNC SAFE
 
 -- Reusable intent templates
 CREATE TABLE blueprints (

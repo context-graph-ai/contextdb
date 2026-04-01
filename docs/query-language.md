@@ -8,7 +8,7 @@ contextdb's query language is built on three standards:
 
 On top of these, contextdb adds **declarative constraints for agentic memory workloads**: `IMMUTABLE`, `STATE MACHINE`, `DAG`, `RETAIN`, and `PROPAGATE`. These are contextdb-specific extensions — everything else should feel familiar if you've used PostgreSQL.
 
-All examples work in the Rust API via `db.execute(sql, &params)` where parameters are passed as `HashMap<String, Value>`. The CLI REPL does not support parameter binding (`$param`) — use literal values directly. Vector search examples that use `$query` parameters are Rust-API-only and cannot be run from the CLI.
+All examples work in the Rust API via `db.execute(sql, &params)` where parameters are passed as `HashMap<String, Value>`. The CLI REPL does not support parameter binding (`$param`) — use literal values directly. Vector search works in the CLI using vector literals: `ORDER BY embedding <=> [0.1, 0.2, 0.3] LIMIT 5`.
 
 ---
 
@@ -35,7 +35,7 @@ ALTER TABLE t DROP [COLUMN] col
 ALTER TABLE t RENAME COLUMN old TO new
 ALTER TABLE t SET RETAIN 7 DAYS [SYNC SAFE]
 ALTER TABLE t DROP RETAIN
-ALTER TABLE t SET SYNC_CONFLICT_POLICY 'LatestWins'
+ALTER TABLE t SET SYNC_CONFLICT_POLICY 'latest_wins'
 ALTER TABLE t DROP SYNC_CONFLICT_POLICY
 ```
 
@@ -107,9 +107,9 @@ ROLLBACK
 ### Configuration
 
 ```sql
-SET SYNC_CONFLICT_POLICY = 'latest_wins'
+SET SYNC_CONFLICT_POLICY 'latest_wins'
 SHOW SYNC_CONFLICT_POLICY
-SET MEMORY_LIMIT = '512M'
+SET MEMORY_LIMIT '512M'
 SHOW MEMORY_LIMIT
 ```
 
@@ -396,11 +396,11 @@ MATCH (a)-[]->(b)
 -- Between 1 and 3 hops
 MATCH (a)-[:DEPENDS_ON]->{1,3}(b)
 
--- 1 or more hops
-MATCH (a)-[:EDGE]->{1,}(b)
+-- 1 to 10 hops (explicit upper bound required)
+MATCH (a)-[:EDGE]->{1,10}(b)
 ```
 
-Maximum traversal depth enforced by the engine is 10.
+An explicit upper bound is always required. Maximum traversal depth enforced by the engine is 10.
 
 ### Filtering and Projection
 
@@ -428,7 +428,7 @@ WITH deps AS (
     COLUMNS (b.id AS b_id)
   )
 )
-SELECT d.* FROM decisions d
+SELECT d.id, d.status FROM decisions d
 INNER JOIN deps ON d.id = deps.b_id
 WHERE d.status = 'active'
 ```
@@ -465,8 +465,14 @@ LIMIT 5
 Cosine distance between two vectors. Used in ORDER BY for nearest-neighbor search:
 
 ```sql
+-- Rust API with parameter binding
 SELECT id, data FROM observations
 ORDER BY embedding <=> $query_vector
+LIMIT 10
+
+-- CLI with vector literal
+SELECT id, data FROM observations
+ORDER BY embedding <=> [0.1, 0.2, 0.3]
 LIMIT 10
 ```
 
