@@ -56,15 +56,19 @@ impl SyncServer {
             }
         };
 
-        let mut push_sub = client
-            .subscribe(push_subject(&self.tenant_id))
-            .await
-            .expect("subscribe push");
-        let mut pull_sub = client
-            .subscribe(pull_subject(&self.tenant_id))
-            .await
-            .expect("subscribe pull");
-        client.flush().await.expect("flush subscriptions");
+        let (mut push_sub, mut pull_sub) = loop {
+            match self.bootstrap_subscriptions(&client).await {
+                Ok(subscriptions) => break subscriptions,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        tenant_id = %self.tenant_id,
+                        "sync server bootstrap failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        };
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
@@ -97,6 +101,25 @@ impl SyncServer {
                 }
             }
         }
+    }
+
+    async fn bootstrap_subscriptions(
+        &self,
+        client: &async_nats::Client,
+    ) -> contextdb_core::Result<(async_nats::Subscriber, async_nats::Subscriber)> {
+        let push_sub = client
+            .subscribe(push_subject(&self.tenant_id))
+            .await
+            .map_err(|e| contextdb_core::Error::SyncError(format!("subscribe push: {e}")))?;
+        let pull_sub = client
+            .subscribe(pull_subject(&self.tenant_id))
+            .await
+            .map_err(|e| contextdb_core::Error::SyncError(format!("subscribe pull: {e}")))?;
+        client
+            .flush()
+            .await
+            .map_err(|e| contextdb_core::Error::SyncError(format!("flush subscriptions: {e}")))?;
+        Ok((push_sub, pull_sub))
     }
 
     async fn handle_push(
