@@ -1,6 +1,9 @@
 use contextdb_core::Value;
 use contextdb_engine::Database;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -2431,6 +2434,357 @@ fn prop_02_fk_propagate_cascades_multiple_children() {
         result.rows[1][status_idx],
         Value::Text("invalidated".to_string())
     );
+}
+
+fn ddl_name(change: &contextdb_engine::sync_types::DdlChange) -> String {
+    match change {
+        contextdb_engine::sync_types::DdlChange::CreateTable { name, .. }
+        | contextdb_engine::sync_types::DdlChange::DropTable { name }
+        | contextdb_engine::sync_types::DdlChange::AlterTable { name, .. } => name.clone(),
+    }
+}
+
+fn max_non_ddl_lsn(changes: &contextdb_engine::sync_types::ChangeSet) -> Option<u64> {
+    let row_max = changes.rows.iter().map(|r| r.lsn).max();
+    let edge_max = changes.edges.iter().map(|e| e.lsn).max();
+    let vector_max = changes.vectors.iter().map(|v| v.lsn).max();
+    row_max.into_iter().chain(edge_max).chain(vector_max).max()
+}
+
+#[test]
+fn sql_15_ddl_dml_lsn_causal_ordering() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let workers = 4;
+    let iterations = 40;
+    let barrier = Arc::new(Barrier::new(workers + 1));
+    let done = Arc::new(AtomicBool::new(false));
+    let expected_tables = Arc::new(Mutex::new(Vec::<String>::new()));
+    let poller_expected = expected_tables.clone();
+    let poller_db = db.clone();
+    let poller_done = done.clone();
+    let poller_barrier = barrier.clone();
+
+    let poller = thread::spawn(move || {
+        let mut watermark = 0_u64;
+        let mut seen_creates = std::collections::HashSet::new();
+        let mut row_before_create = Vec::new();
+        let mut idle_after_done = 0_u32;
+        poller_barrier.wait();
+
+        while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
+            let expected_len = poller_expected.lock().unwrap().len();
+            let changes = poller_db.changes_since(watermark);
+            let before_seen = seen_creates.len();
+            if !changes.ddl.is_empty() || !changes.rows.is_empty() {
+                for ddl in &changes.ddl {
+                    if matches!(
+                        ddl,
+                        contextdb_engine::sync_types::DdlChange::CreateTable { .. }
+                    ) {
+                        seen_creates.insert(ddl_name(ddl));
+                    }
+                }
+                for row in &changes.rows {
+                    if row.table.starts_with("lsn_race_") && !seen_creates.contains(&row.table) {
+                        row_before_create.push(row.table.clone());
+                    }
+                }
+                if let Some(lsn) = max_non_ddl_lsn(&changes) {
+                    watermark = lsn;
+                }
+            } else {
+                thread::yield_now();
+            }
+
+            if poller_done.load(Ordering::SeqCst) && seen_creates.len() >= expected_len {
+                break;
+            }
+            if poller_done.load(Ordering::SeqCst) {
+                if seen_creates.len() == before_seen {
+                    idle_after_done += 1;
+                } else {
+                    idle_after_done = 0;
+                }
+                if idle_after_done > 100 {
+                    break;
+                }
+            }
+        }
+
+        let expected = poller_expected.lock().unwrap().clone();
+        (row_before_create, seen_creates, expected)
+    });
+
+    let mut handles = Vec::new();
+    for worker in 0..workers {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        let expected = expected_tables.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iterations {
+                let table = format!("lsn_race_{worker}_{i}");
+                db.execute(
+                    &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, val TEXT)"),
+                    &empty(),
+                )
+                .unwrap();
+                expected.lock().unwrap().push(table.clone());
+                db.execute(
+                    &format!("INSERT INTO {table} (id, val) VALUES ($id, 'data')"),
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO shared (id, val) VALUES ($id, 'shared')",
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    done.store(true, Ordering::SeqCst);
+    let (row_before_create, seen_creates, expected) = poller.join().unwrap();
+
+    assert!(
+        row_before_create.is_empty(),
+        "sync consumer observed row changes before CREATE TABLE DDL for tables: {:?}",
+        row_before_create
+    );
+    for table in expected {
+        assert!(
+            seen_creates.contains(&table),
+            "sync consumer missed CREATE TABLE DDL for {table}"
+        );
+    }
+}
+
+#[test]
+fn sql_16_ddl_lsn_no_duplicates_under_contention() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let workers = 4;
+    let iterations = 25;
+    let barrier = Arc::new(Barrier::new(workers + 1));
+    let done = Arc::new(AtomicBool::new(false));
+    let expected_columns = Arc::new(Mutex::new(Vec::<String>::new()));
+    let poller_expected = expected_columns.clone();
+    let poller_db = db.clone();
+    let poller_done = done.clone();
+    let poller_barrier = barrier.clone();
+
+    let poller = thread::spawn(move || {
+        let mut watermark = 0_u64;
+        let mut seen_columns = std::collections::HashSet::new();
+        let mut idle_after_done = 0_u32;
+        poller_barrier.wait();
+
+        while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
+            let expected_len = poller_expected.lock().unwrap().len();
+            let changes = poller_db.changes_since(watermark);
+            let before_seen = seen_columns.len();
+            if !changes.ddl.is_empty() || !changes.rows.is_empty() {
+                for ddl in &changes.ddl {
+                    if let contextdb_engine::sync_types::DdlChange::AlterTable {
+                        name, columns, ..
+                    } = ddl
+                        && name == "shared"
+                    {
+                        for (column, _) in columns {
+                            if column.starts_with("c_") {
+                                seen_columns.insert(column.clone());
+                            }
+                        }
+                    }
+                }
+                if let Some(lsn) = max_non_ddl_lsn(&changes) {
+                    watermark = lsn;
+                }
+            } else {
+                thread::yield_now();
+            }
+
+            if poller_done.load(Ordering::SeqCst) && seen_columns.len() >= expected_len {
+                break;
+            }
+            if poller_done.load(Ordering::SeqCst) {
+                if seen_columns.len() == before_seen {
+                    idle_after_done += 1;
+                } else {
+                    idle_after_done = 0;
+                }
+                if idle_after_done > 100 {
+                    break;
+                }
+            }
+        }
+
+        let expected = poller_expected.lock().unwrap().len();
+        (
+            seen_columns,
+            poller_expected.lock().unwrap().clone(),
+            expected,
+        )
+    });
+
+    let mut handles = Vec::new();
+    for worker in 0..workers {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        let expected = expected_columns.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..iterations {
+                let col = format!("c_{worker}_{i}");
+                db.execute(
+                    "INSERT INTO shared (id, val) VALUES ($id, 'data')",
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+                db.execute(
+                    &format!("ALTER TABLE shared ADD COLUMN {col} TEXT"),
+                    &empty(),
+                )
+                .unwrap();
+                expected.lock().unwrap().push(col);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    done.store(true, Ordering::SeqCst);
+    let (seen_columns, expected_columns, expected) = poller.join().unwrap();
+
+    assert_eq!(expected_columns.len(), expected);
+    for column in expected_columns {
+        assert!(
+            seen_columns.contains(&column),
+            "sync consumer missed ALTER TABLE DDL for added column {column}"
+        );
+    }
+}
+
+#[test]
+fn sql_17_sync_watermark_does_not_skip_ddl() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE shared (id UUID PRIMARY KEY, val TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let done = Arc::new(AtomicBool::new(false));
+    let expected_tables = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let poller_db = db.clone();
+    let poller_done = done.clone();
+    let poller_expected = expected_tables.clone();
+    let poller_barrier = barrier.clone();
+    let poller = thread::spawn(move || {
+        let mut watermark = 0_u64;
+        let mut seen_tables = std::collections::HashSet::new();
+        let mut idle_after_done = 0_u32;
+        poller_barrier.wait();
+
+        while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
+            let expected_len = poller_expected.lock().unwrap().len();
+            let changes = poller_db.changes_since(watermark);
+            let before_seen = seen_tables.len();
+            if !changes.ddl.is_empty() || !changes.rows.is_empty() {
+                for ddl in &changes.ddl {
+                    if matches!(
+                        ddl,
+                        contextdb_engine::sync_types::DdlChange::CreateTable { .. }
+                    ) {
+                        seen_tables.insert(ddl_name(ddl));
+                    }
+                }
+                if let Some(lsn) = max_non_ddl_lsn(&changes) {
+                    watermark = lsn;
+                }
+            } else {
+                thread::yield_now();
+            }
+
+            if poller_done.load(Ordering::SeqCst) && seen_tables.len() >= expected_len {
+                break;
+            }
+            if poller_done.load(Ordering::SeqCst) {
+                if seen_tables.len() == before_seen {
+                    idle_after_done += 1;
+                } else {
+                    idle_after_done = 0;
+                }
+                if idle_after_done > 100 {
+                    break;
+                }
+            }
+        }
+
+        let expected = poller_expected.lock().unwrap().clone();
+        (seen_tables, expected)
+    });
+
+    let ddl_db = db.clone();
+    let ddl_expected = expected_tables.clone();
+    let ddl_barrier = barrier.clone();
+    let ddl_thread = thread::spawn(move || {
+        ddl_barrier.wait();
+        for i in 0..120 {
+            let table = format!("watermark_race_{i}");
+            ddl_db
+                .execute(
+                    &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, val TEXT)"),
+                    &empty(),
+                )
+                .unwrap();
+            ddl_expected.lock().unwrap().push(table);
+        }
+    });
+
+    let dml_db = db.clone();
+    let dml_barrier = barrier.clone();
+    let dml_thread = thread::spawn(move || {
+        dml_barrier.wait();
+        for _ in 0..400 {
+            dml_db
+                .execute(
+                    "INSERT INTO shared (id, val) VALUES ($id, 'shared')",
+                    &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                )
+                .unwrap();
+        }
+    });
+
+    ddl_thread.join().unwrap();
+    dml_thread.join().unwrap();
+    done.store(true, Ordering::SeqCst);
+    let (seen_tables, expected) = poller.join().unwrap();
+
+    for table in expected {
+        assert!(
+            seen_tables.contains(&table),
+            "watermark advance skipped CREATE TABLE DDL for {table}"
+        );
+    }
 }
 
 #[test]
