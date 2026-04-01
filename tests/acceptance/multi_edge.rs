@@ -28,7 +28,7 @@ async fn f17_two_edges_push_different_tables_to_same_server() {
     assert!(
         run_cli_script(
             &edge_a,
-            &["--tenant-id", "f17", "--nats-url", &nats.nats_url],
+            &["--tenant-id", "f17", "--nats-url", &nats.ws_url],
             "CREATE TABLE temperatures (id UUID PRIMARY KEY, value REAL)\n.sync push\n.quit\n",
         )
         .status
@@ -37,7 +37,7 @@ async fn f17_two_edges_push_different_tables_to_same_server() {
     assert!(
         run_cli_script(
             &edge_b,
-            &["--tenant-id", "f17", "--nats-url", &nats.nats_url],
+            &["--tenant-id", "f17", "--nats-url", &nats.ws_url],
             "CREATE TABLE pressures (id UUID PRIMARY KEY, value REAL)\n.sync push\n.quit\n",
         )
         .status
@@ -68,7 +68,7 @@ async fn f18_two_edges_push_to_same_table_different_rows() {
     assert!(
         run_cli_script(
             &edge_a,
-            &["--tenant-id", "f18", "--nats-url", &nats.nats_url],
+            &["--tenant-id", "f18", "--nats-url", &nats.ws_url],
             &script_a
         )
         .status
@@ -77,7 +77,7 @@ async fn f18_two_edges_push_to_same_table_different_rows() {
     assert!(
         run_cli_script(
             &edge_b,
-            &["--tenant-id", "f18", "--nats-url", &nats.nats_url],
+            &["--tenant-id", "f18", "--nats-url", &nats.ws_url],
             &script_b
         )
         .status
@@ -99,12 +99,12 @@ async fn f19_two_edges_push_conflicting_updates_to_same_row() {
     let common = "CREATE TABLE sensors (id UUID PRIMARY KEY, reading REAL)\nINSERT INTO sensors (id, reading) VALUES ('00000000-0000-0000-0000-000000000001', 42.0)\n.sync push\n.quit\n";
     let a = run_cli_script(
         &edge_a,
-        &["--tenant-id", "f19", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f19", "--nats-url", &nats.ws_url],
         common,
     );
     let b = run_cli_script(
         &edge_b,
-        &["--tenant-id", "f19", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f19", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, reading REAL)\nINSERT INTO sensors (id, reading) VALUES ('00000000-0000-0000-0000-000000000001', 99.0)\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
@@ -132,12 +132,12 @@ async fn f20_edge_pulls_after_another_edge_pushed() {
     script_a.push_str(".sync push\n.quit\n");
     let _ = run_cli_script(
         &edge_a,
-        &["--tenant-id", "f20", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f20", "--nats-url", &nats.ws_url],
         &script_a,
     );
     let pulled = run_cli_script(
         &edge_b,
-        &["--tenant-id", "f20", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f20", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n",
     );
     stop_child(&mut server);
@@ -158,7 +158,7 @@ async fn f21_edge_a_pushes_edge_b_pushes_both_pull() {
     script_a.push_str(".sync push\n.quit\n");
     let _ = run_cli_script(
         &edge_a,
-        &["--tenant-id", "f21", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f21", "--nats-url", &nats.ws_url],
         &script_a,
     );
     let mut script_b = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
@@ -166,12 +166,12 @@ async fn f21_edge_a_pushes_edge_b_pushes_both_pull() {
     script_b.push_str(".sync push\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n");
     let _ = run_cli_script(
         &edge_b,
-        &["--tenant-id", "f21", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f21", "--nats-url", &nats.ws_url],
         &script_b,
     );
     let pulled_a = run_cli_script(
         &edge_a,
-        &["--tenant-id", "f21", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f21", "--nats-url", &nats.ws_url],
         ".sync pull\nSELECT count(*) FROM sensors\n.quit\n",
     );
     stop_child(&mut server);
@@ -191,17 +191,17 @@ async fn f21b_cross_edge_graph_construction_via_sync() {
     let mut server = spawn_server(&server_path, "f21b", &nats.nats_url);
     let _ = run_cli_script(
         &edge_a,
-        &["--tenant-id", "f21b", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f21b", "--nats-url", &nats.ws_url],
         "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'sensor-1')\n.sync push\n.quit\n",
     );
     let _ = run_cli_script(
         &edge_b,
-        &["--tenant-id", "f21b", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f21b", "--nats-url", &nats.ws_url],
         "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'region-north')\nINSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'EDGE')\n.sync push\n.quit\n",
     );
     let pulled = run_cli_script(
         &edge_c,
-        &["--tenant-id", "f21b", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f21b", "--nats-url", &nats.ws_url],
         "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)\n.sync pull\nSELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,1}(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS(b.id AS target_id))\n.quit\n",
     );
     stop_child(&mut server);
@@ -222,7 +222,7 @@ async fn f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits() {
 
     let setup = run_cli_script(
         &edge_a,
-        &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+        &["--tenant-id", tenant, "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep')\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me')\n\
@@ -233,7 +233,7 @@ async fn f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits() {
 
     let initial_pull = run_cli_script(
         &edge_b,
-        &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+        &["--tenant-id", tenant, "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
          .sync pull\n\
          SELECT count(*) FROM sensors\n\
@@ -243,7 +243,7 @@ async fn f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits() {
 
     let mut child = spawn_cli(
         &edge_a,
-        &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+        &["--tenant-id", tenant, "--nats-url", &nats.ws_url],
     );
     write_child_stdin(
         &mut child,
@@ -254,7 +254,7 @@ async fn f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits() {
     let observed = wait_until(Duration::from_secs(10), || {
         let pulled = run_cli_script(
             &edge_b,
-            &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+            &["--tenant-id", tenant, "--nats-url", &nats.ws_url],
             ".sync pull\n\
              SELECT count(*) FROM sensors\n\
              .quit\n",

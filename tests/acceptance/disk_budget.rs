@@ -179,7 +179,7 @@ async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
     let mut server = spawn_server(&server_path, "a_db6", &nats.nats_url);
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
-        &["--tenant-id", "a_db6", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "a_db6", "--nats-url", &nats.ws_url],
         ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );

@@ -29,13 +29,13 @@ async fn f29_sync_status_shows_meaningful_info_when_connected() {
     let mut server = spawn_server(&server_path, "f29", &nats.nats_url);
     let output = run_cli_script(
         &db_path,
-        &["--tenant-id", "f29", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f29", "--nats-url", &nats.ws_url],
         ".sync status\n.quit\n",
     );
     stop_child(&mut server);
     let stdout = output_string(&output.stdout);
     assert!(stdout.contains("tenant=f29"));
-    assert!(stdout.contains(&nats.nats_url));
+    assert!(stdout.contains(&nats.ws_url));
     assert!(stdout.contains("connected"));
     assert!(stdout.contains("LSN"));
 }

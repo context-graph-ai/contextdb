@@ -24,24 +24,32 @@ async fn setup_sync_env(
     std::path::PathBuf,
     std::path::PathBuf,
     String,
+    String,
     NatsFixture,
 ) {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, &format!("{name}-edge.db"));
     let server_path = temp_db_file(&tmp, &format!("{name}-server.db"));
     let nats = start_nats().await;
-    (tmp, edge_path, server_path, nats.nats_url.clone(), nats)
+    (
+        tmp,
+        edge_path,
+        server_path,
+        nats.nats_url.clone(),
+        nats.ws_url.clone(),
+        nats,
+    )
 }
 
 /// I wrote data on an edge node, and it showed up on the server without me running any sync command.
 #[tokio::test]
 async fn f06a_data_written_on_edge_appears_on_server_automatically() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) = setup_sync_env("f06a").await;
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) = setup_sync_env("f06a").await;
     let tenant = "f06a";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
     let edge = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         "\
 CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
 INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n\
@@ -77,13 +85,13 @@ macro_rules! sync_red_test {
     ($name:ident, $script:expr, $check:expr) => {
         #[tokio::test]
         async fn $name() {
-            let (_tmp, edge_path, server_path, nats_url, _nats) =
+            let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
                 setup_sync_env(stringify!($name)).await;
             let tenant = stringify!($name);
             let mut server = spawn_server(&server_path, tenant, &nats_url);
             let output = run_cli_script(
                 &edge_path,
-                &["--tenant-id", tenant, "--nats-url", &nats_url],
+                &["--tenant-id", tenant, "--nats-url", &ws_url],
                 $script,
             );
             assert!(output.status.success());
@@ -96,7 +104,7 @@ macro_rules! sync_red_test {
 // I wrote data on one edge, and another edge saw it without any manual sync.
 #[tokio::test]
 async fn f06b_data_from_another_edge_appears_on_this_edge_automatically() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f06b_data_from_another_edge_appears_on_this_edge_automatically").await;
     let tenant = "f06b_data_from_another_edge_appears_on_this_edge_automatically";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -105,14 +113,14 @@ async fn f06b_data_from_another_edge_appears_on_this_edge_automatically() {
     script.push_str(".quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
     stop_child(&mut server);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         "SELECT count(*) FROM sensors\n.quit\n",
     );
     assert!(output_string(&output.stdout).contains("10"));
@@ -121,7 +129,7 @@ async fn f06b_data_from_another_edge_appears_on_this_edge_automatically() {
 // I wrote data while the edge was offline, and when the network came back the backlog was synced automatically.
 #[tokio::test]
 async fn f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog").await;
     let tenant = "f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -130,7 +138,7 @@ async fn f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog() {
     script.push_str(".quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -141,7 +149,7 @@ async fn f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog() {
 // I pushed data from the edge, and the server had all the rows.
 #[tokio::test]
 async fn f06_edge_pushes_data_server_has_it() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f06_edge_pushes_data_server_has_it").await;
     let tenant = "f06_edge_pushes_data_server_has_it";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -150,7 +158,7 @@ async fn f06_edge_pushes_data_server_has_it() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -161,7 +169,7 @@ async fn f06_edge_pushes_data_server_has_it() {
 // I pushed twice in a row, and the server had each row exactly once — no duplicates.
 #[tokio::test]
 async fn f07_two_consecutive_pushes_do_not_duplicate_data() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f07_two_consecutive_pushes_do_not_duplicate_data").await;
     let tenant = "f07_two_consecutive_pushes_do_not_duplicate_data";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -172,7 +180,7 @@ async fn f07_two_consecutive_pushes_do_not_duplicate_data() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -183,7 +191,7 @@ async fn f07_two_consecutive_pushes_do_not_duplicate_data() {
 // I pushed from one edge, then pulled onto a brand-new edge, and the fresh edge had all the data.
 #[tokio::test]
 async fn f08_push_then_pull_on_a_fresh_edge() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f08_push_then_pull_on_a_fresh_edge").await;
     let tenant = "f08_push_then_pull_on_a_fresh_edge";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -192,14 +200,14 @@ async fn f08_push_then_pull_on_a_fresh_edge() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
     let fresh_path = edge_path.with_file_name("fresh-edge.db");
     let pulled = run_cli_script(
         &fresh_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n",
     );
     stop_child(&mut server);
@@ -209,7 +217,7 @@ async fn f08_push_then_pull_on_a_fresh_edge() {
 // I pushed data, the server restarted, and a pull from a fresh edge still returned everything.
 #[tokio::test]
 async fn f09_pull_after_server_restart_returns_data() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f09_pull_after_server_restart_returns_data").await;
     let tenant = "f09_pull_after_server_restart_returns_data";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -218,7 +226,7 @@ async fn f09_pull_after_server_restart_returns_data() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -227,14 +235,14 @@ async fn f09_pull_after_server_restart_returns_data() {
     let fresh_path = edge_path.with_file_name("fresh-after-restart.db");
     let initialized = run_cli_script(
         &fresh_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
     );
     assert!(initialized.status.success());
     let pulled_ok = wait_until(Duration::from_secs(5), || {
         let pulled = run_cli_script(
             &fresh_path,
-            &["--tenant-id", tenant, "--nats-url", &nats_url],
+            &["--tenant-id", tenant, "--nats-url", &ws_url],
             ".sync pull\nSELECT count(*) FROM sensors\n.quit\n",
         );
         output_string(&pulled.stdout).contains("100")
@@ -249,7 +257,7 @@ async fn f09_pull_after_server_restart_returns_data() {
 // I pushed, closed the edge, reopened it, inserted more rows, pushed again, and the server had everything.
 #[tokio::test]
 async fn f09b_edge_closes_reopens_pushes_more_data() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f09b_edge_closes_reopens_pushes_more_data").await;
     let tenant = "f09b_edge_closes_reopens_pushes_more_data";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -259,7 +267,7 @@ async fn f09b_edge_closes_reopens_pushes_more_data() {
     script1.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script1,
     );
     assert!(output.status.success());
@@ -269,7 +277,7 @@ async fn f09b_edge_closes_reopens_pushes_more_data() {
     script2.push_str(".sync push\n.quit\n");
     let reopened = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script2,
     );
     assert!(reopened.status.success());
@@ -280,7 +288,7 @@ async fn f09b_edge_closes_reopens_pushes_more_data() {
 // I crashed the edge mid-session, reopened it, pushed, and the server received all the data including what was written before the crash.
 #[tokio::test]
 async fn f09c_edge_crash_recovers_then_pushes() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f09c_edge_crash_recovers_then_pushes").await;
     let tenant = "f09c_edge_crash_recovers_then_pushes";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -290,15 +298,12 @@ async fn f09c_edge_crash_recovers_then_pushes() {
     script1.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script1,
     );
     assert!(output.status.success());
     // Crash session: insert 25 rows then kill (simulating crash)
-    let mut child = spawn_cli(
-        &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
-    );
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", &ws_url]);
     let mut crash_script = gen_sensor_inserts(25);
     crash_script.push('\n');
     write_child_stdin(&mut child, &crash_script);
@@ -325,7 +330,7 @@ async fn f09c_edge_crash_recovers_then_pushes() {
     script3.push_str(".sync push\n.quit\n");
     let reopened = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script3,
     );
     assert!(reopened.status.success());
@@ -336,7 +341,7 @@ async fn f09c_edge_crash_recovers_then_pushes() {
 // I lost power during a sync, retried, and the server had each row exactly once — no duplicates from the interrupted attempt.
 #[tokio::test]
 async fn f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry").await;
     let tenant = "f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -345,7 +350,7 @@ async fn f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry() {
     script.push_str(".quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -378,6 +383,7 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let server_path = temp_db_file(&tmp, "f09f-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f09f_server_side_constraint_violation_during_push_returns_error_to_edge";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
@@ -385,7 +391,7 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let edge1_path = edge_path.with_file_name("f09f-edge1.db");
     let edge1_output = run_cli_script(
         &edge1_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
+        &["--tenant-id", tenant, "--nats-url", ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL)\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid')\n\
          .sync push\n\
@@ -398,7 +404,7 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let edge2_path = edge_path.with_file_name("f09f-edge2.db");
     let violation_output = run_cli_script(
         &edge2_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
+        &["--tenant-id", tenant, "--nats-url", ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
          INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002')\n\
          .sync push\n\
@@ -436,6 +442,7 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let server_path = temp_db_file(&tmp, "f09h-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f09h_constraint_violations_during_sync_pull_are_handled";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
@@ -443,7 +450,7 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let edge_a_path = edge_path.with_file_name("f09h-edge-a.db");
     let push_output = run_cli_script(
         &edge_a_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
+        &["--tenant-id", tenant, "--nats-url", ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\n\
          INSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 1.0)\n\
          .sync push\n\
@@ -455,7 +462,7 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let edge_b_path = edge_path.with_file_name("f09h-edge-b.db");
     let pull_output = run_cli_script(
         &edge_b_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
+        &["--tenant-id", tenant, "--nats-url", ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, label TEXT, score INTEGER)\n\
          .sync pull\n\
          .quit\n",
@@ -477,6 +484,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     let server_path = temp_db_file(&tmp, "f09i-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f09i_conflicting_state_machine_transitions_across_edges_during_sync";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
@@ -486,7 +494,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     let edge_a_path = temp_db_file(&tmp, "f09i-edge-a.db");
     let setup = run_cli_script(
         &edge_a_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
+        &["--tenant-id", tenant, "--nats-url", ws_url],
         &format!(
             "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived]))\n\
              INSERT INTO tasks (id, status) VALUES ('{row_id}', 'active')\n\
@@ -500,7 +508,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     let edge_b_path = temp_db_file(&tmp, "f09i-edge-b.db");
     let edge_b = run_cli_script(
         &edge_b_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
+        &["--tenant-id", tenant, "--nats-url", ws_url],
         &format!(
             "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived]))\n\
              .sync pull\n\
@@ -517,7 +525,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
         let checker_path = temp_db_file(&tmp, "f09i-checker.db");
         let check = run_cli_script(
             &checker_path,
-            &["--tenant-id", tenant, "--nats-url", nats_url],
+            &["--tenant-id", tenant, "--nats-url", ws_url],
             &format!(
                 "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT)\n\
                  .sync pull\n\
@@ -538,7 +546,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
     // This push must report a conflict — the row is no longer in "active" state.
     let conflict_push = run_cli_script(
         &edge_a_path,
-        &["--tenant-id", tenant, "--nats-url", nats_url],
+        &["--tenant-id", tenant, "--nats-url", ws_url],
         &format!(
             "UPDATE tasks SET status = 'archived' WHERE id = '{row_id}'\n\
              .sync push\n\
@@ -576,7 +584,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
 // I accumulated data offline for an extended period, pushed, and the server received the entire backlog.
 #[tokio::test]
 async fn f10_edge_offline_for_one_hour_then_pushes_backlog() {
-    let (_tmp, edge_path, server_path, nats_url, _nats) =
+    let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) =
         setup_sync_env("f10_edge_offline_for_one_hour_then_pushes_backlog").await;
     let tenant = "f10_edge_offline_for_one_hour_then_pushes_backlog";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
@@ -585,7 +593,7 @@ async fn f10_edge_offline_for_one_hour_then_pushes_backlog() {
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", tenant, "--nats-url", &nats_url],
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -602,11 +610,12 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     let server_path = temp_db_file(&tmp, "f12-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f12_auto_sync_pushes_on_commit_not_on_quit";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
     // Start CLI with spawn_cli (keeps process alive)
-    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
 
     // Enable auto-sync, create table, insert a row
     write_child_stdin(
@@ -625,7 +634,7 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
         let fresh_path = edge_path.with_file_name("f12-checker.db");
         let check = run_cli_script(
             &fresh_path,
-            &["--tenant-id", tenant, "--nats-url", nats_url],
+            &["--tenant-id", tenant, "--nats-url", ws_url],
             "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
              .sync pull\n\
              SELECT count(*) FROM sensors\n\
@@ -654,10 +663,11 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     let server_path = temp_db_file(&tmp, "f12b-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f12b_auto_sync_pushes_updates_not_just_inserts";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
-    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
 
     // Create table, insert, enable auto-sync, then UPDATE
     write_child_stdin(
@@ -670,11 +680,13 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     );
 
     // Wait for UPDATE to appear on server while CLI is still running
+    let mut checker_idx = 0u32;
     let found = wait_until(Duration::from_secs(10), || {
-        let fresh_path = edge_path.with_file_name("f12b-checker.db");
+        checker_idx += 1;
+        let fresh_path = edge_path.with_file_name(format!("f12b-checker-{checker_idx}.db"));
         let check = run_cli_script(
             &fresh_path,
-            &["--tenant-id", tenant, "--nats-url", nats_url],
+            &["--tenant-id", tenant, "--nats-url", ws_url],
             "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
              .sync pull\n\
              SELECT name FROM sensors WHERE id = '00000000-0000-0000-0000-000000000001'\n\
@@ -702,10 +714,11 @@ async fn f12c_auto_sync_pushes_deletes() {
     let server_path = temp_db_file(&tmp, "f12c-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f12c_auto_sync_pushes_deletes";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
-    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
 
     // Create table, insert 2 rows, push, enable auto-sync, then DELETE one
     write_child_stdin(
@@ -727,7 +740,7 @@ async fn f12c_auto_sync_pushes_deletes() {
         let fresh_path = edge_path.with_file_name(format!("f12c-checker-{checker_idx}.db"));
         let check = run_cli_script(
             &fresh_path,
-            &["--tenant-id", tenant, "--nats-url", nats_url],
+            &["--tenant-id", tenant, "--nats-url", ws_url],
             "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
              .sync pull\n\
              SELECT count(*) FROM sensors\n\
@@ -759,9 +772,10 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
     let server_path = temp_db_file(&tmp, "f12d-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f12d_auto_sync_retries_after_server_starts_late";
 
-    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
     write_child_stdin(
         &mut child,
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
@@ -778,7 +792,7 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
         let fresh_path = edge_path.with_file_name(format!("f12d-checker-{checker_idx}.db"));
         let check = run_cli_script(
             &fresh_path,
-            &["--tenant-id", tenant, "--nats-url", nats_url],
+            &["--tenant-id", tenant, "--nats-url", ws_url],
             "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
              .sync pull\n\
              SELECT count(*) FROM sensors\n\
@@ -807,6 +821,7 @@ async fn f12e_quit_flushes_pending_auto_sync_work() {
     let server_path = temp_db_file(&tmp, "f12e-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f12e_quit_flushes_pending_auto_sync_work";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
@@ -816,7 +831,7 @@ async fn f12e_quit_flushes_pending_auto_sync_work() {
             "--tenant-id",
             tenant,
             "--nats-url",
-            nats_url,
+            ws_url,
             "--sync-debounce-ms",
             "5000",
         ],
@@ -843,6 +858,7 @@ async fn f12e_quit_flushes_pending_delete_with_long_debounce() {
     let server_path = temp_db_file(&tmp, "f12e-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let tenant = "f12e_quit_flushes_pending_delete_with_long_debounce";
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
@@ -852,7 +868,7 @@ async fn f12e_quit_flushes_pending_delete_with_long_debounce() {
             "--tenant-id",
             tenant,
             "--nats-url",
-            nats_url,
+            ws_url,
             "--sync-debounce-ms",
             "5000",
         ],

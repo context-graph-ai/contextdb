@@ -12,6 +12,7 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
     let server_path = temp_db_file(&tmp, "f25-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let mut server = spawn_server(&server_path, "f25", nats_url);
 
     // Accumulate 1,000 rows offline (proves the pattern; 10K is a benchmark concern)
@@ -27,7 +28,7 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f25", "--nats-url", nats_url],
+        &["--tenant-id", "f25", "--nats-url", ws_url],
         &script,
     );
     assert!(
@@ -40,7 +41,7 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
     let fresh_path = temp_db_file(&tmp, "f25-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f25", "--nats-url", nats_url],
+        &["--tenant-id", "f25", "--nats-url", ws_url],
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n\
          .sync pull\n\
          SELECT count(*) FROM items\n\
@@ -64,6 +65,7 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
     let server_path = temp_db_file(&tmp, "f26-server.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let mut server = spawn_server(&server_path, "f26", nats_url);
 
     // Push 10,000 rows from the source edge
@@ -79,7 +81,7 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
 
     let push_output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f26", "--nats-url", nats_url],
+        &["--tenant-id", "f26", "--nats-url", ws_url],
         &script,
     );
     assert!(
@@ -91,7 +93,7 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
     let fresh_path = temp_db_file(&tmp, "f26-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f26", "--nats-url", nats_url],
+        &["--tenant-id", "f26", "--nats-url", ws_url],
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n\
          .sync pull\n\
          SELECT count(*) FROM items\n\
@@ -116,6 +118,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     let puller_path = temp_db_file(&tmp, "f27-puller.db");
     let nats = start_nats().await;
     let nats_url = &nats.nats_url;
+    let ws_url = &nats.ws_url;
     let mut server = spawn_server(&server_path, "f27", nats_url);
 
     // Push initial 100 rows
@@ -130,7 +133,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     script1.push_str(".sync push\n.quit\n");
     let push1 = run_cli_script(
         &source_path,
-        &["--tenant-id", "f27", "--nats-url", nats_url],
+        &["--tenant-id", "f27", "--nats-url", ws_url],
         &script1,
     );
     assert!(push1.status.success());
@@ -138,7 +141,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     // Initial pull — puller gets 100 rows
     let pull1 = run_cli_script(
         &puller_path,
-        &["--tenant-id", "f27", "--nats-url", nats_url],
+        &["--tenant-id", "f27", "--nats-url", ws_url],
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n\
          .sync pull\n\
          SELECT count(*) FROM items\n\
@@ -163,7 +166,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     script2.push_str(".sync push\n.quit\n");
     let push2 = run_cli_script(
         &source_path,
-        &["--tenant-id", "f27", "--nats-url", nats_url],
+        &["--tenant-id", "f27", "--nats-url", ws_url],
         &script2,
     );
     assert!(push2.status.success());
@@ -171,7 +174,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     // Incremental pull — puller gets the 50 new rows (total 150)
     let pull2 = run_cli_script(
         &puller_path,
-        &["--tenant-id", "f27", "--nats-url", nats_url],
+        &["--tenant-id", "f27", "--nats-url", ws_url],
         ".sync pull\n\
          SELECT count(*) FROM items\n\
          .quit\n",

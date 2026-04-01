@@ -21,6 +21,7 @@ static BUILD_RELEASE_BINARIES: Once = Once::new();
 pub(crate) struct NatsFixture {
     _container: ContainerAsync<GenericImage>,
     pub(crate) nats_url: String,
+    pub(crate) ws_url: String,
 }
 
 pub(crate) fn workspace_root() -> PathBuf {
@@ -97,12 +98,16 @@ pub(crate) fn run_cli_script(db_path: &Path, extra_args: &[&str], script: &str) 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let mut child = command.spawn().expect("CLI should spawn");
-    child
+    match child
         .stdin
         .as_mut()
         .expect("stdin pipe")
         .write_all(script.as_bytes())
-        .expect("write script to CLI");
+    {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("write script to CLI: {err}"),
+    }
     child.wait_with_output().expect("CLI should finish")
 }
 
@@ -260,6 +265,7 @@ pub(crate) async fn start_nats() -> NatsFixture {
         .into_owned();
     let image = GenericImage::new("nats", "latest")
         .with_exposed_port(4222.tcp())
+        .with_exposed_port(9222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
     let request = image
         .with_mount(Mount::bind_mount(conf, "/etc/nats/nats.conf"))
@@ -270,9 +276,14 @@ pub(crate) async fn start_nats() -> NatsFixture {
         .get_host_port_ipv4(4222.tcp())
         .await
         .expect("NATS port should be mapped");
+    let ws_port = container
+        .get_host_port_ipv4(9222.tcp())
+        .await
+        .expect("NATS websocket port should be mapped");
     NatsFixture {
         _container: container,
         nats_url: format!("nats://127.0.0.1:{nats_port}"),
+        ws_url: format!("ws://127.0.0.1:{ws_port}"),
     }
 }
 

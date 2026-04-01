@@ -32,7 +32,7 @@ async fn f12_server_crash_mid_push_does_not_corrupt_server_data() {
     let mut server = spawn_server(&server_path, "f12", &nats.nats_url);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f12", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f12", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
@@ -50,7 +50,7 @@ async fn f13_nats_restart_does_not_require_edge_restart() {
     let mut server = spawn_server(&server_path, "f13", &nats.nats_url);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f13", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f13", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync reconnect\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
@@ -68,14 +68,14 @@ async fn f14_server_restart_does_not_require_edge_restart() {
     let mut server = spawn_server(&server_path, "f14", &nats.nats_url);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f14", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f14", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
     server = spawn_server(&server_path, "f14", &nats.nats_url);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f14", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f14", "--nats-url", &nats.ws_url],
         "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'x')\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
@@ -157,7 +157,7 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
 
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
-        &["--tenant-id", "f16", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f16", "--nats-url", &nats.ws_url],
         ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );
@@ -221,7 +221,7 @@ async fn f16c_server_restart_preserves_constrained_memory_push_behavior() {
 
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
-        &["--tenant-id", "f16c", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f16c", "--nats-url", &nats.ws_url],
         ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );

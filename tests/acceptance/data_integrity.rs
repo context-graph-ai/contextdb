@@ -14,7 +14,7 @@ async fn f32_no_silent_data_loss_on_push() {
     let mut server = spawn_server(&server_path, "f32", &nats.nats_url);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f32", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f32", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\nINSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'temp-1', 42.0)\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
@@ -69,7 +69,7 @@ async fn f33_vector_data_round_trips_correctly_through_sync() {
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f33", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f33", "--nats-url", &nats.ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -80,7 +80,7 @@ async fn f33_vector_data_round_trips_correctly_through_sync() {
     let fresh_path = edge_path.with_file_name("f33-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f33", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f33", "--nats-url", &nats.ws_url],
         ".sync pull\n\
          SELECT id FROM embeddings ORDER BY embedding <=> [1.0, 0.0, 0.0] LIMIT 1\n\
          .quit\n",
@@ -125,7 +125,7 @@ async fn f34_row_deletion_syncs_correctly() {
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f34", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f34", "--nats-url", &nats.ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -171,7 +171,7 @@ async fn f35_graph_edges_sync_correctly() {
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f35", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f35", "--nats-url", &nats.ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -231,7 +231,7 @@ async fn f35b_state_propagation_effects_sync_correctly() {
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f35b", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f35b", "--nats-url", &nats.ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -372,7 +372,7 @@ async fn f109_sync_preserves_graph_vector_relational_atomicity_end_to_end() {
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f109", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "f109", "--nats-url", &nats.ws_url],
         &script,
     );
     assert!(output.status.success());
@@ -442,7 +442,7 @@ async fn sf01_ddl_column_attributes_preserved_through_sync() {
     let mut server = spawn_server(&server_path, "sf01", &nats.nats_url);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "sf01", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "sf01", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL, code TEXT UNIQUE)\n\
          INSERT INTO sensors (id, name, code) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 'S001')\n\
          .sync push\n\
@@ -510,7 +510,7 @@ async fn sf02_ddl_attributes_persist_across_server_restart() {
     let mut server = spawn_server(&server_path, "sf02", &nats.nats_url);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "sf02", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "sf02", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL, code TEXT UNIQUE)\n\
          INSERT INTO sensors (id, name, code) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 'S001')\n\
          .sync push\n\
@@ -569,7 +569,7 @@ async fn sf03_not_null_constraint_enforced_on_server_during_push() {
     // Edge1: create table WITH NOT NULL, push valid row to establish schema on server
     let setup = run_cli_script(
         &edge1_path,
-        &["--tenant-id", "sf03", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "sf03", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL)\n\
          INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid')\n\
          .sync push\n\
@@ -581,7 +581,7 @@ async fn sf03_not_null_constraint_enforced_on_server_during_push() {
     // Server has NOT NULL from edge1's DDL, so it must reject this row
     let violation = run_cli_script(
         &edge2_path,
-        &["--tenant-id", "sf03", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "sf03", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
          INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002')\n\
          .sync push\n\
@@ -619,7 +619,7 @@ async fn sf04_unique_constraint_enforced_on_server_during_push() {
     // Edge1: push table with UNIQUE constraint and one row
     let setup = run_cli_script(
         &edge1_path,
-        &["--tenant-id", "sf04", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "sf04", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, code TEXT UNIQUE)\n\
          INSERT INTO sensors (id, code) VALUES ('00000000-0000-0000-0000-000000000001', 'ABC')\n\
          .sync push\n\
@@ -631,7 +631,7 @@ async fn sf04_unique_constraint_enforced_on_server_during_push() {
     // Server must reject this as a UNIQUE violation
     let violation = run_cli_script(
         &edge2_path,
-        &["--tenant-id", "sf04", "--nats-url", &nats.nats_url],
+        &["--tenant-id", "sf04", "--nats-url", &nats.ws_url],
         "CREATE TABLE sensors (id UUID PRIMARY KEY, code TEXT UNIQUE)\n\
          INSERT INTO sensors (id, code) VALUES ('00000000-0000-0000-0000-000000000002', 'ABC')\n\
          .sync push\n\
