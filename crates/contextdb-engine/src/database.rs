@@ -1592,8 +1592,18 @@ impl Database {
         &self.relational_store
     }
 
-    pub(crate) fn next_lsn_for_ddl(&self) -> u64 {
-        self.tx_mgr.next_lsn()
+    pub(crate) fn allocate_ddl_lsn<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(u64) -> R,
+    {
+        self.tx_mgr.allocate_ddl_lsn(f)
+    }
+
+    pub(crate) fn with_commit_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        self.tx_mgr.with_commit_lock(f)
     }
 
     pub(crate) fn log_create_table_ddl(&self, name: &str, meta: &TableMeta, lsn: u64) {
@@ -2040,12 +2050,17 @@ impl Database {
             return self.persisted_state_since(since_lsn);
         }
 
+        let (ddl, change_entries) = self.with_commit_lock(|| {
+            let ddl = self.ddl_log_since(since_lsn);
+            let changes = self.change_log_since(since_lsn);
+            (ddl, changes)
+        });
+
         let mut rows = Vec::new();
         let mut edges = Vec::new();
         let mut vectors = Vec::new();
-        let ddl = self.ddl_log_since(since_lsn);
 
-        for entry in self.change_log_since(since_lsn) {
+        for entry in change_entries {
             match entry {
                 ChangeLogEntry::RowInsert { table, row_id, lsn } => {
                     if let Some((natural_key, values)) = self.row_change_values(&table, row_id) {

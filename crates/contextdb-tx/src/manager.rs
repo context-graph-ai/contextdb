@@ -93,8 +93,21 @@ impl<S: WriteSetApplicator> TxManager<S> {
         self.next_lsn.load(Ordering::SeqCst).saturating_sub(1)
     }
 
-    pub fn next_lsn(&self) -> u64 {
-        self.next_lsn.fetch_add(1, Ordering::SeqCst)
+    pub fn allocate_ddl_lsn<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(u64) -> R,
+    {
+        let _lock = self.commit_mutex.lock();
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
+        f(lsn)
+    }
+
+    pub fn with_commit_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _lock = self.commit_mutex.lock();
+        f()
     }
 }
 

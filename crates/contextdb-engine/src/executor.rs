@@ -64,8 +64,7 @@ pub(crate) fn execute_plan(
             db.relational_store().create_table(&p.name, meta);
             if let Some(table_meta) = db.table_meta(&p.name) {
                 db.persist_table_meta(&p.name, &table_meta)?;
-                let lsn = db.next_lsn_for_ddl();
-                db.log_create_table_ddl(&p.name, &table_meta, lsn);
+                db.allocate_ddl_lsn(|lsn| db.log_create_table_ddl(&p.name, &table_meta, lsn));
             }
             Ok(QueryResult::empty_with_affected(0))
         }
@@ -73,8 +72,7 @@ pub(crate) fn execute_plan(
             let bytes_to_release = estimate_drop_table_bytes(db, name);
             db.relational_store().drop_table(name);
             db.remove_persisted_table(name)?;
-            let lsn = db.next_lsn_for_ddl();
-            db.log_drop_table_ddl(name, lsn);
+            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn));
             db.accountant().release(bytes_to_release);
             Ok(QueryResult::empty_with_affected(0))
         }
@@ -175,8 +173,7 @@ pub(crate) fn execute_plan(
                 ) {
                     db.persist_table_rows(&p.table)?;
                 }
-                let lsn = db.next_lsn_for_ddl();
-                db.log_alter_table_ddl(&p.table, &table_meta, lsn);
+                db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn));
             }
             Ok(QueryResult::empty_with_affected(0))
         }
