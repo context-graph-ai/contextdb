@@ -124,7 +124,9 @@ Sync not configured. Start with --tenant-id to enable.
 
 ### Auto-Sync
 
-When enabled (`.sync auto on`), INSERT/UPDATE/DELETE statements trigger a background push, debounced by 500ms — rapid writes are batched.
+When enabled (`.sync auto on`), INSERT/UPDATE/DELETE statements trigger a background push. By default the worker debounces for `500ms` so rapid writes are batched, but you can tune that with `--sync-debounce-ms` or `CONTEXTDB_SYNC_DEBOUNCE_MS`.
+
+If a background push fails, the CLI now reports the failure to stderr and keeps retrying in the background instead of silently dropping the pending sync.
 
 On exit, the CLI always performs a final push to flush pending changes, regardless of auto-sync setting.
 

@@ -50,23 +50,11 @@ pub fn run(
                     }
                 } else {
                     let upper = line.trim_start().to_uppercase();
-                    let is_dml = {
-                        upper.starts_with("INSERT")
-                            || upper.starts_with("UPDATE")
-                            || upper.starts_with("DELETE")
-                    };
                     if !interactive && upper.starts_with("INSERT") {
                         println!("{line}");
                     }
                     if !execute_sql(&db, line) {
                         had_error = true;
-                    }
-                    // Auto-sync: notify background push task after DML
-                    if is_dml
-                        && let Some(plugin) = sync_plugin
-                        && plugin.is_auto()
-                    {
-                        plugin.notify_change();
                     }
                 }
             }

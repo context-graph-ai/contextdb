@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
+mod auto_sync;
 mod formatter;
 mod repl;
 
@@ -27,6 +28,10 @@ struct Args {
     /// Memory limit (e.g. 4G, 512M). Sets startup ceiling.
     #[arg(long, env = "CONTEXTDB_MEMORY_LIMIT")]
     memory_limit: Option<String>,
+
+    /// Debounce interval for background auto-sync pushes.
+    #[arg(long, env = "CONTEXTDB_SYNC_DEBOUNCE_MS", default_value_t = 500)]
+    sync_debounce_ms: u64,
 }
 
 fn main() {
@@ -50,7 +55,7 @@ fn main() {
     // If sync is configured, create the SyncPlugin before opening the DB.
     // Keep the rx end alive — a background task will consume it for debounced pushes.
     let (sync_plugin_arc, push_rx) = if args.tenant_id.is_some() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<()>(16);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         (
             Some(Arc::new(contextdb_server::SyncPlugin::new(tx))),
             Some(rx),
@@ -119,54 +124,77 @@ fn main() {
     };
 
     // Spawn background debounced push task if sync is configured.
-    let push_handle = if let (Some(rt_ref), Some(client), Some(mut rx)) = (rt, sync_client, push_rx)
-    {
+    let push_handle = if let (Some(rt_ref), Some(client), Some(rx)) = (rt, sync_client, push_rx) {
         let client_clone = Arc::clone(client);
-        Some(rt_ref.spawn(async move {
-            while rx.recv().await.is_some() {
-                // Debounce: drain any additional signals within 500ms
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                while rx.try_recv().is_ok() {}
-                // Push
-                if let Ok(result) = client_clone.push().await {
-                    for conflict in &result.conflicts {
-                        if let Some(reason) = &conflict.reason {
-                            eprintln!("sync conflict: {}", reason);
-                        }
-                    }
+        let plugin_clone = sync_plugin_arc.clone().expect("sync plugin configured");
+        let config = auto_sync::AutoSyncConfig {
+            debounce: Duration::from_millis(args.sync_debounce_ms),
+            ..auto_sync::AutoSyncConfig::default()
+        };
+        Some(rt_ref.spawn(auto_sync::run_loop(
+            rx,
+            config,
+            move || {
+                let client = client_clone.clone();
+                let plugin = plugin_clone.clone();
+                async move {
+                    let result = client.push().await.map_err(|err| err.to_string())?;
+                    Ok(auto_sync::PushOutcome {
+                        conflicts: result
+                            .conflicts
+                            .into_iter()
+                            .filter_map(|conflict| conflict.reason)
+                            .collect::<Vec<_>>(),
+                        caught_up: client.push_watermark() >= plugin.pending_lsn(),
+                    })
                 }
-            }
-        }))
+            },
+            |msg| eprintln!("{msg}"),
+        )))
     } else {
         None
     };
 
-    let all_ok = repl::run(
+    let mut all_ok = repl::run(
         db.clone(),
         sync_client.map(|c| c.as_ref()),
         rt,
         sync_plugin_arc.as_deref(),
     );
 
-    if let Err(e) = db.close() {
-        eprintln!("Error: failed to close database: {e}");
-        std::process::exit(1);
-    }
-
-    // Graceful shutdown: flush any unsent changes, then stop background task.
+    // Graceful shutdown: stop background notifications, wait for any in-flight
+    // auto-sync work to finish, then do one final flush before closing the DB.
     if let Some((rt, client)) = rt_and_client {
-        // Final push to flush pending changes (regardless of auto-sync setting)
-        let _ = rt.block_on(client.push());
-        // Stop background push task
         if let Some(ref plugin) = sync_plugin_arc {
             plugin.shutdown();
         }
-        if let Some(handle) = push_handle {
-            let _ = rt.block_on(handle);
+        if let Some(handle) = push_handle
+            && let Err(err) = rt.block_on(handle)
+        {
+            eprintln!("Auto-sync worker failed during shutdown: {err}");
+            all_ok = false;
+        }
+        match client.has_pending_push_changes() {
+            Ok(true) => {
+                if let Err(err) = rt.block_on(client.push()) {
+                    eprintln!("Final sync push failed: {err}");
+                    all_ok = false;
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!("Final sync preflight failed: {err}");
+                all_ok = false;
+            }
         }
         rt.block_on(async {
             drop(client);
         });
+    }
+
+    if let Err(e) = db.close() {
+        eprintln!("Error: failed to close database: {e}");
+        std::process::exit(1);
     }
 
     if !all_ok {

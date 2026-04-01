@@ -109,6 +109,19 @@ impl SyncClient {
         &self.db
     }
 
+    pub fn has_pending_push_changes(&self) -> Result<bool, Error> {
+        let since = self.push_watermark.load(Ordering::SeqCst);
+        let directions = self.table_directions()?;
+        let changes = self
+            .db
+            .changes_since(since)
+            .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
+        Ok(!changes.rows.is_empty()
+            || !changes.edges.is_empty()
+            || !changes.vectors.is_empty()
+            || !changes.ddl.is_empty())
+    }
+
     pub async fn push(&self) -> Result<ApplyResult, Error> {
         // Verify NATS connectivity early so users get a clear error even for empty pushes.
         let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
@@ -237,18 +250,34 @@ impl SyncClient {
                     if attempt > 0 {
                         tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
                     }
+                    let inbox = nats_client.new_inbox();
+                    let mut inbox_sub = nats_client
+                        .subscribe(inbox.clone())
+                        .await
+                        .map_err(|e| Error::SyncError(e.to_string()))?;
                     let timeout = if attempt < 2 {
                         Duration::from_secs(2)
                     } else {
                         SYNC_TIMEOUT
                     };
-                    match tokio::time::timeout(
-                        timeout,
-                        nats_client.request(push_subject(&self.tenant_id), encoded.clone().into()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(msg)) => {
+
+                    nats_client
+                        .publish_with_reply(
+                            push_subject(&self.tenant_id),
+                            inbox.clone(),
+                            encoded.clone().into(),
+                        )
+                        .await
+                        .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                    match tokio::time::timeout(timeout, inbox_sub.next()).await {
+                        Ok(Some(msg)) => {
+                            if msg.status == Some(async_nats::StatusCode::NO_RESPONDERS)
+                                && attempt < 4
+                            {
+                                tracing::debug!(attempt, "push got no responders, retrying");
+                                continue;
+                            }
                             let envelope = decode(&msg.payload)
                                 .map_err(|e| Error::SyncError(e.to_string()))?;
                             let response: PushResponse =
@@ -267,13 +296,8 @@ impl SyncClient {
                             );
                             break;
                         }
-                        Ok(Err(e)) => {
-                            let err_str = e.to_string();
-                            if err_str.contains("no responders") && attempt < 4 {
-                                tracing::debug!(attempt, "push got no responders, retrying");
-                                continue;
-                            }
-                            return Err(Error::SyncError(err_str));
+                        Ok(None) => {
+                            return Err(Error::SyncError("push inbox closed".to_string()));
                         }
                         Err(_) if attempt < 4 => {
                             tracing::debug!(attempt, "push timed out, retrying");
@@ -287,7 +311,9 @@ impl SyncClient {
                     }
                 }
                 push_result.ok_or_else(|| {
-                    Error::SyncError("push failed after retries: no responders".to_string())
+                    Error::SyncError(
+                        "push failed after retries: no response from server".to_string(),
+                    )
                 })?
             };
             last_successful_lsn = batch_max_lsn;
