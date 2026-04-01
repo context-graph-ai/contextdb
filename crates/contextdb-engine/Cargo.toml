@@ -45,3 +45,8 @@ path = "../../tests/acceptance.rs"
 name = "engine_throughput"
 harness = false
 path = "../../benches/engine_throughput.rs"
+
+[[bench]]
+name = "engine_full_throughput"
+harness = false
+path = "../../benches/engine_full_throughput.rs"

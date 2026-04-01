@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 fn sql_insert_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("sql_insert");
-    for count in [100, 1_000, 10_000] {
+    for count in [100, 500] {
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             b.iter(|| {
                 let db = Database::open_memory();
@@ -37,43 +37,50 @@ fn sql_insert_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn batched_insert_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("batched_insert");
-    for count in [1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            b.iter(|| {
-                let db = Database::open_memory();
-                db.execute(
-                    "CREATE TABLE items (id UUID PRIMARY KEY, seq INTEGER)",
-                    &HashMap::new(),
-                )
-                .unwrap();
-                let tx = db.begin();
-                for i in 0..count {
-                    db.insert_row(
-                        tx,
-                        "items",
-                        HashMap::from([
-                            (
-                                "id".to_string(),
-                                contextdb_core::Value::Uuid(Uuid::new_v4()),
-                            ),
-                            ("seq".to_string(), contextdb_core::Value::Int64(i as i64)),
-                        ]),
-                    )
-                    .unwrap();
-                }
-                db.commit(tx).unwrap();
-            });
-        });
+fn sql_query_throughput(c: &mut Criterion) {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, category TEXT, seq INTEGER, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    for i in 0..1_000 {
+        db.execute(
+            "INSERT INTO items (id, category, seq, name) VALUES ($id, $category, $seq, $name)",
+            &HashMap::from([
+                (
+                    "id".to_string(),
+                    contextdb_core::Value::Uuid(Uuid::new_v4()),
+                ),
+                (
+                    "category".to_string(),
+                    contextdb_core::Value::Text(if i % 2 == 0 { "a" } else { "b" }.to_string()),
+                ),
+                ("seq".to_string(), contextdb_core::Value::Int64(i)),
+                (
+                    "name".to_string(),
+                    contextdb_core::Value::Text(format!("item-{i}")),
+                ),
+            ]),
+        )
+        .unwrap();
     }
-    group.finish();
+
+    c.bench_function("sql_query/select_after_1k_rows", |b| {
+        b.iter(|| {
+            db.execute(
+                "SELECT id, name FROM items WHERE category = 'a' AND seq >= 500 ORDER BY seq DESC LIMIT 20",
+                &HashMap::new(),
+            )
+            .unwrap();
+        });
+    });
 }
 
 fn vector_insert_and_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector");
 
-    group.bench_function("insert_1000_vectors", |b| {
+    group.bench_function("insert_500_vectors", |b| {
         b.iter(|| {
             let db = Database::open_memory();
             db.execute(
@@ -82,7 +89,7 @@ fn vector_insert_and_search(c: &mut Criterion) {
             )
             .unwrap();
             let tx = db.begin();
-            for i in 0..1_000 {
+            for i in 0..500 {
                 let angle = i as f32 * 0.01;
                 let rid = db
                     .insert_row(
@@ -172,8 +179,8 @@ fn graph_bfs_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn persist_and_reopen(c: &mut Criterion) {
-    c.bench_function("persist_10k_rows_reopen", |b| {
+fn persist_and_reopen_smoke(c: &mut Criterion) {
+    c.bench_function("persist_1k_rows_reopen", |b| {
         b.iter(|| {
             let tmp = tempfile::TempDir::new().unwrap();
             let path = tmp.path().join("bench.db");
@@ -183,7 +190,7 @@ fn persist_and_reopen(c: &mut Criterion) {
                 &HashMap::new(),
             )
             .unwrap();
-            for batch in 0..100 {
+            for batch in 0..10 {
                 let tx = db.begin();
                 for i in 0..100 {
                     db.insert_row(
@@ -206,7 +213,7 @@ fn persist_and_reopen(c: &mut Criterion) {
             }
             db.close().unwrap();
             let db2 = Database::open(&path).unwrap();
-            assert_eq!(db2.scan("t", db2.snapshot()).unwrap().len(), 10_000);
+            assert_eq!(db2.scan("t", db2.snapshot()).unwrap().len(), 1_000);
         });
     });
 }
@@ -214,9 +221,9 @@ fn persist_and_reopen(c: &mut Criterion) {
 criterion_group!(
     benches,
     sql_insert_throughput,
-    batched_insert_throughput,
+    sql_query_throughput,
     vector_insert_and_search,
     graph_bfs_throughput,
-    persist_and_reopen,
+    persist_and_reopen_smoke,
 );
 criterion_main!(benches);

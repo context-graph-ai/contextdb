@@ -35,3 +35,13 @@ tokio.workspace = true
 name = "server_throughput"
 harness = false
 path = "../../benches/server_throughput.rs"
+
+[[bench]]
+name = "server_sync_system"
+harness = false
+path = "../../benches/server_sync_system.rs"
+
+[[bench]]
+name = "sync_pr"
+harness = false
+path = "../../benches/sync_pr.rs"
