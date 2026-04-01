@@ -64,15 +64,13 @@ impl<S: WriteSetApplicator> TxManager<S> {
     }
 
     pub fn commit_with_lsn(&self, tx: TxId) -> Result<u64> {
-        let mut ws = {
-            let mut active = self.active_txs.lock();
-            active.remove(&tx).ok_or(Error::TxNotFound(tx))?
-        };
-
         let _lock = self.commit_mutex.lock();
+        let mut ws = self.cloned_write_set(tx)?;
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         ws.stamp_lsn(lsn);
         self.store.apply(ws)?;
+        let mut active = self.active_txs.lock();
+        active.remove(&tx).ok_or(Error::TxNotFound(tx))?;
         self.committed_watermark.fetch_max(tx, Ordering::SeqCst);
         Ok(lsn)
     }

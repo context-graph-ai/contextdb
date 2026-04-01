@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 pub struct MemoryAccountant {
     limit: AtomicUsize,
     used: AtomicUsize,
-    has_limit: AtomicBool,
     startup_ceiling: AtomicUsize,
     has_ceiling: AtomicBool,
 }
@@ -27,7 +26,6 @@ impl MemoryAccountant {
         Self {
             limit: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
-            has_limit: AtomicBool::new(false),
             startup_ceiling: AtomicUsize::new(0),
             has_ceiling: AtomicBool::new(false),
         }
@@ -38,7 +36,6 @@ impl MemoryAccountant {
         Self {
             limit: AtomicUsize::new(bytes),
             used: AtomicUsize::new(0),
-            has_limit: AtomicBool::new(true),
             startup_ceiling: AtomicUsize::new(bytes),
             has_ceiling: AtomicBool::new(true),
         }
@@ -52,8 +49,8 @@ impl MemoryAccountant {
 
         loop {
             let used = self.used.load(Ordering::SeqCst);
-            if self.has_limit.load(Ordering::SeqCst) {
-                let limit = self.limit.load(Ordering::SeqCst);
+            let limit = self.limit.load(Ordering::SeqCst);
+            if limit != 0 {
                 let available = limit.saturating_sub(used);
                 if bytes > available {
                     return Err(crate::Error::MemoryBudgetExceeded {
@@ -116,11 +113,9 @@ impl MemoryAccountant {
         match limit {
             Some(bytes) => {
                 self.limit.store(bytes, Ordering::SeqCst);
-                self.has_limit.store(true, Ordering::SeqCst);
             }
             None => {
                 self.limit.store(0, Ordering::SeqCst);
-                self.has_limit.store(false, Ordering::SeqCst);
             }
         }
 
@@ -129,10 +124,10 @@ impl MemoryAccountant {
 
     /// Snapshot of current memory state.
     pub fn usage(&self) -> MemoryUsage {
-        let limit = self
-            .has_limit
-            .load(Ordering::SeqCst)
-            .then(|| self.limit.load(Ordering::SeqCst));
+        let limit = match self.limit.load(Ordering::SeqCst) {
+            0 => None,
+            bytes => Some(bytes),
+        };
         let used = self.used.load(Ordering::SeqCst);
         let startup_ceiling = self
             .has_ceiling

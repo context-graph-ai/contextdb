@@ -55,7 +55,7 @@ fn mem_01_set_budget_none_concurrent_allocate() {
 }
 
 #[test]
-fn mem_02_visible_at_uses_map_or() {
+fn mem_02_visible_at_uses_option_combinator() {
     let row = VersionedRow {
         row_id: 1,
         values: HashMap::new(),

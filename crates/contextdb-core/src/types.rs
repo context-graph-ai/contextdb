@@ -99,8 +99,7 @@ impl VersionedRow {
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
-        self.created_tx <= snapshot
-            && (self.deleted_tx.is_none() || self.deleted_tx.unwrap() > snapshot)
+        self.created_tx <= snapshot && self.deleted_tx.is_none_or(|tx| tx > snapshot)
     }
 }
 
@@ -121,8 +120,7 @@ impl AdjEntry {
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
-        self.created_tx <= snapshot
-            && (self.deleted_tx.is_none() || self.deleted_tx.unwrap() > snapshot)
+        self.created_tx <= snapshot && self.deleted_tx.is_none_or(|tx| tx > snapshot)
     }
 }
 
@@ -141,8 +139,7 @@ impl VectorEntry {
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
-        self.created_tx <= snapshot
-            && (self.deleted_tx.is_none() || self.deleted_tx.unwrap() > snapshot)
+        self.created_tx <= snapshot && self.deleted_tx.is_none_or(|tx| tx > snapshot)
     }
 }
 
