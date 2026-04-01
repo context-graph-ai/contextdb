@@ -1117,7 +1117,7 @@ impl Database {
         target: NodeId,
         edge_type: EdgeType,
         properties: HashMap<String, Value>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bytes = estimate_edge_bytes(source, target, &edge_type, &properties);
         self.accountant.try_allocate_for(
             bytes,
@@ -1126,9 +1126,21 @@ impl Database {
             "Reduce edge fan-out or raise MEMORY_LIMIT before inserting more graph edges.",
         )?;
 
-        self.graph
+        match self
+            .graph
             .insert_edge(tx, source, target, edge_type, properties)
-            .inspect_err(|_| self.accountant.release(bytes))
+        {
+            Ok(inserted) => {
+                if !inserted {
+                    self.accountant.release(bytes);
+                }
+                Ok(inserted)
+            }
+            Err(err) => {
+                self.accountant.release(bytes);
+                Err(err)
+            }
+        }
     }
 
     pub fn delete_edge(

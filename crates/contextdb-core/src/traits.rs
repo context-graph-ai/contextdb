@@ -54,7 +54,7 @@ pub trait GraphExecutor: Send + Sync {
         target: NodeId,
         edge_type: EdgeType,
         properties: HashMap<String, Value>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
     fn delete_edge(&self, tx: TxId, source: NodeId, target: NodeId, edge_type: &str) -> Result<()>;
 }
 

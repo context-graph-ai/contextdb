@@ -5,7 +5,9 @@ use contextdb_parser::ast::{
     AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
     SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
 };
-use contextdb_planner::{DeletePlan, GraphStepPlan, InsertPlan, PhysicalPlan, UpdatePlan, plan};
+use contextdb_planner::{
+    DeletePlan, GraphStepPlan, InsertPlan, OnConflictPlan, PhysicalPlan, UpdatePlan, plan,
+};
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -868,7 +870,26 @@ fn exec_insert(
         let checkpoint = db.write_set_checkpoint(txid)?;
 
         let row_id = if let Some(on_conflict) = &p.on_conflict {
-            match db.upsert_row(txid, &p.table, &on_conflict.columns[0], values.clone()) {
+            let conflict_col = &on_conflict.columns[0];
+            let conflict_value = values
+                .get(conflict_col)
+                .ok_or_else(|| Error::Other("conflict column not in values".to_string()))?;
+            let existing =
+                db.point_lookup(&p.table, conflict_col, conflict_value, db.snapshot())?;
+            let upsert_values = if let Some(existing_row) = existing.as_ref() {
+                apply_on_conflict_updates(
+                    db,
+                    &p.table,
+                    values.clone(),
+                    existing_row,
+                    on_conflict,
+                    params,
+                )?
+            } else {
+                values.clone()
+            };
+
+            match db.upsert_row(txid, &p.table, conflict_col, upsert_values) {
                 Ok(_) => 0,
                 Err(err) => {
                     db.accountant().release(row_bytes);
@@ -895,12 +916,20 @@ fn exec_insert(
                 values.get("target_id"),
                 values.get("edge_type"),
             )
-            && let Err(err) =
-                db.insert_edge(txid, *source, *target, edge_type.clone(), HashMap::new())
         {
-            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-            db.accountant().release(row_bytes);
-            return Err(err);
+            match db.insert_edge(txid, *source, *target, edge_type.clone(), HashMap::new()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    db.accountant().release(row_bytes);
+                    continue;
+                }
+                Err(err) => {
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    db.accountant().release(row_bytes);
+                    return Err(err);
+                }
+            }
         }
 
         if let Some(v) = vector_value_for_table(db, &p.table, &values)
@@ -1565,6 +1594,34 @@ fn eval_assignment_expr(
             expr
         ))),
     }
+}
+
+fn apply_on_conflict_updates(
+    db: &Database,
+    table: &str,
+    mut insert_values: HashMap<String, Value>,
+    existing_row: &VersionedRow,
+    on_conflict: &OnConflictPlan,
+    params: &HashMap<String, Value>,
+) -> Result<HashMap<String, Value>> {
+    if on_conflict.update_columns.is_empty() {
+        return Ok(insert_values);
+    }
+
+    let mut merged = existing_row.values.clone();
+    for (column, expr) in &on_conflict.update_columns {
+        let value = eval_assignment_expr(expr, &existing_row.values, params)?;
+        merged.insert(
+            column.clone(),
+            coerce_value_for_column(db, table, column, value)?,
+        );
+    }
+
+    for (column, value) in insert_values.drain() {
+        merged.entry(column).or_insert(value);
+    }
+
+    Ok(merged)
 }
 
 fn literal_to_value(lit: &Literal) -> Result<Value> {
@@ -2324,12 +2381,14 @@ fn coerce_value_for_column(db: &Database, table: &str, col: &str, v: Value) -> R
     match column.column_type {
         contextdb_core::ColumnType::Uuid => coerce_uuid_value(v),
         contextdb_core::ColumnType::Timestamp => coerce_timestamp_value(v),
+        contextdb_core::ColumnType::Vector(dim) => coerce_vector_value(v, dim),
         _ => Ok(coerce_uuid_if_needed(col, v)),
     }
 }
 
 fn coerce_uuid_value(v: Value) -> Result<Value> {
     match v {
+        Value::Null => Ok(Value::Null),
         Value::Uuid(id) => Ok(Value::Uuid(id)),
         Value::Text(text) => uuid::Uuid::parse_str(&text)
             .map(Value::Uuid)
@@ -2352,6 +2411,7 @@ fn coerce_uuid_if_needed(col: &str, v: Value) -> Value {
 
 fn coerce_timestamp_value(v: Value) -> Result<Value> {
     match v {
+        Value::Null => Ok(Value::Null),
         Value::Text(text) if text.eq_ignore_ascii_case("infinity") => {
             Ok(Value::Timestamp(i64::MAX))
         }
@@ -2365,6 +2425,45 @@ fn coerce_timestamp_value(v: Value) -> Result<Value> {
         }
         other => Ok(other),
     }
+}
+
+fn coerce_vector_value(v: Value, expected_dim: usize) -> Result<Value> {
+    let vector = match v {
+        Value::Null => return Ok(Value::Null),
+        Value::Vector(vector) => vector,
+        Value::Text(text) => parse_text_vector_literal(&text)?,
+        other => return Ok(other),
+    };
+
+    if vector.len() != expected_dim {
+        return Err(Error::VectorDimensionMismatch {
+            expected: expected_dim,
+            got: vector.len(),
+        });
+    }
+
+    Ok(Value::Vector(vector))
+}
+
+fn parse_text_vector_literal(text: &str) -> Result<Vec<f32>> {
+    let trimmed = text.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| Error::Other(format!("invalid VECTOR literal '{text}'")))?;
+
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    inner
+        .split(',')
+        .map(|part| {
+            part.trim().parse::<f32>().map_err(|err| {
+                Error::Other(format!("invalid VECTOR component '{}': {err}", part.trim()))
+            })
+        })
+        .collect()
 }
 
 fn apply_missing_column_defaults(

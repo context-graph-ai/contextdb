@@ -731,11 +731,17 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
             })
         }
         Rule::between_suffix => {
-            let mut vals = suffix
-                .into_inner()
-                .filter(|p| p.as_rule() == Rule::additive_expr)
-                .map(build_additive_expr)
-                .collect::<Result<Vec<_>>>()?;
+            let mut negated = false;
+            let mut vals = Vec::new();
+            for p in suffix.into_inner() {
+                match p.as_rule() {
+                    Rule::not_op => negated = true,
+                    Rule::additive_expr => vals.push(build_additive_expr(p)?),
+                    other => {
+                        return Err(unexpected_rule(other, "build_comparison_suffix.between"));
+                    }
+                }
+            }
 
             if vals.len() != 2 {
                 return Err(Error::ParseError(
@@ -755,11 +761,20 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
                 op: BinOp::Lte,
                 right: Box::new(upper),
             };
-            Ok(Expr::BinaryOp {
+            let between = Expr::BinaryOp {
                 left: Box::new(gte),
                 op: BinOp::And,
                 right: Box::new(lte),
-            })
+            };
+
+            if negated {
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    operand: Box::new(between),
+                })
+            } else {
+                Ok(between)
+            }
         }
         Rule::in_suffix => {
             let mut negated = false;

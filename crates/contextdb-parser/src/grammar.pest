@@ -281,7 +281,7 @@ comparison_expr = { additive_expr ~ comparison_suffix? }
 comparison_suffix = { between_suffix | in_suffix | like_suffix | is_null_suffix | cmp_suffix }
 cmp_suffix = { cmp_op ~ additive_expr }
 cmp_op = { "=" | "!=" | "<>" | "<=" | ">=" | "<" | ">" }
-between_suffix = { ^"BETWEEN" ~ additive_expr ~ ^"AND" ~ additive_expr }
+between_suffix = { not_op? ~ ^"BETWEEN" ~ additive_expr ~ ^"AND" ~ additive_expr }
 in_suffix = { not_op? ~ ^"IN" ~ "(" ~ in_contents ~ ")" }
 in_contents = { select_core | expr ~ ("," ~ expr)* }
 like_suffix = { not_op? ~ ^"LIKE" ~ additive_expr }

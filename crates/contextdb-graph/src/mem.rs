@@ -214,7 +214,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         target: NodeId,
         edge_type: EdgeType,
         properties: std::collections::HashMap<String, Value>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let deleted_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
             ws.adj_deletes
                 .iter()
@@ -228,7 +228,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
                     e.target == target && e.edge_type == edge_type && e.deleted_tx.is_none()
                 });
                 if live_in_committed && !deleted_in_ws {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -241,7 +241,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
             inserted && !deleted_in_ws
         })?;
         if duplicate_in_ws {
-            return Ok(());
+            return Ok(false);
         }
 
         if self.dag_edge_types.read().contains(&edge_type) {
@@ -276,7 +276,7 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
             ws.adj_inserts.push(entry);
         })?;
 
-        Ok(())
+        Ok(true)
     }
 
     fn delete_edge(&self, tx: TxId, source: NodeId, target: NodeId, edge_type: &str) -> Result<()> {
