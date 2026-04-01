@@ -2697,12 +2697,7 @@ fn a10_04_bfs_aborts_on_frontier_overflow() {
     }
 }
 
-#[test]
-#[ignore = "requires external RSS harness for deterministic process-memory assertion"]
-fn a10_05_peak_rss_within_2gb() {
-    let _db = setup_ontology_db();
-    todo!("run large persisted mixed workload and assert peak RSS <= 2GB");
-}
+// a10_05 moved to peak_rss_harness.rs
 
 #[test]
 #[ignore = "requires ARM64 cross-compile CI gate"]

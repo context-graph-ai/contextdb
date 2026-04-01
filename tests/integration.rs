@@ -28,6 +28,9 @@ mod hnsw_tests;
 mod job_level;
 #[path = "integration/memory_accounting_tests.rs"]
 mod memory_accounting_tests;
+#[cfg(target_os = "linux")]
+#[path = "integration/peak_rss_harness.rs"]
+mod peak_rss_harness;
 #[path = "integration/persistence_tests.rs"]
 mod persistence_tests;
 #[path = "integration/plugin_tests.rs"]
