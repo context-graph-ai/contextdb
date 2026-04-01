@@ -49,6 +49,8 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::Select(sel) => plan_select(sel),
         Statement::SetMemoryLimit(val) => Ok(PhysicalPlan::SetMemoryLimit(val.clone())),
         Statement::ShowMemoryLimit => Ok(PhysicalPlan::ShowMemoryLimit),
+        Statement::SetDiskLimit(val) => Ok(PhysicalPlan::SetDiskLimit(val.clone())),
+        Statement::ShowDiskLimit => Ok(PhysicalPlan::ShowDiskLimit),
         Statement::SetSyncConflictPolicy(policy) => {
             Ok(PhysicalPlan::SetSyncConflictPolicy(policy.clone()))
         }

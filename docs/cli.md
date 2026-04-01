@@ -21,6 +21,7 @@ contextdb-cli <PATH> [OPTIONS]
 | `--nats-url <URL>` | `CONTEXTDB_NATS_URL` | `ws://localhost:9222` | NATS WebSocket URL for sync. |
 | `--tenant-id <ID>` | `CONTEXTDB_TENANT_ID` | *(none)* | Tenant ID. Omit for local-only mode. |
 | `--memory-limit <SIZE>` | `CONTEXTDB_MEMORY_LIMIT` | *(unlimited)* | Memory ceiling. Suffixes: `K`, `M`, `G`. |
+| `--disk-limit <SIZE>` | `CONTEXTDB_DISK_LIMIT` | *(unlimited)* | Disk ceiling for file-backed databases. Suffixes: `K`, `M`, `G`. Ignored for `:memory:`. |
 
 ### Local-Only Mode
 
@@ -76,6 +77,13 @@ contextdb> SELECT * FROM entities;
 ```
 
 The REPL accepts SQL statements (see [Query Language](query-language.md)) and meta-commands.
+
+Runtime budget control is SQL-driven:
+
+- `SET MEMORY_LIMIT '512M'` / `SHOW MEMORY_LIMIT`
+- `SET DISK_LIMIT '1G'` / `SHOW DISK_LIMIT`
+
+For file-backed databases, `SET DISK_LIMIT` persists in the database file and survives reopen. `:memory:` accepts the command but ignores it.
 
 ### Meta-Commands
 

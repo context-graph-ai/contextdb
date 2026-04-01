@@ -29,6 +29,10 @@ struct Args {
     #[arg(long, env = "CONTEXTDB_MEMORY_LIMIT")]
     memory_limit: Option<String>,
 
+    /// Disk limit for file-backed databases (e.g. 4G, 512M). Sets startup ceiling.
+    #[arg(long, env = "CONTEXTDB_DISK_LIMIT")]
+    disk_limit: Option<String>,
+
     /// Debounce interval for background auto-sync pushes.
     #[arg(long, env = "CONTEXTDB_SYNC_DEBOUNCE_MS", default_value_t = 500)]
     sync_debounce_ms: u64,
@@ -43,7 +47,7 @@ fn main() {
     let accountant = args
         .memory_limit
         .as_ref()
-        .map(|limit| parse_memory_limit(limit).map(contextdb_core::MemoryAccountant::with_budget))
+        .map(|limit| parse_size_limit(limit).map(contextdb_core::MemoryAccountant::with_budget))
         .transpose()
         .unwrap_or_else(|err| {
             eprintln!("Error: invalid --memory-limit: {err}");
@@ -51,6 +55,15 @@ fn main() {
         })
         .map(Arc::new)
         .unwrap_or_else(|| Arc::new(contextdb_core::MemoryAccountant::no_limit()));
+    let disk_limit = args
+        .disk_limit
+        .as_ref()
+        .map(|limit| parse_size_limit(limit).map(|bytes| bytes as u64))
+        .transpose()
+        .unwrap_or_else(|err| {
+            eprintln!("Error: invalid --disk-limit: {err}");
+            std::process::exit(1);
+        });
 
     // If sync is configured, create the SyncPlugin before opening the DB.
     // Keep the rx end alive — a background task will consume it for debounced pushes.
@@ -76,10 +89,11 @@ fn main() {
             contextdb_engine::Database::open_memory_with_accountant(accountant.clone())
         }
     } else if let Some(ref plugin) = sync_plugin_arc {
-        match contextdb_engine::Database::open_with_config(
+        match contextdb_engine::Database::open_with_config_and_disk_limit(
             std::path::Path::new(&args.path),
             plugin.clone(),
             accountant.clone(),
+            disk_limit,
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -88,10 +102,11 @@ fn main() {
             }
         }
     } else {
-        match contextdb_engine::Database::open_with_config(
+        match contextdb_engine::Database::open_with_config_and_disk_limit(
             std::path::Path::new(&args.path),
             Arc::new(contextdb_engine::plugin::CorePlugin),
             accountant.clone(),
+            disk_limit,
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -202,10 +217,10 @@ fn main() {
     }
 }
 
-fn parse_memory_limit(value: &str) -> Result<usize, String> {
+fn parse_size_limit(value: &str) -> Result<usize, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err("memory limit cannot be empty".to_string());
+        return Err("limit cannot be empty".to_string());
     }
 
     let split_at = trimmed

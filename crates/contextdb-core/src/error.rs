@@ -76,6 +76,15 @@ pub enum Error {
         budget_limit_bytes: usize,
         hint: String,
     },
+    #[error(
+        "disk budget exceeded: {operation} - file is {current_bytes} bytes, limit is {budget_limit_bytes} bytes. Hint: {hint}"
+    )]
+    DiskBudgetExceeded {
+        operation: String,
+        current_bytes: u64,
+        budget_limit_bytes: u64,
+        hint: String,
+    },
     #[error("{0}")]
     Other(String),
 }

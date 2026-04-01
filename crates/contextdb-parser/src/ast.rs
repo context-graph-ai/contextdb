@@ -13,6 +13,8 @@ pub enum Statement {
     Rollback,
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
+    SetDiskLimit(SetDiskLimitValue),
+    ShowDiskLimit,
     SetSyncConflictPolicy(String),
     ShowSyncConflictPolicy,
 }
@@ -20,6 +22,12 @@ pub enum Statement {
 #[derive(Debug, Clone)]
 pub enum SetMemoryLimitValue {
     Bytes(usize),
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetDiskLimitValue {
+    Bytes(u64),
     None,
 }
 

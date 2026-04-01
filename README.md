@@ -175,6 +175,7 @@ contextdb is designed for agentic memory, not data warehousing:
 - Sparse graphs with bounded traversal (depth <= 10)
 - Append-heavy writes, small transactions
 - Configurable memory budget via `SET MEMORY_LIMIT` (no hard-coded ceiling)
+- Configurable file-growth budget via `SET DISK_LIMIT` / `SHOW DISK_LIMIT` or `--disk-limit` / `CONTEXTDB_DISK_LIMIT` for file-backed databases
 - Laptops, ARM64 devices (browser and mobile via Rust's WASM target are future directions)
 
 ## Documentation

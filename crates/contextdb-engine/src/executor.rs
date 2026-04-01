@@ -3,7 +3,7 @@ use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
 use contextdb_parser::ast::{
     AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
-    SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
+    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
 };
 use contextdb_planner::{
     DeletePlan, GraphStepPlan, InsertPlan, OnConflictPlan, PhysicalPlan, UpdatePlan, plan,
@@ -684,6 +684,45 @@ pub(crate) fn execute_plan(
                 rows_affected: 0,
             })
         }
+        PhysicalPlan::SetDiskLimit(val) => {
+            let limit = match val {
+                SetDiskLimitValue::Bytes(bytes) => Some(*bytes),
+                SetDiskLimitValue::None => None,
+            };
+            db.set_disk_limit(limit)?;
+            db.persist_disk_limit(limit)?;
+            Ok(QueryResult::empty())
+        }
+        PhysicalPlan::ShowDiskLimit => {
+            let limit = db.disk_limit();
+            let used = db.disk_file_size();
+            let startup_ceiling = db.disk_limit_startup_ceiling();
+            Ok(QueryResult {
+                columns: vec![
+                    "limit".to_string(),
+                    "used".to_string(),
+                    "available".to_string(),
+                    "startup_ceiling".to_string(),
+                ],
+                rows: vec![vec![
+                    limit
+                        .map(|value| Value::Int64(value as i64))
+                        .unwrap_or_else(|| Value::Text("none".to_string())),
+                    used.map(|value| Value::Int64(value as i64))
+                        .unwrap_or(Value::Null),
+                    match (limit, used) {
+                        (Some(limit), Some(used)) => {
+                            Value::Int64(limit.saturating_sub(used) as i64)
+                        }
+                        _ => Value::Null,
+                    },
+                    startup_ceiling
+                        .map(|value| Value::Int64(value as i64))
+                        .unwrap_or_else(|| Value::Text("none".to_string())),
+                ]],
+                rows_affected: 0,
+            })
+        }
         PhysicalPlan::SetSyncConflictPolicy(policy) => {
             let cp = parse_conflict_policy(policy)?;
             db.set_default_conflict_policy(cp);
@@ -830,6 +869,7 @@ fn exec_insert(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
 ) -> Result<QueryResult> {
+    db.check_disk_budget("INSERT")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for insert".to_string()))?;
 
     // When no column list is provided (INSERT INTO t VALUES (...)),
@@ -983,6 +1023,7 @@ fn exec_update(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
 ) -> Result<QueryResult> {
+    db.check_disk_budget("UPDATE")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for update".to_string()))?;
     let snapshot = db.snapshot();
     let rows = db.scan(&p.table, snapshot)?;

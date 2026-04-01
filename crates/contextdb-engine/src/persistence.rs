@@ -39,6 +39,10 @@ impl RedbPersistence {
         Self::release_pid_lock(&self.path);
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// PID-based advisory lock. Writes current PID to a .lock file.
     /// On open, checks if the .lock file exists and if the PID in it is still alive.
     fn acquire_pid_lock(path: &Path) -> Result<()> {

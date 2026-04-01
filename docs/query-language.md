@@ -111,7 +111,14 @@ SET SYNC_CONFLICT_POLICY 'latest_wins'
 SHOW SYNC_CONFLICT_POLICY
 SET MEMORY_LIMIT '512M'
 SHOW MEMORY_LIMIT
+SET DISK_LIMIT '1G'
+SET DISK_LIMIT 'none'
+SHOW DISK_LIMIT
 ```
+
+`SHOW MEMORY_LIMIT` returns `limit`, `used`, `available`, and `startup_ceiling`.
+
+`SHOW DISK_LIMIT` returns the same columns for file-backed storage. On `:memory:` databases, disk limit commands are accepted but ignored.
 
 ---
 

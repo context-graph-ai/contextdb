@@ -222,6 +222,14 @@ The planner is rule-based (no cost optimizer). Key planning decisions:
 
 ---
 
-## Memory Accounting
+## Memory And Disk Budgets
 
-`MemoryAccountant` tracks memory usage against a configurable budget. Set via `--memory-limit` in the CLI or `MemoryAccountant::with_budget(bytes)` in the API. All vector and row allocations are accounted. Budget exceeded → operations return `MemoryLimitExceeded`.
+`MemoryAccountant` tracks memory usage against a configurable budget. Set via `--memory-limit` in the CLI or `MemoryAccountant::with_budget(bytes)` in the API. All vector and row allocations are accounted. Budget exceeded → operations return `MemoryBudgetExceeded`.
+
+File-backed databases also support a persisted disk budget:
+
+- startup ceiling/default via `--disk-limit` or `CONTEXTDB_DISK_LIMIT`
+- runtime control via `SET DISK_LIMIT` / `SHOW DISK_LIMIT`
+- persisted live config in the redb file so reopen preserves the limit
+
+Disk enforcement happens in the engine write paths before `INSERT`, `UPDATE`, and sync-apply work begins. Once the on-disk file is at or above the configured limit, further file-backed writes fail with `DiskBudgetExceeded`. In-memory databases accept the SQL but ignore disk budgeting because there is no backing file to measure.

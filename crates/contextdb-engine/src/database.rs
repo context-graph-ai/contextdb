@@ -76,6 +76,8 @@ pub struct Database {
     subscriptions: Mutex<SubscriptionState>,
     pruning_runtime: Mutex<PruningRuntime>,
     pruning_guard: Arc<Mutex<()>>,
+    disk_limit: AtomicU64,
+    disk_limit_startup_ceiling: AtomicU64,
     sync_watermark: Arc<AtomicU64>,
     closed: AtomicBool,
 }
@@ -157,6 +159,8 @@ impl Database {
         persistence: Option<Arc<RedbPersistence>>,
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
+        disk_limit: Option<u64>,
+        disk_limit_startup_ceiling: Option<u64>,
     ) -> Self {
         Self {
             tx_mgr: tx_mgr.clone(),
@@ -182,6 +186,8 @@ impl Database {
             subscriptions: Mutex::new(SubscriptionState::new()),
             pruning_runtime: Mutex::new(PruningRuntime::new()),
             pruning_guard: Arc::new(Mutex::new(())),
+            disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
+            disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
             sync_watermark: Arc::new(AtomicU64::new(0)),
             closed: AtomicBool::new(false),
         }
@@ -207,6 +213,7 @@ impl Database {
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
         mut accountant: Arc<MemoryAccountant>,
+        startup_disk_limit: Option<u64>,
     ) -> Result<Self> {
         let path = path.as_ref();
         let persistence = if path.exists() {
@@ -219,6 +226,14 @@ impl Database {
         {
             accountant = Arc::new(MemoryAccountant::with_budget(limit));
         }
+        let persisted_disk_limit = persistence.load_config_value::<u64>("disk_limit")?;
+        let startup_disk_ceiling = startup_disk_limit;
+        let effective_disk_limit = match (persisted_disk_limit, startup_disk_limit) {
+            (Some(persisted), Some(ceiling)) => Some(persisted.min(ceiling)),
+            (Some(persisted), None) => Some(persisted),
+            (None, Some(ceiling)) => Some(ceiling),
+            (None, None) => None,
+        };
 
         let all_meta = persistence.load_all_table_meta()?;
 
@@ -283,6 +298,8 @@ impl Database {
             Some(persistence),
             plugin,
             accountant,
+            effective_disk_limit,
+            startup_disk_ceiling,
         );
 
         for meta in all_meta.values() {
@@ -318,6 +335,7 @@ impl Database {
 
         let db = Self::build_db(
             tx_mgr, relational, graph, vector, hnsw, change_log, ddl_log, None, plugin, accountant,
+            None, None,
         );
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         Ok(db)
@@ -1348,7 +1366,7 @@ impl Database {
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
     ) -> Result<Self> {
-        let db = Self::open_loaded(path, plugin, Arc::new(MemoryAccountant::no_limit()))?;
+        let db = Self::open_loaded(path, plugin, Arc::new(MemoryAccountant::no_limit()), None)?;
         db.plugin.on_open()?;
         Ok(db)
     }
@@ -1358,6 +1376,15 @@ impl Database {
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
+    ) -> Result<Self> {
+        Self::open_with_config_and_disk_limit(path, plugin, accountant, None)
+    }
+
+    pub fn open_with_config_and_disk_limit(
+        path: impl AsRef<Path>,
+        plugin: Arc<dyn DatabasePlugin>,
+        accountant: Arc<MemoryAccountant>,
+        startup_disk_limit: Option<u64>,
     ) -> Result<Self> {
         let path = path.as_ref();
         if path.as_os_str() == ":memory:" {
@@ -1373,7 +1400,7 @@ impl Database {
         } else {
             accountant
         };
-        let db = Self::open_loaded(path, plugin, accountant)?;
+        let db = Self::open_loaded(path, plugin, accountant, startup_disk_limit)?;
         db.plugin.on_open()?;
         Ok(db)
     }
@@ -1660,6 +1687,85 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    pub fn set_disk_limit(&self, limit: Option<u64>) -> Result<()> {
+        if self.persistence.is_none() {
+            self.disk_limit.store(0, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        let ceiling = self.disk_limit_startup_ceiling();
+        if let Some(ceiling) = ceiling {
+            match limit {
+                Some(bytes) if bytes > ceiling => {
+                    return Err(Error::Other(format!(
+                        "disk limit {bytes} exceeds startup ceiling {ceiling}"
+                    )));
+                }
+                None => {
+                    return Err(Error::Other(
+                        "cannot remove disk limit when a startup ceiling is set".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        self.disk_limit.store(limit.unwrap_or(0), Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn disk_limit(&self) -> Option<u64> {
+        match self.disk_limit.load(Ordering::SeqCst) {
+            0 => None,
+            bytes => Some(bytes),
+        }
+    }
+
+    pub fn disk_limit_startup_ceiling(&self) -> Option<u64> {
+        match self.disk_limit_startup_ceiling.load(Ordering::SeqCst) {
+            0 => None,
+            bytes => Some(bytes),
+        }
+    }
+
+    pub fn disk_file_size(&self) -> Option<u64> {
+        self.persistence
+            .as_ref()
+            .map(|persistence| std::fs::metadata(persistence.path()).map(|meta| meta.len()))
+            .transpose()
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) fn persist_disk_limit(&self, limit: Option<u64>) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            match limit {
+                Some(limit) => persistence.flush_config_value("disk_limit", &limit)?,
+                None => persistence.remove_config_value("disk_limit")?,
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check_disk_budget(&self, operation: &str) -> Result<()> {
+        let Some(limit) = self.disk_limit() else {
+            return Ok(());
+        };
+        let Some(current_bytes) = self.disk_file_size() else {
+            return Ok(());
+        };
+        if current_bytes < limit {
+            return Ok(());
+        }
+        Err(Error::DiskBudgetExceeded {
+            operation: operation.to_string(),
+            current_bytes,
+            budget_limit_bytes: limit,
+            hint: "Reduce retained file-backed data or raise DISK_LIMIT before writing more data."
+                .to_string(),
+        })
     }
 
     pub fn persisted_sync_watermarks(&self, tenant_id: &str) -> Result<(u64, u64)> {
@@ -2220,6 +2326,8 @@ impl Database {
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
         self.plugin.on_sync_pull(&mut changes)?;
+        self.check_disk_budget("sync_pull")?;
+        self.preflight_sync_apply_memory(&changes, policies)?;
 
         let mut tx = self.begin();
         let mut result = ApplyResult {
@@ -3089,7 +3197,10 @@ fn persisted_memory_limit(path: &Path) -> Result<Option<usize>> {
 }
 
 fn is_fatal_sync_apply_error(err: &Error) -> bool {
-    matches!(err, Error::MemoryBudgetExceeded { .. })
+    matches!(
+        err,
+        Error::MemoryBudgetExceeded { .. } | Error::DiskBudgetExceeded { .. }
+    )
 }
 
 fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {

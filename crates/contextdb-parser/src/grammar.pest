@@ -20,6 +20,8 @@ stmt = _{
     | show_sync_conflict_policy
     | set_memory_limit
     | show_memory_limit
+    | set_disk_limit
+    | show_disk_limit
     | select_stmt
 }
 
@@ -29,6 +31,9 @@ conflict_policy_value = { ^"latest_wins" | ^"server_wins" | ^"edge_wins" | ^"ins
 set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "'" ~ memory_limit_value ~ "'" }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }
+set_disk_limit = { ^"SET" ~ ^"DISK_LIMIT" ~ "'" ~ disk_limit_value ~ "'" }
+show_disk_limit = { ^"SHOW" ~ ^"DISK_LIMIT" }
+disk_limit_value = { ^"none" | size_with_unit }
 size_with_unit = { ASCII_DIGIT+ ~ ("G" | "M" | "K") }
 
 begin_stmt = { ^"BEGIN" }

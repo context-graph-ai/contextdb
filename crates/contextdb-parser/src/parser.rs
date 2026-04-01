@@ -63,6 +63,8 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::show_sync_conflict_policy => Statement::ShowSyncConflictPolicy,
         Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
         Rule::show_memory_limit => Statement::ShowMemoryLimit,
+        Rule::set_disk_limit => Statement::SetDiskLimit(build_set_disk_limit(inner)?),
+        Rule::show_disk_limit => Statement::ShowDiskLimit,
         _ => return Err(Error::ParseError("unsupported statement".to_string())),
     };
 
@@ -2094,20 +2096,46 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
         .ok_or_else(|| Error::ParseError("empty memory_limit_value".to_string()))?;
 
     match value_inner.as_rule() {
-        Rule::size_with_unit => {
-            let text = value_inner.as_str();
-            let (digits, suffix) = text.split_at(text.len() - 1);
-            let base: usize = digits
-                .parse()
-                .map_err(|e| Error::ParseError(format!("invalid size number: {e}")))?;
-            let multiplier = match suffix {
-                "G" | "g" => 1024 * 1024 * 1024,
-                "M" | "m" => 1024 * 1024,
-                "K" | "k" => 1024,
-                _ => return Err(Error::ParseError(format!("unknown size suffix: {suffix}"))),
-            };
-            Ok(SetMemoryLimitValue::Bytes(base * multiplier))
-        }
+        Rule::size_with_unit => Ok(SetMemoryLimitValue::Bytes(parse_size_with_unit(
+            value_inner.as_str(),
+        )? as usize)),
         _ => Ok(SetMemoryLimitValue::None),
     }
+}
+
+fn build_set_disk_limit(pair: Pair<'_, Rule>) -> Result<SetDiskLimitValue> {
+    let inner = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::disk_limit_value)
+        .ok_or_else(|| Error::ParseError("missing disk_limit_value".to_string()))?;
+
+    if inner.as_str().eq_ignore_ascii_case("none") {
+        return Ok(SetDiskLimitValue::None);
+    }
+
+    let value_inner = inner
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("empty disk_limit_value".to_string()))?;
+
+    match value_inner.as_rule() {
+        Rule::size_with_unit => Ok(SetDiskLimitValue::Bytes(parse_size_with_unit(
+            value_inner.as_str(),
+        )?)),
+        _ => Ok(SetDiskLimitValue::None),
+    }
+}
+
+fn parse_size_with_unit(text: &str) -> Result<u64> {
+    let (digits, suffix) = text.split_at(text.len() - 1);
+    let base: u64 = digits
+        .parse()
+        .map_err(|e| Error::ParseError(format!("invalid size number: {e}")))?;
+    let multiplier = match suffix {
+        "G" | "g" => 1024 * 1024 * 1024,
+        "M" | "m" => 1024 * 1024,
+        "K" | "k" => 1024,
+        _ => return Err(Error::ParseError(format!("unknown size suffix: {suffix}"))),
+    };
+    Ok(base * multiplier)
 }
