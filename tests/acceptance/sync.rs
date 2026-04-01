@@ -709,9 +709,61 @@ async fn f12c_auto_sync_pushes_deletes() {
     // Wait for DELETE to propagate — server should have 1 row, not 2
     // Each checker uses a unique path to avoid stale local data from previous pulls
     let mut checker_idx = 0u32;
+    let mut last_stdout = String::new();
     let found = wait_until(Duration::from_secs(10), || {
         checker_idx += 1;
         let fresh_path = edge_path.with_file_name(format!("f12c-checker-{checker_idx}.db"));
+        let check = run_cli_script(
+            &fresh_path,
+            &["--tenant-id", tenant, "--nats-url", nats_url],
+            "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+             .sync pull\n\
+             SELECT count(*) FROM sensors\n\
+             .quit\n",
+        );
+        let stdout = output_string(&check.stdout);
+        last_stdout = stdout.clone();
+        stdout.contains("| 1")
+    });
+
+    write_child_stdin(&mut child, ".quit\n");
+    let output = child.wait_with_output().expect("collect f12c child output");
+    stop_child(&mut server);
+
+    assert!(
+        found,
+        "DELETE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}; last checker stdout={last_stdout}",
+        output_string(&output.stdout),
+        output_string(&output.stderr),
+    );
+}
+
+/// I enabled .sync auto, wrote data while the server was temporarily unavailable,
+/// and the change appeared once the server came up without requiring another write.
+#[tokio::test]
+async fn f12d_auto_sync_retries_after_server_starts_late() {
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f12d-edge.db");
+    let server_path = temp_db_file(&tmp, "f12d-server.db");
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
+    let tenant = "f12d_auto_sync_retries_after_server_starts_late";
+
+    let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", nats_url]);
+    write_child_stdin(
+        &mut child,
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+         .sync auto on\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'late-server')\n",
+    );
+
+    std::thread::sleep(Duration::from_secs(2));
+    let mut server = spawn_server(&server_path, tenant, nats_url);
+
+    let mut checker_idx = 0u32;
+    let found = wait_until(Duration::from_secs(10), || {
+        checker_idx += 1;
+        let fresh_path = edge_path.with_file_name(format!("f12d-checker-{checker_idx}.db"));
         let check = run_cli_script(
             &fresh_path,
             &["--tenant-id", tenant, "--nats-url", nats_url],
@@ -730,7 +782,125 @@ async fn f12c_auto_sync_pushes_deletes() {
 
     assert!(
         found,
-        "DELETE must auto-sync to server while CLI is still running"
+        "auto-sync must retry a failed background push when the server starts later"
+    );
+}
+
+/// I enabled .sync auto, changed data, quit immediately, and the CLI still flushed the pending
+/// sync work before shutdown.
+#[tokio::test]
+async fn f12e_quit_flushes_pending_auto_sync_work() {
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f12e-edge.db");
+    let server_path = temp_db_file(&tmp, "f12e-server.db");
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
+    let tenant = "f12e_quit_flushes_pending_auto_sync_work";
+    let mut server = spawn_server(&server_path, tenant, nats_url);
+
+    let output = run_cli_script(
+        &edge_path,
+        &[
+            "--tenant-id",
+            tenant,
+            "--nats-url",
+            nats_url,
+            "--sync-debounce-ms",
+            "5000",
+        ],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+         .sync auto on\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'flush-me')\n\
+         .quit\n",
+    );
+
+    stop_child(&mut server);
+    assert!(output.status.success(), "CLI session must succeed");
+    assert_eq!(
+        count_rows_from_file(&server_path, "sensors"),
+        1,
+        "quit must flush pending auto-sync work even when the debounce window has not elapsed"
+    );
+}
+
+/// I deleted a row and quit immediately, and the pending delete was still flushed on shutdown.
+#[tokio::test]
+async fn f12e_quit_flushes_pending_delete_with_long_debounce() {
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f12e-edge.db");
+    let server_path = temp_db_file(&tmp, "f12e-server.db");
+    let nats = start_nats().await;
+    let nats_url = &nats.nats_url;
+    let tenant = "f12e_quit_flushes_pending_delete_with_long_debounce";
+    let mut server = spawn_server(&server_path, tenant, nats_url);
+
+    let output = run_cli_script(
+        &edge_path,
+        &[
+            "--tenant-id",
+            tenant,
+            "--nats-url",
+            nats_url,
+            "--sync-debounce-ms",
+            "5000",
+        ],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep')\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me')\n\
+         .sync push\n\
+         .sync auto on\n\
+         DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002'\n\
+         .quit\n",
+    );
+
+    stop_child(&mut server);
+
+    assert!(
+        output.status.success(),
+        "CLI should exit cleanly after flushing pending delete: stdout={}; stderr={}",
+        output_string(&output.stdout),
+        output_string(&output.stderr)
+    );
+    assert_eq!(
+        count_rows_from_file(&server_path, "sensors"),
+        1,
+        "pending delete must flush during shutdown before the database closes"
+    );
+}
+
+/// I quit with pending sync work while sync transport was unavailable, and the CLI surfaced a
+/// clear shutdown sync failure instead of exiting successfully.
+#[tokio::test]
+async fn f12f_quit_reports_failed_final_sync_flush() {
+    let tmp = TempDir::new().expect("tempdir");
+    let edge_path = temp_db_file(&tmp, "f12f-edge.db");
+
+    let output = run_cli_script(
+        &edge_path,
+        &[
+            "--tenant-id",
+            "f12f_quit_reports_failed_final_sync_flush",
+            "--nats-url",
+            "ws://127.0.0.1:65531",
+            "--sync-debounce-ms",
+            "5000",
+        ],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+         .sync auto on\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'unsent')\n\
+         .quit\n",
+    );
+
+    let stderr = output_string(&output.stderr).to_lowercase();
+    assert!(
+        !output.status.success(),
+        "CLI must not exit successfully when the final sync flush fails silently; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("final sync")
+            || stderr.contains("cannot connect")
+            || stderr.contains("push failed"),
+        "shutdown sync failure must be reported clearly; stderr={stderr}"
     );
 }
 

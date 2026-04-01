@@ -1,4 +1,5 @@
 use super::common::*;
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -205,4 +206,68 @@ async fn f21b_cross_edge_graph_construction_via_sync() {
     );
     stop_child(&mut server);
     assert!(output_string(&pulled.stdout).contains("00000000-0000-0000-0000-000000000002"));
+}
+
+/// I deleted a row on edge A with auto-sync enabled, and edge B observed the deletion through pull
+/// without waiting for edge A to quit.
+#[tokio::test]
+async fn f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits() {
+    let tmp = TempDir::new().expect("tempdir");
+    let server_path = temp_db_file(&tmp, "f21c-server.db");
+    let edge_a = temp_db_file(&tmp, "f21c-edge-a.db");
+    let edge_b = temp_db_file(&tmp, "f21c-edge-b.db");
+    let nats = start_nats().await;
+    let tenant = "f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits";
+    let mut server = spawn_server(&server_path, tenant, &nats.nats_url);
+
+    let setup = run_cli_script(
+        &edge_a,
+        &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep')\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me')\n\
+         .sync push\n\
+         .quit\n",
+    );
+    assert!(setup.status.success());
+
+    let initial_pull = run_cli_script(
+        &edge_b,
+        &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+         .sync pull\n\
+         SELECT count(*) FROM sensors\n\
+         .quit\n",
+    );
+    assert!(output_string(&initial_pull.stdout).contains("| 2"));
+
+    let mut child = spawn_cli(
+        &edge_a,
+        &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+    );
+    write_child_stdin(
+        &mut child,
+        ".sync auto on\n\
+         DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002'\n",
+    );
+
+    let observed = wait_until(Duration::from_secs(10), || {
+        let pulled = run_cli_script(
+            &edge_b,
+            &["--tenant-id", tenant, "--nats-url", &nats.nats_url],
+            ".sync pull\n\
+             SELECT count(*) FROM sensors\n\
+             .quit\n",
+        );
+        output_string(&pulled.stdout).contains("| 1")
+    });
+
+    write_child_stdin(&mut child, ".quit\n");
+    let _ = child.wait_with_output().expect("collect edge A output");
+    stop_child(&mut server);
+
+    assert!(
+        observed,
+        "edge B must observe the delete through pull while edge A is still running"
+    );
 }

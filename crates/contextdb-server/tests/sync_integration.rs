@@ -674,6 +674,209 @@ async fn a9_row_delete_events_synced() {
     );
 }
 
+#[tokio::test]
+async fn a9_file_backed_row_delete_events_synced() {
+    use contextdb_core::Value;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    let tmp = TempDir::new().unwrap();
+    let server_path = tmp.path().join("server.db");
+    let edge_path = tmp.path().join("edge.db");
+    let nats = start_nats().await;
+    let server_db = Arc::new(Database::open(&server_path).unwrap());
+    let edge_db = Arc::new(Database::open(&edge_path).unwrap());
+    let empty = HashMap::new();
+
+    edge_db
+        .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
+        .unwrap();
+    server_db
+        .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
+        .unwrap();
+
+    let policies = ConflictPolicies::uniform(ConflictPolicy::EdgeWins);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "rowdelete-file-test",
+        policies,
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "rowdelete-file-test");
+
+    let id = Uuid::new_v4();
+    let mut p = HashMap::new();
+    p.insert("id".to_string(), Value::Uuid(id));
+    p.insert("v".to_string(), Value::Text("exists".into()));
+    edge_db
+        .execute("INSERT INTO t (id, v) VALUES ($id, $v)", &p)
+        .unwrap();
+    client.push().await.unwrap();
+
+    let mut dp = HashMap::new();
+    dp.insert("id".to_string(), Value::Uuid(id));
+    edge_db
+        .execute("DELETE FROM t WHERE id = $id", &dp)
+        .unwrap();
+    client.push().await.unwrap();
+
+    let server_row_after = server_db
+        .point_lookup("t", "id", &Value::Uuid(id), server_db.snapshot())
+        .unwrap();
+    assert!(
+        server_row_after.is_none(),
+        "server must NOT have the row after file-backed delete push"
+    );
+}
+
+// Fresh pull after insert+delete history must converge to the net state without conflicts.
+#[tokio::test]
+async fn a9_fresh_pull_after_delete_history_converges_without_conflict() {
+    use contextdb_core::Value;
+    use uuid::Uuid;
+
+    let nats = start_nats().await;
+    let server_db = Arc::new(Database::open_memory());
+    let edge_a_db = Arc::new(Database::open_memory());
+    let edge_b_db = Arc::new(Database::open_memory());
+    let empty = HashMap::new();
+
+    for db in [&server_db, &edge_a_db, &edge_b_db] {
+        db.execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
+            .unwrap();
+    }
+
+    let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "fresh-delete-history",
+        policies.clone(),
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let edge_a = SyncClient::new(edge_a_db.clone(), &nats.nats_url, "fresh-delete-history");
+    let edge_b = SyncClient::new(edge_b_db.clone(), &nats.nats_url, "fresh-delete-history");
+
+    let keep_id = Uuid::new_v4();
+    let delete_id = Uuid::new_v4();
+    for (id, value) in [(keep_id, "keep"), (delete_id, "delete-me")] {
+        let mut p = HashMap::new();
+        p.insert("id".to_string(), Value::Uuid(id));
+        p.insert("v".to_string(), Value::Text(value.into()));
+        edge_a_db
+            .execute("INSERT INTO t (id, v) VALUES ($id, $v)", &p)
+            .unwrap();
+    }
+    edge_a.push().await.unwrap();
+
+    let mut delete_params = HashMap::new();
+    delete_params.insert("id".to_string(), Value::Uuid(delete_id));
+    edge_a_db
+        .execute("DELETE FROM t WHERE id = $id", &delete_params)
+        .unwrap();
+    edge_a.push().await.unwrap();
+
+    let pull = edge_b.pull_default().await.unwrap();
+    assert!(
+        pull.conflicts.is_empty(),
+        "fresh pull over insert+delete history must not report conflicts: {:?}",
+        pull.conflicts
+    );
+
+    let rows = edge_b_db.scan("t", edge_b_db.snapshot()).unwrap();
+    assert_eq!(rows.len(), 1, "fresh pull must converge to net row count");
+    assert_eq!(
+        rows[0].values.get("id"),
+        Some(&Value::Uuid(keep_id)),
+        "deleted row must not remain after fresh pull"
+    );
+}
+
+#[tokio::test]
+async fn a9_file_backed_fresh_pull_after_delete_history_converges_without_conflict() {
+    use contextdb_core::Value;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    let tmp = TempDir::new().unwrap();
+    let server_path = tmp.path().join("server.db");
+    let edge_a_path = tmp.path().join("edge-a.db");
+    let edge_b_path = tmp.path().join("edge-b.db");
+    let nats = start_nats().await;
+    let server_db = Arc::new(Database::open(&server_path).unwrap());
+    let edge_a_db = Arc::new(Database::open(&edge_a_path).unwrap());
+    let edge_b_db = Arc::new(Database::open(&edge_b_path).unwrap());
+    let empty = HashMap::new();
+
+    for db in [&server_db, &edge_a_db, &edge_b_db] {
+        db.execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
+            .unwrap();
+    }
+
+    let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "file-fresh-delete-history",
+        policies.clone(),
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let edge_a = SyncClient::new(
+        edge_a_db.clone(),
+        &nats.nats_url,
+        "file-fresh-delete-history",
+    );
+    let edge_b = SyncClient::new(
+        edge_b_db.clone(),
+        &nats.nats_url,
+        "file-fresh-delete-history",
+    );
+
+    let keep_id = Uuid::new_v4();
+    let delete_id = Uuid::new_v4();
+    for (id, value) in [(keep_id, "keep"), (delete_id, "delete-me")] {
+        let mut p = HashMap::new();
+        p.insert("id".to_string(), Value::Uuid(id));
+        p.insert("v".to_string(), Value::Text(value.into()));
+        edge_a_db
+            .execute("INSERT INTO t (id, v) VALUES ($id, $v)", &p)
+            .unwrap();
+    }
+    edge_a.push().await.unwrap();
+
+    let mut delete_params = HashMap::new();
+    delete_params.insert("id".to_string(), Value::Uuid(delete_id));
+    edge_a_db
+        .execute("DELETE FROM t WHERE id = $id", &delete_params)
+        .unwrap();
+    edge_a.push().await.unwrap();
+
+    let pull = edge_b.pull_default().await.unwrap();
+    assert!(
+        pull.conflicts.is_empty(),
+        "file-backed fresh pull over insert+delete history must not report conflicts: {:?}",
+        pull.conflicts
+    );
+
+    let rows = edge_b_db.scan("t", edge_b_db.snapshot()).unwrap();
+    assert_eq!(rows.len(), 1, "fresh pull must converge to net row count");
+    assert_eq!(
+        rows[0].values.get("id"),
+        Some(&Value::Uuid(keep_id)),
+        "deleted row must not remain after fresh pull"
+    );
+}
+
 // A10: Vector mapping survives failed row inserts (exact test code from plan)
 #[tokio::test]
 async fn a10_vector_mapping_survives_failed_inserts() {

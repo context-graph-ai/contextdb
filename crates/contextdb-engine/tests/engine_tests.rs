@@ -2,6 +2,7 @@ use contextdb_core::*;
 use contextdb_engine::Database;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
+use tempfile::TempDir;
 use uuid::Uuid;
 
 fn make_values(pairs: Vec<(&str, Value)>) -> HashMap<ColName, Value> {
@@ -151,6 +152,68 @@ fn test_rollback_across_all_subsystems() {
             .unwrap()
             .len(),
         0
+    );
+}
+
+#[test]
+fn test_file_backed_delete_delta_matches_after_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("delete-delta.db");
+    let db = Database::open(&path).unwrap();
+    let params = HashMap::new();
+
+    db.execute(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep')",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me')",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002'",
+        &params,
+    )
+    .unwrap();
+
+    let live = db.changes_since(3);
+    assert_eq!(
+        live.rows.len(),
+        1,
+        "live delta should contain one row change"
+    );
+    assert!(
+        live.rows[0].deleted,
+        "live delta should be a delete tombstone"
+    );
+    assert_eq!(
+        live.rows[0].natural_key.value,
+        Value::Uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
+    );
+
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    let persisted = reopened.changes_since(3);
+    assert_eq!(
+        persisted.rows.len(),
+        1,
+        "reopened delta should contain one row change"
+    );
+    assert!(
+        persisted.rows[0].deleted,
+        "reopened delta should still be a delete tombstone"
+    );
+    assert_eq!(
+        persisted.rows[0].natural_key.value,
+        Value::Uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
     );
 }
 
