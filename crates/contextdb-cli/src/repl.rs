@@ -448,7 +448,13 @@ fn execute_sql(db: &Database, sql: &str) -> bool {
 fn is_fatal_cli_error(error: &Error) -> bool {
     matches!(
         error,
-        Error::ParseError(_) | Error::TableNotFound(_) | Error::NotFound(_)
+        Error::ParseError(_)
+            | Error::TableNotFound(_)
+            | Error::NotFound(_)
+            | Error::BfsDepthExceeded(_)
+            | Error::RecursiveCteNotSupported
+            | Error::WindowFunctionNotSupported
+            | Error::FullTextSearchNotSupported
     )
 }
 
