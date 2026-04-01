@@ -2,7 +2,7 @@ use crate::database::Database;
 use contextdb_core::{Error, Result, Value};
 use contextdb_parser::ast::{Expr, Literal};
 use contextdb_planner::PhysicalPlan;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn validate_dml(
     plan: &PhysicalPlan,
@@ -20,7 +20,6 @@ pub fn validate_dml(
             let table_meta = db
                 .table_meta(&p.table)
                 .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
-            let existing_rows = db.scan(&p.table, db.snapshot())?;
 
             // When no column list is provided, infer from table metadata.
             let columns: Vec<String> = if p.columns.is_empty() {
@@ -42,12 +41,19 @@ pub fn validate_dml(
             if p.on_conflict.is_none()
                 && let Some(id_idx) = columns.iter().position(|c| c == "id")
             {
+                let mut pending_ids = HashSet::new();
                 for row in &p.values {
                     let id_value = row
                         .get(id_idx)
                         .map(|e| resolve_expr(e, params))
                         .transpose()?;
                     if let Some(v) = id_value {
+                        if !pending_ids.insert(cache_key_for_value(&v)) {
+                            return Err(Error::UniqueViolation {
+                                table: p.table.clone(),
+                                column: "id".to_string(),
+                            });
+                        }
                         let lookup = db.point_lookup(&p.table, "id", &v, db.snapshot())?;
                         if lookup.is_some() {
                             return Err(Error::UniqueViolation {
@@ -87,30 +93,37 @@ pub fn validate_dml(
                 }
             }
 
-            for row in &p.values {
-                for column in table_meta
-                    .columns
-                    .iter()
-                    .filter(|column| column.unique && !column.primary_key)
-                {
-                    let Some(index) = columns.iter().position(|name| name == &column.name) else {
-                        continue;
-                    };
-                    let value = row
-                        .get(index)
-                        .ok_or_else(|| Error::PlanError("column/value count mismatch".to_string()))
-                        .and_then(|expr| resolve_expr(expr, params))?;
-                    if value == Value::Null {
-                        continue;
-                    }
-                    if existing_rows
-                        .iter()
-                        .any(|existing| existing.values.get(&column.name) == Some(&value))
-                    {
-                        return Err(Error::UniqueViolation {
-                            table: p.table.clone(),
-                            column: column.name.clone(),
-                        });
+            let unique_columns: Vec<_> = table_meta
+                .columns
+                .iter()
+                .filter(|column| column.unique && !column.primary_key)
+                .collect();
+            if !unique_columns.is_empty() {
+                let existing_rows = db.scan(&p.table, db.snapshot())?;
+                for row in &p.values {
+                    for column in &unique_columns {
+                        let Some(index) = columns.iter().position(|name| name == &column.name)
+                        else {
+                            continue;
+                        };
+                        let value = row
+                            .get(index)
+                            .ok_or_else(|| {
+                                Error::PlanError("column/value count mismatch".to_string())
+                            })
+                            .and_then(|expr| resolve_expr(expr, params))?;
+                        if value == Value::Null {
+                            continue;
+                        }
+                        if existing_rows
+                            .iter()
+                            .any(|existing| existing.values.get(&column.name) == Some(&value))
+                        {
+                            return Err(Error::UniqueViolation {
+                                table: p.table.clone(),
+                                column: column.name.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -145,4 +158,9 @@ fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
             "unsupported expression in schema enforcer".to_string(),
         )),
     }
+}
+
+fn cache_key_for_value(value: &Value) -> Vec<u8> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard())
+        .expect("Value should serialize for uniqueness cache key generation")
 }

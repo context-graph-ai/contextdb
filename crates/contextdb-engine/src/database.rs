@@ -635,7 +635,10 @@ impl Database {
                             nullable: col.nullable,
                             primary_key: col.primary_key,
                             unique: col.unique,
-                            default: col.default.as_ref().map(|expr| format!("{expr:?}")),
+                            default: col
+                                .default
+                                .as_ref()
+                                .map(crate::executor::stored_default_expr),
                             expires: col.expires,
                         });
                         if col.expires {

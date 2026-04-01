@@ -8,7 +8,7 @@ use contextdb_parser::ast::{
 use contextdb_planner::{DeletePlan, InsertPlan, PhysicalPlan, UpdatePlan, plan};
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -32,7 +32,7 @@ pub(crate) fn execute_plan(
                         nullable: c.nullable,
                         primary_key: c.primary_key,
                         unique: c.unique,
-                        default: c.default.as_ref().map(|expr| format!("{expr:?}")),
+                        default: c.default.as_ref().map(stored_default_expr),
                         expires: c.expires,
                     })
                     .collect(),
@@ -93,7 +93,7 @@ pub(crate) fn execute_plan(
                         nullable: col.nullable,
                         primary_key: col.primary_key,
                         unique: col.unique,
-                        default: col.default.as_ref().map(|expr| format!("{expr:?}")),
+                        default: col.default.as_ref().map(stored_default_expr),
                         expires: col.expires,
                     };
                     store
@@ -594,18 +594,11 @@ pub(crate) fn execute_plan(
         }
         PhysicalPlan::Distinct { input } => {
             let input_result = execute_plan(db, input, params, tx)?;
-            let mut seen = Vec::<Vec<Value>>::new();
+            let mut seen = HashSet::<Vec<u8>>::new();
             let rows = input_result
                 .rows
                 .into_iter()
-                .filter(|row| {
-                    if seen.contains(row) {
-                        false
-                    } else {
-                        seen.push(row.clone());
-                        true
-                    }
-                })
+                .filter(|row| seen.insert(distinct_row_key(row)))
                 .collect();
             Ok(QueryResult {
                 columns: input_result.columns,
@@ -881,6 +874,8 @@ fn exec_insert(
             values.insert(col.clone(), coerce_value_for_column(db, &p.table, col, v)?);
         }
 
+        apply_missing_column_defaults(db, &p.table, &mut values)?;
+
         validate_vector_columns(db, &p.table, &values)?;
         let row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
         db.accountant().try_allocate_for(
@@ -909,9 +904,7 @@ fn exec_insert(
             }
         };
 
-        if db
-            .table_meta(&p.table)
-            .is_some_and(|table_meta| !table_meta.dag_edge_types.is_empty())
+        if should_route_insert_to_graph(db, &p.table)
             && let (
                 Some(Value::Uuid(source)),
                 Some(Value::Uuid(target)),
@@ -2036,16 +2029,27 @@ fn lookup_query_result_column(
         return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
     }
 
-    let idx = input_columns
+    let matches = input_columns
         .iter()
-        .position(|name| {
-            name == &column_ref.column
-                || name.rsplit('.').next() == Some(column_ref.column.as_str())
+        .enumerate()
+        .filter_map(|(idx, name)| {
+            (name == &column_ref.column
+                || name.rsplit('.').next() == Some(column_ref.column.as_str()))
+            .then_some(idx)
         })
-        .ok_or_else(|| {
-            Error::PlanError(format!("project column not found: {}", column_ref.column))
-        })?;
-    Ok(row.get(idx).cloned().unwrap_or(Value::Null))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [] => Err(Error::PlanError(format!(
+            "project column not found: {}",
+            column_ref.column
+        ))),
+        [idx] => Ok(row.get(*idx).cloned().unwrap_or(Value::Null)),
+        _ => Err(Error::PlanError(format!(
+            "ambiguous column reference: {}",
+            column_ref.column
+        ))),
+    }
 }
 
 fn concatenate_rows(left: &[Value], right: &[Value]) -> Vec<Value> {
@@ -2111,6 +2115,11 @@ fn right_table_name(plan: &PhysicalPlan) -> String {
         PhysicalPlan::Scan { table, alias, .. } => alias.clone().unwrap_or_else(|| table.clone()),
         _ => "right".to_string(),
     }
+}
+
+fn distinct_row_key(row: &[Value]) -> Vec<u8> {
+    bincode::serde::encode_to_vec(row, bincode::config::standard())
+        .expect("query rows should serialize for DISTINCT")
 }
 
 fn resolve_uuid(expr: &Expr, params: &HashMap<String, Value>) -> Result<uuid::Uuid> {
@@ -2332,8 +2341,21 @@ fn coerce_value_for_column(db: &Database, table: &str, col: &str, v: Value) -> R
     };
 
     match column.column_type {
+        contextdb_core::ColumnType::Uuid => coerce_uuid_value(v),
         contextdb_core::ColumnType::Timestamp => coerce_timestamp_value(v),
         _ => Ok(coerce_uuid_if_needed(col, v)),
+    }
+}
+
+fn coerce_uuid_value(v: Value) -> Result<Value> {
+    match v {
+        Value::Uuid(id) => Ok(Value::Uuid(id)),
+        Value::Text(text) => uuid::Uuid::parse_str(&text)
+            .map(Value::Uuid)
+            .map_err(|err| Error::Other(format!("invalid UUID literal '{text}': {err}"))),
+        other => Err(Error::Other(format!(
+            "UUID column requires UUID or text literal, got {other:?}"
+        ))),
     }
 }
 
@@ -2362,6 +2384,121 @@ fn coerce_timestamp_value(v: Value) -> Result<Value> {
         }
         other => Ok(other),
     }
+}
+
+fn apply_missing_column_defaults(
+    db: &Database,
+    table: &str,
+    values: &mut HashMap<String, Value>,
+) -> Result<()> {
+    let Some(meta) = db.table_meta(table) else {
+        return Ok(());
+    };
+
+    for column in &meta.columns {
+        if values.contains_key(&column.name) {
+            continue;
+        }
+        let Some(default) = &column.default else {
+            continue;
+        };
+        let value = evaluate_stored_default_expr(default)?;
+        values.insert(
+            column.name.clone(),
+            coerce_value_for_column(db, table, &column.name, value)?,
+        );
+    }
+
+    Ok(())
+}
+
+fn evaluate_stored_default_expr(default: &str) -> Result<Value> {
+    if default.eq_ignore_ascii_case("NOW()") {
+        return eval_function("now", &[]);
+    }
+    if default.contains("FunctionCall") && default.contains("name: \"NOW\"") {
+        return eval_function("now", &[]);
+    }
+    if default == "Literal(Null)" || default.eq_ignore_ascii_case("NULL") {
+        return Ok(Value::Null);
+    }
+    if default.eq_ignore_ascii_case("TRUE") {
+        return Ok(Value::Bool(true));
+    }
+    if default.eq_ignore_ascii_case("FALSE") {
+        return Ok(Value::Bool(false));
+    }
+    if default.starts_with('\'') && default.ends_with('\'') && default.len() >= 2 {
+        return Ok(Value::Text(
+            default[1..default.len() - 1].replace("''", "'"),
+        ));
+    }
+    if let Some(text) = default
+        .strip_prefix("Literal(Text(\"")
+        .and_then(|value| value.strip_suffix("\"))"))
+    {
+        return Ok(Value::Text(text.to_string()));
+    }
+    if let Some(value) = default
+        .strip_prefix("Literal(Integer(")
+        .and_then(|value| value.strip_suffix("))"))
+    {
+        let parsed = value.parse::<i64>().map_err(|err| {
+            Error::Other(format!("invalid stored integer default '{value}': {err}"))
+        })?;
+        return Ok(Value::Int64(parsed));
+    }
+    if let Some(value) = default
+        .strip_prefix("Literal(Real(")
+        .and_then(|value| value.strip_suffix("))"))
+    {
+        let parsed = value
+            .parse::<f64>()
+            .map_err(|err| Error::Other(format!("invalid stored real default '{value}': {err}")))?;
+        return Ok(Value::Float64(parsed));
+    }
+    if let Some(value) = default
+        .strip_prefix("Literal(Bool(")
+        .and_then(|value| value.strip_suffix("))"))
+    {
+        let parsed = value
+            .parse::<bool>()
+            .map_err(|err| Error::Other(format!("invalid stored bool default '{value}': {err}")))?;
+        return Ok(Value::Bool(parsed));
+    }
+
+    Err(Error::Other(format!(
+        "unsupported stored DEFAULT expression: {default}"
+    )))
+}
+
+pub(crate) fn stored_default_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Literal(Literal::Null) => "NULL".to_string(),
+        Expr::Literal(Literal::Bool(value)) => {
+            if *value {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Expr::Literal(Literal::Integer(value)) => value.to_string(),
+        Expr::Literal(Literal::Real(value)) => value.to_string(),
+        Expr::Literal(Literal::Text(value)) => format!("'{}'", value.replace('\'', "''")),
+        Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("NOW") && args.is_empty() =>
+        {
+            "NOW()".to_string()
+        }
+        _ => format!("{expr:?}"),
+    }
+}
+
+fn should_route_insert_to_graph(db: &Database, table: &str) -> bool {
+    table.eq_ignore_ascii_case("edges")
+        || db
+            .table_meta(table)
+            .is_some_and(|table_meta| !table_meta.dag_edge_types.is_empty())
 }
 
 fn validate_expires_column(col: &contextdb_parser::ast::ColumnDef) -> Result<()> {

@@ -19,6 +19,9 @@ pub fn parse(input: &str) -> Result<Statement> {
     if starts_with_keywords(sql, &["WITH", "RECURSIVE"]) {
         return Err(Error::RecursiveCteNotSupported);
     }
+    if contains_keyword_sequence_outside_strings(sql, &["GROUP", "BY"]) {
+        return Err(Error::ParseError("GROUP BY is not supported".to_string()));
+    }
     if contains_token_outside_strings(sql, "OVER") {
         return Err(Error::WindowFunctionNotSupported);
     }
@@ -1871,6 +1874,52 @@ fn contains_token_outside_strings(input: &str, token: &str) -> bool {
     }
 
     false
+}
+
+fn contains_keyword_sequence_outside_strings(input: &str, words: &[&str]) -> bool {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_str = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if in_str {
+                if chars.peek() == Some(&'\'') {
+                    let _ = chars.next();
+                    continue;
+                }
+                in_str = false;
+            } else {
+                in_str = true;
+            }
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        if in_str {
+            continue;
+        }
+
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens.windows(words.len()).any(|window| {
+        window
+            .iter()
+            .zip(words)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
 }
 
 fn contains_where_match_operator(input: &str) -> bool {

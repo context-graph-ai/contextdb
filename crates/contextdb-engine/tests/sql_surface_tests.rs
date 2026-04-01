@@ -1161,7 +1161,6 @@ fn sql_08_distinct_not_quadratic() {
     )
     .unwrap();
 
-    let started = Instant::now();
     for i in 0..5_000 {
         let tag = format!("tag-{}", i % 100);
         db.execute(
@@ -1174,6 +1173,7 @@ fn sql_08_distinct_not_quadratic() {
         .unwrap();
     }
 
+    let started = Instant::now();
     let result = db
         .execute("SELECT DISTINCT tag FROM items", &empty())
         .unwrap();
