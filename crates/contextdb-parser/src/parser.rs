@@ -989,6 +989,11 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                 }
                 columns.push(col);
                 if let Some(sm) = inline_sm {
+                    if state_machine.is_some() {
+                        return Err(Error::ParseError(
+                            "duplicate STATE MACHINE clause".to_string(),
+                        ));
+                    }
                     state_machine = Some(sm);
                 }
             }
@@ -998,11 +1003,28 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                     .next()
                     .ok_or_else(|| Error::ParseError("invalid table option".to_string()))?;
                 match opt.as_rule() {
-                    Rule::immutable_option => immutable = true,
+                    Rule::immutable_option => {
+                        if immutable {
+                            return Err(Error::ParseError(
+                                "duplicate IMMUTABLE clause".to_string(),
+                            ));
+                        }
+                        immutable = true;
+                    }
                     Rule::state_machine_option => {
+                        if state_machine.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate STATE MACHINE clause".to_string(),
+                            ));
+                        }
                         state_machine = Some(build_state_machine_option(opt)?)
                     }
-                    Rule::dag_option => dag_edge_types = build_dag_option(opt)?,
+                    Rule::dag_option => {
+                        if !dag_edge_types.is_empty() {
+                            return Err(Error::ParseError("duplicate DAG clause".to_string()));
+                        }
+                        dag_edge_types = build_dag_option(opt)?;
+                    }
                     Rule::propagate_edge_option => {
                         has_propagation = true;
                         propagation_rules.push(build_edge_propagation_option(opt)?);
@@ -1011,7 +1033,12 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                         has_propagation = true;
                         propagation_rules.push(build_vector_propagation_option(opt)?);
                     }
-                    Rule::retain_option => retain = Some(build_retain_option(opt)?),
+                    Rule::retain_option => {
+                        if retain.is_some() {
+                            return Err(Error::ParseError("duplicate RETAIN clause".to_string()));
+                        }
+                        retain = Some(build_retain_option(opt)?);
+                    }
                     _ => {}
                 }
             }
@@ -1161,10 +1188,34 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                     .next()
                     .ok_or_else(|| Error::ParseError("invalid column constraint".to_string()))?;
                 match c.as_rule() {
-                    Rule::not_null => nullable = false,
-                    Rule::primary_key => primary_key = true,
-                    Rule::unique => unique = true,
+                    Rule::not_null => {
+                        if !nullable {
+                            return Err(Error::ParseError(
+                                "duplicate NOT NULL constraint".to_string(),
+                            ));
+                        }
+                        nullable = false;
+                    }
+                    Rule::primary_key => {
+                        if primary_key {
+                            return Err(Error::ParseError(
+                                "duplicate PRIMARY KEY constraint".to_string(),
+                            ));
+                        }
+                        primary_key = true;
+                    }
+                    Rule::unique => {
+                        if unique {
+                            return Err(Error::ParseError(
+                                "duplicate UNIQUE constraint".to_string(),
+                            ));
+                        }
+                        unique = true;
+                    }
                     Rule::default_clause => {
+                        if default.is_some() {
+                            return Err(Error::ParseError("duplicate DEFAULT clause".to_string()));
+                        }
                         let expr = c
                             .into_inner()
                             .find(|i| i.as_rule() == Rule::expr)
@@ -1173,12 +1224,31 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                             })?;
                         default = Some(build_expr(expr)?);
                     }
-                    Rule::references_clause => references = Some(build_references_clause(c)?),
+                    Rule::references_clause => {
+                        if references.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate REFERENCES clause".to_string(),
+                            ));
+                        }
+                        references = Some(build_references_clause(c)?);
+                    }
                     Rule::fk_propagation_clause => {
                         fk_propagation_rules.push(build_fk_propagation_clause(c)?);
                     }
-                    Rule::expires_constraint => expires = true,
+                    Rule::expires_constraint => {
+                        if expires {
+                            return Err(Error::ParseError(
+                                "duplicate EXPIRES constraint".to_string(),
+                            ));
+                        }
+                        expires = true;
+                    }
                     Rule::state_machine_option => {
+                        if inline_state_machine.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate STATE MACHINE clause".to_string(),
+                            ));
+                        }
                         inline_state_machine = Some(build_state_machine_option(c)?);
                     }
                     _ => {}
