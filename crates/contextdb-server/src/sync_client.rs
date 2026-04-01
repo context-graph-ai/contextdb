@@ -330,17 +330,18 @@ impl SyncClient {
                 let encoded = encode(MessageType::PullRequest, &request)
                     .map_err(|e| Error::SyncError(e.to_string()))?;
 
-                let inbox = nats_client.new_inbox();
-                let mut inbox_sub = nats_client
-                    .subscribe(inbox.clone())
-                    .await
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-
-                let mut first_msg = None;
+                let mut first_attempt_response = None;
                 for attempt in 0..5u32 {
                     if attempt > 0 {
                         tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
                     }
+                    // Use a fresh inbox per attempt so late responses from earlier attempts
+                    // cannot be mistaken for the current pull reply or chunk stream.
+                    let inbox = nats_client.new_inbox();
+                    let mut inbox_sub = nats_client
+                        .subscribe(inbox.clone())
+                        .await
+                        .map_err(|e| Error::SyncError(e.to_string()))?;
                     let timeout = if attempt < 2 {
                         Duration::from_secs(2)
                     } else {
@@ -358,7 +359,7 @@ impl SyncClient {
 
                     match tokio::time::timeout(timeout, inbox_sub.next()).await {
                         Ok(Some(msg)) => {
-                            first_msg = Some(msg);
+                            first_attempt_response = Some((msg, inbox_sub));
                             break;
                         }
                         Ok(None) => {
@@ -372,7 +373,7 @@ impl SyncClient {
                     }
                 }
 
-                let first_msg = first_msg.ok_or_else(|| {
+                let (first_msg, mut inbox_sub) = first_attempt_response.ok_or_else(|| {
                     Error::SyncError("NATS request timed out waiting for pull response".to_string())
                 })?;
 
