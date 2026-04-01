@@ -109,7 +109,7 @@ impl SyncClient {
 
         let since = self.push_watermark.load(Ordering::SeqCst);
         // Clone directions out of RwLock BEFORE any .await
-        let directions = self.table_directions.read().unwrap().clone();
+        let directions = self.table_directions()?;
         let changeset = self
             .db
             .changes_since(since)
@@ -283,7 +283,7 @@ impl SyncClient {
     /// Pull with explicit policies (frozen test contract, library consumers).
     pub async fn pull(&self, policies: &ConflictPolicies) -> Result<ApplyResult, Error> {
         let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
-        let directions = self.table_directions.read().unwrap().clone();
+        let directions = self.table_directions()?;
 
         let mut since_lsn = self.pull_watermark.load(Ordering::SeqCst);
         #[allow(unused_assignments)]
@@ -458,7 +458,7 @@ impl SyncClient {
 
     /// Pull using internally configured conflict policies (used by CLI).
     pub async fn pull_default(&self) -> Result<ApplyResult, Error> {
-        let policies = self.conflict_policies.read().unwrap().clone();
+        let policies = self.conflict_policies()?;
         self.pull(&policies).await
     }
 
@@ -484,22 +484,44 @@ impl SyncClient {
     }
 
     pub fn set_table_direction(&self, table: &str, direction: SyncDirection) {
-        self.table_directions
-            .write()
-            .unwrap()
-            .insert(table.to_string(), direction);
+        match self.table_directions.write() {
+            Ok(mut directions) => {
+                directions.insert(table.to_string(), direction);
+            }
+            Err(_) => tracing::warn!("sync table_directions lock poisoned; ignoring update"),
+        }
     }
 
     pub fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
-        self.conflict_policies
-            .write()
-            .unwrap()
-            .per_table
-            .insert(table.to_string(), policy);
+        match self.conflict_policies.write() {
+            Ok(mut policies) => {
+                policies.per_table.insert(table.to_string(), policy);
+            }
+            Err(_) => tracing::warn!("sync conflict_policies lock poisoned; ignoring update"),
+        }
     }
 
     pub fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
-        self.conflict_policies.write().unwrap().default = policy;
+        match self.conflict_policies.write() {
+            Ok(mut policies) => {
+                policies.default = policy;
+            }
+            Err(_) => tracing::warn!("sync conflict_policies lock poisoned; ignoring update"),
+        }
+    }
+
+    fn table_directions(&self) -> Result<HashMap<String, SyncDirection>, Error> {
+        self.table_directions
+            .read()
+            .map(|directions| directions.clone())
+            .map_err(|_| Error::SyncError("sync table directions lock poisoned".to_string()))
+    }
+
+    fn conflict_policies(&self) -> Result<ConflictPolicies, Error> {
+        self.conflict_policies
+            .read()
+            .map(|policies| policies.clone())
+            .map_err(|_| Error::SyncError("sync conflict policies lock poisoned".to_string()))
     }
 }
 

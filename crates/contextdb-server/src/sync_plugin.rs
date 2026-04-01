@@ -30,14 +30,24 @@ impl SyncPlugin {
 
     /// Signal the background push task that a DML change occurred.
     pub fn notify_change(&self) {
-        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
-            let _ = tx.try_send(());
+        match self.tx.lock() {
+            Ok(guard) => {
+                if let Some(tx) = guard.as_ref() {
+                    let _ = tx.try_send(());
+                }
+            }
+            Err(_) => tracing::warn!("sync plugin mutex poisoned; skipping change notification"),
         }
     }
 
     /// Shutdown: drop the sender to close the channel and stop the background task.
     pub fn shutdown(&self) {
-        let _ = self.tx.lock().unwrap().take();
+        match self.tx.lock() {
+            Ok(mut guard) => {
+                let _ = guard.take();
+            }
+            Err(_) => tracing::warn!("sync plugin mutex poisoned during shutdown"),
+        }
     }
 }
 
