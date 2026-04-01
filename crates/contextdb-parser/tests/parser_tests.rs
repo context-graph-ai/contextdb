@@ -127,6 +127,32 @@ fn parse_create_table_constraints() {
 }
 
 #[test]
+fn parse_create_table_duplicate_retain_is_rejected() {
+    assert!(matches!(
+        parse("CREATE TABLE bad4 (id UUID PRIMARY KEY) RETAIN 1 DAYS RETAIN 2 DAYS"),
+        Err(Error::ParseError(_))
+    ));
+}
+
+#[test]
+fn parse_create_table_duplicate_state_machine_is_rejected() {
+    assert!(matches!(
+        parse(
+            "CREATE TABLE bad5 (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: a -> [b]) STATE MACHINE (status: c -> [d])"
+        ),
+        Err(Error::ParseError(_))
+    ));
+}
+
+#[test]
+fn parse_create_table_duplicate_primary_key_is_rejected() {
+    assert!(matches!(
+        parse("CREATE TABLE bad6 (id UUID PRIMARY KEY PRIMARY KEY)"),
+        Err(Error::ParseError(_))
+    ));
+}
+
+#[test]
 fn sql_edge_case_keywords_inside_string_literals() {
     assert!(matches!(
         parse("INSERT INTO entities (id, name) VALUES ($id, 'SELECT FROM table WHERE x = 1')"),
