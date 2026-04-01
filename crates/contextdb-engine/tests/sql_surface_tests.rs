@@ -1,6 +1,7 @@
 use contextdb_core::Value;
 use contextdb_engine::Database;
 use std::collections::HashMap;
+use std::time::Instant;
 use uuid::Uuid;
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -864,6 +865,323 @@ fn fn_03_now_with_from() {
         }
         other => panic!("expected Timestamp, got {:?}", other),
     }
+}
+
+// ============================================================
+// Group 5b: SQL Correctness Regression Cases
+// ============================================================
+
+#[test]
+fn sql_01_default_now_produces_timestamp() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE events (id UUID PRIMARY KEY, created_at TIMESTAMP DEFAULT NOW())",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO events (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT created_at FROM events WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Timestamp(ts) => assert!(
+            *ts > 1_700_000_000,
+            "created_at should be a recent unix timestamp, got {ts}"
+        ),
+        other => panic!("expected TIMESTAMP from DEFAULT NOW(), got {:?}", other),
+    }
+}
+
+#[test]
+fn sql_02_edge_insert_routes_to_graph_once() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    for _ in 0..2 {
+        db.execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("source_id", Value::Uuid(source)),
+                ("target_id", Value::Uuid(target)),
+                ("edge_type", Value::Text("RELATES_TO".to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let result = db
+        .execute(
+            "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->(b) WHERE a.id = $source_id COLUMNS (b.id AS b_id))",
+            &params(vec![("source_id", Value::Uuid(source))]),
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "graph traversal should see exactly one reachable target after duplicate SQL edge inserts"
+    );
+    assert_eq!(result.rows[0][0], Value::Uuid(target));
+}
+
+#[test]
+fn sql_03_group_by_clean_error() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, tag TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let err = db
+        .execute("SELECT tag, COUNT(*) FROM items GROUP BY tag", &empty())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("GROUP BY") && err.contains("not supported"),
+        "expected a clean GROUP BY not-supported error, got: {err}"
+    );
+}
+
+#[test]
+fn sql_04_join_ambiguous_column_error() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE left_t (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE right_t (id UUID PRIMARY KEY, name TEXT, value INT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO left_t (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("left".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO right_t (id, name, value) VALUES ($id, $name, $value)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("right".into())),
+            ("value", Value::Int64(1)),
+        ]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "SELECT name FROM left_t INNER JOIN right_t ON left_t.id = right_t.id",
+            &empty(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("ambiguous"),
+        "expected ambiguous column error, got: {err}"
+    );
+}
+
+#[test]
+fn sql_05_scenario3_multi_hop_cascade() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT) STATE MACHINE (status: active -> [archived, paused, superseded])",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, intention_id UUID REFERENCES intentions(id) ON STATE archived PROPAGATE SET invalidated, embedding VECTOR(128)) STATE MACHINE (status: active -> [invalidated, superseded]) PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
+        &empty(),
+    )
+    .unwrap();
+
+    let intention_id = Uuid::new_v4();
+    let decision_a = Uuid::new_v4();
+    let decision_b = Uuid::new_v4();
+
+    db.execute(
+        "INSERT INTO intentions (id, description, status) VALUES ($id, $description, $status)",
+        &params(vec![
+            ("id", Value::Uuid(intention_id)),
+            ("description", Value::Text("root".into())),
+            ("status", Value::Text("active".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, description, status, intention_id) VALUES ($id, $description, $status, $intention_id)",
+        &params(vec![
+            ("id", Value::Uuid(decision_a)),
+            ("description", Value::Text("a".into())),
+            ("status", Value::Text("active".into())),
+            ("intention_id", Value::Uuid(intention_id)),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, description, status, intention_id) VALUES ($id, $description, $status, $intention_id)",
+        &params(vec![
+            ("id", Value::Uuid(decision_b)),
+            ("description", Value::Text("b".into())),
+            ("status", Value::Text("active".into())),
+            ("intention_id", Value::Uuid(intention_id)),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(decision_b)),
+            ("target_id", Value::Uuid(decision_a)),
+            ("edge_type", Value::Text("CITES".into())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE intentions SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(intention_id))]),
+    )
+    .unwrap();
+
+    let decision_a_row = db
+        .execute(
+            "SELECT status FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(decision_a))]),
+        )
+        .unwrap();
+    let decision_b_row = db
+        .execute(
+            "SELECT status FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(decision_b))]),
+        )
+        .unwrap();
+    assert_eq!(decision_a_row.rows[0][0], Value::Text("invalidated".into()));
+    assert_eq!(decision_b_row.rows[0][0], Value::Text("invalidated".into()));
+}
+
+#[test]
+fn sql_06_uuid_column_validation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let result = db.execute("INSERT INTO items VALUES ('not-a-uuid', 'test')", &empty());
+    assert!(
+        result.is_err(),
+        "invalid UUID literal should be rejected, but insert succeeded"
+    );
+}
+
+#[test]
+fn sql_07_join_double_qualification() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE employees (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id UUID PRIMARY KEY, name TEXT, employee_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+
+    let employee_id = Uuid::new_v4();
+    let order_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO employees (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(employee_id)),
+            ("name", Value::Text("employee".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO orders (id, name, employee_id) VALUES ($id, $name, $employee_id)",
+        &params(vec![
+            ("id", Value::Uuid(order_id)),
+            ("name", Value::Text("order".into())),
+            ("employee_id", Value::Uuid(employee_id)),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT e.name, o.name FROM employees e INNER JOIN orders o ON e.id = o.employee_id",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Text("employee".into()));
+    assert_eq!(result.rows[0][1], Value::Text("order".into()));
+}
+
+#[test]
+fn sql_08_distinct_not_quadratic() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, tag TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    for i in 0..5_000 {
+        let tag = format!("tag-{}", i % 100);
+        db.execute(
+            "INSERT INTO items (id, tag) VALUES ($id, $tag)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("tag", Value::Text(tag)),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let result = db
+        .execute("SELECT DISTINCT tag FROM items", &empty())
+        .unwrap();
+    assert_eq!(result.rows.len(), 100);
+    assert!(
+        started.elapsed().as_secs_f32() < 5.0,
+        "SELECT DISTINCT should finish within 5 seconds on 5k rows"
+    );
 }
 
 // ============================================================
