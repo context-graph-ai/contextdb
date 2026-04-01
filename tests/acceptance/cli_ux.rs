@@ -161,3 +161,28 @@ fn f31g_select_output_format_is_parseable() {
     assert!(stdout.contains("| val "));
     assert!(stdout.contains("| alpha "));
 }
+
+/// I asked for an over-deep graph traversal, and the CLI treated it as a real error on stderr instead of a successful run.
+#[test]
+fn f31h_bfs_depth_exceeded_routes_to_stderr_and_nonzero_exit() {
+    let tmp = TempDir::new().expect("tempdir");
+    let output = run_cli_script(
+        &temp_db_file(&tmp, "f31h.db"),
+        &[],
+        "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,11}(b) COLUMNS (b.id AS b_id))\n.quit\n",
+    );
+    assert!(
+        !output.status.success(),
+        "BfsDepthExceeded must fail the CLI script so shell automation can detect it"
+    );
+    let stdout = output_string(&output.stdout);
+    let stderr = output_string(&output.stderr).to_lowercase();
+    assert!(
+        stdout.trim().is_empty(),
+        "BfsDepthExceeded should not be reported as successful stdout output: {stdout}"
+    );
+    assert!(
+        stderr.contains("depth") || stderr.contains("bfs"),
+        "BfsDepthExceeded should be reported on stderr with a depth-related message: {stderr}"
+    );
+}

@@ -2558,3 +2558,73 @@ fn conflict_policy_to_string(p: ConflictPolicy) -> String {
         ConflictPolicy::InsertIfNotExists => "insert_if_not_exists".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contextdb_planner::GraphStepPlan;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use uuid::Uuid;
+
+    fn project_graph_frontier_rows(
+        frontier: Vec<(HashMap<String, Uuid>, Uuid, u32)>,
+        start_alias: &str,
+        steps: &[GraphStepPlan],
+    ) -> Vec<Vec<Value>> {
+        frontier
+            .into_iter()
+            .map(|(bindings, id, depth)| {
+                let mut row = Vec::with_capacity(steps.len() + 3);
+                row.push(Value::Uuid(
+                    *bindings
+                        .get(start_alias)
+                        .expect("graph frontier must keep start alias binding"),
+                ));
+                for step in steps {
+                    row.push(Value::Uuid(
+                        *bindings
+                            .get(&step.target_alias)
+                            .expect("graph frontier must keep target alias binding"),
+                    ));
+                }
+                row.push(Value::Uuid(id));
+                row.push(Value::Int64(depth as i64));
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn graph_01_frontier_projection_requires_complete_bindings() {
+        let steps = vec![GraphStepPlan {
+            edge_types: vec!["EDGE".to_string()],
+            direction: Direction::Outgoing,
+            min_depth: 1,
+            max_depth: 1,
+            target_alias: "b".to_string(),
+        }];
+
+        let missing_start = vec![(HashMap::new(), Uuid::new_v4(), 0)];
+        let missing_target = vec![(
+            HashMap::from([("a".to_string(), Uuid::new_v4())]),
+            Uuid::new_v4(),
+            0,
+        )];
+
+        let start_result = catch_unwind(AssertUnwindSafe(|| {
+            project_graph_frontier_rows(missing_start, "a", &steps)
+        }));
+        assert!(
+            start_result.is_ok(),
+            "graph frontier projection should not panic on missing start alias binding"
+        );
+
+        let target_result = catch_unwind(AssertUnwindSafe(|| {
+            project_graph_frontier_rows(missing_target, "a", &steps)
+        }));
+        assert!(
+            target_result.is_ok(),
+            "graph frontier projection should not panic on missing target alias binding"
+        );
+    }
+}
