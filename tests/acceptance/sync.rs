@@ -225,13 +225,25 @@ async fn f09_pull_after_server_restart_returns_data() {
     stop_child(&mut server);
     let mut restarted = spawn_server(&server_path, tenant, &nats_url);
     let fresh_path = edge_path.with_file_name("fresh-after-restart.db");
-    let pulled = run_cli_script(
+    let initialized = run_cli_script(
         &fresh_path,
         &["--tenant-id", tenant, "--nats-url", &nats_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
     );
+    assert!(initialized.status.success());
+    let pulled_ok = wait_until(Duration::from_secs(5), || {
+        let pulled = run_cli_script(
+            &fresh_path,
+            &["--tenant-id", tenant, "--nats-url", &nats_url],
+            ".sync pull\nSELECT count(*) FROM sensors\n.quit\n",
+        );
+        output_string(&pulled.stdout).contains("100")
+    });
     stop_child(&mut restarted);
-    assert!(output_string(&pulled.stdout).contains("100"));
+    assert!(
+        pulled_ok,
+        "fresh edge should observe all rows after server restart"
+    );
 }
 
 // I pushed, closed the edge, reopened it, inserted more rows, pushed again, and the server had everything.

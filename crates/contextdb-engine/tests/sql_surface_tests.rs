@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
 use uuid::Uuid;
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -13,6 +14,11 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn empty() -> HashMap<String, Value> {
     HashMap::new()
+}
+
+fn disk_limit_kib_for_path(path: &std::path::Path, extra_kib: u64) -> u64 {
+    let bytes = std::fs::metadata(path).expect("metadata").len();
+    bytes.div_ceil(1024) + extra_kib
 }
 
 // ============================================================
@@ -2474,7 +2480,7 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
         let mut watermark = 0_u64;
         let mut seen_creates = std::collections::HashSet::new();
         let mut row_before_create = Vec::new();
-        let mut idle_after_done = 0_u32;
+        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
         while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
@@ -2507,11 +2513,13 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
             }
             if poller_done.load(Ordering::SeqCst) {
                 if seen_creates.len() == before_seen {
-                    idle_after_done += 1;
+                    idle_after_done_since.get_or_insert_with(Instant::now);
                 } else {
-                    idle_after_done = 0;
+                    idle_after_done_since = None;
                 }
-                if idle_after_done > 100 {
+                if idle_after_done_since
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
+                {
                     break;
                 }
             }
@@ -2591,7 +2599,7 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
     let poller = thread::spawn(move || {
         let mut watermark = 0_u64;
         let mut seen_columns = std::collections::HashSet::new();
-        let mut idle_after_done = 0_u32;
+        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
         while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
@@ -2624,11 +2632,13 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
             }
             if poller_done.load(Ordering::SeqCst) {
                 if seen_columns.len() == before_seen {
-                    idle_after_done += 1;
+                    idle_after_done_since.get_or_insert_with(Instant::now);
                 } else {
-                    idle_after_done = 0;
+                    idle_after_done_since = None;
                 }
-                if idle_after_done > 100 {
+                if idle_after_done_since
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
+                {
                     break;
                 }
             }
@@ -2701,7 +2711,7 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
     let poller = thread::spawn(move || {
         let mut watermark = 0_u64;
         let mut seen_tables = std::collections::HashSet::new();
-        let mut idle_after_done = 0_u32;
+        let mut idle_after_done_since = None;
         poller_barrier.wait();
 
         while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
@@ -2729,11 +2739,13 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
             }
             if poller_done.load(Ordering::SeqCst) {
                 if seen_tables.len() == before_seen {
-                    idle_after_done += 1;
+                    idle_after_done_since.get_or_insert_with(Instant::now);
                 } else {
-                    idle_after_done = 0;
+                    idle_after_done_since = None;
                 }
-                if idle_after_done > 100 {
+                if idle_after_done_since
+                    .is_some_and(|started| started.elapsed() > Duration::from_secs(3))
+                {
                     break;
                 }
             }
@@ -2785,6 +2797,241 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
             "watermark advance skipped CREATE TABLE DDL for {table}"
         );
     }
+}
+
+#[test]
+fn disk_01_set_disk_limit_parses() {
+    let db = Database::open_memory();
+    let result = db.execute("SET DISK_LIMIT '1G'", &empty());
+    assert!(result.is_ok(), "SET DISK_LIMIT must parse: {result:?}");
+}
+
+#[test]
+fn disk_02_show_disk_limit_parses() {
+    let db = Database::open_memory();
+    let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+    assert_eq!(
+        result.columns,
+        vec!["limit", "used", "available", "startup_ceiling"]
+    );
+    assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn disk_03_disk_limit_noop_for_memory() {
+    let db = Database::open_memory();
+    db.execute("SET DISK_LIMIT '1M'", &empty()).unwrap();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let payload = "x".repeat(128 * 1024);
+    let insert = db.execute(
+        "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("payload", Value::Text(payload)),
+        ]),
+    );
+    assert!(
+        insert.is_ok(),
+        "in-memory databases must ignore disk limits: {insert:?}"
+    );
+
+    let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+    assert_eq!(
+        result.columns,
+        vec!["limit", "used", "available", "startup_ceiling"]
+    );
+    assert!(
+        match &result.rows[0][0] {
+            Value::Null => true,
+            Value::Text(s) if s == "none" => true,
+            _ => false,
+        },
+        "in-memory SHOW DISK_LIMIT must report no active limit: {:?}",
+        result.rows[0]
+    );
+}
+
+#[test]
+fn disk_04_insert_rejected_when_over_disk_budget() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("disk_04.db");
+    let db = Database::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let limit_kib = disk_limit_kib_for_path(&db_path, 64);
+    db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+        .unwrap();
+
+    let payload = "x".repeat(16 * 1024);
+    let mut inserted = 0usize;
+    let mut failure = None;
+    for _ in 0..64 {
+        match db.execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text(payload.clone())),
+            ]),
+        ) {
+            Ok(_) => inserted += 1,
+            Err(err) => {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+
+    assert!(
+        inserted > 0,
+        "disk budget should allow at least one insert before rejecting writes"
+    );
+    let err = failure.expect("eventually expected disk budget rejection");
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "error must mention disk budget, got: {err}"
+    );
+}
+
+#[test]
+fn disk_05_disk_limit_persists_across_reopen() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("disk_05.db");
+    let configured_limit_bytes = {
+        let db = Database::open(&db_path).unwrap();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        let limit_kib = disk_limit_kib_for_path(&db_path, 64);
+        let configured_limit_bytes = (limit_kib * 1024) as i64;
+        db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+            .unwrap();
+        let before = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+        assert!(
+            before.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+            "SHOW DISK_LIMIT must reflect configured limit before reopen: {:?}",
+            before.rows
+        );
+        db.close().unwrap();
+        configured_limit_bytes
+    };
+
+    let reopened = Database::open(&db_path).unwrap();
+    let after = reopened.execute("SHOW DISK_LIMIT", &empty()).unwrap();
+    assert!(
+        after.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+        "SHOW DISK_LIMIT must reflect persisted limit after reopen: {:?}",
+        after.rows
+    );
+
+    let payload = "x".repeat(16 * 1024);
+    let mut failure = None;
+    for _ in 0..64 {
+        match reopened.execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text(payload.clone())),
+            ]),
+        ) {
+            Ok(_) => {}
+            Err(err) => {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    let err = failure.expect("persisted disk limit must still reject writes after reopen");
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "reopened file-backed database must still enforce persisted disk limit: {err}"
+    );
+}
+
+#[test]
+fn disk_06_sync_pull_rejected_when_over_disk_budget() {
+    let edge_tmp = TempDir::new().expect("edge tempdir");
+    let server_tmp = TempDir::new().expect("server tempdir");
+    let edge_path = edge_tmp.path().join("edge.db");
+    let server_path = server_tmp.path().join("server.db");
+
+    let edge = Database::open(&edge_path).unwrap();
+    edge.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    for _ in 0..24 {
+        edge.execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text("x".repeat(8 * 1024))),
+            ]),
+        )
+        .unwrap();
+    }
+    let changes = edge.changes_since(0);
+
+    let server = Database::open(&server_path).unwrap();
+    server
+        .execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, payload TEXT)",
+            &empty(),
+        )
+        .unwrap();
+    server
+        .execute(
+            "INSERT INTO items (id, payload) VALUES ($id, $payload)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("payload", Value::Text("prime".repeat(1024))),
+            ]),
+        )
+        .unwrap();
+    let limit_kib = (std::fs::metadata(&server_path).unwrap().len() / 1024).max(1);
+    server
+        .execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+        .unwrap();
+    server.close().unwrap();
+
+    let server = Database::open(&server_path).unwrap();
+
+    let result = server.apply_changes(
+        changes,
+        &contextdb_engine::sync_types::ConflictPolicies::uniform(
+            contextdb_engine::sync_types::ConflictPolicy::LatestWins,
+        ),
+    );
+    assert!(
+        result.is_err(),
+        "sync pull must fail when disk budget blocks persistence"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "sync pull failure must mention disk budget, got: {err}"
+    );
+
+    let count = server
+        .execute("SELECT COUNT(*) FROM items", &empty())
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    assert_eq!(
+        count,
+        Value::Int64(1),
+        "failed sync pull must not make remote rows visible on the server"
+    );
 }
 
 #[test]

@@ -1,5 +1,7 @@
 use super::helpers::*;
 use contextdb_core::{Direction, Value};
+use contextdb_engine::Database;
+use tempfile::TempDir;
 
 #[test]
 fn job_01_placeholder_all_ontology_tables_queryable() {
@@ -94,8 +96,57 @@ fn job_04_cross_subsystem_tx() {
 }
 
 #[test]
-#[ignore = "requires disk-backed storage + memory accounting"]
-fn job_05_ignored_disk_budget() {}
+fn job_05_ignored_disk_budget() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("job_05.db");
+    let db = Database::open(&db_path).expect("open file-backed db");
+
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, content TEXT)",
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+
+    let limit_kib = std::fs::metadata(&db_path)
+        .expect("metadata")
+        .len()
+        .div_ceil(1024)
+        + 96;
+    db.execute(
+        &format!("SET DISK_LIMIT '{limit_kib}K'"),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+
+    let payload = "x".repeat(8 * 1024);
+    let mut inserted = 0usize;
+    let mut failure = None;
+    for _ in 0..128 {
+        match db.execute(
+            "INSERT INTO observations (id, content) VALUES ($id, $content)",
+            &std::collections::HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+                ("content".to_string(), Value::Text(payload.clone())),
+            ]),
+        ) {
+            Ok(_) => inserted += 1,
+            Err(err) => {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+
+    assert!(
+        inserted > 0,
+        "disk budget should allow at least one ontology row before rejecting writes"
+    );
+    let err = failure.expect("disk budget must eventually reject oversized ontology growth");
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "error must mention disk budget, got: {err}"
+    );
+}
 
 #[test]
 fn job_07_embedded_operation() {

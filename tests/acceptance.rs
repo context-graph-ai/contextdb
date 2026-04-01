@@ -14,6 +14,8 @@ mod data_integrity;
 mod deployment;
 #[path = "acceptance/dev_experience.rs"]
 mod dev_experience;
+#[path = "acceptance/disk_budget.rs"]
+mod disk_budget;
 #[path = "acceptance/embedding.rs"]
 mod embedding;
 #[path = "acceptance/infra_failures.rs"]
