@@ -13,6 +13,8 @@ No triggers. No application-side validation. The database enforces it.
 
 **Familiar conventions, nothing new to learn:** PostgreSQL-compatible SQL, [pgvector](https://github.com/pgvector/pgvector) syntax for vector search (`<=>`), and [SQL/PGQ](https://www.iso.org/standard/76120.html)-style `GRAPH_TABLE ... MATCH` for graph queries — the subset that matters for bounded traversal, not the full standard.
 
+**Language support:** contextdb is a Rust library and CLI today. Python and TypeScript bindings are on the roadmap — contributions welcome.
+
 See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or jump to [Getting Started](docs/getting-started.md) to try it in 2 minutes.
 
 ## Why Not SQLite + Extensions?

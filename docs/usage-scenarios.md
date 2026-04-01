@@ -153,7 +153,7 @@ WITH similar_decisions AS (
 basis_entities AS (
   SELECT b_id FROM GRAPH_TABLE(
     edges
-    MATCH (d)<-[:BASED_ON]-(b)
+    MATCH (d)-[:BASED_ON]->(b)
     WHERE d.id IN (SELECT id FROM similar_decisions)
     COLUMNS (b.id AS b_id)
   )
