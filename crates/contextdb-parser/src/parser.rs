@@ -81,12 +81,12 @@ fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStatement> {
                     match item.as_rule() {
                         Rule::recursive_kw => return Err(Error::RecursiveCteNotSupported),
                         Rule::cte_def => ctes.push(build_cte(item)?),
-                        _ => {}
+                        other => return Err(unexpected_rule(other, "build_select.with_clause")),
                     }
                 }
             }
             Rule::select_core => body = Some(build_select_core(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_select")),
         }
     }
 
@@ -104,7 +104,7 @@ fn build_cte(pair: Pair<'_, Rule>) -> Result<Cte> {
         match p.as_rule() {
             Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
             Rule::select_core => query = Some(build_select_core(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_cte")),
         }
     }
 
@@ -144,7 +144,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
             Rule::limit_clause => {
                 limit = Some(build_limit_clause(p)?);
             }
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_select_core")),
         }
     }
 
@@ -172,7 +172,7 @@ fn build_select_list(pair: Pair<'_, Rule>) -> Result<Vec<SelectColumn>> {
                 alias: None,
             }),
             Rule::select_item => cols.push(build_select_item(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_select_list")),
         }
     }
 
@@ -187,7 +187,7 @@ fn build_select_item(pair: Pair<'_, Rule>) -> Result<SelectColumn> {
         match p.as_rule() {
             Rule::expr => expr = Some(build_expr(p)?),
             Rule::identifier => alias = Some(parse_identifier(p.as_str())),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_select_item")),
         }
     }
 
@@ -244,7 +244,7 @@ fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
                 }
             }
             Rule::expr => on = Some(build_expr(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_join_clause")),
         }
     }
 
@@ -266,7 +266,7 @@ fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
             Rule::identifier | Rule::table_alias if alias.is_none() => {
                 alias = Some(parse_identifier(part.as_str()))
             }
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_table_ref")),
         }
     }
 
@@ -283,6 +283,7 @@ fn build_graph_table(pair: Pair<'_, Rule>) -> Result<FromItem> {
 
     for p in pair.into_inner() {
         match p.as_rule() {
+            Rule::graph_table_kw => {}
             Rule::identifier if graph_name.is_none() => {
                 graph_name = Some(parse_identifier(p.as_str()))
             }
@@ -297,7 +298,7 @@ fn build_graph_table(pair: Pair<'_, Rule>) -> Result<FromItem> {
                 where_clause = Some(build_expr(expr_pair)?);
             }
             Rule::columns_clause => columns = build_columns_clause(p)?,
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_graph_table")),
         }
     }
 
@@ -408,7 +409,7 @@ fn build_edge_step(pair: Pair<'_, Rule>) -> Result<EdgeStep> {
                 max_hops = max;
             }
             Rule::node_pattern => target = Some(build_node_pattern(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_edge_step")),
         }
     }
 
@@ -490,7 +491,9 @@ fn build_columns_clause(pair: Pair<'_, Rule>) -> Result<Vec<GraphTableColumn>> {
                 match inner.as_rule() {
                     Rule::expr => expr = Some(build_expr(inner)?),
                     Rule::identifier => alias = Some(parse_identifier(inner.as_str())),
-                    _ => {}
+                    other => {
+                        return Err(unexpected_rule(other, "build_columns_clause.graph_column"));
+                    }
                 }
             }
 
@@ -555,7 +558,7 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
                     SortDirection::Asc
                 };
             }
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_order_item")),
         }
     }
 
@@ -638,7 +641,7 @@ fn build_unary_bool_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
         match p.as_rule() {
             Rule::not_op => not_count += 1,
             Rule::comparison_expr => cmp = Some(build_comparison_expr(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_unary_bool_expr")),
         }
     }
 
@@ -716,7 +719,7 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
                 match p.as_rule() {
                     Rule::not_op => negated = true,
                     Rule::additive_expr => pattern = Some(build_additive_expr(p)?),
-                    _ => {}
+                    other => return Err(unexpected_rule(other, "build_comparison_suffix.like")),
                 }
             }
             Ok(Expr::Like {
@@ -784,7 +787,7 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
                             _ => return Err(Error::ParseError("invalid IN contents".to_string())),
                         }
                     }
-                    _ => {}
+                    other => return Err(unexpected_rule(other, "build_comparison_suffix.in")),
                 }
             }
 
@@ -860,7 +863,7 @@ fn build_unary_math_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
         match p.as_rule() {
             Rule::unary_minus => neg_count += 1,
             Rule::primary_expr => primary = Some(build_primary_expr(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_unary_math_expr")),
         }
     }
 
@@ -933,7 +936,7 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
                 column: "*".to_string(),
             })),
             Rule::expr => args.push(build_expr(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_function_call")),
         }
     }
 
@@ -1039,10 +1042,10 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                         }
                         retain = Some(build_retain_option(opt)?);
                     }
-                    _ => {}
+                    other => return Err(unexpected_rule(other, "build_create_table.table_option")),
                 }
             }
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_create_table")),
         }
     }
 
@@ -1093,7 +1096,7 @@ fn build_alter_table(pair: Pair<'_, Rule>) -> Result<AlterTable> {
         match p.as_rule() {
             Rule::identifier if table.is_none() => table = Some(parse_identifier(p.as_str())),
             Rule::alter_action => action = Some(build_alter_action(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_alter_table")),
         }
     }
 
@@ -1251,10 +1254,12 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                         }
                         inline_state_machine = Some(build_state_machine_option(c)?);
                     }
-                    _ => {}
+                    other => {
+                        return Err(unexpected_rule(other, "build_column_def.column_constraint"));
+                    }
                 }
             }
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_column_def")),
         }
     }
 
@@ -1298,7 +1303,7 @@ fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
             }
             Rule::retain_unit => unit = Some(part.as_str().to_ascii_uppercase()),
             Rule::sync_safe_option => sync_safe = true,
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_retain_option")),
         }
     }
 
@@ -1358,7 +1363,7 @@ fn build_fk_propagation_clause(pair: Pair<'_, Rule>) -> Result<AstPropagationRul
             }
             Rule::max_depth_clause => max_depth = Some(parse_max_depth_clause(p)?),
             Rule::abort_on_failure_clause => abort_on_failure = true,
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_fk_propagation_clause")),
         }
     }
 
@@ -1394,7 +1399,7 @@ fn build_edge_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationR
             }
             Rule::max_depth_clause => max_depth = Some(parse_max_depth_clause(p)?),
             Rule::abort_on_failure_clause => abort_on_failure = true,
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_edge_propagation_option")),
         }
     }
 
@@ -1539,7 +1544,7 @@ fn build_drop_table(pair: Pair<'_, Rule>) -> Result<DropTable> {
         match p.as_rule() {
             Rule::if_exists => if_exists = true,
             Rule::identifier => name = Some(parse_identifier(p.as_str())),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_drop_table")),
         }
     }
 
@@ -1583,7 +1588,7 @@ fn build_insert(pair: Pair<'_, Rule>) -> Result<Insert> {
             Rule::identifier => columns.push(parse_identifier(p.as_str())),
             Rule::values_row => values.push(build_values_row(p)?),
             Rule::on_conflict_clause => on_conflict = Some(build_on_conflict(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_insert")),
         }
     }
 
@@ -1610,7 +1615,7 @@ fn build_on_conflict(pair: Pair<'_, Rule>) -> Result<OnConflict> {
         match p.as_rule() {
             Rule::identifier => columns.push(parse_identifier(p.as_str())),
             Rule::assignment => update_columns.push(build_assignment(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_on_conflict")),
         }
     }
 
@@ -1628,7 +1633,7 @@ fn build_assignment(pair: Pair<'_, Rule>) -> Result<(String, Expr)> {
         match p.as_rule() {
             Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
             Rule::expr => value = Some(build_expr(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_assignment")),
         }
     }
 
@@ -1646,7 +1651,7 @@ fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
         match p.as_rule() {
             Rule::identifier => table = Some(parse_identifier(p.as_str())),
             Rule::where_clause => where_clause = Some(build_where_clause(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_delete")),
         }
     }
 
@@ -1666,7 +1671,7 @@ fn build_update(pair: Pair<'_, Rule>) -> Result<Update> {
             Rule::identifier if table.is_none() => table = Some(parse_identifier(p.as_str())),
             Rule::assignment => assignments.push(build_assignment(p)?),
             Rule::where_clause => where_clause = Some(build_where_clause(p)?),
-            _ => {}
+            other => return Err(unexpected_rule(other, "build_update")),
         }
     }
 
@@ -1804,7 +1809,7 @@ fn validate_expr(expr: &Expr) -> Result<()> {
                 validate_expr(arg)?;
             }
         }
-        _ => {}
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
     }
     Ok(())
 }
@@ -1853,10 +1858,14 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
                 validate_subquery_expr(arg, cte_names)?;
             }
         }
-        _ => {}
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => {}
     }
 
     Ok(())
+}
+
+fn unexpected_rule(rule: Rule, context: &str) -> Error {
+    Error::ParseError(format!("unexpected rule {:?} in {}", rule, context))
 }
 
 fn parse_identifier(raw: &str) -> String {
