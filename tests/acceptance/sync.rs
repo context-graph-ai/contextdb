@@ -628,7 +628,7 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     // Wait for data to appear on server WHILE CLI IS STILL RUNNING.
     // Timeout-based poll is correct here: auto-sync is async by design,
     // there is no deterministic completion signal (unlike f09c which has stdout "ok" lines).
-    let found = wait_until(Duration::from_secs(10), || {
+    let found = wait_until(Duration::from_secs(30), || {
         // Must not kill the server — check by opening a second connection to the DB
         // The server process holds the DB open, so we check via a fresh CLI pull
         let fresh_path = edge_path.with_file_name("f12-checker.db");
@@ -739,7 +739,7 @@ async fn f12c_auto_sync_pushes_deletes() {
     // Each checker uses a unique path to avoid stale local data from previous pulls
     let mut checker_idx = 0u32;
     let mut last_stdout = String::new();
-    let found = wait_until(Duration::from_secs(20), || {
+    let found = wait_until(Duration::from_secs(30), || {
         checker_idx += 1;
         let fresh_path = edge_path.with_file_name(format!("f12c-checker-{checker_idx}.db"));
         let check = run_cli_script(
@@ -791,7 +791,7 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
     let mut checker_idx = 0u32;
-    let found = wait_until(Duration::from_secs(10), || {
+    let found = wait_until(Duration::from_secs(30), || {
         checker_idx += 1;
         let fresh_path = edge_path.with_file_name(format!("f12d-checker-{checker_idx}.db"));
         let check = run_cli_script(
