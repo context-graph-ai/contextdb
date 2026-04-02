@@ -7,6 +7,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  IMAGE: ghcr.io/context-graph-ai/contextdb-server
 
 permissions:
   contents: write
@@ -42,29 +43,67 @@ jobs:
             sleep 30
           done
 
-  publish-docker:
+  build-docker:
     needs: verify-version
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push multi-arch image
+      - name: Build and push digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: |
-            ghcr.io/context-graph-ai/contextdb-server:${{ github.ref_name }}
-            ghcr.io/context-graph-ai/contextdb-server:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+          outputs: type=image,push-by-digest=true,name-canonical=true
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+
+  publish-docker:
+    needs: build-docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: docker-digest-*
+          merge-multiple: true
+      - name: Create manifest and push
+        run: |
+          cd /tmp/digests
+          docker buildx imagetools create \
+            -t $IMAGE:${{ github.ref_name }} \
+            -t $IMAGE:latest \
+            $(printf '$IMAGE@sha256:%s ' *)
 
   build-binaries:
     needs: verify-version
@@ -139,7 +178,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install mdBook
-        run: cargo install mdbook
+        run: cargo install mdbook --version 0.5.2
       - name: Build docs
         run: mdbook build
       - name: Dispatch to website repo

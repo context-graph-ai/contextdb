@@ -1,6 +1,14 @@
-FROM rust:1-bookworm AS builder
-
+FROM rust:1.94.0-bookworm AS chef
+RUN cargo install cargo-chef --version 0.1.77
 WORKDIR /src
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p contextdb-server
 COPY . .
 RUN cargo build --release -p contextdb-server \
     && strip target/release/contextdb-server

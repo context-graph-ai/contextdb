@@ -9,6 +9,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/**'
+      - 'rust-toolchain.toml'
+      - 'Dockerfile'
   pull_request:
     branches: [main]
 
