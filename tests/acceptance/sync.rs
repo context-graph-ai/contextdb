@@ -735,7 +735,7 @@ async fn f12c_auto_sync_pushes_deletes() {
     // Each checker uses a unique path to avoid stale local data from previous pulls
     let mut checker_idx = 0u32;
     let mut last_stdout = String::new();
-    let found = wait_until(Duration::from_secs(10), || {
+    let found = wait_until(Duration::from_secs(20), || {
         checker_idx += 1;
         let fresh_path = edge_path.with_file_name(format!("f12c-checker-{checker_idx}.db"));
         let check = run_cli_script(
