@@ -8,5 +8,5 @@ repository.workspace = true
 description = "Rule-based query planner for contextdb"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core" }
-contextdb-parser = { path = "../contextdb-parser" }
+contextdb-core = { path = "../contextdb-core", version = "0.2" }
+contextdb-parser = { path = "../contextdb-parser", version = "0.2" }

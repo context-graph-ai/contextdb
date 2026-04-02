@@ -7,20 +7,22 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, Once, mpsc};
+use std::sync::{Arc, LazyLock, Once, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 static BUILD_RELEASE_BINARIES: Once = Once::new();
-static NATS_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NATS_TEST_LOCK: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 pub(crate) struct NatsFixture {
-    _lock: MutexGuard<'static, ()>,
+    _lock: OwnedSemaphorePermit,
     _container: ContainerAsync<GenericImage>,
     pub(crate) nats_url: String,
     pub(crate) ws_url: String,
@@ -261,7 +263,11 @@ pub(crate) fn wait_for_child_stdout_contains(
 }
 
 pub(crate) async fn start_nats() -> NatsFixture {
-    let lock = NATS_TEST_LOCK.lock().expect("NATS test lock");
+    let lock = NATS_TEST_LOCK
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("NATS fixture lock should not close");
     let conf = workspace_root()
         .join("crates/contextdb-engine/tests/nats.conf")
         .to_string_lossy()

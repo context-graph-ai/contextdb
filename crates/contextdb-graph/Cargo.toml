@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Graph executor for contextdb — bounded BFS, DAG enforcement, typed edges"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core" }
-contextdb-tx = { path = "../contextdb-tx" }
+contextdb-core = { path = "../contextdb-core", version = "0.2" }
+contextdb-tx = { path = "../contextdb-tx", version = "0.2" }
 parking_lot.workspace = true
 uuid.workspace = true

@@ -1,6 +1,11 @@
+[![CI](https://github.com/context-graph-ai/contextdb/actions/workflows/ci.yml/badge.svg)](https://github.com/context-graph-ai/contextdb/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/contextdb-engine)](https://crates.io/crates/contextdb-engine)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![docs.rs](https://docs.rs/contextdb-engine/badge.svg)](https://docs.rs/contextdb-engine)
+
 # contextdb
 
-An embedded database for agentic memory systems. Relational storage, graph traversal, and vector similarity search under unified MVCC transactions — in a single file, in a single process.
+An embedded database for agentic memory systems. Relational storage, graph traversal, and vector similarity search under unified MVCC transactions — in a single file, in a single process. Every agent, device, or service runs its own contextdb. They sync bidirectionally through a central server over WebSocket — knowledge learned by one becomes available to all, with per-table conflict resolution. No port forwarding, no VPN — WebSocket traverses NAT out of the box.
 
 If you're building agent memory today, you're probably stitching together SQLite for state, a vector database for embeddings, and application code for graph traversal. contextdb replaces all three — and adds **enforceable policy constraints** (state machines, DAG enforcement, cascading propagation) that the database guarantees, not application code.
 
@@ -15,6 +20,8 @@ No triggers. No application-side validation. The database enforces it.
 
 **Language support:** contextdb is a Rust library and CLI today. Python and TypeScript bindings are on the roadmap — contributions welcome.
 
+**Website:** [contextdb.tech](https://contextdb.tech) · **Docs:** [contextdb.tech/docs](https://contextdb.tech/docs/)
+
 See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or jump to [Getting Started](docs/getting-started.md) to try it in 2 minutes.
 
 ## Why Not SQLite + Extensions?
@@ -25,7 +32,7 @@ See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or j
 | Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ with bounded BFS, DAG enforcement, typed edges |
 | State machines | CHECK constraints + triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
 | Atomic cross-model updates | Application-level coordination | Single MVCC transaction across relational + graph + vector |
-| Sync | Build your own | Built-in NATS-based replication with conflict resolution |
+| Sync | Build your own | Bidirectional collaborative sync — each database syncs changesets with conflict resolution, not WAL pages |
 | Immutable tables | Not enforceable (triggers are bypassable) | `IMMUTABLE` keyword, enforced by the database engine |
 | Cascading invalidation | Application code | `PROPAGATE` in DDL — state changes cascade along edges and FKs |
 
@@ -116,8 +123,20 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb" }
-contextdb-core = { git = "https://github.com/context-graph-ai/contextdb" }
+contextdb-engine = "0.2"
+contextdb-core = "0.2"
+```
+
+## Install
+
+```bash
+# Install the CLI
+cargo install contextdb-cli
+
+# Or run the server (no clone needed)
+curl -O https://raw.githubusercontent.com/context-graph-ai/contextdb/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/context-graph-ai/contextdb/main/nats.conf
+docker compose up
 ```
 
 ## Or Explore With the CLI
@@ -161,7 +180,7 @@ STATE MACHINE (status: active -> [superseded], draft -> [active, rejected])
 
 **Enforceable policy constraints** — `IMMUTABLE` tables, `STATE MACHINE` column transitions, `DAG` cycle prevention, `RETAIN` with TTL expiry, `PROPAGATE` for cascading state changes along edges and foreign keys. Enforced by the database — no application code can bypass them.
 
-**Sync** — Edge-to-server replication over NATS. Offline-first: the edge database works without connectivity. Sync pushes/pulls changesets with configurable conflict resolution per table.
+**Collaborative sync** — Every contextdb instance is a full read-write database. Each runs a SyncClient that syncs bidirectionally with a central SyncServer over NATS (WebSocket for clients behind NAT, native protocol for server-to-server). Offline-first: each database works independently, syncing changesets when connected. Per-table conflict resolution (LatestWins, ServerWins, EdgeWins) and per-table sync direction (Push, Pull, Both, None) give you fine-grained control over what flows where. The server runs the same contextdb engine — self-host it, or point your databases at a hosted server.
 
 **Persistence** — Single-file storage via redb. Crash-safe. Compute/storage separated via the `WriteSetApplicator` trait (local redb for open source, object store for enterprise).
 
@@ -181,6 +200,8 @@ contextdb is designed for agentic memory, not data warehousing:
 - Laptops, ARM64 devices (browser and mobile via Rust's WASM target are future directions)
 
 ## Documentation
+
+Full documentation is available at [contextdb.tech/docs](https://contextdb.tech/docs/), or browse the source files:
 
 | Doc | What it covers |
 |-----|---------------|

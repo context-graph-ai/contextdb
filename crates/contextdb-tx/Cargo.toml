@@ -8,5 +8,5 @@ repository.workspace = true
 description = "MVCC transaction manager for contextdb"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core" }
+contextdb-core = { path = "../contextdb-core", version = "0.2" }
 parking_lot.workspace = true

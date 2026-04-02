@@ -1,0 +1,86 @@
+name: Release Dry Run
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release
+
+  dry-run-publish:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Dry-run publish all crates
+        run: |
+          for crate in contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-vector contextdb-parser contextdb-planner contextdb-engine contextdb-server contextdb-cli; do
+            echo "Dry-run: $crate"
+            cargo publish -p $crate --dry-run
+          done
+
+  dry-run-docker:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build multi-arch image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+
+  dry-run-binaries:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            bins: contextdb-cli,contextdb-server
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            bins: contextdb-cli,contextdb-server
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            bins: contextdb-cli
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bins: contextdb-cli
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      - name: Build
+        run: |
+          for bin in $(echo "${{ matrix.bins }}" | tr ',' ' '); do
+            cargo build --release --target ${{ matrix.target }} -p $bin
+          done

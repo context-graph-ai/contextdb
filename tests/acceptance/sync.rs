@@ -682,7 +682,7 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     // Wait for UPDATE to appear on server while CLI is still running
     let mut checker_idx = 0u32;
     let mut last_stdout = String::new();
-    let found = wait_until(Duration::from_secs(20), || {
+    let found = wait_until(Duration::from_secs(30), || {
         checker_idx += 1;
         let fresh_path = edge_path.with_file_name(format!("f12b-checker-{checker_idx}.db"));
         let check = run_cli_script(

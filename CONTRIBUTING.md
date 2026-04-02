@@ -1,8 +1,22 @@
 # Contributing to contextdb
 
-## Build and Test
+## Building
 
-Run all four verification checks before submitting:
+```bash
+git clone https://github.com/context-graph-ai/contextdb.git
+cd contextdb
+cargo build --workspace
+```
+
+## Running Tests
+
+```bash
+cargo test --workspace
+```
+
+## Before Submitting a PR
+
+All four checks must pass:
 
 ```bash
 cargo fmt --all --check
@@ -13,17 +27,15 @@ cargo build --release
 
 ## Crate Layout
 
-All crates live under `crates/`:
+All source lives under `crates/` — see [Architecture](docs/architecture.md) for the full crate map and dependency graph.
 
-| Crate | Purpose |
-|---|---|
-| `crates/contextdb-core` | Shared types, errors, and traits |
-| `crates/contextdb-tx` | MVCC transaction manager |
-| `crates/contextdb-relational` | Relational (row) storage |
-| `crates/contextdb-graph` | Graph edge storage and BFS |
-| `crates/contextdb-vector` | Vector storage and ANN search |
-| `crates/contextdb-parser` | SQL/PGQ parser (pest grammar) |
-| `crates/contextdb-planner` | Query planner |
-| `crates/contextdb-engine` | Database engine (orchestrates all subsystems) |
-| `crates/contextdb-server` | NATS sync server and client |
-| `crates/contextdb-cli` | CLI REPL |
+## Pull Requests
+
+- Fork the repo, create a branch, submit a PR against `main`
+- Keep changes focused — one feature or fix per PR
+- Include tests for new functionality
+- Ensure all CI checks pass before requesting review
+
+## License
+
+By contributing, you agree that your contributions will be licensed under Apache-2.0.

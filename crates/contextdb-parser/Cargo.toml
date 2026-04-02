@@ -8,7 +8,7 @@ repository.workspace = true
 description = "SQL parser for contextdb with GRAPH_TABLE and vector extensions"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core" }
+contextdb-core = { path = "../contextdb-core", version = "0.2" }
 pest.workspace = true
 pest_derive.workspace = true
 

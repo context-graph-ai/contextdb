@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Relational executor for contextdb — scan, insert, upsert, delete"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core" }
-contextdb-tx = { path = "../contextdb-tx" }
+contextdb-core = { path = "../contextdb-core", version = "0.2" }
+contextdb-tx = { path = "../contextdb-tx", version = "0.2" }
 parking_lot.workspace = true
 uuid.workspace = true

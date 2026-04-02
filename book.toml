@@ -1,0 +1,6 @@
+[book]
+title = "contextdb"
+src = "docs"
+
+[output.html]
+git-repository-url = "https://github.com/context-graph-ai/contextdb"

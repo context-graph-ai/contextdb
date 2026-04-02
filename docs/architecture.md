@@ -164,12 +164,39 @@ Fan-out to multiple subscribers. Dead channels are cleaned up automatically. Gra
 
 ## Sync
 
-Edge-to-server replication over NATS. The sync layer uses the same `Database` engine on both sides.
+### Deployment Topology
+
+contextdb uses a client-server sync model where every instance — client or server — runs the same database engine. There is no "replica" or "read-only copy." Each database is a full read-write contextdb that works independently offline.
+
+```
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  contextdb   │  │  contextdb   │  │  contextdb   │
+│  (laptop)    │  │  (service)   │  │  (device)    │
+│  SyncClient  │  │  SyncClient  │  │  SyncClient  │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │ ws://           │ ws://           │ ws://
+       │                 │                 │
+       └────────┬────────┴────────┬────────┘
+                │  NATS (WebSocket :9222)  │
+                └────────┬────────────────┘
+                         │
+                ┌────────┴───────┐
+                │  contextdb     │
+                │  (server)      │
+                │  SyncServer    │
+                └────────────────┘
+```
+
+Each client database accumulates knowledge independently — decisions, observations, corrections, embeddings. On sync, changesets flow bidirectionally: local changes push up, server changes pull down. This is collaborative sync, not WAL replication — logical changesets with per-table conflict resolution, so knowledge learned by any participant propagates to all others.
+
+WebSocket transport means clients behind NAT (laptops, mobile, browser) connect outbound to the NATS server — no port forwarding, no VPN, no network configuration.
+
+The server is just a contextdb instance running SyncServer. Self-host it alongside your own NATS, or point your client databases at a hosted server — the client binary and database files don't change, only the NATS connection string. Managed hosting is coming soon — [join the waitlist](https://contextdb.tech).
 
 ### Components
 
-- `SyncClient` — runs on edge devices. Pushes local changes to server, pulls remote changes.
-- `SyncServer` — runs on the server. Receives pushes, serves pulls.
+- `SyncClient` — runs on each participant. Pushes local changes to server, pulls remote changes.
+- `SyncServer` — runs on the central server. Receives pushes, serves pulls.
 
 Both communicate via NATS subjects: `sync.{tenant_id}.push` / `sync.{tenant_id}.pull`.
 

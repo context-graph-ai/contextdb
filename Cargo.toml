@@ -18,7 +18,11 @@ default-members = ["crates/contextdb-engine", "crates/contextdb-cli", "crates/co
 authors = ["John Cyriac <lucidprogrammer@hotmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/context-graph-ai/contextdb"
+homepage = "https://contextdb.tech"
+documentation = "https://contextdb.tech/docs/"
 description = "Embedded database for agentic memory — relational, graph, and vector under unified MVCC transactions"
+keywords = ["database", "embedded", "graph", "vector", "agentic"]
+categories = ["database-implementations", "data-structures"]
 
 [workspace.dependencies]
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
@@ -42,3 +46,17 @@ tempfile = "3"
 hnsw_rs = "0.3"
 anndists = "0.1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
+tag-message = "v{{version}}"
+pre-release-commit-message = "release: v{{version}}"
+pre-release-replacements = [
+  { file = "README.md", search = 'contextdb-engine = "[^"]+"', replace = 'contextdb-engine = "{{version}}"' },
+  { file = "README.md", search = 'contextdb-core = "[^"]+"', replace = 'contextdb-core = "{{version}}"' },
+  { file = "docs/getting-started.md", search = 'contextdb-engine = "[^"]+"', replace = 'contextdb-engine = "{{version}}"', prerelease = true },
+  { file = "docs/getting-started.md", search = 'contextdb-core = "[^"]+"', replace = 'contextdb-core = "{{version}}"', prerelease = true },
+]
+publish = true
+push = true

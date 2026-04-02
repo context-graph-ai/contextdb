@@ -1182,9 +1182,12 @@ fn validate_update_state_transition(
     };
 
     if old_state == new_state
-        || db
-            .relational_store()
-            .validate_state_transition(table, &state_machine.column, old_state, new_state)
+        || db.relational_store().validate_state_transition(
+            table,
+            &state_machine.column,
+            old_state,
+            new_state,
+        )
     {
         return Ok(());
     }

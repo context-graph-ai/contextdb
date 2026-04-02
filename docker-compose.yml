@@ -1,0 +1,26 @@
+services:
+  nats:
+    image: nats:latest
+    ports:
+      - "4222:4222"
+      - "9222:9222"
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf:ro
+    command: ["-c", "/etc/nats/nats.conf"]
+
+  contextdb-server:
+    # To build from source instead: docker compose build
+    image: ghcr.io/context-graph-ai/contextdb-server:latest
+    build: .
+    depends_on:
+      - nats
+    environment:
+      CONTEXTDB_NATS_URL: "nats://nats:4222"
+      CONTEXTDB_TENANT_ID: "default"
+      CONTEXTDB_DB_PATH: "/data/server.db"
+    volumes:
+      - contextdb-data:/data
+    restart: unless-stopped
+
+volumes:
+  contextdb-data:

@@ -1,0 +1,8 @@
+target/
+.git/
+.claude/
+docs/
+benches/
+tests/
+*.md
+LICENSE
