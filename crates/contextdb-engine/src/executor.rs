@@ -1086,6 +1086,7 @@ fn exec_update(
             let value = eval_assignment_expr(vexpr, &row.values, params)?;
             values.insert(k.clone(), coerce_value_for_column(db, &p.table, k, value)?);
         }
+        validate_update_state_transition(db, &p.table, row, &values)?;
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
         let new_state = db
             .table_meta(&p.table)
@@ -1153,6 +1154,44 @@ fn estimate_table_row_bytes(
         .table_meta(table)
         .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
     Ok(estimate_row_bytes_for_meta(values, &meta, false))
+}
+
+fn validate_update_state_transition(
+    db: &Database,
+    table: &str,
+    existing: &VersionedRow,
+    next_values: &HashMap<String, Value>,
+) -> Result<()> {
+    let Some(meta) = db.table_meta(table) else {
+        return Ok(());
+    };
+    let Some(state_machine) = meta.state_machine else {
+        return Ok(());
+    };
+
+    let old_state = existing
+        .values
+        .get(&state_machine.column)
+        .and_then(Value::as_text);
+    let new_state = next_values
+        .get(&state_machine.column)
+        .and_then(Value::as_text);
+
+    let (Some(old_state), Some(new_state)) = (old_state, new_state) else {
+        return Ok(());
+    };
+
+    if old_state == new_state
+        || db
+            .relational_store()
+            .validate_state_transition(table, &state_machine.column, old_state, new_state)
+    {
+        return Ok(());
+    }
+
+    Err(Error::InvalidStateTransition(format!(
+        "{old_state} -> {new_state}"
+    )))
 }
 
 fn estimate_row_bytes_for_meta(

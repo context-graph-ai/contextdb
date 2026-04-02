@@ -1087,14 +1087,8 @@ impl Database {
             if trigger_state != source.state {
                 continue;
             }
-            if let Some(row) = self.relational.point_lookup_with_tx(
-                Some(ctx.tx),
-                source.table,
-                "id",
-                &Value::Uuid(source.uuid),
-                ctx.snapshot,
-            )? {
-                self.delete_vector(ctx.tx, row.row_id)?;
+            for row_id in self.logical_row_ids_for_uuid(ctx.tx, source.table, source.uuid) {
+                self.delete_vector(ctx.tx, row_id)?;
             }
         }
 
@@ -1138,6 +1132,33 @@ impl Database {
     ) -> Result<Option<VersionedRow>> {
         self.relational
             .point_lookup_with_tx(Some(tx), table, col, value, snapshot)
+    }
+
+    pub(crate) fn logical_row_ids_for_uuid(
+        &self,
+        tx: TxId,
+        table: &str,
+        uuid: uuid::Uuid,
+    ) -> Vec<RowId> {
+        let mut row_ids = HashSet::new();
+
+        if let Some(rows) = self.relational_store.tables.read().get(table) {
+            for row in rows {
+                if row.values.get("id") == Some(&Value::Uuid(uuid)) {
+                    row_ids.insert(row.row_id);
+                }
+            }
+        }
+
+        let _ = self.tx_mgr.with_write_set(tx, |ws| {
+            for (insert_table, row) in &ws.relational_inserts {
+                if insert_table == table && row.values.get("id") == Some(&Value::Uuid(uuid)) {
+                    row_ids.insert(row.row_id);
+                }
+            }
+        });
+
+        row_ids.into_iter().collect()
     }
 
     pub fn insert_edge(
