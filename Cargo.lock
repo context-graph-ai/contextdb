@@ -610,6 +610,7 @@ dependencies = [
 name = "contextdb-engine"
 version = "0.2.0"
 dependencies = [
+ "async-nats",
  "bincode 2.0.1",
  "contextdb-core",
  "contextdb-graph",
@@ -620,6 +621,7 @@ dependencies = [
  "contextdb-tx",
  "contextdb-vector",
  "criterion",
+ "futures-util",
  "parking_lot",
  "redb",
  "rmp-serde",

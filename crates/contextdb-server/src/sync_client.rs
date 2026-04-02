@@ -265,17 +265,42 @@ impl SyncClient {
 
                     match tokio::time::timeout(PUSH_REQUEST_TIMEOUT, inbox_sub.next()).await {
                         Ok(Some(msg)) => {
-                            if msg.status == Some(async_nats::StatusCode::NO_RESPONDERS)
-                                && attempt < 4
-                            {
-                                tracing::debug!(attempt, "push got no responders, retrying");
-                                continue;
+                            if let Some(status) = msg.status {
+                                if status == async_nats::StatusCode::NO_RESPONDERS && attempt < 4 {
+                                    tracing::debug!(attempt, "push got no responders, retrying");
+                                    continue;
+                                }
+                                if attempt < 4 {
+                                    tracing::debug!(
+                                        attempt,
+                                        ?status,
+                                        "push got status reply, retrying"
+                                    );
+                                    continue;
+                                }
+                                return Err(Error::SyncError(format!(
+                                    "push failed with NATS status reply: {status:?}"
+                                )));
                             }
-                            let envelope = decode(&msg.payload)
-                                .map_err(|e| Error::SyncError(e.to_string()))?;
-                            let response: PushResponse =
-                                rmp_serde::from_slice(&envelope.payload)
-                                    .map_err(|e| Error::SyncError(e.to_string()))?;
+
+                            let envelope = match decode(&msg.payload) {
+                                Ok(envelope) => envelope,
+                                Err(err) if attempt < 4 => {
+                                    tracing::debug!(attempt, error = %err, "push got malformed reply envelope, retrying");
+                                    continue;
+                                }
+                                Err(err) => return Err(Error::SyncError(err.to_string())),
+                            };
+                            let response: PushResponse = match rmp_serde::from_slice(
+                                &envelope.payload,
+                            ) {
+                                Ok(response) => response,
+                                Err(err) if attempt < 4 => {
+                                    tracing::debug!(attempt, error = %err, "push got malformed reply payload, retrying");
+                                    continue;
+                                }
+                                Err(err) => return Err(Error::SyncError(err.to_string())),
+                            };
                             if let Some(err) = response.error {
                                 return Err(Error::SyncError(err));
                             }

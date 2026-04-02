@@ -2,6 +2,9 @@
 
 use contextdb_core::{Direction, Error, Value, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
+use contextdb_server::protocol::{MessageType, PullRequest, PullResponse, decode, encode};
+use contextdb_server::subjects::pull_subject;
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -295,6 +298,71 @@ pub(crate) async fn start_nats() -> NatsFixture {
         nats_url: format!("nats://127.0.0.1:{nats_port}"),
         ws_url: format!("ws://127.0.0.1:{ws_port}"),
     }
+}
+
+pub(crate) async fn wait_for_sync_server_ready(
+    nats_url: &str,
+    tenant_id: &str,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let client = match async_nats::connect(nats_url).await {
+            Ok(client) => client,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        let inbox = client.new_inbox();
+        let mut inbox_sub = match client.subscribe(inbox.clone()).await {
+            Ok(sub) => sub,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        let payload = match encode(
+            MessageType::PullRequest,
+            &PullRequest {
+                since_lsn: 0,
+                max_entries: Some(1),
+            },
+        ) {
+            Ok(payload) => payload,
+            Err(_) => return false,
+        };
+
+        if client
+            .publish_with_reply(pull_subject(tenant_id), inbox.clone(), payload.into())
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        let response = tokio::time::timeout(Duration::from_millis(500), inbox_sub.next()).await;
+        match response {
+            Ok(Some(msg)) if msg.status == Some(async_nats::StatusCode::NO_RESPONDERS) => {}
+            Ok(Some(msg)) if msg.status.is_some() => {}
+            Ok(Some(msg)) => {
+                if let Ok(envelope) = decode(&msg.payload)
+                    && matches!(envelope.message_type, MessageType::PullResponse)
+                    && rmp_serde::from_slice::<PullResponse>(&envelope.payload).is_ok()
+                {
+                    return true;
+                }
+            }
+            Ok(None) | Err(_) => {}
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    false
 }
 
 pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {

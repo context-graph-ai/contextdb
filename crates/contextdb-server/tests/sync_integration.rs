@@ -1,5 +1,6 @@
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_server::protocol::{MessageType, PushResponse, WireApplyResult, encode};
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,6 +113,70 @@ async fn sync_round_trip_smoke() {
 
     let client = SyncClient::new(edge, &nats.nats_url, "test_tenant");
     let _ = client.pull(&policies).await;
+}
+
+#[tokio::test]
+async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
+    use contextdb_core::Value;
+    use futures_util::StreamExt;
+    use uuid::Uuid;
+
+    let nats = start_nats().await;
+    let edge = Arc::new(Database::open_memory());
+    let empty = HashMap::new();
+    edge.execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
+        .unwrap();
+
+    let responder = async_nats::connect(&nats.nats_url).await.unwrap();
+    let mut sub = responder
+        .subscribe(contextdb_server::subjects::push_subject("malformed-reply"))
+        .await
+        .unwrap();
+
+    tokio::spawn(async move {
+        let mut attempt = 0u32;
+        while let Some(msg) = sub.next().await {
+            attempt += 1;
+            if let Some(reply) = msg.reply {
+                let payload = if attempt == 1 {
+                    vec![0x91]
+                } else {
+                    encode(
+                        MessageType::PushResponse,
+                        &PushResponse {
+                            result: Some(WireApplyResult {
+                                applied_rows: 1,
+                                skipped_rows: 0,
+                                conflicts: Vec::new(),
+                                new_lsn: 2,
+                            }),
+                            error: None,
+                        },
+                    )
+                    .unwrap()
+                };
+                responder.publish(reply, payload.into()).await.unwrap();
+                if attempt >= 2 {
+                    break;
+                }
+            }
+        }
+    });
+
+    let client = SyncClient::new(edge.clone(), &nats.nats_url, "malformed-reply");
+    let id = Uuid::new_v4();
+    let mut p = HashMap::new();
+    p.insert("id".to_string(), Value::Uuid(id));
+    p.insert("v".to_string(), Value::Text("retry".into()));
+    edge.execute("INSERT INTO t (id, v) VALUES ($id, $v)", &p)
+        .unwrap();
+
+    let result = client
+        .push()
+        .await
+        .expect("push should retry malformed reply");
+    assert_eq!(result.applied_rows, 1);
+    assert!(client.push_watermark() > 0, "push watermark should advance");
 }
 
 /// I connected the sync server to a NATS account that denies its sync subscriptions,

@@ -721,6 +721,10 @@ async fn f12c_auto_sync_pushes_deletes() {
     let ws_url = &nats.ws_url;
     let tenant = "f12c_auto_sync_pushes_deletes";
     let mut server = spawn_server(&server_path, tenant, nats_url);
+    assert!(
+        wait_for_sync_server_ready(nats_url, tenant, Duration::from_secs(15)).await,
+        "sync server should be ready before f12c setup push begins"
+    );
 
     let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
 
@@ -735,23 +739,31 @@ async fn f12c_auto_sync_pushes_deletes() {
          DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002'\n",
     );
 
-    // Wait for DELETE to propagate — server should have 1 row, not 2
-    // Each checker uses a unique path to avoid stale local data from previous pulls
-    let mut checker_idx = 0u32;
-    let mut last_stdout = String::new();
+    let checker_path = edge_path.with_file_name("f12c-checker.db");
+    let checker_setup = run_cli_script(
+        &checker_path,
+        &["--tenant-id", tenant, "--nats-url", ws_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+    );
+    assert!(
+        checker_setup.status.success(),
+        "checker edge setup must succeed"
+    );
+
+    // Wait for DELETE to propagate while the writer CLI is still running.
+    // Reuse a single checker edge so the probe stays end-to-end without creating a new
+    // edge process and schema bootstrap on every polling iteration.
+    let mut last_checker_stdout = String::new();
     let found = wait_until(Duration::from_secs(30), || {
-        checker_idx += 1;
-        let fresh_path = edge_path.with_file_name(format!("f12c-checker-{checker_idx}.db"));
         let check = run_cli_script(
-            &fresh_path,
+            &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
-            "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-             .sync pull\n\
+            ".sync pull\n\
              SELECT count(*) FROM sensors\n\
              .quit\n",
         );
         let stdout = output_string(&check.stdout);
-        last_stdout = stdout.clone();
+        last_checker_stdout = stdout.clone();
         stdout.contains("| 1")
     });
 
@@ -761,7 +773,7 @@ async fn f12c_auto_sync_pushes_deletes() {
 
     assert!(
         found,
-        "DELETE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}; last checker stdout={last_stdout}",
+        "DELETE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}; last checker stdout={last_checker_stdout}",
         output_string(&output.stdout),
         output_string(&output.stderr),
     );
