@@ -6,7 +6,7 @@
 //!
 //! Sync contract tests. A9-xx test engine sync mechanics. NT-xx test NATS transport.
 
-use contextdb_core::{Direction, Value};
+use contextdb_core::{Direction, MemoryAccountant, Value};
 use contextdb_engine::Database;
 #[allow(unused_imports)]
 use contextdb_engine::sync_types::{
@@ -4256,4 +4256,217 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
     server_handle.abort();
     edge_db.close().unwrap();
     server_db.close().unwrap();
+}
+
+#[test]
+fn integrity_11_sync_apply_respects_memory_limit() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(8 * 1024));
+    let db = Database::open_memory_with_accountant(accountant);
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, data TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    let changes = ChangeSet {
+        rows: vec![RowChange {
+            table: "items".to_string(),
+            natural_key: NaturalKey {
+                column: "id".to_string(),
+                value: Value::Uuid(id),
+            },
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("data".to_string(), Value::Text("x".repeat(4096))),
+            ]),
+            deleted: false,
+            lsn: 1,
+        }],
+        edges: vec![],
+        vectors: vec![],
+        ddl: vec![],
+    };
+
+    let result = db.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
+    );
+    assert!(
+        result.is_err(),
+        "sync apply must reject rows that exceed the server memory budget"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("MEMORY_LIMIT") || err.to_lowercase().contains("memory"),
+        "memory-limit rejection must mention memory, got: {err}"
+    );
+}
+
+#[test]
+fn integrity_12_sync_delete_removes_vectors() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let filler_id = Uuid::new_v4();
+    let filler_tx = db.begin();
+    db.insert_row(
+        filler_tx,
+        "observations",
+        make_params(vec![
+            ("id", Value::Uuid(filler_id)),
+            ("data", Value::Text("filler".into())),
+        ]),
+    )
+    .unwrap();
+    db.commit(filler_tx).unwrap();
+
+    let target_id = Uuid::new_v4();
+    let target_tx = db.begin();
+    let target_row_id = db
+        .insert_row(
+            target_tx,
+            "observations",
+            make_params(vec![
+                ("id", Value::Uuid(target_id)),
+                ("data", Value::Text("target".into())),
+                ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+            ]),
+        )
+        .unwrap();
+    db.insert_vector(target_tx, target_row_id, vec![1.0, 0.0, 0.0])
+        .unwrap();
+    db.commit(target_tx).unwrap();
+
+    let changes = ChangeSet {
+        rows: vec![RowChange {
+            table: "observations".to_string(),
+            natural_key: NaturalKey {
+                column: "id".to_string(),
+                value: Value::Uuid(target_id),
+            },
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(target_id)),
+                ("data".to_string(), Value::Text("target".into())),
+            ]),
+            deleted: true,
+            lsn: 10,
+        }],
+        edges: vec![],
+        vectors: vec![VectorChange {
+            row_id: 1,
+            vector: Vec::new(),
+            lsn: 10,
+        }],
+        ddl: vec![],
+    };
+
+    db.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+
+    assert!(
+        db.point_lookup("observations", "id", &Value::Uuid(target_id), db.snapshot(),)
+            .unwrap()
+            .is_none(),
+        "deleted row must disappear after sync apply"
+    );
+    assert!(
+        db.live_vector_entry(target_row_id, db.snapshot()).is_none(),
+        "sync delete must also remove the local vector entry"
+    );
+}
+
+#[test]
+fn integrity_13_sync_upsert_refreshes_vector() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let filler_tx = db.begin();
+    db.insert_row(
+        filler_tx,
+        "observations",
+        make_params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("data", Value::Text("filler".into())),
+        ]),
+    )
+    .unwrap();
+    db.commit(filler_tx).unwrap();
+
+    let target_id = Uuid::new_v4();
+    let target_tx = db.begin();
+    let original_row_id = db
+        .insert_row(
+            target_tx,
+            "observations",
+            make_params(vec![
+                ("id", Value::Uuid(target_id)),
+                ("data", Value::Text("old".into())),
+                ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+            ]),
+        )
+        .unwrap();
+    db.insert_vector(target_tx, original_row_id, vec![1.0, 0.0, 0.0])
+        .unwrap();
+    db.commit(target_tx).unwrap();
+
+    let new_vector = vec![0.0, 1.0, 0.0];
+    let changes = ChangeSet {
+        rows: vec![RowChange {
+            table: "observations".to_string(),
+            natural_key: NaturalKey {
+                column: "id".to_string(),
+                value: Value::Uuid(target_id),
+            },
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(target_id)),
+                ("data".to_string(), Value::Text("new".into())),
+                ("embedding".to_string(), Value::Vector(new_vector.clone())),
+            ]),
+            deleted: false,
+            lsn: 10,
+        }],
+        edges: vec![],
+        vectors: vec![VectorChange {
+            row_id: 1,
+            vector: new_vector.clone(),
+            lsn: 10,
+        }],
+        ddl: vec![],
+    };
+
+    db.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+
+    let row = db
+        .point_lookup("observations", "id", &Value::Uuid(target_id), db.snapshot())
+        .unwrap()
+        .expect("upserted row must still exist");
+    assert_eq!(
+        row.values.get("data"),
+        Some(&Value::Text("new".into())),
+        "sync upsert must update relational values"
+    );
+    let vector_hits = db
+        .query_vector(&new_vector, 1, None, db.snapshot())
+        .expect("vector search after sync upsert");
+    assert_eq!(
+        vector_hits.len(),
+        1,
+        "sync upsert must keep the row searchable by its new embedding"
+    );
 }

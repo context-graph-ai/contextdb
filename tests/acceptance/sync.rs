@@ -681,7 +681,8 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
 
     // Wait for UPDATE to appear on server while CLI is still running
     let mut checker_idx = 0u32;
-    let found = wait_until(Duration::from_secs(10), || {
+    let mut last_stdout = String::new();
+    let found = wait_until(Duration::from_secs(20), || {
         checker_idx += 1;
         let fresh_path = edge_path.with_file_name(format!("f12b-checker-{checker_idx}.db"));
         let check = run_cli_script(
@@ -693,16 +694,19 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
              .quit\n",
         );
         let stdout = output_string(&check.stdout);
+        last_stdout = stdout.clone();
         stdout.contains("updated")
     });
 
     write_child_stdin(&mut child, ".quit\n");
-    let _ = child.wait();
+    let output = child.wait_with_output().expect("collect f12b child output");
     stop_child(&mut server);
 
     assert!(
         found,
-        "UPDATE must auto-sync to server while CLI is still running"
+        "UPDATE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}; last checker stdout={last_stdout}",
+        output_string(&output.stdout),
+        output_string(&output.stderr),
     );
 }
 

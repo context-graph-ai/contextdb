@@ -1,4 +1,4 @@
-use contextdb_core::Value;
+use contextdb_core::{MemoryAccountant, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3236,4 +3236,338 @@ fn sql_13_null_in_nullable_uuid() {
         .unwrap();
     assert_eq!(out.rows.len(), 1);
     assert_eq!(out.rows[0][0], Value::Null);
+}
+
+#[test]
+fn integrity_01_text_memory_estimate_not_pathologically_high() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(32 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, body TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let body = "x".repeat(1024);
+    let result = db.execute(
+        "INSERT INTO docs (id, body) VALUES ($id, $body)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("body", Value::Text(body)),
+        ]),
+    );
+    assert!(
+        result.is_ok(),
+        "1KiB TEXT insert should fit within a 32KiB budget: {result:?}"
+    );
+    assert!(
+        accountant.usage().used < 16 * 1024,
+        "1KiB TEXT row should not consume pathological memory, got {} bytes",
+        accountant.usage().used
+    );
+}
+
+#[test]
+fn integrity_02_upsert_noop_does_not_leak_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(12 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute("CREATE TABLE kv (id UUID PRIMARY KEY, val TEXT)", &empty())
+        .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO kv (id, val) VALUES ($id, 'same')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    let baseline = accountant.usage().used;
+
+    for _ in 0..20 {
+        db.execute(
+            "INSERT INTO kv (id, val) VALUES ($id, 'same') ON CONFLICT (id) DO UPDATE SET val = 'same'",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    }
+
+    let used = accountant.usage().used;
+    assert!(
+        used <= baseline + 256,
+        "noop upserts must not leak memory: baseline={baseline}, used={used}"
+    );
+}
+
+#[test]
+fn integrity_03_retain_pruning_releases_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
+        &empty(),
+    )
+    .unwrap();
+
+    let baseline = accountant.usage().used;
+    db.execute(
+        "INSERT INTO obs (id, data) VALUES ($id, $data)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("data", Value::Text("x".repeat(4096))),
+        ]),
+    )
+    .unwrap();
+    let used_after_insert = accountant.usage().used;
+    assert!(used_after_insert > baseline);
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let pruned = db.run_pruning_cycle();
+    assert_eq!(pruned, 1, "expired row must be pruned");
+
+    let used_after_prune = accountant.usage().used;
+    assert!(
+        used_after_prune + 512 < used_after_insert,
+        "pruning must release row memory: before={used_after_insert}, after={used_after_prune}"
+    );
+    assert_eq!(
+        db.execute("SELECT COUNT(*) FROM obs", &empty())
+            .unwrap()
+            .rows[0][0],
+        Value::Int64(0)
+    );
+}
+
+#[test]
+fn integrity_04_edge_delete_releases_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let baseline = accountant.usage().used;
+
+    let tx = db.begin();
+    assert!(
+        db.insert_edge(tx, source, target, "REL".to_string(), HashMap::new())
+            .unwrap()
+    );
+    db.commit(tx).unwrap();
+
+    let used_after_insert = accountant.usage().used;
+    assert!(used_after_insert > baseline);
+
+    let tx = db.begin();
+    db.delete_edge(tx, source, target, "REL").unwrap();
+    db.commit(tx).unwrap();
+
+    let used_after_delete = accountant.usage().used;
+    assert!(
+        used_after_delete + 128 < used_after_insert,
+        "edge delete must release adjacency memory: before={used_after_insert}, after={used_after_delete}"
+    );
+}
+
+#[test]
+fn integrity_05_drop_table_releases_edge_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source, $target, 'REL')",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source", Value::Uuid(source)),
+            ("target", Value::Uuid(target)),
+        ]),
+    )
+    .unwrap();
+    let used_after_insert = accountant.usage().used;
+
+    db.execute("DROP TABLE edges", &empty()).unwrap();
+
+    assert!(
+        accountant.usage().used + 128 < used_after_insert,
+        "DROP TABLE must release edge allocations: before={used_after_insert}, after={}",
+        accountant.usage().used
+    );
+    let bfs = db
+        .query_bfs(
+            source,
+            Some(&["REL".to_string()]),
+            contextdb_core::Direction::Outgoing,
+            1,
+            db.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(
+        bfs.nodes.len(),
+        0,
+        "dropped edge table must not leave graph edges behind"
+    );
+}
+
+#[test]
+fn integrity_06_create_table_honors_disk_budget() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("integrity-create-table.db");
+    let db = Database::open(&path).unwrap();
+
+    let limit_kib = disk_limit_kib_for_path(&path, 0);
+    db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+        .unwrap();
+
+    let result = db.execute("CREATE TABLE blocked (id UUID PRIMARY KEY)", &empty());
+    assert!(
+        result.is_err(),
+        "CREATE TABLE must fail when disk budget is already exhausted"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "disk-budget rejection must mention disk budget, got: {err}"
+    );
+    assert!(
+        db.table_meta("blocked").is_none(),
+        "failed CREATE TABLE must not leave table metadata behind"
+    );
+}
+
+#[test]
+fn integrity_07_alter_table_honors_disk_budget() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("integrity-alter-table.db");
+    let db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE items (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+
+    let limit_kib = disk_limit_kib_for_path(&path, 0);
+    db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+        .unwrap();
+
+    let result = db.execute("ALTER TABLE items ADD COLUMN note TEXT", &empty());
+    assert!(
+        result.is_err(),
+        "ALTER TABLE must fail when disk budget is already exhausted"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("disk budget"),
+        "disk-budget rejection must mention disk budget, got: {err}"
+    );
+    let meta = db.table_meta("items").unwrap();
+    assert!(
+        meta.columns.iter().all(|c| c.name != "note"),
+        "failed ALTER TABLE must not mutate schema"
+    );
+}
+
+#[test]
+fn integrity_08_upsert_insert_indexes_vector() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[1.0, 0.0, 0.0]')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[0.0, 1.0, 0.0]') ON CONFLICT (id) DO UPDATE SET embedding = '[0.0, 1.0, 0.0]'",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0, 1.0, 0.0]))]),
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        result.len(),
+        1,
+        "vector search must still find the upserted row"
+    );
+    assert_eq!(
+        result[0][0],
+        Value::Uuid(id),
+        "vector search must resolve to the row updated by ON CONFLICT DO UPDATE"
+    );
+}
+
+#[test]
+fn integrity_09_drop_table_removes_vectors() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, '[0.1, 0.2, 0.3]')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    let row_id = db
+        .point_lookup("docs", "id", &Value::Uuid(id), db.snapshot())
+        .unwrap()
+        .expect("row must exist")
+        .row_id;
+    assert!(
+        db.live_vector_entry(row_id, db.snapshot()).is_some(),
+        "vector must exist before DROP TABLE"
+    );
+
+    db.execute("DROP TABLE docs", &empty()).unwrap();
+
+    assert!(
+        db.live_vector_entry(row_id, db.snapshot()).is_none(),
+        "DROP TABLE must remove vector entries for dropped rows"
+    );
+}
+
+#[test]
+fn integrity_10_failed_insert_does_not_leak_memory() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(12 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT UNIQUE)",
+        &empty(),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO items (id, name) VALUES ($id, 'dup')",
+        &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+    )
+    .unwrap();
+    let baseline = accountant.usage().used;
+
+    for _ in 0..20 {
+        let result = db.execute(
+            "INSERT INTO items (id, name) VALUES ($id, 'dup')",
+            &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+        );
+        assert!(result.is_err(), "duplicate UNIQUE insert must fail");
+    }
+
+    let used = accountant.usage().used;
+    assert!(
+        used <= baseline + 256,
+        "failed inserts must not leak memory: baseline={baseline}, used={used}"
+    );
 }

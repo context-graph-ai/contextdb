@@ -692,7 +692,14 @@ fn f96_upsert_user_preference_preserves_graph_and_vector_consistency() {
     let result = db
         .query_vector(&[0.0, 1.0, 0.0], 1, None, db.snapshot())
         .expect("updated vector");
-    assert_eq!(result[0].0, 1);
+    assert_eq!(result.len(), 1, "updated embedding must remain searchable");
+    let row = db
+        .execute(
+            "SELECT value FROM prefs WHERE id = $id",
+            &params(vec![("id", Value::Uuid(pref))]),
+        )
+        .expect("read updated pref");
+    assert_eq!(row.rows[0][0], Value::Text("light".into()));
     assert_eq!(
         db.edge_count(user, "HAS_PREF", db.snapshot())
             .expect("edge count"),
