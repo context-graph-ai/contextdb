@@ -684,6 +684,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "rmp-serde",
+ "roaring",
  "serde",
  "serde_bytes",
  "tempfile",
