@@ -1128,6 +1128,18 @@ impl Database {
         self.relational.point_lookup(table, col, value, snapshot)
     }
 
+    pub(crate) fn point_lookup_in_tx(
+        &self,
+        tx: TxId,
+        table: &str,
+        col: &str,
+        value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        self.relational
+            .point_lookup_with_tx(Some(tx), table, col, value, snapshot)
+    }
+
     pub fn insert_edge(
         &self,
         tx: TxId,
@@ -1263,6 +1275,54 @@ impl Database {
             .cloned()
     }
 
+    pub(crate) fn drop_table_aux_state(&self, table: &str) {
+        let snapshot = self.snapshot();
+        let rows = self.scan(table, snapshot).unwrap_or_default();
+        let row_ids: HashSet<RowId> = rows.iter().map(|row| row.row_id).collect();
+        let edge_keys: HashSet<(NodeId, EdgeType, NodeId)> = rows
+            .iter()
+            .filter_map(|row| {
+                match (
+                    row.values.get("source_id").and_then(Value::as_uuid),
+                    row.values.get("target_id").and_then(Value::as_uuid),
+                    row.values.get("edge_type").and_then(Value::as_text),
+                ) {
+                    (Some(source), Some(target), Some(edge_type)) => {
+                        Some((*source, edge_type.to_string(), *target))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
+        if !row_ids.is_empty() {
+            let mut vectors = self.vector_store.vectors.write();
+            vectors.retain(|entry| !row_ids.contains(&entry.row_id));
+            self.vector_store.clear_hnsw(self.accountant());
+        }
+
+        if !edge_keys.is_empty() {
+            {
+                let mut forward = self.graph_store.forward_adj.write();
+                for entries in forward.values_mut() {
+                    entries.retain(|entry| {
+                        !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
+                    });
+                }
+                forward.retain(|_, entries| !entries.is_empty());
+            }
+            {
+                let mut reverse = self.graph_store.reverse_adj.write();
+                for entries in reverse.values_mut() {
+                    entries.retain(|entry| {
+                        !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
+                    });
+                }
+                reverse.retain(|_, entries| !entries.is_empty());
+            }
+        }
+    }
+
     pub fn table_names(&self) -> Vec<String> {
         self.relational_store.table_names()
     }
@@ -1278,6 +1338,7 @@ impl Database {
             &self.relational_store,
             &self.graph_store,
             &self.vector_store,
+            self.accountant(),
             self.persistence.as_ref(),
             self.sync_watermark(),
         )
@@ -1291,6 +1352,7 @@ impl Database {
         let relational = self.relational_store.clone();
         let graph = self.graph_store.clone();
         let vector = self.vector_store.clone();
+        let accountant = self.accountant.clone();
         let persistence = self.persistence.clone();
         let sync_watermark = self.sync_watermark.clone();
         let pruning_guard = self.pruning_guard.clone();
@@ -1304,6 +1366,7 @@ impl Database {
                         &relational,
                         &graph,
                         &vector,
+                        accountant.as_ref(),
                         persistence.as_ref(),
                         sync_watermark.load(Ordering::SeqCst),
                     );
@@ -1518,6 +1581,12 @@ impl Database {
             }
         }
 
+        for (source, edge_type, target, _) in &ws.adj_deletes {
+            if let Some(edge) = self.find_edge(source, target, edge_type) {
+                self.accountant.release(edge.estimated_bytes());
+            }
+        }
+
         for (row_id, _) in &ws.vector_deletes {
             if let Some(vector) = self.find_vector_by_row_id(*row_id) {
                 self.accountant.release(vector.estimated_bytes());
@@ -1545,6 +1614,19 @@ impl Database {
             .iter()
             .find(|entry| entry.row_id == row_id)
             .cloned()
+    }
+
+    fn find_edge(&self, source: &NodeId, target: &NodeId, edge_type: &str) -> Option<AdjEntry> {
+        self.graph_store
+            .forward_adj
+            .read()
+            .get(source)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.target == *target && entry.edge_type == edge_type)
+                    .cloned()
+            })
     }
 
     pub(crate) fn write_set_checkpoint(
@@ -2336,12 +2418,7 @@ impl Database {
             conflicts: Vec::new(),
             new_lsn: self.current_lsn(),
         };
-        let vector_row_ids = changes
-            .vectors
-            .iter()
-            .filter(|v| !v.vector.is_empty())
-            .map(|v| v.row_id)
-            .collect::<Vec<_>>();
+        let vector_row_ids = changes.vectors.iter().map(|v| v.row_id).collect::<Vec<_>>();
         let mut vector_row_map: HashMap<u64, u64> = HashMap::new();
         let mut vector_row_idx = 0usize;
         let mut failed_row_ids: HashSet<u64> = HashSet::new();
@@ -2424,6 +2501,7 @@ impl Database {
                 }
                 DdlChange::DropTable { name } => {
                     if self.table_meta(&name).is_some() {
+                        self.drop_table_aux_state(&name);
                         self.relational_store().drop_table(&name);
                         self.remove_persisted_table(&name)?;
                     }
@@ -2483,9 +2561,21 @@ impl Database {
                 &row.natural_key.value,
             )?;
             let is_delete = row.deleted;
+            let row_has_vector = cached_table_meta(self, &mut table_meta_cache, &row.table)
+                .is_some_and(|meta| {
+                    meta.columns
+                        .iter()
+                        .any(|col| matches!(col.column_type, ColumnType::Vector(_)))
+                });
 
             if is_delete {
                 if let Some(local) = existing {
+                    if row_has_vector
+                        && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                    {
+                        vector_row_map.insert(*remote_row_id, local.row_id);
+                        vector_row_idx += 1;
+                    }
                     if let Err(err) = self.delete_row(tx, &row.table, local.row_id) {
                         result.conflicts.push(Conflict {
                             natural_key: row.natural_key.clone(),
@@ -2557,7 +2647,9 @@ impl Database {
 
                         if let Some(err_msg) = constraint_error {
                             result.skipped_rows += 1;
-                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                            if row_has_vector
+                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                            {
                                 failed_row_ids.insert(*remote_row_id);
                                 vector_row_idx += 1;
                             }
@@ -2587,7 +2679,9 @@ impl Database {
                                 },
                             );
                             result.applied_rows += 1;
-                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                            if row_has_vector
+                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                            {
                                 vector_row_map.insert(*remote_row_id, new_row_id);
                                 vector_row_idx += 1;
                             }
@@ -2597,7 +2691,9 @@ impl Database {
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
-                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                            if row_has_vector
+                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                            {
                                 failed_row_ids.insert(*remote_row_id);
                                 vector_row_idx += 1;
                             }
@@ -2610,7 +2706,9 @@ impl Database {
                     }
                 }
                 (Some(local), ConflictPolicy::InsertIfNotExists) => {
-                    if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                    if row_has_vector
+                        && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                    {
                         vector_row_map.insert(*remote_row_id, local.row_id);
                         vector_row_idx += 1;
                     }
@@ -2618,7 +2716,9 @@ impl Database {
                 }
                 (Some(_), ConflictPolicy::ServerWins) => {
                     result.skipped_rows += 1;
-                    if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                    if row_has_vector
+                        && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                    {
                         failed_row_ids.insert(*remote_row_id);
                         vector_row_idx += 1;
                     }
@@ -2631,7 +2731,9 @@ impl Database {
                 (Some(local), ConflictPolicy::LatestWins) => {
                     if row.lsn <= local.lsn {
                         result.skipped_rows += 1;
-                        if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                        if row_has_vector
+                            && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                        {
                             failed_row_ids.insert(*remote_row_id);
                             vector_row_idx += 1;
                         }
@@ -2663,7 +2765,9 @@ impl Database {
                                     .is_some_and(|targets| targets.contains(&incoming));
                                 if !valid && incoming != current {
                                     result.skipped_rows += 1;
-                                    if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                                    if row_has_vector
+                                        && let Some(remote_row_id) =
+                                            vector_row_ids.get(vector_row_idx)
                                     {
                                         failed_row_ids.insert(*remote_row_id);
                                         vector_row_idx += 1;
@@ -2692,8 +2796,11 @@ impl Database {
                             Ok(_) => {
                                 visible_rows_cache.remove(&row.table);
                                 result.applied_rows += 1;
-                                if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
-                                    if let Ok(Some(found)) = self.point_lookup(
+                                if row_has_vector
+                                    && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                                {
+                                    if let Ok(Some(found)) = self.point_lookup_in_tx(
+                                        tx,
                                         &row.table,
                                         &row.natural_key.column,
                                         &row.natural_key.value,
@@ -2709,7 +2816,9 @@ impl Database {
                                     return Err(err);
                                 }
                                 result.skipped_rows += 1;
-                                if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                                if row_has_vector
+                                    && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                                {
                                     failed_row_ids.insert(*remote_row_id);
                                     vector_row_idx += 1;
                                 }
@@ -2732,8 +2841,11 @@ impl Database {
                         Ok(_) => {
                             visible_rows_cache.remove(&row.table);
                             result.applied_rows += 1;
-                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
-                                if let Ok(Some(found)) = self.point_lookup(
+                            if row_has_vector
+                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                            {
+                                if let Ok(Some(found)) = self.point_lookup_in_tx(
+                                    tx,
                                     &row.table,
                                     &row.natural_key.column,
                                     &row.natural_key.value,
@@ -2749,7 +2861,9 @@ impl Database {
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
-                            if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
+                            if row_has_vector
+                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
+                            {
                                 failed_row_ids.insert(*remote_row_id);
                                 vector_row_idx += 1;
                             }
@@ -2780,15 +2894,6 @@ impl Database {
             }
         }
 
-        let existing_vector_rows: HashSet<RowId> = self
-            .vector_store
-            .vectors
-            .read()
-            .iter()
-            .filter(|v| v.deleted_tx.is_none())
-            .map(|v| v.row_id)
-            .collect();
-
         for vector in changes.vectors {
             if failed_row_ids.contains(&vector.row_id) {
                 continue; // skip vectors for rows that failed to insert
@@ -2800,8 +2905,8 @@ impl Database {
             if vector.vector.is_empty() {
                 let _ = self.vector.delete_vector(tx, local_row_id);
             } else {
-                if existing_vector_rows.contains(&local_row_id) {
-                    continue;
+                if self.has_live_vector(local_row_id, self.snapshot()) {
+                    let _ = self.delete_vector(tx, local_row_id);
                 }
                 if let Err(err) = self.insert_vector(tx, local_row_id, vector.vector)
                     && is_fatal_sync_apply_error(&err)
@@ -3071,6 +3176,7 @@ fn prune_expired_rows(
     relational_store: &Arc<RelationalStore>,
     graph_store: &Arc<GraphStore>,
     vector_store: &Arc<VectorStore>,
+    accountant: &MemoryAccountant,
     persistence: Option<&Arc<RedbPersistence>>,
     sync_watermark: u64,
 ) -> u64 {
@@ -3078,6 +3184,7 @@ fn prune_expired_rows(
     let metas = relational_store.table_meta.read().clone();
     let mut pruned_by_table: HashMap<String, Vec<RowId>> = HashMap::new();
     let mut pruned_node_ids = HashSet::new();
+    let mut released_row_bytes = 0usize;
 
     {
         let mut tables = relational_store.tables.write();
@@ -3098,6 +3205,8 @@ fn prune_expired_rows(
                     .entry(table_name.clone())
                     .or_default()
                     .push(row.row_id);
+                released_row_bytes = released_row_bytes
+                    .saturating_add(estimate_row_bytes_for_meta(&row.values, meta, false));
                 if let Some(Value::Uuid(id)) = row.values.get("id") {
                     pruned_node_ids.insert(*id);
                 }
@@ -3114,19 +3223,37 @@ fn prune_expired_rows(
         return 0;
     }
 
+    let mut released_vector_bytes = 0usize;
     {
         let mut vectors = vector_store.vectors.write();
-        vectors.retain(|entry| !pruned_row_ids.contains(&entry.row_id));
+        vectors.retain(|entry| {
+            if pruned_row_ids.contains(&entry.row_id) {
+                released_vector_bytes =
+                    released_vector_bytes.saturating_add(entry.estimated_bytes());
+                false
+            } else {
+                true
+            }
+        });
     }
     if let Some(hnsw) = vector_store.hnsw.get() {
         *hnsw.write() = None;
     }
 
+    let mut released_edge_bytes = 0usize;
     {
         let mut forward = graph_store.forward_adj.write();
         for entries in forward.values_mut() {
             entries.retain(|entry| {
-                !pruned_node_ids.contains(&entry.source) && !pruned_node_ids.contains(&entry.target)
+                if pruned_node_ids.contains(&entry.source)
+                    || pruned_node_ids.contains(&entry.target)
+                {
+                    released_edge_bytes =
+                        released_edge_bytes.saturating_add(entry.estimated_bytes());
+                    false
+                } else {
+                    true
+                }
             });
         }
         forward.retain(|_, entries| !entries.is_empty());
@@ -3162,6 +3289,12 @@ fn prune_expired_rows(
         let _ = persistence.rewrite_vectors(&vectors);
         let _ = persistence.rewrite_graph_edges(&edges);
     }
+
+    accountant.release(
+        released_row_bytes
+            .saturating_add(released_vector_bytes)
+            .saturating_add(released_edge_bytes),
+    );
 
     pruned_row_ids.len() as u64
 }

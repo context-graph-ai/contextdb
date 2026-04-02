@@ -23,6 +23,7 @@ pub(crate) fn execute_plan(
 ) -> Result<QueryResult> {
     match plan {
         PhysicalPlan::CreateTable(p) => {
+            db.check_disk_budget("CREATE TABLE")?;
             let expires_column = expires_column_name(&p.columns)?;
             let meta = TableMeta {
                 columns: p
@@ -70,6 +71,7 @@ pub(crate) fn execute_plan(
         }
         PhysicalPlan::DropTable(name) => {
             let bytes_to_release = estimate_drop_table_bytes(db, name);
+            db.drop_table_aux_state(name);
             db.relational_store().drop_table(name);
             db.remove_persisted_table(name)?;
             db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn));
@@ -77,6 +79,7 @@ pub(crate) fn execute_plan(
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::AlterTable(p) => {
+            db.check_disk_budget("ALTER TABLE")?;
             let store = db.relational_store();
             match &p.action {
                 AlterAction::AddColumn(col) => {
@@ -913,6 +916,10 @@ fn exec_insert(
                 .ok_or_else(|| Error::Other("conflict column not in values".to_string()))?;
             let existing =
                 db.point_lookup(&p.table, conflict_col, conflict_value, db.snapshot())?;
+            let existing_row_id = existing.as_ref().map(|row| row.row_id);
+            let existing_has_vector = existing
+                .as_ref()
+                .is_some_and(|row| db.has_live_vector(row.row_id, db.snapshot()));
             let upsert_values = if let Some(existing_row) = existing.as_ref() {
                 apply_on_conflict_updates(
                     db,
@@ -927,7 +934,39 @@ fn exec_insert(
             };
 
             match db.upsert_row(txid, &p.table, conflict_col, upsert_values) {
-                Ok(_) => 0,
+                Ok(UpsertResult::Inserted) => {
+                    db.point_lookup_in_tx(
+                        txid,
+                        &p.table,
+                        conflict_col,
+                        conflict_value,
+                        db.snapshot(),
+                    )?
+                    .ok_or_else(|| {
+                        Error::Other("inserted upsert row not visible in tx".to_string())
+                    })?
+                    .row_id
+                }
+                Ok(UpsertResult::Updated) => {
+                    if existing_has_vector && let Some(existing_row_id) = existing_row_id {
+                        db.delete_vector(txid, existing_row_id)?;
+                    }
+                    db.point_lookup_in_tx(
+                        txid,
+                        &p.table,
+                        conflict_col,
+                        conflict_value,
+                        db.snapshot(),
+                    )?
+                    .ok_or_else(|| {
+                        Error::Other("updated upsert row not visible in tx".to_string())
+                    })?
+                    .row_id
+                }
+                Ok(UpsertResult::NoOp) => {
+                    db.accountant().release(row_bytes);
+                    0
+                }
                 Err(err) => {
                     db.accountant().release(row_bytes);
                     return Err(err);
@@ -1184,27 +1223,35 @@ fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     let meta = db.table_meta(table);
     let metadata_bytes = meta.as_ref().map(TableMeta::estimated_bytes).unwrap_or(0);
     let snapshot = db.snapshot();
-    let row_bytes = db
-        .scan(table, snapshot)
-        .unwrap_or_default()
-        .into_iter()
-        .fold(0usize, |acc, row| {
-            acc.saturating_add(meta.as_ref().map_or_else(
-                || row.estimated_bytes(),
-                |meta| estimate_row_bytes_for_meta(&row.values, meta, false),
-            ))
-        });
-    let vector_bytes = db
-        .scan(table, snapshot)
-        .unwrap_or_default()
-        .into_iter()
+    let rows = db.scan(table, snapshot).unwrap_or_default();
+    let row_bytes = rows.iter().fold(0usize, |acc, row| {
+        acc.saturating_add(meta.as_ref().map_or_else(
+            || row.estimated_bytes(),
+            |meta| estimate_row_bytes_for_meta(&row.values, meta, false),
+        ))
+    });
+    let vector_bytes = rows
+        .iter()
         .filter_map(|row| db.live_vector_entry(row.row_id, snapshot))
         .fold(0usize, |acc, entry| {
             acc.saturating_add(entry.estimated_bytes())
         });
+    let edge_bytes = rows.iter().fold(0usize, |acc, row| {
+        match (
+            row.values.get("source_id").and_then(Value::as_uuid),
+            row.values.get("target_id").and_then(Value::as_uuid),
+            row.values.get("edge_type").and_then(Value::as_text),
+        ) {
+            (Some(_), Some(_), Some(edge_type)) => acc.saturating_add(
+                96 + edge_type.len().saturating_mul(16) + estimate_row_value_bytes(&HashMap::new()),
+            ),
+            _ => acc,
+        }
+    });
     metadata_bytes
         .saturating_add(row_bytes)
         .saturating_add(vector_bytes)
+        .saturating_add(edge_bytes)
 }
 
 fn materialize_rows(

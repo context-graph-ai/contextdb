@@ -42,6 +42,13 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
 
         if let Some(tx_id) = tx {
             let _ = self.tx_mgr.with_write_set(tx_id, |ws| {
+                let deleted_row_ids: std::collections::HashSet<RowId> = ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(t, _, _)| t == table)
+                    .map(|(_, row_id, _)| *row_id)
+                    .collect();
+                result.retain(|row| !deleted_row_ids.contains(&row.row_id));
                 for (t, row) in &ws.relational_inserts {
                     if t == table {
                         result.push(row.clone());

@@ -50,7 +50,7 @@ impl Value {
                 if s.len() <= 16 {
                     32 + s.len().saturating_mul(8)
                 } else {
-                    160 + s.len().saturating_mul(72)
+                    48 + s.len().saturating_mul(2)
                 }
             }
             Value::Uuid(_) => 32,
