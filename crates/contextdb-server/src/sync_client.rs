@@ -17,8 +17,11 @@ use std::time::Duration;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Overall deadline for collecting all chunks in a chunked pull response.
 const CHUNK_COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
+const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const PULL_PAGE_SIZE: u32 = 500;
 const MAX_BATCH_BYTES: usize = 800 * 1024;
+const BATCH_ESTIMATE_SAFETY_MARGIN: usize = 32 * 1024;
+const TARGET_BATCH_BYTES: usize = MAX_BATCH_BYTES - BATCH_ESTIMATE_SAFETY_MARGIN;
 
 pub struct SyncClient {
     db: Arc<Database>,
@@ -207,11 +210,6 @@ impl SyncClient {
                         .map_err(|e| Error::SyncError(e.to_string()))?;
                 }
 
-                nats_client
-                    .flush()
-                    .await
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-
                 let ack = ChunkAck {
                     chunk_id,
                     total_chunks,
@@ -255,11 +253,6 @@ impl SyncClient {
                         .subscribe(inbox.clone())
                         .await
                         .map_err(|e| Error::SyncError(e.to_string()))?;
-                    let timeout = if attempt < 2 {
-                        Duration::from_secs(2)
-                    } else {
-                        SYNC_TIMEOUT
-                    };
 
                     nats_client
                         .publish_with_reply(
@@ -270,7 +263,7 @@ impl SyncClient {
                         .await
                         .map_err(|e| Error::SyncError(e.to_string()))?;
 
-                    match tokio::time::timeout(timeout, inbox_sub.next()).await {
+                    match tokio::time::timeout(PUSH_REQUEST_TIMEOUT, inbox_sub.next()).await {
                         Ok(Some(msg)) => {
                             if msg.status == Some(async_nats::StatusCode::NO_RESPONDERS)
                                 && attempt < 4
@@ -587,6 +580,125 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
         return vec![changeset];
     }
 
+    let batches = fast_split_changeset(changeset.clone());
+    if batches
+        .iter()
+        .all(|batch| batch_wire_size(batch) <= MAX_BATCH_BYTES)
+    {
+        return batches;
+    }
+
+    precise_split_changeset(changeset)
+}
+
+fn batch_wire_size(changeset: &ChangeSet) -> usize {
+    rmp_serde::to_vec(&WireChangeSet::from(changeset.clone()))
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn fast_split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
+    let row_sizes: Vec<usize> = changeset
+        .rows
+        .iter()
+        .map(|r| {
+            let wire_row = WireRowChange::from(r.clone());
+            rmp_serde::to_vec(&wire_row).map(|v| v.len()).unwrap_or(128)
+        })
+        .collect();
+    let vector_sizes: Vec<usize> = changeset
+        .vectors
+        .iter()
+        .map(|v| {
+            let wire_vec = crate::protocol::WireVectorChange::from(v.clone());
+            rmp_serde::to_vec(&wire_vec).map(|v| v.len()).unwrap_or(64)
+        })
+        .collect();
+
+    let mut batches = Vec::new();
+    let mut batch_rows = Vec::new();
+    let mut batch_vectors = Vec::new();
+    let mut batch_size = 0usize;
+    let changeset_edges = changeset.edges;
+    let changeset_vectors = changeset.vectors;
+    let changeset_ddl = changeset.ddl;
+
+    let edges_size: usize = {
+        let edges_wire: Vec<crate::protocol::WireEdgeChange> =
+            changeset_edges.iter().cloned().map(Into::into).collect();
+        rmp_serde::to_vec(&edges_wire).map(|v| v.len()).unwrap_or(0)
+    };
+    let ddl_size: usize = {
+        let ddl_wire: Vec<crate::protocol::WireDdlChange> =
+            changeset_ddl.iter().cloned().map(Into::into).collect();
+        rmp_serde::to_vec(&ddl_wire).map(|v| v.len()).unwrap_or(0)
+    };
+    let first_batch_overhead = edges_size + ddl_size;
+
+    for (i, row) in changeset.rows.into_iter().enumerate() {
+        let row_size = row_sizes.get(i).copied().unwrap_or(128);
+        let vec_size_for_i = vector_sizes.get(i).copied().unwrap_or(64);
+        let item_size = row_size + vec_size_for_i;
+        let first_item_overhead = if batch_rows.is_empty() && batches.is_empty() {
+            first_batch_overhead
+        } else {
+            0
+        };
+
+        if !batch_rows.is_empty() && batch_size + item_size > TARGET_BATCH_BYTES {
+            batches.push(ChangeSet {
+                rows: std::mem::take(&mut batch_rows),
+                edges: if batches.is_empty() {
+                    changeset_edges.clone()
+                } else {
+                    Vec::new()
+                },
+                vectors: std::mem::take(&mut batch_vectors),
+                ddl: if batches.is_empty() {
+                    changeset_ddl.clone()
+                } else {
+                    Vec::new()
+                },
+            });
+            batch_size = 0;
+        }
+
+        if i < changeset_vectors.len() {
+            batch_vectors.push(changeset_vectors[i].clone());
+            batch_size += vec_size_for_i;
+        }
+        batch_rows.push(row);
+        batch_size += row_size + first_item_overhead;
+    }
+
+    if !batch_rows.is_empty() {
+        batches.push(ChangeSet {
+            rows: batch_rows,
+            edges: if batches.is_empty() {
+                changeset_edges
+            } else {
+                Vec::new()
+            },
+            vectors: batch_vectors,
+            ddl: if batches.is_empty() {
+                changeset_ddl
+            } else {
+                Vec::new()
+            },
+        });
+    } else if batches.is_empty() {
+        batches.push(ChangeSet {
+            rows: Vec::new(),
+            edges: changeset_edges,
+            vectors: Vec::new(),
+            ddl: changeset_ddl,
+        });
+    }
+
+    batches
+}
+
+fn precise_split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
     // Estimate per-row sizes by serializing each WireRowChange individually
     let row_sizes: Vec<usize> = changeset
         .rows
