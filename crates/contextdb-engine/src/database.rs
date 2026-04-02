@@ -2345,6 +2345,8 @@ impl Database {
         let mut vector_row_map: HashMap<u64, u64> = HashMap::new();
         let mut vector_row_idx = 0usize;
         let mut failed_row_ids: HashSet<u64> = HashSet::new();
+        let mut table_meta_cache: HashMap<String, Option<TableMeta>> = HashMap::new();
+        let mut visible_rows_cache: HashMap<String, Vec<VersionedRow>> = HashMap::new();
 
         for ddl in changes.ddl.clone() {
             match ddl {
@@ -2417,12 +2419,16 @@ impl Database {
                         sql.push_str(&constraints.join(" "));
                     }
                     self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                    table_meta_cache.remove(&name);
+                    visible_rows_cache.remove(&name);
                 }
                 DdlChange::DropTable { name } => {
                     if self.table_meta(&name).is_some() {
                         self.relational_store().drop_table(&name);
                         self.remove_persisted_table(&name)?;
                     }
+                    table_meta_cache.remove(&name);
+                    visible_rows_cache.remove(&name);
                 }
                 DdlChange::AlterTable {
                     name,
@@ -2447,6 +2453,8 @@ impl Database {
                         sql.push_str(&constraints.join(" "));
                     }
                     self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                    table_meta_cache.remove(&name);
+                    visible_rows_cache.remove(&name);
                 }
             }
         }
@@ -2467,11 +2475,12 @@ impl Database {
                 .copied()
                 .unwrap_or(policies.default);
 
-            let existing = self.point_lookup(
+            let existing = cached_point_lookup(
+                self,
+                &mut visible_rows_cache,
                 &row.table,
                 &row.natural_key.column,
                 &row.natural_key.value,
-                self.snapshot(),
             )?;
             let is_delete = row.deleted;
 
@@ -2485,6 +2494,7 @@ impl Database {
                         });
                         result.skipped_rows += 1;
                     } else {
+                        remove_cached_row(&mut visible_rows_cache, &row.table, local.row_id);
                         result.applied_rows += 1;
                     }
                 } else {
@@ -2500,7 +2510,7 @@ impl Database {
 
             match (existing, policy) {
                 (None, _) => {
-                    if let Some(meta) = self.table_meta(&row.table) {
+                    if let Some(meta) = cached_table_meta(self, &mut table_meta_cache, &row.table) {
                         let mut constraint_error: Option<String> = None;
 
                         for col_def in &meta.columns {
@@ -2523,16 +2533,18 @@ impl Database {
 
                         let has_unique = meta.columns.iter().any(|c| c.unique && !c.primary_key);
                         if constraint_error.is_none() && has_unique {
-                            let existing_rows =
-                                self.scan(&row.table, self.snapshot()).unwrap_or_default();
                             for col_def in &meta.columns {
                                 if col_def.unique
                                     && !col_def.primary_key
                                     && let Some(new_val) = values.get(&col_def.name)
                                     && *new_val != Value::Null
-                                    && existing_rows
-                                        .iter()
-                                        .any(|r| r.values.get(&col_def.name) == Some(new_val))
+                                    && cached_visible_rows(
+                                        self,
+                                        &mut visible_rows_cache,
+                                        &row.table,
+                                    )?
+                                    .iter()
+                                    .any(|r| r.values.get(&col_def.name) == Some(new_val))
                                 {
                                     constraint_error = Some(format!(
                                         "UNIQUE constraint violated: {}.{}",
@@ -2562,6 +2574,18 @@ impl Database {
 
                     match self.insert_row(tx, &row.table, values.clone()) {
                         Ok(new_row_id) => {
+                            record_cached_insert(
+                                &mut visible_rows_cache,
+                                &row.table,
+                                VersionedRow {
+                                    row_id: new_row_id,
+                                    values: values.clone(),
+                                    created_tx: tx,
+                                    deleted_tx: None,
+                                    lsn: row.lsn,
+                                    created_at: None,
+                                },
+                            );
                             result.applied_rows += 1;
                             if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
                                 vector_row_map.insert(*remote_row_id, new_row_id);
@@ -2666,6 +2690,7 @@ impl Database {
                             values.clone(),
                         ) {
                             Ok(_) => {
+                                visible_rows_cache.remove(&row.table);
                                 result.applied_rows += 1;
                                 if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
                                     if let Ok(Some(found)) = self.point_lookup(
@@ -2705,6 +2730,7 @@ impl Database {
                     });
                     match self.upsert_row(tx, &row.table, &row.natural_key.column, values.clone()) {
                         Ok(_) => {
+                            visible_rows_cache.remove(&row.table);
                             result.applied_rows += 1;
                             if let Some(remote_row_id) = vector_row_ids.get(vector_row_idx) {
                                 if let Ok(Some(found)) = self.point_lookup(
@@ -2865,6 +2891,59 @@ fn strip_internal_row_id(mut qr: QueryResult) -> QueryResult {
         }
     }
     qr
+}
+
+fn cached_table_meta(
+    db: &Database,
+    cache: &mut HashMap<String, Option<TableMeta>>,
+    table: &str,
+) -> Option<TableMeta> {
+    cache
+        .entry(table.to_string())
+        .or_insert_with(|| db.table_meta(table))
+        .clone()
+}
+
+fn cached_visible_rows<'a>(
+    db: &Database,
+    cache: &'a mut HashMap<String, Vec<VersionedRow>>,
+    table: &str,
+) -> Result<&'a mut Vec<VersionedRow>> {
+    if !cache.contains_key(table) {
+        let rows = db.scan(table, db.snapshot())?;
+        cache.insert(table.to_string(), rows);
+    }
+    Ok(cache.get_mut(table).expect("cached visible rows"))
+}
+
+fn cached_point_lookup(
+    db: &Database,
+    cache: &mut HashMap<String, Vec<VersionedRow>>,
+    table: &str,
+    col: &str,
+    value: &Value,
+) -> Result<Option<VersionedRow>> {
+    let rows = cached_visible_rows(db, cache, table)?;
+    Ok(rows
+        .iter()
+        .find(|r| r.values.get(col) == Some(value))
+        .cloned())
+}
+
+fn record_cached_insert(
+    cache: &mut HashMap<String, Vec<VersionedRow>>,
+    table: &str,
+    row: VersionedRow,
+) {
+    if let Some(rows) = cache.get_mut(table) {
+        rows.push(row);
+    }
+}
+
+fn remove_cached_row(cache: &mut HashMap<String, Vec<VersionedRow>>, table: &str, row_id: RowId) {
+    if let Some(rows) = cache.get_mut(table) {
+        rows.retain(|row| row.row_id != row_id);
+    }
 }
 
 fn query_outcome_from_result(result: &Result<QueryResult>) -> QueryOutcome {
