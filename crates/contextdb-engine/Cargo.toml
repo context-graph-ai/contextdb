@@ -50,3 +50,13 @@ path = "../../benches/engine_throughput.rs"
 name = "engine_full_throughput"
 harness = false
 path = "../../benches/engine_full_throughput.rs"
+
+[[bench]]
+name = "mixed_workflows_pr"
+harness = false
+path = "../../benches/mixed_workflows_pr.rs"
+
+[[bench]]
+name = "subscriptions_pr"
+harness = false
+path = "../../benches/subscriptions_pr.rs"
