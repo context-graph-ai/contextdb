@@ -2483,7 +2483,7 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
         let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
+        loop {
             let expected_len = poller_expected.lock().unwrap().len();
             let changes = poller_db.changes_since(watermark);
             let before_seen = seen_creates.len();
@@ -2602,7 +2602,7 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
         let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
+        loop {
             let expected_len = poller_expected.lock().unwrap().len();
             let changes = poller_db.changes_since(watermark);
             let before_seen = seen_columns.len();
@@ -2714,7 +2714,7 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
         let mut idle_after_done_since = None;
         poller_barrier.wait();
 
-        while !poller_done.load(Ordering::SeqCst) || watermark < poller_db.current_lsn() {
+        loop {
             let expected_len = poller_expected.lock().unwrap().len();
             let changes = poller_db.changes_since(watermark);
             let before_seen = seen_tables.len();
