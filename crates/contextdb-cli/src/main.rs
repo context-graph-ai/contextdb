@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -39,6 +40,7 @@ struct Args {
 }
 
 fn main() {
+    let interactive = std::io::stdin().is_terminal();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -137,6 +139,12 @@ fn main() {
         Some((rt, client)) => (Some(rt), Some(client)),
         None => (None, None),
     };
+
+    if !interactive && let (Some(rt), Some(client)) = (rt, sync_client) {
+        let _ = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(750), client.ensure_connected()).await
+        });
+    }
 
     // Spawn background debounced push task if sync is configured.
     let push_handle = if let (Some(rt_ref), Some(client), Some(rx)) = (rt, sync_client, push_rx) {

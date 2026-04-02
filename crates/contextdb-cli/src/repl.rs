@@ -6,7 +6,7 @@ use contextdb_server::{SyncClient, SyncPlugin};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal};
 use std::sync::Arc;
 
 /// Run the REPL loop. Returns `true` if all commands succeeded, `false` if any error occurred.
@@ -16,13 +16,23 @@ pub fn run(
     rt: Option<&tokio::runtime::Runtime>,
     sync_plugin: Option<&SyncPlugin>,
 ) -> bool {
-    let mut rl = DefaultEditor::new().expect("failed to initialize readline");
     let interactive = std::io::stdin().is_terminal();
     if interactive {
         eprintln!("ContextDB v{}", env!("CARGO_PKG_VERSION"));
         eprintln!("Enter .help for usage hints.");
+        return run_interactive(&db, sync_client, rt, sync_plugin);
     }
 
+    run_scripted(&db, sync_client, rt, sync_plugin)
+}
+
+fn run_interactive(
+    db: &Database,
+    sync_client: Option<&SyncClient>,
+    rt: Option<&tokio::runtime::Runtime>,
+    sync_plugin: Option<&SyncPlugin>,
+) -> bool {
+    let mut rl = DefaultEditor::new().expect("failed to initialize readline");
     let mut had_error = false;
 
     loop {
@@ -34,28 +44,9 @@ pub fn run(
                     continue;
                 }
                 let _ = rl.add_history_entry(line);
-
-                if line.starts_with(".sync") || line.starts_with("\\sync") {
-                    let mut parts = line.splitn(2, ' ');
-                    let _cmd = parts.next();
-                    let rest = parts.next().unwrap_or("").trim();
-                    let outcome = run_sync_command(sync_client, rt, rest, sync_plugin);
-                    println!("{}", outcome.message);
-                    if !outcome.ok {
-                        had_error = true;
-                    }
-                } else if line.starts_with('.') || line.starts_with('\\') {
-                    if !handle_meta_command(&db, sync_client, rt, line, sync_plugin) {
-                        break;
-                    }
-                } else {
-                    let upper = line.trim_start().to_uppercase();
-                    if !interactive && upper.starts_with("INSERT") {
-                        println!("{line}");
-                    }
-                    if !execute_sql(&db, line) {
-                        had_error = true;
-                    }
+                if !process_input_line(db, sync_client, rt, line, true, sync_plugin, &mut had_error)
+                {
+                    break;
                 }
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
@@ -64,6 +55,72 @@ pub fn run(
     }
 
     !had_error
+}
+
+fn run_scripted(
+    db: &Database,
+    sync_client: Option<&SyncClient>,
+    rt: Option<&tokio::runtime::Runtime>,
+    sync_plugin: Option<&SyncPlugin>,
+) -> bool {
+    let mut had_error = false;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => break,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !process_input_line(
+            db,
+            sync_client,
+            rt,
+            line,
+            false,
+            sync_plugin,
+            &mut had_error,
+        ) {
+            break;
+        }
+    }
+    !had_error
+}
+
+fn process_input_line(
+    db: &Database,
+    sync_client: Option<&SyncClient>,
+    rt: Option<&tokio::runtime::Runtime>,
+    line: &str,
+    interactive: bool,
+    sync_plugin: Option<&SyncPlugin>,
+    had_error: &mut bool,
+) -> bool {
+    if line.starts_with(".sync") || line.starts_with("\\sync") {
+        let mut parts = line.splitn(2, ' ');
+        let _cmd = parts.next();
+        let rest = parts.next().unwrap_or("").trim();
+        let outcome = run_sync_command(sync_client, rt, rest, sync_plugin);
+        println!("{}", outcome.message);
+        if !outcome.ok {
+            *had_error = true;
+        }
+    } else if line.starts_with('.') || line.starts_with('\\') {
+        if !handle_meta_command(db, sync_client, rt, line, sync_plugin) {
+            return false;
+        }
+    } else {
+        let upper = line.trim_start().to_uppercase();
+        if !interactive && upper.starts_with("INSERT") {
+            println!("{line}");
+        }
+        if !execute_sql(db, line) {
+            *had_error = true;
+        }
+    }
+    true
 }
 
 struct SyncCommandOutcome {
