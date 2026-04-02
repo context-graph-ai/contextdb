@@ -49,8 +49,10 @@ impl Value {
             Value::Text(s) => {
                 if s.len() <= 16 {
                     32 + s.len().saturating_mul(8)
+                } else if s.len() <= 128 {
+                    512 + s.len().saturating_mul(64)
                 } else {
-                    160 + s.len().saturating_mul(72)
+                    1024 + s.len().saturating_mul(8)
                 }
             }
             Value::Uuid(_) => 32,

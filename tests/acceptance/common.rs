@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Once, mpsc};
+use std::sync::{Mutex, MutexGuard, Once, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -17,8 +17,10 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
 static BUILD_RELEASE_BINARIES: Once = Once::new();
+static NATS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) struct NatsFixture {
+    _lock: MutexGuard<'static, ()>,
     _container: ContainerAsync<GenericImage>,
     pub(crate) nats_url: String,
     pub(crate) ws_url: String,
@@ -259,6 +261,7 @@ pub(crate) fn wait_for_child_stdout_contains(
 }
 
 pub(crate) async fn start_nats() -> NatsFixture {
+    let lock = NATS_TEST_LOCK.lock().expect("NATS test lock");
     let conf = workspace_root()
         .join("crates/contextdb-engine/tests/nats.conf")
         .to_string_lossy()
@@ -281,6 +284,7 @@ pub(crate) async fn start_nats() -> NatsFixture {
         .await
         .expect("NATS websocket port should be mapped");
     NatsFixture {
+        _lock: lock,
         _container: container,
         nats_url: format!("nats://127.0.0.1:{nats_port}"),
         ws_url: format!("ws://127.0.0.1:{ws_port}"),
