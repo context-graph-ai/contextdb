@@ -53,10 +53,8 @@ tag-name = "v{{version}}"
 tag-message = "v{{version}}"
 pre-release-commit-message = "release: v{{version}}"
 pre-release-replacements = [
-  { file = "README.md", search = 'contextdb-engine = "[^"]+"', replace = 'contextdb-engine = "{{version}}"' },
-  { file = "README.md", search = 'contextdb-core = "[^"]+"', replace = 'contextdb-core = "{{version}}"' },
-  { file = "docs/getting-started.md", search = 'contextdb-engine = "[^"]+"', replace = 'contextdb-engine = "{{version}}"', prerelease = true },
-  { file = "docs/getting-started.md", search = 'contextdb-core = "[^"]+"', replace = 'contextdb-core = "{{version}}"', prerelease = true },
+  { file = "../../README.md", search = 'contextdb-engine = "[^"]+"', replace = 'contextdb-engine = "{{version}}"', min = 0 },
+  { file = "../../README.md", search = 'contextdb-core = "[^"]+"', replace = 'contextdb-core = "{{version}}"', min = 0 },
 ]
 publish = true
 push = true
