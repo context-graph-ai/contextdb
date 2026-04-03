@@ -123,8 +123,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-contextdb-engine = "0.3.0"
-contextdb-core = "0.3.0"
+contextdb-engine = "0.3.1"
+contextdb-core = "0.3.1"
 ```
 
 ## Install
