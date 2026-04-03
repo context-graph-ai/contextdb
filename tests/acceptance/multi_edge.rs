@@ -219,6 +219,10 @@ async fn f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits() {
     let nats = start_nats().await;
     let tenant = "f21c_edge_b_observes_auto_synced_delete_before_edge_a_quits";
     let mut server = spawn_server(&server_path, tenant, &nats.nats_url);
+    assert!(
+        wait_for_sync_server_ready(&nats.nats_url, tenant, Duration::from_secs(15)).await,
+        "sync server should be ready before f21c begins"
+    );
 
     let setup = run_cli_script(
         &edge_a,

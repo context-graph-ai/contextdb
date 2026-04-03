@@ -613,6 +613,10 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     let ws_url = &nats.ws_url;
     let tenant = "f12_auto_sync_pushes_on_commit_not_on_quit";
     let mut server = spawn_server(&server_path, tenant, nats_url);
+    assert!(
+        wait_for_sync_server_ready(nats_url, tenant, Duration::from_secs(15)).await,
+        "sync server should be ready before f12 begins"
+    );
 
     // Start CLI with spawn_cli (keeps process alive)
     let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
@@ -628,15 +632,21 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     // Wait for data to appear on server WHILE CLI IS STILL RUNNING.
     // Timeout-based poll is correct here: auto-sync is async by design,
     // there is no deterministic completion signal (unlike f09c which has stdout "ok" lines).
+    let checker_path = edge_path.with_file_name("f12-checker.db");
+    let checker_setup = run_cli_script(
+        &checker_path,
+        &["--tenant-id", tenant, "--nats-url", ws_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+    );
+    assert!(
+        checker_setup.status.success(),
+        "checker edge setup must succeed"
+    );
     let found = wait_until(Duration::from_secs(30), || {
-        // Must not kill the server — check by opening a second connection to the DB
-        // The server process holds the DB open, so we check via a fresh CLI pull
-        let fresh_path = edge_path.with_file_name("f12-checker.db");
         let check = run_cli_script(
-            &fresh_path,
+            &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
-            "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-             .sync pull\n\
+            ".sync pull\n\
              SELECT count(*) FROM sensors\n\
              .quit\n",
         );
@@ -666,6 +676,10 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     let ws_url = &nats.ws_url;
     let tenant = "f12b_auto_sync_pushes_updates_not_just_inserts";
     let mut server = spawn_server(&server_path, tenant, nats_url);
+    assert!(
+        wait_for_sync_server_ready(nats_url, tenant, Duration::from_secs(15)).await,
+        "sync server should be ready before f12b setup push begins"
+    );
 
     let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
 
@@ -679,23 +693,35 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
          UPDATE sensors SET name = 'updated' WHERE id = '00000000-0000-0000-0000-000000000001'\n",
     );
 
-    // Wait for UPDATE to appear on server while CLI is still running
-    let mut checker_idx = 0u32;
-    let mut last_stdout = String::new();
+    // Wait for UPDATE to appear on the server while the writer CLI is still running.
+    // Inspect the server DB file directly between short server restarts so this test stays
+    // focused on edge->server auto-push rather than pull-side conflict resolution on a checker edge.
+    let mut last_server_name = None;
     let found = wait_until(Duration::from_secs(30), || {
-        checker_idx += 1;
-        let fresh_path = edge_path.with_file_name(format!("f12b-checker-{checker_idx}.db"));
-        let check = run_cli_script(
-            &fresh_path,
-            &["--tenant-id", tenant, "--nats-url", ws_url],
-            "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-             .sync pull\n\
-             SELECT name FROM sensors WHERE id = '00000000-0000-0000-0000-000000000001'\n\
-             .quit\n",
+        stop_child(&mut server);
+        let db = Database::open(&server_path).expect("server db");
+        let row = db.point_lookup(
+            "sensors",
+            "id",
+            &Value::Uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
+            db.snapshot(),
         );
-        let stdout = output_string(&check.stdout);
-        last_stdout = stdout.clone();
-        stdout.contains("updated")
+        last_server_name = match row {
+            Ok(found) => found
+                .as_ref()
+                .and_then(|r| r.values.get("name"))
+                .and_then(Value::as_text)
+                .map(ToOwned::to_owned),
+            Err(contextdb_core::Error::TableNotFound(_)) => None,
+            Err(err) => panic!("server lookup: {err}"),
+        };
+        db.close().expect("server db close");
+        if last_server_name.as_deref() == Some("updated") {
+            true
+        } else {
+            server = spawn_server(&server_path, tenant, nats_url);
+            false
+        }
     });
 
     write_child_stdin(&mut child, ".quit\n");
@@ -704,7 +730,7 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
 
     assert!(
         found,
-        "UPDATE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}; last checker stdout={last_stdout}",
+        "UPDATE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}; last server name={last_server_name:?}",
         output_string(&output.stdout),
         output_string(&output.stderr),
     );
@@ -802,15 +828,22 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
     std::thread::sleep(Duration::from_secs(2));
     let mut server = spawn_server(&server_path, tenant, nats_url);
 
-    let mut checker_idx = 0u32;
+    let checker_path = edge_path.with_file_name("f12d-checker.db");
+    let checker_setup = run_cli_script(
+        &checker_path,
+        &["--tenant-id", tenant, "--nats-url", ws_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+    );
+    assert!(
+        checker_setup.status.success(),
+        "checker edge setup must succeed"
+    );
+
     let found = wait_until(Duration::from_secs(30), || {
-        checker_idx += 1;
-        let fresh_path = edge_path.with_file_name(format!("f12d-checker-{checker_idx}.db"));
         let check = run_cli_script(
-            &fresh_path,
+            &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
-            "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-             .sync pull\n\
+            ".sync pull\n\
              SELECT count(*) FROM sensors\n\
              .quit\n",
         );
