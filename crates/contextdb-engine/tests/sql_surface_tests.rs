@@ -2,7 +2,7 @@ use contextdb_core::{MemoryAccountant, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -2470,8 +2470,10 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
     let iterations = 40;
     let barrier = Arc::new(Barrier::new(workers + 1));
     let done = Arc::new(AtomicBool::new(false));
-    let expected_tables = Arc::new(Mutex::new(Vec::<String>::new()));
-    let poller_expected = expected_tables.clone();
+    let expected_tables: Vec<String> = (0..workers)
+        .flat_map(|worker| (0..iterations).map(move |i| format!("lsn_race_{worker}_{i}")))
+        .collect();
+    let poller_expected = Arc::new(expected_tables.clone());
     let poller_db = db.clone();
     let poller_done = done.clone();
     let poller_barrier = barrier.clone();
@@ -2484,7 +2486,7 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
         poller_barrier.wait();
 
         loop {
-            let expected_len = poller_expected.lock().unwrap().len();
+            let expected_len = poller_expected.len();
             let changes = poller_db.changes_since(watermark);
             let before_seen = seen_creates.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
@@ -2525,7 +2527,7 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
             }
         }
 
-        let expected = poller_expected.lock().unwrap().clone();
+        let expected = poller_expected.as_ref().clone();
         (row_before_create, seen_creates, expected)
     });
 
@@ -2533,7 +2535,6 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
     for worker in 0..workers {
         let db = db.clone();
         let barrier = barrier.clone();
-        let expected = expected_tables.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
             for i in 0..iterations {
@@ -2543,7 +2544,6 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
                     &empty(),
                 )
                 .unwrap();
-                expected.lock().unwrap().push(table.clone());
                 db.execute(
                     &format!("INSERT INTO {table} (id, val) VALUES ($id, 'data')"),
                     &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
@@ -2590,8 +2590,10 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
     let iterations = 25;
     let barrier = Arc::new(Barrier::new(workers + 1));
     let done = Arc::new(AtomicBool::new(false));
-    let expected_columns = Arc::new(Mutex::new(Vec::<String>::new()));
-    let poller_expected = expected_columns.clone();
+    let expected_columns: Vec<String> = (0..workers)
+        .flat_map(|worker| (0..iterations).map(move |i| format!("c_{worker}_{i}")))
+        .collect();
+    let poller_expected = Arc::new(expected_columns.clone());
     let poller_db = db.clone();
     let poller_done = done.clone();
     let poller_barrier = barrier.clone();
@@ -2603,7 +2605,7 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
         poller_barrier.wait();
 
         loop {
-            let expected_len = poller_expected.lock().unwrap().len();
+            let expected_len = poller_expected.len();
             let changes = poller_db.changes_since(watermark);
             let before_seen = seen_columns.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
@@ -2644,19 +2646,14 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
             }
         }
 
-        let expected = poller_expected.lock().unwrap().len();
-        (
-            seen_columns,
-            poller_expected.lock().unwrap().clone(),
-            expected,
-        )
+        let expected = poller_expected.len();
+        (seen_columns, poller_expected.as_ref().clone(), expected)
     });
 
     let mut handles = Vec::new();
     for worker in 0..workers {
         let db = db.clone();
         let barrier = barrier.clone();
-        let expected = expected_columns.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
             for i in 0..iterations {
@@ -2671,7 +2668,6 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
                     &empty(),
                 )
                 .unwrap();
-                expected.lock().unwrap().push(col);
             }
         }));
     }
@@ -2702,11 +2698,11 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
 
     let barrier = Arc::new(Barrier::new(3));
     let done = Arc::new(AtomicBool::new(false));
-    let expected_tables = Arc::new(Mutex::new(Vec::<String>::new()));
+    let expected_tables: Vec<String> = (0..120).map(|i| format!("watermark_race_{i}")).collect();
 
     let poller_db = db.clone();
     let poller_done = done.clone();
-    let poller_expected = expected_tables.clone();
+    let poller_expected = Arc::new(expected_tables.clone());
     let poller_barrier = barrier.clone();
     let poller = thread::spawn(move || {
         let mut watermark = 0_u64;
@@ -2715,7 +2711,7 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
         poller_barrier.wait();
 
         loop {
-            let expected_len = poller_expected.lock().unwrap().len();
+            let expected_len = poller_expected.len();
             let changes = poller_db.changes_since(watermark);
             let before_seen = seen_tables.len();
             if !changes.ddl.is_empty() || !changes.rows.is_empty() {
@@ -2751,12 +2747,11 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
             }
         }
 
-        let expected = poller_expected.lock().unwrap().clone();
+        let expected = poller_expected.as_ref().clone();
         (seen_tables, expected)
     });
 
     let ddl_db = db.clone();
-    let ddl_expected = expected_tables.clone();
     let ddl_barrier = barrier.clone();
     let ddl_thread = thread::spawn(move || {
         ddl_barrier.wait();
@@ -2768,7 +2763,6 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
                     &empty(),
                 )
                 .unwrap();
-            ddl_expected.lock().unwrap().push(table);
         }
     });
 
