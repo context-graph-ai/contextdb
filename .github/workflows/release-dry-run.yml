@@ -28,10 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Dry-run package all crates
         run: |
-          for crate in contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-vector contextdb-parser contextdb-planner contextdb-engine contextdb-server contextdb-cli; do
-            echo "Packaging: $crate"
-            cargo package -p $crate --no-verify
-          done
+          cargo package --workspace --no-verify --allow-dirty
 
   dry-run-docker:
     needs: check
