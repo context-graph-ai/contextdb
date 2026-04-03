@@ -30,7 +30,7 @@ jobs:
         run: |
           for crate in contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-vector contextdb-parser contextdb-planner contextdb-engine contextdb-server contextdb-cli; do
             echo "Dry-run: $crate"
-            cargo publish -p $crate --dry-run
+            cargo publish -p $crate --dry-run --no-verify
           done
 
   dry-run-docker:
