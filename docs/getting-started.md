@@ -1,15 +1,35 @@
 # Getting Started
 
-Build and run contextdb in under 2 minutes.
+Run contextdb in under a minute.
 
 ---
 
-## Prerequisites
+## Install
 
-- [Rust stable](https://rustup.rs/) (1.75+)
-- Git
+### Download a pre-built binary (recommended)
 
-## Build
+Download the latest release for your platform from [GitHub Releases](https://github.com/context-graph-ai/contextdb/releases/latest):
+
+```bash
+# Linux x86_64
+curl -fsSL https://github.com/context-graph-ai/contextdb/releases/latest/download/x86_64-unknown-linux-gnu.tar.gz | tar xz
+# Linux ARM64
+curl -fsSL https://github.com/context-graph-ai/contextdb/releases/latest/download/aarch64-unknown-linux-gnu.tar.gz | tar xz
+# macOS Intel
+curl -fsSL https://github.com/context-graph-ai/contextdb/releases/latest/download/x86_64-apple-darwin.tar.gz | tar xz
+# macOS Apple Silicon
+curl -fsSL https://github.com/context-graph-ai/contextdb/releases/latest/download/aarch64-apple-darwin.tar.gz | tar xz
+```
+
+### Install via cargo
+
+```bash
+cargo install contextdb-cli
+```
+
+### Build from source
+
+Requires [Rust stable](https://rustup.rs/) (1.75+) and Git.
 
 ```bash
 git clone https://github.com/context-graph-ai/contextdb.git
@@ -17,12 +37,10 @@ cd contextdb
 cargo build --release -p contextdb-cli
 ```
 
-This builds only the CLI binary and its dependencies (~90 seconds on a modern machine).
-
 ## First REPL Session
 
 ```bash
-./target/release/contextdb-cli :memory:
+contextdb-cli :memory:
 ```
 
 Try the state machine — the feature that makes contextdb different from plain SQL:
@@ -54,7 +72,7 @@ The database enforces the state machine. No application code needed.
 Replace `:memory:` with a file path. Everything else works the same:
 
 ```bash
-./target/release/contextdb-cli ./my.db
+contextdb-cli ./my.db
 ```
 
 Single file. Crash-safe via redb. Reopen and your data is there.
@@ -96,11 +114,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb" }
-contextdb-core = { git = "https://github.com/context-graph-ai/contextdb" }
+contextdb-engine = "0.3"
+contextdb-core = "0.3"
 ```
-
-> contextdb is not yet published to crates.io. Git dependencies are required until the first crates.io release.
 
 ## What's Next
 

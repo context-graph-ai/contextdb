@@ -5,6 +5,7 @@ edition = "2024"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 description = "SQL parser for contextdb with GRAPH_TABLE and vector extensions"
 
 [dependencies]

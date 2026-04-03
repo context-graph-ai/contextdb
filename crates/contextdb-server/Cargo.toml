@@ -5,6 +5,7 @@ edition = "2024"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 description = "Sync server for contextdb — NATS-based replication with conflict resolution"
 
 [dependencies]

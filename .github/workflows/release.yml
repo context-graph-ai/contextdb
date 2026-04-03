@@ -37,9 +37,30 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          for crate in contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-vector contextdb-parser contextdb-planner contextdb-engine contextdb-server contextdb-cli; do
+          publish_crate() {
+            local crate=$1
             echo "Publishing $crate..."
-            cargo publish -p $crate --allow-dirty
+            cargo publish -p "$crate" --allow-dirty || {
+              if cargo search "$crate" --limit 1 | grep -q "$(sed -n 's/^version = "\(.*\)"/\1/p' "crates/$crate/Cargo.toml")"; then
+                echo "$crate already published, skipping"
+              else
+                exit 1
+              fi
+            }
+          }
+
+          # Batch 1: leaf crates
+          for crate in contextdb-core contextdb-tx contextdb-relational contextdb-graph contextdb-vector; do
+            publish_crate "$crate"
+            sleep 30
+          done
+
+          echo "Rate limit: waiting 10 minutes before next batch..."
+          sleep 600
+
+          # Batch 2: engine depends on all above; server depends on engine; cli depends on both
+          for crate in contextdb-parser contextdb-planner contextdb-engine contextdb-server contextdb-cli; do
+            publish_crate "$crate"
             sleep 30
           done
 
@@ -103,7 +124,7 @@ jobs:
           docker buildx imagetools create \
             -t $IMAGE:${{ github.ref_name }} \
             -t $IMAGE:latest \
-            $(printf '$IMAGE@sha256:%s ' *)
+            $(printf "$IMAGE@sha256:%s " *)
 
   build-binaries:
     needs: verify-version
@@ -155,7 +176,8 @@ jobs:
           path: ${{ matrix.target }}.tar.gz
 
   github-release:
-    needs: [publish-crates, publish-docker, build-binaries]
+    needs: [build-binaries]
+    if: always() && needs.build-binaries.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

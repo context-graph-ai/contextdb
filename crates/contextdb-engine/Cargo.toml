@@ -5,6 +5,7 @@ edition = "2024"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 description = "Embedded database engine for agentic memory — relational, graph, and vector under unified MVCC transactions"
 
 [dependencies]
@@ -27,7 +28,7 @@ bincode = { workspace = true }
 time.workspace = true
 
 [dev-dependencies]
-contextdb-server = { path = "../contextdb-server", version = "0.3" }
+contextdb-server = { path = "../contextdb-server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
 async-nats = "0.46"
