@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-vector"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ repository.workspace = true
 description = "Vector executor for contextdb — cosine similarity, HNSW indexing, pre-filtered search"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core", version = "0.2" }
-contextdb-tx = { path = "../contextdb-tx", version = "0.2" }
+contextdb-core = { path = "../contextdb-core", version = "0.3" }
+contextdb-tx = { path = "../contextdb-tx", version = "0.3" }
 roaring.workspace = true
 parking_lot.workspace = true
 hnsw_rs.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -8,13 +8,13 @@ repository.workspace = true
 description = "Embedded database engine for agentic memory — relational, graph, and vector under unified MVCC transactions"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core", version = "0.2" }
-contextdb-tx = { path = "../contextdb-tx", version = "0.2" }
-contextdb-relational = { path = "../contextdb-relational", version = "0.2" }
-contextdb-graph = { path = "../contextdb-graph", version = "0.2" }
-contextdb-vector = { path = "../contextdb-vector", version = "0.2" }
-contextdb-parser = { path = "../contextdb-parser", version = "0.2" }
-contextdb-planner = { path = "../contextdb-planner", version = "0.2" }
+contextdb-core = { path = "../contextdb-core", version = "0.3" }
+contextdb-tx = { path = "../contextdb-tx", version = "0.3" }
+contextdb-relational = { path = "../contextdb-relational", version = "0.3" }
+contextdb-graph = { path = "../contextdb-graph", version = "0.3" }
+contextdb-vector = { path = "../contextdb-vector", version = "0.3" }
+contextdb-parser = { path = "../contextdb-parser", version = "0.3" }
+contextdb-planner = { path = "../contextdb-planner", version = "0.3" }
 roaring.workspace = true
 uuid.workspace = true
 parking_lot.workspace = true
@@ -27,7 +27,7 @@ bincode = { workspace = true }
 time.workspace = true
 
 [dev-dependencies]
-contextdb-server = { path = "../contextdb-server", version = "0.2" }
+contextdb-server = { path = "../contextdb-server", version = "0.3" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
 async-nats = "0.46"

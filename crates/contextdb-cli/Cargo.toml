@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -8,9 +8,9 @@ repository.workspace = true
 description = "Interactive CLI for contextdb — explore relational, graph, and vector queries in a REPL"
 
 [dependencies]
-contextdb-engine = { path = "../contextdb-engine", version = "0.2" }
-contextdb-core = { path = "../contextdb-core", version = "0.2" }
-contextdb-server = { path = "../contextdb-server", version = "0.2" }
+contextdb-engine = { path = "../contextdb-engine", version = "0.3" }
+contextdb-core = { path = "../contextdb-core", version = "0.3" }
+contextdb-server = { path = "../contextdb-server", version = "0.3" }
 rustyline.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -18,4 +18,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-contextdb-parser = { path = "../contextdb-parser", version = "0.2" }
+contextdb-parser = { path = "../contextdb-parser", version = "0.3" }
