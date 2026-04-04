@@ -5,3 +5,4 @@ spikes/
 *.swo
 *~
 .DS_Store
+book/

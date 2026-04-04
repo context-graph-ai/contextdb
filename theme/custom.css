@@ -1,0 +1,285 @@
+/* contextdb dark theme — matches contextdb.tech landing page */
+/* Applied on top of mdBook's default Navy theme */
+
+/* ---- Site-wide nav bar (injected by site-nav.js) ---- */
+#site-nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+  display: flex; align-items: center; justify-content: space-between;
+  height: 48px; padding: 0 24px;
+  background: rgba(10, 10, 10, 0.92);
+  backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+  border-bottom: 1px solid #1a1a1a;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.sn-wordmark {
+  display: flex; align-items: center; gap: 8px;
+  color: #f0f0f0 !important; font-size: 0.95rem; font-weight: 600;
+  text-decoration: none !important; letter-spacing: -0.3px;
+}
+.sn-links {
+  display: flex; align-items: center; gap: 24px;
+}
+.sn-links a {
+  color: #999 !important; font-size: 0.85rem; text-decoration: none !important;
+}
+.sn-links a:hover { color: #ededed !important; }
+.sn-cta {
+  color: #38bdf8 !important; border: 1px solid #38bdf8;
+  border-radius: 9999px; padding: 5px 16px; font-weight: 500;
+}
+.sn-cta:hover { background: rgba(56, 189, 248, 0.1); }
+
+/* Push everything below the fixed nav bar */
+body { padding-top: 48px !important; }
+#menu-bar-hover-placeholder { margin-top: 0; }
+.sidebar { top: 48px !important; height: calc(100vh - 48px) !important; }
+
+:root {
+  --bg-deep: #0a0a0a;
+  --bg-card: #141414;
+  --bg-surface: #111;
+  --text-heading: #f0f0f0;
+  --text-body: #e0e0e0;
+  --text-secondary: #b0b0b0;
+  --text-muted: #888;
+  --border-subtle: #1e1e1e;
+  --border-standard: #2a2a2a;
+  --accent: #38bdf8;
+  --success: #4ade80;
+}
+
+/* Force Navy theme colors to match landing page */
+.navy {
+  --bg: #0a0a0a;
+  --fg: #e0e0e0;
+  --sidebar-bg: #111;
+  --sidebar-fg: #b0b0b0;
+  --sidebar-non-existant: #555;
+  --sidebar-active: #38bdf8;
+  --sidebar-spacer: #1e1e1e;
+  --scrollbar: #2a2a2a;
+  --icons: #888;
+  --icons-hover: #e0e0e0;
+  --links: #38bdf8;
+  --inline-code-color: #e0e0e0;
+  --theme-popup-bg: #141414;
+  --theme-popup-border: #2a2a2a;
+  --theme-hover: #1e1e1e;
+  --quote-bg: #141414;
+  --quote-border: #2a2a2a;
+  --table-border-color: #2a2a2a;
+  --table-header-bg: #141414;
+  --table-alternate-bg: #111;
+  --searchbar-border-color: #2a2a2a;
+  --searchbar-bg: #141414;
+  --searchbar-fg: #e0e0e0;
+  --searchbar-shadow-color: transparent;
+  --searchresults-header-fg: #b0b0b0;
+  --searchresults-border-color: #1e1e1e;
+  --searchresults-li-bg: #141414;
+  --search-mark-bg: rgba(56, 189, 248, 0.2);
+}
+
+/* Apply navy as default */
+.ayu, .coal, .light, .rust {
+  --bg: #0a0a0a;
+  --fg: #e0e0e0;
+  --sidebar-bg: #111;
+  --sidebar-fg: #b0b0b0;
+  --sidebar-non-existant: #555;
+  --sidebar-active: #38bdf8;
+  --sidebar-spacer: #1e1e1e;
+  --scrollbar: #2a2a2a;
+  --icons: #888;
+  --icons-hover: #e0e0e0;
+  --links: #38bdf8;
+  --inline-code-color: #e0e0e0;
+  --theme-popup-bg: #141414;
+  --theme-popup-border: #2a2a2a;
+  --theme-hover: #1e1e1e;
+  --quote-bg: #141414;
+  --quote-border: #2a2a2a;
+  --table-border-color: #2a2a2a;
+  --table-header-bg: #141414;
+  --table-alternate-bg: #111;
+  --searchbar-border-color: #2a2a2a;
+  --searchbar-bg: #141414;
+  --searchbar-fg: #e0e0e0;
+  --searchbar-shadow-color: transparent;
+  --searchresults-header-fg: #b0b0b0;
+  --searchresults-border-color: #1e1e1e;
+  --searchresults-li-bg: #141414;
+  --search-mark-bg: rgba(56, 189, 248, 0.2);
+}
+
+/* Sidebar styling */
+.sidebar {
+  background: #111 !important;
+  border-right: 1px solid #1e1e1e;
+}
+
+.sidebar .sidebar-scrollbox {
+  padding: 16px;
+}
+
+.sidebar ol.chapter li a {
+  color: #b0b0b0 !important;
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+.sidebar ol.chapter li a:hover {
+  color: #f0f0f0 !important;
+}
+
+.sidebar ol.chapter li.chapter-item.expanded a,
+.sidebar ol.chapter li a.active {
+  color: #38bdf8 !important;
+}
+
+/* Base font size — matches DESIGN.md (18px base) */
+html {
+  font-size: 18px !important;
+}
+
+/* Main content */
+.content {
+  max-width: 800px;
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+.content main {
+  color: #e0e0e0;
+}
+
+/* Headings */
+.content main h1 {
+  color: #f0f0f0;
+  border-bottom-color: #1e1e1e;
+  font-weight: 600;
+}
+
+.content main h2 {
+  color: #f0f0f0;
+  border-bottom-color: #1e1e1e;
+  font-weight: 600;
+}
+
+.content main h3,
+.content main h4 {
+  color: #e0e0e0;
+  font-weight: 600;
+}
+
+/* Code blocks */
+.content main pre {
+  background: #141414 !important;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  padding: 16px 20px;
+}
+
+.content main code {
+  background: #141414;
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: #e0e0e0;
+  font-size: 0.875em;
+}
+
+.content main pre > code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+
+/* Links */
+.content main a {
+  color: #38bdf8;
+}
+
+.content main a:hover {
+  color: #7dd3fc;
+}
+
+/* Tables */
+.content main table {
+  border-collapse: collapse;
+}
+
+.content main table th {
+  background: #141414;
+  color: #f0f0f0;
+  border-color: #2a2a2a;
+}
+
+.content main table td {
+  border-color: #2a2a2a;
+  color: #e0e0e0;
+}
+
+.content main table tr:nth-child(2n) {
+  background: #111;
+}
+
+/* Blockquotes */
+.content main blockquote {
+  background: #141414;
+  border-left-color: #38bdf8;
+  border-radius: 0 8px 8px 0;
+  padding: 12px 16px;
+  color: #b0b0b0;
+}
+
+/* Menu bar */
+#menu-bar {
+  background: rgba(10, 10, 10, 0.95) !important;
+  border-bottom: 1px solid #1e1e1e;
+}
+
+#menu-bar .icon-button {
+  color: #888;
+}
+
+#menu-bar .icon-button:hover {
+  color: #e0e0e0;
+}
+
+/* Nav arrows */
+.nav-chapters {
+  color: #888;
+}
+
+.nav-chapters:hover {
+  color: #38bdf8;
+}
+
+/* Hide theme picker — single theme */
+#theme-toggle {
+  display: none;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2a2a2a;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+
+/* Title in sidebar */
+.sidebar .sidebar-scrollbox .chapter li > a.active {
+  color: #38bdf8 !important;
+  font-weight: 500;
+}

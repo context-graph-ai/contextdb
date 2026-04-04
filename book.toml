@@ -4,3 +4,7 @@ src = "docs"
 
 [output.html]
 git-repository-url = "https://github.com/context-graph-ai/contextdb"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-css = ["theme/custom.css"]
+additional-js = ["theme/site-nav.js"]
