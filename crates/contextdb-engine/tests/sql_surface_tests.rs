@@ -1900,6 +1900,71 @@ fn con_03_backward_compat_column_def_serde() {
     // For now, this test verifies the current schema deserializes without error.
 }
 
+#[test]
+fn con_04_composite_unique_rejects_duplicate_tuple() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE memberships (id UUID PRIMARY KEY, org_id UUID NOT NULL, email TEXT NOT NULL, UNIQUE (org_id, email))",
+        &empty(),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("org_id", Value::Uuid(Uuid::from_u128(1))),
+            ("email", Value::Text("alice@example.com".into())),
+        ]),
+    )
+    .unwrap();
+
+    let result = db.execute(
+        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("org_id", Value::Uuid(Uuid::from_u128(1))),
+            ("email", Value::Text("alice@example.com".into())),
+        ]),
+    );
+    assert!(
+        result.is_err(),
+        "duplicate composite tuple must be rejected"
+    );
+}
+
+#[test]
+fn con_05_composite_unique_allows_distinct_tuple() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE memberships (id UUID PRIMARY KEY, org_id UUID NOT NULL, email TEXT NOT NULL, UNIQUE (org_id, email))",
+        &empty(),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("org_id", Value::Uuid(Uuid::from_u128(1))),
+            ("email", Value::Text("alice@example.com".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("org_id", Value::Uuid(Uuid::from_u128(2))),
+            ("email", Value::Text("alice@example.com".into())),
+        ]),
+    )
+    .unwrap();
+
+    let rows = db.scan("memberships", db.snapshot()).unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
 // ============================================================
 // Group 9: Other
 // ============================================================

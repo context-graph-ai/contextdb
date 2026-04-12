@@ -444,9 +444,67 @@ fn f80_unique_constraint_rejects_duplicates() {
     assert!(matches!(err, Error::UniqueViolation { .. }));
 }
 
+/// I inserted a row that references a missing parent row, and the database rejected it.
+#[test]
+fn f81_foreign_key_rejects_missing_reference() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE parents (id UUID PRIMARY KEY)",
+        &empty_params(),
+    )
+    .expect("create parents");
+    db.execute(
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id))",
+        &empty_params(),
+    )
+    .expect("create children");
+
+    let err = db
+        .execute(
+            "INSERT INTO children (id, parent_id) VALUES ($id, $parent_id)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("parent_id", Value::Uuid(Uuid::new_v4())),
+            ]),
+        )
+        .expect_err("missing reference should fail");
+    assert!(matches!(err, Error::ForeignKeyViolation { .. }));
+}
+
+/// I inserted a duplicate tuple into a composite UNIQUE constraint, and the database rejected it.
+#[test]
+fn f82_composite_unique_rejects_duplicate_tuple() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE memberships (id UUID PRIMARY KEY, org_id UUID NOT NULL, email TEXT NOT NULL, UNIQUE (org_id, email))",
+        &empty_params(),
+    )
+    .expect("create memberships");
+    db.execute(
+        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("org_id", Value::Uuid(Uuid::from_u128(1))),
+            ("email", Value::Text("alice@example.com".into())),
+        ]),
+    )
+    .expect("first tuple");
+    let err = db
+        .execute(
+            "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("org_id", Value::Uuid(Uuid::from_u128(1))),
+                ("email", Value::Text("alice@example.com".into())),
+            ]),
+        )
+        .expect_err("duplicate tuple should fail");
+    assert!(matches!(err, Error::UniqueViolation { .. }));
+}
+
 /// I queried for incoming edges with <-[:EDGE]-, and I got both nodes that point into the target.
 #[test]
-fn f81_incoming_edge_direction() {
+fn graph_01_incoming_edge_direction() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",
@@ -476,7 +534,7 @@ fn f81_incoming_edge_direction() {
 
 /// I queried for edges in either direction with -[:EDGE]-, and I got all connected nodes regardless of direction.
 #[test]
-fn f82_bidirectional_edge_match() {
+fn graph_02_bidirectional_edge_match() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)",

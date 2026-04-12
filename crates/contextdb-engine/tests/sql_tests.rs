@@ -237,6 +237,104 @@ fn duplicate_uuid_without_conflict_clause_errors() {
 }
 
 #[test]
+fn test_insert_with_missing_foreign_key_fails() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE parents (id UUID PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "INSERT INTO children (id, parent_id) VALUES ($id, $parent_id)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("parent_id", Value::Uuid(Uuid::new_v4())),
+            ]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::ForeignKeyViolation { .. }));
+}
+
+#[test]
+fn test_update_with_missing_foreign_key_fails() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE parents (id UUID PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO parents (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(parent_id))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO children (id, parent_id) VALUES ($id, $parent_id)",
+        &params(vec![
+            ("id", Value::Uuid(child_id)),
+            ("parent_id", Value::Uuid(parent_id)),
+        ]),
+    )
+    .unwrap();
+
+    let err = db
+        .execute(
+            "UPDATE children SET parent_id = $parent_id WHERE id = $id",
+            &params(vec![
+                ("id", Value::Uuid(child_id)),
+                ("parent_id", Value::Uuid(Uuid::new_v4())),
+            ]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::ForeignKeyViolation { .. }));
+}
+
+#[test]
+fn test_insert_with_existing_foreign_key_succeeds() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE parents (id UUID PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let parent_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO parents (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(parent_id))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO children (id, parent_id) VALUES ($id, $parent_id)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("parent_id", Value::Uuid(parent_id)),
+        ]),
+    )
+    .unwrap();
+}
+
+#[test]
 fn insert_edge_table_maintains_adjacency() {
     let db = setup_sql_db();
     let source = Uuid::new_v4();
