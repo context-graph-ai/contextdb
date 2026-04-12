@@ -93,40 +93,6 @@ pub fn validate_dml(
                 }
             }
 
-            let unique_columns: Vec<_> = table_meta
-                .columns
-                .iter()
-                .filter(|column| column.unique && !column.primary_key)
-                .collect();
-            if !unique_columns.is_empty() {
-                let existing_rows = db.scan(&p.table, db.snapshot())?;
-                for row in &p.values {
-                    for column in &unique_columns {
-                        let Some(index) = columns.iter().position(|name| name == &column.name)
-                        else {
-                            continue;
-                        };
-                        let value = row
-                            .get(index)
-                            .ok_or_else(|| {
-                                Error::PlanError("column/value count mismatch".to_string())
-                            })
-                            .and_then(|expr| resolve_expr(expr, params))?;
-                        if value == Value::Null {
-                            continue;
-                        }
-                        if existing_rows
-                            .iter()
-                            .any(|existing| existing.values.get(&column.name) == Some(&value))
-                        {
-                            return Err(Error::UniqueViolation {
-                                table: p.table.clone(),
-                                column: column.name.clone(),
-                            });
-                        }
-                    }
-                }
-            }
             Ok(())
         }
         _ => Ok(()),

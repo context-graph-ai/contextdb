@@ -82,6 +82,16 @@ pub struct Database {
     closed: AtomicBool,
 }
 
+pub(crate) enum InsertRowResult {
+    Inserted(RowId),
+    NoOp,
+}
+
+enum RowConstraintCheck {
+    Valid,
+    DuplicateUniqueNoOp,
+}
+
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Database")
@@ -768,6 +778,21 @@ impl Database {
         self.relational.insert(tx, table, values)
     }
 
+    pub(crate) fn insert_row_with_unique_noop(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+    ) -> Result<InsertRowResult> {
+        match self.check_row_constraints(tx, table, &values, None, true)? {
+            RowConstraintCheck::Valid => self
+                .relational
+                .insert(tx, table, values)
+                .map(InsertRowResult::Inserted),
+            RowConstraintCheck::DuplicateUniqueNoOp => Ok(InsertRowResult::NoOp),
+        }
+    }
+
     pub fn upsert_row(
         &self,
         tx: TxId,
@@ -816,6 +841,22 @@ impl Database {
         values: &HashMap<ColName, Value>,
         skip_row_id: Option<RowId>,
     ) -> Result<()> {
+        match self.check_row_constraints(tx, table, values, skip_row_id, false)? {
+            RowConstraintCheck::Valid => Ok(()),
+            RowConstraintCheck::DuplicateUniqueNoOp => {
+                unreachable!("strict constraint validation cannot return no-op")
+            }
+        }
+    }
+
+    fn check_row_constraints(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+        skip_row_id: Option<RowId>,
+        allow_duplicate_unique_noop: bool,
+    ) -> Result<RowConstraintCheck> {
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
@@ -827,11 +868,7 @@ impl Database {
                     skip_row_id.is_none_or(|row_id| row.row_id != row_id)
                 })?;
 
-        for column in meta
-            .columns
-            .iter()
-            .filter(|column| column.unique && !column.primary_key)
-        {
+        for column in meta.columns.iter().filter(|column| column.primary_key) {
             let Some(value) = values.get(&column.name) else {
                 continue;
             };
@@ -847,6 +884,33 @@ impl Database {
                     column: column.name.clone(),
                 });
             }
+        }
+
+        let mut duplicate_unique_row_id = None;
+
+        for column in meta
+            .columns
+            .iter()
+            .filter(|column| column.unique && !column.primary_key)
+        {
+            let Some(value) = values.get(&column.name) else {
+                continue;
+            };
+            if *value == Value::Null {
+                continue;
+            }
+            let matching_row_ids: Vec<RowId> = visible_rows
+                .iter()
+                .filter(|existing| existing.values.get(&column.name) == Some(value))
+                .map(|existing| existing.row_id)
+                .collect();
+            self.merge_unique_conflict(
+                table,
+                &column.name,
+                &matching_row_ids,
+                allow_duplicate_unique_noop,
+                &mut duplicate_unique_row_id,
+            )?;
         }
 
         for unique_constraint in &meta.unique_constraints {
@@ -867,17 +931,60 @@ impl Database {
                 continue;
             }
 
-            if visible_rows.iter().any(|existing| {
-                unique_constraint
-                    .iter()
-                    .zip(candidate_values.iter())
-                    .all(|(column_name, value)| existing.values.get(column_name) == Some(*value))
-            }) {
+            let matching_row_ids: Vec<RowId> = visible_rows
+                .iter()
+                .filter(|existing| {
+                    unique_constraint.iter().zip(candidate_values.iter()).all(
+                        |(column_name, value)| existing.values.get(column_name) == Some(*value),
+                    )
+                })
+                .map(|existing| existing.row_id)
+                .collect();
+            self.merge_unique_conflict(
+                table,
+                &unique_constraint.join(","),
+                &matching_row_ids,
+                allow_duplicate_unique_noop,
+                &mut duplicate_unique_row_id,
+            )?;
+        }
+
+        if duplicate_unique_row_id.is_some() {
+            Ok(RowConstraintCheck::DuplicateUniqueNoOp)
+        } else {
+            Ok(RowConstraintCheck::Valid)
+        }
+    }
+
+    fn merge_unique_conflict(
+        &self,
+        table: &str,
+        column: &str,
+        matching_row_ids: &[RowId],
+        allow_duplicate_unique_noop: bool,
+        duplicate_unique_row_id: &mut Option<RowId>,
+    ) -> Result<()> {
+        if matching_row_ids.is_empty() {
+            return Ok(());
+        }
+
+        if !allow_duplicate_unique_noop || matching_row_ids.len() != 1 {
+            return Err(Error::UniqueViolation {
+                table: table.to_string(),
+                column: column.to_string(),
+            });
+        }
+
+        let matched_row_id = matching_row_ids[0];
+        if let Some(existing_row_id) = duplicate_unique_row_id {
+            if *existing_row_id != matched_row_id {
                 return Err(Error::UniqueViolation {
                     table: table.to_string(),
-                    column: unique_constraint.join(","),
+                    column: column.to_string(),
                 });
             }
+        } else {
+            *duplicate_unique_row_id = Some(matched_row_id);
         }
 
         Ok(())

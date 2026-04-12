@@ -415,9 +415,9 @@ fn f79_not_null_constraint_rejects_null_inserts() {
     assert!(matches!(err, Error::Other(_) | Error::PlanError(_)));
 }
 
-/// I inserted a duplicate value into a UNIQUE column, and the database rejected it with a UniqueViolation error.
+/// I inserted a duplicate value into a UNIQUE column, and the database treated it as a no-op.
 #[test]
-fn f80_unique_constraint_rejects_duplicates() {
+fn f80_unique_constraint_duplicate_is_noop() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE t (id UUID PRIMARY KEY, email TEXT UNIQUE)",
@@ -432,16 +432,21 @@ fn f80_unique_constraint_rejects_duplicates() {
         ]),
     )
     .expect("first insert");
-    let err = db
-        .execute(
-            "INSERT INTO t (id, email) VALUES ($id, $email)",
-            &params(vec![
-                ("id", Value::Uuid(Uuid::new_v4())),
-                ("email", Value::Text("a@example.com".into())),
-            ]),
-        )
-        .expect_err("duplicate should fail");
-    assert!(matches!(err, Error::UniqueViolation { .. }));
+    db.execute(
+        "INSERT INTO t (id, email) VALUES ($id, $email)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("email", Value::Text("a@example.com".into())),
+        ]),
+    )
+    .expect("duplicate should be a no-op");
+
+    let rows = db.scan("t", db.snapshot()).expect("scan t");
+    assert_eq!(
+        rows.len(),
+        1,
+        "duplicate UNIQUE insert must not create a second row"
+    );
 }
 
 /// I inserted a row that references a missing parent row, and the database rejected it.
@@ -471,9 +476,9 @@ fn f81_foreign_key_rejects_missing_reference() {
     assert!(matches!(err, Error::ForeignKeyViolation { .. }));
 }
 
-/// I inserted a duplicate tuple into a composite UNIQUE constraint, and the database rejected it.
+/// I inserted a duplicate tuple into a composite UNIQUE constraint, and the database treated it as a no-op.
 #[test]
-fn f82_composite_unique_rejects_duplicate_tuple() {
+fn f82_composite_unique_duplicate_is_noop() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE memberships (id UUID PRIMARY KEY, org_id UUID NOT NULL, email TEXT NOT NULL, UNIQUE (org_id, email))",
@@ -489,17 +494,24 @@ fn f82_composite_unique_rejects_duplicate_tuple() {
         ]),
     )
     .expect("first tuple");
-    let err = db
-        .execute(
-            "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
-            &params(vec![
-                ("id", Value::Uuid(Uuid::new_v4())),
-                ("org_id", Value::Uuid(Uuid::from_u128(1))),
-                ("email", Value::Text("alice@example.com".into())),
-            ]),
-        )
-        .expect_err("duplicate tuple should fail");
-    assert!(matches!(err, Error::UniqueViolation { .. }));
+    db.execute(
+        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("org_id", Value::Uuid(Uuid::from_u128(1))),
+            ("email", Value::Text("alice@example.com".into())),
+        ]),
+    )
+    .expect("duplicate tuple should be a no-op");
+
+    let rows = db
+        .scan("memberships", db.snapshot())
+        .expect("scan memberships");
+    assert_eq!(
+        rows.len(),
+        1,
+        "duplicate composite tuple must not create a second row"
+    );
 }
 
 /// I queried for incoming edges with <-[:EDGE]-, and I got both nodes that point into the target.

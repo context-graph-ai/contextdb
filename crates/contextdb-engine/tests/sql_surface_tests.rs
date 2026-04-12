@@ -1848,7 +1848,7 @@ fn con_01_not_null_rejects_null() {
 }
 
 #[test]
-fn con_02_unique_rejects_duplicate() {
+fn con_02_unique_duplicate_is_noop() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE uniq (id UUID PRIMARY KEY, email TEXT UNIQUE)",
@@ -1864,14 +1864,17 @@ fn con_02_unique_rejects_duplicate() {
     )
     .unwrap();
 
-    let result = db.execute(
+    db.execute(
         "INSERT INTO uniq (id, email) VALUES ($id, $email)",
         &params(vec![
             ("id", Value::Uuid(Uuid::new_v4())),
             ("email", Value::Text("alice@example.com".into())),
         ]),
-    );
-    assert!(result.is_err(), "UNIQUE column must reject duplicate value");
+    )
+    .unwrap();
+
+    let rows = db.scan("uniq", db.snapshot()).unwrap();
+    assert_eq!(rows.len(), 1, "duplicate UNIQUE insert must be a no-op");
 }
 
 #[test]
@@ -1901,7 +1904,7 @@ fn con_03_backward_compat_column_def_serde() {
 }
 
 #[test]
-fn con_04_composite_unique_rejects_duplicate_tuple() {
+fn con_04_composite_unique_duplicate_is_noop() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE memberships (id UUID PRIMARY KEY, org_id UUID NOT NULL, email TEXT NOT NULL, UNIQUE (org_id, email))",
@@ -1919,18 +1922,18 @@ fn con_04_composite_unique_rejects_duplicate_tuple() {
     )
     .unwrap();
 
-    let result = db.execute(
+    db.execute(
         "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
         &params(vec![
             ("id", Value::Uuid(Uuid::new_v4())),
             ("org_id", Value::Uuid(Uuid::from_u128(1))),
             ("email", Value::Text("alice@example.com".into())),
         ]),
-    );
-    assert!(
-        result.is_err(),
-        "duplicate composite tuple must be rejected"
-    );
+    )
+    .unwrap();
+
+    let rows = db.scan("memberships", db.snapshot()).unwrap();
+    assert_eq!(rows.len(), 1, "duplicate composite tuple must be a no-op");
 }
 
 #[test]
@@ -3617,16 +3620,16 @@ fn integrity_10_failed_insert_does_not_leak_memory() {
     let baseline = accountant.usage().used;
 
     for _ in 0..20 {
-        let result = db.execute(
+        db.execute(
             "INSERT INTO items (id, name) VALUES ($id, 'dup')",
             &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
-        );
-        assert!(result.is_err(), "duplicate UNIQUE insert must fail");
+        )
+        .unwrap();
     }
 
     let used = accountant.usage().used;
     assert!(
         used <= baseline + 256,
-        "failed inserts must not leak memory: baseline={baseline}, used={used}"
+        "duplicate no-op inserts must not leak memory: baseline={baseline}, used={used}"
     );
 }

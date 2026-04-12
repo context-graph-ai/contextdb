@@ -1,4 +1,4 @@
-use crate::database::{Database, QueryResult};
+use crate::database::{Database, InsertRowResult, QueryResult};
 use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
 use contextdb_parser::ast::{
@@ -986,8 +986,12 @@ fn exec_insert(
                 }
             }
         } else {
-            match db.insert_row(txid, &p.table, values.clone()) {
-                Ok(row_id) => row_id,
+            match db.insert_row_with_unique_noop(txid, &p.table, values.clone()) {
+                Ok(InsertRowResult::Inserted(row_id)) => row_id,
+                Ok(InsertRowResult::NoOp) => {
+                    db.accountant().release(row_bytes);
+                    continue;
+                }
                 Err(err) => {
                     db.accountant().release(row_bytes);
                     return Err(err);
