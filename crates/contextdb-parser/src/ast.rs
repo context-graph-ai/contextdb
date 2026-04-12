@@ -251,6 +251,7 @@ pub struct OnConflict {
 pub struct CreateTable {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    pub unique_constraints: Vec<Vec<String>>,
     pub if_not_exists: bool,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,

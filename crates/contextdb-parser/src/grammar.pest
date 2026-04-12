@@ -119,12 +119,14 @@ create_table_stmt = {
     ~ if_not_exists?
     ~ identifier
     ~ "("
-    ~ column_def
-    ~ ("," ~ column_def)*
+    ~ table_element
+    ~ ("," ~ table_element)*
     ~ ")"
     ~ table_option*
 }
 if_not_exists = { ^"IF" ~ ^"NOT" ~ ^"EXISTS" }
+table_element = { column_def | unique_table_constraint }
+unique_table_constraint = { ^"UNIQUE" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
 alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_table_conflict_policy | drop_table_conflict_policy }

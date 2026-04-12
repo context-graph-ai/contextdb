@@ -36,6 +36,12 @@ pub(crate) fn execute_plan(
                         primary_key: c.primary_key,
                         unique: c.unique,
                         default: c.default.as_ref().map(stored_default_expr),
+                        references: c.references.as_ref().map(|reference| {
+                            contextdb_core::ForeignKeyReference {
+                                table: reference.table.clone(),
+                                column: reference.column.clone(),
+                            }
+                        }),
                         expires: c.expires,
                     })
                     .collect(),
@@ -49,6 +55,7 @@ pub(crate) fn execute_plan(
                         .collect(),
                 }),
                 dag_edge_types: p.dag_edge_types.clone(),
+                unique_constraints: p.unique_constraints.clone(),
                 natural_key_column: None,
                 propagation_rules: p.propagation_rules.clone(),
                 default_ttl_seconds: p.retain.as_ref().map(|r| r.duration_seconds),
@@ -97,6 +104,12 @@ pub(crate) fn execute_plan(
                         primary_key: col.primary_key,
                         unique: col.unique,
                         default: col.default.as_ref().map(stored_default_expr),
+                        references: col.references.as_ref().map(|reference| {
+                            contextdb_core::ForeignKeyReference {
+                                table: reference.table.clone(),
+                                column: reference.column.clone(),
+                            }
+                        }),
                         expires: col.expires,
                     };
                     store

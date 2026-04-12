@@ -987,6 +987,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut name = None;
     let mut if_not_exists = false;
     let mut columns = Vec::new();
+    let mut unique_constraints = Vec::new();
     let mut immutable = false;
     let mut state_machine = None;
     let mut dag_edge_types = Vec::new();
@@ -998,23 +999,37 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         match p.as_rule() {
             Rule::if_not_exists => if_not_exists = true,
             Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
-            Rule::column_def => {
-                let (col, inline_sm) = build_column_def(p)?;
-                if col
-                    .references
-                    .as_ref()
-                    .is_some_and(|fk| !fk.propagation_rules.is_empty())
-                {
-                    has_propagation = true;
-                }
-                columns.push(col);
-                if let Some(sm) = inline_sm {
-                    if state_machine.is_some() {
-                        return Err(Error::ParseError(
-                            "duplicate STATE MACHINE clause".to_string(),
-                        ));
+            Rule::table_element => {
+                let element = p
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| Error::ParseError("invalid table element".to_string()))?;
+                match element.as_rule() {
+                    Rule::column_def => {
+                        let (col, inline_sm) = build_column_def(element)?;
+                        if col
+                            .references
+                            .as_ref()
+                            .is_some_and(|fk| !fk.propagation_rules.is_empty())
+                        {
+                            has_propagation = true;
+                        }
+                        columns.push(col);
+                        if let Some(sm) = inline_sm {
+                            if state_machine.is_some() {
+                                return Err(Error::ParseError(
+                                    "duplicate STATE MACHINE clause".to_string(),
+                                ));
+                            }
+                            state_machine = Some(sm);
+                        }
                     }
-                    state_machine = Some(sm);
+                    Rule::unique_table_constraint => {
+                        unique_constraints.push(build_unique_table_constraint(element)?);
+                    }
+                    other => {
+                        return Err(unexpected_rule(other, "build_create_table.table_element"));
+                    }
                 }
             }
             Rule::table_option => {
@@ -1093,9 +1108,21 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         ));
     }
 
+    for columns_in_constraint in &unique_constraints {
+        for column_name in columns_in_constraint {
+            if !columns.iter().any(|column| column.name == *column_name) {
+                return Err(Error::ParseError(format!(
+                    "UNIQUE constraint references unknown column '{}'",
+                    column_name
+                )));
+            }
+        }
+    }
+
     Ok(CreateTable {
         name: name.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
         columns,
+        unique_constraints,
         if_not_exists,
         immutable,
         state_machine,
@@ -1301,6 +1328,32 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
         },
         inline_state_machine,
     ))
+}
+
+fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
+    let columns: Vec<String> = pair
+        .into_inner()
+        .filter(|part| part.as_rule() == Rule::identifier)
+        .map(|part| parse_identifier(part.as_str()))
+        .collect();
+
+    if columns.len() < 2 {
+        return Err(Error::ParseError(
+            "table-level UNIQUE requires at least two columns".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for column in &columns {
+        if !seen.insert(column.clone()) {
+            return Err(Error::ParseError(format!(
+                "duplicate column '{}' in UNIQUE constraint",
+                column
+            )));
+        }
+    }
+
+    Ok(columns)
 }
 
 fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {

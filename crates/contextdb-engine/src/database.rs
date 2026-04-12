@@ -447,6 +447,13 @@ impl Database {
         let mut ws = self.tx_mgr.cloned_write_set(tx)?;
 
         if !ws.is_empty()
+            && let Err(err) = self.validate_foreign_keys_in_tx(tx)
+        {
+            let _ = self.rollback(tx);
+            return Err(err);
+        }
+
+        if !ws.is_empty()
             && let Err(err) = self.plugin.pre_commit(&ws, source)
         {
             let _ = self.rollback(tx);
@@ -662,6 +669,12 @@ impl Database {
                                 .default
                                 .as_ref()
                                 .map(crate::executor::stored_default_expr),
+                            references: col.references.as_ref().map(|reference| {
+                                contextdb_core::ForeignKeyReference {
+                                    table: reference.table.clone(),
+                                    column: reference.column.clone(),
+                                }
+                            }),
                             expires: col.expires,
                         });
                         if col.expires {
@@ -751,6 +764,7 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<RowId> {
+        self.validate_row_constraints(tx, table, &values, None)?;
         self.relational.insert(tx, table, values)
     }
 
@@ -761,6 +775,17 @@ impl Database {
         conflict_col: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
+        let snapshot = self.snapshot();
+        let existing_row_id = values
+            .get(conflict_col)
+            .map(|conflict_value| {
+                self.point_lookup_in_tx(tx, table, conflict_col, conflict_value, snapshot)
+                    .map(|row| row.map(|row| row.row_id))
+            })
+            .transpose()?
+            .flatten();
+        self.validate_row_constraints(tx, table, &values, existing_row_id)?;
+
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
         let meta = self.table_meta(table);
         let new_state = meta
@@ -772,7 +797,7 @@ impl Database {
 
         let result = self
             .relational
-            .upsert(tx, table, conflict_col, values, self.snapshot())?;
+            .upsert(tx, table, conflict_col, values, snapshot)?;
 
         if let (Some(uuid), Some(state), Some(_meta)) =
             (row_uuid, new_state.as_deref(), meta.as_ref())
@@ -782,6 +807,116 @@ impl Database {
         }
 
         Ok(result)
+    }
+
+    fn validate_row_constraints(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+        skip_row_id: Option<RowId>,
+    ) -> Result<()> {
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        let snapshot = self.snapshot();
+
+        let visible_rows =
+            self.relational
+                .scan_filter_with_tx(Some(tx), table, snapshot, &|row| {
+                    skip_row_id.is_none_or(|row_id| row.row_id != row_id)
+                })?;
+
+        for column in meta
+            .columns
+            .iter()
+            .filter(|column| column.unique && !column.primary_key)
+        {
+            let Some(value) = values.get(&column.name) else {
+                continue;
+            };
+            if *value == Value::Null {
+                continue;
+            }
+            if visible_rows
+                .iter()
+                .any(|existing| existing.values.get(&column.name) == Some(value))
+            {
+                return Err(Error::UniqueViolation {
+                    table: table.to_string(),
+                    column: column.name.clone(),
+                });
+            }
+        }
+
+        for unique_constraint in &meta.unique_constraints {
+            let mut candidate_values = Vec::with_capacity(unique_constraint.len());
+            let mut has_null = false;
+
+            for column_name in unique_constraint {
+                match values.get(column_name) {
+                    Some(Value::Null) | None => {
+                        has_null = true;
+                        break;
+                    }
+                    Some(value) => candidate_values.push(value),
+                }
+            }
+
+            if has_null {
+                continue;
+            }
+
+            if visible_rows.iter().any(|existing| {
+                unique_constraint
+                    .iter()
+                    .zip(candidate_values.iter())
+                    .all(|(column_name, value)| existing.values.get(column_name) == Some(*value))
+            }) {
+                return Err(Error::UniqueViolation {
+                    table: table.to_string(),
+                    column: unique_constraint.join(","),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_foreign_keys_in_tx(&self, tx: TxId) -> Result<()> {
+        let snapshot = self.snapshot();
+        let relational_inserts = self
+            .tx_mgr
+            .with_write_set(tx, |ws| ws.relational_inserts.clone())?;
+
+        for (table, row) in relational_inserts {
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            for column in &meta.columns {
+                let Some(reference) = &column.references else {
+                    continue;
+                };
+                let Some(value) = row.values.get(&column.name) else {
+                    continue;
+                };
+                if *value == Value::Null {
+                    continue;
+                }
+                if self
+                    .point_lookup_in_tx(tx, &reference.table, &reference.column, value, snapshot)?
+                    .is_none()
+                {
+                    return Err(Error::ForeignKeyViolation {
+                        table: table.clone(),
+                        column: column.name.clone(),
+                        ref_table: reference.table.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn propagate_state_change_if_needed(
@@ -3561,11 +3696,19 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
         })
         .collect::<Vec<_>>();
 
-    if let Some((referenced_table, referenced_column, ..)) = fk_rules.first() {
+    if let Some(reference) = &col.references {
+        ty.push_str(&format!(
+            " REFERENCES {}({})",
+            reference.table, reference.column
+        ));
+    } else if let Some((referenced_table, referenced_column, ..)) = fk_rules.first() {
         ty.push_str(&format!(
             " REFERENCES {}({})",
             referenced_table, referenced_column
         ));
+    }
+
+    if col.references.is_some() || !fk_rules.is_empty() {
         for (_, _, trigger_state, target_state, max_depth, abort_on_failure) in fk_rules {
             ty.push_str(&format!(
                 " ON STATE {} PROPAGATE SET {}",
@@ -3628,6 +3771,10 @@ fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
             clause.push_str(" SYNC SAFE");
         }
         constraints.push(clause);
+    }
+
+    for unique_constraint in &ct.unique_constraints {
+        constraints.push(format!("UNIQUE ({})", unique_constraint.join(", ")));
     }
 
     for rule in &ct.propagation_rules {
@@ -3698,6 +3845,10 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
             clause.push_str(" SYNC SAFE");
         }
         constraints.push(clause);
+    }
+
+    for unique_constraint in &meta.unique_constraints {
+        constraints.push(format!("UNIQUE ({})", unique_constraint.join(", ")));
     }
 
     for rule in &meta.propagation_rules {

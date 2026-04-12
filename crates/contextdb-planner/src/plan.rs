@@ -145,6 +145,7 @@ pub struct GraphStepPlan {
 pub struct CreateTablePlan {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    pub unique_constraints: Vec<Vec<String>>,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,

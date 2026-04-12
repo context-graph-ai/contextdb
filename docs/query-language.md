@@ -131,7 +131,7 @@ SHOW DISK_LIMIT
 | `TEXT` | UTF-8 string | `'hello'` |
 | `BOOLEAN` / `BOOL` | Boolean | `TRUE`, `FALSE` |
 | `UUID` | 128-bit UUID | `'550e8400-e29b-41d4-a716-446655440000'` |
-| `TIMESTAMP` | Unix timestamp | `NOW()` |
+| `TIMESTAMP` | Stored as a Unix timestamp (`Value::Timestamp(i64)`); ISO 8601 text literals are also accepted on input | `NOW()` |
 | `JSON` | JSON value | `'{"key": "value"}'` |
 | `VECTOR(n)` | Fixed-dimension float vector | `[0.1, 0.2, 0.3]` |
 
@@ -156,9 +156,25 @@ CREATE TABLE decisions (
 |------------|-------------|
 | `PRIMARY KEY` | Unique row identifier |
 | `NOT NULL` | Value required |
-| `UNIQUE` | No duplicate values |
+| `UNIQUE` | No duplicate values (single column) |
 | `DEFAULT expr` | Default value for inserts |
-| `REFERENCES table(col)` | Foreign key |
+| `REFERENCES table(col)` | Foreign key — writes are rejected if the referenced row does not exist; in explicit transactions the error may surface at `COMMIT` |
+
+### Composite Uniqueness
+
+Enforce uniqueness across a combination of columns using a table-level constraint:
+
+```sql
+CREATE TABLE edges (
+  id UUID PRIMARY KEY,
+  source_id UUID NOT NULL,
+  target_id UUID NOT NULL,
+  edge_type TEXT NOT NULL,
+  UNIQUE(source_id, target_id, edge_type)
+)
+```
+
+A duplicate `(source_id, target_id, edge_type)` tuple is rejected. Rows that share individual column values but differ in at least one constrained column are allowed. Rows with `NULL` in any constrained column do not participate in the composite uniqueness check.
 
 ### Foreign Key State Propagation
 

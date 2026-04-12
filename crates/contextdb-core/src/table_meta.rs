@@ -9,6 +9,8 @@ pub struct TableMeta {
     pub state_machine: Option<StateMachineConstraint>,
     #[serde(default)]
     pub dag_edge_types: Vec<String>,
+    #[serde(default)]
+    pub unique_constraints: Vec<Vec<String>>,
     pub natural_key_column: Option<String>,
     #[serde(default)]
     pub propagation_rules: Vec<PropagationRule>,
@@ -61,7 +63,15 @@ pub struct ColumnDef {
     #[serde(default)]
     pub default: Option<String>,
     #[serde(default)]
+    pub references: Option<ForeignKeyReference>,
+    #[serde(default)]
     pub expires: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKeyReference {
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +99,15 @@ impl TableMeta {
         let dag_bytes = self.dag_edge_types.iter().fold(0usize, |acc, edge_type| {
             acc.saturating_add(32 + edge_type.len() * 16)
         });
+        let unique_constraint_bytes =
+            self.unique_constraints.iter().fold(0usize, |acc, columns| {
+                acc.saturating_add(
+                    24 + columns
+                        .iter()
+                        .map(|column| 16 + column.len() * 16)
+                        .sum::<usize>(),
+                )
+            });
         let natural_key_bytes = self
             .natural_key_column
             .as_ref()
@@ -106,6 +125,7 @@ impl TableMeta {
         16 + columns_bytes
             + state_machine_bytes
             + dag_bytes
+            + unique_constraint_bytes
             + natural_key_bytes
             + propagation_bytes
             + expires_bytes
@@ -160,7 +180,16 @@ impl ColumnDef {
             .as_ref()
             .map(|value| 32 + value.len() * 16)
             .unwrap_or(0);
-        8 + self.name.len() * 16 + self.column_type.estimated_bytes() + default_bytes + 8
+        let reference_bytes = self
+            .references
+            .as_ref()
+            .map(|reference| 32 + reference.table.len() * 16 + reference.column.len() * 16)
+            .unwrap_or(0);
+        8 + self.name.len() * 16
+            + self.column_type.estimated_bytes()
+            + default_bytes
+            + reference_bytes
+            + 8
     }
 }
 
