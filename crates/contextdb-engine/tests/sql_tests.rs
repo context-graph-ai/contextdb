@@ -237,6 +237,111 @@ fn duplicate_uuid_without_conflict_clause_errors() {
 }
 
 #[test]
+fn test_insert_duplicate_unique_value_is_noop() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE people (id UUID PRIMARY KEY, name TEXT UNIQUE)",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO people (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("name", Value::Text("alex".into())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO people (id, name) VALUES ($id, $name)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("name", Value::Text("alex".into())),
+        ]),
+    )
+    .unwrap();
+
+    assert_eq!(db.scan("people", db.snapshot()).unwrap().len(), 1);
+}
+
+#[test]
+fn test_insert_duplicate_composite_unique_tuple_is_noop() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE relationships (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL, UNIQUE (source_id, target_id, edge_type))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let source_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+    let edge_type = "RELATES_TO";
+
+    db.execute(
+        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source_id)),
+            ("target_id", Value::Uuid(target_id)),
+            ("edge_type", Value::Text(edge_type.into())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source_id)),
+            ("target_id", Value::Uuid(target_id)),
+            ("edge_type", Value::Text(edge_type.into())),
+        ]),
+    )
+    .unwrap();
+
+    assert_eq!(db.scan("relationships", db.snapshot()).unwrap().len(), 1);
+}
+
+#[test]
+fn test_insert_distinct_composite_unique_tuple_still_creates_second_row() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE relationships (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL, UNIQUE (source_id, target_id, edge_type))",
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let source_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+
+    db.execute(
+        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source_id)),
+            ("target_id", Value::Uuid(target_id)),
+            ("edge_type", Value::Text("RELATES_TO".into())),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source_id)),
+            ("target_id", Value::Uuid(target_id)),
+            ("edge_type", Value::Text("DEPENDS_ON".into())),
+        ]),
+    )
+    .unwrap();
+
+    assert_eq!(db.scan("relationships", db.snapshot()).unwrap().len(), 2);
+}
+
+#[test]
 fn test_insert_with_missing_foreign_key_fails() {
     let db = Database::open_memory();
     db.execute(
