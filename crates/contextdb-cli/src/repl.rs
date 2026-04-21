@@ -505,6 +505,10 @@ fn execute_sql(db: &Database, sql: &str) -> bool {
     }
 }
 
+pub fn is_fatal_cli_error_public(error: &Error) -> bool {
+    is_fatal_cli_error(error)
+}
+
 fn is_fatal_cli_error(error: &Error) -> bool {
     matches!(
         error,
@@ -515,6 +519,7 @@ fn is_fatal_cli_error(error: &Error) -> bool {
             | Error::RecursiveCteNotSupported
             | Error::WindowFunctionNotSupported
             | Error::FullTextSearchNotSupported
+            | Error::ImmutableColumn { .. }
     )
 }
 

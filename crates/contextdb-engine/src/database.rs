@@ -686,6 +686,7 @@ impl Database {
                                 }
                             }),
                             expires: col.expires,
+                            immutable: col.immutable,
                         });
                         if col.expires {
                             meta.expires_column = Some(col.name.clone());
@@ -778,12 +779,8 @@ impl Database {
         // `n <= max(committed_watermark, tx)` so writes inside an active
         // transaction can reference their own allocated TxId. The error,
         // when fired, still reports `committed_watermark` per plan B7.
-        let values = self.coerce_row_for_insert(
-            table,
-            values,
-            Some(self.committed_watermark()),
-            Some(tx),
-        )?;
+        let values =
+            self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
         self.validate_row_constraints(tx, table, &values, None)?;
         self.relational.insert(tx, table, values)
     }
@@ -842,7 +839,14 @@ impl Database {
             let coerced = if is_vector_bypass {
                 v
             } else {
-                crate::executor::coerce_into_column(self, table, &col, v, current_tx_max, active_tx)?
+                crate::executor::coerce_into_column(
+                    self,
+                    table,
+                    &col,
+                    v,
+                    current_tx_max,
+                    active_tx,
+                )?
             };
             out.insert(col, coerced);
         }

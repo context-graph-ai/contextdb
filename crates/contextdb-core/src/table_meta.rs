@@ -66,6 +66,8 @@ pub struct ColumnDef {
     pub references: Option<ForeignKeyReference>,
     #[serde(default)]
     pub expires: bool,
+    #[serde(default)]
+    pub immutable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

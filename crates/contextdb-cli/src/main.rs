@@ -4,9 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
-mod auto_sync;
-mod formatter;
-mod repl;
+use contextdb_cli::{auto_sync, repl};
 
 #[derive(Parser)]
 #[command(name = "contextdb-cli", version)]

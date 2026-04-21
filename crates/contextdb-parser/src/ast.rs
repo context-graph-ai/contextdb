@@ -318,6 +318,7 @@ pub struct ColumnDef {
     pub default: Option<Expr>,
     pub references: Option<ForeignKey>,
     pub expires: bool,
+    pub immutable: bool,
 }
 
 #[derive(Debug, Clone)]

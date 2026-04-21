@@ -43,6 +43,7 @@ pub(crate) fn execute_plan(
                             }
                         }),
                         expires: c.expires,
+                        immutable: c.immutable,
                     })
                     .collect(),
                 immutable: p.immutable,
@@ -111,6 +112,7 @@ pub(crate) fn execute_plan(
                             }
                         }),
                         expires: col.expires,
+                        immutable: col.immutable,
                     };
                     store
                         .alter_table_add_column(&p.table, core_col)

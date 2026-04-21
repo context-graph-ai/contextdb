@@ -16,6 +16,8 @@ mod deployment;
 mod dev_experience;
 #[path = "acceptance/disk_budget.rs"]
 mod disk_budget;
+#[path = "acceptance/docs_immutable_column.rs"]
+mod docs_immutable_column;
 #[path = "acceptance/embedding.rs"]
 mod embedding;
 #[path = "acceptance/infra_failures.rs"]

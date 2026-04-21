@@ -8,6 +8,14 @@ repository.workspace = true
 readme = "../../README.md"
 description = "Interactive CLI for contextdb — explore relational, graph, and vector queries in a REPL"
 
+[lib]
+name = "contextdb_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "contextdb-cli"
+path = "src/main.rs"
+
 [dependencies]
 contextdb-engine = { path = "../contextdb-engine", version = "0.3" }
 contextdb-core = { path = "../contextdb-core", version = "0.3" }

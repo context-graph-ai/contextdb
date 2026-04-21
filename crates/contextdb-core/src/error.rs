@@ -6,6 +6,8 @@ pub enum Error {
     TableNotFound(String),
     #[error("{0} are immutable")]
     ImmutableTable(String),
+    #[error("column `{column}` on table `{table}` is immutable")]
+    ImmutableColumn { table: String, column: String },
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
     #[error("propagation aborted: {table}.{column} transition {from} -> {to} is invalid")]

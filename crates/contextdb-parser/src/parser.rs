@@ -1328,6 +1328,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             default,
             references,
             expires,
+            immutable: false,
         },
         inline_state_machine,
     ))
