@@ -37,9 +37,15 @@ pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
         if col.primary_key {
             ty.push_str(" PRIMARY KEY");
         }
+        if col.immutable {
+            ty.push_str(" IMMUTABLE");
+        }
         write!(&mut buf, "  {} {}", col.name, ty).unwrap();
     }
     buf.push_str("\n)\n");
+    if meta.immutable {
+        buf.push_str("IMMUTABLE\n");
+    }
     buf
 }
 

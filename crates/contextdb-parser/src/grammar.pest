@@ -165,9 +165,11 @@ column_constraint = {
     | references_clause
     | fk_propagation_clause
     | expires_constraint
+    | immutable_constraint
     | state_machine_option
 }
 expires_constraint = { ^"EXPIRES" }
+immutable_constraint = { ^"IMMUTABLE" }
 not_null = { ^"NOT" ~ ^"NULL" }
 nullable_marker = { ^"NULL" }
 primary_key = { ^"PRIMARY" ~ ^"KEY" }

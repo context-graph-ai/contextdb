@@ -1108,6 +1108,47 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         ));
     }
 
+    // A column declared both in the STATE MACHINE status position AND IMMUTABLE is
+    // contradictory — STATE MACHINE permits transitions, IMMUTABLE refuses them.
+    if let Some(sm) = &state_machine
+        && let Some(col) = columns.iter().find(|c| c.name == sm.column)
+        && col.immutable
+    {
+        return Err(Error::ParseError(format!(
+            "column '{}' cannot be both IMMUTABLE and the STATE MACHINE status column",
+            sm.column
+        )));
+    }
+
+    // Propagation rules that write into a column (edge propagation and
+    // FK propagation `PROPAGATE SET <col>`) cannot target a column declared
+    // IMMUTABLE on the same table.
+    for rule in &propagation_rules {
+        if let AstPropagationRule::EdgeState { target_state, .. } = rule
+            && let Some(col) = columns.iter().find(|c| c.name == *target_state)
+            && col.immutable
+        {
+            return Err(Error::ParseError(format!(
+                "propagation rule cannot target column '{}' declared IMMUTABLE",
+                target_state
+            )));
+        }
+    }
+    for col in &columns {
+        let Some(fk) = &col.references else { continue };
+        for rule in &fk.propagation_rules {
+            if let AstPropagationRule::FkState { target_state, .. } = rule
+                && let Some(target_col) = columns.iter().find(|c| c.name == *target_state)
+                && target_col.immutable
+            {
+                return Err(Error::ParseError(format!(
+                    "FK propagation rule cannot target column '{}' declared IMMUTABLE",
+                    target_state
+                )));
+            }
+        }
+    }
+
     for columns_in_constraint in &unique_constraints {
         for column_name in columns_in_constraint {
             if !columns.iter().any(|column| column.name == *column_name) {
@@ -1224,10 +1265,19 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut fk_propagation_rules = Vec::new();
     let mut inline_state_machine = None;
     let mut expires = false;
+    let mut immutable_flag = false;
+    // Track if we saw the type token before column_constraints. If IMMUTABLE appears
+    // as the column name (i.e. before the data_type position), Pest will parse it as
+    // the identifier rule; we detect that case by the column name.
+    let mut column_name_text: Option<String> = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
-            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::identifier if name.is_none() => {
+                let ident = parse_identifier(p.as_str());
+                column_name_text = Some(ident.clone());
+                name = Some(ident);
+            }
             Rule::data_type => data_type = Some(build_data_type(p)?),
             Rule::column_constraint => {
                 let c = p
@@ -1293,6 +1343,15 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                         }
                         expires = true;
                     }
+                    Rule::immutable_constraint => {
+                        if immutable_flag {
+                            let col = column_name_text.as_deref().unwrap_or("column");
+                            return Err(Error::ParseError(format!(
+                                "duplicate IMMUTABLE constraint on column '{col}'"
+                            )));
+                        }
+                        immutable_flag = true;
+                    }
                     Rule::state_machine_option => {
                         if inline_state_machine.is_some() {
                             return Err(Error::ParseError(
@@ -1328,7 +1387,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             default,
             references,
             expires,
-            immutable: false,
+            immutable: immutable_flag,
         },
         inline_state_machine,
     ))

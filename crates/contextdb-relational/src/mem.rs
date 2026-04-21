@@ -50,7 +50,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     .collect();
                 result.retain(|row| !deleted_row_ids.contains(&row.row_id));
                 for (t, row) in &ws.relational_inserts {
-                    if t == table {
+                    if t == table && !deleted_row_ids.contains(&row.row_id) {
                         result.push(row.clone());
                     }
                 }

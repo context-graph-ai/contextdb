@@ -113,22 +113,10 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
             "crates/contextdb-engine/tests/sql_surface_tests.rs".to_string(),
             888u32,
         ),
-        (
-            "tests/acceptance/query_surface.rs".to_string(),
-            686u32,
-        ),
-        (
-            "tests/acceptance/query_surface.rs".to_string(),
-            1114u32,
-        ),
-        (
-            "tests/integration/retention_tests.rs".to_string(),
-            1366u32,
-        ),
-        (
-            "tests/integration/retention_tests.rs".to_string(),
-            1414u32,
-        ),
+        ("tests/acceptance/query_surface.rs".to_string(), 686u32),
+        ("tests/acceptance/query_surface.rs".to_string(), 1114u32),
+        ("tests/integration/retention_tests.rs".to_string(), 1366u32),
+        ("tests/integration/retention_tests.rs".to_string(), 1414u32),
     ]
     .into_iter()
     .collect();

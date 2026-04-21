@@ -10,8 +10,45 @@ pub fn validate_dml(
     params: &HashMap<String, Value>,
 ) -> Result<()> {
     match plan {
-        PhysicalPlan::Update(p) if db.relational_store().is_immutable(&p.table) => {
-            Err(Error::ImmutableTable(p.table.clone()))
+        PhysicalPlan::Update(p) => {
+            // Error-ordering precedence on UPDATE (per I13):
+            //   1. Table does not exist
+            //   2. Column in SET list does not exist on the table
+            //   3. Table-level ImmutableTable rejection
+            //   4. Column-level ImmutableColumn rejection (first flagged column in SET-list order)
+            //   5. STATE MACHINE / NOT NULL / coerce (handled later in executor)
+            let table_meta = db
+                .table_meta(&p.table)
+                .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+
+            // (2) Unknown-column check on every SET target.
+            for (col_name, _) in &p.assignments {
+                if !table_meta.columns.iter().any(|c| c.name == *col_name) {
+                    return Err(Error::Other(format!(
+                        "column '{}' does not exist on table '{}'",
+                        col_name, p.table
+                    )));
+                }
+            }
+
+            // (3) Table-level IMMUTABLE short-circuits column-level checks.
+            if db.relational_store().is_immutable(&p.table) {
+                return Err(Error::ImmutableTable(p.table.clone()));
+            }
+
+            // (4) Column-level IMMUTABLE: first flagged column in SET-list order wins.
+            for (col_name, _) in &p.assignments {
+                if let Some(col) = table_meta.columns.iter().find(|c| c.name == *col_name)
+                    && col.immutable
+                {
+                    return Err(Error::ImmutableColumn {
+                        table: p.table.clone(),
+                        column: col_name.clone(),
+                    });
+                }
+            }
+
+            Ok(())
         }
         PhysicalPlan::Delete(p) if db.relational_store().is_immutable(&p.table) => {
             Err(Error::ImmutableTable(p.table.clone()))

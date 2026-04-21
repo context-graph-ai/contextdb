@@ -52,7 +52,7 @@ pub struct StateMachineConstraint {
     pub transitions: HashMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnDef {
     pub name: String,
     pub column_type: ColumnType,
@@ -68,6 +68,135 @@ pub struct ColumnDef {
     pub expires: bool,
     #[serde(default)]
     pub immutable: bool,
+}
+
+// Custom `Deserialize` that tolerates prior on-disk schemas missing the
+// `immutable` field (backward-compat, I5). Attempts to deserialize the full
+// nine-field struct; on sequence truncation at the trailing `immutable`
+// position, defaults it to `false`. JSON / other formats that distinguish
+// "missing field" from "required field" continue to work via `serde(default)`
+// on the field itself.
+impl<'de> serde::Deserialize<'de> for ColumnDef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct ColumnDefVisitor;
+
+        impl<'de> Visitor<'de> for ColumnDefVisitor {
+            type Value = ColumnDef;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a ColumnDef")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<ColumnDef, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let name = seq
+                    .next_element::<String>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let column_type = seq
+                    .next_element::<ColumnType>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let nullable = seq
+                    .next_element::<bool>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let primary_key = seq
+                    .next_element::<bool>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                let unique = seq.next_element::<bool>()?.unwrap_or_default();
+                let default = seq.next_element::<Option<String>>()?.unwrap_or_default();
+                let references = seq
+                    .next_element::<Option<ForeignKeyReference>>()?
+                    .unwrap_or_default();
+                let expires = seq.next_element::<bool>()?.unwrap_or_default();
+                // Trailing field: tolerate bincode-style premature EOF by defaulting
+                // to `false` when reading the next element produces an error that
+                // indicates the buffer ended short of the expected bool tag.
+                let immutable = match seq.next_element::<bool>() {
+                    Ok(Some(v)) => v,
+                    Ok(None) => false,
+                    Err(_) => false,
+                };
+                Ok(ColumnDef {
+                    name,
+                    column_type,
+                    nullable,
+                    primary_key,
+                    unique,
+                    default,
+                    references,
+                    expires,
+                    immutable,
+                })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<ColumnDef, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut name: Option<String> = None;
+                let mut column_type: Option<ColumnType> = None;
+                let mut nullable: Option<bool> = None;
+                let mut primary_key: Option<bool> = None;
+                let mut unique: Option<bool> = None;
+                let mut default: Option<Option<String>> = None;
+                let mut references: Option<Option<ForeignKeyReference>> = None;
+                let mut expires: Option<bool> = None;
+                let mut immutable: Option<bool> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => name = Some(map.next_value()?),
+                        "column_type" => column_type = Some(map.next_value()?),
+                        "nullable" => nullable = Some(map.next_value()?),
+                        "primary_key" => primary_key = Some(map.next_value()?),
+                        "unique" => unique = Some(map.next_value()?),
+                        "default" => default = Some(map.next_value()?),
+                        "references" => references = Some(map.next_value()?),
+                        "expires" => expires = Some(map.next_value()?),
+                        "immutable" => immutable = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                Ok(ColumnDef {
+                    name: name.ok_or_else(|| serde::de::Error::missing_field("name"))?,
+                    column_type: column_type
+                        .ok_or_else(|| serde::de::Error::missing_field("column_type"))?,
+                    nullable: nullable
+                        .ok_or_else(|| serde::de::Error::missing_field("nullable"))?,
+                    primary_key: primary_key
+                        .ok_or_else(|| serde::de::Error::missing_field("primary_key"))?,
+                    unique: unique.unwrap_or_default(),
+                    default: default.unwrap_or_default(),
+                    references: references.unwrap_or_default(),
+                    expires: expires.unwrap_or_default(),
+                    immutable: immutable.unwrap_or_default(),
+                })
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "name",
+            "column_type",
+            "nullable",
+            "primary_key",
+            "unique",
+            "default",
+            "references",
+            "expires",
+            "immutable",
+        ];
+        deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -98,6 +98,38 @@ pub(crate) fn execute_plan(
                         ));
                     }
                     validate_expires_column(col)?;
+                    // If the new column is flagged IMMUTABLE, refuse to add it if any
+                    // existing propagation rule would write into a column of that name.
+                    // This closes the DROP-then-ADD-as-flagged loophole (Gotcha 13).
+                    if col.immutable
+                        && let Some(existing_meta) = db.table_meta(&p.table)
+                    {
+                        let targets_col =
+                            existing_meta
+                                .propagation_rules
+                                .iter()
+                                .any(|rule| {
+                                    match rule {
+                                contextdb_core::table_meta::PropagationRule::ForeignKey {
+                                    target_state,
+                                    ..
+                                } => *target_state == col.name,
+                                contextdb_core::table_meta::PropagationRule::Edge {
+                                    target_state,
+                                    ..
+                                } => *target_state == col.name,
+                                contextdb_core::table_meta::PropagationRule::VectorExclusion {
+                                    ..
+                                } => false,
+                            }
+                                });
+                        if targets_col {
+                            return Err(Error::ImmutableColumn {
+                                table: p.table.clone(),
+                                column: col.name.clone(),
+                            });
+                        }
+                    }
                     let core_col = contextdb_core::ColumnDef {
                         name: col.name.clone(),
                         column_type: map_column_type(&col.data_type),
@@ -126,6 +158,15 @@ pub(crate) fn execute_plan(
                     }
                 }
                 AlterAction::DropColumn(name) => {
+                    if let Some(existing_meta) = db.table_meta(&p.table)
+                        && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *name)
+                        && col.immutable
+                    {
+                        return Err(Error::ImmutableColumn {
+                            table: p.table.clone(),
+                            column: name.clone(),
+                        });
+                    }
                     store
                         .alter_table_drop_column(&p.table, name)
                         .map_err(Error::Other)?;
@@ -137,6 +178,15 @@ pub(crate) fn execute_plan(
                     }
                 }
                 AlterAction::RenameColumn { from, to } => {
+                    if let Some(existing_meta) = db.table_meta(&p.table)
+                        && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *from)
+                        && col.immutable
+                    {
+                        return Err(Error::ImmutableColumn {
+                            table: p.table.clone(),
+                            column: from.clone(),
+                        });
+                    }
                     store
                         .alter_table_rename_column(&p.table, from, to)
                         .map_err(Error::Other)?;
@@ -942,7 +992,7 @@ fn exec_insert(
                 .as_ref()
                 .is_some_and(|row| db.has_live_vector(row.row_id, db.snapshot()));
             let upsert_values = if let Some(existing_row) = existing.as_ref() {
-                apply_on_conflict_updates(
+                match apply_on_conflict_updates(
                     db,
                     &p.table,
                     values.clone(),
@@ -950,7 +1000,14 @@ fn exec_insert(
                     on_conflict,
                     params,
                     Some(txid),
-                )?
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        db.accountant().release(row_bytes);
+                        let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                        return Err(err);
+                    }
+                }
             } else {
                 values.clone()
             };
@@ -1091,7 +1148,9 @@ fn exec_update(
     db.check_disk_budget("UPDATE")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for update".to_string()))?;
     let snapshot = db.snapshot();
-    let rows = db.scan(&p.table, snapshot)?;
+    // Use in-tx scan so prior statements in a BEGIN/COMMIT block are visible:
+    // the old row must not shadow a previously-updated in-tx row.
+    let rows = db.scan_in_tx(txid, &p.table, snapshot)?;
     let resolved_where = p
         .where_clause
         .as_ref()
@@ -1781,6 +1840,23 @@ fn apply_on_conflict_updates(
 ) -> Result<HashMap<String, Value>> {
     if on_conflict.update_columns.is_empty() {
         return Ok(insert_values);
+    }
+
+    // Reject column-level IMMUTABLE updates at the ON CONFLICT DO UPDATE merge
+    // point. First flagged column in update-list order wins. Rejection returns
+    // Err here; the caller (exec_insert) is responsible for releasing any
+    // allocator bytes and restoring the write-set checkpoint.
+    if let Some(meta) = db.table_meta(table) {
+        for (column, _) in &on_conflict.update_columns {
+            if let Some(col_def) = meta.columns.iter().find(|c| c.name == *column)
+                && col_def.immutable
+            {
+                return Err(Error::ImmutableColumn {
+                    table: table.to_string(),
+                    column: column.clone(),
+                });
+            }
+        }
     }
 
     let current_tx_max = Some(db.committed_watermark());

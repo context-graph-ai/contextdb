@@ -876,14 +876,31 @@ impl Database {
         values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
         let snapshot = self.snapshot();
-        let existing_row_id = values
+        let existing_row = values
             .get(conflict_col)
             .map(|conflict_value| {
                 self.point_lookup_in_tx(tx, table, conflict_col, conflict_value, snapshot)
-                    .map(|row| row.map(|row| row.row_id))
             })
             .transpose()?
             .flatten();
+        let existing_row_id = existing_row.as_ref().map(|row| row.row_id);
+        // Diff-respecting column-level IMMUTABLE check: reject any upsert whose
+        // flagged-column value differs from the existing local value. Idempotent
+        // replay (same-value) succeeds; new rows (no existing match) apply normally.
+        if let (Some(existing), Some(meta)) = (existing_row.as_ref(), self.table_meta(table)) {
+            for col_def in meta.columns.iter().filter(|c| c.immutable) {
+                let Some(incoming) = values.get(&col_def.name) else {
+                    continue;
+                };
+                let existing_value = existing.values.get(&col_def.name);
+                if existing_value != Some(incoming) {
+                    return Err(Error::ImmutableColumn {
+                        table: table.to_string(),
+                        column: col_def.name.clone(),
+                    });
+                }
+            }
+        }
         self.validate_row_constraints(tx, table, &values, existing_row_id)?;
 
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
@@ -1418,6 +1435,17 @@ impl Database {
 
     pub fn scan(&self, table: &str, snapshot: SnapshotId) -> Result<Vec<VersionedRow>> {
         self.relational.scan(table, snapshot)
+    }
+
+    /// Scan a table with visibility over the tx's in-flight write-set layered on
+    /// top of the committed snapshot.
+    pub(crate) fn scan_in_tx(
+        &self,
+        tx: TxId,
+        table: &str,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<VersionedRow>> {
+        self.relational.scan_with_tx(Some(tx), table, snapshot)
     }
 
     pub fn scan_filter(
@@ -3960,6 +3988,9 @@ fn sql_type_for_ast_column(
     if col.unique {
         ty.push_str(" UNIQUE");
     }
+    if col.immutable {
+        ty.push_str(" IMMUTABLE");
+    }
     ty
 }
 
@@ -4036,6 +4067,9 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
     }
     if col.expires {
         ty.push_str(" EXPIRES");
+    }
+    if col.immutable {
+        ty.push_str(" IMMUTABLE");
     }
 
     ty

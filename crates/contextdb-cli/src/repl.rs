@@ -429,12 +429,14 @@ fn render_table_meta(table: &str, meta: &TableMeta) -> String {
         };
         let nullable = if col.nullable { "" } else { " NOT NULL" };
         let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
+        let immut = if col.immutable { " IMMUTABLE" } else { "" };
         out.push_str(&format!(
-            "  {} {}{}{}{}",
+            "  {} {}{}{}{}{}",
             col.name,
             render_column_type(&col.column_type),
             nullable,
             pk,
+            immut,
             comma
         ));
         out.push('\n');
@@ -519,7 +521,6 @@ fn is_fatal_cli_error(error: &Error) -> bool {
             | Error::RecursiveCteNotSupported
             | Error::WindowFunctionNotSupported
             | Error::FullTextSearchNotSupported
-            | Error::ImmutableColumn { .. }
     )
 }
 
