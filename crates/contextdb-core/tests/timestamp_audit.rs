@@ -115,6 +115,18 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
         ),
         ("tests/acceptance/query_surface.rs".to_string(), 686u32),
         ("tests/acceptance/query_surface.rs".to_string(), 1114u32),
+        (
+            "tests/integration/indexed_scan_filter_tests.rs".to_string(),
+            1880u32,
+        ),
+        (
+            "tests/integration/indexed_scan_filter_tests.rs".to_string(),
+            1906u32,
+        ),
+        (
+            "tests/integration/indexed_scan_filter_tests.rs".to_string(),
+            2666u32,
+        ),
         ("tests/integration/retention_tests.rs".to_string(), 1366u32),
         ("tests/integration/retention_tests.rs".to_string(), 1414u32),
     ]

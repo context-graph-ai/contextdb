@@ -47,6 +47,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::alter_table_stmt => Statement::AlterTable(build_alter_table(inner)?),
         Rule::drop_table_stmt => Statement::DropTable(build_drop_table(inner)?),
         Rule::create_index_stmt => Statement::CreateIndex(build_create_index(inner)?),
+        Rule::drop_index_stmt => Statement::DropIndex(build_drop_index(inner)?),
         Rule::insert_stmt => Statement::Insert(build_insert(inner)?),
         Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
         Rule::update_stmt => Statement::Update(build_update(inner)?),
@@ -1210,12 +1211,26 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             Ok(AlterAction::AddColumn(column))
         }
         Rule::drop_column_action => {
-            let column = action
-                .into_inner()
-                .find(|part| part.as_rule() == Rule::identifier)
-                .map(|part| parse_identifier(part.as_str()))
+            let mut column: Option<String> = None;
+            let mut cascade = false;
+            for part in action.into_inner() {
+                match part.as_rule() {
+                    Rule::identifier if column.is_none() => {
+                        column = Some(parse_identifier(part.as_str()));
+                    }
+                    Rule::drop_column_modifier => {
+                        let token = part.as_str().to_ascii_uppercase();
+                        if token == "CASCADE" {
+                            cascade = true;
+                        }
+                        // RESTRICT is the default; no-op.
+                    }
+                    other => return Err(unexpected_rule(other, "build_alter_action/drop_column")),
+                }
+            }
+            let column = column
                 .ok_or_else(|| Error::ParseError("DROP COLUMN missing column name".to_string()))?;
-            Ok(AlterAction::DropColumn(column))
+            Ok(AlterAction::DropColumn { column, cascade })
         }
         Rule::rename_column_action => {
             let mut identifiers = action
@@ -1690,20 +1705,62 @@ fn build_drop_table(pair: Pair<'_, Rule>) -> Result<DropTable> {
 }
 
 fn build_create_index(pair: Pair<'_, Rule>) -> Result<CreateIndex> {
-    let ids: Vec<String> = pair
-        .into_inner()
-        .filter(|p| p.as_rule() == Rule::identifier)
-        .map(|p| parse_identifier(p.as_str()))
-        .collect();
+    let mut name: Option<String> = None;
+    let mut table: Option<String> = None;
+    let mut columns: Vec<(String, SortDirection)> = Vec::new();
 
-    if ids.len() < 3 {
-        return Err(Error::ParseError("invalid CREATE INDEX".to_string()));
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => {
+                name = Some(parse_identifier(p.as_str()));
+            }
+            Rule::identifier if table.is_none() => {
+                table = Some(parse_identifier(p.as_str()));
+            }
+            Rule::indexed_column => {
+                // Stub: always emit Asc regardless of declared direction. Impl
+                // must read the optional `index_sort_direction` child and map
+                // ASC/DESC to SortDirection::Asc/Desc.
+                let mut col_name: Option<String> = None;
+                for inner in p.into_inner() {
+                    if inner.as_rule() == Rule::identifier && col_name.is_none() {
+                        col_name = Some(parse_identifier(inner.as_str()));
+                    }
+                }
+                let col = col_name
+                    .ok_or_else(|| Error::ParseError("CREATE INDEX missing column".to_string()))?;
+                columns.push((col, SortDirection::Asc));
+            }
+            other => return Err(unexpected_rule(other, "build_create_index")),
+        }
     }
 
     Ok(CreateIndex {
-        name: ids[0].clone(),
-        table: ids[1].clone(),
-        columns: ids[2..].to_vec(),
+        name: name.ok_or_else(|| Error::ParseError("CREATE INDEX missing name".to_string()))?,
+        table: table.ok_or_else(|| Error::ParseError("CREATE INDEX missing table".to_string()))?,
+        columns,
+    })
+}
+
+fn build_drop_index(pair: Pair<'_, Rule>) -> Result<DropIndex> {
+    let mut if_exists = false;
+    let mut idents: Vec<String> = Vec::new();
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::if_exists => if_exists = true,
+            Rule::identifier => idents.push(parse_identifier(p.as_str())),
+            other => return Err(unexpected_rule(other, "build_drop_index")),
+        }
+    }
+    if idents.len() < 2 {
+        return Err(Error::ParseError(
+            "DROP INDEX requires `<index_name> ON <table>`".to_string(),
+        ));
+    }
+    Ok(DropIndex {
+        name: idents[0].clone(),
+        table: idents[1].clone(),
+        if_exists,
     })
 }
 

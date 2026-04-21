@@ -162,6 +162,17 @@ pub enum WireDdlChange {
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
     },
+    // Direction is encoded as a string ("ASC" / "DESC") on the wire so the
+    // server does not depend on contextdb-core's SortDirection type shape.
+    CreateIndex {
+        table: String,
+        name: String,
+        columns: Vec<(String, String)>,
+    },
+    DropIndex {
+        table: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -325,6 +336,28 @@ impl From<DdlChange> for WireDdlChange {
                 columns,
                 constraints,
             },
+            DdlChange::CreateIndex {
+                table,
+                name,
+                columns,
+            } => {
+                let wire_cols = columns
+                    .into_iter()
+                    .map(|(c, dir)| {
+                        let dir_str = match dir {
+                            contextdb_core::SortDirection::Asc => "ASC".to_string(),
+                            contextdb_core::SortDirection::Desc => "DESC".to_string(),
+                        };
+                        (c, dir_str)
+                    })
+                    .collect();
+                Self::CreateIndex {
+                    table,
+                    name,
+                    columns: wire_cols,
+                }
+            }
+            DdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
         }
     }
 }
@@ -351,6 +384,29 @@ impl From<WireDdlChange> for DdlChange {
                 columns,
                 constraints,
             },
+            WireDdlChange::CreateIndex {
+                table,
+                name,
+                columns,
+            } => {
+                let engine_cols = columns
+                    .into_iter()
+                    .map(|(c, dir_str)| {
+                        let dir = if dir_str.eq_ignore_ascii_case("DESC") {
+                            contextdb_core::SortDirection::Desc
+                        } else {
+                            contextdb_core::SortDirection::Asc
+                        };
+                        (c, dir)
+                    })
+                    .collect();
+                Self::CreateIndex {
+                    table,
+                    name,
+                    columns: engine_cols,
+                }
+            }
+            WireDdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
         }
     }
 }

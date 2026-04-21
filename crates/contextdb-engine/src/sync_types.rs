@@ -48,6 +48,8 @@ impl ChangeSet {
                     DdlChange::CreateTable { name, .. } => include_dir(name),
                     DdlChange::DropTable { name } => include_dir(name),
                     DdlChange::AlterTable { name, .. } => include_dir(name),
+                    DdlChange::CreateIndex { table, .. } => include_dir(table),
+                    DdlChange::DropIndex { table, .. } => include_dir(table),
                 })
                 .cloned()
                 .collect(),
@@ -94,6 +96,15 @@ pub enum DdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+    },
+    CreateIndex {
+        table: String,
+        name: String,
+        columns: Vec<(String, contextdb_core::SortDirection)>,
+    },
+    DropIndex {
+        table: String,
+        name: String,
     },
 }
 

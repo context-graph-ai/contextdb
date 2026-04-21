@@ -46,7 +46,46 @@ pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
     if meta.immutable {
         buf.push_str("IMMUTABLE\n");
     }
+    if let Some(sm) = &meta.state_machine {
+        let mut entries: Vec<_> = sm.transitions.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let transitions: Vec<String> = entries
+            .into_iter()
+            .map(|(from, tos)| format!("{from} -> [{}]", tos.join(", ")))
+            .collect();
+        writeln!(
+            &mut buf,
+            "STATE MACHINE ({}: {})",
+            sm.column,
+            transitions.join(", ")
+        )
+        .unwrap();
+    }
+    if !meta.dag_edge_types.is_empty() {
+        let edge_types = meta
+            .dag_edge_types
+            .iter()
+            .map(|edge_type| format!("'{edge_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(&mut buf, "DAG({edge_types})").unwrap();
+    }
+    // Stub: emit NO `CREATE INDEX ...` lines for declared indexes. Impl must
+    // walk `meta.indexes` and emit one line per index with per-column ASC/DESC.
+    let _ = meta.indexes.len();
     buf
+}
+
+/// Render the `.explain <sql>` REPL output. Stub returns a placeholder that
+/// does NOT contain `"IndexScan"`, so EX03 fails until the impl fills this
+/// with a real physical-plan + trace summary.
+pub fn render_explain(
+    db: &Database,
+    sql: &str,
+    params: &std::collections::HashMap<String, Value>,
+) -> contextdb_core::Result<String> {
+    let _ = (db, sql, params);
+    Ok("Scan(stub)\n".to_string())
 }
 
 /// Render a single `Value` as the CLI displays it in SELECT output.

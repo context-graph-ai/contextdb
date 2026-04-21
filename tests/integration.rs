@@ -26,6 +26,8 @@ mod helpers;
 mod hiring_criteria;
 #[path = "integration/hnsw_tests.rs"]
 mod hnsw_tests;
+#[path = "integration/indexed_scan_filter_tests.rs"]
+mod indexed_scan_filter_tests;
 #[path = "integration/job_level.rs"]
 mod job_level;
 #[path = "integration/memory_accounting_tests.rs"]

@@ -326,6 +326,123 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+}
+
+/// Direction-aware total ordering over `Value`. Wraps `Value` so that
+/// `BTreeMap` keys sort per the index's declared direction without separate
+/// comparison logic in the planner.
+#[derive(Debug, Clone)]
+pub struct TotalOrdAsc(pub Value);
+
+#[derive(Debug, Clone)]
+pub struct TotalOrdDesc(pub Value);
+
+#[derive(Debug, Clone)]
+pub enum DirectedValue {
+    Asc(TotalOrdAsc),
+    Desc(TotalOrdDesc),
+}
+
+pub type IndexKey = Vec<DirectedValue>;
+
+impl PartialEq for TotalOrdAsc {
+    fn eq(&self, other: &Self) -> bool {
+        value_total_cmp(&self.0, &other.0).is_eq()
+    }
+}
+impl Eq for TotalOrdAsc {}
+impl Ord for TotalOrdAsc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        value_total_cmp(&self.0, &other.0)
+    }
+}
+impl PartialOrd for TotalOrdAsc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TotalOrdDesc {
+    fn eq(&self, other: &Self) -> bool {
+        value_total_cmp(&self.0, &other.0).is_eq()
+    }
+}
+impl Eq for TotalOrdDesc {}
+impl Ord for TotalOrdDesc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        value_total_cmp(&self.0, &other.0).reverse()
+    }
+}
+impl PartialOrd for TotalOrdDesc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DirectedValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DirectedValue::Asc(a), DirectedValue::Asc(b)) => a == b,
+            (DirectedValue::Desc(a), DirectedValue::Desc(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for DirectedValue {}
+impl Ord for DirectedValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (DirectedValue::Asc(a), DirectedValue::Asc(b)) => a.cmp(b),
+            (DirectedValue::Desc(a), DirectedValue::Desc(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+impl PartialOrd for DirectedValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Total ordering over `Value`. Stub uses a simple discriminant tiebreak +
+/// `f64::total_cmp` for Float64 + NULL-LAST-ASC semantics. Works uniformly
+/// for every value type; impl may replace this with a more specialized lookup
+/// in its own pass.
+fn value_total_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // NULL > any finite under ASC per shp_05 (NULLS LAST ASC).
+    match (a.is_null(), b.is_null()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        _ => {}
+    }
+    match (a, b) {
+        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
+        (Value::Float64(x), Value::Float64(y)) => x.total_cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::TxId(x), Value::TxId(y)) => x.0.cmp(&y.0),
+        // Cross-variant comparisons (Int64 vs Text etc.) are unreachable
+        // because DDL-time indexable-type enforcement guarantees all values
+        // feeding a given IndexKey share the column's type.
+        //
+        // Json / Vector variants are unreachable because DDL5 / DDL6 reject
+        // them with ColumnNotIndexable at CREATE INDEX time.
+        //
+        // F-S6: panic on internal invariant violation — better than silently
+        // returning Ordering::Equal which corrupts BTree ordering.
+        (a, b) => panic!(
+            "value_total_cmp called on non-indexable / mismatched variants: \
+             left={a:?}, right={b:?}; DDL should have rejected this"
+        ),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

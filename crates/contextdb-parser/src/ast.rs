@@ -4,6 +4,7 @@ pub enum Statement {
     AlterTable(AlterTable),
     DropTable(DropTable),
     CreateIndex(CreateIndex),
+    DropIndex(DropIndex),
     Insert(Insert),
     Delete(Delete),
     Update(Update),
@@ -275,7 +276,10 @@ pub struct AlterTable {
 #[derive(Debug, Clone)]
 pub enum AlterAction {
     AddColumn(ColumnDef),
-    DropColumn(String),
+    DropColumn {
+        column: String,
+        cascade: bool,
+    },
     RenameColumn {
         from: String,
         to: String,
@@ -305,7 +309,14 @@ pub struct DropTable {
 pub struct CreateIndex {
     pub name: String,
     pub table: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<(String, SortDirection)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropIndex {
+    pub name: String,
+    pub table: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone)]

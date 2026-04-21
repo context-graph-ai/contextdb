@@ -10,6 +10,7 @@ pub enum PhysicalPlan {
     AlterTable(AlterTablePlan),
     DropTable(String),
     CreateIndex(CreateIndexPlan),
+    DropIndex(DropIndexPlan),
     Insert(InsertPlan),
     Delete(DeletePlan),
     Update(UpdatePlan),
@@ -163,7 +164,14 @@ pub struct AlterTablePlan {
 pub struct CreateIndexPlan {
     pub name: String,
     pub table: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<(String, contextdb_core::SortDirection)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropIndexPlan {
+    pub name: String,
+    pub table: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +220,21 @@ pub enum JoinType {
 }
 
 #[derive(Debug, Clone)]
-pub struct ScanRange;
+pub struct ScanRange {
+    pub lower: std::ops::Bound<contextdb_core::Value>,
+    pub upper: std::ops::Bound<contextdb_core::Value>,
+    pub equality: Option<contextdb_core::Value>,
+}
+
+impl Default for ScanRange {
+    fn default() -> Self {
+        Self {
+            lower: std::ops::Bound::Unbounded,
+            upper: std::ops::Bound::Unbounded,
+            equality: None,
+        }
+    }
+}
 
 impl From<OnConflict> for OnConflictPlan {
     fn from(value: OnConflict) -> Self {

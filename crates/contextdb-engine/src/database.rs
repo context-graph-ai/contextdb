@@ -33,10 +33,44 @@ type DynStore = Box<dyn WriteSetApplicator>;
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
+pub struct IndexCandidate {
+    pub name: String,
+    pub rejected_reason: std::borrow::Cow<'static, str>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryTrace {
+    pub physical_plan: &'static str,
+    pub index_used: Option<String>,
+    pub predicates_pushed: smallvec::SmallVec<[std::borrow::Cow<'static, str>; 4]>,
+    pub indexes_considered: smallvec::SmallVec<[IndexCandidate; 4]>,
+    pub sort_elided: bool,
+}
+
+impl QueryTrace {
+    /// Stub default: scan-labeled trace with no plan data. The no-op writes
+    /// this everywhere. Impl must replace construction sites with real plan
+    /// inspection.
+    pub fn scan() -> Self {
+        Self {
+            physical_plan: "Scan",
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CascadeReport {
+    pub dropped_indexes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
     pub rows_affected: u64,
+    pub trace: QueryTrace,
+    pub cascade: Option<CascadeReport>,
 }
 
 impl QueryResult {
@@ -45,6 +79,8 @@ impl QueryResult {
             columns: vec![],
             rows: vec![],
             rows_affected: 0,
+            trace: QueryTrace::scan(),
+            cascade: None,
         }
     }
 
@@ -53,6 +89,8 @@ impl QueryResult {
             columns: vec![],
             rows: vec![],
             rows_affected,
+            trace: QueryTrace::scan(),
+            cascade: None,
         }
     }
 }
@@ -692,7 +730,10 @@ impl Database {
                             meta.expires_column = Some(col.name.clone());
                         }
                     }
-                    AlterAction::DropColumn(name) => {
+                    AlterAction::DropColumn {
+                        column: name,
+                        cascade: _,
+                    } => {
                         meta.columns.retain(|c| c.name != *name);
                         if meta.expires_column.as_deref() == Some(name.as_str()) {
                             meta.expires_column = None;
@@ -1695,6 +1736,64 @@ impl Database {
 
     pub fn table_meta(&self, table: &str) -> Option<TableMeta> {
         self.relational_store.table_meta(table)
+    }
+
+    /// Execute at a specific snapshot — stub ignores the snapshot and
+    /// delegates to `execute`. Impl must thread the snapshot into the tx
+    /// manager + visibility check.
+    #[doc(hidden)]
+    pub fn execute_at_snapshot(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        _snapshot: SnapshotId,
+    ) -> Result<QueryResult> {
+        self.execute(sql, params)
+    }
+
+    /// Return the row changes since `since`. Stub returns empty; impl must
+    /// walk the change_log and emit `RowChange` entries preserving row_id
+    /// ordering per I18.
+    #[doc(hidden)]
+    pub fn change_log_rows_since(&self, since: Lsn) -> Result<Vec<RowChange>> {
+        let _ = since;
+        Ok(Vec::new())
+    }
+
+    /// Count of base rows the executor touched during the most recent query.
+    /// Stub returns `u64::MAX` so every `<= small_bound` assertion fails.
+    /// Impl must reset per query and bump per base-row touch.
+    #[doc(hidden)]
+    pub fn __rows_examined(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Count of `indexes.write()` lock acquisitions since startup. Stub
+    /// returns `0` so `after - before == 1` assertions fail.
+    #[doc(hidden)]
+    pub fn __index_write_lock_count(&self) -> u64 {
+        0
+    }
+
+    /// Total entries across every registered index's BTreeMap. Stub returns
+    /// `u64::MAX` so `== 0` assertions fail. Impl must walk the registry.
+    #[doc(hidden)]
+    pub fn __introspect_indexes_total_entries(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Probe the constraint-check path for a specific table/column/value.
+    /// Stub returns an empty `QueryResult` with Scan trace; impl must thread
+    /// the probe through `check_row_constraints` with index routing.
+    #[doc(hidden)]
+    pub fn __probe_constraint_check(
+        &self,
+        table: &str,
+        column: &str,
+        value: Value,
+    ) -> Result<QueryResult> {
+        let _ = (table, column, value);
+        Ok(QueryResult::empty())
     }
 
     /// Run one pruning cycle. Called by the background loop or manually in tests.
@@ -2946,6 +3045,20 @@ impl Database {
                     self.execute_in_tx(tx, &sql, &HashMap::new())?;
                     table_meta_cache.remove(&name);
                     visible_rows_cache.remove(&name);
+                }
+                DdlChange::CreateIndex {
+                    table,
+                    name,
+                    columns,
+                } => {
+                    // Stub: ignore — impl must write the IndexDecl into
+                    // TableMeta.indexes on the receiver so SY01/SY04/SY05 pass.
+                    let _ = (table, name, columns);
+                }
+                DdlChange::DropIndex { table, name } => {
+                    // Stub: ignore — impl must remove the IndexDecl from
+                    // TableMeta.indexes so SY02 passes.
+                    let _ = (table, name);
                 }
             }
         }

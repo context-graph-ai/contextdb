@@ -62,6 +62,7 @@ pub(crate) fn execute_plan(
                 default_ttl_seconds: p.retain.as_ref().map(|r| r.duration_seconds),
                 sync_safe: p.retain.as_ref().is_some_and(|r| r.sync_safe),
                 expires_column,
+                indexes: Vec::new(),
             };
             let metadata_bytes = meta.estimated_bytes();
             db.accountant().try_allocate_for(
@@ -157,7 +158,13 @@ pub(crate) fn execute_plan(
                         table_meta.expires_column = Some(col.name.clone());
                     }
                 }
-                AlterAction::DropColumn(name) => {
+                AlterAction::DropColumn {
+                    column: name,
+                    cascade: _,
+                } => {
+                    // Stub: RESTRICT (no cascade) check against TableMeta.indexes
+                    // and CASCADE's index-dropping behavior are NOT yet wired.
+                    // Impl must add both paths per §4.13.
                     if let Some(existing_meta) = db.table_meta(&p.table)
                         && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *name)
                         && col.immutable
@@ -254,6 +261,8 @@ pub(crate) fn execute_plan(
                     columns: vec![],
                     rows: vec![vec![]],
                     rows_affected: 0,
+                    trace: crate::database::QueryTrace::scan(),
+                    cascade: None,
                 });
             }
             let snapshot = db.snapshot();
@@ -307,6 +316,8 @@ pub(crate) fn execute_plan(
                     columns: vec!["id".to_string(), "depth".to_string()],
                     rows: vec![],
                     rows_affected: 0,
+                    trace: crate::database::QueryTrace::scan(),
+                    cascade: None,
                 });
             }
             let snapshot = db.snapshot();
@@ -368,6 +379,8 @@ pub(crate) fn execute_plan(
                     columns,
                     rows: project_graph_frontier_rows(frontier, start_alias, steps)?,
                     rows_affected: 0,
+                    trace: crate::database::QueryTrace::scan(),
+                    cascade: None,
                 })
             })();
             db.accountant().release(bfs_bytes);
@@ -489,6 +502,8 @@ pub(crate) fn execute_plan(
                 columns,
                 rows,
                 rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
             })
         }
         PhysicalPlan::MaterializeCte { input, .. } => execute_plan(db, input, params, tx),
@@ -564,6 +579,8 @@ pub(crate) fn execute_plan(
                     columns: output_columns,
                     rows: vec![aggregate_row],
                     rows_affected: 0,
+                    trace: input_result.trace.clone(),
+                    cascade: None,
                 });
             }
 
@@ -595,6 +612,8 @@ pub(crate) fn execute_plan(
                 columns: output_columns,
                 rows: output_rows,
                 rows_affected: 0,
+                trace: input_result.trace.clone(),
+                cascade: None,
             })
         }
         PhysicalPlan::Sort { input, keys } => {
@@ -651,6 +670,8 @@ pub(crate) fn execute_plan(
                 columns: input_result.columns,
                 rows,
                 rows_affected: input_result.rows_affected,
+                trace: input_result.trace,
+                cascade: None,
             })
         }
         PhysicalPlan::Join {
@@ -713,9 +734,33 @@ pub(crate) fn execute_plan(
                 columns: output_columns,
                 rows,
                 rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
             })
         }
         PhysicalPlan::CreateIndex(_) => Ok(QueryResult::empty_with_affected(0)),
+        PhysicalPlan::DropIndex(_) => Ok(QueryResult::empty_with_affected(0)),
+        PhysicalPlan::IndexScan {
+            table,
+            index,
+            range: _,
+        } => {
+            // Stub: always return empty rows + an IndexScan trace marker. Impl
+            // must walk the BTreeMap at the named index, apply visibility,
+            // materialize rows, and populate the trace fully.
+            let _ = (table, index);
+            Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: 0,
+                trace: crate::database::QueryTrace {
+                    physical_plan: "IndexScan",
+                    index_used: None,
+                    ..crate::database::QueryTrace::default()
+                },
+                cascade: None,
+            })
+        }
         PhysicalPlan::SetMemoryLimit(val) => {
             let limit = match val {
                 SetMemoryLimitValue::Bytes(bytes) => Some(*bytes),
@@ -750,6 +795,8 @@ pub(crate) fn execute_plan(
                         .unwrap_or_else(|| Value::Text("none".to_string())),
                 ]],
                 rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
             })
         }
         PhysicalPlan::SetDiskLimit(val) => {
@@ -789,6 +836,8 @@ pub(crate) fn execute_plan(
                         .unwrap_or_else(|| Value::Text("none".to_string())),
                 ]],
                 rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
             })
         }
         PhysicalPlan::SetSyncConflictPolicy(policy) => {
@@ -811,6 +860,8 @@ pub(crate) fn execute_plan(
                 columns: vec!["policy".to_string()],
                 rows,
                 rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
             })
         }
         PhysicalPlan::Pipeline(plans) => {
@@ -1427,6 +1478,8 @@ fn materialize_rows(
         columns,
         rows,
         rows_affected: 0,
+        trace: crate::database::QueryTrace::scan(),
+        cascade: None,
     })
 }
 

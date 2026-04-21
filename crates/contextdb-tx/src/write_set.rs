@@ -1,5 +1,19 @@
 use contextdb_core::*;
 
+#[derive(Debug, Clone)]
+pub enum IndexMutation {
+    Insert {
+        index_id: String,
+        key: IndexKey,
+        row_id: RowId,
+    },
+    Delete {
+        index_id: String,
+        key: IndexKey,
+        row_id: RowId,
+    },
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct WriteSet {
     pub relational_inserts: Vec<(TableName, VersionedRow)>,
@@ -8,6 +22,8 @@ pub struct WriteSet {
     pub adj_deletes: Vec<(NodeId, EdgeType, NodeId, TxId)>,
     pub vector_inserts: Vec<VectorEntry>,
     pub vector_deletes: Vec<(RowId, TxId)>,
+    pub index_inserts: Vec<IndexMutation>,
+    pub index_deletes: Vec<IndexMutation>,
     pub commit_lsn: Option<Lsn>,
     pub propagation_in_progress: bool,
 }
@@ -24,6 +40,8 @@ impl WriteSet {
             && self.adj_deletes.is_empty()
             && self.vector_inserts.is_empty()
             && self.vector_deletes.is_empty()
+            && self.index_inserts.is_empty()
+            && self.index_deletes.is_empty()
     }
 
     pub fn stamp_lsn(&mut self, lsn: Lsn) {

@@ -105,6 +105,24 @@ pub enum Error {
     TxIdOverflow { table: String, incoming: u64 },
     #[error("column {table}.{column} is NOT NULL")]
     ColumnNotNullable { table: String, column: String },
+    #[error("index not found: {table}.{index}")]
+    IndexNotFound { table: String, index: String },
+    #[error("duplicate index: {table}.{index}")]
+    DuplicateIndex { table: String, index: String },
+    #[error("column not indexable: {table}.{column} has type {column_type:?}")]
+    ColumnNotIndexable {
+        table: String,
+        column: String,
+        column_type: crate::table_meta::ColumnType,
+    },
+    #[error("column in index: {table}.{column} referenced by index {index}")]
+    ColumnInIndex {
+        table: String,
+        column: String,
+        index: String,
+    },
+    #[error("column not found: {table}.{column}")]
+    ColumnNotFound { table: String, column: String },
     #[error("{0}")]
     Other(String),
 }

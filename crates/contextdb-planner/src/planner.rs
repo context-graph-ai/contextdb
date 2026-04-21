@@ -27,10 +27,21 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             action: at.action.clone(),
         })),
         Statement::DropTable(dt) => Ok(PhysicalPlan::DropTable(dt.name.clone())),
-        Statement::CreateIndex(ci) => Ok(PhysicalPlan::CreateIndex(CreateIndexPlan {
-            name: ci.name.clone(),
-            table: ci.table.clone(),
-            columns: ci.columns.clone(),
+        Statement::CreateIndex(ci) => {
+            let mut columns = Vec::with_capacity(ci.columns.len());
+            for (col, dir) in &ci.columns {
+                columns.push((col.clone(), map_parser_to_core_sort_direction(*dir)?));
+            }
+            Ok(PhysicalPlan::CreateIndex(CreateIndexPlan {
+                name: ci.name.clone(),
+                table: ci.table.clone(),
+                columns,
+            }))
+        }
+        Statement::DropIndex(di) => Ok(PhysicalPlan::DropIndex(DropIndexPlan {
+            name: di.name.clone(),
+            table: di.table.clone(),
+            if_exists: di.if_exists,
         })),
         Statement::Insert(i) => Ok(PhysicalPlan::Insert(InsertPlan {
             table: i.table.clone(),
@@ -504,4 +515,31 @@ fn is_graph_start_id_ref(expr: &Expr, start_alias: &str) -> bool {
             column
         }) if table == start_alias && column == "id"
     )
+}
+
+/// Stub bridge from parser-AST `SortDirection` (Asc/Desc/CosineDistance) to
+/// core engine `SortDirection` (Asc/Desc). CosineDistance is not meaningful
+/// for B-tree indexes; reject it as a parse-level error.
+fn map_parser_to_core_sort_direction(
+    dir: contextdb_parser::ast::SortDirection,
+) -> Result<contextdb_core::SortDirection> {
+    match dir {
+        contextdb_parser::ast::SortDirection::Asc => Ok(contextdb_core::SortDirection::Asc),
+        contextdb_parser::ast::SortDirection::Desc => Ok(contextdb_core::SortDirection::Desc),
+        contextdb_parser::ast::SortDirection::CosineDistance => Err(Error::ParseError(
+            "CosineDistance is not a valid CREATE INDEX direction".to_string(),
+        )),
+    }
+}
+
+/// Stub: returns None so the planner always uses Scan. Impl must inspect the
+/// WHERE clause, match eligible predicate shapes, consult TableMeta.indexes,
+/// and return Some(IndexScan { ... }) when applicable.
+#[allow(dead_code)]
+fn try_plan_index_scan(
+    _table: &str,
+    _where_clause: Option<&Expr>,
+    _indexes: &[contextdb_core::table_meta::IndexDecl],
+) -> Option<crate::plan::PhysicalPlan> {
+    None
 }

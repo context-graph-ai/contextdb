@@ -20,6 +20,34 @@ pub struct TableMeta {
     pub sync_safe: bool,
     #[serde(default)]
     pub expires_column: Option<String>,
+    #[serde(default)]
+    pub indexes: Vec<IndexDecl>,
+}
+
+/// Direction for a column within an engine-local index declaration.
+/// Distinct from `contextdb_parser::ast::SortDirection`, which carries a
+/// `CosineDistance` variant that is meaningful only for vector ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDecl {
+    pub name: String,
+    pub columns: Vec<(String, SortDirection)>,
+}
+
+impl IndexDecl {
+    pub fn estimated_bytes(&self) -> usize {
+        32 + self.name.len() * 16
+            + self
+                .columns
+                .iter()
+                .fold(0usize, |acc, (c, _)| acc.saturating_add(24 + c.len() * 16))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +281,10 @@ impl TableMeta {
             .as_ref()
             .map(|column| 32 + column.len() * 16)
             .unwrap_or(0);
+        let indexes_bytes = self
+            .indexes
+            .iter()
+            .fold(0usize, |acc, i| acc.saturating_add(i.estimated_bytes()));
 
         16 + columns_bytes
             + state_machine_bytes
@@ -261,6 +293,7 @@ impl TableMeta {
             + natural_key_bytes
             + propagation_bytes
             + expires_bytes
+            + indexes_bytes
             + self.default_ttl_seconds.map(|_| 8).unwrap_or(0)
             + 8
     }

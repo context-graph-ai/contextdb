@@ -2516,6 +2516,8 @@ fn ddl_name(change: &contextdb_engine::sync_types::DdlChange) -> String {
         contextdb_engine::sync_types::DdlChange::CreateTable { name, .. }
         | contextdb_engine::sync_types::DdlChange::DropTable { name }
         | contextdb_engine::sync_types::DdlChange::AlterTable { name, .. } => name.clone(),
+        contextdb_engine::sync_types::DdlChange::CreateIndex { table, .. }
+        | contextdb_engine::sync_types::DdlChange::DropIndex { table, .. } => table.clone(),
     }
 }
 

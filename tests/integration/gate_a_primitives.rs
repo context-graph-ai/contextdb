@@ -46,6 +46,10 @@ fn ddl_sql_from_change(change: &DdlChange) -> String {
         }
         DdlChange::DropTable { .. } => panic!("unexpected DROP TABLE in DDL round-trip helper"),
         DdlChange::AlterTable { .. } => panic!("unexpected ALTER TABLE in DDL round-trip helper"),
+        DdlChange::CreateIndex { .. } => {
+            panic!("unexpected CREATE INDEX in DDL round-trip helper")
+        }
+        DdlChange::DropIndex { .. } => panic!("unexpected DROP INDEX in DDL round-trip helper"),
     }
 }
 

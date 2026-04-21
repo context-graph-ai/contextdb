@@ -640,6 +640,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "testcontainers",
  "time",

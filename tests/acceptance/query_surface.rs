@@ -1275,7 +1275,9 @@ fn f105_public_type_documentation_cargo_doc_check() {
     let database =
         fs::read_to_string(workspace_root().join("crates/contextdb-engine/src/database.rs"))
             .expect("read database source");
-    assert!(lib.contains("pub use database::{Database, QueryResult};"));
+    assert!(lib.contains(
+        "pub use database::{CascadeReport, Database, IndexCandidate, QueryResult, QueryTrace};"
+    ));
     assert!(database.contains("pub fn open("));
     assert!(database.contains("pub fn open_memory("));
     assert!(database.contains("pub fn execute("));

@@ -385,6 +385,8 @@ impl DatabasePlugin for DdlVetoPlugin {
             DdlChange::CreateTable { .. } => "CreateTable",
             DdlChange::DropTable { .. } => "DropTable",
             DdlChange::AlterTable { .. } => "AlterTable",
+            DdlChange::CreateIndex { .. } => "CreateIndex",
+            DdlChange::DropIndex { .. } => "DropIndex",
         };
         if variant_name == self.reject_variant {
             Err(Error::PluginRejected {

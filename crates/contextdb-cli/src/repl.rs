@@ -1,5 +1,5 @@
 use crate::formatter::format_query_result;
-use contextdb_core::{ColumnType, Error, TableMeta};
+use contextdb_core::{Error, TableMeta};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 use contextdb_server::{SyncClient, SyncPlugin};
@@ -415,73 +415,10 @@ fn run_sync_command(
 }
 
 fn print_table_meta(table: &str, meta: &TableMeta) {
-    print!("{}", render_table_meta(table, meta));
-}
-
-fn render_table_meta(table: &str, meta: &TableMeta) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("CREATE TABLE {table} (\n"));
-    for (idx, col) in meta.columns.iter().enumerate() {
-        let comma = if idx + 1 == meta.columns.len() {
-            ""
-        } else {
-            ","
-        };
-        let nullable = if col.nullable { "" } else { " NOT NULL" };
-        let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
-        let immut = if col.immutable { " IMMUTABLE" } else { "" };
-        out.push_str(&format!(
-            "  {} {}{}{}{}{}",
-            col.name,
-            render_column_type(&col.column_type),
-            nullable,
-            pk,
-            immut,
-            comma
-        ));
-        out.push('\n');
-    }
-    out.push_str(")\n");
-    if meta.immutable {
-        out.push_str("IMMUTABLE\n");
-    }
-    if let Some(sm) = &meta.state_machine {
-        let mut entries: Vec<_> = sm.transitions.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        let transitions: Vec<String> = entries
-            .into_iter()
-            .map(|(from, tos)| format!("{from} -> [{}]", tos.join(", ")))
-            .collect();
-        out.push_str(&format!(
-            "STATE MACHINE ({}: {})\n",
-            sm.column,
-            transitions.join(", ")
-        ));
-    }
-    if !meta.dag_edge_types.is_empty() {
-        let edge_types = meta
-            .dag_edge_types
-            .iter()
-            .map(|edge_type| format!("'{edge_type}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("DAG({edge_types})\n"));
-    }
-    out
-}
-
-fn render_column_type(col_type: &ColumnType) -> String {
-    match col_type {
-        ColumnType::Integer => "INTEGER".to_string(),
-        ColumnType::Real => "REAL".to_string(),
-        ColumnType::Text => "TEXT".to_string(),
-        ColumnType::Boolean => "BOOLEAN".to_string(),
-        ColumnType::Json => "JSON".to_string(),
-        ColumnType::Uuid => "UUID".to_string(),
-        ColumnType::Vector(dim) => format!("VECTOR({dim})"),
-        ColumnType::Timestamp => "TIMESTAMP".to_string(),
-        ColumnType::TxId => "TXID".to_string(),
-    }
+    print!(
+        "{}",
+        contextdb_engine::cli_render::render_table_meta(table, meta)
+    );
 }
 
 /// Execute a SQL statement and print the result. Returns `true` on success, `false` on error.
@@ -680,7 +617,7 @@ mod tests {
         .unwrap();
 
         let meta = db.table_meta("repl_rt_sm").expect("table meta");
-        let rendered = render_table_meta("repl_rt_sm", &meta);
+        let rendered = contextdb_engine::cli_render::render_table_meta("repl_rt_sm", &meta);
         assert!(matches!(parse(&rendered), Ok(Statement::CreateTable(_))));
     }
 }

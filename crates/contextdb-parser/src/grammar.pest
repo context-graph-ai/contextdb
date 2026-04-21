@@ -13,6 +13,7 @@ stmt = _{
     | alter_table_stmt
     | drop_table_stmt
     | create_index_stmt
+    | drop_index_stmt
     | insert_stmt
     | delete_stmt
     | update_stmt
@@ -135,7 +136,8 @@ drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
 set_table_conflict_policy = { ^"SET" ~ ^"SYNC_CONFLICT_POLICY" ~ "'" ~ conflict_policy_value ~ "'" }
 drop_table_conflict_policy = { ^"DROP" ~ ^"SYNC_CONFLICT_POLICY" }
 add_column_action = { ^"ADD" ~ (^"COLUMN")? ~ column_def }
-drop_column_action = { ^"DROP" ~ ^"COLUMN" ~ identifier }
+drop_column_action = { ^"DROP" ~ ^"COLUMN" ~ identifier ~ drop_column_modifier? }
+drop_column_modifier = { ^"RESTRICT" | ^"CASCADE" }
 rename_column_action = { ^"RENAME" ~ ^"COLUMN" ~ identifier ~ ^"TO" ~ identifier }
 
 column_def = { identifier ~ data_type ~ column_constraint* }
@@ -239,9 +241,15 @@ create_index_stmt = {
     ~ ^"ON"
     ~ identifier
     ~ "("
-    ~ identifier
-    ~ ("," ~ identifier)*
+    ~ indexed_column
+    ~ ("," ~ indexed_column)*
     ~ ")"
+}
+indexed_column = { identifier ~ index_sort_direction? }
+index_sort_direction = { ^"ASC" | ^"DESC" }
+
+drop_index_stmt = {
+    ^"DROP" ~ ^"INDEX" ~ if_exists? ~ identifier ~ ^"ON" ~ identifier
 }
 
 insert_stmt = {
