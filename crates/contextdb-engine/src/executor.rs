@@ -25,6 +25,63 @@ pub(crate) fn execute_plan(
         PhysicalPlan::CreateTable(p) => {
             db.check_disk_budget("CREATE TABLE")?;
             let expires_column = expires_column_name(&p.columns)?;
+            // Auto-generate implicit indexes for PK / UNIQUE columns and
+            // composite UNIQUE constraints, so constraint probes run at
+            // O(log n) instead of O(n) per insert.
+            let mut auto_indexes: Vec<contextdb_core::IndexDecl> = Vec::new();
+            for c in &p.columns {
+                if c.primary_key
+                    && !matches!(
+                        map_column_type(&c.data_type),
+                        ColumnType::Json | ColumnType::Vector(_)
+                    )
+                {
+                    auto_indexes.push(contextdb_core::IndexDecl {
+                        name: format!("__pk_{}", c.name),
+                        columns: vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
+                    });
+                }
+                if c.unique
+                    && !c.primary_key
+                    && !matches!(
+                        map_column_type(&c.data_type),
+                        ColumnType::Json | ColumnType::Vector(_)
+                    )
+                {
+                    auto_indexes.push(contextdb_core::IndexDecl {
+                        name: format!("__unique_{}", c.name),
+                        columns: vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
+                    });
+                }
+            }
+            for uc in &p.unique_constraints {
+                // Only index composite UNIQUE constraints whose columns are
+                // all B-tree indexable.
+                let all_indexable = uc.iter().all(|col_name| {
+                    p.columns
+                        .iter()
+                        .find(|c| c.name == *col_name)
+                        .map(|c| {
+                            !matches!(
+                                map_column_type(&c.data_type),
+                                ColumnType::Json | ColumnType::Vector(_)
+                            )
+                        })
+                        .unwrap_or(false)
+                });
+                if !all_indexable || uc.is_empty() {
+                    continue;
+                }
+                let name = format!("__unique_{}", uc.join("_"));
+                let cols: Vec<(String, contextdb_core::SortDirection)> = uc
+                    .iter()
+                    .map(|c| (c.clone(), contextdb_core::SortDirection::Asc))
+                    .collect();
+                auto_indexes.push(contextdb_core::IndexDecl {
+                    name,
+                    columns: cols,
+                });
+            }
             let meta = TableMeta {
                 columns: p
                     .columns
@@ -62,6 +119,10 @@ pub(crate) fn execute_plan(
                 default_ttl_seconds: p.retain.as_ref().map(|r| r.duration_seconds),
                 sync_safe: p.retain.as_ref().is_some_and(|r| r.sync_safe),
                 expires_column,
+                // Auto-indexes are stored as implementation-detail IndexStorage
+                // entries (see create_index_storage below) but NOT exposed in
+                // TableMeta.indexes — the user-visible list reflects only
+                // explicitly-declared CREATE INDEX statements.
                 indexes: Vec::new(),
             };
             let metadata_bytes = meta.estimated_bytes();
@@ -72,6 +133,10 @@ pub(crate) fn execute_plan(
                 "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
             )?;
             db.relational_store().create_table(&p.name, meta);
+            for idx in &auto_indexes {
+                db.relational_store()
+                    .create_index_storage(&p.name, &idx.name, idx.columns.clone());
+            }
             if let Some(table_meta) = db.table_meta(&p.name) {
                 db.persist_table_meta(&p.name, &table_meta)?;
                 db.allocate_ddl_lsn(|lsn| db.log_create_table_ddl(&p.name, &table_meta, lsn));
@@ -160,11 +225,8 @@ pub(crate) fn execute_plan(
                 }
                 AlterAction::DropColumn {
                     column: name,
-                    cascade: _,
+                    cascade,
                 } => {
-                    // Stub: RESTRICT (no cascade) check against TableMeta.indexes
-                    // and CASCADE's index-dropping behavior are NOT yet wired.
-                    // Impl must add both paths per §4.13.
                     if let Some(existing_meta) = db.table_meta(&p.table)
                         && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *name)
                         && col.immutable
@@ -174,15 +236,68 @@ pub(crate) fn execute_plan(
                             column: name.clone(),
                         });
                     }
+                    // RESTRICT / CASCADE on indexed columns.
+                    let dependent_indexes: Vec<String> = db
+                        .table_meta(&p.table)
+                        .map(|m| {
+                            m.indexes
+                                .iter()
+                                .filter(|i| i.columns.iter().any(|(c, _)| c == name))
+                                .map(|i| i.name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !*cascade && !dependent_indexes.is_empty() {
+                        return Err(Error::ColumnInIndex {
+                            table: p.table.clone(),
+                            column: name.clone(),
+                            index: dependent_indexes[0].clone(),
+                        });
+                    }
                     store
                         .alter_table_drop_column(&p.table, name)
                         .map_err(Error::Other)?;
+                    if *cascade {
+                        // Remove IndexDecls referencing `name`, release storage.
+                        {
+                            let mut metas = store.table_meta.write();
+                            if let Some(m) = metas.get_mut(&p.table) {
+                                m.indexes
+                                    .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
+                            }
+                        }
+                        for idx in &dependent_indexes {
+                            store.drop_index_storage(&p.table, idx);
+                            db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&p.table, idx, lsn));
+                        }
+                    }
                     let mut meta = store.table_meta.write();
                     if let Some(table_meta) = meta.get_mut(&p.table)
                         && table_meta.expires_column.as_deref() == Some(name.as_str())
                     {
                         table_meta.expires_column = None;
                     }
+                    drop(meta);
+                    if let Some(table_meta) = db.table_meta(&p.table) {
+                        db.persist_table_meta(&p.table, &table_meta)?;
+                        db.persist_table_rows(&p.table)?;
+                        db.allocate_ddl_lsn(|lsn| {
+                            db.log_alter_table_ddl(&p.table, &table_meta, lsn)
+                        });
+                    }
+                    return Ok(QueryResult {
+                        columns: vec![],
+                        rows: vec![],
+                        rows_affected: 0,
+                        trace: crate::database::QueryTrace::scan(),
+                        cascade: if *cascade {
+                            Some(crate::database::CascadeReport {
+                                dropped_indexes: dependent_indexes,
+                            })
+                        } else {
+                            None
+                        },
+                    });
                 }
                 AlterAction::RenameColumn { from, to } => {
                     if let Some(existing_meta) = db.table_meta(&p.table)
@@ -265,8 +380,7 @@ pub(crate) fn execute_plan(
                     cascade: None,
                 });
             }
-            let snapshot = db.snapshot();
-            let rows = db.scan(table, snapshot)?;
+            let snapshot = db.snapshot_for_read();
             let schema_columns = db.table_meta(table).map(|meta| {
                 meta.columns
                     .into_iter()
@@ -277,12 +391,84 @@ pub(crate) fn execute_plan(
                 .as_ref()
                 .map(|expr| resolve_in_subqueries(db, expr, params, tx))
                 .transpose()?;
-            materialize_rows(
+
+            // Try to route through an IndexScan if the filter is index-eligible.
+            // Analyze the PRE-resolve filter so `a IN (SELECT …)` disqualifies
+            // the outer IndexScan even after the subquery has been executed.
+            let meta_for_indexes = db.table_meta(table);
+            let indexes: Vec<contextdb_core::IndexDecl> = meta_for_indexes
+                .as_ref()
+                .map(|m| m.indexes.clone())
+                .unwrap_or_default();
+            let analysis = filter
+                .as_ref()
+                .filter(|_| !indexes.is_empty())
+                .map(|f| analyze_filter_for_index(f, &indexes, params));
+
+            if let Some(a) = analysis {
+                if let Some(pick) = a.pick {
+                    // IndexScan path. Fetch by BTree range; apply residual filter.
+                    let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
+                    db.__reset_rows_examined();
+                    db.__bump_rows_examined(examined);
+                    let mut result = materialize_rows(
+                        rows,
+                        resolved_filter.as_ref(),
+                        params,
+                        schema_columns.as_deref(),
+                    )?;
+                    let mut pushed: smallvec::SmallVec<[std::borrow::Cow<'static, str>; 4]> =
+                        smallvec::SmallVec::new();
+                    pushed.push(std::borrow::Cow::Owned(pick.pushed_column.clone()));
+                    let considered: smallvec::SmallVec<[crate::database::IndexCandidate; 4]> = a
+                        .considered
+                        .iter()
+                        .filter(|c| c.name != pick.name)
+                        .cloned()
+                        .collect();
+                    result.trace = crate::database::QueryTrace {
+                        physical_plan: "IndexScan",
+                        index_used: Some(pick.name.clone()),
+                        predicates_pushed: pushed,
+                        indexes_considered: considered,
+                        sort_elided: false,
+                    };
+                    return Ok(result);
+                } else {
+                    // Scan with rejection trace.
+                    let rows = db.scan(table, snapshot)?;
+                    db.__reset_rows_examined();
+                    db.__bump_rows_examined(rows.len() as u64);
+                    let mut result = materialize_rows(
+                        rows,
+                        resolved_filter.as_ref(),
+                        params,
+                        schema_columns.as_deref(),
+                    )?;
+                    let considered: smallvec::SmallVec<[crate::database::IndexCandidate; 4]> =
+                        a.considered.into_iter().collect();
+                    result.trace = crate::database::QueryTrace {
+                        physical_plan: "Scan",
+                        index_used: None,
+                        predicates_pushed: Default::default(),
+                        indexes_considered: considered,
+                        sort_elided: false,
+                    };
+                    return Ok(result);
+                }
+            }
+
+            let rows = db.scan(table, snapshot)?;
+            db.__reset_rows_examined();
+            db.__bump_rows_examined(rows.len() as u64);
+            let mut result = materialize_rows(
                 rows,
                 resolved_filter.as_ref(),
                 params,
                 schema_columns.as_deref(),
-            )
+            )?;
+            result.trace = crate::database::QueryTrace::scan();
+            Ok(result)
         }
         PhysicalPlan::GraphBfs {
             start_alias,
@@ -617,7 +803,27 @@ pub(crate) fn execute_plan(
             })
         }
         PhysicalPlan::Sort { input, keys } => {
+            // Sort elision path A: input is a Scan and an index's direction
+            // prefix matches `keys`. We rewrite the input into an IndexScan
+            // and skip the re-sort.
+            let elided = try_elide_sort(db, input, keys, params, tx)?;
+            if let Some(mut result) = elided {
+                result.trace.sort_elided = true;
+                return Ok(result);
+            }
             let mut input_result = execute_plan(db, input, params, tx)?;
+
+            // Sort elision path B: the input already used an IndexScan whose
+            // column list + directions prefix-match the ORDER BY keys. The
+            // IndexScan already delivers rows in the requested order, so the
+            // Sort is a no-op; skip it and mark `sort_elided`.
+            if input_result.trace.physical_plan == "IndexScan"
+                && let Some(idx_name) = &input_result.trace.index_used
+                && sort_keys_match_index_prefix(db, input, idx_name, keys)
+            {
+                input_result.trace.sort_elided = true;
+                return Ok(input_result);
+            }
             input_result.rows.sort_by(|left, right| {
                 for key in keys {
                     let Expr::Column(column_ref) = &key.expr else {
@@ -643,6 +849,15 @@ pub(crate) fn execute_plan(
                 }
                 Ordering::Equal
             });
+            // Preserve the child's physical_plan when it was an IndexScan:
+            // the trace reports the data-source strategy, and Sort is
+            // represented by `sort_elided = false` rather than overriding the
+            // plan label. A plain `Scan` child gets relabeled to `Sort` to
+            // match the plan's ORDER BY-without-index expectations.
+            if input_result.trace.physical_plan != "IndexScan" {
+                input_result.trace.physical_plan = "Sort";
+            }
+            input_result.trace.sort_elided = false;
             Ok(input_result)
         }
         PhysicalPlan::Limit { input, count } => {
@@ -738,8 +953,8 @@ pub(crate) fn execute_plan(
                 cascade: None,
             })
         }
-        PhysicalPlan::CreateIndex(_) => Ok(QueryResult::empty_with_affected(0)),
-        PhysicalPlan::DropIndex(_) => Ok(QueryResult::empty_with_affected(0)),
+        PhysicalPlan::CreateIndex(p) => exec_create_index(db, p),
+        PhysicalPlan::DropIndex(p) => exec_drop_index(db, p),
         PhysicalPlan::IndexScan {
             table,
             index,
@@ -1286,6 +1501,107 @@ fn exec_update(
     Ok(QueryResult::empty_with_affected(matched.len() as u64))
 }
 
+fn exec_create_index(
+    db: &Database,
+    plan: &contextdb_planner::CreateIndexPlan,
+) -> Result<QueryResult> {
+    // Error precedence (plan §Error precedence): TableNotFound > ColumnNotFound
+    // > ColumnNotIndexable > DuplicateIndex. Check in that exact order so
+    // "structural" bugs surface before "naming" bugs.
+    let meta = db
+        .table_meta(&plan.table)
+        .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
+
+    // 2. Check every column exists.
+    for (col_name, _) in &plan.columns {
+        if !meta.columns.iter().any(|c| c.name == *col_name) {
+            return Err(Error::ColumnNotFound {
+                table: plan.table.clone(),
+                column: col_name.clone(),
+            });
+        }
+    }
+
+    // 3. Check every column type is B-tree indexable.
+    for (col_name, _) in &plan.columns {
+        let col = meta
+            .columns
+            .iter()
+            .find(|c| c.name == *col_name)
+            .expect("column existence verified above");
+        if matches!(col.column_type, ColumnType::Json | ColumnType::Vector(_)) {
+            return Err(Error::ColumnNotIndexable {
+                table: plan.table.clone(),
+                column: col_name.clone(),
+                column_type: col.column_type.clone(),
+            });
+        }
+    }
+
+    // 4. Duplicate-name check (last).
+    if meta.indexes.iter().any(|i| i.name == plan.name) {
+        return Err(Error::DuplicateIndex {
+            table: plan.table.clone(),
+            index: plan.name.clone(),
+        });
+    }
+
+    // All validations passed. Persist the IndexDecl into TableMeta.indexes,
+    // register the IndexStorage, rebuild it over existing rows, flush meta.
+    {
+        let store = db.relational_store();
+        let mut metas = store.table_meta.write();
+        let m = metas
+            .get_mut(&plan.table)
+            .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
+        m.indexes.push(contextdb_core::IndexDecl {
+            name: plan.name.clone(),
+            columns: plan.columns.clone(),
+        });
+    }
+    db.relational_store()
+        .create_index_storage(&plan.table, &plan.name, plan.columns.clone());
+    db.relational_store().rebuild_index(&plan.table, &plan.name);
+
+    if let Some(table_meta) = db.table_meta(&plan.table) {
+        db.persist_table_meta(&plan.table, &table_meta)?;
+    }
+
+    db.allocate_ddl_lsn(|lsn| db.log_create_index_ddl(&plan.table, &plan.name, &plan.columns, lsn));
+
+    Ok(QueryResult::empty_with_affected(0))
+}
+
+fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Result<QueryResult> {
+    let meta = db
+        .table_meta(&plan.table)
+        .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
+    let exists = meta.indexes.iter().any(|i| i.name == plan.name);
+    if !exists {
+        if plan.if_exists {
+            return Ok(QueryResult::empty_with_affected(0));
+        }
+        return Err(Error::IndexNotFound {
+            table: plan.table.clone(),
+            index: plan.name.clone(),
+        });
+    }
+    {
+        let store = db.relational_store();
+        let mut metas = store.table_meta.write();
+        if let Some(m) = metas.get_mut(&plan.table) {
+            m.indexes.retain(|i| i.name != plan.name);
+        }
+    }
+    db.relational_store()
+        .drop_index_storage(&plan.table, &plan.name);
+    if let Some(table_meta) = db.table_meta(&plan.table) {
+        db.persist_table_meta(&plan.table, &table_meta)?;
+    }
+    db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&plan.table, &plan.name, lsn));
+    Ok(QueryResult::empty_with_affected(0))
+}
+
 fn estimate_table_row_bytes(
     db: &Database,
     table: &str,
@@ -1296,6 +1612,941 @@ fn estimate_table_row_bytes(
         .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
     Ok(estimate_row_bytes_for_meta(values, &meta, false))
 }
+
+// ========================= Index scan planning + execution =========================
+
+/// Shape of a predicate on the first indexed column. Drives IndexScan
+/// eligibility: equality narrows to a point, range to a range walk, IN-list
+/// to multiple point lookups, IS NULL to the NULL partition.
+#[derive(Debug, Clone)]
+pub(crate) enum IndexPredicateShape {
+    Equality(Value),
+    NotEqual(Value),
+    Range {
+        lower: std::ops::Bound<Value>,
+        upper: std::ops::Bound<Value>,
+    },
+    InList(Vec<Value>),
+    IsNull,
+    IsNotNull,
+}
+
+impl IndexPredicateShape {
+    /// Selectivity tier — lower is more selective.
+    fn selectivity_tier(&self) -> u8 {
+        match self {
+            IndexPredicateShape::Equality(_) | IndexPredicateShape::InList(_) => 0,
+            IndexPredicateShape::Range { .. } | IndexPredicateShape::NotEqual(_) => 1,
+            IndexPredicateShape::IsNull | IndexPredicateShape::IsNotNull => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexPick {
+    name: String,
+    columns: Vec<(String, contextdb_core::SortDirection)>,
+    /// Shape on the FIRST indexed column. Only one shape drives the scan.
+    shape: IndexPredicateShape,
+    /// Pushed column name (engine column name) for trace.
+    pushed_column: String,
+}
+
+/// Top-level decision: did we rewrite to IndexScan?
+/// Carries index pick + the rejected candidates (for trace) + residual filter.
+struct IndexAnalysis {
+    pick: Option<IndexPick>,
+    considered: Vec<crate::database::IndexCandidate>,
+}
+
+/// Inspect `filter` looking for an eligible predicate on the first column of
+/// any declared index. Returns the chosen pick + list of considered/rejected.
+fn analyze_filter_for_index(
+    filter: &Expr,
+    indexes: &[contextdb_core::IndexDecl],
+    params: &HashMap<String, Value>,
+) -> IndexAnalysis {
+    use std::borrow::Cow;
+    let mut considered: Vec<crate::database::IndexCandidate> = Vec::new();
+
+    // Find each conjunct (split on AND) and map to (column, shape).
+    let conjuncts = split_conjuncts(filter);
+    let mut conjunct_shapes: Vec<(String, IndexPredicateShape)> = Vec::new();
+    for conjunct in &conjuncts {
+        if let Some((col, shape)) = classify_index_predicate(conjunct, params) {
+            conjunct_shapes.push((col, shape));
+        }
+    }
+
+    // Annotate rejections on indexes that can't apply, for the trace.
+    let mut candidates: Vec<(IndexPick, u8, usize)> = Vec::new();
+    for (i_idx, decl) in indexes.iter().enumerate() {
+        let first_col = match decl.columns.first() {
+            Some((c, _)) => c.clone(),
+            None => continue,
+        };
+        // Find the most-selective matching conjunct on the first column.
+        let matching: Vec<&(String, IndexPredicateShape)> = conjunct_shapes
+            .iter()
+            .filter(|(c, _)| c == &first_col)
+            .collect();
+        if matching.is_empty() {
+            // Check whether the filter mentions first_col in an un-usable way
+            // (function call / arithmetic / col-to-col / subquery) to produce
+            // a useful rejection reason.
+            let reason = classify_rejection_reason(filter, &first_col);
+            considered.push(crate::database::IndexCandidate {
+                name: decl.name.clone(),
+                rejected_reason: Cow::Borrowed(reason),
+            });
+            continue;
+        }
+        // Combine range conjuncts on the same column (BETWEEN = `>= X AND <= Y`).
+        let shape = combine_shapes(matching.iter().map(|(_, s)| s.clone()).collect());
+        let tier = shape.selectivity_tier();
+        candidates.push((
+            IndexPick {
+                name: decl.name.clone(),
+                columns: decl.columns.clone(),
+                shape,
+                pushed_column: first_col.clone(),
+            },
+            tier,
+            i_idx,
+        ));
+    }
+
+    // Selection: most-selective tier wins; tie-break by creation order (index i).
+    let pick = candidates
+        .into_iter()
+        .min_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)))
+        .map(|(p, _, _)| p);
+
+    IndexAnalysis { pick, considered }
+}
+
+/// Combine multiple index-shapes on the same column into the most-selective
+/// composite form. Used by BETWEEN (which becomes `col >= X AND col <= Y`).
+fn combine_shapes(mut shapes: Vec<IndexPredicateShape>) -> IndexPredicateShape {
+    // Find the single best (most selective) shape.
+    shapes.sort_by_key(|s| s.selectivity_tier());
+    let head = shapes.remove(0);
+    // If the head is a Range, try to merge subsequent Range conjuncts into it.
+    if let IndexPredicateShape::Range {
+        mut lower,
+        mut upper,
+    } = head.clone()
+    {
+        for s in shapes {
+            if let IndexPredicateShape::Range { lower: l, upper: u } = s {
+                // Merge lower: more restrictive is higher.
+                lower = tighter_lower(&lower, &l);
+                upper = tighter_upper(&upper, &u);
+            }
+        }
+        return IndexPredicateShape::Range { lower, upper };
+    }
+    head
+}
+
+fn tighter_lower(a: &std::ops::Bound<Value>, b: &std::ops::Bound<Value>) -> std::ops::Bound<Value> {
+    use std::ops::Bound;
+    match (a, b) {
+        (Bound::Unbounded, _) => b.clone(),
+        (_, Bound::Unbounded) => a.clone(),
+        (Bound::Included(va), Bound::Included(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Greater) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        }
+        (Bound::Excluded(va), Bound::Excluded(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Greater) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        }
+        (Bound::Included(va), Bound::Excluded(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Greater) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        }
+        (Bound::Excluded(va), Bound::Included(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Less) {
+                b.clone()
+            } else {
+                a.clone()
+            }
+        }
+    }
+}
+
+fn tighter_upper(a: &std::ops::Bound<Value>, b: &std::ops::Bound<Value>) -> std::ops::Bound<Value> {
+    use std::ops::Bound;
+    match (a, b) {
+        (Bound::Unbounded, _) => b.clone(),
+        (_, Bound::Unbounded) => a.clone(),
+        (Bound::Included(va), Bound::Included(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Less) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        }
+        (Bound::Excluded(va), Bound::Excluded(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Less) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        }
+        (Bound::Included(va), Bound::Excluded(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Less) {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        }
+        (Bound::Excluded(va), Bound::Included(vb)) => {
+            if compare_values(va, vb).is_some_and(|o| o == std::cmp::Ordering::Greater) {
+                b.clone()
+            } else {
+                a.clone()
+            }
+        }
+    }
+}
+
+/// Split a boolean expression on top-level AND.
+fn split_conjuncts(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let mut out = split_conjuncts(left);
+            out.extend(split_conjuncts(right));
+            out
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// Look at a predicate of the form `<col-ref> <op> <rhs>` where both sides are
+/// simple. Return Some((column, shape)) if it's index-eligible, None otherwise.
+fn classify_index_predicate(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+) -> Option<(String, IndexPredicateShape)> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            let col = extract_simple_col_ref(left)?;
+            // Reject function / arithmetic / column-ref RHS / subquery.
+            if !is_literal_or_param(right) {
+                return None;
+            }
+            let rhs = resolve_simple_rhs(right, params)?;
+            let shape = match op {
+                BinOp::Eq => IndexPredicateShape::Equality(rhs),
+                BinOp::Neq => IndexPredicateShape::NotEqual(rhs),
+                BinOp::Lt => IndexPredicateShape::Range {
+                    lower: std::ops::Bound::Unbounded,
+                    upper: std::ops::Bound::Excluded(rhs),
+                },
+                BinOp::Lte => IndexPredicateShape::Range {
+                    lower: std::ops::Bound::Unbounded,
+                    upper: std::ops::Bound::Included(rhs),
+                },
+                BinOp::Gt => IndexPredicateShape::Range {
+                    lower: std::ops::Bound::Excluded(rhs),
+                    upper: std::ops::Bound::Unbounded,
+                },
+                BinOp::Gte => IndexPredicateShape::Range {
+                    lower: std::ops::Bound::Included(rhs),
+                    upper: std::ops::Bound::Unbounded,
+                },
+                _ => return None,
+            };
+            Some((col, shape))
+        }
+        Expr::InList {
+            expr: e,
+            list,
+            negated: false,
+        } => {
+            let col = extract_simple_col_ref(e)?;
+            let mut values = Vec::with_capacity(list.len());
+            for v in list {
+                if !is_literal_or_param(v) {
+                    return None;
+                }
+                values.push(resolve_simple_rhs(v, params)?);
+            }
+            Some((col, IndexPredicateShape::InList(values)))
+        }
+        Expr::IsNull { expr: e, negated } => {
+            let col = extract_simple_col_ref(e)?;
+            Some((
+                col,
+                if *negated {
+                    IndexPredicateShape::IsNotNull
+                } else {
+                    IndexPredicateShape::IsNull
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Classify why `filter` rejected `column` for IndexScan. Returns a static
+/// reason string matching the plan's trace-reason vocabulary.
+fn classify_rejection_reason(filter: &Expr, column: &str) -> &'static str {
+    // Walk the expression tree and find a predicate mentioning `column`; report
+    // the first structural reason we detect.
+    fn walk(expr: &Expr, column: &str) -> Option<&'static str> {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::And | BinOp::Or,
+                right,
+            } => walk(left, column).or_else(|| walk(right, column)),
+            Expr::BinaryOp { left, op, right } => {
+                // Detect arithmetic-on-column specifically (parser lowers
+                // `a + 1` to FunctionCall { name: "__add", .. }).
+                if expr_uses_arithmetic_on(left, column) || expr_uses_arithmetic_on(right, column) {
+                    return Some("arithmetic in predicate");
+                }
+                // Generic function call (UPPER(col) etc.)
+                if expr_uses_function_on(left, column) || expr_uses_function_on(right, column) {
+                    return Some("function call in predicate");
+                }
+                // Column-ref RHS?
+                if mentions_column_ref(left, column) || mentions_column_ref(right, column) {
+                    let left_is_col = extract_simple_col_ref(left).as_deref() == Some(column);
+                    let right_is_col_ref = matches!(right.as_ref(), Expr::Column(_));
+                    if left_is_col && right_is_col_ref {
+                        return Some("non-literal rhs");
+                    }
+                }
+                let _ = op;
+                None
+            }
+            Expr::Like { expr: e, .. } => {
+                if mentions_column_ref(e, column) {
+                    Some("LIKE is residual-only")
+                } else {
+                    None
+                }
+            }
+            Expr::InSubquery { expr: e, .. } => {
+                if mentions_column_ref(e, column) {
+                    Some("non-literal rhs")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    walk(filter, column).unwrap_or("first column not in WHERE")
+}
+
+fn extract_simple_col_ref(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(r) => Some(r.column.clone()),
+        _ => None,
+    }
+}
+
+fn is_literal_or_param(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::FunctionCall { name, args } => {
+            // Arithmetic-of-literals (e.g., `0.0 / 0.0`, `1 + 2`) counts as
+            // a const RHS for planning purposes; we evaluate at execute time.
+            matches!(name.as_str(), "__add" | "__sub" | "__mul" | "__div")
+                && args.iter().all(is_literal_or_param)
+        }
+        _ => false,
+    }
+}
+
+fn resolve_simple_rhs(expr: &Expr, params: &HashMap<String, Value>) -> Option<Value> {
+    match expr {
+        Expr::Literal(lit) => Some(match lit {
+            Literal::Null => Value::Null,
+            Literal::Bool(b) => Value::Bool(*b),
+            Literal::Integer(i) => Value::Int64(*i),
+            Literal::Real(f) => Value::Float64(*f),
+            Literal::Text(s) => Value::Text(s.clone()),
+            Literal::Vector(_) => return None,
+        }),
+        Expr::Parameter(name) => params.get(name).cloned(),
+        Expr::FunctionCall { name, args }
+            if matches!(name.as_str(), "__add" | "__sub" | "__mul" | "__div") =>
+        {
+            if args.len() != 2 {
+                return None;
+            }
+            let a = resolve_simple_rhs(&args[0], params)?;
+            let b = resolve_simple_rhs(&args[1], params)?;
+            match (a, b, name.as_str()) {
+                (Value::Int64(x), Value::Int64(y), "__add") => {
+                    Some(Value::Int64(x.wrapping_add(y)))
+                }
+                (Value::Int64(x), Value::Int64(y), "__sub") => {
+                    Some(Value::Int64(x.wrapping_sub(y)))
+                }
+                (Value::Int64(x), Value::Int64(y), "__mul") => {
+                    Some(Value::Int64(x.wrapping_mul(y)))
+                }
+                (Value::Int64(x), Value::Int64(y), "__div") if y != 0 => Some(Value::Int64(x / y)),
+                (Value::Float64(x), Value::Float64(y), "__add") => Some(Value::Float64(x + y)),
+                (Value::Float64(x), Value::Float64(y), "__sub") => Some(Value::Float64(x - y)),
+                (Value::Float64(x), Value::Float64(y), "__mul") => Some(Value::Float64(x * y)),
+                (Value::Float64(x), Value::Float64(y), "__div") => Some(Value::Float64(x / y)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn expr_uses_function_on(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            // Skip known arithmetic-lowering function-call names; those are
+            // classified separately as "arithmetic in predicate".
+            if matches!(name.as_str(), "__add" | "__sub" | "__mul" | "__div") {
+                return false;
+            }
+            args.iter().any(|a| mentions_column_ref(a, column))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_uses_function_on(left, column) || expr_uses_function_on(right, column)
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_arithmetic_on(expr: &Expr, column: &str) -> bool {
+    // The parser lowers `a + 1`, `a - 1`, etc. into FunctionCall with reserved
+    // names `__add` / `__sub` / `__mul` / `__div`. We detect that shape here.
+    match expr {
+        Expr::FunctionCall { name, args } => {
+            matches!(name.as_str(), "__add" | "__sub" | "__mul" | "__div")
+                && args.iter().any(|a| mentions_column_ref(a, column))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_uses_arithmetic_on(left, column) || expr_uses_arithmetic_on(right, column)
+        }
+        _ => false,
+    }
+}
+
+fn mentions_column_ref(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::Column(r) => r.column == column,
+        Expr::FunctionCall { args, .. } => args.iter().any(|a| mentions_column_ref(a, column)),
+        Expr::BinaryOp { left, right, .. } => {
+            mentions_column_ref(left, column) || mentions_column_ref(right, column)
+        }
+        Expr::UnaryOp { operand, .. } => mentions_column_ref(operand, column),
+        Expr::IsNull { expr: e, .. } => mentions_column_ref(e, column),
+        Expr::Like { expr: e, .. } => mentions_column_ref(e, column),
+        Expr::InList { expr: e, .. } => mentions_column_ref(e, column),
+        Expr::InSubquery { expr: e, .. } => mentions_column_ref(e, column),
+        _ => false,
+    }
+}
+
+/// Walk the index's B-tree per the picked shape, fetch matching rows by
+/// row_id, apply residual filter, return VersionedRow list.
+#[allow(clippy::too_many_arguments)]
+fn execute_index_scan(
+    db: &Database,
+    table: &str,
+    pick: &IndexPick,
+    snapshot: contextdb_core::SnapshotId,
+    tx: Option<TxId>,
+) -> Result<(Vec<VersionedRow>, u64)> {
+    use contextdb_core::{DirectedValue, SortDirection, TotalOrdAsc, TotalOrdDesc};
+    use std::ops::Bound;
+
+    // NaN equality short-circuit (I19): `col = NaN` or bound param NaN → empty.
+    if let IndexPredicateShape::Equality(rhs) = &pick.shape
+        && let Value::Float64(f) = rhs
+        && f.is_nan()
+    {
+        return Ok((Vec::new(), 0));
+    }
+    // NULL equality short-circuit: `col = $p` with $p = NULL → empty (NULL
+    // comparisons are UNKNOWN in SQL).
+    if let IndexPredicateShape::Equality(Value::Null) = &pick.shape {
+        return Ok((Vec::new(), 0));
+    }
+
+    let indexes = db.relational_store().indexes.read();
+    let storage = match indexes.get(&(table.to_string(), pick.name.clone())) {
+        Some(s) => s,
+        None => return Ok((Vec::new(), 0)),
+    };
+
+    // Build bound keys as single-column IndexKey prefixes. Composite indexes:
+    // we walk the entire range for the first-col match and rely on residual
+    // filter for subsequent columns.
+    let first_dir = pick
+        .columns
+        .first()
+        .map(|(_, d)| *d)
+        .unwrap_or(SortDirection::Asc);
+
+    let wrap = |v: Value| -> DirectedValue {
+        match first_dir {
+            SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(v)),
+            SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(v)),
+        }
+    };
+
+    // Collect matching postings then filter by MVCC visibility.
+    let mut postings: Vec<contextdb_relational::IndexEntry> = Vec::new();
+    let mut rows_examined: u64 = 0;
+
+    let collect_range = |postings: &mut Vec<contextdb_relational::IndexEntry>,
+                         examined: &mut u64,
+                         lower: Bound<Vec<DirectedValue>>,
+                         upper: Bound<Vec<DirectedValue>>| {
+        for (_k, entries) in storage.tree.range((lower, upper)) {
+            for e in entries {
+                *examined += 1;
+                if e.visible_at(snapshot) {
+                    postings.push(e.clone());
+                }
+            }
+        }
+    };
+
+    // For composite indexes, a first-column equality must walk ALL keys
+    // whose first component equals the target (i.e. the prefix range). We
+    // iterate the whole tree and filter by first-component match to cover
+    // both single-column and composite shapes uniformly.
+    let is_composite = pick.columns.len() > 1;
+
+    match &pick.shape {
+        IndexPredicateShape::Equality(v) => {
+            if is_composite {
+                // Walk every posting whose first component equals `v`.
+                let want = wrap(v.clone());
+                for (key, entries) in storage.tree.iter() {
+                    if key.first() != Some(&want) {
+                        continue;
+                    }
+                    for e in entries {
+                        rows_examined += 1;
+                        if e.visible_at(snapshot) {
+                            postings.push(e.clone());
+                        }
+                    }
+                }
+            } else {
+                let lower = vec![wrap(v.clone())];
+                let upper = lower.clone();
+                collect_range(
+                    &mut postings,
+                    &mut rows_examined,
+                    Bound::Included(lower),
+                    Bound::Included(upper),
+                );
+            }
+        }
+        IndexPredicateShape::InList(vs) => {
+            for v in vs {
+                if is_composite {
+                    let want = wrap(v.clone());
+                    for (key, entries) in storage.tree.iter() {
+                        if key.first() != Some(&want) {
+                            continue;
+                        }
+                        for e in entries {
+                            rows_examined += 1;
+                            if e.visible_at(snapshot) {
+                                postings.push(e.clone());
+                            }
+                        }
+                    }
+                } else {
+                    let k = vec![wrap(v.clone())];
+                    collect_range(
+                        &mut postings,
+                        &mut rows_examined,
+                        Bound::Included(k.clone()),
+                        Bound::Included(k),
+                    );
+                }
+            }
+        }
+        IndexPredicateShape::Range { lower, upper } => {
+            if is_composite {
+                // Composite + range on first column: walk entries whose first
+                // component falls in the range.
+                for (key, entries) in storage.tree.iter() {
+                    let Some(first) = key.first() else { continue };
+                    let in_lower = match lower {
+                        Bound::Unbounded => true,
+                        Bound::Included(v) => first >= &wrap(v.clone()),
+                        Bound::Excluded(v) => first > &wrap(v.clone()),
+                    };
+                    let in_upper = match upper {
+                        Bound::Unbounded => true,
+                        Bound::Included(v) => first <= &wrap(v.clone()),
+                        Bound::Excluded(v) => first < &wrap(v.clone()),
+                    };
+                    if !(in_lower && in_upper) {
+                        continue;
+                    }
+                    for e in entries {
+                        rows_examined += 1;
+                        if e.visible_at(snapshot) {
+                            postings.push(e.clone());
+                        }
+                    }
+                }
+            } else {
+                let l = match lower {
+                    Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
+                    Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
+                    Bound::Unbounded => Bound::Unbounded,
+                };
+                let u = match upper {
+                    Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
+                    Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
+                    Bound::Unbounded => Bound::Unbounded,
+                };
+                collect_range(&mut postings, &mut rows_examined, l, u);
+            }
+        }
+        IndexPredicateShape::NotEqual(v) => {
+            // Full walk; skip exact key. For IndexScan-trace we still attribute
+            // all postings touched to __rows_examined (trace counts postings).
+            let except_key = vec![wrap(v.clone())];
+            for (k, entries) in storage.tree.iter() {
+                if *k == except_key {
+                    continue;
+                }
+                for e in entries {
+                    rows_examined += 1;
+                    if e.visible_at(snapshot) {
+                        postings.push(e.clone());
+                    }
+                }
+            }
+        }
+        IndexPredicateShape::IsNull => {
+            let k = vec![wrap(Value::Null)];
+            collect_range(
+                &mut postings,
+                &mut rows_examined,
+                Bound::Included(k.clone()),
+                Bound::Included(k),
+            );
+        }
+        IndexPredicateShape::IsNotNull => {
+            // Everything except NULL partition.
+            let null_key = vec![wrap(Value::Null)];
+            for (k, entries) in storage.tree.iter() {
+                if *k == null_key {
+                    continue;
+                }
+                for e in entries {
+                    rows_examined += 1;
+                    if e.visible_at(snapshot) {
+                        postings.push(e.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Now fetch base rows by row_id while preserving index-order. The index
+    // already enumerates postings in index sort order; rows[] preserve it.
+    drop(indexes);
+    let row_ids: Vec<RowId> = postings.iter().map(|p| p.row_id).collect();
+    if row_ids.is_empty() {
+        return Ok((Vec::new(), rows_examined));
+    }
+    let tables = db.relational_store().tables.read();
+    let rows_slice = tables.get(table);
+    let mut out: Vec<VersionedRow> = Vec::with_capacity(row_ids.len());
+    if let Some(rows) = rows_slice {
+        let by_id: HashMap<RowId, &VersionedRow> = rows.iter().map(|r| (r.row_id, r)).collect();
+        for rid in &row_ids {
+            if let Some(r) = by_id.get(rid) {
+                // Layered-visibility check: apply same rule as scan_with_tx so
+                // deletes/inserts from the active tx are honored.
+                if (*r).visible_at(snapshot) {
+                    out.push((**r).clone());
+                }
+            }
+        }
+    }
+    // Layer tx-scoped inserts / deletes on top, matching the semantics of
+    // scan_with_tx.
+    drop(tables);
+    if let Some(tx_id) = tx {
+        let overlay = db.index_scan_tx_overlay(tx_id, table, &pick.pushed_column, &pick.shape)?;
+        let deleted_row_ids = overlay.deleted_row_ids;
+        out.retain(|row| !deleted_row_ids.contains(&row.row_id));
+        out.extend(overlay.matching_inserts);
+    }
+    Ok((out, rows_examined))
+}
+
+pub(crate) fn range_includes(
+    v: &Value,
+    lower: &std::ops::Bound<Value>,
+    upper: &std::ops::Bound<Value>,
+) -> bool {
+    use std::ops::Bound;
+    let ok_lower = match lower {
+        Bound::Unbounded => true,
+        Bound::Included(b) => compare_values(v, b).is_some_and(|o| o != std::cmp::Ordering::Less),
+        Bound::Excluded(b) => {
+            compare_values(v, b).is_some_and(|o| o == std::cmp::Ordering::Greater)
+        }
+    };
+    let ok_upper = match upper {
+        Bound::Unbounded => true,
+        Bound::Included(b) => {
+            compare_values(v, b).is_some_and(|o| o != std::cmp::Ordering::Greater)
+        }
+        Bound::Excluded(b) => compare_values(v, b).is_some_and(|o| o == std::cmp::Ordering::Less),
+    };
+    ok_lower && ok_upper
+}
+
+/// Try to elide the `Sort` node when the child's Scan can be rewritten as an
+/// IndexScan whose ordering matches `keys`. The common case with no WHERE
+/// filter uses a full-range index walk. If the Scan has a WHERE filter that
+/// does NOT match this specific index's first column, we refuse to elide
+/// (the Scan arm will still pick the best-matching index for the filter and
+/// the Sort arm's path-B check handles the elision).
+fn try_elide_sort(
+    db: &Database,
+    input: &PhysicalPlan,
+    keys: &[contextdb_planner::SortKey],
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+) -> Result<Option<QueryResult>> {
+    fn find_scan(plan: &PhysicalPlan) -> Option<(&String, &Option<String>, &Option<Expr>)> {
+        match plan {
+            PhysicalPlan::Scan {
+                table,
+                alias,
+                filter,
+            } => Some((table, alias, filter)),
+            PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Limit { input, .. } => find_scan(input),
+            _ => None,
+        }
+    }
+    let Some((table, _alias, filter)) = find_scan(input) else {
+        return Ok(None);
+    };
+    // If the underlying Scan has a WHERE, route through the Scan executor
+    // path so it gets the narrow range / correct rows_examined accounting.
+    // Path B on the Sort arm will detect the IndexScan trace + matching
+    // prefix and flip `sort_elided` on the result.
+    if filter.is_some() {
+        return Ok(None);
+    }
+    // Keys must all be simple column references.
+    let key_cols: Option<Vec<(&str, &contextdb_parser::ast::SortDirection)>> = keys
+        .iter()
+        .map(|k| match &k.expr {
+            Expr::Column(r) => Some((r.column.as_str(), &k.direction)),
+            _ => None,
+        })
+        .collect();
+    let Some(key_cols) = key_cols else {
+        return Ok(None);
+    };
+    let meta = match db.table_meta(table) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let matching_index = meta.indexes.iter().find(|decl| {
+        if decl.columns.len() < key_cols.len() {
+            return false;
+        }
+        decl.columns
+            .iter()
+            .zip(key_cols.iter())
+            .all(|((col, dir), (kcol, kdir))| col == kcol && core_dir_matches_ast(*dir, **kdir))
+    });
+    let Some(matching) = matching_index else {
+        return Ok(None);
+    };
+    run_index_scan_with_order(db, table, matching, filter.as_ref(), params, tx)
+}
+
+/// Execute an IndexScan over `table` with `index`, applying the optional
+/// residual filter. Constructs predicates_pushed / indexes_considered the
+/// same way the Scan arm does.
+fn run_index_scan_with_order(
+    db: &Database,
+    table: &str,
+    decl: &contextdb_core::IndexDecl,
+    filter: Option<&Expr>,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+) -> Result<Option<QueryResult>> {
+    use std::borrow::Cow;
+    let snapshot = db.snapshot_for_read();
+    let schema_columns = db.table_meta(table).map(|meta| {
+        meta.columns
+            .into_iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>()
+    });
+    let resolved_filter = filter
+        .map(|expr| resolve_in_subqueries(db, expr, params, tx))
+        .transpose()?;
+
+    // Pick: full-range walk for ORDER BY elision. Shape is "unbounded range"
+    // so we walk every posting. Residual filter applies.
+    let pick = IndexPick {
+        name: decl.name.clone(),
+        columns: decl.columns.clone(),
+        shape: IndexPredicateShape::Range {
+            lower: std::ops::Bound::Unbounded,
+            upper: std::ops::Bound::Unbounded,
+        },
+        pushed_column: decl.columns[0].0.clone(),
+    };
+    let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
+    db.__reset_rows_examined();
+    db.__bump_rows_examined(examined);
+    let mut result = materialize_rows(
+        rows,
+        resolved_filter.as_ref(),
+        params,
+        schema_columns.as_deref(),
+    )?;
+    let mut pushed: smallvec::SmallVec<[Cow<'static, str>; 4]> = smallvec::SmallVec::new();
+    pushed.push(Cow::Owned(decl.columns[0].0.clone()));
+    result.trace = crate::database::QueryTrace {
+        physical_plan: "IndexScan",
+        index_used: Some(decl.name.clone()),
+        predicates_pushed: pushed,
+        indexes_considered: Default::default(),
+        sort_elided: true,
+    };
+    Ok(Some(result))
+}
+
+fn sort_keys_match_index_prefix(
+    db: &Database,
+    input: &PhysicalPlan,
+    index_name: &str,
+    keys: &[contextdb_planner::SortKey],
+) -> bool {
+    fn find_scan_and_filter(plan: &PhysicalPlan) -> Option<(&String, &Option<Expr>)> {
+        match plan {
+            PhysicalPlan::Scan { table, filter, .. } => Some((table, filter)),
+            PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Distinct { input }
+            | PhysicalPlan::Limit { input, .. } => find_scan_and_filter(input),
+            _ => None,
+        }
+    }
+    let (table, filter) = match find_scan_and_filter(input) {
+        Some(t) => t,
+        None => return false,
+    };
+    let meta = match db.table_meta(table) {
+        Some(m) => m,
+        None => return false,
+    };
+    let decl = meta.indexes.iter().find(|i| i.name == index_name);
+    let Some(decl) = decl else {
+        return false;
+    };
+    // Determine how many leading index columns the WHERE filter pins to a
+    // single equality. Those columns are effectively "used up" by the
+    // IndexScan's range; subsequent ORDER BY keys matching the remaining
+    // index columns still elide the Sort.
+    let pinned_prefix_len = count_equality_prefix(filter.as_ref(), &decl.columns);
+    let remaining_index_cols = &decl.columns[pinned_prefix_len..];
+    if remaining_index_cols.len() < keys.len() {
+        return false;
+    }
+    remaining_index_cols
+        .iter()
+        .zip(keys.iter())
+        .all(|((col, dir), k)| match &k.expr {
+            Expr::Column(r) => r.column == *col && core_dir_matches_ast(*dir, k.direction),
+            _ => false,
+        })
+}
+
+fn count_equality_prefix(
+    filter: Option<&Expr>,
+    columns: &[(String, contextdb_core::SortDirection)],
+) -> usize {
+    let Some(filter) = filter else {
+        return 0;
+    };
+    let conjuncts = split_conjuncts(filter);
+    let mut pinned = 0usize;
+    for (col, _) in columns {
+        let has_eq = conjuncts.iter().any(|c| match c {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::Eq,
+                right,
+            } => {
+                let left_is_col = matches!(left.as_ref(), Expr::Column(r) if r.column == *col);
+                let right_is_simple =
+                    matches!(right.as_ref(), Expr::Literal(_) | Expr::Parameter(_));
+                left_is_col && right_is_simple
+            }
+            _ => false,
+        });
+        if has_eq {
+            pinned += 1;
+        } else {
+            break;
+        }
+    }
+    pinned
+}
+
+fn core_dir_matches_ast(
+    core: contextdb_core::SortDirection,
+    ast: contextdb_parser::ast::SortDirection,
+) -> bool {
+    matches!(
+        (core, ast),
+        (
+            contextdb_core::SortDirection::Asc,
+            contextdb_parser::ast::SortDirection::Asc
+        ) | (
+            contextdb_core::SortDirection::Desc,
+            contextdb_parser::ast::SortDirection::Desc
+        )
+    )
+}
+
+// ========================= End of index scan planning =========================
 
 fn validate_update_state_transition(
     db: &Database,
@@ -1576,7 +2827,16 @@ pub fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Valu
             .get(p)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", p))),
-        Expr::Column(c) => Ok(Value::Text(c.column.clone())),
+        Expr::Column(c) => {
+            if c.column.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                return Ok(Value::Timestamp(ms));
+            }
+            Ok(Value::Text(c.column.clone()))
+        }
         Expr::UnaryOp { op, operand } => match op {
             UnaryOp::Neg => match resolve_expr(operand, params)? {
                 Value::Int64(v) => Ok(Value::Int64(-v)),

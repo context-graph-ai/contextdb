@@ -78,6 +78,7 @@ pub fn validate_dml(
             if p.on_conflict.is_none()
                 && let Some(id_idx) = columns.iter().position(|c| c == "id")
             {
+                let id_column_indexed = db.index_covers_column_pub(&p.table, "id");
                 let mut pending_ids = HashSet::new();
                 for row in &p.values {
                     let id_value = row
@@ -91,8 +92,14 @@ pub fn validate_dml(
                                 column: "id".to_string(),
                             });
                         }
-                        let lookup = db.point_lookup(&p.table, "id", &v, db.snapshot())?;
-                        if lookup.is_some() {
+                        let found = if id_column_indexed {
+                            // O(log n) index probe.
+                            db.index_point_probe(&p.table, "id", &v)?
+                        } else {
+                            db.point_lookup(&p.table, "id", &v, db.snapshot())?
+                                .map(|r| r.row_id)
+                        };
+                        if found.is_some() {
                             return Err(Error::UniqueViolation {
                                 table: p.table.clone(),
                                 column: "id".to_string(),

@@ -2,7 +2,7 @@ use crate::Direction;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     pub immutable: bool,
@@ -22,6 +22,139 @@ pub struct TableMeta {
     pub expires_column: Option<String>,
     #[serde(default)]
     pub indexes: Vec<IndexDecl>,
+}
+
+// Custom `Deserialize` that tolerates prior on-disk `TableMeta` encoded
+// without the trailing `indexes` field (backward-compat).
+impl<'de> serde::Deserialize<'de> for TableMeta {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct TableMetaVisitor;
+
+        impl<'de> Visitor<'de> for TableMetaVisitor {
+            type Value = TableMeta;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a TableMeta")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<TableMeta, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let columns = seq
+                    .next_element::<Vec<ColumnDef>>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let immutable = seq
+                    .next_element::<bool>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let state_machine = seq
+                    .next_element::<Option<StateMachineConstraint>>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let dag_edge_types = seq.next_element::<Vec<String>>()?.unwrap_or_default();
+                let unique_constraints =
+                    seq.next_element::<Vec<Vec<String>>>()?.unwrap_or_default();
+                let natural_key_column = seq.next_element::<Option<String>>()?.unwrap_or_default();
+                let propagation_rules = seq
+                    .next_element::<Vec<PropagationRule>>()?
+                    .unwrap_or_default();
+                let default_ttl_seconds = seq.next_element::<Option<u64>>()?.unwrap_or_default();
+                let sync_safe = seq.next_element::<bool>()?.unwrap_or_default();
+                let expires_column = seq
+                    .next_element::<Option<String>>()?
+                    .unwrap_or_default();
+                let indexes = match seq.next_element::<Vec<IndexDecl>>() {
+                    Ok(Some(v)) => v,
+                    Ok(None) => Vec::new(),
+                    Err(_) => Vec::new(),
+                };
+                Ok(TableMeta {
+                    columns,
+                    immutable,
+                    state_machine,
+                    dag_edge_types,
+                    unique_constraints,
+                    natural_key_column,
+                    propagation_rules,
+                    default_ttl_seconds,
+                    sync_safe,
+                    expires_column,
+                    indexes,
+                })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<TableMeta, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut columns: Option<Vec<ColumnDef>> = None;
+                let mut immutable: Option<bool> = None;
+                let mut state_machine: Option<Option<StateMachineConstraint>> = None;
+                let mut dag_edge_types: Option<Vec<String>> = None;
+                let mut unique_constraints: Option<Vec<Vec<String>>> = None;
+                let mut natural_key_column: Option<Option<String>> = None;
+                let mut propagation_rules: Option<Vec<PropagationRule>> = None;
+                let mut default_ttl_seconds: Option<Option<u64>> = None;
+                let mut sync_safe: Option<bool> = None;
+                let mut expires_column: Option<Option<String>> = None;
+                let mut indexes: Option<Vec<IndexDecl>> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "columns" => columns = Some(map.next_value()?),
+                        "immutable" => immutable = Some(map.next_value()?),
+                        "state_machine" => state_machine = Some(map.next_value()?),
+                        "dag_edge_types" => dag_edge_types = Some(map.next_value()?),
+                        "unique_constraints" => unique_constraints = Some(map.next_value()?),
+                        "natural_key_column" => natural_key_column = Some(map.next_value()?),
+                        "propagation_rules" => propagation_rules = Some(map.next_value()?),
+                        "default_ttl_seconds" => default_ttl_seconds = Some(map.next_value()?),
+                        "sync_safe" => sync_safe = Some(map.next_value()?),
+                        "expires_column" => expires_column = Some(map.next_value()?),
+                        "indexes" => indexes = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                Ok(TableMeta {
+                    columns: columns.ok_or_else(|| serde::de::Error::missing_field("columns"))?,
+                    immutable: immutable
+                        .ok_or_else(|| serde::de::Error::missing_field("immutable"))?,
+                    state_machine: state_machine.unwrap_or_default(),
+                    dag_edge_types: dag_edge_types.unwrap_or_default(),
+                    unique_constraints: unique_constraints.unwrap_or_default(),
+                    natural_key_column: natural_key_column.unwrap_or_default(),
+                    propagation_rules: propagation_rules.unwrap_or_default(),
+                    default_ttl_seconds: default_ttl_seconds.unwrap_or_default(),
+                    sync_safe: sync_safe.unwrap_or_default(),
+                    expires_column: expires_column.unwrap_or_default(),
+                    indexes: indexes.unwrap_or_default(),
+                })
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "columns",
+            "immutable",
+            "state_machine",
+            "dag_edge_types",
+            "unique_constraints",
+            "natural_key_column",
+            "propagation_rules",
+            "default_ttl_seconds",
+            "sync_safe",
+            "expires_column",
+            "indexes",
+        ];
+        deserializer.deserialize_struct("TableMeta", FIELDS, TableMetaVisitor)
+    }
 }
 
 /// Direction for a column within an engine-local index declaration.

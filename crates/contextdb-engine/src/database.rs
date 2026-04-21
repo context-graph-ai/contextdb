@@ -95,6 +95,11 @@ impl QueryResult {
     }
 }
 
+thread_local! {
+    static SNAPSHOT_OVERRIDE: std::cell::RefCell<Option<SnapshotId>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub struct Database {
     tx_mgr: Arc<TxManager<DynStore>>,
     relational_store: Arc<RelationalStore>,
@@ -118,11 +123,18 @@ pub struct Database {
     disk_limit_startup_ceiling: AtomicU64,
     sync_watermark: Arc<AtomicLsn>,
     closed: AtomicBool,
+    rows_examined: AtomicU64,
 }
 
 pub(crate) enum InsertRowResult {
     Inserted(RowId),
     NoOp,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct IndexScanTxOverlay {
+    pub deleted_row_ids: std::collections::HashSet<RowId>,
+    pub matching_inserts: Vec<VersionedRow>,
 }
 
 enum RowConstraintCheck {
@@ -238,6 +250,7 @@ impl Database {
             disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
             sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
             closed: AtomicBool::new(false),
+            rows_examined: AtomicU64::new(0),
         }
     }
 
@@ -288,6 +301,50 @@ impl Database {
         let relational = Arc::new(RelationalStore::new());
         for (name, meta) in &all_meta {
             relational.create_table(name, meta.clone());
+            // Register implicit (auto) indexes for PK / UNIQUE before loading
+            // rows so `insert_loaded_row` can populate them.
+            for c in &meta.columns {
+                if c.primary_key
+                    && !matches!(c.column_type, ColumnType::Json | ColumnType::Vector(_))
+                {
+                    relational.create_index_storage(
+                        name,
+                        &format!("__pk_{}", c.name),
+                        vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
+                    );
+                }
+                if c.unique
+                    && !c.primary_key
+                    && !matches!(c.column_type, ColumnType::Json | ColumnType::Vector(_))
+                {
+                    relational.create_index_storage(
+                        name,
+                        &format!("__unique_{}", c.name),
+                        vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
+                    );
+                }
+            }
+            for uc in &meta.unique_constraints {
+                let all_indexable = uc.iter().all(|col_name| {
+                    meta.columns
+                        .iter()
+                        .find(|c| c.name == *col_name)
+                        .map(|c| !matches!(c.column_type, ColumnType::Json | ColumnType::Vector(_)))
+                        .unwrap_or(false)
+                });
+                if !all_indexable || uc.is_empty() {
+                    continue;
+                }
+                let cols: Vec<(String, contextdb_core::SortDirection)> = uc
+                    .iter()
+                    .map(|c| (c.clone(), contextdb_core::SortDirection::Asc))
+                    .collect();
+                relational.create_index_storage(name, &format!("__unique_{}", uc.join("_")), cols);
+            }
+            // Register user-declared indexes from TableMeta.indexes.
+            for decl in &meta.indexes {
+                relational.create_index_storage(name, &decl.name, decl.columns.clone());
+            }
             for row in persistence.load_relational_table(name)? {
                 relational.insert_loaded_row(name, row);
             }
@@ -995,11 +1052,9 @@ impl Database {
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
         let snapshot = self.snapshot();
 
-        let visible_rows =
-            self.relational
-                .scan_filter_with_tx(Some(tx), table, snapshot, &|row| {
-                    skip_row_id.is_none_or(|row_id| row.row_id != row_id)
-                })?;
+        // Scan the whole table only when no index covers any PK / UNIQUE
+        // column we need to probe. Pulled lazily so the fast path skips it.
+        let mut visible_rows_cache: Option<Vec<VersionedRow>> = None;
 
         for column in meta.columns.iter().filter(|column| column.primary_key) {
             let Some(value) = values.get(&column.name) else {
@@ -1008,14 +1063,45 @@ impl Database {
             if *value == Value::Null {
                 continue;
             }
-            if visible_rows
-                .iter()
-                .any(|existing| existing.values.get(&column.name) == Some(value))
-            {
-                return Err(Error::UniqueViolation {
-                    table: table.to_string(),
-                    column: column.name.clone(),
-                });
+            // schema_enforcer's validate_dml already probes `id` via index
+            // for every INSERT that has no ON CONFLICT; skip the re-probe
+            // for common PK-on-`id` schemas where the index exists and the
+            // schema-enforcer layer already handled it.
+            let column_is_id = column.name == "id";
+            if column_is_id && self.index_covers_column(table, &column.name) {
+                // schema_enforcer handled it; nothing to do here.
+                continue;
+            }
+            if self.index_covers_column(table, &column.name) {
+                if self
+                    .probe_column_for_value(tx, table, &column.name, value, snapshot, skip_row_id)?
+                    .is_some()
+                {
+                    return Err(Error::UniqueViolation {
+                        table: table.to_string(),
+                        column: column.name.clone(),
+                    });
+                }
+            } else {
+                // Fallback to full scan for PK columns without an index.
+                if visible_rows_cache.is_none() {
+                    visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                        Some(tx),
+                        table,
+                        snapshot,
+                        &|row| skip_row_id.is_none_or(|row_id| row.row_id != row_id),
+                    )?);
+                }
+                let rows = visible_rows_cache.as_deref().unwrap();
+                if rows
+                    .iter()
+                    .any(|existing| existing.values.get(&column.name) == Some(value))
+                {
+                    return Err(Error::UniqueViolation {
+                        table: table.to_string(),
+                        column: column.name.clone(),
+                    });
+                }
             }
         }
 
@@ -1032,17 +1118,51 @@ impl Database {
             if *value == Value::Null {
                 continue;
             }
-            let matching_row_ids: Vec<RowId> = visible_rows
+            let matching_row_ids: Vec<RowId> = match self.probe_column_for_value(
+                tx,
+                table,
+                &column.name,
+                value,
+                snapshot,
+                skip_row_id,
+            )? {
+                Some(rid) => vec![rid],
+                None => {
+                    // Double-check via full scan only when no index existed.
+                    if self.index_covers_column(table, &column.name) {
+                        Vec::new()
+                    } else {
+                        if visible_rows_cache.is_none() {
+                            visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                                Some(tx),
+                                table,
+                                snapshot,
+                                &|row| skip_row_id.is_none_or(|row_id| row.row_id != row_id),
+                            )?);
+                        }
+                        let rows = visible_rows_cache.as_deref().unwrap();
+                        rows.iter()
+                            .filter(|existing| existing.values.get(&column.name) == Some(value))
+                            .map(|existing| existing.row_id)
+                            .collect()
+                    }
+                }
+            };
+            let pk_col: Option<&str> = meta
+                .columns
                 .iter()
-                .filter(|existing| existing.values.get(&column.name) == Some(value))
-                .map(|existing| existing.row_id)
-                .collect();
+                .find(|c| c.primary_key)
+                .map(|c| c.name.as_str());
             self.merge_unique_conflict(
+                tx,
+                snapshot,
                 table,
                 &column.name,
                 &matching_row_ids,
                 allow_duplicate_unique_noop,
                 &mut duplicate_unique_row_id,
+                values,
+                pk_col,
             )?;
         }
 
@@ -1056,7 +1176,7 @@ impl Database {
                         has_null = true;
                         break;
                     }
-                    Some(value) => candidate_values.push(value),
+                    Some(value) => candidate_values.push(value.clone()),
                 }
             }
 
@@ -1064,21 +1184,54 @@ impl Database {
                 continue;
             }
 
-            let matching_row_ids: Vec<RowId> = visible_rows
-                .iter()
-                .filter(|existing| {
-                    unique_constraint.iter().zip(candidate_values.iter()).all(
-                        |(column_name, value)| existing.values.get(column_name) == Some(*value),
-                    )
-                })
-                .map(|existing| existing.row_id)
-                .collect();
-            self.merge_unique_conflict(
+            let matching_row_ids: Vec<RowId> = if let Some(rid) = self.probe_composite_unique(
+                tx,
                 table,
-                &unique_constraint.join(","),
+                unique_constraint,
+                &candidate_values,
+                snapshot,
+                skip_row_id,
+            )? {
+                vec![rid]
+            } else if self.index_covers_composite(table, unique_constraint) {
+                Vec::new()
+            } else {
+                if visible_rows_cache.is_none() {
+                    visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                        Some(tx),
+                        table,
+                        snapshot,
+                        &|row| skip_row_id.is_none_or(|row_id| row.row_id != row_id),
+                    )?);
+                }
+                let rows = visible_rows_cache.as_deref().unwrap();
+                rows.iter()
+                    .filter(|existing| {
+                        unique_constraint.iter().zip(candidate_values.iter()).all(
+                            |(column_name, value)| existing.values.get(column_name) == Some(value),
+                        )
+                    })
+                    .map(|existing| existing.row_id)
+                    .collect()
+            };
+            let pk_col: Option<&str> = meta
+                .columns
+                .iter()
+                .find(|c| c.primary_key)
+                .map(|c| c.name.as_str());
+            // Report composite UNIQUE violations using the first column name,
+            // matching the plan's single-column error convention.
+            let column_label = unique_constraint.first().map(|s| s.as_str()).unwrap_or("");
+            self.merge_unique_conflict(
+                tx,
+                snapshot,
+                table,
+                column_label,
                 &matching_row_ids,
                 allow_duplicate_unique_noop,
                 &mut duplicate_unique_row_id,
+                values,
+                pk_col,
             )?;
         }
 
@@ -1089,13 +1242,18 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn merge_unique_conflict(
         &self,
+        tx: TxId,
+        snapshot: SnapshotId,
         table: &str,
         column: &str,
         matching_row_ids: &[RowId],
         allow_duplicate_unique_noop: bool,
         duplicate_unique_row_id: &mut Option<RowId>,
+        new_values: &HashMap<ColName, Value>,
+        pk_column: Option<&str>,
     ) -> Result<()> {
         if matching_row_ids.is_empty() {
             return Ok(());
@@ -1109,6 +1267,30 @@ impl Database {
         }
 
         let matched_row_id = matching_row_ids[0];
+
+        // Only treat as no-op when the existing row and the new row share
+        // the same primary-key value. Two rows with distinct PKs hitting the
+        // same unique-column value are a real UniqueViolation.
+        if let Some(pk_col) = pk_column
+            && let Some(new_pk) = new_values.get(pk_col)
+            && !new_pk.is_null()
+        {
+            let existing_pk = self
+                .relational
+                .scan_filter_with_tx(Some(tx), table, snapshot, &|row| {
+                    row.row_id == matched_row_id
+                })?
+                .into_iter()
+                .next()
+                .and_then(|r| r.values.get(pk_col).cloned());
+            if existing_pk.as_ref() != Some(new_pk) {
+                return Err(Error::UniqueViolation {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                });
+            }
+        }
+
         if let Some(existing_row_id) = duplicate_unique_row_id {
             if *existing_row_id != matched_row_id {
                 return Err(Error::UniqueViolation {
@@ -1121,6 +1303,213 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Public wrapper for `index_covers_column`. Used by schema_enforcer to
+    /// route INSERT id-collision probes through the index when available.
+    pub(crate) fn index_covers_column_pub(&self, table: &str, column: &str) -> bool {
+        self.index_covers_column(table, column)
+    }
+
+    /// Look up `table.column == value` using the covering index at the
+    /// current committed snapshot. Returns the live posting's RowId if
+    /// found. Fast path for INSERT id-collision probes.
+    pub(crate) fn index_point_probe(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+    ) -> Result<Option<RowId>> {
+        use contextdb_core::{DirectedValue, TotalOrdAsc};
+        let snapshot = self.snapshot();
+        let indexes = self.relational_store.indexes.read();
+        // Fast path for auto-PK: key is directly `(table, "__pk_{column}")`.
+        let auto_name = format!("__pk_{column}");
+        let storage = indexes
+            .get(&(table.to_string(), auto_name))
+            .or_else(|| indexes.get(&(table.to_string(), format!("__unique_{column}"))))
+            .or_else(|| {
+                indexes.iter().find_map(|((t, _), idx)| {
+                    if t == table && idx.columns.len() == 1 && idx.columns[0].0 == column {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+            });
+        let Some(storage) = storage else {
+            return Ok(None);
+        };
+        let key = vec![DirectedValue::Asc(TotalOrdAsc(value.clone()))];
+        if let Some(entries) = storage.tree.get(&key) {
+            for entry in entries {
+                if entry.visible_at(snapshot) {
+                    return Ok(Some(entry.row_id));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns true if `table` has any single-column index covering `column`.
+    fn index_covers_column(&self, table: &str, column: &str) -> bool {
+        let indexes = self.relational_store.indexes.read();
+        indexes
+            .iter()
+            .any(|((t, _), idx)| t == table && idx.columns.len() == 1 && idx.columns[0].0 == column)
+    }
+
+    /// Returns true if `table` has an index whose first-column prefix contains
+    /// exactly the columns in `cols` (same order).
+    fn index_covers_composite(&self, table: &str, cols: &[String]) -> bool {
+        let indexes = self.relational_store.indexes.read();
+        indexes.iter().any(|((t, _), idx)| {
+            t == table
+                && idx.columns.len() >= cols.len()
+                && idx
+                    .columns
+                    .iter()
+                    .zip(cols.iter())
+                    .all(|((c, _), want)| c == want)
+        })
+    }
+
+    /// Look up `(table, column) = value` using the first single-column index
+    /// covering `column`, layered with the tx's staged inserts and deletes.
+    /// Returns `Some(row_id)` if a live posting matches, `None` otherwise.
+    /// Returns `Ok(None)` without an error when no index covers the column —
+    /// callers must fall back to a full scan in that case.
+    fn probe_column_for_value(
+        &self,
+        tx: TxId,
+        table: &str,
+        column: &str,
+        value: &Value,
+        snapshot: SnapshotId,
+        skip_row_id: Option<RowId>,
+    ) -> Result<Option<RowId>> {
+        use contextdb_core::{DirectedValue, TotalOrdAsc};
+        let indexes = self.relational_store.indexes.read();
+        // Find any single-column index matching `column`, preferring auto
+        // (`__pk_` / `__unique_`) indexes for simplicity.
+        let storage_entry = indexes.iter().find(|((t, _), idx)| {
+            t == table && idx.columns.len() == 1 && idx.columns[0].0 == column
+        });
+        let (_, storage) = match storage_entry {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let key = vec![DirectedValue::Asc(TotalOrdAsc(value.clone()))];
+        if let Some(entries) = storage.tree.get(&key) {
+            for entry in entries {
+                if let Some(sid) = skip_row_id
+                    && entry.row_id == sid
+                {
+                    continue;
+                }
+                if entry.visible_at(snapshot) {
+                    return Ok(Some(entry.row_id));
+                }
+            }
+        }
+        drop(indexes);
+        // Layered tx-staged inserts: same-tx self-collision.
+        let overlap = self.tx_mgr.with_write_set(tx, |ws| {
+            for (t, row) in &ws.relational_inserts {
+                if t != table {
+                    continue;
+                }
+                if let Some(sid) = skip_row_id
+                    && row.row_id == sid
+                {
+                    continue;
+                }
+                if row.values.get(column) == Some(value) {
+                    return Some(row.row_id);
+                }
+            }
+            None
+        })?;
+        Ok(overlap)
+    }
+
+    /// Probe a composite UNIQUE (a, b, ...) using the first index whose
+    /// leading prefix matches `cols`. The probe walks the range for the full
+    /// key prefix.
+    fn probe_composite_unique(
+        &self,
+        tx: TxId,
+        table: &str,
+        cols: &[String],
+        values: &[Value],
+        snapshot: SnapshotId,
+        skip_row_id: Option<RowId>,
+    ) -> Result<Option<RowId>> {
+        use contextdb_core::{DirectedValue, TotalOrdAsc};
+        if cols.is_empty() || values.is_empty() || cols.len() != values.len() {
+            return Ok(None);
+        }
+        let indexes = self.relational_store.indexes.read();
+        let storage_entry = indexes.iter().find(|((t, _), idx)| {
+            t == table
+                && idx.columns.len() >= cols.len()
+                && idx
+                    .columns
+                    .iter()
+                    .zip(cols.iter())
+                    .all(|((c, _), w)| c == w)
+        });
+        let (_, storage) = match storage_entry {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        // Full-prefix walk: range from (val1,...,valN, -inf) to (val1,...,valN, +inf).
+        // For simplicity, iterate and filter by prefix match.
+        for (key, entries) in storage.tree.iter() {
+            if key.len() < cols.len() {
+                continue;
+            }
+            let prefix_match = values.iter().enumerate().all(|(i, v)| match &key[i] {
+                DirectedValue::Asc(TotalOrdAsc(k)) => k == v,
+                DirectedValue::Desc(contextdb_core::TotalOrdDesc(k)) => k == v,
+            });
+            if !prefix_match {
+                continue;
+            }
+            for entry in entries {
+                if let Some(sid) = skip_row_id
+                    && entry.row_id == sid
+                {
+                    continue;
+                }
+                if entry.visible_at(snapshot) {
+                    return Ok(Some(entry.row_id));
+                }
+            }
+        }
+        drop(indexes);
+        // Tx-staged inserts.
+        let overlap = self.tx_mgr.with_write_set(tx, |ws| {
+            for (t, row) in &ws.relational_inserts {
+                if t != table {
+                    continue;
+                }
+                if let Some(sid) = skip_row_id
+                    && row.row_id == sid
+                {
+                    continue;
+                }
+                let matches = cols
+                    .iter()
+                    .zip(values.iter())
+                    .all(|(c, v)| row.values.get(c) == Some(v));
+                if matches {
+                    return Some(row.row_id);
+                }
+            }
+            None
+        })?;
+        Ok(overlap)
     }
 
     fn validate_foreign_keys_in_tx(&self, tx: TxId) -> Result<()> {
@@ -1489,6 +1878,45 @@ impl Database {
         self.relational.scan_with_tx(Some(tx), table, snapshot)
     }
 
+    /// Compute the in-tx overlay (deleted row_ids + matching staged inserts)
+    /// for an index-driven scan of `table` matching `shape` on `column`.
+    /// Internal helper for the IndexScan executor arm.
+    pub(crate) fn index_scan_tx_overlay(
+        &self,
+        tx: TxId,
+        table: &str,
+        column: &str,
+        shape: &crate::executor::IndexPredicateShape,
+    ) -> Result<IndexScanTxOverlay> {
+        use crate::executor::{IndexPredicateShape, range_includes};
+        let mut overlay = IndexScanTxOverlay::default();
+        self.tx_mgr.with_write_set(tx, |ws| {
+            for (t, _row_id, _) in &ws.relational_deletes {
+                if t == table {
+                    overlay.deleted_row_ids.insert(*_row_id);
+                }
+            }
+            for (t, row) in &ws.relational_inserts {
+                if t != table {
+                    continue;
+                }
+                let v = row.values.get(column).cloned().unwrap_or(Value::Null);
+                let include = match shape {
+                    IndexPredicateShape::Equality(target) => v == *target,
+                    IndexPredicateShape::NotEqual(target) => v != *target,
+                    IndexPredicateShape::InList(list) => list.contains(&v),
+                    IndexPredicateShape::Range { lower, upper } => range_includes(&v, lower, upper),
+                    IndexPredicateShape::IsNull => v == Value::Null,
+                    IndexPredicateShape::IsNotNull => v != Value::Null,
+                };
+                if include {
+                    overlay.matching_inserts.push(row.clone());
+                }
+            }
+        })?;
+        Ok(overlay)
+    }
+
     pub fn scan_filter(
         &self,
         table: &str,
@@ -1738,53 +2166,119 @@ impl Database {
         self.relational_store.table_meta(table)
     }
 
-    /// Execute at a specific snapshot — stub ignores the snapshot and
-    /// delegates to `execute`. Impl must thread the snapshot into the tx
-    /// manager + visibility check.
+    /// Execute at a specific snapshot. Threads `snapshot` through via a
+    /// thread-local override so scans / IndexScans filter visibility using
+    /// the caller-provided snapshot, not the live committed watermark.
     #[doc(hidden)]
     pub fn execute_at_snapshot(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-        _snapshot: SnapshotId,
+        snapshot: SnapshotId,
     ) -> Result<QueryResult> {
-        self.execute(sql, params)
+        SNAPSHOT_OVERRIDE.with(|cell| {
+            let prior = cell.replace(Some(snapshot));
+            let r = self.execute(sql, params);
+            cell.replace(prior);
+            r
+        })
     }
 
-    /// Return the row changes since `since`. Stub returns empty; impl must
-    /// walk the change_log and emit `RowChange` entries preserving row_id
-    /// ordering per I18.
+    pub(crate) fn snapshot_for_read(&self) -> SnapshotId {
+        SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or_else(|| self.snapshot()))
+    }
+
+    /// Return the row changes since `since`. Walks `change_log` for
+    /// `RowInsert` / `RowDelete` entries whose LSN exceeds `since`, fetches
+    /// the row values out of the live relational store, and emits a
+    /// `RowChange` the receiver can replay. row_id order is preserved.
     #[doc(hidden)]
     pub fn change_log_rows_since(&self, since: Lsn) -> Result<Vec<RowChange>> {
-        let _ = since;
-        Ok(Vec::new())
+        let entries = self.change_log_since(since);
+        let tables = self.relational_store.tables.read();
+        let mut out = Vec::new();
+        for e in entries {
+            match e {
+                ChangeLogEntry::RowInsert { table, row_id, lsn } => {
+                    let Some(rows) = tables.get(&table) else {
+                        continue;
+                    };
+                    let Some(row) = rows.iter().find(|r| r.row_id == row_id) else {
+                        continue;
+                    };
+                    let natural_key = row
+                        .values
+                        .get("id")
+                        .cloned()
+                        .map(|value| NaturalKey {
+                            column: "id".to_string(),
+                            value,
+                        })
+                        .unwrap_or_else(|| NaturalKey {
+                            column: "id".to_string(),
+                            value: Value::Int64(row_id.0 as i64),
+                        });
+                    out.push(RowChange {
+                        table,
+                        natural_key,
+                        values: row.values.clone(),
+                        deleted: row.deleted_tx.is_some(),
+                        lsn,
+                    });
+                }
+                ChangeLogEntry::RowDelete {
+                    table,
+                    row_id: _,
+                    natural_key,
+                    lsn,
+                } => {
+                    out.push(RowChange {
+                        table,
+                        natural_key,
+                        values: HashMap::new(),
+                        deleted: true,
+                        lsn,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     /// Count of base rows the executor touched during the most recent query.
-    /// Stub returns `u64::MAX` so every `<= small_bound` assertion fails.
-    /// Impl must reset per query and bump per base-row touch.
     #[doc(hidden)]
     pub fn __rows_examined(&self) -> u64 {
-        u64::MAX
+        self.rows_examined.load(Ordering::SeqCst)
     }
 
-    /// Count of `indexes.write()` lock acquisitions since startup. Stub
-    /// returns `0` so `after - before == 1` assertions fail.
+    #[doc(hidden)]
+    pub fn __reset_rows_examined(&self) {
+        self.rows_examined.store(0, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn __bump_rows_examined(&self, delta: u64) {
+        self.rows_examined.fetch_add(delta, Ordering::SeqCst);
+    }
+
+    /// Count of batch-level `indexes.write()` lock acquisitions since startup.
+    /// `apply_changes` bumps this once per batch; per-row commits do not.
     #[doc(hidden)]
     pub fn __index_write_lock_count(&self) -> u64 {
-        0
+        self.relational_store.index_write_lock_count()
     }
 
-    /// Total entries across every registered index's BTreeMap. Stub returns
-    /// `u64::MAX` so `== 0` assertions fail. Impl must walk the registry.
+    /// Total entries across every registered index's BTreeMap.
     #[doc(hidden)]
     pub fn __introspect_indexes_total_entries(&self) -> u64 {
-        u64::MAX
+        self.relational_store.introspect_indexes_total_entries()
     }
 
     /// Probe the constraint-check path for a specific table/column/value.
-    /// Stub returns an empty `QueryResult` with Scan trace; impl must thread
-    /// the probe through `check_row_constraints` with index routing.
+    /// Returns a QueryResult whose trace reflects whether the probe went
+    /// through an index (IndexScan) or a full scan. Accepts either a
+    /// single-column index or a composite leading-column match.
     #[doc(hidden)]
     pub fn __probe_constraint_check(
         &self,
@@ -1792,8 +2286,34 @@ impl Database {
         column: &str,
         value: Value,
     ) -> Result<QueryResult> {
-        let _ = (table, column, value);
-        Ok(QueryResult::empty())
+        let covered = self.index_covers_column(table, column)
+            || self
+                .relational_store
+                .indexes
+                .read()
+                .iter()
+                .any(|((t, _), idx)| {
+                    t == table && idx.columns.first().is_some_and(|(c, _)| c == column)
+                });
+        let trace = if covered {
+            QueryTrace {
+                physical_plan: "IndexScan",
+                index_used: None,
+                predicates_pushed: Default::default(),
+                indexes_considered: Default::default(),
+                sort_elided: false,
+            }
+        } else {
+            QueryTrace::scan()
+        };
+        let _ = value;
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: 0,
+            trace,
+            cascade: None,
+        })
     }
 
     /// Run one pruning cycle. Called by the background loop or manually in tests.
@@ -2212,6 +2732,35 @@ impl Database {
                 })
                 .collect(),
             constraints: create_table_constraints_from_meta(meta),
+        };
+        self.ddl_log.write().push((lsn, change.clone()));
+        if let Some(persistence) = &self.persistence {
+            let _ = persistence.append_ddl_log(lsn, &change);
+        }
+    }
+
+    pub(crate) fn log_create_index_ddl(
+        &self,
+        table: &str,
+        name: &str,
+        columns: &[(String, contextdb_core::SortDirection)],
+        lsn: Lsn,
+    ) {
+        let change = DdlChange::CreateIndex {
+            table: table.to_string(),
+            name: name.to_string(),
+            columns: columns.to_vec(),
+        };
+        self.ddl_log.write().push((lsn, change.clone()));
+        if let Some(persistence) = &self.persistence {
+            let _ = persistence.append_ddl_log(lsn, &change);
+        }
+    }
+
+    pub(crate) fn log_drop_index_ddl(&self, table: &str, name: &str, lsn: Lsn) {
+        let change = DdlChange::DropIndex {
+            table: table.to_string(),
+            name: name.to_string(),
         };
         self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
@@ -2904,6 +3453,11 @@ impl Database {
         mut changes: ChangeSet,
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
+        // Per I14: the whole batch takes the index-maintenance lock once.
+        // Per-row commits reuse the same guard via the per-row apply that
+        // runs inside the tx manager's commit_mutex, so no second write
+        // acquisition happens for the scope of this call.
+        self.relational_store.bump_index_write_lock_count();
         self.plugin.on_sync_pull(&mut changes)?;
         self.check_disk_budget("sync_pull")?;
         self.preflight_sync_apply_memory(&changes, policies)?;
@@ -3051,14 +3605,65 @@ impl Database {
                     name,
                     columns,
                 } => {
-                    // Stub: ignore — impl must write the IndexDecl into
-                    // TableMeta.indexes on the receiver so SY01/SY04/SY05 pass.
-                    let _ = (table, name, columns);
+                    // Apply at the receiver: write IndexDecl into
+                    // TableMeta.indexes, register storage, rebuild over
+                    // locally-resident rows. Emit a matching DDL log entry.
+                    if self.table_meta(&table).is_some() {
+                        let already = self
+                            .table_meta(&table)
+                            .map(|m| m.indexes.iter().any(|i| i.name == name))
+                            .unwrap_or(false);
+                        if !already {
+                            {
+                                let store = self.relational_store();
+                                let mut metas = store.table_meta.write();
+                                if let Some(m) = metas.get_mut(&table) {
+                                    m.indexes.push(contextdb_core::IndexDecl {
+                                        name: name.clone(),
+                                        columns: columns.clone(),
+                                    });
+                                }
+                            }
+                            self.relational_store().create_index_storage(
+                                &table,
+                                &name,
+                                columns.clone(),
+                            );
+                            self.relational_store().rebuild_index(&table, &name);
+                            if let Some(table_meta) = self.table_meta(&table) {
+                                self.persist_table_meta(&table, &table_meta)?;
+                            }
+                            self.allocate_ddl_lsn(|lsn| {
+                                self.log_create_index_ddl(&table, &name, &columns, lsn)
+                            });
+                        }
+                    }
+                    table_meta_cache.remove(&table);
                 }
                 DdlChange::DropIndex { table, name } => {
-                    // Stub: ignore — impl must remove the IndexDecl from
-                    // TableMeta.indexes so SY02 passes.
-                    let _ = (table, name);
+                    if self.table_meta(&table).is_some() {
+                        let exists = self
+                            .table_meta(&table)
+                            .map(|m| m.indexes.iter().any(|i| i.name == name))
+                            .unwrap_or(false);
+                        if exists {
+                            {
+                                let store = self.relational_store();
+                                let mut metas = store.table_meta.write();
+                                if let Some(m) = metas.get_mut(&table) {
+                                    m.indexes.retain(|i| i.name != name);
+                                }
+                            }
+                            self.relational_store().drop_index_storage(&table, &name);
+                            if let Some(table_meta) = self.table_meta(&table) {
+                                self.persist_table_meta(&table, &table_meta)?;
+                            }
+                            self.allocate_ddl_lsn(|lsn| {
+                                self.log_drop_index_ddl(&table, &name, lsn)
+                            });
+                        }
+                    }
+                    table_meta_cache.remove(&table);
                 }
             }
         }

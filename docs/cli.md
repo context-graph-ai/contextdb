@@ -95,6 +95,20 @@ For file-backed databases, `SET DISK_LIMIT` persists in the database file and su
 | `.schema <table>` | `\d <table>` | Show table DDL and constraints. |
 | `.explain <sql>` | | Show the query execution plan (useful for seeing whether vector search uses HNSW or brute-force). |
 
+### Trace vs Explain
+
+`.explain <sql>` is the interactive CLI command — it runs the SQL, formats
+the physical plan and trace fields, and prints them for a human. It names
+the strategy (`Scan`, `IndexScan`, `Sort`, etc.), the chosen index name
+when applicable, any predicates pushed to the index, and whether a `Sort`
+node was elided by index-driven ordering.
+
+For machine-readable access, every `QueryResult` returned by
+`Database::execute` carries a `trace: QueryTrace` field with the same
+information plus the set of indexes the planner considered and rejected.
+Agent code and tests assert on `QueryResult.trace` directly; `.explain`
+formats the same fields for terminal inspection.
+
 ### Sync Commands
 
 All sync commands require `--tenant-id` at startup. Without it:

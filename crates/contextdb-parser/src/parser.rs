@@ -1458,10 +1458,10 @@ fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     let amount = amount.ok_or_else(|| Error::ParseError("RETAIN missing duration".to_string()))?;
     let unit = unit.ok_or_else(|| Error::ParseError("RETAIN missing unit".to_string()))?;
     let duration_seconds = match unit.as_str() {
-        "SECONDS" => amount,
-        "MINUTES" => amount.saturating_mul(60),
-        "HOURS" => amount.saturating_mul(60 * 60),
-        "DAYS" => amount.saturating_mul(24 * 60 * 60),
+        "SECONDS" | "SECOND" => amount,
+        "MINUTES" | "MINUTE" => amount.saturating_mul(60),
+        "HOURS" | "HOUR" => amount.saturating_mul(60 * 60),
+        "DAYS" | "DAY" => amount.saturating_mul(24 * 60 * 60),
         _ => {
             return Err(Error::ParseError(format!(
                 "unsupported RETAIN unit: {unit}"
@@ -1718,18 +1718,27 @@ fn build_create_index(pair: Pair<'_, Rule>) -> Result<CreateIndex> {
                 table = Some(parse_identifier(p.as_str()));
             }
             Rule::indexed_column => {
-                // Stub: always emit Asc regardless of declared direction. Impl
-                // must read the optional `index_sort_direction` child and map
-                // ASC/DESC to SortDirection::Asc/Desc.
                 let mut col_name: Option<String> = None;
+                let mut direction = SortDirection::Asc;
                 for inner in p.into_inner() {
-                    if inner.as_rule() == Rule::identifier && col_name.is_none() {
-                        col_name = Some(parse_identifier(inner.as_str()));
+                    match inner.as_rule() {
+                        Rule::identifier if col_name.is_none() => {
+                            col_name = Some(parse_identifier(inner.as_str()));
+                        }
+                        Rule::index_sort_direction => {
+                            let token = inner.as_str().to_ascii_uppercase();
+                            direction = if token == "DESC" {
+                                SortDirection::Desc
+                            } else {
+                                SortDirection::Asc
+                            };
+                        }
+                        other => return Err(unexpected_rule(other, "build_create_index/column")),
                     }
                 }
                 let col = col_name
                     .ok_or_else(|| Error::ParseError("CREATE INDEX missing column".to_string()))?;
-                columns.push((col, SortDirection::Asc));
+                columns.push((col, direction));
             }
             other => return Err(unexpected_rule(other, "build_create_index")),
         }

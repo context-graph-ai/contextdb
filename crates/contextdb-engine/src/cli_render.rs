@@ -70,22 +70,68 @@ pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
             .join(", ");
         writeln!(&mut buf, "DAG({edge_types})").unwrap();
     }
-    // Stub: emit NO `CREATE INDEX ...` lines for declared indexes. Impl must
-    // walk `meta.indexes` and emit one line per index with per-column ASC/DESC.
-    let _ = meta.indexes.len();
+    for decl in &meta.indexes {
+        let cols: Vec<String> = decl
+            .columns
+            .iter()
+            .map(|(c, dir)| {
+                let dir_str = match dir {
+                    contextdb_core::SortDirection::Asc => "ASC",
+                    contextdb_core::SortDirection::Desc => "DESC",
+                };
+                format!("{c} {dir_str}")
+            })
+            .collect();
+        writeln!(
+            &mut buf,
+            "CREATE INDEX {} ON {} ({});",
+            decl.name,
+            table,
+            cols.join(", ")
+        )
+        .unwrap();
+    }
     buf
 }
 
-/// Render the `.explain <sql>` REPL output. Stub returns a placeholder that
-/// does NOT contain `"IndexScan"`, so EX03 fails until the impl fills this
-/// with a real physical-plan + trace summary.
+/// Render the `.explain <sql>` REPL output. Runs the SQL to populate the
+/// trace, then formats the physical plan + index-usage summary.
 pub fn render_explain(
     db: &Database,
     sql: &str,
     params: &std::collections::HashMap<String, Value>,
 ) -> contextdb_core::Result<String> {
-    let _ = (db, sql, params);
-    Ok("Scan(stub)\n".to_string())
+    let result = db.execute(sql, params)?;
+    let mut out = String::new();
+    out.push_str(result.trace.physical_plan);
+    if let Some(idx) = &result.trace.index_used {
+        out.push_str(&format!(" {{ index: {idx} }}"));
+    }
+    out.push('\n');
+    if !result.trace.predicates_pushed.is_empty() {
+        out.push_str("  predicates_pushed: [");
+        for (i, p) in result.trace.predicates_pushed.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(p.as_ref());
+        }
+        out.push_str("]\n");
+    }
+    if !result.trace.indexes_considered.is_empty() {
+        out.push_str("  indexes_considered: [");
+        for (i, c) in result.trace.indexes_considered.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("{}: {}", c.name, c.rejected_reason));
+        }
+        out.push_str("]\n");
+    }
+    if result.trace.sort_elided {
+        out.push_str("  sort_elided: true\n");
+    }
+    Ok(out)
 }
 
 /// Render a single `Value` as the CLI displays it in SELECT output.

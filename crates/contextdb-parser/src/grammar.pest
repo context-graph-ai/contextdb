@@ -198,7 +198,7 @@ table_option = {
     | retain_option
 }
 retain_option = { ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
-retain_unit = { ^"SECONDS" | ^"MINUTES" | ^"HOURS" | ^"DAYS" }
+retain_unit = { ^"SECONDS" | ^"SECOND" | ^"MINUTES" | ^"MINUTE" | ^"HOURS" | ^"HOUR" | ^"DAYS" | ^"DAY" }
 sync_safe_option = { ^"SYNC" ~ ^"SAFE" }
 immutable_option = { ^"IMMUTABLE" }
 state_machine_option = { (^"STATE_MACHINE" | (^"STATE" ~ ^"MACHINE")) ~ "(" ~ state_machine_entries ~ ")" }

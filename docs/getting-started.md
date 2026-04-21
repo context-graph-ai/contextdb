@@ -67,6 +67,56 @@ WHERE id = '550e8400-e29b-41d4-a716-446655440000';
 
 The database enforces the state machine. No application code needed.
 
+Audit-frozen columns — declare `IMMUTABLE` on any column whose value must never be silently rewritten after the initial INSERT:
+
+```sql
+CREATE TABLE audit_decisions (
+  id UUID PRIMARY KEY,
+  decision_type TEXT NOT NULL IMMUTABLE,
+  description TEXT NOT NULL IMMUTABLE,
+  status TEXT NOT NULL DEFAULT 'active'
+);
+
+INSERT INTO audit_decisions (id, decision_type, description)
+VALUES ('550e8400-e29b-41d4-a716-446655440001', 'sql-migration', 'adopt contextdb');
+
+-- Mutable column: succeeds
+UPDATE audit_decisions SET status = 'superseded'
+WHERE id = '550e8400-e29b-41d4-a716-446655440001';
+
+-- Flagged column: rejected with Error::ImmutableColumn
+UPDATE audit_decisions SET decision_type = 'other'
+WHERE id = '550e8400-e29b-41d4-a716-446655440001';
+-- Error: column `decision_type` on table `audit_decisions` is immutable
+```
+
+The row stays at its original `decision_type`; the session continues. To record a correction, INSERT a new row and mark the original `superseded`.
+
+## Indexes and Scale
+
+contextdb is designed for agents holding tens of thousands of entities with
+sub-100ms filtered retrieval. Indexes accelerate filtered scans so a
+10,000-row table answers `WHERE tag = 'x'` in microseconds instead of
+milliseconds.
+
+```sql
+CREATE TABLE observations (
+  id UUID PRIMARY KEY,
+  tag TEXT,
+  value INTEGER
+);
+
+CREATE INDEX idx_tag ON observations (tag);
+
+INSERT INTO observations (id, tag, value)
+VALUES ('650e8400-e29b-41d4-a716-446655440010', 'pay', 1);
+
+SELECT value FROM observations WHERE tag = 'pay';
+```
+
+`.explain` shows which plan ran — `IndexScan` for the filtered select above,
+`Scan` for a query whose WHERE clause does not match a declared index.
+
 ## Persist to Disk
 
 Replace `:memory:` with a file path. Everything else works the same:

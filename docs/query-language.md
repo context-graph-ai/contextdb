@@ -554,3 +554,72 @@ These are explicitly rejected with descriptive error messages:
 | `INSERT ... SELECT` | Not supported |
 | Subqueries outside `IN` | `SubqueryNotSupported` |
 | SUM, AVG, MIN, MAX | Not supported (COUNT only) |
+
+## Indexes
+
+Indexes accelerate filtered scans. Declared indexes maintain a sorted B-tree
+from the index key to the underlying row ids, with MVCC postings so every
+read sees the set of rows live at its snapshot.
+
+### CREATE INDEX
+
+```sql
+CREATE INDEX idx_bucket ON observations (bucket);
+
+-- Per-column direction
+CREATE INDEX idx_recent ON decisions (created_at DESC, id DESC);
+
+-- Composite index (leading-column equality + residual filter)
+CREATE INDEX idx_entities ON entities (context_id, entity_type, created_at DESC, id DESC);
+```
+
+Indexable column types: `INTEGER`, `TEXT`, `UUID`, `TIMESTAMP`, `TXID`,
+`BOOLEAN`, `REAL`. `JSON` and `VECTOR` columns are rejected at DDL time
+with `ColumnNotIndexable`; extract JSON fields into typed columns or use
+HNSW for vectors.
+
+Index names are scoped to the table. A duplicate name on the same table
+returns `DuplicateIndex`; the same name on two different tables is allowed.
+
+### DROP INDEX
+
+```sql
+DROP INDEX idx_bucket ON observations;
+DROP INDEX IF EXISTS idx_bucket ON observations;
+```
+
+`DROP INDEX` without `IF EXISTS` on a nonexistent index returns
+`IndexNotFound`. `DROP INDEX IF EXISTS` is idempotent (returns
+`rows_affected == 0`).
+
+### ALTER TABLE DROP COLUMN
+
+```sql
+ALTER TABLE t DROP COLUMN a;              -- defaults to RESTRICT
+ALTER TABLE t DROP COLUMN a RESTRICT;     -- explicit
+ALTER TABLE t DROP COLUMN a CASCADE;      -- drops dependent indexes
+```
+
+Under `RESTRICT` (the default), dropping a column referenced by any index
+returns `ColumnInIndex { table, column, index }` naming the first dependent
+index in declaration order. Under `CASCADE`, every index whose column list
+mentions the target column is removed, and the returned `QueryResult.cascade`
+carries a `dropped_indexes` list.
+
+### Ordering
+
+Indexes sort by declared direction per column. `NULL` sorts LAST under `ASC`
+and FIRST under `DESC`, matching the engine's ORDER BY convention. Float64
+values use `f64::total_cmp` — `NaN` sorts greater than any finite value,
+matching the ordering test suite.
+
+### Error variants
+
+| Error | When it fires |
+|-------|---------------|
+| `IndexNotFound { table, index }` | `DROP INDEX` without `IF EXISTS` on a missing index |
+| `DuplicateIndex { table, index }` | `CREATE INDEX` with a name already in use on the same table |
+| `ColumnNotIndexable { table, column, column_type }` | `CREATE INDEX` on a `JSON` or `VECTOR` column |
+| `ColumnInIndex { table, column, index }` | `ALTER TABLE ... DROP COLUMN c RESTRICT` on a column referenced by an index |
+| `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table |
+
