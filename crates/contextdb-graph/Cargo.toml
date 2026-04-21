@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-graph"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
