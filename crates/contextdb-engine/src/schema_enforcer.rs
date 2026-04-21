@@ -2,7 +2,7 @@ use crate::database::Database;
 use contextdb_core::{Error, Result, Value};
 use contextdb_parser::ast::{Expr, Literal};
 use contextdb_planner::PhysicalPlan;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub fn validate_dml(
     plan: &PhysicalPlan,
@@ -17,8 +17,9 @@ pub fn validate_dml(
             //   3. Table-level ImmutableTable rejection
             //   4. Column-level ImmutableColumn rejection (first flagged column in SET-list order)
             //   5. STATE MACHINE / NOT NULL / coerce (handled later in executor)
-            let table_meta = db
-                .table_meta(&p.table)
+            let metas = db.relational_store().table_meta.read();
+            let table_meta = metas
+                .get(&p.table)
                 .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
 
             // (2) Unknown-column check on every SET target.
@@ -32,7 +33,7 @@ pub fn validate_dml(
             }
 
             // (3) Table-level IMMUTABLE short-circuits column-level checks.
-            if db.relational_store().is_immutable(&p.table) {
+            if table_meta.immutable {
                 return Err(Error::ImmutableTable(p.table.clone()));
             }
 
@@ -50,12 +51,18 @@ pub fn validate_dml(
 
             Ok(())
         }
-        PhysicalPlan::Delete(p) if db.relational_store().is_immutable(&p.table) => {
-            Err(Error::ImmutableTable(p.table.clone()))
+        PhysicalPlan::Delete(p) => {
+            let metas = db.relational_store().table_meta.read();
+            if metas.get(&p.table).is_some_and(|meta| meta.immutable) {
+                Err(Error::ImmutableTable(p.table.clone()))
+            } else {
+                Ok(())
+            }
         }
         PhysicalPlan::Insert(p) => {
-            let table_meta = db
-                .table_meta(&p.table)
+            let metas = db.relational_store().table_meta.read();
+            let table_meta = metas
+                .get(&p.table)
                 .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
 
             // When no column list is provided, infer from table metadata.
@@ -72,40 +79,6 @@ pub fn validate_dml(
                         "column '{}' does not exist in table '{}'",
                         col_name, p.table
                     )));
-                }
-            }
-
-            if p.on_conflict.is_none()
-                && let Some(id_idx) = columns.iter().position(|c| c == "id")
-            {
-                let id_column_indexed = db.index_covers_column_pub(&p.table, "id");
-                let mut pending_ids = HashSet::new();
-                for row in &p.values {
-                    let id_value = row
-                        .get(id_idx)
-                        .map(|e| resolve_expr(e, params))
-                        .transpose()?;
-                    if let Some(v) = id_value {
-                        if !pending_ids.insert(cache_key_for_value(&v)) {
-                            return Err(Error::UniqueViolation {
-                                table: p.table.clone(),
-                                column: "id".to_string(),
-                            });
-                        }
-                        let found = if id_column_indexed {
-                            // O(log n) index probe.
-                            db.index_point_probe(&p.table, "id", &v)?
-                        } else {
-                            db.point_lookup(&p.table, "id", &v, db.snapshot())?
-                                .map(|r| r.row_id)
-                        };
-                        if found.is_some() {
-                            return Err(Error::UniqueViolation {
-                                table: p.table.clone(),
-                                column: "id".to_string(),
-                            });
-                        }
-                    }
                 }
             }
 
@@ -168,9 +141,4 @@ fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Value> {
             "unsupported expression in schema enforcer".to_string(),
         )),
     }
-}
-
-fn cache_key_for_value(value: &Value) -> Vec<u8> {
-    bincode::serde::encode_to_vec(value, bincode::config::standard())
-        .expect("Value should serialize for uniqueness cache key generation")
 }

@@ -1052,10 +1052,10 @@ fn coerce_value_for_column_exhaustive_no_catch_all() {
     let body = std::fs::read_to_string(&executor_rs)
         .unwrap_or_else(|e| panic!("read {}: {e}", executor_rs.display()));
 
-    // Locate `fn coerce_value_for_column` and extract its body by brace matching.
+    // Locate the metadata-borrowing coercion helper and extract its body by brace matching.
     let fn_start = body
-        .find("fn coerce_value_for_column")
-        .expect("coerce_value_for_column must exist in executor.rs");
+        .find("fn coerce_value_for_column_with_meta")
+        .expect("coerce_value_for_column_with_meta must exist in executor.rs");
     let tail = &body[fn_start..];
     let body_start = tail.find('{').expect("fn has opening brace");
     let mut depth = 0i32;
@@ -1102,7 +1102,7 @@ fn coerce_value_for_column_exhaustive_no_catch_all() {
     let catchall_re = Regex::new(r"(?m)^\s*_\s*=>").expect("catchall regex compiles");
     assert!(
         !catchall_re.is_match(match_body),
-        "coerce_value_for_column's match on col.column_type must not contain a `_ =>` catch-all arm; body:\n{match_body}"
+        "coerce_value_for_column_with_meta's match on col.column_type must not contain a `_ =>` catch-all arm; body:\n{match_body}"
     );
 
     // Runtime leg: inserting Value::Text("x") into a VECTOR(3) column must not silently succeed.

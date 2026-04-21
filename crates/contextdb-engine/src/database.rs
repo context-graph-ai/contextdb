@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 type DynStore = Box<dyn WriteSetApplicator>;
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
+const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -71,6 +72,12 @@ pub struct QueryResult {
     pub rows_affected: u64,
     pub trace: QueryTrace,
     pub cascade: Option<CascadeReport>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedStatement {
+    stmt: Statement,
+    plan: PhysicalPlan,
 }
 
 impl QueryResult {
@@ -124,6 +131,7 @@ pub struct Database {
     sync_watermark: Arc<AtomicLsn>,
     closed: AtomicBool,
     rows_examined: AtomicU64,
+    statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
 }
 
 pub(crate) enum InsertRowResult {
@@ -140,6 +148,12 @@ pub(crate) struct IndexScanTxOverlay {
 enum RowConstraintCheck {
     Valid,
     DuplicateUniqueNoOp,
+}
+
+enum ConstraintProbe {
+    NoIndex,
+    NoMatch,
+    Match(RowId),
 }
 
 impl std::fmt::Debug for Database {
@@ -251,6 +265,7 @@ impl Database {
             sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
             closed: AtomicBool::new(false),
             rows_examined: AtomicU64::new(0),
+            statement_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -427,6 +442,17 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        if let Some(cached) = self.cached_statement(sql) {
+            let active_tx = *self.session_tx.lock();
+            return self.execute_statement_with_plan(
+                &cached.stmt,
+                sql,
+                params,
+                active_tx,
+                Some(&cached.plan),
+            );
+        }
+
         let stmt = contextdb_parser::parse(sql)?;
 
         match &stmt {
@@ -457,6 +483,46 @@ impl Database {
 
         let active_tx = *self.session_tx.lock();
         self.execute_statement(&stmt, sql, params, active_tx)
+    }
+
+    fn cached_statement(&self, sql: &str) -> Option<Arc<CachedStatement>> {
+        self.statement_cache.read().get(sql).cloned()
+    }
+
+    fn cache_statement_if_eligible(&self, sql: &str, stmt: &Statement, plan: &PhysicalPlan) {
+        if !Self::is_statement_cache_eligible(stmt, plan) {
+            return;
+        }
+
+        let mut cache = self.statement_cache.write();
+        if cache.contains_key(sql) {
+            return;
+        }
+        if cache.len() >= MAX_STATEMENT_CACHE_ENTRIES {
+            return;
+        }
+        cache.insert(
+            sql.to_string(),
+            Arc::new(CachedStatement {
+                stmt: stmt.clone(),
+                plan: plan.clone(),
+            }),
+        );
+    }
+
+    fn is_statement_cache_eligible(stmt: &Statement, plan: &PhysicalPlan) -> bool {
+        matches!((stmt, plan), (Statement::Insert(ins), PhysicalPlan::Insert(_))
+            if !ins.table.eq_ignore_ascii_case("GRAPH")
+                && !ins.table.eq_ignore_ascii_case("__edges"))
+    }
+
+    pub(crate) fn clear_statement_cache(&self) {
+        self.statement_cache.write().clear();
+    }
+
+    #[doc(hidden)]
+    pub fn __statement_cache_len(&self) -> usize {
+        self.statement_cache.read().len()
     }
 
     fn execute_autocommit(
@@ -537,7 +603,7 @@ impl Database {
             self.release_delete_allocations(&ws);
             ws.stamp_lsn(lsn);
             self.plugin.post_commit(&ws, source);
-            self.publish_commit_event(Self::build_commit_event(&ws, source, lsn));
+            self.publish_commit_event_if_subscribers(&ws, source, lsn);
         }
 
         Ok(())
@@ -575,8 +641,17 @@ impl Database {
         }
     }
 
-    fn publish_commit_event(&self, event: CommitEvent) {
+    fn publish_commit_event_if_subscribers(
+        &self,
+        ws: &contextdb_tx::WriteSet,
+        source: CommitSource,
+        lsn: Lsn,
+    ) {
         let mut subscriptions = self.subscriptions.lock();
+        if subscriptions.subscribers.is_empty() {
+            return;
+        }
+        let event = Self::build_commit_event(ws, source, lsn);
         let subscribers = std::mem::take(&mut subscriptions.subscribers);
         let mut live_subscribers = Vec::with_capacity(subscribers.len());
 
@@ -618,6 +693,17 @@ impl Database {
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
     ) -> Result<QueryResult> {
+        self.execute_statement_with_plan(stmt, sql, params, tx, None)
+    }
+
+    fn execute_statement_with_plan(
+        &self,
+        stmt: &Statement,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+        cached_plan: Option<&PhysicalPlan>,
+    ) -> Result<QueryResult> {
         self.plugin.on_query(sql)?;
 
         if let Some(change) = self.ddl_change_for_statement(stmt).as_ref() {
@@ -634,31 +720,49 @@ impl Database {
 
         let started = Instant::now();
         let result = (|| {
-            // Pre-resolve InSubquery expressions with CTE context before planning
-            let stmt = self.pre_resolve_cte_subqueries(stmt, params, tx)?;
-            let plan = contextdb_planner::plan(&stmt)?;
-            validate_dml(&plan, self, params)?;
-            let result = match tx {
-                Some(tx) => {
-                    // Reset rows_examined at the top of an in-tx statement so
-                    // sub-plans accumulate rather than overwrite.
-                    self.__reset_rows_examined();
-                    execute_plan(self, &plan, params, Some(tx))
-                }
-                None => self.execute_autocommit(&plan, params),
-            };
-            if result.is_ok()
-                && let Statement::CreateTable(ct) = &stmt
-                && !ct.dag_edge_types.is_empty()
-            {
-                self.graph.register_dag_edge_types(&ct.dag_edge_types);
+            if let Some(plan) = cached_plan {
+                return self.run_planned_statement(stmt, plan, params, tx);
             }
-            result
+
+            let (stmt, plan) = {
+                // Pre-resolve InSubquery expressions with CTE context before planning.
+                let stmt = self.pre_resolve_cte_subqueries(stmt, params, tx)?;
+                let plan = contextdb_planner::plan(&stmt)?;
+                self.cache_statement_if_eligible(sql, &stmt, &plan);
+                (stmt, plan)
+            };
+            self.run_planned_statement(&stmt, &plan, params, tx)
         })();
         let duration = started.elapsed();
         let outcome = query_outcome_from_result(&result);
         self.plugin.post_query(sql, duration, &outcome);
         result.map(strip_internal_row_id)
+    }
+
+    fn run_planned_statement(
+        &self,
+        stmt: &Statement,
+        plan: &PhysicalPlan,
+        params: &HashMap<String, Value>,
+        tx: Option<TxId>,
+    ) -> Result<QueryResult> {
+        validate_dml(plan, self, params)?;
+        let result = match tx {
+            Some(tx) => {
+                // Reset rows_examined at the top of an in-tx statement so
+                // sub-plans accumulate rather than overwrite.
+                self.__reset_rows_examined();
+                execute_plan(self, plan, params, Some(tx))
+            }
+            None => self.execute_autocommit(plan, params),
+        };
+        if result.is_ok()
+            && let Statement::CreateTable(ct) = stmt
+            && !ct.dag_edge_types.is_empty()
+        {
+            self.graph.register_dag_edge_types(&ct.dag_edge_types);
+        }
+        result
     }
 
     /// Handle `INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES (...)`.
@@ -1036,8 +1140,9 @@ impl Database {
         skip_row_id: Option<RowId>,
         allow_duplicate_unique_noop: bool,
     ) -> Result<RowConstraintCheck> {
-        let meta = self
-            .table_meta(table)
+        let metas = self.relational_store.table_meta.read();
+        let meta = metas
+            .get(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
         // Constraint probes MUST see the current committed watermark, not any
         // thread-local override. A PK/UNIQUE violation on a committed row must
@@ -1056,35 +1161,41 @@ impl Database {
             if *value == Value::Null {
                 continue;
             }
-            if self.index_covers_column(table, &column.name) {
-                if self
-                    .probe_column_for_value(tx, table, &column.name, value, snapshot, skip_row_id)?
-                    .is_some()
-                {
+            match self.probe_column_for_constraint(
+                tx,
+                table,
+                &column.name,
+                value,
+                snapshot,
+                skip_row_id,
+            )? {
+                ConstraintProbe::Match(_) => {
                     return Err(Error::UniqueViolation {
                         table: table.to_string(),
                         column: column.name.clone(),
                     });
                 }
-            } else {
-                // Fallback to full scan for PK columns without an index.
-                if visible_rows_cache.is_none() {
-                    visible_rows_cache = Some(self.relational.scan_filter_with_tx(
-                        Some(tx),
-                        table,
-                        snapshot,
-                        &|row| skip_row_id.is_none_or(|row_id| row.row_id != row_id),
-                    )?);
-                }
-                let rows = visible_rows_cache.as_deref().unwrap();
-                if rows
-                    .iter()
-                    .any(|existing| existing.values.get(&column.name) == Some(value))
-                {
-                    return Err(Error::UniqueViolation {
-                        table: table.to_string(),
-                        column: column.name.clone(),
-                    });
+                ConstraintProbe::NoMatch => {}
+                ConstraintProbe::NoIndex => {
+                    // Fallback to full scan for PK columns without an index.
+                    if visible_rows_cache.is_none() {
+                        visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                            Some(tx),
+                            table,
+                            snapshot,
+                            &|row| skip_row_id.is_none_or(|row_id| row.row_id != row_id),
+                        )?);
+                    }
+                    let rows = visible_rows_cache.as_deref().unwrap();
+                    if rows
+                        .iter()
+                        .any(|existing| existing.values.get(&column.name) == Some(value))
+                    {
+                        return Err(Error::UniqueViolation {
+                            table: table.to_string(),
+                            column: column.name.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1102,7 +1213,7 @@ impl Database {
             if *value == Value::Null {
                 continue;
             }
-            let matching_row_ids: Vec<RowId> = match self.probe_column_for_value(
+            let matching_row_ids: Vec<RowId> = match self.probe_column_for_constraint(
                 tx,
                 table,
                 &column.name,
@@ -1110,26 +1221,22 @@ impl Database {
                 snapshot,
                 skip_row_id,
             )? {
-                Some(rid) => vec![rid],
-                None => {
-                    // Double-check via full scan only when no index existed.
-                    if self.index_covers_column(table, &column.name) {
-                        Vec::new()
-                    } else {
-                        if visible_rows_cache.is_none() {
-                            visible_rows_cache = Some(self.relational.scan_filter_with_tx(
-                                Some(tx),
-                                table,
-                                snapshot,
-                                &|row| skip_row_id.is_none_or(|row_id| row.row_id != row_id),
-                            )?);
-                        }
-                        let rows = visible_rows_cache.as_deref().unwrap();
-                        rows.iter()
-                            .filter(|existing| existing.values.get(&column.name) == Some(value))
-                            .map(|existing| existing.row_id)
-                            .collect()
+                ConstraintProbe::Match(rid) => vec![rid],
+                ConstraintProbe::NoMatch => Vec::new(),
+                ConstraintProbe::NoIndex => {
+                    if visible_rows_cache.is_none() {
+                        visible_rows_cache = Some(self.relational.scan_filter_with_tx(
+                            Some(tx),
+                            table,
+                            snapshot,
+                            &|row| skip_row_id.is_none_or(|row_id| row.row_id != row_id),
+                        )?);
                     }
+                    let rows = visible_rows_cache.as_deref().unwrap();
+                    rows.iter()
+                        .filter(|existing| existing.values.get(&column.name) == Some(value))
+                        .map(|existing| existing.row_id)
+                        .collect()
                 }
             };
             self.merge_unique_conflict(
@@ -1243,54 +1350,6 @@ impl Database {
         Ok(())
     }
 
-    /// Public wrapper for `index_covers_column`. Used by schema_enforcer to
-    /// route INSERT id-collision probes through the index when available.
-    pub(crate) fn index_covers_column_pub(&self, table: &str, column: &str) -> bool {
-        self.index_covers_column(table, column)
-    }
-
-    /// Look up `table.column == value` using the covering index at the
-    /// current committed snapshot. Returns the live posting's RowId if
-    /// found. Fast path for INSERT id-collision probes.
-    pub(crate) fn index_point_probe(
-        &self,
-        table: &str,
-        column: &str,
-        value: &Value,
-    ) -> Result<Option<RowId>> {
-        use contextdb_core::{DirectedValue, TotalOrdAsc};
-        // Constraint probe — see comment on check_row_constraints. Must walk
-        // the committed watermark, not any read-side override.
-        let snapshot = self.snapshot();
-        let indexes = self.relational_store.indexes.read();
-        // Fast path for auto-PK: key is directly `(table, "__pk_{column}")`.
-        let auto_name = format!("__pk_{column}");
-        let storage = indexes
-            .get(&(table.to_string(), auto_name))
-            .or_else(|| indexes.get(&(table.to_string(), format!("__unique_{column}"))))
-            .or_else(|| {
-                indexes.iter().find_map(|((t, _), idx)| {
-                    if t == table && idx.columns.len() == 1 && idx.columns[0].0 == column {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-            });
-        let Some(storage) = storage else {
-            return Ok(None);
-        };
-        let key = vec![DirectedValue::Asc(TotalOrdAsc(value.clone()))];
-        if let Some(entries) = storage.tree.get(&key) {
-            for entry in entries {
-                if entry.visible_at(snapshot) {
-                    return Ok(Some(entry.row_id));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// Returns true if `table` has any single-column index covering `column`.
     fn index_covers_column(&self, table: &str, column: &str) -> bool {
         let indexes = self.relational_store.indexes.read();
@@ -1314,12 +1373,9 @@ impl Database {
         })
     }
 
-    /// Look up `(table, column) = value` using the first single-column index
-    /// covering `column`, layered with the tx's staged inserts and deletes.
-    /// Returns `Some(row_id)` if a live posting matches, `None` otherwise.
-    /// Returns `Ok(None)` without an error when no index covers the column —
-    /// callers must fall back to a full scan in that case.
-    fn probe_column_for_value(
+    /// Look up `(table, column) = value` using a single-column index when one
+    /// exists, layered with the tx's staged inserts and deletes.
+    fn probe_column_for_constraint(
         &self,
         tx: TxId,
         table: &str,
@@ -1327,28 +1383,58 @@ impl Database {
         value: &Value,
         snapshot: SnapshotId,
         skip_row_id: Option<RowId>,
-    ) -> Result<Option<RowId>> {
+    ) -> Result<ConstraintProbe> {
         use contextdb_core::{DirectedValue, TotalOrdAsc};
-        // Rows this tx has already staged for delete must not be treated as
-        // obstructions by the constraint probe. The old index entry still
-        // looks visible at the committed-watermark snapshot until commit.
-        let tx_staged_deletes: std::collections::HashSet<RowId> =
-            self.tx_mgr.with_write_set(tx, |ws| {
+        let (tx_staged_deletes, staged_overlap) = self.tx_mgr.with_write_set(tx, |ws| {
+            // Rows this tx has already staged for delete must not be treated as
+            // obstructions by the constraint probe. The old index entry still
+            // looks visible at the committed-watermark snapshot until commit.
+            let deletes = if ws.relational_deletes.is_empty() {
+                std::collections::HashSet::new()
+            } else {
                 ws.relational_deletes
                     .iter()
                     .filter(|(t, _, _)| t == table)
                     .map(|(_, row_id, _)| *row_id)
                     .collect()
-            })?;
+            };
+            let overlap = ws.relational_inserts.iter().find_map(|(t, row)| {
+                if t != table {
+                    return None;
+                }
+                if let Some(sid) = skip_row_id
+                    && row.row_id == sid
+                {
+                    return None;
+                }
+                if row.values.get(column) == Some(value) {
+                    Some(row.row_id)
+                } else {
+                    None
+                }
+            });
+            (deletes, overlap)
+        })?;
         let indexes = self.relational_store.indexes.read();
-        // Find any single-column index matching `column`, preferring auto
-        // (`__pk_` / `__unique_`) indexes for simplicity.
-        let storage_entry = indexes.iter().find(|((t, _), idx)| {
-            t == table && idx.columns.len() == 1 && idx.columns[0].0 == column
-        });
-        let (_, storage) = match storage_entry {
-            Some(e) => e,
-            None => return Ok(None),
+        // Auto constraint indexes have stable names. Try those directly before
+        // falling back to user-declared single-column indexes.
+        let table_key = table.to_string();
+        let pk_key = (table_key.clone(), format!("__pk_{column}"));
+        let unique_key = (table_key, format!("__unique_{column}"));
+        let storage = indexes
+            .get(&pk_key)
+            .or_else(|| indexes.get(&unique_key))
+            .or_else(|| {
+                indexes.iter().find_map(|((t, _), idx)| {
+                    if t == table && idx.columns.len() == 1 && idx.columns[0].0 == column {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+            });
+        let Some(storage) = storage else {
+            return Ok(ConstraintProbe::NoIndex);
         };
         let key = vec![DirectedValue::Asc(TotalOrdAsc(value.clone()))];
         if let Some(entries) = storage.tree.get(&key) {
@@ -1362,29 +1448,15 @@ impl Database {
                     continue;
                 }
                 if entry.visible_at(snapshot) {
-                    return Ok(Some(entry.row_id));
+                    return Ok(ConstraintProbe::Match(entry.row_id));
                 }
             }
         }
         drop(indexes);
-        // Layered tx-staged inserts: same-tx self-collision.
-        let overlap = self.tx_mgr.with_write_set(tx, |ws| {
-            for (t, row) in &ws.relational_inserts {
-                if t != table {
-                    continue;
-                }
-                if let Some(sid) = skip_row_id
-                    && row.row_id == sid
-                {
-                    continue;
-                }
-                if row.values.get(column) == Some(value) {
-                    return Some(row.row_id);
-                }
-            }
-            None
-        })?;
-        Ok(overlap)
+        Ok(match staged_overlap {
+            Some(row_id) => ConstraintProbe::Match(row_id),
+            None => ConstraintProbe::NoMatch,
+        })
     }
 
     /// Probe a composite UNIQUE (a, b, ...) using the first index whose
@@ -3540,6 +3612,7 @@ impl Database {
                         sql.push_str(&constraints.join(" "));
                     }
                     self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                    self.clear_statement_cache();
                     table_meta_cache.remove(&name);
                     visible_rows_cache.remove(&name);
                 }
@@ -3548,6 +3621,7 @@ impl Database {
                         self.drop_table_aux_state(&name);
                         self.relational_store().drop_table(&name);
                         self.remove_persisted_table(&name)?;
+                        self.clear_statement_cache();
                     }
                     table_meta_cache.remove(&name);
                     visible_rows_cache.remove(&name);
@@ -3575,6 +3649,7 @@ impl Database {
                         sql.push_str(&constraints.join(" "));
                     }
                     self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                    self.clear_statement_cache();
                     table_meta_cache.remove(&name);
                     visible_rows_cache.remove(&name);
                 }
@@ -3620,6 +3695,7 @@ impl Database {
                         self.allocate_ddl_lsn(|lsn| {
                             self.log_create_index_ddl(&table, &name, &columns, lsn)
                         })?;
+                        self.clear_statement_cache();
                     }
                     table_meta_cache.remove(&table);
                 }
@@ -3644,6 +3720,7 @@ impl Database {
                             self.allocate_ddl_lsn(|lsn| {
                                 self.log_drop_index_ddl(&table, &name, lsn)
                             })?;
+                            self.clear_statement_cache();
                         }
                     }
                     table_meta_cache.remove(&table);

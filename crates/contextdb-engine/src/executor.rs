@@ -146,6 +146,7 @@ pub(crate) fn execute_plan(
                 db.persist_table_meta(&p.name, &table_meta)?;
                 db.allocate_ddl_lsn(|lsn| db.log_create_table_ddl(&p.name, &table_meta, lsn))?;
             }
+            db.clear_statement_cache();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::DropTable(name) => {
@@ -155,6 +156,7 @@ pub(crate) fn execute_plan(
             db.remove_persisted_table(name)?;
             db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn))?;
             db.accountant().release(bytes_to_release);
+            db.clear_statement_cache();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::AlterTable(p) => {
@@ -318,6 +320,7 @@ pub(crate) fn execute_plan(
                             db.log_alter_table_ddl(&p.table, &table_meta, lsn)
                         })?;
                     }
+                    db.clear_statement_cache();
                     return Ok(QueryResult {
                         columns: vec![],
                         rows: vec![],
@@ -398,6 +401,7 @@ pub(crate) fn execute_plan(
                 }
                 db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn))?;
             }
+            db.clear_statement_cache();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
@@ -1236,19 +1240,32 @@ fn exec_insert(
     db.check_disk_budget("INSERT")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for insert".to_string()))?;
 
+    let insert_meta = db
+        .table_meta(&p.table)
+        .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
     // When no column list is provided (INSERT INTO t VALUES (...)),
     // infer column names from table metadata in declaration order.
     let columns: Vec<String> = if p.columns.is_empty() {
-        let meta = db
-            .table_meta(&p.table)
-            .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
-        meta.columns.iter().map(|c| c.name.clone()).collect()
+        insert_meta.columns.iter().map(|c| c.name.clone()).collect()
     } else {
         p.columns.clone()
     };
 
     // Statement-scoped snapshot of the committed TxId watermark for TXID bound checks.
     let current_tx_max = Some(db.committed_watermark());
+    let route_inserts_to_graph =
+        p.table.eq_ignore_ascii_case("edges") || !insert_meta.dag_edge_types.is_empty();
+    let vector_column = insert_meta.columns.iter().find_map(|column| {
+        if matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) {
+            Some(column.name.clone())
+        } else {
+            None
+        }
+    });
+    let has_column_defaults = insert_meta
+        .columns
+        .iter()
+        .any(|column| column.default.is_some());
 
     let mut rows_affected = 0;
     for row in &p.values {
@@ -1260,14 +1277,25 @@ fn exec_insert(
             let v = resolve_expr(expr, params)?;
             values.insert(
                 col.clone(),
-                coerce_value_for_column(db, &p.table, col, v, current_tx_max, Some(txid))?,
+                coerce_value_for_column_with_meta(
+                    &p.table,
+                    &insert_meta,
+                    col,
+                    v,
+                    current_tx_max,
+                    Some(txid),
+                )?,
             );
         }
 
-        apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
+        if has_column_defaults {
+            apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
+        }
 
-        validate_vector_columns(db, &p.table, &values)?;
-        let row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
+        if vector_column.is_some() {
+            validate_vector_columns(db, &p.table, &values)?;
+        }
+        let row_bytes = estimate_row_bytes_for_meta(&values, &insert_meta, false);
         db.accountant().try_allocate_for(
             row_bytes,
             "insert",
@@ -1275,6 +1303,28 @@ fn exec_insert(
             "Reduce row size or raise MEMORY_LIMIT before inserting more data.",
         )?;
         let checkpoint = db.write_set_checkpoint(txid)?;
+        let graph_edge = if route_inserts_to_graph {
+            match (
+                values.get("source_id"),
+                values.get("target_id"),
+                values.get("edge_type"),
+            ) {
+                (
+                    Some(Value::Uuid(source)),
+                    Some(Value::Uuid(target)),
+                    Some(Value::Text(edge_type)),
+                ) => Some((*source, *target, edge_type.clone())),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let vector_value = vector_column
+            .as_ref()
+            .and_then(|column| match values.get(column) {
+                Some(Value::Vector(vector)) => Some(vector.clone()),
+                _ => None,
+            });
 
         let row_id = if let Some(on_conflict) = &p.on_conflict {
             let conflict_col = &on_conflict.columns[0];
@@ -1348,7 +1398,7 @@ fn exec_insert(
                 }
             }
         } else {
-            match db.insert_row_with_unique_noop(txid, &p.table, values.clone()) {
+            match db.insert_row_with_unique_noop(txid, &p.table, values) {
                 Ok(InsertRowResult::Inserted(row_id)) => row_id,
                 Ok(InsertRowResult::NoOp) => {
                     db.accountant().release(row_bytes);
@@ -1361,18 +1411,8 @@ fn exec_insert(
             }
         };
 
-        if should_route_insert_to_graph(db, &p.table)
-            && let (
-                Some(Value::Uuid(source)),
-                Some(Value::Uuid(target)),
-                Some(Value::Text(edge_type)),
-            ) = (
-                values.get("source_id"),
-                values.get("target_id"),
-                values.get("edge_type"),
-            )
-        {
-            match db.insert_edge(txid, *source, *target, edge_type.clone(), HashMap::new()) {
+        if let Some((source, target, edge_type)) = graph_edge {
+            match db.insert_edge(txid, source, target, edge_type, HashMap::new()) {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -1387,9 +1427,9 @@ fn exec_insert(
             }
         }
 
-        if let Some(v) = vector_value_for_table(db, &p.table, &values)
+        if let Some(v) = vector_value
             && row_id != RowId(0)
-            && let Err(err) = db.insert_vector(txid, row_id, v.clone())
+            && let Err(err) = db.insert_vector(txid, row_id, v)
         {
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
             db.accountant().release(row_bytes);
@@ -1614,6 +1654,7 @@ fn exec_create_index(
         db.log_create_index_ddl(&plan.table, &plan.name, &plan.columns, lsn)
     })?;
 
+    db.clear_statement_cache();
     Ok(QueryResult::empty_with_affected(0))
 }
 
@@ -1644,6 +1685,7 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
         db.persist_table_meta(&plan.table, &table_meta)?;
     }
     db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&plan.table, &plan.name, lsn))?;
+    db.clear_statement_cache();
     Ok(QueryResult::empty_with_affected(0))
 }
 
@@ -4083,6 +4125,17 @@ fn coerce_value_for_column(
         }
         return Ok(coerce_uuid_if_needed(col_name, v));
     };
+    coerce_value_for_column_with_meta(table, &meta, col_name, v, current_tx_max, active_tx)
+}
+
+fn coerce_value_for_column_with_meta(
+    table: &str,
+    meta: &TableMeta,
+    col_name: &str,
+    v: Value,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
     let Some(col) = meta.columns.iter().find(|c| c.name == col_name) else {
         if let Value::TxId(_) = &v {
             return Err(Error::ColumnTypeMismatch {
@@ -4450,13 +4503,6 @@ pub(crate) fn stored_default_expr(expr: &Expr) -> String {
         }
         _ => format!("{expr:?}"),
     }
-}
-
-fn should_route_insert_to_graph(db: &Database, table: &str) -> bool {
-    table.eq_ignore_ascii_case("edges")
-        || db
-            .table_meta(table)
-            .is_some_and(|table_meta| !table_meta.dag_edge_types.is_empty())
 }
 
 fn validate_expires_column(col: &contextdb_parser::ast::ColumnDef) -> Result<()> {

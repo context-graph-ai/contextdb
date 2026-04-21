@@ -1516,18 +1516,13 @@ fn pk01_pk_constraint_check_routes_through_index() {
         .unwrap();
     }
     let elapsed = started.elapsed();
-    // A full-scan check_row_constraints is O(n) per insert, O(n²) total. In
-    // release this stays under 4s; debug builds are much slower, especially
-    // under the full parallel integration suite, so keep the timing guard
-    // loose there and rely on the direct probe below for the routing contract.
-    let budget = if cfg!(debug_assertions) {
-        std::time::Duration::from_secs(15)
-    } else {
-        std::time::Duration::from_secs(4)
-    };
+    // A full-scan check_row_constraints is O(n) per insert, O(n²) total — at
+    // n=10K that is >> 4 seconds on any hardware. An index-routed check stays
+    // well under this budget. The upper bound is generous to avoid CI flakes
+    // while still being a hard contradictor of O(n²).
     assert!(
-        elapsed < budget,
-        "10K PK inserts must finish within {budget:?}, took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(4),
+        "10K PK inserts must finish in <4s, took {elapsed:?}"
     );
     // Direct probe: a duplicate-id INSERT returns UniqueViolation and the
     // constraint probe trace says IndexScan.
@@ -2281,6 +2276,64 @@ fn pr03_index_ddl_emits_ddl_log_entries() {
     assert!(has_drop, "expected DropIndex entry, got {entries:?}");
 }
 
+#[test]
+fn insert_statement_cache_is_cleared_by_schema_ddl() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER)", &empty())
+        .unwrap();
+    let insert_sql = "INSERT INTO t (id, a) VALUES ($id, $a)";
+
+    db.execute(
+        insert_sql,
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("a", Value::Int64(1)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(db.__statement_cache_len(), 1);
+
+    db.execute("CREATE INDEX idx_a ON t (a)", &empty()).unwrap();
+    assert_eq!(db.__statement_cache_len(), 0);
+    db.execute(
+        insert_sql,
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("a", Value::Int64(2)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(db.__statement_cache_len(), 1);
+
+    db.execute("DROP INDEX idx_a ON t", &empty()).unwrap();
+    assert_eq!(db.__statement_cache_len(), 0);
+    db.execute(
+        insert_sql,
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("a", Value::Int64(3)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(db.__statement_cache_len(), 1);
+
+    db.execute("ALTER TABLE t ADD COLUMN note TEXT", &empty())
+        .unwrap();
+    assert_eq!(db.__statement_cache_len(), 0);
+    db.execute(
+        insert_sql,
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("a", Value::Int64(4)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(db.__statement_cache_len(), 1);
+
+    db.execute("DROP TABLE t", &empty()).unwrap();
+    assert_eq!(db.__statement_cache_len(), 0);
+}
+
 // ============================================================================
 // PR04 — RED — rebuild-scale guard: 100K rows + 1 index, close, reopen must
 // complete under 10s on Jetson-class hardware. Binds the upper edge of the
@@ -2292,16 +2345,6 @@ fn database_open_with_100k_rows_and_index_completes_under_upper_bound() {
     use std::time::Instant;
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("db");
-    let (row_count, sample_at, bucket_mod, reopen_budget) = if cfg!(debug_assertions) {
-        (1_000i64, 420i64, 100i64, std::time::Duration::from_secs(15))
-    } else {
-        (
-            100_000i64,
-            42_000i64,
-            10_000i64,
-            std::time::Duration::from_secs(10),
-        )
-    };
     let mut sampled_id: Option<Uuid> = None;
     {
         let db = Database::open(&path).unwrap();
@@ -2313,19 +2356,25 @@ fn database_open_with_100k_rows_and_index_completes_under_upper_bound() {
         db.execute("CREATE INDEX idx_bucket ON t (bucket)", &empty())
             .unwrap();
         let insert_started = Instant::now();
-        for i in 0..row_count {
+        for i in 0..100_000i64 {
+            if i % 1_000 == 0 {
+                db.execute("BEGIN", &empty()).unwrap();
+            }
             let id = Uuid::new_v4();
-            if i == sample_at {
+            if i == 42_000 {
                 sampled_id = Some(id);
             }
             db.execute(
                 "INSERT INTO t (id, bucket) VALUES ($id, $b)",
                 &params(vec![
                     ("id", Value::Uuid(id)),
-                    ("b", Value::Int64(i % bucket_mod)),
+                    ("b", Value::Int64(i % 10_000)),
                 ]),
             )
             .unwrap();
+            if i % 1_000 == 999 {
+                db.execute("COMMIT", &empty()).unwrap();
+            }
         }
         let insert_elapsed = insert_started.elapsed();
         // File-backed 100K INSERTs under O(n log n) finish well under this
@@ -2342,15 +2391,16 @@ fn database_open_with_100k_rows_and_index_completes_under_upper_bound() {
     let db = Database::open(&path).unwrap();
     let elapsed = started.elapsed();
     assert!(
-        elapsed < reopen_budget,
-        "{row_count}-row reopen must complete within {reopen_budget:?}; took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(10),
+        "100K-row reopen must complete in <10s; took {elapsed:?}"
     );
     // Index functional after reopen.
     let r = db
         .execute("SELECT id FROM t WHERE bucket = 42", &empty())
         .unwrap();
     assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows.len(), (row_count / bucket_mod) as usize);
+    // 100_000 / 10_000 = 10 rows per bucket.
+    assert_eq!(r.rows.len(), 10);
     assert!(db.__rows_examined() <= 50, "got {}", db.__rows_examined());
     // Full-row identity: the sampled row is readable back by PK.
     let r2 = db
@@ -2363,7 +2413,7 @@ fn database_open_with_100k_rows_and_index_completes_under_upper_bound() {
     match (&r2.rows[0][0], &r2.rows[0][1]) {
         (Value::Uuid(u), Value::Int64(b)) => {
             assert_eq!(*u, sampled_id.unwrap());
-            assert_eq!(*b, sample_at % bucket_mod);
+            assert_eq!(*b, 42_000 % 10_000);
         }
         other => panic!("expected (Uuid, Int64), got {other:?}"),
     }
@@ -2382,16 +2432,11 @@ fn in_memory_100k_pk_inserts_complete_sublinear() {
         &empty(),
     )
     .unwrap();
-    let (row_count, sample_at, budget) = if cfg!(debug_assertions) {
-        (10_000i64, 7_300i64, std::time::Duration::from_secs(15))
-    } else {
-        (100_000i64, 73_000i64, std::time::Duration::from_secs(10))
-    };
     let mut sampled_id: Option<Uuid> = None;
     let started = Instant::now();
-    for i in 0..row_count {
+    for i in 0..100_000i64 {
         let id = Uuid::new_v4();
-        if i == sample_at {
+        if i == 73_000 {
             sampled_id = Some(id);
         }
         db.execute(
@@ -2402,8 +2447,8 @@ fn in_memory_100k_pk_inserts_complete_sublinear() {
     }
     let elapsed = started.elapsed();
     assert!(
-        elapsed < budget,
-        "in-memory {row_count} PK INSERTs must finish within {budget:?}, took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(10),
+        "in-memory 100K PK INSERTs must finish in <10s, took {elapsed:?}"
     );
     // Full-row identity against a sampled mid-load row.
     let r = db
@@ -2414,7 +2459,7 @@ fn in_memory_100k_pk_inserts_complete_sublinear() {
         .unwrap();
     assert_eq!(r.rows.len(), 1);
     match &r.rows[0][0] {
-        Value::Int64(b) => assert_eq!(*b, sample_at),
+        Value::Int64(b) => assert_eq!(*b, 73_000),
         other => panic!("expected Int64, got {other:?}"),
     }
 }
@@ -3950,17 +3995,10 @@ fn non_id_pk_column_probe_routes_through_index() {
     }
     let elapsed = started.elapsed();
     // If the non-id-PK code path fell through to full-scan constraint checks,
-    // 10K inserts under O(n^2) would grossly exceed this budget. Debug builds
-    // are slower under the full parallel integration suite, so the structural
-    // probe below is the primary contract check there.
-    let budget = if cfg!(debug_assertions) {
-        std::time::Duration::from_secs(15)
-    } else {
-        std::time::Duration::from_secs(4)
-    };
+    // 10K inserts under O(n^2) would grossly exceed 4s.
     assert!(
-        elapsed < budget,
-        "non-id PK inserts must finish within {budget:?}, took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(4),
+        "non-id PK inserts must finish in <4s, took {elapsed:?}"
     );
     // Probe trace says IndexScan.
     let probe = db
