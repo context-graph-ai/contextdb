@@ -35,6 +35,7 @@ async-nats = "0.46"
 testcontainers = "0.27"
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
+regex = "1"
 
 [[test]]
 name = "integration"

@@ -1,3 +1,4 @@
+use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_server::protocol::{MessageType, PushResponse, WireApplyResult, encode};
@@ -148,7 +149,7 @@ async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
                                 applied_rows: 1,
                                 skipped_rows: 0,
                                 conflicts: Vec::new(),
-                                new_lsn: 2,
+                                new_lsn: Lsn(2),
                             }),
                             error: None,
                         },
@@ -176,7 +177,10 @@ async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
         .await
         .expect("push should retry malformed reply");
     assert_eq!(result.applied_rows, 1);
-    assert!(client.push_watermark() > 0, "push watermark should advance");
+    assert!(
+        client.push_watermark() > Lsn(0),
+        "push watermark should advance"
+    );
 }
 
 /// I connected the sync server to a NATS account that denies its sync subscriptions,
@@ -727,7 +731,7 @@ async fn a8_pull_watermark_advances() {
     assert_eq!(result1.applied_rows, 5, "first pull must apply 5 rows");
     assert_eq!(result1.skipped_rows, 0, "first pull must skip 0 rows");
     assert!(
-        client.pull_watermark() > 0,
+        client.pull_watermark() > Lsn(0),
         "pull watermark must advance after first pull"
     );
     let prev_watermark = client.pull_watermark();
@@ -1083,7 +1087,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                     v
                 },
                 deleted: false,
-                lsn: 10,
+                lsn: Lsn(10),
             },
             RowChange {
                 table: "t".to_string(),
@@ -1100,7 +1104,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                     v
                 },
                 deleted: false,
-                lsn: 11,
+                lsn: Lsn(11),
             },
             RowChange {
                 table: "t".to_string(),
@@ -1116,25 +1120,25 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                     v
                 },
                 deleted: false,
-                lsn: 12,
+                lsn: Lsn(12),
             },
         ],
         edges: Vec::new(),
         vectors: vec![
             VectorChange {
-                row_id: edge_row_a,
+                row_id: RowId(edge_row_a),
                 vector: vec![1.0, 0.0, 0.0],
-                lsn: 10,
+                lsn: Lsn(10),
             },
             VectorChange {
-                row_id: edge_row_b,
+                row_id: RowId(edge_row_b),
                 vector: vec![0.0, 1.0, 0.0],
-                lsn: 11,
+                lsn: Lsn(11),
             },
             VectorChange {
-                row_id: edge_row_c,
+                row_id: RowId(edge_row_c),
                 vector: vec![0.0, 0.0, 1.0],
-                lsn: 12,
+                lsn: Lsn(12),
             },
         ],
         ddl: Vec::new(),
@@ -1328,7 +1332,7 @@ async fn a13_pull_pagination_fetches_all_pages() {
             },
             values,
             deleted: false,
-            lsn: 0,
+            lsn: Lsn(0),
         });
     }
     let changeset = ChangeSet {
@@ -1449,11 +1453,343 @@ async fn a15_concurrent_push_and_pull() {
     assert!(push_r.is_ok(), "concurrent push must succeed");
     assert!(pull_r.is_ok(), "concurrent pull must succeed");
     assert!(
-        client.push_watermark() > 0,
+        client.push_watermark() > Lsn(0),
         "push watermark must be non-zero after concurrent ops"
     );
     assert!(
-        client.pull_watermark() > 0,
+        client.pull_watermark() > Lsn(0),
         "pull watermark must be non-zero after concurrent ops"
+    );
+}
+
+// ======== T14 ========
+#[test]
+fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use contextdb_engine::sync_types::NaturalKey;
+    use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, RowChange};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    // Single in-memory edge — the receiver. A fresh `Database::open_memory()`
+    // starts with committed_watermark == TxId(0) and next_tx == TxId(1). Peer
+    // TxId(100) is well beyond the local initial watermark, which is the exact
+    // condition this test pins: sync-apply must accept a peer TxId that exceeds
+    // the receiver's local allocator and advance both counters accordingly.
+    let edge_b = Database::open_memory();
+
+    edge_b
+        .execute(
+            "CREATE TABLE t (pk UUID PRIMARY KEY, x TXID NOT NULL)",
+            &HashMap::new(),
+        )
+        .expect("edge_b CREATE TABLE must succeed");
+
+    // Construct a ChangeSet carrying Value::TxId(TxId(100)) for table `t` column `x`.
+    let pk = Uuid::from_u128(0xFEED_FACE_0000_0001_0000_0000_0000_0001);
+    let mut values: HashMap<String, Value> = HashMap::new();
+    values.insert("pk".to_string(), Value::Uuid(pk));
+    values.insert("x".to_string(), Value::TxId(TxId(100)));
+    let changeset = ChangeSet {
+        rows: vec![RowChange {
+            table: "t".to_string(),
+            natural_key: NaturalKey {
+                column: "pk".to_string(),
+                value: Value::Uuid(pk),
+            },
+            values,
+            deleted: false,
+            lsn: contextdb_core::Lsn(1),
+        }],
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl: Vec::new(),
+    };
+
+    // Apply on edge-B — apply_changes is the sync-pull entry point and internally
+    // commits under CommitSource::SyncPull.
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let result = edge_b
+        .apply_changes(changeset, &policies)
+        .expect("sync-apply must succeed for peer TxId beyond local watermark");
+
+    // Row-count pinned.
+    assert_eq!(
+        result.applied_rows, 1,
+        "sync-apply must report exactly 1 applied row, got {}",
+        result.applied_rows
+    );
+
+    // Allocator pinned: next_tx must have advanced past the peer max.
+    let next_tx_after = edge_b.next_tx();
+    assert!(
+        next_tx_after.0 >= 101,
+        "edge_b.next_tx must be >= TxId(101) after applying peer TxId(100); got {:?}",
+        next_tx_after
+    );
+
+    // Watermark pinned: committed_watermark must have advanced past the peer value.
+    let watermark_after = edge_b.committed_watermark();
+    assert!(
+        watermark_after.0 >= 100,
+        "edge_b.committed_watermark must be >= TxId(100) after applying peer TxId(100); got {:?}",
+        watermark_after
+    );
+
+    // A subsequent local transaction on edge-B must allocate a TxId >= 101 —
+    // proving the allocator did not silently reuse an id. begin() returns a bare
+    // TxId; rollback releases it.
+    let probe_tx = edge_b.begin();
+    assert!(
+        probe_tx.0 >= 101,
+        "new transaction on edge_b must issue TxId >= 101 after allocator advance; got {:?}",
+        probe_tx
+    );
+    edge_b
+        .rollback(probe_tx)
+        .expect("rollback of probe tx must succeed");
+
+    // SELECT x FROM t on edge-B returns exactly one row whose cell equals Value::TxId(TxId(100)).
+    let result = edge_b
+        .execute("SELECT x FROM t", &HashMap::new())
+        .expect("SELECT must succeed");
+    assert_eq!(result.rows.len(), 1, "edge_b must have exactly 1 row in t");
+    let x_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("result must have column \"x\"");
+    assert_eq!(
+        result.rows[0][x_idx],
+        Value::TxId(TxId(100)),
+        "edge_b row cell must equal Value::TxId(TxId(100))"
+    );
+}
+
+// ======== T15 ========
+#[test]
+fn sync_apply_rejects_peer_txid_u64_max() {
+    use contextdb_core::{Error, TxId, Value};
+    use contextdb_engine::Database;
+    use contextdb_engine::sync_types::NaturalKey;
+    use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, RowChange};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (pk UUID PRIMARY KEY, x TXID NOT NULL)",
+        &HashMap::new(),
+    )
+    .expect("CREATE TABLE must succeed");
+
+    // A fresh `Database::open_memory()` starts with next_tx == TxId(1) and
+    // committed_watermark == TxId(0). Pin those exact values as preconditions
+    // so the "allocator unchanged after overflow rejection" assertion below
+    // has deterministic, typed expected values rather than merely captured
+    // copies.
+    let next_tx_before = db.next_tx();
+    let watermark_before = db.committed_watermark();
+    assert_eq!(
+        next_tx_before,
+        TxId(1),
+        "precondition: fresh open_memory next_tx must be TxId(1)"
+    );
+    assert_eq!(
+        watermark_before,
+        TxId(0),
+        "precondition: fresh open_memory committed_watermark must be TxId(0)"
+    );
+
+    // Construct a ChangeSet with Value::TxId(TxId(u64::MAX)).
+    let pk = Uuid::from_u128(0xDEAD_BEEF_0000_0002_0000_0000_0000_0002);
+    let mut values: HashMap<String, Value> = HashMap::new();
+    values.insert("pk".to_string(), Value::Uuid(pk));
+    values.insert("x".to_string(), Value::TxId(TxId(u64::MAX)));
+    let changeset = ChangeSet {
+        rows: vec![RowChange {
+            table: "t".to_string(),
+            natural_key: NaturalKey {
+                column: "pk".to_string(),
+                value: Value::Uuid(pk),
+            },
+            values,
+            deleted: false,
+            lsn: contextdb_core::Lsn(1),
+        }],
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl: Vec::new(),
+    };
+
+    // Apply must return Err(Error::TxIdOverflow { table: "t", incoming: u64::MAX }).
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let err = db
+        .apply_changes(changeset, &policies)
+        .expect_err("sync-apply must reject Value::TxId(TxId(u64::MAX))");
+
+    match err {
+        Error::TxIdOverflow { table, incoming } => {
+            assert_eq!(table, "t", "error.table must equal the target table");
+            assert_eq!(incoming, u64::MAX, "error.incoming must equal u64::MAX");
+        }
+        other => panic!("expected Error::TxIdOverflow, got {other:?}"),
+    }
+
+    // Allocator state must be unchanged.
+    assert_eq!(
+        db.next_tx(),
+        next_tx_before,
+        "next_tx must be unchanged after overflow rejection"
+    );
+    assert_eq!(
+        db.committed_watermark(),
+        watermark_before,
+        "committed_watermark must be unchanged after overflow rejection"
+    );
+
+    // No row must have been committed into table t.
+    let count_rows = db
+        .execute("SELECT COUNT(*) FROM t", &HashMap::new())
+        .expect("SELECT COUNT(*) must succeed")
+        .rows;
+    assert_eq!(count_rows.len(), 1);
+    assert_eq!(
+        count_rows[0][0],
+        Value::Int64(0),
+        "no row must be committed when sync-apply overflow aborts"
+    );
+}
+
+// ======== T16 ========
+#[test]
+fn sync_apply_row_count_preserved_across_txid_boundary() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use contextdb_engine::sync_types::NaturalKey;
+    use contextdb_engine::sync_types::{
+        ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, RowChange,
+    };
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (pk UUID PRIMARY KEY, x TXID NOT NULL)",
+        &HashMap::new(),
+    )
+    .expect("CREATE TABLE must succeed");
+
+    // Fresh `Database::open_memory()` starts at committed_watermark == TxId(0).
+    // The 50 incoming rows carry Value::TxId(TxId(51..=100)), which straddles a
+    // clear gap above the local watermark — this is the "txid boundary" the
+    // test title references. Row-count preservation must hold regardless of
+    // that gap.
+
+    // Build 50 RowChange entries with TxId(51..=100), each with a unique primary key.
+    let mut row_changes: Vec<RowChange> = Vec::with_capacity(50);
+    for i in 0..50u64 {
+        let pk = Uuid::from_u128(0xABCD_0000_0000_0000_0000_0000_0000_0000u128 + (i as u128));
+        let mut values: HashMap<String, Value> = HashMap::new();
+        values.insert("pk".to_string(), Value::Uuid(pk));
+        values.insert("x".to_string(), Value::TxId(TxId(51 + i)));
+        row_changes.push(RowChange {
+            table: "t".to_string(),
+            natural_key: NaturalKey {
+                column: "pk".to_string(),
+                value: Value::Uuid(pk),
+            },
+            values,
+            deleted: false,
+            lsn: contextdb_core::Lsn(100 + i),
+        });
+    }
+    let changeset = ChangeSet {
+        rows: row_changes,
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl: Vec::new(),
+    };
+
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let result: ApplyResult = db
+        .apply_changes(changeset, &policies)
+        .expect("sync-apply must succeed for 50-row TxId batch");
+
+    // Destructure all counters.
+    let ApplyResult {
+        applied_rows,
+        skipped_rows,
+        conflicts,
+        new_lsn: _new_lsn,
+    } = result;
+
+    assert_eq!(
+        applied_rows, 50,
+        "all 50 rows must apply; got applied_rows={applied_rows}"
+    );
+    assert_eq!(
+        skipped_rows, 0,
+        "no rows must be skipped; got skipped_rows={skipped_rows}"
+    );
+    assert!(
+        conflicts.is_empty(),
+        "no rows must land in conflicts; got conflicts.len()={}",
+        conflicts.len()
+    );
+
+    // Follow-up SELECT COUNT(*) must reflect 50 committed rows.
+    let count_rows = db
+        .execute("SELECT COUNT(*) FROM t", &HashMap::new())
+        .expect("SELECT COUNT(*) must succeed")
+        .rows;
+    assert_eq!(count_rows.len(), 1);
+    assert_eq!(
+        count_rows[0][0],
+        Value::Int64(50),
+        "COUNT(*) must equal 50 after applying 50 sync rows"
+    );
+
+    // Identity guard: read back two specific rows by primary key and assert the
+    // stored Value::TxId matches the exact value supplied on the incoming
+    // RowChange. Cardinality (50 == 50) is satisfied by pass-through stubs that
+    // echo row counts without preserving per-row TxId identity; this check
+    // forces byte-level fidelity of Value::TxId through the sync-apply path.
+    let pk_first = Uuid::from_u128(0xABCD_0000_0000_0000_0000_0000_0000_0000u128);
+    let pk_last = Uuid::from_u128(0xABCD_0000_0000_0000_0000_0000_0000_0000u128 + 49u128);
+
+    let mut params_first: HashMap<String, Value> = HashMap::new();
+    params_first.insert("pk".to_string(), Value::Uuid(pk_first));
+    let first_rows = db
+        .execute("SELECT x FROM t WHERE pk = $pk", &params_first)
+        .expect("SELECT x WHERE pk = first must succeed")
+        .rows;
+    assert_eq!(
+        first_rows.len(),
+        1,
+        "exactly one row must match pk = {pk_first}"
+    );
+    assert_eq!(
+        first_rows[0][0],
+        Value::TxId(TxId(51)),
+        "row i=0 must store Value::TxId(TxId(51)), the exact value supplied on the sync RowChange"
+    );
+
+    let mut params_last: HashMap<String, Value> = HashMap::new();
+    params_last.insert("pk".to_string(), Value::Uuid(pk_last));
+    let last_rows = db
+        .execute("SELECT x FROM t WHERE pk = $pk", &params_last)
+        .expect("SELECT x WHERE pk = last must succeed")
+        .rows;
+    assert_eq!(
+        last_rows.len(),
+        1,
+        "exactly one row must match pk = {pk_last}"
+    );
+    assert_eq!(
+        last_rows[0][0],
+        Value::TxId(TxId(100)),
+        "row i=49 must store Value::TxId(TxId(100)), the exact value supplied on the sync RowChange"
     );
 }

@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/snapshotid_into_rowid.rs:5:23
+  |
+5 |     let _rid: RowId = s;
+  |               -----   ^ expected `RowId`, found `SnapshotId`
+  |               |
+  |               expected due to this

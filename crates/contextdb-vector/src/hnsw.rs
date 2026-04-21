@@ -103,7 +103,7 @@ fn select_params(count: usize) -> (usize, usize, usize) {
 }
 
 fn insertion_key(entry: &VectorEntry) -> u64 {
-    let mut x = entry.row_id ^ entry.lsn ^ entry.created_tx;
+    let mut x = entry.row_id.0 ^ entry.lsn.0 ^ entry.created_tx.0;
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

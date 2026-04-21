@@ -1,3 +1,4 @@
+use contextdb_core::Lsn;
 use contextdb_core::Value;
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
@@ -50,7 +51,7 @@ fn ds01_rows_available_after_reopen() {
     }
 
     let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(0);
+    let cs = db2.changes_since(Lsn(0));
 
     assert_eq!(
         cs.rows.len(),
@@ -94,7 +95,7 @@ fn ds02_ddl_in_changeset_after_reopen() {
     }
 
     let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(0);
+    let cs = db2.changes_since(Lsn(0));
 
     assert_eq!(cs.ddl.len(), 2, "expected 2 DDL entries after reopen");
     let events_ddl = cs
@@ -199,7 +200,7 @@ fn ds03_edges_available_after_reopen() {
     }
 
     let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(0);
+    let cs = db2.changes_since(Lsn(0));
 
     assert_eq!(
         cs.edges.len(),
@@ -244,7 +245,7 @@ fn ds04_vectors_available_after_reopen() {
     }
 
     let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(0);
+    let cs = db2.changes_since(Lsn(0));
 
     assert_eq!(
         cs.vectors.len(),
@@ -285,7 +286,7 @@ fn ds05_edge_restart_push_full_dataset() {
     }
 
     let edge_db2 = Database::open(&edge_path).unwrap();
-    let cs = edge_db2.changes_since(0);
+    let cs = edge_db2.changes_since(Lsn(0));
 
     let server = Database::open_memory();
     server
@@ -329,7 +330,7 @@ fn ds06_idempotent_row_reapply() {
         .unwrap();
     source.commit(tx).unwrap();
 
-    let cs = source.changes_since(0);
+    let cs = source.changes_since(Lsn(0));
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
@@ -386,7 +387,7 @@ fn ds07_idempotent_edge_reapply() {
         .unwrap();
     source.commit(tx).unwrap();
 
-    let cs = source.changes_since(0);
+    let cs = source.changes_since(Lsn(0));
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
@@ -403,7 +404,7 @@ fn ds07_idempotent_edge_reapply() {
         .unwrap();
     assert_eq!(count, 1, "edges must not duplicate on re-apply");
 
-    let cs_after = receiver.changes_since(0);
+    let cs_after = receiver.changes_since(Lsn(0));
     let matching_edges: Vec<_> = cs_after
         .edges
         .iter()
@@ -435,7 +436,7 @@ fn ds08_idempotent_vector_reapply() {
         .unwrap();
     source.commit(tx).unwrap();
 
-    let cs = source.changes_since(0);
+    let cs = source.changes_since(Lsn(0));
     let receiver = Database::open_memory();
     receiver
         .apply_changes(
@@ -485,7 +486,7 @@ fn ds09_future_watermark_returns_empty() {
 
     let db2 = Database::open(&path).unwrap();
     let current_lsn = db2.current_lsn();
-    let cs = db2.changes_since(current_lsn + 1000);
+    let cs = db2.changes_since(Lsn(current_lsn.0 + 1000));
 
     assert!(
         cs.rows.is_empty(),
@@ -576,7 +577,7 @@ fn ds11_empty_db_restart_no_crash() {
     }
 
     let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(0);
+    let cs = db2.changes_since(Lsn(0));
 
     assert!(cs.rows.is_empty(), "empty DB must return empty rows");
     assert!(cs.edges.is_empty(), "empty DB must return empty edges");
@@ -618,7 +619,7 @@ fn ds12_edge_only_db_after_reopen() {
     }
 
     let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(0);
+    let cs = db2.changes_since(Lsn(0));
 
     assert_eq!(cs.edges.len(), 2, "expected 2 edges after reopen");
     assert!(
@@ -658,7 +659,7 @@ fn ds13_vector_only_after_reopen() {
     }
 
     let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(0);
+    let cs = db2.changes_since(Lsn(0));
 
     assert_eq!(
         cs.vectors.len(),
@@ -726,7 +727,7 @@ fn ds14_both_sides_restart_bidirectional() {
     let server2 = Database::open(&server_path).unwrap();
     let edge2 = Database::open(&edge_path).unwrap();
 
-    let cs_server = server2.changes_since(0);
+    let cs_server = server2.changes_since(Lsn(0));
     edge2
         .apply_changes(
             cs_server,
@@ -734,7 +735,7 @@ fn ds14_both_sides_restart_bidirectional() {
         )
         .unwrap();
 
-    let cs_edge = edge2.changes_since(0);
+    let cs_edge = edge2.changes_since(Lsn(0));
     server2
         .apply_changes(
             cs_edge,
@@ -863,7 +864,7 @@ fn ds16_deletion_tombstone_sync() {
     }
     edge.commit(tx).unwrap();
 
-    let cs_initial = edge.changes_since(0);
+    let cs_initial = edge.changes_since(Lsn(0));
     server
         .apply_changes(
             cs_initial,

@@ -63,7 +63,7 @@ pub struct Database {
     graph_store: Arc<GraphStore>,
     vector_store: Arc<VectorStore>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
-    ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
+    ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     persistence: Option<Arc<RedbPersistence>>,
     relational: MemRelationalExecutor<DynStore>,
     graph: MemGraphExecutor<DynStore>,
@@ -78,7 +78,7 @@ pub struct Database {
     pruning_guard: Arc<Mutex<()>>,
     disk_limit: AtomicU64,
     disk_limit_startup_ceiling: AtomicU64,
-    sync_watermark: Arc<AtomicU64>,
+    sync_watermark: Arc<AtomicLsn>,
     closed: AtomicBool,
 }
 
@@ -165,7 +165,7 @@ impl Database {
         vector_store: Arc<VectorStore>,
         hnsw: Arc<OnceLock<parking_lot::RwLock<Option<HnswIndex>>>>,
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
-        ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
+        ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         persistence: Option<Arc<RedbPersistence>>,
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
@@ -198,7 +198,7 @@ impl Database {
             pruning_guard: Arc::new(Mutex::new(())),
             disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
             disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
-            sync_watermark: Arc::new(AtomicU64::new(0)),
+            sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
             closed: AtomicBool::new(false),
         }
     }
@@ -277,7 +277,7 @@ impl Database {
         let max_row_id = relational.max_row_id();
         let max_tx = max_tx_across_all(&relational, &graph, &vector);
         let max_lsn = max_lsn_across_all(&relational, &graph, &vector);
-        relational.set_next_row_id(max_row_id.saturating_add(1));
+        relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
         let change_log = Arc::new(RwLock::new(persistence.load_change_log()?));
         let ddl_log = Arc::new(RwLock::new(persistence.load_ddl_log()?));
@@ -292,8 +292,8 @@ impl Database {
         let store: DynStore = Box::new(persistent);
         let tx_mgr = Arc::new(TxManager::new_with_counters(
             store,
-            max_tx.saturating_add(1),
-            max_lsn.saturating_add(1),
+            TxId(max_tx.0.saturating_add(1)),
+            Lsn(max_lsn.0.saturating_add(1)),
             max_tx,
         ));
 
@@ -485,7 +485,7 @@ impl Database {
     fn build_commit_event(
         ws: &contextdb_tx::WriteSet,
         source: CommitSource,
-        lsn: u64,
+        lsn: Lsn,
     ) -> CommitEvent {
         let mut tables_changed: Vec<String> = ws
             .relational_inserts
@@ -1643,11 +1643,11 @@ impl Database {
         runtime.handle = Some(handle);
     }
 
-    pub fn sync_watermark(&self) -> u64 {
+    pub fn sync_watermark(&self) -> Lsn {
         self.sync_watermark.load(Ordering::SeqCst)
     }
 
-    pub fn set_sync_watermark(&self, watermark: u64) {
+    pub fn set_sync_watermark(&self, watermark: Lsn) {
         self.sync_watermark.store(watermark, Ordering::SeqCst);
     }
 
@@ -1966,7 +1966,7 @@ impl Database {
 
     pub(crate) fn allocate_ddl_lsn<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(u64) -> R,
+        F: FnOnce(Lsn) -> R,
     {
         self.tx_mgr.allocate_ddl_lsn(f)
     }
@@ -1978,7 +1978,7 @@ impl Database {
         self.tx_mgr.with_commit_lock(f)
     }
 
-    pub(crate) fn log_create_table_ddl(&self, name: &str, meta: &TableMeta, lsn: u64) {
+    pub(crate) fn log_create_table_ddl(&self, name: &str, meta: &TableMeta, lsn: Lsn) {
         let change = ddl_change_from_meta(name, meta);
         self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
@@ -1986,7 +1986,7 @@ impl Database {
         }
     }
 
-    pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: u64) {
+    pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: Lsn) {
         let change = DdlChange::DropTable {
             name: name.to_string(),
         };
@@ -1996,7 +1996,7 @@ impl Database {
         }
     }
 
-    pub(crate) fn log_alter_table_ddl(&self, name: &str, meta: &TableMeta, lsn: u64) {
+    pub(crate) fn log_alter_table_ddl(&self, name: &str, meta: &TableMeta, lsn: Lsn) {
         let change = DdlChange::AlterTable {
             name: name.to_string(),
             columns: meta
@@ -2113,31 +2113,33 @@ impl Database {
         })
     }
 
-    pub fn persisted_sync_watermarks(&self, tenant_id: &str) -> Result<(u64, u64)> {
+    pub fn persisted_sync_watermarks(&self, tenant_id: &str) -> Result<(Lsn, Lsn)> {
         let Some(persistence) = &self.persistence else {
-            return Ok((0, 0));
+            return Ok((Lsn(0), Lsn(0)));
         };
         let push = persistence
             .load_config_value::<u64>(&format!("sync_push_watermark:{tenant_id}"))?
-            .unwrap_or(0);
+            .map(Lsn)
+            .unwrap_or(Lsn(0));
         let pull = persistence
             .load_config_value::<u64>(&format!("sync_pull_watermark:{tenant_id}"))?
-            .unwrap_or(0);
+            .map(Lsn)
+            .unwrap_or(Lsn(0));
         Ok((push, pull))
     }
 
-    pub fn persist_sync_push_watermark(&self, tenant_id: &str, watermark: u64) -> Result<()> {
+    pub fn persist_sync_push_watermark(&self, tenant_id: &str, watermark: Lsn) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             persistence
-                .flush_config_value(&format!("sync_push_watermark:{tenant_id}"), &watermark)?;
+                .flush_config_value(&format!("sync_push_watermark:{tenant_id}"), &watermark.0)?;
         }
         Ok(())
     }
 
-    pub fn persist_sync_pull_watermark(&self, tenant_id: &str, watermark: u64) -> Result<()> {
+    pub fn persist_sync_pull_watermark(&self, tenant_id: &str, watermark: Lsn) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             persistence
-                .flush_config_value(&format!("sync_pull_watermark:{tenant_id}"), &watermark)?;
+                .flush_config_value(&format!("sync_pull_watermark:{tenant_id}"), &watermark.0)?;
         }
         Ok(())
     }
@@ -2160,13 +2162,13 @@ impl Database {
         Ok(())
     }
 
-    pub fn change_log_since(&self, since_lsn: u64) -> Vec<ChangeLogEntry> {
+    pub fn change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
         let log = self.change_log.read();
         let start = log.partition_point(|e| e.lsn() <= since_lsn);
         log[start..].to_vec()
     }
 
-    pub fn ddl_log_since(&self, since_lsn: u64) -> Vec<DdlChange> {
+    pub fn ddl_log_since(&self, since_lsn: Lsn) -> Vec<DdlChange> {
         let ddl = self.ddl_log.read();
         let start = ddl.partition_point(|(lsn, _)| *lsn <= since_lsn);
         ddl[start..].iter().map(|(_, c)| c.clone()).collect()
@@ -2273,8 +2275,8 @@ impl Database {
         }
     }
 
-    fn persisted_state_since(&self, since_lsn: u64) -> ChangeSet {
-        if since_lsn == 0 {
+    fn persisted_state_since(&self, since_lsn: Lsn) -> ChangeSet {
+        if since_lsn == Lsn(0) {
             return self.full_state_snapshot();
         }
 
@@ -2456,7 +2458,7 @@ impl Database {
     }
 
     /// Extracts changes from this database since the given LSN.
-    pub fn changes_since(&self, since_lsn: u64) -> ChangeSet {
+    pub fn changes_since(&self, since_lsn: Lsn) -> ChangeSet {
         // Future watermark guard
         if since_lsn > self.current_lsn() {
             return ChangeSet::default();
@@ -2496,7 +2498,7 @@ impl Database {
             (None, None) => None, // both empty, stores empty — nothing to serve
         };
 
-        if min_first_lsn.is_some_and(|min_lsn| min_lsn > since_lsn + 1) {
+        if min_first_lsn.is_some_and(|min_lsn| min_lsn.0 > since_lsn.0 + 1) {
             // Log doesn't cover since_lsn — derive the delta from persisted state.
             return self.persisted_state_since(since_lsn);
         }
@@ -2595,15 +2597,15 @@ impl Database {
         // Only remove a delete if there is a non-delete entry with a HIGHER LSN
         // (i.e., the insert came after the delete, indicating an upsert).
         // If the insert has a lower LSN, the delete is genuine and must be kept.
-        let insert_max_lsn: HashMap<(String, String, String), u64> = {
-            let mut map: HashMap<(String, String, String), u64> = HashMap::new();
+        let insert_max_lsn: HashMap<(String, String, String), Lsn> = {
+            let mut map: HashMap<(String, String, String), Lsn> = HashMap::new();
             for r in rows.iter().filter(|r| !r.deleted) {
                 let key = (
                     r.table.clone(),
                     r.natural_key.column.clone(),
                     format!("{:?}", r.natural_key.value),
                 );
-                let entry = map.entry(key).or_insert(0);
+                let entry = map.entry(key).or_insert(Lsn(0));
                 if r.lsn > *entry {
                     *entry = r.lsn;
                 }
@@ -2637,8 +2639,18 @@ impl Database {
     }
 
     /// Returns the current LSN of this database.
-    pub fn current_lsn(&self) -> u64 {
+    pub fn current_lsn(&self) -> Lsn {
         self.tx_mgr.current_lsn()
+    }
+
+    /// Stub: returns TxId(0) regardless. Impl must return the committed-tx watermark.
+    pub fn committed_watermark(&self) -> TxId {
+        TxId(0)
+    }
+
+    /// Stub: returns TxId(0) regardless. Impl must return the next-tx allocator peek.
+    pub fn next_tx(&self) -> TxId {
+        TxId(0)
     }
 
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
@@ -2682,9 +2694,9 @@ impl Database {
             new_lsn: self.current_lsn(),
         };
         let vector_row_ids = changes.vectors.iter().map(|v| v.row_id).collect::<Vec<_>>();
-        let mut vector_row_map: HashMap<u64, u64> = HashMap::new();
+        let mut vector_row_map: HashMap<RowId, RowId> = HashMap::new();
         let mut vector_row_idx = 0usize;
-        let mut failed_row_ids: HashSet<u64> = HashSet::new();
+        let mut failed_row_ids: HashSet<RowId> = HashSet::new();
         let mut table_meta_cache: HashMap<String, Option<TableMeta>> = HashMap::new();
         let mut visible_rows_cache: HashMap<String, Vec<VersionedRow>> = HashMap::new();
 
@@ -2710,6 +2722,7 @@ impl Database {
                                         ColumnType::Uuid => "UUID".to_string(),
                                         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
                                         ColumnType::Timestamp => "TIMESTAMP".to_string(),
+                                        ColumnType::TxId => "TXID".to_string(),
                                     };
                                     (c.name.clone(), ty)
                                 })
@@ -3225,7 +3238,7 @@ impl Database {
         source: NodeId,
         target: NodeId,
         edge_type: &str,
-        lsn: u64,
+        lsn: Lsn,
     ) -> Option<HashMap<String, Value>> {
         self.graph_store
             .forward_adj
@@ -3239,7 +3252,7 @@ impl Database {
             })
     }
 
-    fn vector_for_row_lsn(&self, row_id: RowId, lsn: u64) -> Option<Vec<f32>> {
+    fn vector_for_row_lsn(&self, row_id: RowId, lsn: Lsn) -> Option<Vec<f32>> {
         self.vector_store
             .vectors
             .read()
@@ -3392,9 +3405,9 @@ fn estimate_edge_bytes(
         target,
         edge_type: edge_type.to_string(),
         properties: properties.clone(),
-        created_tx: 0,
+        created_tx: TxId(0),
         deleted_tx: None,
-        lsn: 0,
+        lsn: Lsn(0),
     }
     .estimated_bytes()
 }
@@ -3441,7 +3454,7 @@ fn prune_expired_rows(
     vector_store: &Arc<VectorStore>,
     accountant: &MemoryAccountant,
     persistence: Option<&Arc<RedbPersistence>>,
-    sync_watermark: u64,
+    sync_watermark: Lsn,
 ) -> u64 {
     let now_millis = current_epoch_millis();
     let metas = relational_store.table_meta.read().clone();
@@ -3566,7 +3579,7 @@ fn row_is_prunable(
     row: &VersionedRow,
     meta: &TableMeta,
     now_millis: u64,
-    sync_watermark: u64,
+    sync_watermark: Lsn,
 ) -> bool {
     if meta.sync_safe && row.lsn >= sync_watermark {
         return false;
@@ -3588,7 +3601,7 @@ fn row_is_prunable(
 
     let ttl_millis = default_ttl_seconds.saturating_mul(1000);
     row.created_at
-        .map(|created_at| now_millis.saturating_sub(created_at) > ttl_millis)
+        .map(|created_at| now_millis.saturating_sub(created_at.0) > ttl_millis)
         .unwrap_or(false)
 }
 
@@ -3611,7 +3624,7 @@ fn max_tx_across_all(
         .flat_map(|rows| rows.iter())
         .flat_map(|row| std::iter::once(row.created_tx).chain(row.deleted_tx))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(TxId(0));
     let graph_max = graph
         .forward_adj
         .read()
@@ -3619,14 +3632,14 @@ fn max_tx_across_all(
         .flat_map(|entries| entries.iter())
         .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(TxId(0));
     let vector_max = vector
         .vectors
         .read()
         .iter()
         .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(TxId(0));
 
     relational_max.max(graph_max).max(vector_max)
 }
@@ -3635,28 +3648,28 @@ fn max_lsn_across_all(
     relational: &RelationalStore,
     graph: &GraphStore,
     vector: &VectorStore,
-) -> u64 {
+) -> Lsn {
     let relational_max = relational
         .tables
         .read()
         .values()
         .flat_map(|rows| rows.iter().map(|row| row.lsn))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(Lsn(0));
     let graph_max = graph
         .forward_adj
         .read()
         .values()
         .flat_map(|entries| entries.iter().map(|entry| entry.lsn))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(Lsn(0));
     let vector_max = vector
         .vectors
         .read()
         .iter()
         .map(|entry| entry.lsn)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(Lsn(0));
 
     relational_max.max(graph_max).max(vector_max)
 }
@@ -3722,6 +3735,7 @@ fn sql_type_for_ast(data_type: &DataType) -> String {
         DataType::Timestamp => "TIMESTAMP".to_string(),
         DataType::Json => "JSON".to_string(),
         DataType::Vector(dim) => format!("VECTOR({dim})"),
+        DataType::TxId => "TXID".to_string(),
     }
 }
 
@@ -3778,6 +3792,7 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
         ColumnType::Timestamp => "TIMESTAMP".to_string(),
+        ColumnType::TxId => "TXID".to_string(),
     };
 
     let fk_rules = rules

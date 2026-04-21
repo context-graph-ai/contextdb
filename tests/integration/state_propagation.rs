@@ -1,3 +1,4 @@
+use contextdb_core::Lsn;
 use contextdb_core::{Error, Value, VersionedRow};
 use contextdb_engine::{ConflictPolicies, ConflictPolicy, Database};
 use std::collections::HashMap;
@@ -973,7 +974,7 @@ fn t17_sync_propagation_server_archives_client_applies_and_propagates() {
         .unwrap();
     server.commit(tx).unwrap();
 
-    let bootstrap = server.changes_since(0);
+    let bootstrap = server.changes_since(Lsn(0));
     client
         .apply_changes(
             bootstrap,
@@ -1072,7 +1073,7 @@ fn t18_sync_does_not_repropagate_already_propagated_rows() {
         .unwrap();
     server.commit(tx).unwrap();
 
-    let changes = server.changes_since(0);
+    let changes = server.changes_since(Lsn(0));
     client
         .apply_changes(
             changes,

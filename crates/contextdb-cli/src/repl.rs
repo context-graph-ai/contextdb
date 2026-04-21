@@ -233,15 +233,17 @@ fn run_sync_command(
             } else {
                 "unreachable"
             };
+            let base = format!(
+                "Sync: tenant={}, url={}\nNATS: {status}\nDatabase LSN: {}\nPush watermark: LSN {}\nPull watermark: LSN {}",
+                client.tenant_id(),
+                client.nats_url(),
+                client.db().current_lsn(),
+                client.push_watermark(),
+                client.pull_watermark()
+            );
+            let render = contextdb_engine::cli_render::render_sync_status(client.db());
             SyncCommandOutcome {
-                message: format!(
-                    "Sync: tenant={}, url={}\nNATS: {status}\nDatabase LSN: {}\nPush watermark: LSN {}\nPull watermark: LSN {}",
-                    client.tenant_id(),
-                    client.nats_url(),
-                    client.db().current_lsn(),
-                    client.push_watermark(),
-                    client.pull_watermark()
-                ),
+                message: format!("{base}\n{render}"),
                 ok: true,
             }
         }
@@ -476,6 +478,7 @@ fn render_column_type(col_type: &ColumnType) -> String {
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
         ColumnType::Timestamp => "TIMESTAMP".to_string(),
+        ColumnType::TxId => "BROKEN".to_string(),
     }
 }
 

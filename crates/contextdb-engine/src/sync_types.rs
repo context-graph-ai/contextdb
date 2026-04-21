@@ -3,7 +3,7 @@
 //! These types define the public API for sync operations. The actual
 //! implementations are pending (all methods currently `unimplemented!()`).
 
-use contextdb_core::Value;
+use contextdb_core::{Lsn, RowId, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -55,29 +55,29 @@ impl ChangeSet {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RowChange {
     pub table: String,
     pub natural_key: NaturalKey,
     pub values: HashMap<String, Value>,
     pub deleted: bool,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EdgeChange {
     pub source: Uuid,
     pub target: Uuid,
     pub edge_type: String,
     pub properties: HashMap<String, Value>,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorChange {
-    pub row_id: u64,
+    pub row_id: RowId,
     pub vector: Vec<f32>,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +131,7 @@ pub struct ApplyResult {
     pub applied_rows: usize,
     pub skipped_rows: usize,
     pub conflicts: Vec<Conflict>,
-    pub new_lsn: u64,
+    pub new_lsn: Lsn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

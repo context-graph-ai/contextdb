@@ -53,7 +53,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
 
             if let Some(cands) = candidates
-                && !cands.contains(entry.row_id)
+                && !cands.contains(entry.row_id.0)
             {
                 continue;
             }
@@ -141,7 +141,7 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
                             .find(|entry| entry.row_id == rid && entry.visible_at(snapshot))
                             .map(|entry| {
                                 if let Some(cands) = candidates
-                                    && !cands.contains(entry.row_id)
+                                    && !cands.contains(entry.row_id.0)
                                 {
                                     return None;
                                 }
@@ -180,7 +180,7 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             vector,
             created_tx: tx,
             deleted_tx: None,
-            lsn: 0,
+            lsn: contextdb_core::Lsn(0),
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {

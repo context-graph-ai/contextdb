@@ -1,4 +1,5 @@
 use contextdb_core::*;
+use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_server::{SyncClient, SyncServer};
@@ -614,12 +615,12 @@ fn p11_change_log_survives_reopen() {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    assert!(!db.change_log_since(0).is_empty());
+    assert!(!db.change_log_since(Lsn(0)).is_empty());
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
     assert!(
-        !db2.change_log_since(0).is_empty(),
+        !db2.change_log_since(Lsn(0)).is_empty(),
         "durable sync restart semantics require the change log after reopen"
     );
 }

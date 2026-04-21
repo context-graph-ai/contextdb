@@ -1,4 +1,6 @@
-use contextdb_core::{AdjEntry, MemoryAccountant, Value, VectorEntry, VersionedRow};
+use contextdb_core::{
+    AdjEntry, Lsn, MemoryAccountant, RowId, SnapshotId, TxId, Value, VectorEntry, VersionedRow,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -61,47 +63,47 @@ fn mem_01_set_budget_none_concurrent_allocate() {
 #[test]
 fn mem_02_visible_at_uses_option_combinator() {
     let row = VersionedRow {
-        row_id: 1,
+        row_id: RowId(1),
         values: HashMap::new(),
-        created_tx: 1,
+        created_tx: TxId(1),
         deleted_tx: None,
-        lsn: 0,
+        lsn: Lsn(0),
         created_at: None,
     };
-    assert!(row.visible_at(1));
-    assert!(row.visible_at(99));
+    assert!(row.visible_at(SnapshotId(1)));
+    assert!(row.visible_at(SnapshotId(99)));
 
     let deleted_row = VersionedRow {
-        deleted_tx: Some(5),
+        deleted_tx: Some(TxId(5)),
         ..row.clone()
     };
-    assert!(deleted_row.visible_at(3));
-    assert!(!deleted_row.visible_at(5));
-    assert!(!deleted_row.visible_at(7));
+    assert!(deleted_row.visible_at(SnapshotId(3)));
+    assert!(!deleted_row.visible_at(SnapshotId(5)));
+    assert!(!deleted_row.visible_at(SnapshotId(7)));
 
     let edge = AdjEntry {
         source: Uuid::new_v4(),
         target: Uuid::new_v4(),
         edge_type: "CITES".to_string(),
         properties: HashMap::new(),
-        created_tx: 1,
-        deleted_tx: Some(5),
-        lsn: 0,
+        created_tx: TxId(1),
+        deleted_tx: Some(TxId(5)),
+        lsn: Lsn(0),
     };
-    assert!(edge.visible_at(3));
-    assert!(!edge.visible_at(5));
-    assert!(!edge.visible_at(7));
+    assert!(edge.visible_at(SnapshotId(3)));
+    assert!(!edge.visible_at(SnapshotId(5)));
+    assert!(!edge.visible_at(SnapshotId(7)));
 
     let vector = VectorEntry {
-        row_id: 1,
+        row_id: RowId(1),
         vector: vec![1.0, 2.0, 3.0],
-        created_tx: 1,
-        deleted_tx: Some(5),
-        lsn: 0,
+        created_tx: TxId(1),
+        deleted_tx: Some(TxId(5)),
+        lsn: Lsn(0),
     };
-    assert!(vector.visible_at(3));
-    assert!(!vector.visible_at(5));
-    assert!(!vector.visible_at(7));
+    assert!(vector.visible_at(SnapshotId(3)));
+    assert!(!vector.visible_at(SnapshotId(5)));
+    assert!(!vector.visible_at(SnapshotId(7)));
 
     let _ = Value::Null;
 }

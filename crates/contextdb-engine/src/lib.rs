@@ -1,3 +1,4 @@
+pub mod cli_render;
 pub mod composite_store;
 pub mod database;
 pub mod executor;

@@ -1,5 +1,6 @@
 use super::common::*;
 use contextdb_core::{Error, Value};
+use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
 use contextdb_parser::parse;
 use std::fs;
@@ -1213,7 +1214,7 @@ fn f107_graph_edge_deletion_cascades_or_is_explicit() {
     assert!(
         result.is_err()
             || db.edge_count(a, "EDGE", db.snapshot()).expect("edge count") == 0
-            || row.row_id > 0
+            || row.row_id > RowId(0)
     );
 }
 
@@ -1331,7 +1332,7 @@ fn f115_subscription_fires_on_insert() {
     let event = rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("subscription must fire after insert");
-    assert!(event.lsn > 0);
+    assert!(event.lsn > Lsn(0));
     assert!(event.row_count > 0);
     assert!(event.tables_changed.contains(&"sensors".to_string()));
 }
@@ -1393,7 +1394,7 @@ fn f116_subscription_fires_on_state_propagation() {
         "tables_changed must include the propagated table, got: {:?}",
         event.tables_changed
     );
-    assert!(event.lsn > 0, "LSN must be positive");
+    assert!(event.lsn > Lsn(0), "LSN must be positive");
     assert_eq!(
         event.source,
         contextdb_engine::plugin::CommitSource::AutoCommit,

@@ -1,4 +1,5 @@
 use super::helpers::*;
+use contextdb_core::Lsn;
 use contextdb_core::{Direction, Error, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
@@ -97,7 +98,7 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    assert_eq!(db.change_log_since(0).len(), 5);
+    assert_eq!(db.change_log_since(Lsn(0)).len(), 5);
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
@@ -146,7 +147,7 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
             .iter()
             .any(|(rid, _)| *rid == committed_child_rid)
     );
-    assert_eq!(reopened.change_log_since(0).len(), 5);
+    assert_eq!(reopened.change_log_since(Lsn(0)).len(), 5);
 
     let tx2 = reopened.begin();
     let ghost = Uuid::new_v4();
@@ -187,7 +188,7 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
         .query_vector(&[0.0, 0.0, 1.0], 10, None, snapshot)
         .unwrap();
     assert!(ghost_vectors.iter().all(|(rid, _)| *rid != ghost_rid));
-    assert_eq!(reopened_again.change_log_since(0).len(), 5);
+    assert_eq!(reopened_again.change_log_since(Lsn(0)).len(), 5);
 }
 
 // si_07 and si_08 are retired as separate placeholders.

@@ -1,5 +1,6 @@
 use super::helpers::{setup_ontology_db, setup_propagation_ontology_db};
 use contextdb_core::{Direction, Value};
+use contextdb_core::{Lsn, TxId};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
@@ -24,7 +25,7 @@ fn float64_value(row: &contextdb_core::VersionedRow, key: &str) -> f64 {
 
 fn insert_entity(db: &contextdb_engine::Database, tx: u64, id: Uuid, props: &str) {
     db.insert_row(
-        tx,
+        TxId(tx),
         "entities",
         HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
@@ -91,7 +92,7 @@ fn c1_02_pattern_match_criteria() {
     let db = setup_ontology_db();
     let entity = Uuid::new_v4();
     let tx = db.begin();
-    insert_entity(&db, tx, entity, "");
+    insert_entity(&db, tx.0, entity, "");
     for _ in 0..3 {
         db.insert_row(
             tx,
@@ -224,7 +225,7 @@ fn c2_01_entity_context_retrieval() {
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
     let tx = db.begin();
-    insert_entity(&db, tx, e, "state=v1");
+    insert_entity(&db, tx.0, e, "state=v1");
     db.insert_row(
         tx,
         "decisions",
@@ -273,7 +274,7 @@ fn c2_02_entity_context_empty() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let tx = db.begin();
-    insert_entity(&db, tx, e, "state=empty");
+    insert_entity(&db, tx.0, e, "state=empty");
     db.commit(tx).expect("commit");
 
     assert!(
@@ -389,7 +390,7 @@ fn c2_04_subscribe_invalidation_detected() {
         "tables_changed must include at least one propagated table, got: {:?}",
         event.tables_changed
     );
-    assert!(event.lsn > 0, "LSN must be positive");
+    assert!(event.lsn > Lsn(0), "LSN must be positive");
 }
 
 #[test]
@@ -672,7 +673,7 @@ fn c4_01_pattern_generates_system_intention() {
     let d = Uuid::new_v4();
     let e = Uuid::new_v4();
     let tx = db.begin();
-    insert_entity(&db, tx, e, "state=match");
+    insert_entity(&db, tx.0, e, "state=match");
     db.insert_row(
         tx,
         "patterns",
@@ -823,7 +824,7 @@ fn d1_01_observation_to_new_decision() {
         ]),
     )
     .expect("intention");
-    insert_entity(&db, tx, e, "region=us-east-1,replicas=3");
+    insert_entity(&db, tx.0, e, "region=us-east-1,replicas=3");
     db.insert_row(
         tx,
         "decisions",
@@ -1056,7 +1057,7 @@ fn d1_02_unwatched_field_unknown_unknown() {
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
     let tx = db.begin();
-    insert_entity(&db, tx, e, "cpu=4cores,region=us-east-1");
+    insert_entity(&db, tx.0, e, "cpu=4cores,region=us-east-1");
     db.insert_row(
         tx,
         "decisions",
@@ -1106,7 +1107,7 @@ fn d1_03_cascade_invalidation_full_chain() {
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
     let tx = db.begin();
-    insert_entity(&db, tx, e, "state=v1");
+    insert_entity(&db, tx.0, e, "state=v1");
     db.insert_row(
         tx,
         "intentions",
@@ -1203,7 +1204,7 @@ fn d3_04_local_pattern_match_generates_intent() {
     let d = Uuid::new_v4();
     let e = Uuid::new_v4();
     let tx = db.begin();
-    insert_entity(&db, tx, e, "person_detected=true");
+    insert_entity(&db, tx.0, e, "person_detected=true");
     db.insert_row(
         tx,
         "patterns",

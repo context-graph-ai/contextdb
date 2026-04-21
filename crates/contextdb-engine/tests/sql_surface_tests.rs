@@ -1,3 +1,4 @@
+use contextdb_core::Lsn;
 use contextdb_core::{MemoryAccountant, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
@@ -2518,7 +2519,7 @@ fn ddl_name(change: &contextdb_engine::sync_types::DdlChange) -> String {
     }
 }
 
-fn max_non_ddl_lsn(changes: &contextdb_engine::sync_types::ChangeSet) -> Option<u64> {
+fn max_non_ddl_lsn(changes: &contextdb_engine::sync_types::ChangeSet) -> Option<Lsn> {
     let row_max = changes.rows.iter().map(|r| r.lsn).max();
     let edge_max = changes.edges.iter().map(|e| e.lsn).max();
     let vector_max = changes.vectors.iter().map(|v| v.lsn).max();
@@ -2547,7 +2548,7 @@ fn sql_15_ddl_dml_lsn_causal_ordering() {
     let poller_barrier = barrier.clone();
 
     let poller = thread::spawn(move || {
-        let mut watermark = 0_u64;
+        let mut watermark = Lsn(0);
         let mut seen_creates = std::collections::HashSet::new();
         let mut row_before_create = Vec::new();
         let mut idle_after_done_since = None;
@@ -2667,7 +2668,7 @@ fn sql_16_ddl_lsn_no_duplicates_under_contention() {
     let poller_barrier = barrier.clone();
 
     let poller = thread::spawn(move || {
-        let mut watermark = 0_u64;
+        let mut watermark = Lsn(0);
         let mut seen_columns = std::collections::HashSet::new();
         let mut idle_after_done_since = None;
         poller_barrier.wait();
@@ -2773,7 +2774,7 @@ fn sql_17_sync_watermark_does_not_skip_ddl() {
     let poller_expected = Arc::new(expected_tables.clone());
     let poller_barrier = barrier.clone();
     let poller = thread::spawn(move || {
-        let mut watermark = 0_u64;
+        let mut watermark = Lsn(0);
         let mut seen_tables = std::collections::HashSet::new();
         let mut idle_after_done_since = None;
         poller_barrier.wait();
@@ -3042,7 +3043,7 @@ fn disk_06_sync_pull_rejected_when_over_disk_budget() {
         )
         .unwrap();
     }
-    let changes = edge.changes_since(0);
+    let changes = edge.changes_since(Lsn(0));
 
     let server = Database::open(&server_path).unwrap();
     server
@@ -3631,5 +3632,354 @@ fn integrity_10_failed_insert_does_not_leak_memory() {
     assert!(
         used <= baseline + 256,
         "duplicate no-op inserts must not leak memory: baseline={baseline}, used={used}"
+    );
+}
+
+// ======== T20 ========
+#[test]
+fn test_coerce_uuid_name_based_still_works_post_catchall_removal() {
+    use contextdb_core::Value;
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id INTEGER, user_id INTEGER, other_id INTEGER, plain INTEGER)",
+        &empty,
+    )
+    .expect("CREATE TABLE with four INTEGER columns must succeed");
+
+    let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+    let expected_uuid = Uuid::parse_str(uuid_str).expect("fixture uuid must parse");
+
+    let mut row: HashMap<String, Value> = HashMap::new();
+    row.insert("id".to_string(), Value::Text(uuid_str.into()));
+    row.insert("user_id".to_string(), Value::Text(uuid_str.into()));
+    row.insert("other_id".to_string(), Value::Text(uuid_str.into()));
+    row.insert("plain".to_string(), Value::Text(uuid_str.into()));
+
+    db.execute(
+        "INSERT INTO t (id, user_id, other_id, plain) VALUES ($id, $user_id, $other_id, $plain)",
+        &row,
+    )
+    .expect("INSERT must succeed under UUID name-based coercion");
+
+    let result = db
+        .execute("SELECT * FROM t", &empty)
+        .expect("SELECT * FROM t must succeed");
+    assert_eq!(result.rows.len(), 1, "exactly one row expected");
+    let row_vals = &result.rows[0];
+    let col_idx = |name: &str| {
+        result
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("column {name:?} must exist in result"))
+    };
+
+    assert_eq!(
+        row_vals[col_idx("id")],
+        Value::Uuid(expected_uuid),
+        "id column must coerce Text → Uuid",
+    );
+    assert_eq!(
+        row_vals[col_idx("user_id")],
+        Value::Uuid(expected_uuid),
+        "user_id column must coerce Text → Uuid (name ends in _id)",
+    );
+    assert_eq!(
+        row_vals[col_idx("other_id")],
+        Value::Uuid(expected_uuid),
+        "other_id column must coerce Text → Uuid (name ends in _id)",
+    );
+    assert_eq!(
+        row_vals[col_idx("plain")],
+        Value::Text(uuid_str.into()),
+        "plain column (no _id suffix) must retain Value::Text without coercion",
+    );
+}
+
+// ======== T21 ========
+#[test]
+fn where_txid_bound_int64_returns_rows() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Drive watermark past 200 so inserts are allowed.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..250i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    // Insert the three TxId rows via library API.
+    for tx_val in &[TxId(10), TxId(50), TxId(200)] {
+        let tx = db.begin();
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("x".to_string(), Value::TxId(*tx_val));
+        db.insert_row(tx, "t", r)
+            .unwrap_or_else(|e| panic!("insert Value::TxId({tx_val:?}) must succeed: {e:?}"));
+        db.commit(tx).expect("commit must succeed");
+    }
+
+    let mut bind: HashMap<String, Value> = HashMap::new();
+    bind.insert("bound".to_string(), Value::Int64(100));
+    let result = db
+        .execute("SELECT * FROM t WHERE x > $bound", &bind)
+        .expect("SELECT with bound Int64 must succeed on TXID column");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "exactly one row must match x > 100 (only TxId(200))",
+    );
+    let x_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("result must have column \"x\"");
+    assert_eq!(
+        result.rows[0][x_idx],
+        Value::TxId(TxId(200)),
+        "the one matching row must be Value::TxId(TxId(200))",
+    );
+}
+
+// ======== T22 ========
+#[test]
+fn where_txid_negative_literal_below_all() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Bump watermark past 200.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..250i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    for tx_val in &[TxId(10), TxId(50), TxId(200)] {
+        let tx = db.begin();
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("x".to_string(), Value::TxId(*tx_val));
+        db.insert_row(tx, "t", r)
+            .unwrap_or_else(|e| panic!("insert Value::TxId({tx_val:?}) must succeed: {e:?}"));
+        db.commit(tx).expect("commit must succeed");
+    }
+
+    let mut bind: HashMap<String, Value> = HashMap::new();
+    bind.insert("bound".to_string(), Value::Int64(-1));
+    let result = db
+        .execute("SELECT COUNT(*) AS c FROM t WHERE x > $bound", &bind)
+        .expect("COUNT(*) with negative bound must succeed on TXID column");
+
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "COUNT(*) result must have exactly one row",
+    );
+    let c_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "c")
+        .expect("result must have the aliased count column \"c\"");
+    assert_eq!(
+        result.rows[0][c_idx],
+        Value::Int64(3),
+        "COUNT(*) of TxIds > -1 must equal 3 (all three rows match)",
+    );
+}
+
+// ======== T23 ========
+#[test]
+fn where_txid_text_literal_returns_no_rows() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Bump watermark past 42.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..50i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    let tx = db.begin();
+    let mut r: HashMap<String, Value> = HashMap::new();
+    r.insert("x".to_string(), Value::TxId(TxId(42)));
+    db.insert_row(tx, "t", r)
+        .expect("insert Value::TxId(TxId(42)) must succeed");
+    db.commit(tx).expect("commit must succeed");
+
+    // Positive control: prove the row is actually present with x = Value::TxId(TxId(42))
+    // before we test the text-bind negative case. This prevents a stub or regression
+    // that silently drops inserts from trivially satisfying the "0 rows" assertion below.
+    let unfiltered = db
+        .execute("SELECT x FROM t", &empty)
+        .expect("SELECT x FROM t (no filter) must succeed");
+    assert_eq!(
+        unfiltered.rows.len(),
+        1,
+        "positive control: exactly one row must be present after insert",
+    );
+    assert_eq!(
+        unfiltered.rows[0][0],
+        Value::TxId(TxId(42)),
+        "positive control: the stored x column must be Value::TxId(TxId(42))",
+    );
+
+    let mut bind: HashMap<String, Value> = HashMap::new();
+    bind.insert("bound".to_string(), Value::Text("42".into()));
+    let result = db
+        .execute("SELECT * FROM t WHERE x = $bound", &bind)
+        .expect("SELECT with Text bound on TXID column must not error — just return empty");
+
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "no rows must be returned — Text must never coerce to TxId; got rows: {:?}",
+        result.rows,
+    );
+}
+
+// ======== T24 ========
+#[test]
+fn insert_sql_literal_int_into_txid_rejected() {
+    use contextdb_core::{Error, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    let err = db
+        .execute("INSERT INTO t (x) VALUES (42)", &empty)
+        .expect_err("INSERT INTO t (x) VALUES (42) must be rejected — literal Int64 into TXID");
+
+    match err {
+        Error::ColumnTypeMismatch {
+            table,
+            column,
+            expected,
+            actual,
+        } => {
+            assert_eq!(table, "t", "error.table must be \"t\"");
+            assert_eq!(column, "x", "error.column must be \"x\"");
+            assert_eq!(expected, "TXID", "error.expected must be \"TXID\"");
+            assert_eq!(
+                actual, "Int64",
+                "error.actual must be \"Int64\" (SQL literal 42 parses to Value::Int64)",
+            );
+        }
+        other => panic!("expected Error::ColumnTypeMismatch, got {other:?}",),
+    }
+}
+
+// ======== T25 ========
+#[test]
+fn orderby_txid_asc_desc() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Bump watermark past 42.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .unwrap();
+    for n in 0..50i64 {
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        r.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &r)
+            .unwrap();
+    }
+
+    // Insert out of order: 7, 1, 42, 3.
+    for tx_val in &[TxId(7), TxId(1), TxId(42), TxId(3)] {
+        let tx = db.begin();
+        let mut r: HashMap<String, Value> = HashMap::new();
+        r.insert("x".to_string(), Value::TxId(*tx_val));
+        db.insert_row(tx, "t", r)
+            .unwrap_or_else(|e| panic!("insert Value::TxId({tx_val:?}) must succeed: {e:?}"));
+        db.commit(tx).expect("commit must succeed");
+    }
+
+    // ASC
+    let asc = db
+        .execute("SELECT x FROM t ORDER BY x ASC", &empty)
+        .expect("SELECT ... ORDER BY x ASC must succeed");
+    let x_idx = asc
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("asc result must have column \"x\"");
+    let asc_vals: Vec<Value> = asc.rows.iter().map(|r| r[x_idx].clone()).collect();
+    assert_eq!(
+        asc_vals,
+        vec![
+            Value::TxId(TxId(1)),
+            Value::TxId(TxId(3)),
+            Value::TxId(TxId(7)),
+            Value::TxId(TxId(42)),
+        ],
+        "ORDER BY x ASC must sort TxIds by native u64::cmp",
+    );
+
+    // DESC
+    let desc = db
+        .execute("SELECT x FROM t ORDER BY x DESC", &empty)
+        .expect("SELECT ... ORDER BY x DESC must succeed");
+    let x_idx_d = desc
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("desc result must have column \"x\"");
+    let desc_vals: Vec<Value> = desc.rows.iter().map(|r| r[x_idx_d].clone()).collect();
+    assert_eq!(
+        desc_vals,
+        vec![
+            Value::TxId(TxId(42)),
+            Value::TxId(TxId(7)),
+            Value::TxId(TxId(3)),
+            Value::TxId(TxId(1)),
+        ],
+        "ORDER BY x DESC must reverse the ASC sequence",
     );
 }

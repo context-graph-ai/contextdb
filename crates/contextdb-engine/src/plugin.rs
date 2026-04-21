@@ -1,5 +1,5 @@
 use crate::sync_types::{ChangeSet, DdlChange};
-use contextdb_core::Result;
+use contextdb_core::{Lsn, Result};
 use contextdb_tx::WriteSet;
 use std::time::Duration;
 
@@ -64,7 +64,7 @@ pub trait DatabasePlugin: Send + Sync {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitEvent {
     pub source: CommitSource,
-    pub lsn: u64,
+    pub lsn: Lsn,
     pub tables_changed: Vec<String>,
     pub row_count: usize,
 }

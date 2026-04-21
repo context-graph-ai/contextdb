@@ -1000,3 +1000,108 @@ sync_red_test!(
         assert!(stdout.contains("timed out") || stdout.contains("cannot connect"));
     }
 );
+
+// ======== T27 ========
+// Three-database NATS round-trip uses the real harness pattern from
+// `crates/contextdb-server/tests/sync_integration.rs`:
+//   start_nats() → Arc<Database>::open_memory() × 3 → SyncServer::new(...).run()
+//   spawned in tokio task → SyncClient::new(...) per edge → push/pull via NATS.
+// `super::common::*` re-exports `start_nats()` and `NatsFixture`; `SyncServer`
+// and `SyncClient` come from `contextdb-server` (dev-dep of `contextdb-engine`).
+#[tokio::test]
+async fn sync_e2e_value_txid_round_trip() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+    use contextdb_server::{SyncClient, SyncServer};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let nats = start_nats().await;
+
+    // Three databases: edge-A, server-S, edge-B.
+    let edge_a_db = Arc::new(Database::open_memory());
+    let server_db = Arc::new(Database::open_memory());
+    let edge_b_db = Arc::new(Database::open_memory());
+
+    // Same DDL on all three databases.
+    let empty: HashMap<String, Value> = HashMap::new();
+    for db in [&edge_a_db, &server_db, &edge_b_db] {
+        db.execute(
+            "CREATE TABLE t (pk UUID PRIMARY KEY, x TXID NOT NULL)",
+            &empty,
+        )
+        .expect("CREATE TABLE must succeed on every node");
+    }
+
+    // Start the sync server bound to NATS for tenant "txid-e2e".
+    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        "txid-e2e",
+        policies.clone(),
+    ));
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Edge clients share the same tenant subject space as the server.
+    let edge_a = SyncClient::new(edge_a_db.clone(), &nats.nats_url, "txid-e2e");
+    let edge_b = SyncClient::new(edge_b_db.clone(), &nats.nats_url, "txid-e2e");
+
+    // Fixed primary key for retrieval.
+    let pk = uuid::Uuid::from_u128(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111);
+
+    // Begin a real transaction on edge-A; capture its TxId; insert via library API.
+    // `begin()` returns TxId; `commit(tx)` finalizes.
+    let tx_id_used: TxId = edge_a_db.begin();
+    assert!(
+        tx_id_used.0 > 0,
+        "precondition: allocated TxId must be > 0, got {:?}",
+        tx_id_used
+    );
+    let mut row = HashMap::new();
+    row.insert("pk".to_string(), Value::Uuid(pk));
+    row.insert("x".to_string(), Value::TxId(tx_id_used));
+    edge_a_db
+        .insert_row(tx_id_used, "t", row)
+        .expect("insert must succeed inside tx");
+    edge_a_db.commit(tx_id_used).expect("commit must succeed");
+
+    // Edge-A pushes over NATS; edge-B pulls over NATS.
+    edge_a.push().await.expect("edge_a push must succeed");
+    edge_b
+        .pull(&policies)
+        .await
+        .expect("edge_b pull must succeed");
+
+    // SELECT x FROM t WHERE pk = $pk on edge-B returns exactly one row
+    // whose x cell equals Value::TxId(tx_id_used).
+    let mut select_params: HashMap<String, Value> = HashMap::new();
+    select_params.insert("pk".to_string(), Value::Uuid(pk));
+    let result = edge_b_db
+        .execute("SELECT x FROM t WHERE pk = $pk", &select_params)
+        .expect("bound select must succeed");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "edge_b must have exactly 1 row for pk; got {}",
+        result.rows.len()
+    );
+    assert_eq!(
+        result.rows[0][0],
+        Value::TxId(tx_id_used),
+        "edge_b.x must equal Value::TxId({:?}) bit-identical to sender",
+        tx_id_used
+    );
+
+    // Edge-B's committed_watermark must have advanced past the peer TxId.
+    let watermark = edge_b_db.committed_watermark();
+    assert!(
+        watermark >= tx_id_used,
+        "edge_b.committed_watermark ({:?}) must be >= peer TxId ({:?})",
+        watermark,
+        tx_id_used
+    );
+}

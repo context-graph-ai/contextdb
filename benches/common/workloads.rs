@@ -101,7 +101,7 @@ pub fn run_graph_relational_vector_query(db: &Database, root: Uuid) {
         .unwrap();
     let mut candidates = RoaringTreemap::new();
     for r in &candidate_obs {
-        candidates.insert(r.row_id);
+        candidates.insert(r.row_id.0);
     }
     db.query_vector(&[1.0, 0.0], 5, Some(&candidates), db.snapshot())
         .unwrap();

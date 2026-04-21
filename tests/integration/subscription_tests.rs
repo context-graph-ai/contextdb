@@ -1,3 +1,4 @@
+use contextdb_core::Lsn;
 use contextdb_core::Value;
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
@@ -28,7 +29,7 @@ fn s01_subscribe_fires_on_insert() {
     let event = rx
         .recv_timeout(Duration::from_secs(2))
         .expect("should receive CommitEvent after insert");
-    assert!(event.lsn > 0, "LSN must be positive");
+    assert!(event.lsn > Lsn(0), "LSN must be positive");
     assert!(event.row_count > 0, "row_count must be positive");
     assert_eq!(
         event.source,
@@ -122,7 +123,7 @@ fn s04_apply_changes_source_is_sync_pull() {
                 ("name".to_string(), Value::Text("synced".to_string())),
             ]),
             deleted: false,
-            lsn: 1,
+            lsn: Lsn(1),
         }],
         edges: vec![],
         vectors: vec![],
@@ -201,7 +202,10 @@ fn s06_graph_only_commit_empty_tables_changed() {
         event.tables_changed
     );
     assert!(event.row_count > 0, "row_count should count graph edges");
-    assert!(event.lsn > 0, "LSN must be positive for graph-only commit");
+    assert!(
+        event.lsn > Lsn(0),
+        "LSN must be positive for graph-only commit"
+    );
     assert_eq!(
         event.source,
         contextdb_engine::plugin::CommitSource::User,
@@ -662,7 +666,7 @@ fn s18_concurrent_commits_with_subscriber() {
 
     // Every event must have positive LSN
     for event in &events {
-        assert!(event.lsn > 0, "every event must have positive LSN");
+        assert!(event.lsn > Lsn(0), "every event must have positive LSN");
     }
 }
 
@@ -682,7 +686,7 @@ fn s19_ddl_only_commit_create_table() {
     // If not, recv_timeout returns Err — which we also accept.
     match rx.recv_timeout(Duration::from_secs(2)) {
         Ok(event) => {
-            assert!(event.lsn > 0, "DDL event must have positive LSN");
+            assert!(event.lsn > Lsn(0), "DDL event must have positive LSN");
             assert_eq!(event.row_count, 0, "DDL-only commit has no row changes");
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -723,7 +727,7 @@ fn s20_auto_sync_fires_commit_event() {
                 ("name".to_string(), Value::Text("auto-synced".to_string())),
             ]),
             deleted: false,
-            lsn: 1,
+            lsn: Lsn(1),
         }],
         edges: vec![],
         vectors: vec![],
@@ -740,7 +744,7 @@ fn s20_auto_sync_fires_commit_event() {
         contextdb_engine::plugin::CommitSource::SyncPull,
         "auto-sync must report SyncPull source"
     );
-    assert!(event.lsn > 0);
+    assert!(event.lsn > Lsn(0));
     assert!(event.row_count > 0);
     assert!(event.tables_changed.contains(&"t".to_string()));
 }

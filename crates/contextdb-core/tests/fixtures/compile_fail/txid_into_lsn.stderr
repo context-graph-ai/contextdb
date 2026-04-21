@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/txid_into_lsn.rs:5:21
+  |
+5 |     let _lsn: Lsn = tx;
+  |               ---   ^^ expected `Lsn`, found `TxId`
+  |               |
+  |               expected due to this

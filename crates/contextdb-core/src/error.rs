@@ -85,6 +85,24 @@ pub enum Error {
         budget_limit_bytes: u64,
         hint: String,
     },
+    #[error("column type mismatch: {table}.{column} expected {expected}, got {actual}")]
+    ColumnTypeMismatch {
+        table: String,
+        column: String,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    #[error("tx id out of range: {table}.{column} value {value} exceeds max {max}")]
+    TxIdOutOfRange {
+        table: String,
+        column: String,
+        value: u64,
+        max: u64,
+    },
+    #[error("tx id overflow: {table} incoming {incoming}")]
+    TxIdOverflow { table: String, incoming: u64 },
+    #[error("column {table}.{column} is NOT NULL")]
+    ColumnNotNullable { table: String, column: String },
     #[error("{0}")]
     Other(String),
 }

@@ -1,5 +1,5 @@
 use crate::sync_types::{DdlChange, NaturalKey};
-use contextdb_core::{EdgeType, NodeId, Result, RowId, TableName, Value};
+use contextdb_core::{EdgeType, Lsn, NodeId, Result, RowId, TableName, Value};
 use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
@@ -8,43 +8,43 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChangeLogEntry {
     RowInsert {
         table: TableName,
         row_id: RowId,
-        lsn: u64,
+        lsn: Lsn,
     },
     RowDelete {
         table: TableName,
         row_id: RowId,
         natural_key: NaturalKey,
-        lsn: u64,
+        lsn: Lsn,
     },
     EdgeInsert {
         source: NodeId,
         target: NodeId,
         edge_type: EdgeType,
-        lsn: u64,
+        lsn: Lsn,
     },
     EdgeDelete {
         source: NodeId,
         target: NodeId,
         edge_type: EdgeType,
-        lsn: u64,
+        lsn: Lsn,
     },
     VectorInsert {
         row_id: RowId,
-        lsn: u64,
+        lsn: Lsn,
     },
     VectorDelete {
         row_id: RowId,
-        lsn: u64,
+        lsn: Lsn,
     },
 }
 
 impl ChangeLogEntry {
-    pub fn lsn(&self) -> u64 {
+    pub fn lsn(&self) -> Lsn {
         match self {
             ChangeLogEntry::RowInsert { lsn, .. }
             | ChangeLogEntry::RowDelete { lsn, .. }
@@ -61,7 +61,7 @@ pub struct CompositeStore {
     pub graph: Arc<GraphStore>,
     pub vector: Arc<VectorStore>,
     pub change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
-    pub ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
+    pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
 }
 
 impl CompositeStore {
@@ -70,7 +70,7 @@ impl CompositeStore {
         graph: Arc<GraphStore>,
         vector: Arc<VectorStore>,
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
-        ddl_log: Arc<RwLock<Vec<(u64, DdlChange)>>>,
+        ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     ) -> Self {
         Self {
             relational,
@@ -82,7 +82,7 @@ impl CompositeStore {
     }
 
     pub(crate) fn build_change_log_entries(&self, ws: &WriteSet) -> Vec<ChangeLogEntry> {
-        let lsn = ws.commit_lsn.unwrap_or(0);
+        let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
         let mut log_entries = Vec::new();
 
         for (table, row) in &ws.relational_inserts {
@@ -108,7 +108,7 @@ impl CompositeStore {
                 })
                 .unwrap_or_else(|| NaturalKey {
                     column: "id".to_string(),
-                    value: Value::Int64(*row_id as i64),
+                    value: Value::Int64(row_id.0 as i64),
                 });
 
             log_entries.push(ChangeLogEntry::RowDelete {

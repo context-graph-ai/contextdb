@@ -1,6 +1,6 @@
 use crate::composite_store::ChangeLogEntry;
 use crate::sync_types::DdlChange;
-use contextdb_core::{AdjEntry, Error, Result, TableMeta, VectorEntry, VersionedRow};
+use contextdb_core::{AdjEntry, Error, Lsn, Result, TableMeta, VectorEntry, VersionedRow};
 use contextdb_tx::WriteSet;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
@@ -85,7 +85,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 let encoded = Self::encode(row)?;
                 redb_table
-                    .insert(row.row_id, encoded.as_slice())
+                    .insert(row.row_id.0, encoded.as_slice())
                     .map_err(Self::storage_error)?;
             }
 
@@ -98,7 +98,7 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 let bytes = {
                     let existing = redb_table
-                        .get(*row_id)
+                        .get(row_id.0)
                         .map_err(Self::storage_error)?
                         .ok_or_else(|| Error::NotFound(format!("row {row_id} in table {table}")))?;
                     let bytes: &[u8] = existing.value();
@@ -108,7 +108,7 @@ impl RedbPersistence {
                 row.deleted_tx = Some(*deleted_tx);
                 let encoded = Self::encode(&row)?;
                 redb_table
-                    .insert(*row_id, encoded.as_slice())
+                    .insert(row_id.0, encoded.as_slice())
                     .map_err(Self::storage_error)?;
             }
 
@@ -169,14 +169,14 @@ impl RedbPersistence {
                 for entry in &ws.vector_inserts {
                     let encoded = Self::encode(entry)?;
                     vectors_table
-                        .insert(entry.row_id, encoded.as_slice())
+                        .insert(entry.row_id.0, encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
 
                 for (row_id, deleted_tx) in &ws.vector_deletes {
                     let bytes = {
                         let existing = vectors_table
-                            .get(*row_id)
+                            .get(row_id.0)
                             .map_err(Self::storage_error)?
                             .ok_or_else(|| Error::NotFound(format!("vector row {row_id}")))?;
                         let bytes: &[u8] = existing.value();
@@ -186,7 +186,7 @@ impl RedbPersistence {
                     entry.deleted_tx = Some(*deleted_tx);
                     let encoded = Self::encode(&entry)?;
                     vectors_table
-                        .insert(*row_id, encoded.as_slice())
+                        .insert(row_id.0, encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -195,7 +195,7 @@ impl RedbPersistence {
                 let mut table = write_txn
                     .open_table(CHANGE_LOG_TABLE)
                     .map_err(Self::storage_error)?;
-                let lsn = ws.commit_lsn.unwrap_or(0);
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
                 for (index, entry) in change_log.iter().enumerate() {
                     let key = Self::change_log_key(lsn, index);
                     let encoded = Self::encode(entry)?;
@@ -276,7 +276,7 @@ impl RedbPersistence {
         })
     }
 
-    pub fn append_change_log(&self, lsn: u64, entries: &[ChangeLogEntry]) -> Result<()> {
+    pub fn append_change_log(&self, lsn: Lsn, entries: &[ChangeLogEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -299,7 +299,7 @@ impl RedbPersistence {
         })
     }
 
-    pub fn append_ddl_log(&self, lsn: u64, change: &DdlChange) -> Result<()> {
+    pub fn append_ddl_log(&self, lsn: Lsn, change: &DdlChange) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             {
@@ -344,7 +344,7 @@ impl RedbPersistence {
                 for row in rows {
                     let encoded = Self::encode(row)?;
                     redb_table
-                        .insert(row.row_id, encoded.as_slice())
+                        .insert(row.row_id.0, encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -364,7 +364,7 @@ impl RedbPersistence {
                 for entry in vectors {
                     let encoded = Self::encode(entry)?;
                     table
-                        .insert(entry.row_id, encoded.as_slice())
+                        .insert(entry.row_id.0, encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -516,7 +516,7 @@ impl RedbPersistence {
         })
     }
 
-    pub fn load_ddl_log(&self) -> Result<Vec<(u64, DdlChange)>> {
+    pub fn load_ddl_log(&self) -> Result<Vec<(Lsn, DdlChange)>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table = match read_txn.open_table(DDL_LOG_TABLE) {
@@ -532,7 +532,7 @@ impl RedbPersistence {
                     .value()
                     .parse::<u64>()
                     .map_err(|err| Error::Other(format!("invalid ddl log key: {err}")))?;
-                entries.push((lsn, Self::decode(value.value())?));
+                entries.push((Lsn(lsn), Self::decode(value.value())?));
             }
             Ok(entries)
         })
@@ -564,12 +564,12 @@ impl RedbPersistence {
         format!("table:{name}")
     }
 
-    fn change_log_key(lsn: u64, index: usize) -> String {
-        format!("{lsn:020}:{index:06}")
+    fn change_log_key(lsn: Lsn, index: usize) -> String {
+        format!("{:020}:{index:06}", lsn.0)
     }
 
-    fn ddl_log_key(lsn: u64) -> String {
-        format!("{lsn:020}")
+    fn ddl_log_key(lsn: Lsn) -> String {
+        format!("{:020}", lsn.0)
     }
 
     fn graph_fwd_key(entry: &AdjEntry) -> Vec<u8> {

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use contextdb_core::{Direction, Error, Value, VersionedRow};
+use contextdb_core::{Direction, Error, Lsn, Value, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
 use contextdb_server::protocol::{MessageType, PullRequest, PullResponse, decode, encode};
 use contextdb_server::subjects::pull_subject;
@@ -327,7 +327,7 @@ pub(crate) async fn wait_for_sync_server_ready(
         let payload = match encode(
             MessageType::PullRequest,
             &PullRequest {
-                since_lsn: 0,
+                since_lsn: Lsn(0),
                 max_entries: Some(1),
             },
         ) {
@@ -515,7 +515,7 @@ pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64
     db.insert_vector(tx, row_id, vector)
         .expect("insert embedding vector");
     db.commit(tx).expect("commit embedding row");
-    row_id as i64
+    row_id.0 as i64
 }
 
 pub(crate) fn bfs_ids(db: &Database, start: Uuid) -> Vec<Uuid> {

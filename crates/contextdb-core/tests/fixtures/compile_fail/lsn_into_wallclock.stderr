@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/lsn_into_wallclock.rs:5:25
+  |
+5 |     let _w: Wallclock = lsn;
+  |             ---------   ^^^ expected `Wallclock`, found `Lsn`
+  |             |
+  |             expected due to this

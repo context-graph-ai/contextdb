@@ -1,4 +1,4 @@
-use contextdb_core::{Error, Result, RowId};
+use contextdb_core::{Error, Lsn, Result, RowId};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,7 +20,7 @@ impl WriteSetApplicator for FailingStore {
     }
 
     fn new_row_id(&self) -> RowId {
-        self.next_row_id.fetch_add(1, Ordering::SeqCst)
+        RowId(self.next_row_id.fetch_add(1, Ordering::SeqCst))
     }
 }
 
@@ -34,7 +34,7 @@ fn tx_01_failed_apply_preserves_transaction() {
     let txm = TxManager::new(store);
     let tx = txm.begin();
     txm.with_write_set(tx, |ws| {
-        ws.commit_lsn = Some(999);
+        ws.commit_lsn = Some(Lsn(999));
     })
     .expect("write set exists before commit");
 

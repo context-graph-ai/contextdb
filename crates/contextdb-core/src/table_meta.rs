@@ -84,6 +84,7 @@ pub enum ColumnType {
     Uuid,
     Vector(usize),
     Timestamp,
+    TxId,
 }
 
 impl TableMeta {
@@ -204,6 +205,8 @@ impl ColumnType {
             ColumnType::Uuid => 16,
             ColumnType::Vector(_) => 24,
             ColumnType::Timestamp => 16,
+            // Stub: wrong. Impl must change to 8 (matches Int64/Timestamp).
+            ColumnType::TxId => 0,
         }
     }
 }

@@ -17,7 +17,7 @@ impl WriteSetApplicator for TestStore {
     }
 
     fn new_row_id(&self) -> RowId {
-        1
+        RowId(1)
     }
 }
 

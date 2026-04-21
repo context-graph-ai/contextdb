@@ -106,7 +106,8 @@ fn test_cross_subsystem_atomic_commit() {
         HashMap::new(),
     )
     .unwrap();
-    eng.insert_vector(tx2, 999, vec![0.0, 1.0, 0.0]).unwrap();
+    eng.insert_vector(tx2, RowId(999), vec![0.0, 1.0, 0.0])
+        .unwrap();
     eng.rollback(tx2).unwrap();
 
     let snap2 = eng.snapshot();
@@ -183,7 +184,7 @@ fn test_file_backed_delete_delta_matches_after_reopen() {
     )
     .unwrap();
 
-    let live = db.changes_since(3);
+    let live = db.changes_since(Lsn(3));
     assert_eq!(
         live.rows.len(),
         1,
@@ -201,7 +202,7 @@ fn test_file_backed_delete_delta_matches_after_reopen() {
     drop(db);
 
     let reopened = Database::open(&path).unwrap();
-    let persisted = reopened.changes_since(3);
+    let persisted = reopened.changes_since(Lsn(3));
     assert_eq!(
         persisted.rows.len(),
         1,
@@ -362,16 +363,26 @@ fn test_vector_search_with_prefilter() {
     let eng = setup_db();
 
     let tx = eng.begin();
-    eng.insert_vector(tx, 1, vec![1.0, 0.0, 0.0]).unwrap();
-    eng.insert_vector(tx, 2, vec![0.0, 1.0, 0.0]).unwrap();
-    eng.insert_vector(tx, 3, vec![0.9, 0.1, 0.0]).unwrap();
-    eng.insert_vector(tx, 4, vec![0.0, 0.0, 1.0]).unwrap();
-    eng.insert_vector(tx, 5, vec![0.5, 0.5, 0.0]).unwrap();
-    eng.insert_vector(tx, 6, vec![-1.0, 0.0, 0.0]).unwrap();
-    eng.insert_vector(tx, 7, vec![0.8, 0.2, 0.0]).unwrap();
-    eng.insert_vector(tx, 8, vec![0.0, -1.0, 0.0]).unwrap();
-    eng.insert_vector(tx, 9, vec![0.99, 0.01, 0.0]).unwrap();
-    eng.insert_vector(tx, 10, vec![0.1, 0.9, 0.0]).unwrap();
+    eng.insert_vector(tx, RowId(1), vec![1.0, 0.0, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(2), vec![0.0, 1.0, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(3), vec![0.9, 0.1, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(4), vec![0.0, 0.0, 1.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(5), vec![0.5, 0.5, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(6), vec![-1.0, 0.0, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(7), vec![0.8, 0.2, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(8), vec![0.0, -1.0, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(9), vec![0.99, 0.01, 0.0])
+        .unwrap();
+    eng.insert_vector(tx, RowId(10), vec![0.1, 0.9, 0.0])
+        .unwrap();
     eng.commit(tx).unwrap();
 
     let mut candidates = RoaringTreemap::new();
@@ -384,7 +395,7 @@ fn test_vector_search_with_prefilter() {
         .unwrap();
 
     for (rid, _) in &results {
-        assert!(candidates.contains(*rid));
+        assert!(candidates.contains(rid.0));
     }
     assert_eq!(results.len(), 3);
 }
@@ -461,7 +472,7 @@ fn test_unified_pipeline() {
                     .and_then(Value::as_uuid)
                     .is_some_and(|u| neighborhood_ids.contains(u))
         })
-        .map(|r| r.row_id)
+        .map(|r| r.row_id.0)
         .collect();
     assert_eq!(filtered_row_ids.len(), 2);
 
@@ -657,16 +668,21 @@ fn test_vector_snapshot_isolation() {
     let eng = setup_db();
 
     let tx1 = eng.begin();
-    eng.insert_vector(tx1, 1, vec![1.0, 0.0, 0.0]).unwrap();
-    eng.insert_vector(tx1, 2, vec![0.0, 1.0, 0.0]).unwrap();
-    eng.insert_vector(tx1, 3, vec![0.0, 0.0, 1.0]).unwrap();
+    eng.insert_vector(tx1, RowId(1), vec![1.0, 0.0, 0.0])
+        .unwrap();
+    eng.insert_vector(tx1, RowId(2), vec![0.0, 1.0, 0.0])
+        .unwrap();
+    eng.insert_vector(tx1, RowId(3), vec![0.0, 0.0, 1.0])
+        .unwrap();
     eng.commit(tx1).unwrap();
 
     let snap1 = eng.snapshot();
 
     let tx2 = eng.begin();
-    eng.insert_vector(tx2, 4, vec![0.7, 0.7, 0.0]).unwrap();
-    eng.insert_vector(tx2, 5, vec![0.5, 0.5, 0.5]).unwrap();
+    eng.insert_vector(tx2, RowId(4), vec![0.7, 0.7, 0.0])
+        .unwrap();
+    eng.insert_vector(tx2, RowId(5), vec![0.5, 0.5, 0.5])
+        .unwrap();
     eng.commit(tx2).unwrap();
 
     let rids1: HashSet<RowId> = eng
@@ -676,8 +692,8 @@ fn test_vector_snapshot_isolation() {
         .map(|(r, _)| *r)
         .collect();
     assert_eq!(rids1.len(), 3);
-    assert!(!rids1.contains(&4));
-    assert!(!rids1.contains(&5));
+    assert!(!rids1.contains(&RowId(4)));
+    assert!(!rids1.contains(&RowId(5)));
 
     assert_eq!(
         eng.query_vector(&[1.0, 0.0, 0.0], 10, None, eng.snapshot())
@@ -712,7 +728,7 @@ fn test_empty_database() {
 fn test_vector_search_requires_limit() {
     let eng = setup_db();
     let tx = eng.begin();
-    eng.insert_vector(tx, 1, vec![1.0, 0.0]).unwrap();
+    eng.insert_vector(tx, RowId(1), vec![1.0, 0.0]).unwrap();
     eng.commit(tx).unwrap();
 
     let snap = eng.snapshot();

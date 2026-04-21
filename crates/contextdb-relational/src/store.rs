@@ -1,4 +1,4 @@
-use contextdb_core::{RowId, TableMeta, TableName, VersionedRow};
+use contextdb_core::{RowId, TableMeta, TableName, TxId, VersionedRow};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +25,7 @@ impl RelationalStore {
     }
 
     pub fn new_row_id(&self) -> RowId {
-        self.next_row_id.fetch_add(1, Ordering::SeqCst)
+        RowId(self.next_row_id.fetch_add(1, Ordering::SeqCst))
     }
 
     pub fn apply_inserts(&self, inserts: Vec<(TableName, VersionedRow)>) {
@@ -35,7 +35,7 @@ impl RelationalStore {
         }
     }
 
-    pub fn apply_deletes(&self, deletes: Vec<(TableName, RowId, u64)>) {
+    pub fn apply_deletes(&self, deletes: Vec<(TableName, RowId, TxId)>) {
         let mut tables = self.tables.write();
         for (table_name, row_id, deleted_tx) in deletes {
             if let Some(rows) = tables.get_mut(&table_name) {
@@ -67,11 +67,11 @@ impl RelationalStore {
             .values()
             .flat_map(|rows| rows.iter().map(|row| row.row_id))
             .max()
-            .unwrap_or(0)
+            .unwrap_or(RowId(0))
     }
 
     pub fn set_next_row_id(&self, next_row_id: RowId) {
-        self.next_row_id.store(next_row_id, Ordering::SeqCst);
+        self.next_row_id.store(next_row_id.0, Ordering::SeqCst);
     }
 
     pub fn drop_table(&self, name: &str) {

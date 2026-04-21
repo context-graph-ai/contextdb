@@ -348,7 +348,7 @@ pub enum AstPropagationRule {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Uuid,
     Text,
@@ -358,6 +358,7 @@ pub enum DataType {
     Timestamp,
     Json,
     Vector(u32),
+    TxId,
 }
 
 #[derive(Debug, Clone)]

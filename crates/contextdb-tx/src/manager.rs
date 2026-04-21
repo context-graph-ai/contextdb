@@ -1,13 +1,13 @@
 use crate::write_set::{WriteSet, WriteSetApplicator};
-use contextdb_core::{Error, Result, RowId, SnapshotId, TxId};
+use contextdb_core::{AtomicLsn, AtomicTxId, Error, Lsn, Result, RowId, SnapshotId, TxId};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 pub struct TxManager<S: WriteSetApplicator> {
-    next_tx: AtomicU64,
-    committed_watermark: AtomicU64,
-    next_lsn: AtomicU64,
+    pub next_tx: AtomicTxId,
+    pub committed_watermark: AtomicTxId,
+    next_lsn: AtomicLsn,
     active_txs: Mutex<HashMap<TxId, WriteSet>>,
     commit_mutex: Mutex<()>,
     store: S,
@@ -15,19 +15,19 @@ pub struct TxManager<S: WriteSetApplicator> {
 
 impl<S: WriteSetApplicator> TxManager<S> {
     pub fn new(store: S) -> Self {
-        Self::new_with_counters(store, 1, 1, 0)
+        Self::new_with_counters(store, TxId(1), Lsn(1), TxId(0))
     }
 
     pub fn new_with_counters(
         store: S,
         next_tx: TxId,
-        next_lsn: u64,
+        next_lsn: Lsn,
         committed_watermark: TxId,
     ) -> Self {
         Self {
-            next_tx: AtomicU64::new(next_tx),
-            committed_watermark: AtomicU64::new(committed_watermark),
-            next_lsn: AtomicU64::new(next_lsn),
+            next_tx: AtomicTxId::new(next_tx),
+            committed_watermark: AtomicTxId::new(committed_watermark),
+            next_lsn: AtomicLsn::new(next_lsn),
             active_txs: Mutex::new(HashMap::new()),
             commit_mutex: Mutex::new(()),
             store,
@@ -42,7 +42,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
     }
 
     pub fn snapshot(&self) -> SnapshotId {
-        self.committed_watermark.load(Ordering::SeqCst)
+        SnapshotId::from_tx(self.committed_watermark.load(Ordering::SeqCst))
     }
 
     pub fn with_write_set<F, R>(&self, tx: TxId, f: F) -> Result<R>
@@ -63,7 +63,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
         self.commit_with_lsn(tx).map(|_| ())
     }
 
-    pub fn commit_with_lsn(&self, tx: TxId) -> Result<u64> {
+    pub fn commit_with_lsn(&self, tx: TxId) -> Result<Lsn> {
         let _lock = self.commit_mutex.lock();
         let mut ws = self.cloned_write_set(tx)?;
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
@@ -89,13 +89,14 @@ impl<S: WriteSetApplicator> TxManager<S> {
         self.store.new_row_id()
     }
 
-    pub fn current_lsn(&self) -> u64 {
-        self.next_lsn.load(Ordering::SeqCst).saturating_sub(1)
+    pub fn current_lsn(&self) -> Lsn {
+        let raw = self.next_lsn.load(Ordering::SeqCst).0.saturating_sub(1);
+        Lsn(raw)
     }
 
     pub fn allocate_ddl_lsn<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(u64) -> R,
+        F: FnOnce(Lsn) -> R,
     {
         let _lock = self.commit_mutex.lock();
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
@@ -108,6 +109,19 @@ impl<S: WriteSetApplicator> TxManager<S> {
     {
         let _lock = self.commit_mutex.lock();
         f()
+    }
+
+    /// Stub: returns TxId(0) regardless. Impl must return committed_watermark.load(SeqCst).
+    #[inline]
+    pub fn current_tx_max(&self) -> TxId {
+        TxId(0)
+    }
+
+    /// Stub: does nothing, returns Ok(()). Impl must:
+    ///   - If incoming.0 == u64::MAX, return Err(Error::TxIdOverflow { table, incoming: u64::MAX })
+    ///   - Else: next_tx.fetch_max(TxId(incoming.0 + 1), SeqCst); committed_watermark.fetch_max(incoming, SeqCst); Ok(())
+    pub fn advance_for_sync(&self, _table: &str, _incoming: TxId) -> Result<()> {
+        Ok(())
     }
 }
 

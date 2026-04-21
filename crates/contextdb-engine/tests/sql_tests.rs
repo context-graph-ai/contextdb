@@ -612,3 +612,514 @@ fn test_drop_table() {
         .unwrap_err();
     assert!(matches!(err, Error::TableNotFound(_)));
 }
+
+// ======== T9 ========
+#[test]
+fn test_create_table_txid_column_parses_and_roundtrips() {
+    use contextdb_core::table_meta::ColumnType;
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, contextdb_core::Value> = HashMap::new();
+
+    // Case 1: uppercase TXID, NOT NULL
+    let db1 = Database::open_memory();
+    db1.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse after stubs land");
+    let meta1 = db1
+        .table_meta("t")
+        .expect("table_meta(\"t\") must be Some after CREATE TABLE");
+    let col1 = meta1
+        .columns
+        .iter()
+        .find(|c| c.name == "x")
+        .expect("column \"x\" must exist in table meta");
+    assert_eq!(
+        col1.column_type,
+        ColumnType::TxId,
+        "column \"x\" type must be ColumnType::TxId (uppercase TXID)",
+    );
+    assert!(
+        !col1.nullable,
+        "column \"x\" declared NOT NULL must have nullable == false",
+    );
+
+    // Case 2: lowercase txid, implicit nullable
+    let db2 = Database::open_memory();
+    db2.execute("CREATE TABLE t2 (x txid)", &empty)
+        .expect("CREATE TABLE t2 (x txid) must parse (lowercase)");
+    let meta2 = db2
+        .table_meta("t2")
+        .expect("table_meta(\"t2\") must be Some after CREATE TABLE");
+    let col2 = meta2
+        .columns
+        .iter()
+        .find(|c| c.name == "x")
+        .expect("column \"x\" must exist in t2");
+    assert_eq!(
+        col2.column_type,
+        ColumnType::TxId,
+        "column \"x\" type must be ColumnType::TxId (lowercase txid)",
+    );
+    assert!(
+        col2.nullable,
+        "column \"x\" with no NOT NULL must have nullable == true",
+    );
+
+    // Case 3: mixed-case Txid
+    let db3 = Database::open_memory();
+    db3.execute("CREATE TABLE t3 (x Txid)", &empty)
+        .expect("CREATE TABLE t3 (x Txid) must parse (mixed case)");
+    let meta3 = db3
+        .table_meta("t3")
+        .expect("table_meta(\"t3\") must be Some after CREATE TABLE");
+    let col3 = meta3
+        .columns
+        .iter()
+        .find(|c| c.name == "x")
+        .expect("column \"x\" must exist in t3");
+    assert_eq!(
+        col3.column_type,
+        ColumnType::TxId,
+        "column \"x\" type must be ColumnType::TxId (mixed-case Txid)",
+    );
+}
+
+// ======== T10 ========
+#[test]
+fn test_schema_render_txid_roundtrips() {
+    use contextdb_core::table_meta::ColumnType;
+    use contextdb_engine::Database;
+    use contextdb_engine::cli_render::render_table_meta;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, contextdb_core::Value> = HashMap::new();
+
+    // Database A: create the table with a TXID column.
+    let db_a = Database::open_memory();
+    db_a.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE with TXID must parse after stubs land");
+    let meta_a = db_a
+        .table_meta("t")
+        .expect("table_meta(\"t\") must be Some after CREATE TABLE");
+    let original_col_type = meta_a
+        .columns
+        .iter()
+        .find(|c| c.name == "x")
+        .map(|c| c.column_type.clone())
+        .expect("column \"x\" must exist in t");
+    assert_eq!(
+        original_col_type,
+        ColumnType::TxId,
+        "sanity: original column type must be ColumnType::TxId",
+    );
+
+    // Render via the CLI surface.
+    let rendered = render_table_meta("t", &meta_a);
+    assert!(
+        rendered.contains("TXID"),
+        "rendered .schema output must contain \"TXID\", got: {rendered}",
+    );
+    assert!(
+        !rendered.contains("BROKEN"),
+        "rendered .schema output must not contain stub value \"BROKEN\", got: {rendered}",
+    );
+
+    // Database B: execute the rendered DDL on a fresh database.
+    let db_b = Database::open_memory();
+    db_b.execute(&rendered, &empty).unwrap_or_else(|e| {
+        panic!("rendered DDL must parse back on fresh db: {e:?}\nrendered:\n{rendered}")
+    });
+    let meta_b = db_b
+        .table_meta("t")
+        .expect("table_meta(\"t\") must be Some on db_b after re-executing rendered DDL");
+    let roundtripped_col_type = meta_b
+        .columns
+        .iter()
+        .find(|c| c.name == "x")
+        .map(|c| c.column_type.clone())
+        .expect("column \"x\" must exist in t on db_b");
+    assert_eq!(
+        roundtripped_col_type, original_col_type,
+        "round-tripped column type must equal the original ColumnType::TxId",
+    );
+}
+
+// ======== T12 ========
+#[test]
+fn test_insert_value_txid_within_watermark_succeeds() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+
+    // Drive the committed watermark forward with regular commits on an unrelated table.
+    db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+        .expect("CREATE TABLE bump must succeed");
+    for n in 0..5i64 {
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("id".to_string(), Value::Uuid(Uuid::new_v4()));
+        row.insert("n".to_string(), Value::Int64(n));
+        db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &row)
+            .unwrap_or_else(|e| panic!("bump insert {n} must succeed: {e:?}"));
+    }
+    let watermark = db.committed_watermark();
+    assert!(
+        watermark.0 >= 5,
+        "committed_watermark must be >= 5 after five regular commits, got TxId({})",
+        watermark.0,
+    );
+
+    // Create the TXID table.
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    // Insert Value::TxId(TxId(2)) — strictly below the watermark — via library API.
+    let tx = db.begin();
+    let mut values: HashMap<String, Value> = HashMap::new();
+    values.insert("x".to_string(), Value::TxId(TxId(2)));
+    let insert_result = db.insert_row(tx, "t", values);
+    assert!(
+        insert_result.is_ok(),
+        "insert Value::TxId(TxId(2)) into TXID column with watermark >= 5 must succeed; got {insert_result:?}",
+    );
+    db.commit(tx)
+        .expect("commit of Value::TxId(TxId(2)) insert must succeed");
+
+    // SELECT * FROM t must return exactly one row with x == Value::TxId(TxId(2)).
+    let result = db
+        .execute("SELECT * FROM t", &empty)
+        .expect("SELECT * FROM t must succeed");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "exactly one row must be stored after the single insert",
+    );
+    let x_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("result must have column \"x\"");
+    assert_eq!(
+        result.rows[0][x_idx],
+        Value::TxId(TxId(2)),
+        "stored value must round-trip equal to Value::TxId(TxId(2))",
+    );
+}
+
+// ======== T13 ========
+#[test]
+fn test_insert_value_txid_beyond_watermark_rejected() {
+    use contextdb_core::{Error, TxId, Value};
+    use contextdb_engine::Database;
+
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &Default::default())
+        .expect("CREATE TABLE with TXID column must parse after stubs land");
+
+    // Read the committed watermark as the max-allowed TxId baseline.
+    let baseline = db.committed_watermark();
+
+    // Attempt to insert Value::TxId(u64::MAX) — must fail with TxIdOutOfRange.
+    // Stubs: coerce_value_for_column returns Err(ColumnTypeMismatch { actual: "STUB" }) unconditionally
+    //        for a TXID column, so this test currently fails at the `match` arm below.
+    // Impl must: positive-accept value <= current_tx_max; reject value > current_tx_max
+    //           with TxIdOutOfRange { table, column, value, max } populated from the
+    //           threaded statement-scoped snapshot.
+    let tx = db.begin();
+    let mut row = std::collections::HashMap::new();
+    row.insert("x".to_string(), Value::TxId(TxId(u64::MAX)));
+    let err = db
+        .insert_row(tx, "t", row)
+        .expect_err("insert must reject TxId(u64::MAX)");
+    let _ = db.rollback(tx);
+
+    match err {
+        Error::TxIdOutOfRange {
+            table,
+            column,
+            value,
+            max,
+        } => {
+            assert_eq!(table, "t", "error.table must be the target table name");
+            assert_eq!(column, "x", "error.column must be the target column name");
+            assert_eq!(value, u64::MAX, "error.value must be the offending raw u64");
+            assert_eq!(
+                max, baseline.0,
+                "error.max must equal the committed watermark at statement entry"
+            );
+        }
+        other => panic!("expected Error::TxIdOutOfRange, got {other:?}"),
+    }
+
+    // Confirm no row was committed.
+    let rows = db
+        .execute("SELECT * FROM t", &Default::default())
+        .expect("SELECT must succeed")
+        .rows;
+    assert_eq!(rows.len(), 0, "rejected insert must not commit any row");
+}
+
+// ======== T17 ========
+#[test]
+fn test_insert_wrong_variant_into_txid_column_rejected() {
+    use contextdb_core::{Error, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
+
+    #[allow(clippy::approx_constant)]
+    let fixtures: Vec<(Value, &'static str)> = vec![
+        (Value::Timestamp(0), "Timestamp"),
+        (Value::Int64(42), "Int64"),
+        (Value::Float64(3.14), "Float64"),
+        (Value::Text("x".into()), "Text"),
+        (Value::Uuid(Uuid::nil()), "Uuid"),
+        (Value::Bool(true), "Bool"),
+        (Value::Json(serde_json::Value::Null), "Json"),
+        (Value::Vector(vec![1.0]), "Vector"),
+    ];
+
+    for (value, expected_actual) in fixtures {
+        let tx = db.begin();
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("x".to_string(), value.clone());
+        let err = db.insert_row(tx, "t", row).expect_err(&format!(
+            "insert of {value:?} into TXID NOT NULL column must be rejected",
+        ));
+        let _ = db.rollback(tx);
+
+        match err {
+            Error::ColumnTypeMismatch {
+                table,
+                column,
+                expected,
+                actual,
+            } => {
+                assert_eq!(table, "t", "error.table must be \"t\" for {value:?}");
+                assert_eq!(column, "x", "error.column must be \"x\" for {value:?}");
+                assert_eq!(
+                    expected, "TXID",
+                    "error.expected must be \"TXID\" for {value:?}",
+                );
+                assert_eq!(
+                    actual, expected_actual,
+                    "error.actual must be {expected_actual:?} for {value:?}",
+                );
+            }
+            other => panic!("expected Error::ColumnTypeMismatch for {value:?}, got {other:?}",),
+        }
+    }
+}
+
+// ======== T18 ========
+#[test]
+fn test_insert_null_respects_txid_nullability() {
+    use contextdb_core::{Error, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+    let db = Database::open_memory();
+
+    // Case (a): TXID NULL accepts Value::Null, stores it back.
+    db.execute("CREATE TABLE t_null (x TXID NULL)", &empty)
+        .expect("CREATE TABLE t_null (x TXID NULL) must parse");
+    let tx_a = db.begin();
+    let mut row_a: HashMap<String, Value> = HashMap::new();
+    row_a.insert("x".to_string(), Value::Null);
+    db.insert_row(tx_a, "t_null", row_a)
+        .expect("Value::Null into TXID NULL column must succeed");
+    db.commit(tx_a).expect("commit of null row must succeed");
+
+    let result = db
+        .execute("SELECT * FROM t_null", &empty)
+        .expect("SELECT * FROM t_null must succeed");
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "exactly one row must be stored in t_null",
+    );
+    let x_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "x")
+        .expect("result must have column \"x\"");
+    assert_eq!(
+        result.rows[0][x_idx],
+        Value::Null,
+        "stored value must round-trip as Value::Null",
+    );
+
+    // Case (b): TXID NOT NULL rejects Value::Null with ColumnNotNullable, not ColumnTypeMismatch.
+    db.execute("CREATE TABLE t_nn (x TXID NOT NULL)", &empty)
+        .expect("CREATE TABLE t_nn (x TXID NOT NULL) must parse");
+    let tx_b = db.begin();
+    let mut row_b: HashMap<String, Value> = HashMap::new();
+    row_b.insert("x".to_string(), Value::Null);
+    let err = db
+        .insert_row(tx_b, "t_nn", row_b)
+        .expect_err("Value::Null into TXID NOT NULL must be rejected");
+    let _ = db.rollback(tx_b);
+
+    match err {
+        Error::ColumnNotNullable { table, column } => {
+            assert_eq!(table, "t_nn", "error.table must be \"t_nn\"");
+            assert_eq!(column, "x", "error.column must be \"x\"");
+        }
+        Error::ColumnTypeMismatch { .. } => panic!(
+            "Value::Null into NOT NULL must produce ColumnNotNullable, not ColumnTypeMismatch: {err:?}",
+        ),
+        other => panic!("expected Error::ColumnNotNullable, got {other:?}",),
+    }
+}
+
+// ======== T19 ========
+#[test]
+fn test_insert_value_txid_into_non_txid_columns_rejected() {
+    use contextdb_core::{Error, TxId, Value};
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+
+    let empty: HashMap<String, Value> = HashMap::new();
+
+    let fixtures: Vec<(&'static str, &'static str, &'static str)> = vec![
+        ("t_int", "INTEGER", "INTEGER"),
+        ("t_ts", "TIMESTAMP", "TIMESTAMP"),
+        ("t_text", "TEXT", "TEXT"),
+        ("t_real", "REAL", "REAL"),
+        ("t_bool", "BOOLEAN", "BOOLEAN"),
+        ("t_uuid", "UUID", "UUID"),
+        ("t_json", "JSON", "JSON"),
+        ("t_vec", "VECTOR(3)", "VECTOR(3)"),
+    ];
+
+    for (table, col_type_ddl, expected_str) in fixtures {
+        let db = Database::open_memory();
+        let create = format!("CREATE TABLE {table} (x {col_type_ddl} NOT NULL)");
+        db.execute(&create, &empty)
+            .unwrap_or_else(|e| panic!("CREATE TABLE {table} ({col_type_ddl}) must parse: {e:?}"));
+
+        let tx = db.begin();
+        let mut row: HashMap<String, Value> = HashMap::new();
+        row.insert("x".to_string(), Value::TxId(TxId(42)));
+        let err = db.insert_row(tx, table, row).expect_err(&format!(
+            "insert of Value::TxId into {col_type_ddl} column must be rejected",
+        ));
+        let _ = db.rollback(tx);
+
+        match err {
+            Error::ColumnTypeMismatch {
+                table: t,
+                column,
+                expected,
+                actual,
+            } => {
+                assert_eq!(t, table, "error.table must be {table:?}");
+                assert_eq!(column, "x", "error.column must be \"x\" for {table}");
+                assert_eq!(
+                    expected, expected_str,
+                    "error.expected must be {expected_str:?} for column type {col_type_ddl}",
+                );
+                assert_eq!(
+                    actual, "TxId",
+                    "error.actual must be \"TxId\" for Value::TxId into {col_type_ddl}",
+                );
+            }
+            other => {
+                panic!("expected Error::ColumnTypeMismatch for {col_type_ddl}, got {other:?}",)
+            }
+        }
+    }
+}
+
+// ======== TU8 ========
+#[test]
+fn coerce_value_for_column_exhaustive_no_catch_all() {
+    use regex::Regex;
+
+    let executor_rs = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("executor.rs");
+    let body = std::fs::read_to_string(&executor_rs)
+        .unwrap_or_else(|e| panic!("read {}: {e}", executor_rs.display()));
+
+    // Locate `fn coerce_value_for_column` and extract its body by brace matching.
+    let fn_start = body
+        .find("fn coerce_value_for_column")
+        .expect("coerce_value_for_column must exist in executor.rs");
+    let tail = &body[fn_start..];
+    let body_start = tail.find('{').expect("fn has opening brace");
+    let mut depth = 0i32;
+    let mut end = body_start;
+    for (i, ch) in tail[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = body_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let fn_body = &tail[body_start..end];
+
+    // Locate the `match col.column_type { ... }` block inside the fn body.
+    let match_start = fn_body
+        .find("match col.column_type")
+        .expect("match on col.column_type must exist");
+    let match_tail = &fn_body[match_start..];
+    let match_brace = match_tail.find('{').expect("match has opening brace");
+    let mut depth = 0i32;
+    let mut match_end = match_brace;
+    for (i, ch) in match_tail[match_brace..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    match_end = match_brace + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let match_body = &match_tail[match_brace..match_end];
+
+    // Catch-all rejection: no `_ =>` arm at the match's top level.
+    let catchall_re = Regex::new(r"(?m)^\s*_\s*=>").expect("catchall regex compiles");
+    assert!(
+        !catchall_re.is_match(match_body),
+        "coerce_value_for_column's match on col.column_type must not contain a `_ =>` catch-all arm; body:\n{match_body}"
+    );
+
+    // Runtime leg: inserting Value::Text("x") into a VECTOR(3) column must not silently succeed.
+    use contextdb_core::Value;
+    use contextdb_engine::Database;
+
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE v (e VECTOR(3))", &Default::default())
+        .expect("CREATE TABLE v must succeed");
+
+    let mut row = std::collections::HashMap::new();
+    row.insert("e".to_string(), Value::Text("x".to_string()));
+    let tx = db.begin();
+    let result = db.insert_row(tx, "v", row);
+    let _ = db.rollback(tx);
+    assert!(
+        result.is_err(),
+        "insert Value::Text('x') into VECTOR(3) must be rejected, got {result:?}"
+    );
+}

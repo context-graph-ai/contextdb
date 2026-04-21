@@ -7,6 +7,7 @@
 //! Sync contract tests. A9-xx test engine sync mechanics. NT-xx test NATS transport.
 
 use contextdb_core::{Direction, MemoryAccountant, Value};
+use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
 #[allow(unused_imports)]
 use contextdb_engine::sync_types::{
@@ -241,7 +242,7 @@ fn a9_01_push_returns_rows_since_watermark() {
     );
 
     // All changes since LSN 0
-    let cs_all = edge.changes_since(0);
+    let cs_all = edge.changes_since(Lsn(0));
     assert_eq!(
         cs_all.rows.len(),
         5,
@@ -394,7 +395,7 @@ fn a9_02_pull_inserts_new_rows() {
     .unwrap();
     edge.commit(tx).unwrap();
 
-    let changeset = edge.changes_since(0);
+    let changeset = edge.changes_since(Lsn(0));
     let result = server
         .apply_changes(
             changeset,
@@ -489,7 +490,7 @@ fn a9_03_pull_conflict_server_wins() {
         "server must have the row before apply"
     );
 
-    let changeset = edge.changes_since(0);
+    let changeset = edge.changes_since(Lsn(0));
     let result = server
         .apply_changes(
             changeset,
@@ -584,7 +585,7 @@ fn a9_04_pull_conflict_latest_wins() {
         "edge must have higher LSN than server for scenario 1"
     );
 
-    let changeset = edge1.changes_since(0);
+    let changeset = edge1.changes_since(Lsn(0));
     let _result = server1
         .apply_changes(
             changeset,
@@ -654,7 +655,7 @@ fn a9_04_pull_conflict_latest_wins() {
         "server must have higher LSN than edge for scenario 2"
     );
 
-    let changeset2 = edge2.changes_since(0);
+    let changeset2 = edge2.changes_since(Lsn(0));
     let result2 = server2
         .apply_changes(
             changeset2,
@@ -731,7 +732,7 @@ fn a9_05_pull_conflict_edge_wins() {
         Some("server-version")
     );
 
-    let changeset = edge.changes_since(0);
+    let changeset = edge.changes_since(Lsn(0));
     let result = server
         .apply_changes(
             changeset,
@@ -857,7 +858,7 @@ fn a9_06_observations_never_conflict() {
     edge.commit(tx_e).unwrap();
 
     // First push: 3 new observations arrive
-    let cs = edge.changes_since(0);
+    let cs = edge.changes_since(Lsn(0));
     let result1 = server
         .apply_changes(
             cs.clone(),
@@ -946,7 +947,7 @@ fn a9_07_watermark_advances_after_sync() {
     // Guard: server starts empty
     assert_eq!(server.scan("entities", server.snapshot()).unwrap().len(), 0);
 
-    let changeset = edge.changes_since(0);
+    let changeset = edge.changes_since(Lsn(0));
     let _result = server
         .apply_changes(
             changeset,
@@ -960,10 +961,13 @@ fn a9_07_watermark_advances_after_sync() {
         server_lsn_after > server_lsn_before,
         "server LSN must advance after applying changes"
     );
-    assert!(server_lsn_after > 0, "server LSN must be > 0 after apply");
+    assert!(
+        server_lsn_after > Lsn(0),
+        "server LSN must be > 0 after apply"
+    );
 
     // Server can now serve these rows to other pullers
-    let server_cs = server.changes_since(0);
+    let server_cs = server.changes_since(Lsn(0));
     assert_eq!(
         server_cs.rows.len(),
         2,
@@ -1021,7 +1025,7 @@ fn a9_08_sync_is_deterministic() {
             .unwrap();
         }
         db.commit(tx).unwrap();
-        changesets.push(db.changes_since(0));
+        changesets.push(db.changes_since(Lsn(0)));
     }
 
     // Server 1: apply in order 0, 1, 2
@@ -1176,7 +1180,7 @@ fn a9_09_memory_to_memory_sync() {
         0
     );
 
-    let changeset = edge.changes_since(0);
+    let changeset = edge.changes_since(Lsn(0));
 
     // Guard: changeset has all subsystems
     assert!(!changeset.rows.is_empty(), "changeset must contain rows");
@@ -1346,7 +1350,7 @@ fn a9_11_conflict_resolution_respects_state_machine() {
         "guard: edge must have higher LSN for LatestWins to select edge version"
     );
 
-    let changeset = edge.changes_since(0);
+    let changeset = edge.changes_since(Lsn(0));
     let result = server
         .apply_changes(
             changeset,
@@ -1460,7 +1464,7 @@ fn a9_12_edge_temporal_validity_syncs() {
     );
 
     // Sync the OPEN edge to server — verify BFS finds it (positive assertion)
-    let changeset_open = edge.changes_since(0);
+    let changeset_open = edge.changes_since(Lsn(0));
     server
         .apply_changes(
             changeset_open,
@@ -1490,7 +1494,7 @@ fn a9_12_edge_temporal_validity_syncs() {
         .unwrap();
     edge.commit(tx2).unwrap();
 
-    let changeset_closed = edge.changes_since(0);
+    let changeset_closed = edge.changes_since(Lsn(0));
     server
         .apply_changes(
             changeset_closed,
@@ -1578,7 +1582,7 @@ fn a9_13_apply_changes_concurrent_with_local_writes() {
         .unwrap();
 
     // While local tx is open, apply edge changes
-    let changeset = edge.changes_since(0);
+    let changeset = edge.changes_since(Lsn(0));
     let result = server
         .apply_changes(
             changeset,
@@ -1699,7 +1703,7 @@ fn a9_14_selective_sync_direction_filtering() {
     edge.commit(tx).unwrap();
 
     // Push with direction filter: only Push and Both tables
-    let full_cs = edge.changes_since(0);
+    let full_cs = edge.changes_since(Lsn(0));
     let push_cs =
         full_cs.filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
     server
@@ -1759,7 +1763,7 @@ fn a9_14_selective_sync_direction_filtering() {
     server.commit(tx_s).unwrap();
 
     // Edge pulls with direction filter: only Pull and Both tables
-    let server_full_cs = server.changes_since(0);
+    let server_full_cs = server.changes_since(Lsn(0));
     let pull_cs = server_full_cs
         .filter_by_direction(&directions, &[SyncDirection::Pull, SyncDirection::Both]);
 
@@ -1851,7 +1855,7 @@ fn a9_15_archive_not_delete_status_transition_sync() {
     let lsn_after_insert = edge.current_lsn();
 
     // Sync initial insert to server
-    let initial_cs = edge.changes_since(0);
+    let initial_cs = edge.changes_since(Lsn(0));
     server
         .apply_changes(
             initial_cs,
@@ -1982,7 +1986,7 @@ fn a9_15_archive_not_delete_status_transition_sync() {
         },
         values: HashMap::new(), // deliberately empty
         deleted: false,
-        lsn: 999,
+        lsn: Lsn(999),
     };
     let poison_cs = ChangeSet {
         rows: vec![empty_values_change],
@@ -2825,7 +2829,7 @@ async fn nt_07_offline_accumulate_batch_sync() {
     );
 
     // Guard: changes_since(0) returns all 1000
-    let cs = edge_db.changes_since(0);
+    let cs = edge_db.changes_since(Lsn(0));
     assert_eq!(
         cs.rows.len(),
         1000,
@@ -2855,7 +2859,7 @@ async fn nt_07_offline_accumulate_batch_sync() {
     assert_eq!(all.len(), 1000, "server must have all 1000 observations");
 
     // LSN ordering preserved — seq values must be in ascending order
-    let server_cs = server_db.changes_since(0);
+    let server_cs = server_db.changes_since(Lsn(0));
     let seqs: Vec<i64> = server_cs
         .rows
         .iter()
@@ -3106,7 +3110,7 @@ async fn nt_09_cross_edge_embedding_clustering() {
     // Verify that result row_ids map back to the 3 pushed observations.
     // Since the server has exactly 3 observations total and we search with k=3,
     // all results must be the 3 pushed observations — no other rows exist.
-    let result_row_ids: HashSet<u64> = search_result.iter().map(|(rid, _)| *rid).collect();
+    let result_row_ids: HashSet<u64> = search_result.iter().map(|(rid, _)| rid.0).collect();
     assert_eq!(
         result_row_ids.len(),
         3,
@@ -3468,7 +3472,7 @@ async fn nt_11_push_large_mixed_payload_chunked() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(edge_db.changes_since(0));
+        let wire = WireChangeSet::from(edge_db.changes_since(Lsn(0)));
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -3571,7 +3575,7 @@ async fn nt_12_push_single_oversized_text_blob() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(edge_db.changes_since(0));
+        let wire = WireChangeSet::from(edge_db.changes_since(Lsn(0)));
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -3661,7 +3665,7 @@ async fn nt_13_pull_large_dataset_chunked() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(server_db.changes_since(0));
+        let wire = WireChangeSet::from(server_db.changes_since(Lsn(0)));
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -3811,7 +3815,7 @@ async fn nt_14_large_bidirectional_vector_sync() {
 
     {
         use contextdb_server::protocol::WireChangeSet;
-        let wire = WireChangeSet::from(edge_db.changes_since(0));
+        let wire = WireChangeSet::from(edge_db.changes_since(Lsn(0)));
         let encoded_len = rmp_serde::to_vec(&wire).unwrap().len();
         assert!(
             encoded_len > 1_048_576,
@@ -4007,7 +4011,7 @@ fn cp06_conflict_policy_wired_to_apply_changes() {
                 ("name".to_string(), Value::Text("edge_value".to_string())),
             ]),
             deleted: false,
-            lsn: 100,
+            lsn: Lsn(100),
         }],
         edges: vec![],
         vectors: vec![],
@@ -4281,7 +4285,7 @@ fn integrity_11_sync_apply_respects_memory_limit() {
                 ("data".to_string(), Value::Text("x".repeat(4096))),
             ]),
             deleted: false,
-            lsn: 1,
+            lsn: Lsn(1),
         }],
         edges: vec![],
         vectors: vec![],
@@ -4354,13 +4358,13 @@ fn integrity_12_sync_delete_removes_vectors() {
                 ("data".to_string(), Value::Text("target".into())),
             ]),
             deleted: true,
-            lsn: 10,
+            lsn: Lsn(10),
         }],
         edges: vec![],
         vectors: vec![VectorChange {
-            row_id: 1,
+            row_id: RowId(1),
             vector: Vec::new(),
-            lsn: 10,
+            lsn: Lsn(10),
         }],
         ddl: vec![],
     };
@@ -4435,13 +4439,13 @@ fn integrity_13_sync_upsert_refreshes_vector() {
                 ("embedding".to_string(), Value::Vector(new_vector.clone())),
             ]),
             deleted: false,
-            lsn: 10,
+            lsn: Lsn(10),
         }],
         edges: vec![],
         vectors: vec![VectorChange {
-            row_id: 1,
+            row_id: RowId(1),
             vector: new_vector.clone(),
-            lsn: 10,
+            lsn: Lsn(10),
         }],
         ddl: vec![],
     };
@@ -4469,4 +4473,118 @@ fn integrity_13_sync_upsert_refreshes_vector() {
         1,
         "sync upsert must keep the row searchable by its new embedding"
     );
+}
+
+// ======== T28 ========
+// Partition-heal uses the real in-process pattern from gate_a_sync.rs
+// (see a9_04_pull_conflict_latest_wins): two Database instances write
+// independently (simulating partition — neither sees the other's changes),
+// then "heal" is a bidirectional exchange of `changes_since(0)` applied
+// via `apply_changes(cs, ConflictPolicies::uniform(ConflictPolicy::LatestWins))`.
+// No partition helper type is required; partition = withholding the
+// changeset exchange until the write phase is complete.
+#[test]
+fn sync_partition_heal_value_txid_lww_deterministic() {
+    use contextdb_core::{TxId, Value};
+    use contextdb_engine::Database;
+    use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+    use std::collections::HashMap;
+
+    // Fixed primary key; identical in every iteration.
+    let pk = uuid::Uuid::from_u128(0x1234_5678_9ABC_DEF0_1122_3344_5566_7788);
+
+    for iteration in 0..10u32 {
+        // Fresh databases every iteration — no shared state carries across runs.
+        let edge_a = Database::open_memory();
+        let edge_b = Database::open_memory();
+
+        let empty: HashMap<String, Value> = HashMap::new();
+        for db in [&edge_a, &edge_b] {
+            db.execute(
+                "CREATE TABLE t (pk UUID PRIMARY KEY, x TXID NOT NULL)",
+                &empty,
+            )
+            .expect("CREATE TABLE must succeed");
+
+            // Drive the committed watermark past 200 via unrelated auto-commit SQL,
+            // mirroring T12's pattern. Library-API insert_row enforces the plan's
+            // B7 bound (n <= current_tx_max) on the library path, so the TxId(100)
+            // and TxId(200) targets below must fall inside the watermark.
+            db.execute("CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)", &empty)
+                .expect("CREATE TABLE bump must succeed");
+            for n in 0..210i64 {
+                let mut row: HashMap<String, Value> = HashMap::new();
+                row.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+                row.insert("n".to_string(), Value::Int64(n));
+                db.execute("INSERT INTO bump (id, n) VALUES ($id, $n)", &row)
+                    .unwrap_or_else(|e| panic!("bump insert {n} must succeed: {e:?}"));
+            }
+            let wm = db.committed_watermark();
+            assert!(
+                wm.0 >= 200,
+                "committed_watermark must be >= 200 after bump commits, got TxId({})",
+                wm.0,
+            );
+        }
+
+        // Partition: each edge writes the same pk with a distinct Value::TxId.
+        // No changeset is exchanged during this phase.
+        {
+            let mut row_a = HashMap::new();
+            row_a.insert("pk".to_string(), Value::Uuid(pk));
+            row_a.insert("x".to_string(), Value::TxId(TxId(100)));
+            let tx_a = edge_a.begin();
+            edge_a
+                .insert_row(tx_a, "t", row_a)
+                .expect("edge_a insert must succeed");
+            edge_a.commit(tx_a).expect("edge_a commit must succeed");
+        }
+        {
+            let mut row_b = HashMap::new();
+            row_b.insert("pk".to_string(), Value::Uuid(pk));
+            row_b.insert("x".to_string(), Value::TxId(TxId(200)));
+            let tx_b = edge_b.begin();
+            edge_b
+                .insert_row(tx_b, "t", row_b)
+                .expect("edge_b insert must succeed");
+            edge_b.commit(tx_b).expect("edge_b commit must succeed");
+        }
+
+        // Heal + bidirectional sync to quiescence under uniform LWW:
+        // apply each peer's changes_since(0) on the other, in both directions,
+        // and repeat until neither side changes. Two rounds suffice for a
+        // single conflicting row under LatestWins.
+        let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+        for _round in 0..2 {
+            let a_to_b = edge_a.changes_since(contextdb_core::Lsn(0));
+            edge_b
+                .apply_changes(a_to_b, &policies)
+                .expect("apply edge_a → edge_b must succeed");
+            let b_to_a = edge_b.changes_since(contextdb_core::Lsn(0));
+            edge_a
+                .apply_changes(b_to_a, &policies)
+                .expect("apply edge_b → edge_a must succeed");
+        }
+
+        // Both edges must converge to exactly Value::TxId(TxId(200)).
+        let mut select_params: HashMap<String, Value> = HashMap::new();
+        select_params.insert("pk".to_string(), Value::Uuid(pk));
+        for (name, db) in [("edge-A", &edge_a), ("edge-B", &edge_b)] {
+            let result = db
+                .execute("SELECT x FROM t WHERE pk = $pk", &select_params)
+                .expect("bound select must succeed");
+            assert_eq!(
+                result.rows.len(),
+                1,
+                "{name} must have exactly 1 row for pk on iteration {iteration}; got {}",
+                result.rows.len()
+            );
+            assert_eq!(
+                result.rows[0][0],
+                Value::TxId(TxId(200)),
+                "{name} must converge to Value::TxId(TxId(200)) on iteration {iteration}; got {:?}",
+                result.rows[0][0]
+            );
+        }
+    }
 }

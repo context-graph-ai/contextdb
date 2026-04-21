@@ -3,7 +3,7 @@ use crate::protocol::{
     WireRowChange, decode, encode,
 };
 use crate::subjects::{pull_subject, push_subject};
-use contextdb_core::Error;
+use contextdb_core::{AtomicLsn, Error, Lsn};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, SyncDirection,
@@ -11,7 +11,7 @@ use contextdb_engine::sync_types::{
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -28,8 +28,8 @@ pub struct SyncClient {
     nats: tokio::sync::Mutex<Option<async_nats::Client>>,
     nats_url: String,
     tenant_id: String,
-    push_watermark: AtomicU64,
-    pull_watermark: AtomicU64,
+    push_watermark: AtomicLsn,
+    pull_watermark: AtomicLsn,
     table_directions: std::sync::RwLock<HashMap<String, SyncDirection>>,
     conflict_policies: std::sync::RwLock<ConflictPolicies>,
 }
@@ -47,15 +47,15 @@ impl SyncClient {
             .persisted_sync_watermarks(tenant_id)
             .unwrap_or_else(|err| {
                 tracing::warn!(%tenant_id, error = %err, "failed to load persisted sync watermarks");
-                (0, 0)
+                (Lsn(0), Lsn(0))
             });
         Self {
             db,
             nats: tokio::sync::Mutex::new(None),
             nats_url: nats_url.to_string(),
             tenant_id: tenant_id.to_string(),
-            push_watermark: AtomicU64::new(push_watermark),
-            pull_watermark: AtomicU64::new(pull_watermark),
+            push_watermark: AtomicLsn::new(push_watermark),
+            pull_watermark: AtomicLsn::new(pull_watermark),
             table_directions: std::sync::RwLock::new(HashMap::new()),
             conflict_policies: std::sync::RwLock::new(ConflictPolicies {
                 per_table: HashMap::new(),
@@ -540,11 +540,11 @@ impl SyncClient {
         self.pull(policies).await
     }
 
-    pub fn push_watermark(&self) -> u64 {
+    pub fn push_watermark(&self) -> Lsn {
         self.push_watermark.load(Ordering::SeqCst)
     }
 
-    pub fn pull_watermark(&self) -> u64 {
+    pub fn pull_watermark(&self) -> Lsn {
         self.pull_watermark.load(Ordering::SeqCst)
     }
 
@@ -877,7 +877,7 @@ fn remap_pull_policies(policies: &ConflictPolicies) -> ConflictPolicies {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use contextdb_core::Value;
+    use contextdb_core::{RowId, Value};
     use contextdb_engine::Database;
     use contextdb_engine::sync_types::{NaturalKey, RowChange, VectorChange};
     use std::sync::Arc;
@@ -988,7 +988,7 @@ mod tests {
                 },
                 values,
                 deleted: false,
-                lsn: 1,
+                lsn: Lsn(1),
             });
         }
 
@@ -1060,12 +1060,12 @@ mod tests {
                 },
                 values,
                 deleted: false,
-                lsn: 1,
+                lsn: Lsn(1),
             });
             vectors.push(VectorChange {
-                row_id: 0,
+                row_id: RowId(0),
                 vector: (0..384).map(|j| j as f32).collect(),
-                lsn: 1,
+                lsn: Lsn(1),
             });
         }
         let changeset = ChangeSet {
@@ -1110,7 +1110,7 @@ mod tests {
             },
             values,
             deleted: false,
-            lsn: 1,
+            lsn: Lsn(1),
         };
         let changeset = ChangeSet {
             rows: vec![row],
@@ -1154,12 +1154,12 @@ mod tests {
                 },
                 values,
                 deleted: false,
-                lsn: (i + 1) as u64,
+                lsn: Lsn((i + 1) as u64),
             });
             vectors.push(VectorChange {
-                row_id: (i + 1) as u64,
+                row_id: RowId((i + 1) as u64),
                 vector: vec![i as f32; 3],
-                lsn: (i + 1) as u64,
+                lsn: Lsn((i + 1) as u64),
             });
         }
         let changeset = ChangeSet {
@@ -1238,7 +1238,7 @@ mod tests {
                 target: Uuid::new_v4(),
                 edge_type: "x".repeat(5_000),
                 properties: HashMap::new(),
-                lsn: 1,
+                lsn: Lsn(1),
             });
         }
         let changeset = ChangeSet {

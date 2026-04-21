@@ -1,4 +1,4 @@
-use contextdb_core::{AdjEntry, EdgeType, NodeId};
+use contextdb_core::{AdjEntry, EdgeType, NodeId, TxId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
@@ -31,7 +31,7 @@ impl GraphStore {
         }
     }
 
-    pub fn apply_deletes(&self, deletes: Vec<(NodeId, EdgeType, NodeId, u64)>) {
+    pub fn apply_deletes(&self, deletes: Vec<(NodeId, EdgeType, NodeId, TxId)>) {
         let mut fwd = self.forward_adj.write();
         let mut rev = self.reverse_adj.write();
 

@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/snapshotid_into_wallclock.rs:5:25
+  |
+5 |     let _w: Wallclock = s;
+  |             ---------   ^ expected `Wallclock`, found `SnapshotId`
+  |             |
+  |             expected due to this

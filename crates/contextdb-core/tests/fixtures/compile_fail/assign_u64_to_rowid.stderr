@@ -1,0 +1,12 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/assign_u64_to_rowid.rs:5:21
+  |
+5 |     let _r: RowId = x;
+  |             -----   ^ expected `RowId`, found `u64`
+  |             |
+  |             expected due to this
+  |
+help: try wrapping the expression in `contextdb_core::RowId`
+  |
+5 |     let _r: RowId = contextdb_core::RowId(x);
+  |                     ++++++++++++++++++++++ +

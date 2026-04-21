@@ -8,7 +8,7 @@ pub struct WriteSet {
     pub adj_deletes: Vec<(NodeId, EdgeType, NodeId, TxId)>,
     pub vector_inserts: Vec<VectorEntry>,
     pub vector_deletes: Vec<(RowId, TxId)>,
-    pub commit_lsn: Option<u64>,
+    pub commit_lsn: Option<Lsn>,
     pub propagation_in_progress: bool,
 }
 
@@ -26,7 +26,7 @@ impl WriteSet {
             && self.vector_deletes.is_empty()
     }
 
-    pub fn stamp_lsn(&mut self, lsn: u64) {
+    pub fn stamp_lsn(&mut self, lsn: Lsn) {
         self.commit_lsn = Some(lsn);
 
         for (_, row) in &mut self.relational_inserts {

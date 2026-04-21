@@ -565,3 +565,81 @@ fn f05l_vector_index_correct_after_reopen_update_embedding() {
         "B should be nearest to [1,0,0] after A moved to [-1,0,0]"
     );
 }
+
+// ======== T30 ========
+#[test]
+fn single_database_txid_causal_order_under_backward_wallclock() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use contextdb_core::{TxId, Value, Wallclock};
+    use contextdb_engine::Database;
+
+    // Non-monotonic wall-clock sequence — includes forward, backward, forward, backward, forward.
+    let sequence: Vec<u64> = vec![1000, 1010, 1005, 1020, 1003, 1030, 1001, 1040];
+    let seq_handle = Arc::new(sequence.clone());
+    let idx = Arc::new(AtomicUsize::new(0));
+    {
+        let seq_handle = Arc::clone(&seq_handle);
+        let idx = Arc::clone(&idx);
+        Wallclock::set_test_clock(move || {
+            let i = idx.fetch_add(1, AtomicOrdering::SeqCst);
+            seq_handle[i.min(seq_handle.len() - 1)]
+        });
+    }
+
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, ts TXID NOT NULL)",
+        &Default::default(),
+    )
+    .expect("CREATE TABLE with TXID column must parse after stubs land");
+
+    let mut recorded: Vec<TxId> = Vec::with_capacity(sequence.len());
+    let mut ids: Vec<uuid::Uuid> = Vec::with_capacity(sequence.len());
+
+    for _ in 0..sequence.len() {
+        // `begin()` returns a bare TxId (not a guard); `commit(tx)` finalizes.
+        let txid: TxId = db.begin();
+        let id = uuid::Uuid::new_v4();
+        let mut row = std::collections::HashMap::new();
+        row.insert("id".to_string(), Value::Uuid(id));
+        row.insert("ts".to_string(), Value::TxId(txid));
+        db.insert_row(txid, "t", row)
+            .expect("insert must succeed under stubs' TXID arm once impl lands");
+        db.commit(txid).expect("commit must succeed");
+        recorded.push(txid);
+        ids.push(id);
+    }
+
+    // Causal-order check: AtomicU64 allocator is monotonic regardless of wall-clock skew,
+    // so recorded is strictly increasing.
+    for window in recorded.windows(2) {
+        assert!(
+            window[0].0 < window[1].0,
+            "allocated TxId must be strictly increasing (engine-monotonic); got {window:?}"
+        );
+    }
+
+    // ORDER BY on a TXID column must order by engine-issued TxId, not wall-clock.
+    let result = db
+        .execute("SELECT id, ts FROM t ORDER BY ts ASC", &Default::default())
+        .expect("SELECT must succeed");
+
+    let ts_column: Vec<Value> = result.rows.iter().map(|row| row[1].clone()).collect();
+
+    let expected: Vec<Value> = recorded.iter().copied().map(Value::TxId).collect();
+    assert_eq!(
+        ts_column, expected,
+        "ORDER BY ts ASC must return engine-allocator order, not wall-clock order"
+    );
+
+    let id_column: Vec<Value> = result.rows.iter().map(|row| row[0].clone()).collect();
+    let expected_ids: Vec<Value> = ids.iter().copied().map(Value::Uuid).collect();
+    assert_eq!(
+        id_column, expected_ids,
+        "row ids must align with insertion order under ORDER BY ts ASC"
+    );
+
+    Wallclock::reset_test_clock();
+}

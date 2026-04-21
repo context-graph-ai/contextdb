@@ -1,0 +1,12 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/assign_u64_to_lsn.rs:5:19
+  |
+5 |     let _l: Lsn = x;
+  |             ---   ^ expected `Lsn`, found `u64`
+  |             |
+  |             expected due to this
+  |
+help: try wrapping the expression in `contextdb_core::Lsn`
+  |
+5 |     let _l: Lsn = contextdb_core::Lsn(x);
+  |                   ++++++++++++++++++++ +

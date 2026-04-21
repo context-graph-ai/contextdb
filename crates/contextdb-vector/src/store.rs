@@ -1,5 +1,5 @@
 use crate::HnswIndex;
-use contextdb_core::{MemoryAccountant, RowId, VectorEntry};
+use contextdb_core::{MemoryAccountant, RowId, TxId, VectorEntry};
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -47,7 +47,7 @@ impl VectorStore {
         }
     }
 
-    pub fn apply_deletes(&self, deletes: Vec<(RowId, u64)>) {
+    pub fn apply_deletes(&self, deletes: Vec<(RowId, TxId)>) {
         let mut vectors = self.vectors.write();
         for (row_id, deleted_tx) in deletes {
             for v in vectors.iter_mut() {

@@ -142,13 +142,13 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             values,
             created_tx: tx,
             deleted_tx: None,
-            lsn: 0,
-            created_at: Some(
+            lsn: contextdb_core::Lsn(0),
+            created_at: Some(contextdb_core::Wallclock(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64,
-            ),
+            )),
         };
 
         self.tx_mgr.with_write_set(tx, |ws| {

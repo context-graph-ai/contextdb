@@ -1,3 +1,4 @@
+use contextdb_core::Lsn;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,8 +66,8 @@ impl DatabasePlugin for RejectingPlugin {
 // Records every hook call with its arguments.
 #[derive(Debug, Clone, PartialEq)]
 enum HookEvent {
-    PreCommit(CommitSource, Option<u64>),  // source, commit_lsn
-    PostCommit(CommitSource, Option<u64>), // source, commit_lsn
+    PreCommit(CommitSource, Option<Lsn>),  // source, commit_lsn
+    PostCommit(CommitSource, Option<Lsn>), // source, commit_lsn
     OnOpen,
     OnClose,
     OnQuery(String),
@@ -541,7 +542,7 @@ fn p05_pre_commit_source_sync_pull() {
                 ("name".to_string(), Value::Text("synced".to_string())),
             ]),
             deleted: false,
-            lsn: 1,
+            lsn: Lsn(1),
         }],
         edges: vec![],
         vectors: vec![],
@@ -579,7 +580,7 @@ fn p06_post_commit_fires_with_lsn_autocommit() {
         .collect();
     assert_eq!(posts.len(), 1, "exactly one post_commit for the INSERT");
     assert!(
-        matches!(posts[0], HookEvent::PostCommit(CommitSource::AutoCommit, Some(lsn)) if *lsn > 0)
+        matches!(posts[0], HookEvent::PostCommit(CommitSource::AutoCommit, Some(lsn)) if lsn.0 > 0)
     );
     // Cross-check: captured LSN matches the database's current LSN
     if let HookEvent::PostCommit(_, Some(captured_lsn)) = posts[0] {
@@ -620,7 +621,7 @@ fn p07_post_commit_fires_with_lsn_explicit() {
         .filter(|e| matches!(e, HookEvent::PostCommit(CommitSource::User, _)))
         .collect();
     assert_eq!(posts.len(), 1);
-    assert!(matches!(posts[0], HookEvent::PostCommit(CommitSource::User, Some(lsn)) if *lsn > 0));
+    assert!(matches!(posts[0], HookEvent::PostCommit(CommitSource::User, Some(lsn)) if lsn.0 > 0));
 }
 
 #[test]
@@ -1309,7 +1310,7 @@ fn p23_on_sync_push_filters_rows() {
 
     // Get changeset and call on_sync_push directly on the plugin
     // (tests plugin behavior, not the SyncClient transport path)
-    let mut cs = db.changes_since(0);
+    let mut cs = db.changes_since(Lsn(0));
     assert!(
         cs.rows.iter().any(|r| r.table == "secret_items"),
         "changeset must contain secret_items BEFORE on_sync_push"
@@ -1345,7 +1346,7 @@ fn p24_on_sync_pull_rejects_batch() {
                 ("name".to_string(), Value::Text("incoming".to_string())),
             ]),
             deleted: false,
-            lsn: 1,
+            lsn: Lsn(1),
         }],
         edges: vec![],
         vectors: vec![],
@@ -1385,7 +1386,7 @@ fn p25_on_sync_pull_filters_rows() {
                     ("name".to_string(), Value::Text("allowed".to_string())),
                 ]),
                 deleted: false,
-                lsn: 1,
+                lsn: Lsn(1),
             },
             RowChange {
                 table: "blocked".to_string(),
@@ -1398,7 +1399,7 @@ fn p25_on_sync_pull_filters_rows() {
                     ("data".to_string(), Value::Text("nope".to_string())),
                 ]),
                 deleted: false,
-                lsn: 2,
+                lsn: Lsn(2),
             },
         ],
         edges: vec![],
@@ -1572,7 +1573,7 @@ fn p34_apply_changes_per_row_sync_pull() {
                     ("name".to_string(), Value::Text(format!("sync-{i}"))),
                 ]),
                 deleted: false,
-                lsn: (i + 1) as u64,
+                lsn: Lsn((i + 1) as u64),
             }
         })
         .collect();

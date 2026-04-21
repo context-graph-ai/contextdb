@@ -1,3 +1,4 @@
+use contextdb_core::{Lsn, RowId, TxId, Wallclock};
 use contextdb_core::{Value, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
 use std::collections::HashMap;
@@ -102,7 +103,7 @@ fn r03_sync_safe_unsynced_rows_survive() {
     thread::sleep(Duration::from_secs(3));
 
     // Sync watermark is 0 — no rows synced
-    db.set_sync_watermark(0);
+    db.set_sync_watermark(Lsn(0));
     db.run_pruning_cycle();
 
     assert_eq!(
@@ -129,7 +130,7 @@ fn r04_sync_safe_synced_rows_pruned() {
         .unwrap();
 
     // Advance sync watermark past the row's LSN
-    db.set_sync_watermark(u64::MAX);
+    db.set_sync_watermark(Lsn(u64::MAX));
 
     thread::sleep(Duration::from_secs(3));
     let pruned = db.run_pruning_cycle();
@@ -318,7 +319,7 @@ fn r10_alter_table_set_retain_sync_safe() {
     thread::sleep(Duration::from_secs(3));
 
     // Sync watermark at 0 — unsynced
-    db.set_sync_watermark(0);
+    db.set_sync_watermark(Lsn(0));
     db.run_pruning_cycle();
 
     assert_eq!(
@@ -328,7 +329,7 @@ fn r10_alter_table_set_retain_sync_safe() {
     );
 
     // Now sync and prune
-    db.set_sync_watermark(u64::MAX);
+    db.set_sync_watermark(Lsn(u64::MAX));
     let pruned = db.run_pruning_cycle();
 
     assert!(pruned > 0, "synced expired row must be pruned");
@@ -676,20 +677,20 @@ fn r20_legacy_rows_without_created_at_survive() {
 
     // --- Part A: unit test on pruning eligibility ---
     let legacy_row = VersionedRow {
-        row_id: 1,
+        row_id: RowId(1),
         values: HM::new(),
-        created_tx: 1,
+        created_tx: TxId(1),
         deleted_tx: None,
-        lsn: 1,
+        lsn: Lsn(1),
         created_at: None, // legacy: no timestamp
     };
     let old_row = VersionedRow {
-        row_id: 2,
+        row_id: RowId(2),
         values: HM::new(),
-        created_tx: 2,
+        created_tx: TxId(2),
         deleted_tx: None,
-        lsn: 2,
-        created_at: Some(0), // epoch 0 — ancient
+        lsn: Lsn(2),
+        created_at: Some(Wallclock(0)), // epoch 0 — ancient
     };
 
     let ttl_millis: u64 = 1_000; // 1 second in millis
@@ -701,7 +702,7 @@ fn r20_legacy_rows_without_created_at_survive() {
     // Legacy row: created_at is None → NOT eligible for age-based pruning
     let legacy_eligible = legacy_row
         .created_at
-        .map(|ts| now_millis.saturating_sub(ts) > ttl_millis)
+        .map(|ts| now_millis.saturating_sub(ts.0) > ttl_millis)
         .unwrap_or(false);
     assert!(
         !legacy_eligible,
@@ -711,7 +712,7 @@ fn r20_legacy_rows_without_created_at_survive() {
     // Old row: created_at is 0, now is far past TTL → eligible
     let old_eligible = old_row
         .created_at
-        .map(|ts| now_millis.saturating_sub(ts) > ttl_millis)
+        .map(|ts| now_millis.saturating_sub(ts.0) > ttl_millis)
         .unwrap_or(false);
     assert!(
         old_eligible,
@@ -1228,7 +1229,7 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
 
     // With watermark at 0 and row lsn at 0, the row is "unsynced" (lsn >= watermark).
     // Sync-safe must NOT prune it.
-    db.set_sync_watermark(0);
+    db.set_sync_watermark(Lsn(0));
     db.run_pruning_cycle();
     assert_eq!(
         row_count(&db, "obs"),
@@ -1238,7 +1239,7 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
 
     // Set watermark high enough that the row's LSN is below it.
     // This means the row has been synced → eligible for pruning.
-    db.set_sync_watermark(u64::MAX);
+    db.set_sync_watermark(Lsn(u64::MAX));
     let pruned = db.run_pruning_cycle();
     assert!(pruned > 0, "row must be pruned when watermark > lsn");
     assert_eq!(row_count(&db, "obs"), 0);
@@ -1339,4 +1340,108 @@ fn mr5_persistence_round_trip_with_pruning() {
             "pruned rows must not be reloaded from persistence after reopen"
         );
     }
+}
+
+// ======== T31 ========
+#[test]
+fn retention_wallclock_now_hoisted_once_per_pass() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::{Value, Wallclock};
+    use contextdb_engine::Database;
+
+    let counter = Arc::new(AtomicU64::new(0));
+    {
+        let counter = Arc::clone(&counter);
+        Wallclock::set_test_clock(move || {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+            // Return a fixed "far future" wall-clock millis reading so every candidate is past the horizon.
+            10_000_000_000u64
+        });
+    }
+
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, created_at TIMESTAMP EXPIRES) RETAIN 1 SECONDS",
+        &Default::default(),
+    )
+    .expect("CREATE TABLE with TIMESTAMP EXPIRES + RETAIN must parse");
+
+    // Insert 100 rows with created_at well before the mock clock's 10_000_000_000 reading
+    // (arbitrary small millis — 1-second TTL is easily exceeded).
+    for _ in 0..100 {
+        let tx = db.begin();
+        let mut row = std::collections::HashMap::new();
+        row.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
+        row.insert("created_at".to_string(), Value::Timestamp(1_000));
+        db.insert_row(tx, "t", row).expect("insert must succeed");
+        db.commit(tx).expect("commit must succeed");
+    }
+
+    // Reset counter AFTER setup — inserts may legitimately read the clock for row timestamps.
+    counter.store(0, AtomicOrdering::SeqCst);
+
+    // run_pruning_cycle returns the count of pruned rows (u64), not Result.
+    let _pruned = db.run_pruning_cycle();
+
+    let reads = counter.load(AtomicOrdering::SeqCst);
+    assert_eq!(
+        reads, 1,
+        "retention pass must read Wallclock::now() exactly once per pass; got {reads} reads across 100 candidate rows"
+    );
+
+    Wallclock::reset_test_clock();
+}
+
+// ======== T32 ========
+#[test]
+fn retention_tolerates_ntp_backward_jump() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::{Value, Wallclock};
+    use contextdb_engine::Database;
+
+    let mock_now = Arc::new(AtomicU64::new(1000));
+    {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::set_test_clock(move || mock_now.load(AtomicOrdering::SeqCst));
+    }
+
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, created_at TIMESTAMP EXPIRES) RETAIN 1 SECONDS",
+        &Default::default(),
+    )
+    .expect("CREATE TABLE with TIMESTAMP EXPIRES + RETAIN must parse");
+
+    // Insert a single row at simulated Wallclock(1000). Engine stores created_at as 1000ms.
+    let id = uuid::Uuid::new_v4();
+    let mut row = std::collections::HashMap::new();
+    row.insert("id".to_string(), Value::Uuid(id));
+    row.insert("created_at".to_string(), Value::Timestamp(1_000));
+    let tx = db.begin();
+    db.insert_row(tx, "t", row).expect("insert must succeed");
+    db.commit(tx).expect("commit must succeed");
+
+    // NTP adjusts backward: now returns 900ms — 100ms BEFORE the row's created_at.
+    // now - created_at would underflow; saturating_sub returns 0; 0 is not > ttl (1000ms).
+    // Row must survive.
+    mock_now.store(900, AtomicOrdering::SeqCst);
+
+    // run_pruning_cycle returns the pruned count (u64), not Result.
+    let _pruned = db.run_pruning_cycle();
+
+    let result = db
+        .execute("SELECT COUNT(*) FROM t", &Default::default())
+        .expect("SELECT COUNT must succeed");
+    assert_eq!(result.rows.len(), 1, "COUNT returns exactly one row");
+    assert_eq!(
+        result.rows[0][0],
+        Value::Int64(1),
+        "row with created_at > now must survive pruning (saturating_sub semantics)"
+    );
+
+    Wallclock::reset_test_clock();
 }

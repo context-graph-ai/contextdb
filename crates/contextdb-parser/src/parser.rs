@@ -1533,6 +1533,8 @@ fn build_data_type(pair: Pair<'_, Rule>) -> Result<DataType> {
         Ok(DataType::Timestamp)
     } else if txt.eq_ignore_ascii_case("JSON") {
         Ok(DataType::Json)
+    } else if txt.eq_ignore_ascii_case("TXID") {
+        Ok(DataType::TxId)
     } else {
         Err(Error::ParseError(format!("unsupported data type: {txt}")))
     }

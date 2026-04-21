@@ -1,5 +1,5 @@
 use crate::error::SyncError;
-use contextdb_core::Value;
+use contextdb_core::{Lsn, RowId, Value};
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, VectorChange,
 };
@@ -8,48 +8,62 @@ use std::collections::HashMap;
 
 const PROTOCOL_VERSION: u8 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub version: u8,
     pub message_type: MessageType,
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Envelope {
+    /// Stub: returns an Envelope with version = 2 (WRONG) so TU7 fails on runtime
+    /// assertion. Impl must change `version` back to 1 and pick a real
+    /// `MessageType::PullRequest` payload.
+    pub fn default_pull_request() -> Self {
+        Self {
+            version: 2,
+            message_type: MessageType::PullRequest,
+            payload: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum MessageType {
     PushRequest,
     PushResponse,
+    #[default]
     PullRequest,
     PullResponse,
     Chunk,
     ChunkAck,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PushRequest {
     pub changeset: WireChangeSet,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PushResponse {
     pub result: Option<WireApplyResult>,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
-    pub since_lsn: u64,
+    pub since_lsn: Lsn,
     pub max_entries: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PullResponse {
     pub changeset: WireChangeSet,
     pub has_more: bool,
-    pub cursor: Option<u64>,
+    pub cursor: Option<Lsn>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkMessage {
     pub chunk_id: uuid::Uuid,
     pub sequence: u32,
@@ -58,14 +72,14 @@ pub struct ChunkMessage {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkAck {
     pub chunk_id: uuid::Uuid,
     pub total_chunks: u32,
     pub reply_inbox: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireChangeSet {
     pub rows: Vec<WireRowChange>,
     pub edges: Vec<WireEdgeChange>,
@@ -73,33 +87,33 @@ pub struct WireChangeSet {
     pub ddl: Vec<WireDdlChange>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireRowChange {
     pub table: String,
     pub natural_key: WireNaturalKey,
     pub values: HashMap<String, Value>,
     #[serde(default)]
     pub deleted: bool,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireEdgeChange {
     pub source: uuid::Uuid,
     pub target: uuid::Uuid,
     pub edge_type: String,
     pub properties: HashMap<String, Value>,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireVectorChange {
-    pub row_id: u64,
+    pub row_id: RowId,
     pub vector: Vec<f32>,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireDdlChange {
     CreateTable {
         name: String,
@@ -116,21 +130,30 @@ pub enum WireDdlChange {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireNaturalKey {
     pub column: String,
     pub value: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for WireNaturalKey {
+    fn default() -> Self {
+        Self {
+            column: String::new(),
+            value: Value::Null,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireApplyResult {
     pub applied_rows: usize,
     pub skipped_rows: usize,
     pub conflicts: Vec<WireConflict>,
-    pub new_lsn: u64,
+    pub new_lsn: Lsn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireConflict {
     pub natural_key: WireNaturalKey,
     pub resolution: String,

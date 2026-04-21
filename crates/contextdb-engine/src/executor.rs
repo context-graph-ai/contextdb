@@ -357,7 +357,7 @@ pub(crate) fn execute_plan(
                         }
                     }
                 } else if let Some(idx) = id_idx {
-                    let uuid_to_row_id: HashMap<uuid::Uuid, u64> = all_rows
+                    let uuid_to_row_id: HashMap<uuid::Uuid, RowId> = all_rows
                         .iter()
                         .filter_map(|row| match row.values.get("id") {
                             Some(Value::Uuid(uuid)) => Some((*uuid, row.row_id)),
@@ -368,7 +368,7 @@ pub(crate) fn execute_plan(
                         if let Some(Value::Uuid(uuid)) = row.get(idx)
                             && let Some(row_id) = uuid_to_row_id.get(uuid)
                         {
-                            bm.insert(*row_id);
+                            bm.insert(row_id.0);
                         }
                     }
                 }
@@ -412,7 +412,7 @@ pub(crate) fn execute_plan(
                 ks.into_iter().collect::<Vec<_>>()
             };
 
-            let row_map: HashMap<u64, &VersionedRow> =
+            let row_map: HashMap<RowId, &VersionedRow> =
                 all_rows.iter().map(|r| (r.row_id, r)).collect();
 
             let mut columns = vec!["row_id".to_string()];
@@ -423,7 +423,7 @@ pub(crate) fn execute_plan(
                 .into_iter()
                 .filter_map(|(rid, score)| {
                     row_map.get(&rid).map(|row| {
-                        let mut out = vec![Value::Int64(rid as i64)];
+                        let mut out = vec![Value::Int64(rid.0 as i64)];
                         for k in &keys {
                             out.push(row.values.get(k).cloned().unwrap_or(Value::Null));
                         }
@@ -978,7 +978,7 @@ fn exec_insert(
                 }
                 Ok(UpsertResult::NoOp) => {
                     db.accountant().release(row_bytes);
-                    0
+                    RowId(0)
                 }
                 Err(err) => {
                     db.accountant().release(row_bytes);
@@ -1026,7 +1026,7 @@ fn exec_insert(
         }
 
         if let Some(v) = vector_value_for_table(db, &p.table, &values)
-            && row_id != 0
+            && row_id != RowId(0)
             && let Err(err) = db.insert_vector(txid, row_id, v.clone())
         {
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
@@ -1342,7 +1342,7 @@ fn materialize_rows(
     let rows = filtered
         .into_iter()
         .map(|r| {
-            let mut out = vec![Value::Int64(r.row_id as i64)];
+            let mut out = vec![Value::Int64(r.row_id.0 as i64)];
             for k in &keys {
                 out.push(r.values.get(k).cloned().unwrap_or(Value::Null));
             }
@@ -1369,7 +1369,7 @@ fn eval_expr_value(
     match expr {
         Expr::Column(c) => {
             if c.column == "row_id" {
-                Ok(Value::Int64(row.row_id as i64))
+                Ok(Value::Int64(row.row_id.0 as i64))
             } else {
                 Ok(row.values.get(&c.column).cloned().unwrap_or(Value::Null))
             }
@@ -2526,6 +2526,14 @@ fn coerce_value_for_column(db: &Database, table: &str, col: &str, v: Value) -> R
         contextdb_core::ColumnType::Uuid => coerce_uuid_value(v),
         contextdb_core::ColumnType::Timestamp => coerce_timestamp_value(v),
         contextdb_core::ColumnType::Vector(dim) => coerce_vector_value(v, dim),
+        // Stub: always rejects. Impl replaces with real enforcement (positive accept
+        // + wrong-variant reject + reverse rejection).
+        contextdb_core::ColumnType::TxId => Err(Error::ColumnTypeMismatch {
+            table: table.to_string(),
+            column: col.to_string(),
+            expected: "TXID",
+            actual: "STUB",
+        }),
         _ => Ok(coerce_uuid_if_needed(col, v)),
     }
 }
@@ -2760,6 +2768,7 @@ pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
         DataType::Timestamp => contextdb_core::ColumnType::Timestamp,
         DataType::Json => contextdb_core::ColumnType::Json,
         DataType::Vector(dim) => contextdb_core::ColumnType::Vector(*dim as usize),
+        DataType::TxId => contextdb_core::ColumnType::TxId,
     }
 }
 

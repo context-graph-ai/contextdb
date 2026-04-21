@@ -1,4 +1,5 @@
 use super::helpers::{setup_ontology_db, setup_propagation_ontology_db};
+use contextdb_core::TxId;
 use contextdb_core::{Direction, Error, Value};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +21,7 @@ fn entity_row(db: &contextdb_engine::Database, id: Uuid) -> contextdb_core::Vers
 
 fn insert_decision(
     db: &contextdb_engine::Database,
-    tx: u64,
+    tx: TxId,
     id: Uuid,
     description: &str,
     status: &str,
@@ -42,7 +43,7 @@ fn insert_decision(
     .expect("insert decision");
 }
 
-fn insert_entity(db: &contextdb_engine::Database, tx: u64, id: Uuid, name: &str, state: &str) {
+fn insert_entity(db: &contextdb_engine::Database, tx: TxId, id: Uuid, name: &str, state: &str) {
     db.insert_row(
         tx,
         "entities",
@@ -59,7 +60,7 @@ fn insert_entity(db: &contextdb_engine::Database, tx: u64, id: Uuid, name: &str,
     .expect("insert entity");
 }
 
-fn add_edge(db: &contextdb_engine::Database, tx: u64, s: Uuid, t: Uuid, ty: &str) {
+fn add_edge(db: &contextdb_engine::Database, tx: TxId, s: Uuid, t: Uuid, ty: &str) {
     db.insert_edge(tx, s, t, ty.to_string(), HashMap::new())
         .expect("insert edge");
 }
@@ -1333,11 +1334,11 @@ fn b5_02_similarity_with_type_filter() {
     let sec_row_ids: HashSet<u64> = all_rows
         .iter()
         .filter(|r| r.values.get("decision_type") == Some(&Value::Text("security".to_string())))
-        .map(|r| r.row_id)
+        .map(|r| r.row_id.0)
         .collect();
     let filtered: Vec<_> = results
         .iter()
-        .filter(|(rid, _)| sec_row_ids.contains(rid))
+        .filter(|(rid, _)| sec_row_ids.contains(&rid.0))
         .collect();
     assert_eq!(
         filtered.len(),
@@ -1421,7 +1422,7 @@ fn b5_05_compound_search_time_vector_confidence() {
             ]),
         )
         .expect("outcome");
-        decision_row_ids.push((d, rid));
+        decision_row_ids.push((d, rid.0));
     }
     db.commit(tx).expect("commit");
 
@@ -1440,7 +1441,7 @@ fn b5_05_compound_search_time_vector_confidence() {
     // (2) collect row_ids into RoaringTreemap candidates
     let mut candidates = RoaringTreemap::new();
     for r in &recent {
-        candidates.insert(r.row_id);
+        candidates.insert(r.row_id.0);
     }
 
     // (3) query_vector with candidates
@@ -1520,7 +1521,7 @@ fn b5_06_cross_context_semantic_search() {
         // Spread vectors so all are findable
         db.insert_vector(tx, rid, vec![1.0 - (idx as f32 * 0.1), idx as f32 * 0.1])
             .expect("vector");
-        row_ids_ctx.push((rid, ctx.to_string()));
+        row_ids_ctx.push((rid.0, ctx.to_string()));
     }
     db.commit(tx).expect("commit");
 
@@ -1531,7 +1532,7 @@ fn b5_06_cross_context_semantic_search() {
     assert_eq!(results.len(), 4);
 
     // Verify results come from BOTH contexts by checking the context_id value
-    let result_row_ids: HashSet<u64> = results.iter().map(|(rid, _)| *rid).collect();
+    let result_row_ids: HashSet<u64> = results.iter().map(|(rid, _)| rid.0).collect();
     let c1_found = row_ids_ctx
         .iter()
         .any(|(rid, ctx)| ctx == "c1" && result_row_ids.contains(rid));
@@ -3906,7 +3907,7 @@ fn b16_01_graph_to_relational_to_vector() {
     // Collect row_ids from scan results into RoaringTreemap
     let mut candidates = RoaringTreemap::new();
     for r in &candidate_obs {
-        candidates.insert(r.row_id);
+        candidates.insert(r.row_id.0);
     }
 
     // Insert vectors for the observations so query_vector has data

@@ -1,6 +1,7 @@
+use contextdb_core::{AtomicLsn, Lsn};
 use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 use contextdb_tx::WriteSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 /// Plugin that marks auto-sync as active.
@@ -8,7 +9,7 @@ use tokio::sync::mpsc;
 pub struct SyncPlugin {
     tx: std::sync::Mutex<Option<mpsc::UnboundedSender<()>>>,
     auto_enabled: AtomicBool,
-    pending_lsn: AtomicU64,
+    pending_lsn: AtomicLsn,
 }
 
 impl SyncPlugin {
@@ -16,7 +17,7 @@ impl SyncPlugin {
         Self {
             tx: std::sync::Mutex::new(Some(tx)),
             auto_enabled: AtomicBool::new(false),
-            pending_lsn: AtomicU64::new(0),
+            pending_lsn: AtomicLsn::new(Lsn(0)),
         }
     }
 
@@ -30,7 +31,7 @@ impl SyncPlugin {
         self.auto_enabled.load(Ordering::SeqCst)
     }
 
-    pub fn pending_lsn(&self) -> u64 {
+    pub fn pending_lsn(&self) -> Lsn {
         self.pending_lsn.load(Ordering::SeqCst)
     }
 
@@ -132,11 +133,11 @@ mod tests {
         ws.relational_inserts.push((
             "t".to_string(),
             contextdb_core::VersionedRow {
-                row_id: 1,
+                row_id: contextdb_core::RowId(1),
                 values: std::collections::HashMap::new(),
-                created_tx: 1,
+                created_tx: contextdb_core::TxId(1),
                 deleted_tx: None,
-                lsn: 1,
+                lsn: Lsn(1),
                 created_at: None,
             },
         ));
@@ -162,15 +163,23 @@ mod tests {
         plugin.set_auto(true);
 
         let mut ws = WriteSet::new();
-        ws.commit_lsn = Some(7);
-        ws.relational_deletes.push(("t".to_string(), 1, 7));
+        ws.commit_lsn = Some(Lsn(7));
+        ws.relational_deletes.push((
+            "t".to_string(),
+            contextdb_core::RowId(1),
+            contextdb_core::TxId(7),
+        ));
         plugin.post_commit(&ws, CommitSource::AutoCommit);
-        assert_eq!(plugin.pending_lsn(), 7);
+        assert_eq!(plugin.pending_lsn(), Lsn(7));
 
         let mut newer = WriteSet::new();
-        newer.commit_lsn = Some(11);
-        newer.relational_deletes.push(("t".to_string(), 2, 11));
+        newer.commit_lsn = Some(Lsn(11));
+        newer.relational_deletes.push((
+            "t".to_string(),
+            contextdb_core::RowId(2),
+            contextdb_core::TxId(11),
+        ));
         plugin.post_commit(&newer, CommitSource::AutoCommit);
-        assert_eq!(plugin.pending_lsn(), 11);
+        assert_eq!(plugin.pending_lsn(), Lsn(11));
     }
 }

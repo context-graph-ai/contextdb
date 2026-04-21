@@ -1,4 +1,4 @@
-use contextdb_core::{Error, RowId, TxId};
+use contextdb_core::{Error, RowId, SnapshotId, TxId};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +16,7 @@ impl WriteSetApplicator for MockStore {
     }
 
     fn new_row_id(&self) -> RowId {
-        self.next_row_id.fetch_add(1, Ordering::SeqCst)
+        RowId(self.next_row_id.fetch_add(1, Ordering::SeqCst))
     }
 }
 
@@ -27,9 +27,9 @@ fn begin_is_monotonic() {
         ..Default::default()
     };
     let txm = TxManager::new(store);
-    assert_eq!(txm.begin(), 1);
-    assert_eq!(txm.begin(), 2);
-    assert_eq!(txm.begin(), 3);
+    assert_eq!(txm.begin(), TxId(1));
+    assert_eq!(txm.begin(), TxId(2));
+    assert_eq!(txm.begin(), TxId(3));
 }
 
 #[test]
@@ -38,10 +38,10 @@ fn snapshot_advances_on_commit() {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });
-    assert_eq!(txm.snapshot(), 0);
+    assert_eq!(txm.snapshot(), SnapshotId(0));
     let tx = txm.begin();
     txm.commit(tx).expect("commit should succeed");
-    assert_eq!(txm.snapshot(), tx);
+    assert_eq!(txm.snapshot(), SnapshotId::from_tx(tx));
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn rollback_does_not_advance_snapshot() {
     });
     let tx = txm.begin();
     txm.rollback(tx).expect("rollback should succeed");
-    assert_eq!(txm.snapshot(), 0);
+    assert_eq!(txm.snapshot(), SnapshotId(0));
 }
 
 #[test]
@@ -64,9 +64,9 @@ fn commit_updates_watermark() {
     let t1 = txm.begin();
     let t2 = txm.begin();
     txm.commit(t1).expect("first commit should succeed");
-    assert_eq!(txm.snapshot(), t1);
+    assert_eq!(txm.snapshot(), SnapshotId::from_tx(t1));
     txm.commit(t2).expect("second commit should succeed");
-    assert_eq!(txm.snapshot(), t2);
+    assert_eq!(txm.snapshot(), SnapshotId::from_tx(t2));
 }
 
 #[test]

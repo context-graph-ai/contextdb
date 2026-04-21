@@ -1,3 +1,4 @@
+use contextdb_core::RowId;
 use contextdb_core::*;
 use contextdb_engine::Database;
 use roaring::RoaringTreemap;
@@ -315,7 +316,7 @@ fn h08_prefiltered_search_respects_candidate_bitmap() {
 
     let mut candidates = RoaringTreemap::new();
     for (rid, _) in all_vectors.iter().step_by(2) {
-        candidates.insert(*rid);
+        candidates.insert(rid.0);
     }
 
     let explain = db
@@ -329,7 +330,7 @@ fn h08_prefiltered_search_respects_candidate_bitmap() {
     assert!(explain.contains("HNSWSearch"));
     assert!(results.len() <= 10);
     for (rid, _) in &results {
-        assert!(candidates.contains(*rid));
+        assert!(candidates.contains(rid.0));
     }
 }
 
@@ -538,7 +539,7 @@ fn h15_single_surviving_vector_is_returned() {
     let tx1 = db.begin();
     let mut all_rids = Vec::with_capacity(1_100);
     let survivor_vec = random_unit_vector(DIMENSION, 999);
-    let mut survivor_rid = 0;
+    let mut survivor_rid = RowId(0);
     for i in 0..1_100 {
         let rid = db
             .insert_row(

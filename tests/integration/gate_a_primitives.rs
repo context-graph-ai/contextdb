@@ -1,4 +1,5 @@
 use super::helpers::{make_params, setup_ontology_db, setup_ontology_db_with_dag};
+use contextdb_core::Lsn;
 use contextdb_core::{Direction, Error, MemoryAccountant, UpsertResult, Value, VersionedRow};
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use contextdb_parser::{Statement as AstStatement, parse as parse_sql};
@@ -161,7 +162,7 @@ fn rt1_composite_store_ddl_round_trip_parse() {
     )
     .unwrap();
 
-    let ddl = db.ddl_log_since(0);
+    let ddl = db.ddl_log_since(Lsn(0));
     assert_eq!(ddl.len(), 3);
 
     for change in ddl {
@@ -1123,13 +1124,13 @@ fn a4_03_search_with_candidate_prefilter() {
     }
     db.commit(tx).expect("commit");
 
-    let candidates = RoaringTreemap::from_iter([row_ids[0], row_ids[1], row_ids[2]]);
+    let candidates = RoaringTreemap::from_iter([row_ids[0].0, row_ids[1].0, row_ids[2].0]);
     let out = db
         .query_vector(&[1.0, 0.0, 0.0], 5, Some(&candidates), db.snapshot())
         .expect("search");
     assert!(!out.is_empty());
     for (rid, _) in out {
-        assert!(candidates.contains(rid));
+        assert!(candidates.contains(rid.0));
     }
 }
 

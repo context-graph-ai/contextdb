@@ -16,7 +16,7 @@ impl WriteSetApplicator for TestStore {
     }
 
     fn new_row_id(&self) -> RowId {
-        1
+        RowId(1)
     }
 }
 
@@ -40,25 +40,25 @@ fn cosine_similarity_known_vectors() {
 fn search_returns_top_k_descending() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();
-    exec.insert_vector(tx, 1, vec![1.0, 0.0]).unwrap();
-    exec.insert_vector(tx, 2, vec![0.9, 0.1]).unwrap();
-    exec.insert_vector(tx, 3, vec![0.0, 1.0]).unwrap();
+    exec.insert_vector(tx, RowId(1), vec![1.0, 0.0]).unwrap();
+    exec.insert_vector(tx, RowId(2), vec![0.9, 0.1]).unwrap();
+    exec.insert_vector(tx, RowId(3), vec![0.0, 1.0]).unwrap();
     tx_mgr.commit(tx).unwrap();
 
     let r = exec
         .search(&[1.0, 0.0], 2, None, tx_mgr.snapshot())
         .unwrap();
     assert_eq!(r.len(), 2);
-    assert_eq!(r[0].0, 1);
-    assert_eq!(r[1].0, 2);
+    assert_eq!(r[0].0, RowId(1));
+    assert_eq!(r[1].0, RowId(2));
 }
 
 #[test]
 fn candidate_prefilter_is_applied() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();
-    exec.insert_vector(tx, 1, vec![1.0, 0.0]).unwrap();
-    exec.insert_vector(tx, 2, vec![0.9, 0.1]).unwrap();
+    exec.insert_vector(tx, RowId(1), vec![1.0, 0.0]).unwrap();
+    exec.insert_vector(tx, RowId(2), vec![0.9, 0.1]).unwrap();
     tx_mgr.commit(tx).unwrap();
 
     let mut cands = RoaringTreemap::new();
@@ -68,7 +68,7 @@ fn candidate_prefilter_is_applied() {
         .search(&[1.0, 0.0], 5, Some(&cands), tx_mgr.snapshot())
         .unwrap();
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0].0, 2);
+    assert_eq!(r[0].0, RowId(2));
 }
 
 #[test]
@@ -76,13 +76,13 @@ fn mvcc_snapshot_isolation() {
     let (tx_mgr, exec) = setup();
 
     let tx1 = tx_mgr.begin();
-    exec.insert_vector(tx1, 1, vec![1.0, 0.0]).unwrap();
+    exec.insert_vector(tx1, RowId(1), vec![1.0, 0.0]).unwrap();
     tx_mgr.commit(tx1).unwrap();
 
     let snap1 = tx_mgr.snapshot();
 
     let tx2 = tx_mgr.begin();
-    exec.insert_vector(tx2, 2, vec![0.9, 0.1]).unwrap();
+    exec.insert_vector(tx2, RowId(2), vec![0.9, 0.1]).unwrap();
     tx_mgr.commit(tx2).unwrap();
 
     let old = exec.search(&[1.0, 0.0], 10, None, snap1).unwrap();
@@ -98,11 +98,13 @@ fn mvcc_snapshot_isolation() {
 fn dimension_mismatch_errors() {
     let (tx_mgr, exec) = setup();
     let tx1 = tx_mgr.begin();
-    exec.insert_vector(tx1, 1, vec![1.0, 0.0]).unwrap();
+    exec.insert_vector(tx1, RowId(1), vec![1.0, 0.0]).unwrap();
     tx_mgr.commit(tx1).unwrap();
 
     let tx2 = tx_mgr.begin();
-    let err = exec.insert_vector(tx2, 2, vec![1.0, 0.0, 0.0]).unwrap_err();
+    let err = exec
+        .insert_vector(tx2, RowId(2), vec![1.0, 0.0, 0.0])
+        .unwrap_err();
     assert!(matches!(
         err,
         Error::VectorDimensionMismatch {
@@ -131,7 +133,7 @@ fn k_zero_returns_empty_and_empty_store_returns_empty() {
 fn float32_precision_is_preserved() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();
-    exec.insert_vector(tx, 1, vec![0.12345679, 0.9876543])
+    exec.insert_vector(tx, RowId(1), vec![0.12345679, 0.9876543])
         .unwrap();
     tx_mgr.commit(tx).unwrap();
 

@@ -1,0 +1,12 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/assign_u64_to_snapshotid.rs:5:26
+  |
+5 |     let _s: SnapshotId = x;
+  |             ----------   ^ expected `SnapshotId`, found `u64`
+  |             |
+  |             expected due to this
+  |
+help: try wrapping the expression in `contextdb_core::SnapshotId`
+  |
+5 |     let _s: SnapshotId = contextdb_core::SnapshotId(x);
+  |                          +++++++++++++++++++++++++++ +

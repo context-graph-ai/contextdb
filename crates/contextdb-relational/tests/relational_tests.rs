@@ -189,7 +189,7 @@ fn observations_are_immutable_for_delete_and_upsert() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();
 
-    let del_err = exec.delete(tx, "observations", 1).unwrap_err();
+    let del_err = exec.delete(tx, "observations", RowId(1)).unwrap_err();
     assert!(matches!(del_err, Error::ImmutableTable(ref t) if t == "observations"));
 
     let upsert_err = exec

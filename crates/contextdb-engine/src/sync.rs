@@ -1,10 +1,10 @@
 use crate::database::Database;
 use crate::sync_types::{ApplyResult, ChangeSet, ConflictPolicies};
-use contextdb_core::Result;
+use contextdb_core::{Lsn, Result};
 
 pub trait ChangeTracking {
-    fn changes_since(&self, since_lsn: u64) -> ChangeSet;
-    fn current_lsn(&self) -> u64;
+    fn changes_since(&self, since_lsn: Lsn) -> ChangeSet;
+    fn current_lsn(&self) -> Lsn;
 }
 
 pub trait ChangeApplication {
@@ -13,11 +13,11 @@ pub trait ChangeApplication {
 }
 
 impl ChangeTracking for Database {
-    fn changes_since(&self, since_lsn: u64) -> ChangeSet {
+    fn changes_since(&self, since_lsn: Lsn) -> ChangeSet {
         Database::changes_since(self, since_lsn)
     }
 
-    fn current_lsn(&self) -> u64 {
+    fn current_lsn(&self) -> Lsn {
         Database::current_lsn(self)
     }
 }

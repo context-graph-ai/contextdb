@@ -158,7 +158,7 @@ fn mixed_workflow_latency(c: &mut Criterion) {
                 .unwrap();
             let mut candidates = RoaringTreemap::new();
             for r in &candidate_obs {
-                candidates.insert(r.row_id);
+                candidates.insert(r.row_id.0);
             }
             db.query_vector(&[1.0, 0.0], 5, Some(&candidates), db.snapshot())
                 .unwrap();

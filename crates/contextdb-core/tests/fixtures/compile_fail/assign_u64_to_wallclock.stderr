@@ -1,0 +1,12 @@
+error[E0308]: mismatched types
+ --> tests/fixtures/compile_fail/assign_u64_to_wallclock.rs:5:25
+  |
+5 |     let _w: Wallclock = x;
+  |             ---------   ^ expected `Wallclock`, found `u64`
+  |             |
+  |             expected due to this
+  |
+help: try wrapping the expression in `contextdb_core::Wallclock`
+  |
+5 |     let _w: Wallclock = contextdb_core::Wallclock(x);
+  |                         ++++++++++++++++++++++++++ +

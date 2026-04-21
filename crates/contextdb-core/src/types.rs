@@ -1,14 +1,241 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub type TxId = u64;
-pub type SnapshotId = u64;
-pub type RowId = u64;
 pub type NodeId = Uuid;
 pub type EdgeType = String;
 pub type TableName = String;
 pub type ColName = String;
+
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct TxId(pub u64);
+
+impl TxId {
+    #[inline]
+    pub const fn from_raw_wire(n: u64) -> Self {
+        Self(n)
+    }
+    #[inline]
+    pub const fn from_snapshot(s: SnapshotId) -> Self {
+        Self(s.0)
+    }
+}
+
+impl fmt::Display for TxId {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct SnapshotId(pub u64);
+
+impl SnapshotId {
+    #[inline]
+    pub const fn from_raw_wire(n: u64) -> Self {
+        Self(n)
+    }
+    #[inline]
+    pub const fn from_tx(t: TxId) -> Self {
+        Self(t.0)
+    }
+}
+
+impl fmt::Display for SnapshotId {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct RowId(pub u64);
+
+impl RowId {
+    #[inline]
+    pub const fn from_raw_wire(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+impl fmt::Display for RowId {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct Lsn(pub u64);
+
+impl Lsn {
+    #[inline]
+    pub const fn from_raw_wire(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+impl fmt::Display for Lsn {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(transparent)]
+pub struct Wallclock(pub u64);
+
+impl Wallclock {
+    #[inline]
+    pub const fn from_raw_wire(n: u64) -> Self {
+        Self(n)
+    }
+
+    #[inline]
+    pub fn now() -> Self {
+        if let Some(clock) = Self::test_clock() {
+            return Self(clock());
+        }
+        Self(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        )
+    }
+
+    /// Test seam: install a closure that replaces the `SystemTime::now()` read.
+    /// Stub body panics with `todo!("A8 impl")` so TU10 goes RED with a runtime panic.
+    /// Impl must replace the body with a real thread-safe closure slot.
+    pub fn set_test_clock<F>(_f: F)
+    where
+        F: Fn() -> u64 + Send + Sync + 'static,
+    {
+        todo!("A8 impl: wire closure into a global Mutex<Option<Arc<dyn Fn>>>");
+    }
+
+    /// Test seam: drop any previously-installed clock closure.
+    /// Stub body is a no-op so tests that call `reset_test_clock()` after
+    /// `set_test_clock()` still execute past this line; the test clock call
+    /// site above will panic first.
+    pub fn reset_test_clock() {}
+
+    /// Test seam alias used by TU10 — same semantics as `reset_test_clock`.
+    pub fn clear_test_clock() {}
+
+    /// Internal accessor for the installed test clock.
+    /// Stub returns `None` so `now()` falls through to `SystemTime::now()`.
+    /// Impl replaces with a real read of the global closure slot.
+    #[inline]
+    fn test_clock() -> Option<Box<dyn Fn() -> u64 + Send + Sync>> {
+        None
+    }
+}
+
+impl fmt::Display for Wallclock {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+pub struct AtomicTxId(AtomicU64);
+
+impl AtomicTxId {
+    pub const fn new(v: TxId) -> Self {
+        Self(AtomicU64::new(v.0))
+    }
+    #[inline]
+    pub fn load(&self, order: Ordering) -> TxId {
+        TxId(self.0.load(order))
+    }
+    #[inline]
+    pub fn store(&self, v: TxId, order: Ordering) {
+        self.0.store(v.0, order);
+    }
+    #[inline]
+    pub fn fetch_add(&self, delta: u64, order: Ordering) -> TxId {
+        TxId(self.0.fetch_add(delta, order))
+    }
+    #[inline]
+    pub fn fetch_max(&self, v: TxId, order: Ordering) -> TxId {
+        TxId(self.0.fetch_max(v.0, order))
+    }
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        current: TxId,
+        new: TxId,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<TxId, TxId> {
+        self.0
+            .compare_exchange(current.0, new.0, success, failure)
+            .map(TxId)
+            .map_err(TxId)
+    }
+}
+
+pub struct AtomicLsn(AtomicU64);
+
+impl AtomicLsn {
+    pub const fn new(v: Lsn) -> Self {
+        Self(AtomicU64::new(v.0))
+    }
+    #[inline]
+    pub fn load(&self, order: Ordering) -> Lsn {
+        Lsn(self.0.load(order))
+    }
+    #[inline]
+    pub fn store(&self, v: Lsn, order: Ordering) {
+        self.0.store(v.0, order);
+    }
+    #[inline]
+    pub fn fetch_add(&self, delta: u64, order: Ordering) -> Lsn {
+        Lsn(self.0.fetch_add(delta, order))
+    }
+    #[inline]
+    pub fn fetch_max(&self, v: Lsn, order: Ordering) -> Lsn {
+        Lsn(self.0.fetch_max(v.0, order))
+    }
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        current: Lsn,
+        new: Lsn,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Lsn, Lsn> {
+        self.0
+            .compare_exchange(current.0, new.0, success, failure)
+            .map(Lsn)
+            .map_err(Lsn)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -23,6 +250,7 @@ pub enum Value {
     /// `serde_json::Value` uses `deserialize_any` which bincode does not support.
     Json(#[serde(with = "json_as_string")] serde_json::Value),
     Vector(Vec<f32>),
+    TxId(TxId),
 }
 
 mod json_as_string {
@@ -59,6 +287,8 @@ impl Value {
             Value::Timestamp(_) => 16,
             Value::Json(v) => 96 + v.to_string().len().saturating_mul(32),
             Value::Vector(values) => 24 + values.len().saturating_mul(std::mem::size_of::<f32>()),
+            // Stub: wrong. Impl must change to 16 to match Int64/Timestamp.
+            Value::TxId(_) => 0,
         }
     }
 
@@ -84,15 +314,15 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VersionedRow {
     pub row_id: RowId,
     pub values: HashMap<ColName, Value>,
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
-    pub lsn: u64,
+    pub lsn: Lsn,
     #[serde(default)]
-    pub created_at: Option<u64>,
+    pub created_at: Option<Wallclock>,
 }
 
 impl VersionedRow {
@@ -101,11 +331,11 @@ impl VersionedRow {
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
-        self.created_tx <= snapshot && self.deleted_tx.is_none_or(|tx| tx > snapshot)
+        self.created_tx.0 <= snapshot.0 && self.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdjEntry {
     pub source: NodeId,
     pub target: NodeId,
@@ -113,7 +343,7 @@ pub struct AdjEntry {
     pub properties: HashMap<String, Value>,
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
 impl AdjEntry {
@@ -122,17 +352,17 @@ impl AdjEntry {
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
-        self.created_tx <= snapshot && self.deleted_tx.is_none_or(|tx| tx > snapshot)
+        self.created_tx.0 <= snapshot.0 && self.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorEntry {
     pub row_id: RowId,
     pub vector: Vec<f32>,
     pub created_tx: TxId,
     pub deleted_tx: Option<TxId>,
-    pub lsn: u64,
+    pub lsn: Lsn,
 }
 
 impl VectorEntry {
@@ -141,7 +371,7 @@ impl VectorEntry {
     }
 
     pub fn visible_at(&self, snapshot: SnapshotId) -> bool {
-        self.created_tx <= snapshot && self.deleted_tx.is_none_or(|tx| tx > snapshot)
+        self.created_tx.0 <= snapshot.0 && self.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
     }
 }
 
