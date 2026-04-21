@@ -1243,6 +1243,9 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                         }
                         nullable = false;
                     }
+                    Rule::nullable_marker => {
+                        // Explicit NULL — column remains nullable. Idempotent.
+                    }
                     Rule::primary_key => {
                         if primary_key {
                             return Err(Error::ParseError(

@@ -774,8 +774,79 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<RowId> {
+        // Statement-scoped bound: `Value::TxId(n)` must satisfy
+        // `n <= max(committed_watermark, tx)` so writes inside an active
+        // transaction can reference their own allocated TxId. The error,
+        // when fired, still reports `committed_watermark` per plan B7.
+        let values = self.coerce_row_for_insert(
+            table,
+            values,
+            Some(self.committed_watermark()),
+            Some(tx),
+        )?;
         self.validate_row_constraints(tx, table, &values, None)?;
         self.relational.insert(tx, table, values)
+    }
+
+    /// Internal variant used by sync-apply: skips the TXID bound check because
+    /// peer TxIds may legitimately exceed the local watermark. Still enforces
+    /// wrong-variant + reverse-direction TXID column rules.
+    pub(crate) fn insert_row_for_sync(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+    ) -> Result<RowId> {
+        let values = self.coerce_row_for_insert(table, values, None, None)?;
+        self.validate_row_constraints(tx, table, &values, None)?;
+        self.relational.insert(tx, table, values)
+    }
+
+    pub(crate) fn upsert_row_for_sync(
+        &self,
+        tx: TxId,
+        table: &str,
+        conflict_col: &str,
+        values: HashMap<ColName, Value>,
+    ) -> Result<UpsertResult> {
+        let values = self.coerce_row_for_insert(table, values, None, None)?;
+        self.upsert_row(tx, table, conflict_col, values)
+    }
+
+    /// Route each row cell through `coerce_value_for_column` for variant
+    /// compatibility. The one concession to historical `insert_row` behavior
+    /// is that `Value::Vector` payloads are accepted regardless of declared
+    /// dimension — prior integration suites (e.g. the 3-component probe into
+    /// a VECTOR(384) embedding column) depend on the library API NOT enforcing
+    /// dim equality there. SQL execution (`exec_insert`/`exec_update`) still
+    /// performs the full dim check because it always threads through the
+    /// executor module's coercion helpers.
+    fn coerce_row_for_insert(
+        &self,
+        table: &str,
+        values: HashMap<ColName, Value>,
+        current_tx_max: Option<TxId>,
+        active_tx: Option<TxId>,
+    ) -> Result<HashMap<ColName, Value>> {
+        let meta = self.table_meta(table);
+        let mut out: HashMap<ColName, Value> = HashMap::with_capacity(values.len());
+        for (col, v) in values {
+            // Vector + Value::Vector: pass straight through (dim check happens on SQL path).
+            let is_vector_bypass = matches!(&v, Value::Vector(_))
+                && meta
+                    .as_ref()
+                    .and_then(|m| m.columns.iter().find(|c| c.name == col))
+                    .map(|c| matches!(c.column_type, contextdb_core::ColumnType::Vector(_)))
+                    .unwrap_or(false);
+
+            let coerced = if is_vector_bypass {
+                v
+            } else {
+                crate::executor::coerce_into_column(self, table, &col, v, current_tx_max, active_tx)?
+            };
+            out.insert(col, coerced);
+        }
+        Ok(out)
     }
 
     pub(crate) fn insert_row_with_unique_noop(
@@ -2198,17 +2269,27 @@ impl Database {
                 Some(m) => m,
                 None => continue,
             };
-            let key_col = meta.natural_key_column.clone().unwrap_or_else(|| {
-                if meta
-                    .columns
-                    .iter()
-                    .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
-                {
-                    "id".to_string()
-                } else {
-                    String::new()
-                }
-            });
+            let key_col = meta
+                .natural_key_column
+                .clone()
+                .or_else(|| {
+                    if meta
+                        .columns
+                        .iter()
+                        .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
+                    {
+                        Some("id".to_string())
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    meta.columns
+                        .iter()
+                        .find(|c| c.primary_key && c.column_type == ColumnType::Uuid)
+                        .map(|c| c.name.clone())
+                })
+                .unwrap_or_default();
             if key_col.is_empty() {
                 continue;
             }
@@ -2294,17 +2375,27 @@ impl Database {
                 Some(meta) => meta,
                 None => continue,
             };
-            let key_col = meta.natural_key_column.clone().unwrap_or_else(|| {
-                if meta
-                    .columns
-                    .iter()
-                    .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
-                {
-                    "id".to_string()
-                } else {
-                    String::new()
-                }
-            });
+            let key_col = meta
+                .natural_key_column
+                .clone()
+                .or_else(|| {
+                    if meta
+                        .columns
+                        .iter()
+                        .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
+                    {
+                        Some("id".to_string())
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    meta.columns
+                        .iter()
+                        .find(|c| c.primary_key && c.column_type == ColumnType::Uuid)
+                        .map(|c| c.name.clone())
+                })
+                .unwrap_or_default();
             if key_col.is_empty() {
                 continue;
             }
@@ -2643,14 +2734,14 @@ impl Database {
         self.tx_mgr.current_lsn()
     }
 
-    /// Stub: returns TxId(0) regardless. Impl must return the committed-tx watermark.
+    /// Returns the highest-committed TxId on this database.
     pub fn committed_watermark(&self) -> TxId {
-        TxId(0)
+        self.tx_mgr.current_tx_max()
     }
 
-    /// Stub: returns TxId(0) regardless. Impl must return the next-tx allocator peek.
+    /// Returns the next TxId the allocator will issue on this database.
     pub fn next_tx(&self) -> TxId {
-        TxId(0)
+        self.tx_mgr.peek_next_tx()
     }
 
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
@@ -2685,6 +2776,20 @@ impl Database {
         self.plugin.on_sync_pull(&mut changes)?;
         self.check_disk_budget("sync_pull")?;
         self.preflight_sync_apply_memory(&changes, policies)?;
+
+        // Pre-scan for TxId overflow so the allocator is untouched on rejection.
+        for row in &changes.rows {
+            for v in row.values.values() {
+                if let Value::TxId(incoming) = v
+                    && incoming.0 == u64::MAX
+                {
+                    return Err(Error::TxIdOverflow {
+                        table: row.table.clone(),
+                        incoming: u64::MAX,
+                    });
+                }
+            }
+        }
 
         let mut tx = self.begin();
         let mut result = ApplyResult {
@@ -2940,7 +3045,21 @@ impl Database {
                         }
                     }
 
-                    match self.insert_row(tx, &row.table, values.clone()) {
+                    // Sync-apply overflow guard + allocator/watermark advance for Value::TxId cells.
+                    let mut overflow: Option<Error> = None;
+                    for v in values.values() {
+                        if let Value::TxId(incoming) = v
+                            && let Err(err) = self.tx_mgr.advance_for_sync(&row.table, *incoming)
+                        {
+                            overflow = Some(err);
+                            break;
+                        }
+                    }
+                    if let Some(err) = overflow {
+                        return Err(err);
+                    }
+
+                    match self.insert_row_for_sync(tx, &row.table, values.clone()) {
                         Ok(new_row_id) => {
                             record_cached_insert(
                                 &mut visible_rows_cache,
@@ -3005,7 +3124,31 @@ impl Database {
                     });
                 }
                 (Some(local), ConflictPolicy::LatestWins) => {
-                    if row.lsn <= local.lsn {
+                    // Deterministic tie-break when LSNs match: if both rows carry a
+                    // `Value::TxId` cell under the same column name, the row with the
+                    // strictly greater raw u64 wins. Otherwise fall back to the strict
+                    // "incoming must exceed local" rule.
+                    let incoming_wins = if row.lsn == local.lsn {
+                        let mut winner = false;
+                        for (col, incoming_val) in values.iter() {
+                            if let (Value::TxId(incoming_tx), Some(Value::TxId(local_tx))) =
+                                (incoming_val, local.values.get(col))
+                            {
+                                if incoming_tx.0 > local_tx.0 {
+                                    winner = true;
+                                    break;
+                                } else if incoming_tx.0 < local_tx.0 {
+                                    winner = false;
+                                    break;
+                                }
+                            }
+                        }
+                        winner
+                    } else {
+                        row.lsn > local.lsn
+                    };
+
+                    if !incoming_wins {
                         result.skipped_rows += 1;
                         if row_has_vector
                             && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
@@ -3063,7 +3206,22 @@ impl Database {
                             }
                         }
 
-                        match self.upsert_row(
+                        // Sync-apply overflow guard + allocator/watermark advance.
+                        let mut overflow: Option<Error> = None;
+                        for v in values.values() {
+                            if let Value::TxId(incoming) = v
+                                && let Err(err) =
+                                    self.tx_mgr.advance_for_sync(&row.table, *incoming)
+                            {
+                                overflow = Some(err);
+                                break;
+                            }
+                        }
+                        if let Some(err) = overflow {
+                            return Err(err);
+                        }
+
+                        match self.upsert_row_for_sync(
                             tx,
                             &row.table,
                             &row.natural_key.column,
@@ -3113,7 +3271,25 @@ impl Database {
                         resolution: ConflictPolicy::EdgeWins,
                         reason: Some("edge_wins".to_string()),
                     });
-                    match self.upsert_row(tx, &row.table, &row.natural_key.column, values.clone()) {
+                    let mut overflow: Option<Error> = None;
+                    for v in values.values() {
+                        if let Value::TxId(incoming) = v
+                            && let Err(err) = self.tx_mgr.advance_for_sync(&row.table, *incoming)
+                        {
+                            overflow = Some(err);
+                            break;
+                        }
+                    }
+                    if let Some(err) = overflow {
+                        return Err(err);
+                    }
+
+                    match self.upsert_row_for_sync(
+                        tx,
+                        &row.table,
+                        &row.natural_key.column,
+                        values.clone(),
+                    ) {
                         Ok(_) => {
                             visible_rows_cache.remove(&row.table);
                             result.applied_rows += 1;
@@ -3215,6 +3391,14 @@ impl Database {
                         .iter()
                         .find(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
                         .map(|_| "id".to_string())
+                })
+            })
+            .or_else(|| {
+                meta.get(table).and_then(|m| {
+                    m.columns
+                        .iter()
+                        .find(|c| c.primary_key && c.column_type == ColumnType::Uuid)
+                        .map(|c| c.name.clone())
                 })
             })?;
 
@@ -3456,7 +3640,7 @@ fn prune_expired_rows(
     persistence: Option<&Arc<RedbPersistence>>,
     sync_watermark: Lsn,
 ) -> u64 {
-    let now_millis = current_epoch_millis();
+    let now = Wallclock::now();
     let metas = relational_store.table_meta.read().clone();
     let mut pruned_by_table: HashMap<String, Vec<RowId>> = HashMap::new();
     let mut pruned_node_ids = HashSet::new();
@@ -3473,7 +3657,7 @@ fn prune_expired_rows(
             }
 
             rows.retain(|row| {
-                if !row_is_prunable(row, meta, now_millis, sync_watermark) {
+                if !row_is_prunable(row, meta, now, sync_watermark) {
                     return true;
                 }
 
@@ -3578,7 +3762,7 @@ fn prune_expired_rows(
 fn row_is_prunable(
     row: &VersionedRow,
     meta: &TableMeta,
-    now_millis: u64,
+    now: Wallclock,
     sync_watermark: Lsn,
 ) -> bool {
     if meta.sync_safe && row.lsn >= sync_watermark {
@@ -3593,7 +3777,7 @@ fn row_is_prunable(
         match row.values.get(expires_column) {
             Some(Value::Timestamp(millis)) if *millis == i64::MAX => return false,
             Some(Value::Timestamp(millis)) if *millis < 0 => return true,
-            Some(Value::Timestamp(millis)) => return (*millis as u64) <= now_millis,
+            Some(Value::Timestamp(millis)) => return (*millis as u64) <= now.0,
             Some(Value::Null) | None => {}
             Some(_) => {}
         }
@@ -3601,15 +3785,8 @@ fn row_is_prunable(
 
     let ttl_millis = default_ttl_seconds.saturating_mul(1000);
     row.created_at
-        .map(|created_at| now_millis.saturating_sub(created_at.0) > ttl_millis)
+        .map(|created_at| now.0.saturating_sub(created_at.0) > ttl_millis)
         .unwrap_or(false)
-}
-
-fn current_epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn max_tx_across_all(

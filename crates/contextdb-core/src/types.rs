@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -109,6 +110,13 @@ impl fmt::Display for Lsn {
 #[serde(transparent)]
 pub struct Wallclock(pub u64);
 
+type WallclockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+fn wallclock_test_slot() -> &'static Mutex<Option<WallclockFn>> {
+    static SLOT: OnceLock<Mutex<Option<WallclockFn>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
 impl Wallclock {
     #[inline]
     pub const fn from_raw_wire(n: u64) -> Self {
@@ -129,30 +137,37 @@ impl Wallclock {
     }
 
     /// Test seam: install a closure that replaces the `SystemTime::now()` read.
-    /// Stub body panics with `todo!("A8 impl")` so TU10 goes RED with a runtime panic.
-    /// Impl must replace the body with a real thread-safe closure slot.
-    pub fn set_test_clock<F>(_f: F)
+    /// Provides deterministic wall-clock for retention / sync / ordering tests.
+    pub fn set_test_clock<F>(f: F)
     where
         F: Fn() -> u64 + Send + Sync + 'static,
     {
-        todo!("A8 impl: wire closure into a global Mutex<Option<Arc<dyn Fn>>>");
+        let mut slot = wallclock_test_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *slot = Some(Arc::new(f));
     }
 
     /// Test seam: drop any previously-installed clock closure.
-    /// Stub body is a no-op so tests that call `reset_test_clock()` after
-    /// `set_test_clock()` still execute past this line; the test clock call
-    /// site above will panic first.
-    pub fn reset_test_clock() {}
+    pub fn reset_test_clock() {
+        let mut slot = wallclock_test_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *slot = None;
+    }
 
     /// Test seam alias used by TU10 — same semantics as `reset_test_clock`.
-    pub fn clear_test_clock() {}
+    pub fn clear_test_clock() {
+        Self::reset_test_clock();
+    }
 
     /// Internal accessor for the installed test clock.
-    /// Stub returns `None` so `now()` falls through to `SystemTime::now()`.
-    /// Impl replaces with a real read of the global closure slot.
     #[inline]
-    fn test_clock() -> Option<Box<dyn Fn() -> u64 + Send + Sync>> {
-        None
+    fn test_clock() -> Option<WallclockFn> {
+        let slot = wallclock_test_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        slot.clone()
     }
 }
 
@@ -287,8 +302,7 @@ impl Value {
             Value::Timestamp(_) => 16,
             Value::Json(v) => 96 + v.to_string().len().saturating_mul(32),
             Value::Vector(values) => 24 + values.len().saturating_mul(std::mem::size_of::<f32>()),
-            // Stub: wrong. Impl must change to 16 to match Int64/Timestamp.
-            Value::TxId(_) => 0,
+            Value::TxId(_) => 16,
         }
     }
 

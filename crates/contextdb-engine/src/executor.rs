@@ -899,6 +899,9 @@ fn exec_insert(
         p.columns.clone()
     };
 
+    // Statement-scoped snapshot of the committed TxId watermark for TXID bound checks.
+    let current_tx_max = Some(db.committed_watermark());
+
     let mut rows_affected = 0;
     for row in &p.values {
         let mut values = HashMap::new();
@@ -907,10 +910,13 @@ fn exec_insert(
                 .get(idx)
                 .ok_or_else(|| Error::PlanError("column/value count mismatch".to_string()))?;
             let v = resolve_expr(expr, params)?;
-            values.insert(col.clone(), coerce_value_for_column(db, &p.table, col, v)?);
+            values.insert(
+                col.clone(),
+                coerce_value_for_column(db, &p.table, col, v, current_tx_max, Some(txid))?,
+            );
         }
 
-        apply_missing_column_defaults(db, &p.table, &mut values)?;
+        apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
 
         validate_vector_columns(db, &p.table, &values)?;
         let row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
@@ -941,6 +947,7 @@ fn exec_insert(
                     existing_row,
                     on_conflict,
                     params,
+                    Some(txid),
                 )?
             } else {
                 values.clone()
@@ -1097,11 +1104,16 @@ fn exec_update(
         })
         .collect();
 
+    let current_tx_max = Some(db.committed_watermark());
+
     for row in &matched {
         let mut values = row.values.clone();
         for (k, vexpr) in &p.assignments {
             let value = eval_assignment_expr(vexpr, &row.values, params)?;
-            values.insert(k.clone(), coerce_value_for_column(db, &p.table, k, value)?);
+            values.insert(
+                k.clone(),
+                coerce_value_for_column(db, &p.table, k, value, current_tx_max, Some(txid))?,
+            );
         }
         validate_update_state_transition(db, &p.table, row, &values)?;
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
@@ -1501,6 +1513,22 @@ fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
                 None
             }
         }
+        (Value::TxId(a), Value::TxId(b)) => Some(a.0.cmp(&b.0)),
+        (Value::TxId(a), Value::Int64(b)) => {
+            if *b < 0 {
+                Some(Ordering::Greater)
+            } else {
+                Some(a.0.cmp(&(*b as u64)))
+            }
+        }
+        (Value::Int64(a), Value::TxId(b)) => {
+            if *a < 0 {
+                Some(Ordering::Less)
+            } else {
+                Some((*a as u64).cmp(&b.0))
+            }
+        }
+        (Value::TxId(_), Value::Timestamp(_)) | (Value::Timestamp(_), Value::TxId(_)) => None,
         (Value::Null, _) | (_, Value::Null) => None,
         _ => None,
     }
@@ -1747,17 +1775,20 @@ fn apply_on_conflict_updates(
     existing_row: &VersionedRow,
     on_conflict: &OnConflictPlan,
     params: &HashMap<String, Value>,
+    active_tx: Option<TxId>,
 ) -> Result<HashMap<String, Value>> {
     if on_conflict.update_columns.is_empty() {
         return Ok(insert_values);
     }
+
+    let current_tx_max = Some(db.committed_watermark());
 
     let mut merged = existing_row.values.clone();
     for (column, expr) in &on_conflict.update_columns {
         let value = eval_assignment_expr(expr, &existing_row.values, params)?;
         merged.insert(
             column.clone(),
-            coerce_value_for_column(db, table, column, value)?,
+            coerce_value_for_column(db, table, column, value, current_tx_max, active_tx)?,
         );
     }
 
@@ -2514,27 +2545,212 @@ fn vector_value_for_table<'a>(
         })
 }
 
-fn coerce_value_for_column(db: &Database, table: &str, col: &str, v: Value) -> Result<Value> {
+pub(crate) fn coerce_into_column(
+    db: &Database,
+    table: &str,
+    col: &str,
+    v: Value,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
+    coerce_value_for_column(db, table, col, v, current_tx_max, active_tx)
+}
+
+fn coerce_value_for_column(
+    db: &Database,
+    table: &str,
+    col_name: &str,
+    v: Value,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
     let Some(meta) = db.table_meta(table) else {
-        return Ok(coerce_uuid_if_needed(col, v));
+        // Non-TxId variant: pass through with lenient id-name coercion.
+        if let Value::TxId(_) = &v {
+            return Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "UNKNOWN",
+                actual: "TxId",
+            });
+        }
+        return Ok(coerce_uuid_if_needed(col_name, v));
     };
-    let Some(column) = meta.columns.iter().find(|c| c.name == col) else {
-        return Ok(coerce_uuid_if_needed(col, v));
+    let Some(col) = meta.columns.iter().find(|c| c.name == col_name) else {
+        if let Value::TxId(_) = &v {
+            return Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "UNKNOWN",
+                actual: "TxId",
+            });
+        }
+        return Ok(coerce_uuid_if_needed(col_name, v));
     };
 
-    match column.column_type {
-        contextdb_core::ColumnType::Uuid => coerce_uuid_value(v),
-        contextdb_core::ColumnType::Timestamp => coerce_timestamp_value(v),
-        contextdb_core::ColumnType::Vector(dim) => coerce_vector_value(v, dim),
-        // Stub: always rejects. Impl replaces with real enforcement (positive accept
-        // + wrong-variant reject + reverse rejection).
-        contextdb_core::ColumnType::TxId => Err(Error::ColumnTypeMismatch {
+    match col.column_type {
+        contextdb_core::ColumnType::Uuid => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "UUID",
+                actual: "TxId",
+            }),
+            other => coerce_uuid_value(other),
+        },
+        contextdb_core::ColumnType::Timestamp => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "TIMESTAMP",
+                actual: "TxId",
+            }),
+            other => coerce_timestamp_value(other),
+        },
+        contextdb_core::ColumnType::Vector(dim) => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: format_vector_type(dim),
+                actual: "TxId",
+            }),
+            other => coerce_vector_value(other, dim),
+        },
+        contextdb_core::ColumnType::Integer => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "INTEGER",
+                actual: "TxId",
+            }),
+            other => Ok(coerce_uuid_if_needed(col_name, other)),
+        },
+        contextdb_core::ColumnType::Real => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "REAL",
+                actual: "TxId",
+            }),
+            other => Ok(coerce_uuid_if_needed(col_name, other)),
+        },
+        contextdb_core::ColumnType::Text => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "TEXT",
+                actual: "TxId",
+            }),
+            other => Ok(coerce_uuid_if_needed(col_name, other)),
+        },
+        contextdb_core::ColumnType::Boolean => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "BOOLEAN",
+                actual: "TxId",
+            }),
+            other => Ok(coerce_uuid_if_needed(col_name, other)),
+        },
+        contextdb_core::ColumnType::Json => match v {
+            Value::TxId(_) => Err(Error::ColumnTypeMismatch {
+                table: table.to_string(),
+                column: col_name.to_string(),
+                expected: "JSON",
+                actual: "TxId",
+            }),
+            other => Ok(coerce_uuid_if_needed(col_name, other)),
+        },
+        contextdb_core::ColumnType::TxId => {
+            coerce_txid_value(table, col_name, v, col.nullable, current_tx_max, active_tx)
+        }
+    }
+}
+
+fn format_vector_type(dim: usize) -> &'static str {
+    // We need &'static str for the error variant. Fall back to a lookup for common dims.
+    match dim {
+        1 => "VECTOR(1)",
+        2 => "VECTOR(2)",
+        3 => "VECTOR(3)",
+        4 => "VECTOR(4)",
+        8 => "VECTOR(8)",
+        16 => "VECTOR(16)",
+        32 => "VECTOR(32)",
+        64 => "VECTOR(64)",
+        128 => "VECTOR(128)",
+        256 => "VECTOR(256)",
+        512 => "VECTOR(512)",
+        768 => "VECTOR(768)",
+        1024 => "VECTOR(1024)",
+        1536 => "VECTOR(1536)",
+        3072 => "VECTOR(3072)",
+        _ => "VECTOR",
+    }
+}
+
+fn coerce_txid_value(
+    table: &str,
+    col: &str,
+    v: Value,
+    nullable: bool,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
+    match v {
+        Value::Null => {
+            if nullable {
+                Ok(Value::Null)
+            } else {
+                Err(Error::ColumnNotNullable {
+                    table: table.to_string(),
+                    column: col.to_string(),
+                })
+            }
+        }
+        Value::TxId(tx) => {
+            // Plan B7: `Value::TxId(n)` into a TXID column requires
+            // `n <= max(committed_watermark, active_tx)`. The watermark is the
+            // statement-scoped `current_tx_max` snapshot from
+            // `TxManager::current_tx_max()`; `active_tx` is the in-flight
+            // transaction that allocated the caller's TxId, which is permitted
+            // as a self-reference. The error reports the watermark so callers
+            // see what their edge has committed. Non-SQL callers pass `None`
+            // for `current_tx_max` and skip the check.
+            if let Some(max) = current_tx_max {
+                let ceiling = max.0.max(active_tx.map(|t| t.0).unwrap_or(0));
+                if tx.0 > ceiling {
+                    return Err(Error::TxIdOutOfRange {
+                        table: table.to_string(),
+                        column: col.to_string(),
+                        value: tx.0,
+                        max: max.0,
+                    });
+                }
+            }
+            Ok(Value::TxId(tx))
+        }
+        other => Err(Error::ColumnTypeMismatch {
             table: table.to_string(),
             column: col.to_string(),
             expected: "TXID",
-            actual: "STUB",
+            actual: value_variant_name(&other),
         }),
-        _ => Ok(coerce_uuid_if_needed(col, v)),
+    }
+}
+
+fn value_variant_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Int64(_) => "Int64",
+        Value::Float64(_) => "Float64",
+        Value::Text(_) => "Text",
+        Value::Uuid(_) => "Uuid",
+        Value::Timestamp(_) => "Timestamp",
+        Value::Json(_) => "Json",
+        Value::Vector(_) => "Vector",
+        Value::TxId(_) => "TxId",
     }
 }
 
@@ -2622,10 +2838,13 @@ fn apply_missing_column_defaults(
     db: &Database,
     table: &str,
     values: &mut HashMap<String, Value>,
+    active_tx: Option<TxId>,
 ) -> Result<()> {
     let Some(meta) = db.table_meta(table) else {
         return Ok(());
     };
+
+    let current_tx_max = Some(db.committed_watermark());
 
     for column in &meta.columns {
         if values.contains_key(&column.name) {
@@ -2637,7 +2856,7 @@ fn apply_missing_column_defaults(
         let value = evaluate_stored_default_expr(default)?;
         values.insert(
             column.name.clone(),
-            coerce_value_for_column(db, table, &column.name, value)?,
+            coerce_value_for_column(db, table, &column.name, value, current_tx_max, active_tx)?,
         );
     }
 

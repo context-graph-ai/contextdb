@@ -73,6 +73,6 @@ fn value_to_string(v: &Value) -> String {
         Value::Timestamp(ts) => ts.to_string(),
         Value::Json(j) => j.to_string(),
         Value::Vector(vec) => format!("{:?}", vec),
-        Value::TxId(_) => "BROKEN".to_string(),
+        Value::TxId(tx) => tx.0.to_string(),
     }
 }

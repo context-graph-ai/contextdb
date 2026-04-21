@@ -478,7 +478,7 @@ fn render_column_type(col_type: &ColumnType) -> String {
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
         ColumnType::Timestamp => "TIMESTAMP".to_string(),
-        ColumnType::TxId => "BROKEN".to_string(),
+        ColumnType::TxId => "TXID".to_string(),
     }
 }
 

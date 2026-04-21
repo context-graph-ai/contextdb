@@ -1,15 +1,11 @@
 //! Public rendering helpers used by both the CLI binary and the test suite.
-//! Stub values are intentionally wrong so tests fail on runtime assertion; impl
-//! plan Step 5 replaces them with the real logic.
 
 use crate::Database;
 use contextdb_core::Value;
 use contextdb_core::table_meta::{ColumnType, TableMeta};
 use std::fmt::Write;
 
-/// Render a column type as a DDL token. Stub: returns `"BROKEN"` for `ColumnType::TxId`
-/// and the canonical DDL token for every other variant. Impl must change the TxId arm
-/// to `"TXID"`.
+/// Render a column type as a DDL token.
 pub fn render_column_type(col_type: &ColumnType) -> String {
     match col_type {
         ColumnType::Integer => "INTEGER".to_string(),
@@ -20,13 +16,11 @@ pub fn render_column_type(col_type: &ColumnType) -> String {
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Vector(dim) => format!("VECTOR({dim})"),
         ColumnType::Timestamp => "TIMESTAMP".to_string(),
-        ColumnType::TxId => "BROKEN".to_string(),
+        ColumnType::TxId => "TXID".to_string(),
     }
 }
 
-/// Render a table's `.schema` DDL. Stub: emits a CREATE TABLE that uses the stub
-/// `render_column_type` output (so TxId columns emit `BROKEN`, which fails to
-/// re-parse — the intended RED signal for T10).
+/// Render a table's `.schema` DDL.
 pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
     let mut buf = String::new();
     writeln!(&mut buf, "CREATE TABLE {table} (").unwrap();
@@ -49,8 +43,7 @@ pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
     buf
 }
 
-/// Render a single `Value` as the CLI displays it in SELECT output. Stub: returns
-/// `"BROKEN"` for `Value::TxId`. Impl must change the TxId arm to `tx.0.to_string()`.
+/// Render a single `Value` as the CLI displays it in SELECT output.
 pub fn value_to_string(v: &Value) -> String {
     match v {
         Value::Null => "NULL".to_string(),
@@ -62,13 +55,11 @@ pub fn value_to_string(v: &Value) -> String {
         Value::Timestamp(ts) => ts.to_string(),
         Value::Json(j) => j.to_string(),
         Value::Vector(vs) => format!("{vs:?}"),
-        Value::TxId(_) => "BROKEN".to_string(),
+        Value::TxId(tx) => tx.0.to_string(),
     }
 }
 
-/// Render the `.sync status` output buffer. Stub: returns a string containing the
-/// fixed wrong `Committed TxId: 999999999` line. Impl must change to read the live
-/// `db.committed_watermark().0`.
-pub fn render_sync_status(_db: &Database) -> String {
-    "Committed TxId: 999999999\n".to_string()
+/// Render the `.sync status` output buffer. Includes the live committed-TxId.
+pub fn render_sync_status(db: &Database) -> String {
+    format!("Committed TxId: {}\n", db.committed_watermark().0)
 }

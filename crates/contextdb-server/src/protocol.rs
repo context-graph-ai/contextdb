@@ -16,12 +16,11 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    /// Stub: returns an Envelope with version = 2 (WRONG) so TU7 fails on runtime
-    /// assertion. Impl must change `version` back to 1 and pick a real
-    /// `MessageType::PullRequest` payload.
+    /// Constructs an Envelope pre-populated for a pull request with the current
+    /// protocol version and empty payload.
     pub fn default_pull_request() -> Self {
         Self {
-            version: 2,
+            version: PROTOCOL_VERSION,
             message_type: MessageType::PullRequest,
             payload: Vec::new(),
         }
@@ -50,10 +49,45 @@ pub struct PushResponse {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PullRequest {
     pub since_lsn: Lsn,
     pub max_entries: Option<u32>,
+}
+
+impl<'de> serde::Deserialize<'de> for PullRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{SeqAccess, Visitor};
+
+        struct PullRequestVisitor;
+
+        impl<'de> Visitor<'de> for PullRequestVisitor {
+            type Value = PullRequest;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("PullRequest with 1 or 2 elements")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let since_lsn: Lsn = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let max_entries: Option<u32> = seq.next_element()?.unwrap_or(None);
+                Ok(PullRequest {
+                    since_lsn,
+                    max_entries,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(2, PullRequestVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

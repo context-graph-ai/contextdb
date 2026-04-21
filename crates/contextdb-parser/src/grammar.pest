@@ -158,6 +158,7 @@ vector_type = { ^"VECTOR" ~ "(" ~ integer ~ ")" }
 
 column_constraint = {
     not_null
+    | nullable_marker
     | primary_key
     | unique
     | default_clause
@@ -168,6 +169,7 @@ column_constraint = {
 }
 expires_constraint = { ^"EXPIRES" }
 not_null = { ^"NOT" ~ ^"NULL" }
+nullable_marker = { ^"NULL" }
 primary_key = { ^"PRIMARY" ~ ^"KEY" }
 unique = { ^"UNIQUE" }
 default_clause = { ^"DEFAULT" ~ expr }

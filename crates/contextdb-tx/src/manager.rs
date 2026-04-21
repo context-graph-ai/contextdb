@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 pub struct TxManager<S: WriteSetApplicator> {
-    pub next_tx: AtomicTxId,
-    pub committed_watermark: AtomicTxId,
+    next_tx: AtomicTxId,
+    committed_watermark: AtomicTxId,
     next_lsn: AtomicLsn,
     active_txs: Mutex<HashMap<TxId, WriteSet>>,
     commit_mutex: Mutex<()>,
@@ -111,16 +111,33 @@ impl<S: WriteSetApplicator> TxManager<S> {
         f()
     }
 
-    /// Stub: returns TxId(0) regardless. Impl must return committed_watermark.load(SeqCst).
+    /// Returns the highest-committed TxId (the statement-scoped max for user-SQL
+    /// bound checks against TXID columns). Reads `committed_watermark` under `SeqCst`.
     #[inline]
     pub fn current_tx_max(&self) -> TxId {
-        TxId(0)
+        self.committed_watermark.load(Ordering::SeqCst)
     }
 
-    /// Stub: does nothing, returns Ok(()). Impl must:
-    ///   - If incoming.0 == u64::MAX, return Err(Error::TxIdOverflow { table, incoming: u64::MAX })
-    ///   - Else: next_tx.fetch_max(TxId(incoming.0 + 1), SeqCst); committed_watermark.fetch_max(incoming, SeqCst); Ok(())
-    pub fn advance_for_sync(&self, _table: &str, _incoming: TxId) -> Result<()> {
+    /// Returns the next transaction id the allocator will issue (peek, no increment).
+    #[inline]
+    pub fn peek_next_tx(&self) -> TxId {
+        self.next_tx.load(Ordering::SeqCst)
+    }
+
+    /// Advances the local TxId allocator past an incoming peer TxId seen during
+    /// sync-apply. The overflow guard fires on `u64::MAX` before any mutation so
+    /// the receiver's counters are unchanged on error.
+    pub fn advance_for_sync(&self, table: &str, incoming: TxId) -> Result<()> {
+        if incoming.0 == u64::MAX {
+            return Err(Error::TxIdOverflow {
+                table: table.to_string(),
+                incoming: u64::MAX,
+            });
+        }
+        self.next_tx
+            .fetch_max(TxId(incoming.0 + 1), Ordering::SeqCst);
+        self.committed_watermark
+            .fetch_max(incoming, Ordering::SeqCst);
         Ok(())
     }
 }
