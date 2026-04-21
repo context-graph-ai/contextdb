@@ -744,10 +744,55 @@ fn cp06_table_level_column_immutable_syntax_rejected() {
 }
 
 // ============================================================================
-// SC01 — RED — backward-compatible metadata decode.
+// SC01 — bincode legacy payloads no longer silently default trailing fields.
+// Pre-v0.4.0 eight-field ColumnDef bincode payloads must fail to decode with
+// a structured error, not silently decode as immutable=false. JSON / map-keyed
+// paths continue to honor serde(default) on the field.
 // ============================================================================
 #[test]
-fn sc01_old_serialized_column_def_deserializes_as_mutable() {
+fn sc01_bincode_legacy_column_def_payload_fails_loudly() {
+    use serde::{Deserialize, Serialize};
+
+    // Mirror the pre-feature ColumnDef shape — eight fields, no `immutable`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldColumnDef {
+        name: String,
+        column_type: contextdb_core::table_meta::ColumnType,
+        nullable: bool,
+        primary_key: bool,
+        #[serde(default)]
+        unique: bool,
+        #[serde(default)]
+        default: Option<String>,
+        #[serde(default)]
+        references: Option<contextdb_core::table_meta::ForeignKeyReference>,
+        #[serde(default)]
+        expires: bool,
+    }
+
+    let old = OldColumnDef {
+        name: "c".to_string(),
+        column_type: contextdb_core::table_meta::ColumnType::Text,
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        default: None,
+        references: None,
+        expires: false,
+    };
+    let bytes = bincode::serde::encode_to_vec(&old, bincode::config::standard())
+        .expect("old-shape ColumnDef must encode with bincode");
+
+    // The new decoder refuses legacy payloads. No silent default of `immutable`.
+    let result: std::result::Result<(contextdb_core::ColumnDef, usize), _> =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard());
+    assert!(
+        result.is_err(),
+        "legacy 8-field bincode payload must fail to decode, got Ok"
+    );
+
+    // JSON paths still honor serde(default) on the `immutable` field, so the
+    // same logical 8-field payload expressed as JSON continues to decode.
     let old_json = r#"{
         "name": "c",
         "column_type": "Text",
@@ -758,13 +803,12 @@ fn sc01_old_serialized_column_def_deserializes_as_mutable() {
         "references": null,
         "expires": false
     }"#;
-    let decoded: contextdb_core::ColumnDef =
-        serde_json::from_str(old_json).expect("old-shape ColumnDef must decode");
+    let decoded: contextdb_core::ColumnDef = serde_json::from_str(old_json)
+        .expect("JSON path must honor serde(default) on the new field");
     assert!(
         !decoded.immutable,
-        "missing `immutable` field must default to false, got true"
+        "JSON path defaults immutable to false for missing field"
     );
-    assert_eq!(decoded.name, "c");
 }
 
 // ============================================================================
@@ -2454,70 +2498,6 @@ fn ce17d_fk_propagation_clause_targeting_mutable_column_parses() {
 }
 
 // ============================================================================
-// SC01b — RED — bincode real round-trip of old-shape ColumnDef. Old shape
-// has no `immutable` field; the local mirror struct reproduces the
-// pre-feature field ordering + `#[serde(default)]` attributes. Decoding
-// those bytes into `contextdb_core::ColumnDef` must succeed AND set the
-// missing `immutable` field to false (I5 backward compat).
-// ============================================================================
-#[test]
-fn sc01b_bincode_old_shape_column_def_decodes_as_mutable() {
-    use serde::{Deserialize, Serialize};
-
-    // Mirror the pre-feature `ColumnDef` shape exactly — same field order,
-    // same `#[serde(default)]` attributes where the current type has them.
-    // DataType::TxId is mirrored via its serde tag.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct OldColumnDef {
-        name: String,
-        column_type: contextdb_core::table_meta::ColumnType,
-        nullable: bool,
-        primary_key: bool,
-        #[serde(default)]
-        unique: bool,
-        #[serde(default)]
-        default: Option<String>,
-        #[serde(default)]
-        references: Option<contextdb_core::table_meta::ForeignKeyReference>,
-        #[serde(default)]
-        expires: bool,
-    }
-
-    let old = OldColumnDef {
-        name: "c".to_string(),
-        column_type: contextdb_core::table_meta::ColumnType::Text,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        default: None,
-        references: None,
-        expires: false,
-    };
-
-    // bincode config — match contextdb-core's standard config (see
-    // `crates/contextdb-engine/src/schema_enforcer.rs:131` for the identical
-    // call pattern).
-    let bytes = bincode::serde::encode_to_vec(&old, bincode::config::standard())
-        .expect("old-shape ColumnDef must encode with bincode");
-
-    let (decoded, _): (contextdb_core::ColumnDef, usize) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .expect("old-shape bytes must decode into new ColumnDef");
-
-    assert_eq!(decoded.name, "c");
-    assert!(decoded.nullable);
-    assert!(!decoded.primary_key);
-    assert!(!decoded.unique);
-    assert!(decoded.default.is_none());
-    assert!(decoded.references.is_none());
-    assert!(!decoded.expires);
-    assert!(
-        !decoded.immutable,
-        "missing `immutable` field must default to false on decode, got true"
-    );
-}
-
-// ============================================================================
 // IC14 — RED — Cross-Value-variant coercion into a flagged column must be
 // rejected. sync-apply receives a RowChange whose flagged-column value is a
 // Value::Int64 against a local Value::TxId(TxId(42)). Behavior contract:
@@ -2841,5 +2821,107 @@ fn rc03_meta_column_render_preserves_immutable() {
         assert!(c.immutable);
     } else {
         panic!("expected CreateTable");
+    }
+}
+
+// ============================================================================
+// Step-6 carryover — ALTER TABLE ADD COLUMN IMMUTABLE over sync: the
+// AlterTable DDL replicates the flag to the peer, and a peer-side UPDATE on
+// the flagged column is rejected with Error::ImmutableColumn.
+// ============================================================================
+#[test]
+fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
+    let origin = Database::open_memory();
+    let peer = Database::open_memory();
+
+    // Step 1: bring up the table on origin; replicate CREATE TABLE to peer.
+    origin
+        .execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let before_alter = origin.current_lsn();
+    let create_ddl = origin
+        .ddl_log_since(contextdb_core::Lsn(0))
+        .into_iter()
+        .find(|d| matches!(d, DdlChange::CreateTable { name, .. } if name == "t"))
+        .expect("CreateTable DDL must exist");
+    peer.apply_changes(
+        ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![create_ddl],
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+
+    // Step 2: ALTER on origin; replicate AlterTable DDL to peer.
+    origin
+        .execute(
+            "ALTER TABLE t ADD COLUMN frozen TEXT NOT NULL DEFAULT 'x' IMMUTABLE",
+            &empty(),
+        )
+        .unwrap();
+    let alter_ddl: Vec<DdlChange> = origin
+        .ddl_log_since(before_alter)
+        .into_iter()
+        .filter(|d| matches!(d, DdlChange::AlterTable { name, .. } if name == "t"))
+        .collect();
+    assert!(
+        !alter_ddl.is_empty(),
+        "origin ALTER must emit an AlterTable DDL"
+    );
+    peer.apply_changes(
+        ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: alter_ddl,
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+
+    // Step 3: peer's TableMeta has the IMMUTABLE flag on the new column.
+    let peer_meta = peer.table_meta("t").expect("peer must have table t");
+    let frozen = peer_meta
+        .columns
+        .iter()
+        .find(|c| c.name == "frozen")
+        .expect("peer meta must include frozen column");
+    assert!(
+        frozen.immutable,
+        "peer's frozen column must be marked IMMUTABLE after sync"
+    );
+
+    // Step 4: insert a row on peer, attempt an UPDATE on the flagged column;
+    // must be rejected with Error::ImmutableColumn.
+    let id = Uuid::new_v4();
+    peer.execute(
+        "INSERT INTO t (id, frozen) VALUES ($id, 'original')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+    let err = peer
+        .execute(
+            "UPDATE t SET frozen = 'rewritten' WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::ImmutableColumn { ref column, .. } if column == "frozen"),
+        "expected ImmutableColumn {{ column: \"frozen\", .. }}, got {err:?}"
+    );
+    // Read-back confirms the row still carries the original value.
+    let r = peer
+        .execute(
+            "SELECT frozen FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    match &r.rows[0][0] {
+        Value::Text(s) => assert_eq!(s, "original"),
+        other => panic!("expected Text(\"original\"), got {other:?}"),
     }
 }

@@ -39,5 +39,14 @@ fn parser_no_immutable_keyword_leaves_flag_false() {
 #[test]
 fn parser_rejects_duplicate_immutable() {
     let result = parse("CREATE TABLE t (c TEXT IMMUTABLE IMMUTABLE)");
-    assert!(matches!(result, Err(Error::ParseError(_))));
+    let Err(Error::ParseError(msg)) = result else {
+        panic!("expected ParseError, got {result:?}");
+    };
+    // Pin that the rejection reason names the offending keyword rather than
+    // tripping on a generic "expected identifier" or similar — so a parser
+    // that rejects for an unrelated reason does not accidentally pass.
+    assert!(
+        msg.to_uppercase().contains("IMMUTABLE"),
+        "ParseError message must name IMMUTABLE, got: {msg}"
+    );
 }

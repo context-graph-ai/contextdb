@@ -109,6 +109,12 @@ pub enum Error {
     IndexNotFound { table: String, index: String },
     #[error("duplicate index: {table}.{index}")]
     DuplicateIndex { table: String, index: String },
+    #[error("reserved index name: {table}.{name} uses reserved prefix `{prefix}`")]
+    ReservedIndexName {
+        table: String,
+        name: String,
+        prefix: String,
+    },
     #[error("column not indexable: {table}.{column} has type {column_type:?}")]
     ColumnNotIndexable {
         table: String,

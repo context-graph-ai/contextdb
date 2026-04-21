@@ -20,8 +20,21 @@ pub fn render_column_type(col_type: &ColumnType) -> String {
     }
 }
 
-/// Render a table's `.schema` DDL.
+/// Render a table's `.schema` DDL. Auto-indexes (`kind == IndexKind::Auto`)
+/// are suppressed from output to keep `.schema` focused on user-authored
+/// DDL. Pass `render_table_meta_verbose` to include them.
 pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
+    render_table_meta_inner(table, meta, false)
+}
+
+/// Render a table's `.schema` DDL INCLUDING auto-indexes. Used by
+/// `.schema --verbose` / `EXPLAIN SCHEMA t` for agents that need to see the
+/// full picture.
+pub fn render_table_meta_verbose(table: &str, meta: &TableMeta) -> String {
+    render_table_meta_inner(table, meta, true)
+}
+
+fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> String {
     let mut buf = String::new();
     writeln!(&mut buf, "CREATE TABLE {table} (").unwrap();
     let mut first = true;
@@ -42,9 +55,9 @@ pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
         }
         write!(&mut buf, "  {} {}", col.name, ty).unwrap();
     }
-    buf.push_str("\n)\n");
+    buf.push_str("\n)");
     if meta.immutable {
-        buf.push_str("IMMUTABLE\n");
+        buf.push_str(" IMMUTABLE");
     }
     if let Some(sm) = &meta.state_machine {
         let mut entries: Vec<_> = sm.transitions.iter().collect();
@@ -53,9 +66,9 @@ pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
             .into_iter()
             .map(|(from, tos)| format!("{from} -> [{}]", tos.join(", ")))
             .collect();
-        writeln!(
+        write!(
             &mut buf,
-            "STATE MACHINE ({}: {})",
+            " STATE MACHINE ({}: {})",
             sm.column,
             transitions.join(", ")
         )
@@ -68,9 +81,13 @@ pub fn render_table_meta(table: &str, meta: &TableMeta) -> String {
             .map(|edge_type| format!("'{edge_type}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        writeln!(&mut buf, "DAG({edge_types})").unwrap();
+        write!(&mut buf, " DAG({edge_types})").unwrap();
     }
+    buf.push_str(";\n");
     for decl in &meta.indexes {
+        if !verbose && decl.kind == contextdb_core::IndexKind::Auto {
+            continue;
+        }
         let cols: Vec<String> = decl
             .columns
             .iter()

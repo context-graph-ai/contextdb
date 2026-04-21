@@ -39,6 +39,7 @@ pub(crate) fn execute_plan(
                     auto_indexes.push(contextdb_core::IndexDecl {
                         name: format!("__pk_{}", c.name),
                         columns: vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
+                        kind: contextdb_core::IndexKind::Auto,
                     });
                 }
                 if c.unique
@@ -51,6 +52,7 @@ pub(crate) fn execute_plan(
                     auto_indexes.push(contextdb_core::IndexDecl {
                         name: format!("__unique_{}", c.name),
                         columns: vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
+                        kind: contextdb_core::IndexKind::Auto,
                     });
                 }
             }
@@ -80,6 +82,7 @@ pub(crate) fn execute_plan(
                 auto_indexes.push(contextdb_core::IndexDecl {
                     name,
                     columns: cols,
+                    kind: contextdb_core::IndexKind::Auto,
                 });
             }
             let meta = TableMeta {
@@ -119,11 +122,13 @@ pub(crate) fn execute_plan(
                 default_ttl_seconds: p.retain.as_ref().map(|r| r.duration_seconds),
                 sync_safe: p.retain.as_ref().is_some_and(|r| r.sync_safe),
                 expires_column,
-                // Auto-indexes are stored as implementation-detail IndexStorage
-                // entries (see create_index_storage below) but NOT exposed in
-                // TableMeta.indexes — the user-visible list reflects only
-                // explicitly-declared CREATE INDEX statements.
-                indexes: Vec::new(),
+                // Auto-indexes land in `TableMeta.indexes` at CREATE TABLE
+                // time with `kind == IndexKind::Auto`. The planner sees them
+                // (so PK / UNIQUE point probes pick IndexScan); the user-
+                // visible `.schema` render suppresses them by default but
+                // keeps them in `EXPLAIN <query>` so agents can assert
+                // routing programmatically.
+                indexes: auto_indexes.clone(),
             };
             let metadata_bytes = meta.estimated_bytes();
             db.accountant().try_allocate_for(
@@ -139,7 +144,7 @@ pub(crate) fn execute_plan(
             }
             if let Some(table_meta) = db.table_meta(&p.name) {
                 db.persist_table_meta(&p.name, &table_meta)?;
-                db.allocate_ddl_lsn(|lsn| db.log_create_table_ddl(&p.name, &table_meta, lsn));
+                db.allocate_ddl_lsn(|lsn| db.log_create_table_ddl(&p.name, &table_meta, lsn))?;
             }
             Ok(QueryResult::empty_with_affected(0))
         }
@@ -148,7 +153,7 @@ pub(crate) fn execute_plan(
             db.drop_table_aux_state(name);
             db.relational_store().drop_table(name);
             db.remove_persisted_table(name)?;
-            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn));
+            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn))?;
             db.accountant().release(bytes_to_release);
             Ok(QueryResult::empty_with_affected(0))
         }
@@ -236,7 +241,35 @@ pub(crate) fn execute_plan(
                             column: name.clone(),
                         });
                     }
-                    // RESTRICT / CASCADE on indexed columns.
+                    // PK check precedes index-dependency reporting: a column
+                    // flagged PRIMARY KEY cannot be dropped (the auto-index
+                    // would also show as a dependency, but the actionable
+                    // error is that the PK cannot be removed).
+                    if let Some(existing_meta) = db.table_meta(&p.table)
+                        && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *name)
+                        && col.primary_key
+                    {
+                        return Err(Error::Other(format!(
+                            "cannot drop primary key column {}.{}",
+                            p.table, name
+                        )));
+                    }
+                    // RESTRICT / CASCADE on indexed columns. Only user-declared
+                    // indexes gate the RESTRICT path — auto-indexes dissolve
+                    // naturally when their defining column leaves.
+                    let dependent_user_indexes: Vec<String> = db
+                        .table_meta(&p.table)
+                        .map(|m| {
+                            m.indexes
+                                .iter()
+                                .filter(|i| {
+                                    i.kind == contextdb_core::IndexKind::UserDeclared
+                                        && i.columns.iter().any(|(c, _)| c == name)
+                                })
+                                .map(|i| i.name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let dependent_indexes: Vec<String> = db
                         .table_meta(&p.table)
                         .map(|m| {
@@ -247,11 +280,11 @@ pub(crate) fn execute_plan(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if !*cascade && !dependent_indexes.is_empty() {
+                    if !*cascade && !dependent_user_indexes.is_empty() {
                         return Err(Error::ColumnInIndex {
                             table: p.table.clone(),
                             column: name.clone(),
-                            index: dependent_indexes[0].clone(),
+                            index: dependent_user_indexes[0].clone(),
                         });
                     }
                     store
@@ -268,7 +301,7 @@ pub(crate) fn execute_plan(
                         }
                         for idx in &dependent_indexes {
                             store.drop_index_storage(&p.table, idx);
-                            db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&p.table, idx, lsn));
+                            db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&p.table, idx, lsn))?;
                         }
                     }
                     let mut meta = store.table_meta.write();
@@ -283,7 +316,7 @@ pub(crate) fn execute_plan(
                         db.persist_table_rows(&p.table)?;
                         db.allocate_ddl_lsn(|lsn| {
                             db.log_alter_table_ddl(&p.table, &table_meta, lsn)
-                        });
+                        })?;
                     }
                     return Ok(QueryResult {
                         columns: vec![],
@@ -363,7 +396,7 @@ pub(crate) fn execute_plan(
                 ) {
                     db.persist_table_rows(&p.table)?;
                 }
-                db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn));
+                db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn))?;
             }
             Ok(QueryResult::empty_with_affected(0))
         }
@@ -409,7 +442,6 @@ pub(crate) fn execute_plan(
                 if let Some(pick) = a.pick {
                     // IndexScan path. Fetch by BTree range; apply residual filter.
                     let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
-                    db.__reset_rows_examined();
                     db.__bump_rows_examined(examined);
                     let mut result = materialize_rows(
                         rows,
@@ -437,7 +469,6 @@ pub(crate) fn execute_plan(
                 } else {
                     // Scan with rejection trace.
                     let rows = db.scan(table, snapshot)?;
-                    db.__reset_rows_examined();
                     db.__bump_rows_examined(rows.len() as u64);
                     let mut result = materialize_rows(
                         rows,
@@ -459,7 +490,6 @@ pub(crate) fn execute_plan(
             }
 
             let rows = db.scan(table, snapshot)?;
-            db.__reset_rows_examined();
             db.__bump_rows_examined(rows.len() as u64);
             let mut result = materialize_rows(
                 rows,
@@ -1474,7 +1504,7 @@ fn exec_update(
             return Err(err);
         }
 
-        let new_row_id = match db.insert_row(txid, &p.table, values) {
+        let new_row_id = match db.insert_row_replacing(txid, &p.table, values, row.row_id) {
             Ok(row_id) => row_id,
             Err(err) => {
                 db.accountant().release(new_row_bytes);
@@ -1505,6 +1535,18 @@ fn exec_create_index(
     db: &Database,
     plan: &contextdb_planner::CreateIndexPlan,
 ) -> Result<QueryResult> {
+    // Reserved-prefix guard: user-declared indexes must not collide with the
+    // auto-index namespace used for PRIMARY KEY / UNIQUE backing indexes.
+    for prefix in ["__pk_", "__unique_"] {
+        if plan.name.starts_with(prefix) {
+            return Err(Error::ReservedIndexName {
+                table: plan.table.clone(),
+                name: plan.name.clone(),
+                prefix: prefix.to_string(),
+            });
+        }
+    }
+
     // Error precedence (plan §Error precedence): TableNotFound > ColumnNotFound
     // > ColumnNotIndexable > DuplicateIndex. Check in that exact order so
     // "structural" bugs surface before "naming" bugs.
@@ -1557,6 +1599,7 @@ fn exec_create_index(
         m.indexes.push(contextdb_core::IndexDecl {
             name: plan.name.clone(),
             columns: plan.columns.clone(),
+            kind: contextdb_core::IndexKind::UserDeclared,
         });
     }
     db.relational_store()
@@ -1567,7 +1610,9 @@ fn exec_create_index(
         db.persist_table_meta(&plan.table, &table_meta)?;
     }
 
-    db.allocate_ddl_lsn(|lsn| db.log_create_index_ddl(&plan.table, &plan.name, &plan.columns, lsn));
+    db.allocate_ddl_lsn(|lsn| {
+        db.log_create_index_ddl(&plan.table, &plan.name, &plan.columns, lsn)
+    })?;
 
     Ok(QueryResult::empty_with_affected(0))
 }
@@ -1598,7 +1643,7 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
     if let Some(table_meta) = db.table_meta(&plan.table) {
         db.persist_table_meta(&plan.table, &table_meta)?;
     }
-    db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&plan.table, &plan.name, lsn));
+    db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&plan.table, &plan.name, lsn))?;
     Ok(QueryResult::empty_with_affected(0))
 }
 
@@ -1657,6 +1702,53 @@ struct IndexPick {
 struct IndexAnalysis {
     pick: Option<IndexPick>,
     considered: Vec<crate::database::IndexCandidate>,
+}
+
+/// Coerce every literal value inside `pick.shape` to `pick.pushed_column`'s
+/// declared type. B-tree walks use variant-exact comparisons by design, so a
+/// SELECT `WHERE uuid_col = 'text-literal'` must arrive at the executor with
+/// the text already converted to Uuid. Coercion failure propagates so callers
+/// can fall back to zero-rows — matching the semantics a predicate-evaluating
+/// scan would produce on an un-coercible literal.
+fn coerce_pick_shape_to_column_type(
+    db: &Database,
+    table: &str,
+    pick: &IndexPick,
+) -> Result<IndexPick> {
+    use std::ops::Bound;
+    let col = &pick.pushed_column;
+    let coerce = |v: Value| coerce_value_for_column(db, table, col, v, None, None);
+    let new_shape = match &pick.shape {
+        IndexPredicateShape::Equality(v) => IndexPredicateShape::Equality(coerce(v.clone())?),
+        IndexPredicateShape::InList(vs) => IndexPredicateShape::InList(
+            vs.iter()
+                .cloned()
+                .map(&coerce)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        IndexPredicateShape::Range { lower, upper } => {
+            let lower = match lower {
+                Bound::Included(v) => Bound::Included(coerce(v.clone())?),
+                Bound::Excluded(v) => Bound::Excluded(coerce(v.clone())?),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            let upper = match upper {
+                Bound::Included(v) => Bound::Included(coerce(v.clone())?),
+                Bound::Excluded(v) => Bound::Excluded(coerce(v.clone())?),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            IndexPredicateShape::Range { lower, upper }
+        }
+        IndexPredicateShape::NotEqual(v) => IndexPredicateShape::NotEqual(coerce(v.clone())?),
+        IndexPredicateShape::IsNull => IndexPredicateShape::IsNull,
+        IndexPredicateShape::IsNotNull => IndexPredicateShape::IsNotNull,
+    };
+    Ok(IndexPick {
+        name: pick.name.clone(),
+        columns: pick.columns.clone(),
+        shape: new_shape,
+        pushed_column: pick.pushed_column.clone(),
+    })
 }
 
 /// Inspect `filter` looking for an eligible predicate on the first column of
@@ -2092,6 +2184,19 @@ fn execute_index_scan(
         return Ok((Vec::new(), 0));
     }
 
+    // Coerce pick.shape's literal values to the pushed column's declared type.
+    // A SELECT WHERE uuid_col = 'uuid-string' arrives here with Text(..) even
+    // though the indexed column stores Uuid(..). B-tree walks use variant-exact
+    // comparisons (value_total_cmp panics on mismatched variants by design),
+    // so we must match the stored key-type before walking. Coercion failure
+    // (e.g. Text that is not a valid UUID) is treated as zero rows matched —
+    // same semantics a full-scan predicate would produce.
+    let pick = match coerce_pick_shape_to_column_type(db, table, pick) {
+        Ok(coerced) => coerced,
+        Err(_) => return Ok((Vec::new(), 0)),
+    };
+    let pick = &pick;
+
     let indexes = db.relational_store().indexes.read();
     let storage = match indexes.get(&(table.to_string(), pick.name.clone())) {
         Some(s) => s,
@@ -2432,7 +2537,6 @@ fn run_index_scan_with_order(
         pushed_column: decl.columns[0].0.clone(),
     };
     let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
-    db.__reset_rows_examined();
     db.__bump_rows_examined(examined);
     let mut result = materialize_rows(
         rows,
@@ -2480,6 +2584,27 @@ fn sort_keys_match_index_prefix(
     let Some(decl) = decl else {
         return false;
     };
+    // Shape guard: IndexScan with InList or NotEqual shape on the leading
+    // indexed column walks fragmented posting-list ranges, so rows are
+    // emitted per-value, not globally sorted. Refuse sort elision for those
+    // shapes — the Sort node must run.
+    if let Some(filter_expr) = filter.as_ref()
+        && let Some(leading_col) = decl.columns.first().map(|(c, _)| c.as_str())
+    {
+        let conjuncts = split_conjuncts(filter_expr);
+        let empty_params = HashMap::new();
+        for conjunct in &conjuncts {
+            if let Some((col, shape)) = classify_index_predicate(conjunct, &empty_params)
+                && col == leading_col
+                && matches!(
+                    shape,
+                    IndexPredicateShape::InList(_) | IndexPredicateShape::NotEqual(_)
+                )
+            {
+                return false;
+            }
+        }
+    }
     // Determine how many leading index columns the WHERE filter pins to a
     // single equality. Those columns are effectively "used up" by the
     // IndexScan's range; subsequent ORDER BY keys matching the remaining
@@ -2827,16 +2952,7 @@ pub fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Valu
             .get(p)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("missing parameter: {}", p))),
-        Expr::Column(c) => {
-            if c.column.eq_ignore_ascii_case("CURRENT_TIMESTAMP") {
-                let ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                return Ok(Value::Timestamp(ms));
-            }
-            Ok(Value::Text(c.column.clone()))
-        }
+        Expr::Column(c) => Ok(Value::Text(c.column.clone())),
         Expr::UnaryOp { op, operand } => match op {
             UnaryOp::Neg => match resolve_expr(operand, params)? {
                 Value::Int64(v) => Ok(Value::Int64(-v)),

@@ -156,7 +156,7 @@ CREATE TABLE decisions (
 |------------|-------------|
 | `PRIMARY KEY` | Unique row identifier |
 | `NOT NULL` | Value required |
-| `UNIQUE` | No duplicate values (single column) |
+| `UNIQUE` | No duplicate values (single column). A duplicate INSERT on a `UNIQUE` column is a silent no-op (returns `Ok(rows_affected=0)`), matching the composite-uniqueness contract. |
 | `DEFAULT expr` | Default value for inserts |
 | `REFERENCES table(col)` | Foreign key — writes are rejected if the referenced row does not exist; in explicit transactions the error may surface at `COMMIT` |
 
@@ -174,7 +174,7 @@ CREATE TABLE edges (
 )
 ```
 
-A duplicate `(source_id, target_id, edge_type)` tuple is rejected. Rows that share individual column values but differ in at least one constrained column are allowed. Rows with `NULL` in any constrained column do not participate in the composite uniqueness check.
+A duplicate `(source_id, target_id, edge_type)` tuple is a silent no-op — the second INSERT returns `Ok(rows_affected=0)` and the row count is unchanged, making agent operations idempotent. Rows that share individual column values but differ in at least one constrained column are allowed. Rows with `NULL` in any constrained column do not participate in the composite uniqueness check.
 
 ### Foreign Key State Propagation
 
@@ -613,6 +613,24 @@ and FIRST under `DESC`, matching the engine's ORDER BY convention. Float64
 values use `f64::total_cmp` — `NaN` sorts greater than any finite value,
 matching the ordering test suite.
 
+### Auto-Indexes
+
+`PRIMARY KEY` and `UNIQUE` columns automatically acquire a backing index
+named `__pk_<col>` for `PRIMARY KEY`, `__unique_<col>` for a single-column
+`UNIQUE`, and `__unique_<col1>_<col2>...` for a composite
+`UNIQUE (col1, col2, ...)` constraint. These indexes exist so PK / UNIQUE
+constraint probes run in O(log n) and so `SELECT ... WHERE pk_col = $v`
+queries pick an `IndexScan` without requiring a user `CREATE INDEX`.
+
+Auto-indexes are elided from `.schema` output to keep schema printouts
+focused on user-authored DDL. They remain visible in `EXPLAIN <query>`
+output as index candidates so agents can programmatically confirm that
+a query routed through the auto-index rather than a table scan.
+
+User-declared index names must not begin with `__pk_` or `__unique_`.
+`CREATE INDEX __pk_id ON t (id)` returns
+`ReservedIndexName { table, name, prefix }`.
+
 ### Error variants
 
 | Error | When it fires |
@@ -622,4 +640,5 @@ matching the ordering test suite.
 | `ColumnNotIndexable { table, column, column_type }` | `CREATE INDEX` on a `JSON` or `VECTOR` column |
 | `ColumnInIndex { table, column, index }` | `ALTER TABLE ... DROP COLUMN c RESTRICT` on a column referenced by an index |
 | `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table |
+| `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_` or `__unique_` (reserved for auto-indexes) |
 

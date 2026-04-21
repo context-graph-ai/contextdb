@@ -108,8 +108,9 @@ fn m02_insert_rejected_when_budget_exceeded() {
 // ---------------------------------------------------------------------------
 #[test]
 fn m03_delete_reclaims_memory_for_insert() {
-    // Budget just big enough for one row, not two.
-    let accountant = Arc::new(MemoryAccountant::with_budget(512));
+    // Budget sized to fit schema + one row (schema now includes an auto-PK
+    // IndexDecl), but not two rows.
+    let accountant = Arc::new(MemoryAccountant::with_budget(820));
     let db = Database::open_memory_with_accountant(accountant.clone());
     db.execute(
         "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",

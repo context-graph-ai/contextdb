@@ -65,14 +65,13 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     .unwrap_or_default();
                 let default_ttl_seconds = seq.next_element::<Option<u64>>()?.unwrap_or_default();
                 let sync_safe = seq.next_element::<bool>()?.unwrap_or_default();
-                let expires_column = seq
-                    .next_element::<Option<String>>()?
-                    .unwrap_or_default();
-                let indexes = match seq.next_element::<Vec<IndexDecl>>() {
-                    Ok(Some(v)) => v,
-                    Ok(None) => Vec::new(),
-                    Err(_) => Vec::new(),
-                };
+                // Ok(None) at a declared-length tail is legitimate serde
+                // behavior (declared-length sequence exhausted). Decode
+                // errors, in contrast, indicate corruption or incompatible
+                // on-disk payloads and must propagate rather than silently
+                // default.
+                let expires_column = seq.next_element::<Option<String>>()?.unwrap_or_default();
+                let indexes = seq.next_element::<Vec<IndexDecl>>()?.unwrap_or_default();
                 Ok(TableMeta {
                     columns,
                     immutable,
@@ -167,10 +166,25 @@ pub enum SortDirection {
     Desc,
 }
 
+/// How an index entered `TableMeta.indexes`. `Auto` indexes are synthesized
+/// at CREATE TABLE time from PRIMARY KEY / UNIQUE constraints. `UserDeclared`
+/// indexes come from `CREATE INDEX` DDL. The distinction drives surface
+/// rendering (auto-indexes omitted from `.schema`), schema-rendering verbose
+/// flags, and sync DDL emission (auto-indexes are not re-emitted since they
+/// are derived from the CreateTable payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum IndexKind {
+    Auto,
+    #[default]
+    UserDeclared,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDecl {
     pub name: String,
     pub columns: Vec<(String, SortDirection)>,
+    #[serde(default)]
+    pub kind: IndexKind,
 }
 
 impl IndexDecl {
@@ -276,14 +290,11 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     .next_element::<Option<ForeignKeyReference>>()?
                     .unwrap_or_default();
                 let expires = seq.next_element::<bool>()?.unwrap_or_default();
-                // Trailing field: tolerate bincode-style premature EOF by defaulting
-                // to `false` when reading the next element produces an error that
-                // indicates the buffer ended short of the expected bool tag.
-                let immutable = match seq.next_element::<bool>() {
-                    Ok(Some(v)) => v,
-                    Ok(None) => false,
-                    Err(_) => false,
-                };
+                // Trailing field. `Ok(None)` means the declared-length seq
+                // ended naturally (legitimate for JSON paths). Decode errors
+                // propagate — silently defaulting to `false` would let a
+                // corrupt payload pose as a non-immutable column.
+                let immutable = seq.next_element::<bool>()?.unwrap_or_default();
                 Ok(ColumnDef {
                     name,
                     column_type,

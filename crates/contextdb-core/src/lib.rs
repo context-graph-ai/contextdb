@@ -10,8 +10,8 @@ pub use memory::*;
 // collides by name with `contextdb_parser::ast::SortDirection`, so downstream
 // crates must use fully-qualified paths at ambiguous sites.
 pub use table_meta::{
-    ColumnDef, ColumnType, ForeignKeyReference, IndexDecl, PropagationRule, SortDirection,
-    StateMachineConstraint, TableMeta,
+    ColumnDef, ColumnType, ForeignKeyReference, IndexDecl, IndexKind, PropagationRule,
+    SortDirection, StateMachineConstraint, TableMeta,
 };
 pub use traits::*;
 pub use types::*;

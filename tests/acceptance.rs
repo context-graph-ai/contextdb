@@ -18,6 +18,8 @@ mod dev_experience;
 mod disk_budget;
 #[path = "acceptance/docs_immutable_column.rs"]
 mod docs_immutable_column;
+#[path = "acceptance/docs_query_language_auto_indexes.rs"]
+mod docs_query_language_auto_indexes;
 #[path = "acceptance/embedding.rs"]
 mod embedding;
 #[path = "acceptance/infra_failures.rs"]

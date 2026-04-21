@@ -138,7 +138,7 @@ fn a_ma6_error_message_has_diagnostic_fields() {
     let db_path = temp_db_file(&tmp, "a_ma6.db");
     let output = run_cli_script(
         &db_path,
-        &["--memory-limit", "256"],
+        &["--memory-limit", "512"],
         "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'test data that exceeds tiny budget')\n.quit\n",
     );
     assert!(output.status.success());

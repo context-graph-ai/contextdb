@@ -301,47 +301,9 @@ impl Database {
         let relational = Arc::new(RelationalStore::new());
         for (name, meta) in &all_meta {
             relational.create_table(name, meta.clone());
-            // Register implicit (auto) indexes for PK / UNIQUE before loading
-            // rows so `insert_loaded_row` can populate them.
-            for c in &meta.columns {
-                if c.primary_key
-                    && !matches!(c.column_type, ColumnType::Json | ColumnType::Vector(_))
-                {
-                    relational.create_index_storage(
-                        name,
-                        &format!("__pk_{}", c.name),
-                        vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
-                    );
-                }
-                if c.unique
-                    && !c.primary_key
-                    && !matches!(c.column_type, ColumnType::Json | ColumnType::Vector(_))
-                {
-                    relational.create_index_storage(
-                        name,
-                        &format!("__unique_{}", c.name),
-                        vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
-                    );
-                }
-            }
-            for uc in &meta.unique_constraints {
-                let all_indexable = uc.iter().all(|col_name| {
-                    meta.columns
-                        .iter()
-                        .find(|c| c.name == *col_name)
-                        .map(|c| !matches!(c.column_type, ColumnType::Json | ColumnType::Vector(_)))
-                        .unwrap_or(false)
-                });
-                if !all_indexable || uc.is_empty() {
-                    continue;
-                }
-                let cols: Vec<(String, contextdb_core::SortDirection)> = uc
-                    .iter()
-                    .map(|c| (c.clone(), contextdb_core::SortDirection::Asc))
-                    .collect();
-                relational.create_index_storage(name, &format!("__unique_{}", uc.join("_")), cols);
-            }
-            // Register user-declared indexes from TableMeta.indexes.
+            // Register EVERY index declared in TableMeta.indexes — this
+            // includes auto-indexes (kind=Auto) synthesized at CREATE TABLE
+            // time AND user-declared indexes (kind=UserDeclared).
             for decl in &meta.indexes {
                 relational.create_index_storage(name, &decl.name, decl.columns.clone());
             }
@@ -502,6 +464,10 @@ impl Database {
         plan: &PhysicalPlan,
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
+        // Reset per-query rows_examined once at the entry point so every
+        // sub-plan (union, CTE, subquery IndexScan) accumulates into the
+        // shared counter rather than overwriting prior counts.
+        self.__reset_rows_examined();
         match plan {
             PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_) => {
                 let tx = self.begin();
@@ -673,7 +639,12 @@ impl Database {
             let plan = contextdb_planner::plan(&stmt)?;
             validate_dml(&plan, self, params)?;
             let result = match tx {
-                Some(tx) => execute_plan(self, &plan, params, Some(tx)),
+                Some(tx) => {
+                    // Reset rows_examined at the top of an in-tx statement so
+                    // sub-plans accumulate rather than overwrite.
+                    self.__reset_rows_examined();
+                    execute_plan(self, &plan, params, Some(tx))
+                }
                 None => self.execute_autocommit(&plan, params),
             };
             if result.is_ok()
@@ -883,6 +854,24 @@ impl Database {
         self.relational.insert(tx, table, values)
     }
 
+    /// UPDATE-aware insert: the UPDATE path first deletes the old row and
+    /// then re-inserts. The constraint probe must skip the old row_id so the
+    /// same PK does not self-collide. The old row's index entry still looks
+    /// visible at the committed-watermark snapshot because its `deleted_tx`
+    /// equals the current (uncommitted) `tx`.
+    pub(crate) fn insert_row_replacing(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: HashMap<ColName, Value>,
+        old_row_id: RowId,
+    ) -> Result<RowId> {
+        let values =
+            self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
+        self.validate_row_constraints(tx, table, &values, Some(old_row_id))?;
+        self.relational.insert(tx, table, values)
+    }
+
     /// Internal variant used by sync-apply: skips the TXID bound check because
     /// peer TxIds may legitimately exceed the local watermark. Still enforces
     /// wrong-variant + reverse-direction TXID column rules.
@@ -973,7 +962,7 @@ impl Database {
         conflict_col: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_for_read();
         let existing_row = values
             .get(conflict_col)
             .map(|conflict_value| {
@@ -1050,6 +1039,10 @@ impl Database {
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        // Constraint probes MUST see the current committed watermark, not any
+        // thread-local override. A PK/UNIQUE violation on a committed row must
+        // be detected even if the caller pinned a pre-violation snapshot for
+        // read visibility.
         let snapshot = self.snapshot();
 
         // Scan the whole table only when no index covers any PK / UNIQUE
@@ -1061,15 +1054,6 @@ impl Database {
                 continue;
             };
             if *value == Value::Null {
-                continue;
-            }
-            // schema_enforcer's validate_dml already probes `id` via index
-            // for every INSERT that has no ON CONFLICT; skip the re-probe
-            // for common PK-on-`id` schemas where the index exists and the
-            // schema-enforcer layer already handled it.
-            let column_is_id = column.name == "id";
-            if column_is_id && self.index_covers_column(table, &column.name) {
-                // schema_enforcer handled it; nothing to do here.
                 continue;
             }
             if self.index_covers_column(table, &column.name) {
@@ -1148,21 +1132,12 @@ impl Database {
                     }
                 }
             };
-            let pk_col: Option<&str> = meta
-                .columns
-                .iter()
-                .find(|c| c.primary_key)
-                .map(|c| c.name.as_str());
             self.merge_unique_conflict(
-                tx,
-                snapshot,
                 table,
                 &column.name,
                 &matching_row_ids,
                 allow_duplicate_unique_noop,
                 &mut duplicate_unique_row_id,
-                values,
-                pk_col,
             )?;
         }
 
@@ -1214,24 +1189,15 @@ impl Database {
                     .map(|existing| existing.row_id)
                     .collect()
             };
-            let pk_col: Option<&str> = meta
-                .columns
-                .iter()
-                .find(|c| c.primary_key)
-                .map(|c| c.name.as_str());
             // Report composite UNIQUE violations using the first column name,
             // matching the plan's single-column error convention.
             let column_label = unique_constraint.first().map(|s| s.as_str()).unwrap_or("");
             self.merge_unique_conflict(
-                tx,
-                snapshot,
                 table,
                 column_label,
                 &matching_row_ids,
                 allow_duplicate_unique_noop,
                 &mut duplicate_unique_row_id,
-                values,
-                pk_col,
             )?;
         }
 
@@ -1242,18 +1208,13 @@ impl Database {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn merge_unique_conflict(
         &self,
-        tx: TxId,
-        snapshot: SnapshotId,
         table: &str,
         column: &str,
         matching_row_ids: &[RowId],
         allow_duplicate_unique_noop: bool,
         duplicate_unique_row_id: &mut Option<RowId>,
-        new_values: &HashMap<ColName, Value>,
-        pk_column: Option<&str>,
     ) -> Result<()> {
         if matching_row_ids.is_empty() {
             return Ok(());
@@ -1267,29 +1228,6 @@ impl Database {
         }
 
         let matched_row_id = matching_row_ids[0];
-
-        // Only treat as no-op when the existing row and the new row share
-        // the same primary-key value. Two rows with distinct PKs hitting the
-        // same unique-column value are a real UniqueViolation.
-        if let Some(pk_col) = pk_column
-            && let Some(new_pk) = new_values.get(pk_col)
-            && !new_pk.is_null()
-        {
-            let existing_pk = self
-                .relational
-                .scan_filter_with_tx(Some(tx), table, snapshot, &|row| {
-                    row.row_id == matched_row_id
-                })?
-                .into_iter()
-                .next()
-                .and_then(|r| r.values.get(pk_col).cloned());
-            if existing_pk.as_ref() != Some(new_pk) {
-                return Err(Error::UniqueViolation {
-                    table: table.to_string(),
-                    column: column.to_string(),
-                });
-            }
-        }
 
         if let Some(existing_row_id) = duplicate_unique_row_id {
             if *existing_row_id != matched_row_id {
@@ -1321,6 +1259,8 @@ impl Database {
         value: &Value,
     ) -> Result<Option<RowId>> {
         use contextdb_core::{DirectedValue, TotalOrdAsc};
+        // Constraint probe — see comment on check_row_constraints. Must walk
+        // the committed watermark, not any read-side override.
         let snapshot = self.snapshot();
         let indexes = self.relational_store.indexes.read();
         // Fast path for auto-PK: key is directly `(table, "__pk_{column}")`.
@@ -1389,6 +1329,17 @@ impl Database {
         skip_row_id: Option<RowId>,
     ) -> Result<Option<RowId>> {
         use contextdb_core::{DirectedValue, TotalOrdAsc};
+        // Rows this tx has already staged for delete must not be treated as
+        // obstructions by the constraint probe. The old index entry still
+        // looks visible at the committed-watermark snapshot until commit.
+        let tx_staged_deletes: std::collections::HashSet<RowId> =
+            self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_deletes
+                    .iter()
+                    .filter(|(t, _, _)| t == table)
+                    .map(|(_, row_id, _)| *row_id)
+                    .collect()
+            })?;
         let indexes = self.relational_store.indexes.read();
         // Find any single-column index matching `column`, preferring auto
         // (`__pk_` / `__unique_`) indexes for simplicity.
@@ -1405,6 +1356,9 @@ impl Database {
                 if let Some(sid) = skip_row_id
                     && entry.row_id == sid
                 {
+                    continue;
+                }
+                if tx_staged_deletes.contains(&entry.row_id) {
                     continue;
                 }
                 if entry.visible_at(snapshot) {
@@ -1449,6 +1403,15 @@ impl Database {
         if cols.is_empty() || values.is_empty() || cols.len() != values.len() {
             return Ok(None);
         }
+        // Rows this tx has already staged for delete are not obstructions.
+        let tx_staged_deletes: std::collections::HashSet<RowId> =
+            self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_deletes
+                    .iter()
+                    .filter(|(t, _, _)| t == table)
+                    .map(|(_, row_id, _)| *row_id)
+                    .collect()
+            })?;
         let indexes = self.relational_store.indexes.read();
         let storage_entry = indexes.iter().find(|((t, _), idx)| {
             t == table
@@ -1482,6 +1445,9 @@ impl Database {
                 {
                     continue;
                 }
+                if tx_staged_deletes.contains(&entry.row_id) {
+                    continue;
+                }
                 if entry.visible_at(snapshot) {
                     return Ok(Some(entry.row_id));
                 }
@@ -1513,6 +1479,8 @@ impl Database {
     }
 
     fn validate_foreign_keys_in_tx(&self, tx: TxId) -> Result<()> {
+        // Constraint probe — FK existence checks must see the committed
+        // watermark, not any read-side snapshot override.
         let snapshot = self.snapshot();
         let relational_inserts = self
             .tx_mgr
@@ -1579,7 +1547,7 @@ impl Database {
         row_uuid: uuid::Uuid,
         new_state: &str,
     ) -> Result<()> {
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_for_read();
         let metas = self.relational_store().table_meta.read().clone();
         let mut queue: VecDeque<PropagationQueueEntry> = VecDeque::new();
         let mut visited: HashSet<(String, uuid::Uuid)> = HashSet::new();
@@ -2111,7 +2079,7 @@ impl Database {
     }
 
     pub(crate) fn drop_table_aux_state(&self, table: &str) {
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_for_read();
         let rows = self.scan(table, snapshot).unwrap_or_default();
         let row_ids: HashSet<RowId> = rows.iter().map(|row| row.row_id).collect();
         let edge_keys: HashSet<(NodeId, EdgeType, NodeId)> = rows
@@ -2700,25 +2668,32 @@ impl Database {
         self.tx_mgr.with_commit_lock(f)
     }
 
-    pub(crate) fn log_create_table_ddl(&self, name: &str, meta: &TableMeta, lsn: Lsn) {
+    pub(crate) fn log_create_table_ddl(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        lsn: Lsn,
+    ) -> Result<()> {
         let change = ddl_change_from_meta(name, meta);
         self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
-            let _ = persistence.append_ddl_log(lsn, &change);
+            persistence.append_ddl_log(lsn, &change)?;
         }
+        Ok(())
     }
 
-    pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: Lsn) {
+    pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: Lsn) -> Result<()> {
         let change = DdlChange::DropTable {
             name: name.to_string(),
         };
         self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
-            let _ = persistence.append_ddl_log(lsn, &change);
+            persistence.append_ddl_log(lsn, &change)?;
         }
+        Ok(())
     }
 
-    pub(crate) fn log_alter_table_ddl(&self, name: &str, meta: &TableMeta, lsn: Lsn) {
+    pub(crate) fn log_alter_table_ddl(&self, name: &str, meta: &TableMeta, lsn: Lsn) -> Result<()> {
         let change = DdlChange::AlterTable {
             name: name.to_string(),
             columns: meta
@@ -2735,8 +2710,9 @@ impl Database {
         };
         self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
-            let _ = persistence.append_ddl_log(lsn, &change);
+            persistence.append_ddl_log(lsn, &change)?;
         }
+        Ok(())
     }
 
     pub(crate) fn log_create_index_ddl(
@@ -2745,7 +2721,7 @@ impl Database {
         name: &str,
         columns: &[(String, contextdb_core::SortDirection)],
         lsn: Lsn,
-    ) {
+    ) -> Result<()> {
         let change = DdlChange::CreateIndex {
             table: table.to_string(),
             name: name.to_string(),
@@ -2753,19 +2729,21 @@ impl Database {
         };
         self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
-            let _ = persistence.append_ddl_log(lsn, &change);
+            persistence.append_ddl_log(lsn, &change)?;
         }
+        Ok(())
     }
 
-    pub(crate) fn log_drop_index_ddl(&self, table: &str, name: &str, lsn: Lsn) {
+    pub(crate) fn log_drop_index_ddl(&self, table: &str, name: &str, lsn: Lsn) -> Result<()> {
         let change = DdlChange::DropIndex {
             table: table.to_string(),
             name: name.to_string(),
         };
         self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
-            let _ = persistence.append_ddl_log(lsn, &change);
+            persistence.append_ddl_log(lsn, &change)?;
         }
+        Ok(())
     }
 
     pub(crate) fn persist_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
@@ -3608,35 +3586,40 @@ impl Database {
                     // Apply at the receiver: write IndexDecl into
                     // TableMeta.indexes, register storage, rebuild over
                     // locally-resident rows. Emit a matching DDL log entry.
-                    if self.table_meta(&table).is_some() {
-                        let already = self
-                            .table_meta(&table)
-                            .map(|m| m.indexes.iter().any(|i| i.name == name))
-                            .unwrap_or(false);
-                        if !already {
-                            {
-                                let store = self.relational_store();
-                                let mut metas = store.table_meta.write();
-                                if let Some(m) = metas.get_mut(&table) {
-                                    m.indexes.push(contextdb_core::IndexDecl {
-                                        name: name.clone(),
-                                        columns: columns.clone(),
-                                    });
-                                }
+                    // Silently skipping on missing table would hide sync
+                    // divergence; surface it as TableNotFound so the caller
+                    // can see which index couldn't land.
+                    if self.table_meta(&table).is_none() {
+                        return Err(Error::TableNotFound(table.clone()));
+                    }
+                    let already = self
+                        .table_meta(&table)
+                        .map(|m| m.indexes.iter().any(|i| i.name == name))
+                        .unwrap_or(false);
+                    if !already {
+                        {
+                            let store = self.relational_store();
+                            let mut metas = store.table_meta.write();
+                            if let Some(m) = metas.get_mut(&table) {
+                                m.indexes.push(contextdb_core::IndexDecl {
+                                    name: name.clone(),
+                                    columns: columns.clone(),
+                                    kind: contextdb_core::IndexKind::UserDeclared,
+                                });
                             }
-                            self.relational_store().create_index_storage(
-                                &table,
-                                &name,
-                                columns.clone(),
-                            );
-                            self.relational_store().rebuild_index(&table, &name);
-                            if let Some(table_meta) = self.table_meta(&table) {
-                                self.persist_table_meta(&table, &table_meta)?;
-                            }
-                            self.allocate_ddl_lsn(|lsn| {
-                                self.log_create_index_ddl(&table, &name, &columns, lsn)
-                            });
                         }
+                        self.relational_store().create_index_storage(
+                            &table,
+                            &name,
+                            columns.clone(),
+                        );
+                        self.relational_store().rebuild_index(&table, &name);
+                        if let Some(table_meta) = self.table_meta(&table) {
+                            self.persist_table_meta(&table, &table_meta)?;
+                        }
+                        self.allocate_ddl_lsn(|lsn| {
+                            self.log_create_index_ddl(&table, &name, &columns, lsn)
+                        })?;
                     }
                     table_meta_cache.remove(&table);
                 }
@@ -3660,7 +3643,7 @@ impl Database {
                             }
                             self.allocate_ddl_lsn(|lsn| {
                                 self.log_drop_index_ddl(&table, &name, lsn)
-                            });
+                            })?;
                         }
                     }
                     table_meta_cache.remove(&table);
