@@ -75,10 +75,12 @@ The `DAG('DEPENDS_ON', 'BASED_ON')` declaration means these specific edge types 
 
 **Problem:** Decisions have a lifecycle — draft, active, superseded, invalidated. Invalid transitions (draft directly to superseded) should be impossible.
 
+**Correction-via-supersede.** Provenance columns — what was decided, what it was based on — are marked `IMMUTABLE`. A recorded decision is never silently rewritten. When a correction is needed, insert a *new* row with the corrected values and transition the original `status` to `superseded`. Nothing disappears from the audit trail.
+
 ```sql
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
-  description TEXT NOT NULL,
+  description TEXT NOT NULL IMMUTABLE,
   status TEXT NOT NULL,
   confidence REAL,
   context_id UUID,

@@ -92,7 +92,7 @@ For file-backed databases, `SET DISK_LIMIT` persists in the database file and su
 | `.help` | `\?` | Show available commands. |
 | `.quit` / `.exit` | `\q` | Exit the REPL. |
 | `.tables` | `\dt` | List all table names. |
-| `.schema <table>` | `\d <table>` | Show table DDL and constraints. |
+| `.schema <table>` | `\d <table>` | Show table DDL and constraints. Per-column `IMMUTABLE` flags render on each flagged column alongside `NOT NULL` / `PRIMARY KEY`. |
 | `.explain <sql>` | | Show the query execution plan (useful for seeing whether vector search uses HNSW or brute-force). |
 
 ### Trace vs Explain

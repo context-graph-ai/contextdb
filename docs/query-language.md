@@ -134,6 +134,7 @@ SHOW DISK_LIMIT
 | `TIMESTAMP` | Stored as a Unix timestamp (`Value::Timestamp(i64)`); ISO 8601 text literals are also accepted on input | `NOW()` |
 | `JSON` | JSON value | `'{"key": "value"}'` |
 | `VECTOR(n)` | Fixed-dimension float vector | `[0.1, 0.2, 0.3]` |
+| TXID | Engine-issued transaction id (`Value::TxId`). Populate only via the library API with a bound parameter; SQL literals are rejected. Sync-apply advances the local TxId allocator past incoming peer values. | `Value::TxId(tx.id())` |
 
 NULL values display as `NULL`. Vectors display as `[0.1, 0.2, ...]`.
 
@@ -159,6 +160,39 @@ CREATE TABLE decisions (
 | `UNIQUE` | No duplicate values (single column). A duplicate INSERT on a `UNIQUE` column is a silent no-op (returns `Ok(rows_affected=0)`), matching the composite-uniqueness contract. |
 | `DEFAULT expr` | Default value for inserts |
 | `REFERENCES table(col)` | Foreign key — writes are rejected if the referenced row does not exist; in explicit transactions the error may surface at `COMMIT` |
+| `IMMUTABLE` | Column is audit-frozen — INSERT sets the value once; `UPDATE`, `ON CONFLICT DO UPDATE`, sync-apply mutations, and schema-altering DDL against the column are rejected with `Error::ImmutableColumn` |
+
+### Audit-Frozen Columns
+
+An audit-frozen column carries data that must not be silently rewritten by anyone, through any path. Declare it with `IMMUTABLE`:
+
+```sql
+CREATE TABLE decisions (
+  id UUID PRIMARY KEY,
+  decision_type TEXT NOT NULL IMMUTABLE,
+  description TEXT NOT NULL IMMUTABLE,
+  reasoning JSON,
+  confidence REAL,
+  status TEXT NOT NULL DEFAULT 'active'
+) STATE MACHINE (status: active -> [superseded, archived])
+```
+
+`decision_type` and `description` are provenance — set once at INSERT and never rewritten. `status` and `confidence` remain mutable. An `UPDATE decisions SET decision_type = '…'` returns `Error::ImmutableColumn`; the row is unchanged. Sync-apply across a NATS edge enforces the same rule on the peer: incoming row-changes that mutate a flagged column are rejected and surface in `ApplyResult.conflicts`. `ALTER TABLE ... DROP COLUMN`, `RENAME COLUMN`, and column-type-altering ALTER against a flagged column are refused.
+
+Correction without rewrite — the supersede pattern. When a recorded decision turns out to be wrong, insert a new row with the corrected values and mark the original `superseded`:
+
+```sql
+-- Original (frozen)
+INSERT INTO decisions (id, decision_type, description, status)
+VALUES ('…A', 'sql-migration', 'adopt contextdb', 'active');
+
+-- Correction: a new row, not an update. Both rows remain queryable.
+INSERT INTO decisions (id, decision_type, description, status)
+VALUES ('…B', 'sql-migration', 'adopt contextdb (rev 2)', 'active');
+UPDATE decisions SET status = 'superseded' WHERE id = '…A';
+```
+
+Nothing disappears. The audit trail shows both the original commitment and its correction.
 
 ### Composite Uniqueness
 
