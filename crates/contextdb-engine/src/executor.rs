@@ -104,6 +104,7 @@ pub(crate) fn execute_plan(
                         }),
                         expires: c.expires,
                         immutable: c.immutable,
+                        quantization: map_vector_quantization(c.quantization),
                     })
                     .collect(),
                 immutable: p.immutable,
@@ -143,6 +144,11 @@ pub(crate) fn execute_plan(
                     .create_index_storage(&p.name, &idx.name, idx.columns.clone());
             }
             if let Some(table_meta) = db.table_meta(&p.name) {
+                for column in &table_meta.columns {
+                    db.register_vector_index_for_column(&p.name, column);
+                }
+            }
+            if let Some(table_meta) = db.table_meta(&p.name) {
                 db.persist_table_meta(&p.name, &table_meta)?;
                 db.allocate_ddl_lsn(|lsn| db.log_create_table_ddl(&p.name, &table_meta, lsn))?;
             }
@@ -152,6 +158,7 @@ pub(crate) fn execute_plan(
         PhysicalPlan::DropTable(name) => {
             let bytes_to_release = estimate_drop_table_bytes(db, name);
             db.drop_table_aux_state(name);
+            db.vector_store_deregister_table(name);
             db.relational_store().drop_table(name);
             db.remove_persisted_table(name)?;
             db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn))?;
@@ -162,6 +169,7 @@ pub(crate) fn execute_plan(
         PhysicalPlan::AlterTable(p) => {
             db.check_disk_budget("ALTER TABLE")?;
             let store = db.relational_store();
+            let mut rewrite_vectors_after_alter = false;
             match &p.action {
                 AlterAction::AddColumn(col) => {
                     if col.primary_key {
@@ -218,10 +226,19 @@ pub(crate) fn execute_plan(
                         }),
                         expires: col.expires,
                         immutable: col.immutable,
+                        quantization: map_vector_quantization(col.quantization),
                     };
                     store
                         .alter_table_add_column(&p.table, core_col)
                         .map_err(Error::Other)?;
+                    if let Some(table_meta) = db.table_meta(&p.table)
+                        && let Some(column) = table_meta
+                            .columns
+                            .iter()
+                            .find(|column| column.name == col.name)
+                    {
+                        db.register_vector_index_for_column(&p.table, column);
+                    }
                     if col.expires {
                         let mut meta = store.table_meta.write();
                         let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
@@ -234,6 +251,14 @@ pub(crate) fn execute_plan(
                     column: name,
                     cascade,
                 } => {
+                    let dropped_vector_column = db
+                        .table_meta(&p.table)
+                        .and_then(|meta| {
+                            meta.columns.into_iter().find(|column| column.name == *name)
+                        })
+                        .is_some_and(|column| {
+                            matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                        });
                     if let Some(existing_meta) = db.table_meta(&p.table)
                         && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *name)
                         && col.immutable
@@ -292,6 +317,8 @@ pub(crate) fn execute_plan(
                     store
                         .alter_table_drop_column(&p.table, name)
                         .map_err(Error::Other)?;
+                    db.deregister_vector_index(&p.table, name);
+                    rewrite_vectors_after_alter = dropped_vector_column;
                     if *cascade {
                         // Remove IndexDecls referencing `name`, release storage.
                         {
@@ -316,6 +343,9 @@ pub(crate) fn execute_plan(
                     if let Some(table_meta) = db.table_meta(&p.table) {
                         db.persist_table_meta(&p.table, &table_meta)?;
                         db.persist_table_rows(&p.table)?;
+                        if rewrite_vectors_after_alter {
+                            db.persist_vectors()?;
+                        }
                         db.allocate_ddl_lsn(|lsn| {
                             db.log_alter_table_ddl(&p.table, &table_meta, lsn)
                         })?;
@@ -336,6 +366,14 @@ pub(crate) fn execute_plan(
                     });
                 }
                 AlterAction::RenameColumn { from, to } => {
+                    let renamed_vector_column = db
+                        .table_meta(&p.table)
+                        .and_then(|meta| {
+                            meta.columns.into_iter().find(|column| column.name == *from)
+                        })
+                        .is_some_and(|column| {
+                            matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                        });
                     if let Some(existing_meta) = db.table_meta(&p.table)
                         && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *from)
                         && col.immutable
@@ -348,6 +386,10 @@ pub(crate) fn execute_plan(
                     store
                         .alter_table_rename_column(&p.table, from, to)
                         .map_err(Error::Other)?;
+                    if renamed_vector_column {
+                        db.rename_vector_index(&p.table, from, to)?;
+                        rewrite_vectors_after_alter = true;
+                    }
                     let mut meta = store.table_meta.write();
                     if let Some(table_meta) = meta.get_mut(&p.table)
                         && table_meta.expires_column.as_deref() == Some(from.as_str())
@@ -398,6 +440,9 @@ pub(crate) fn execute_plan(
                         | AlterAction::DropSyncConflictPolicy
                 ) {
                     db.persist_table_rows(&p.table)?;
+                }
+                if rewrite_vectors_after_alter {
+                    db.persist_vectors()?;
                 }
                 db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn))?;
             }
@@ -671,7 +716,7 @@ pub(crate) fn execute_plan(
                 "search",
                 "Reduce LIMIT/dimensionality or raise MEMORY_LIMIT before vector search.",
             )?;
-            let res = db.query_vector(
+            let res = db.query_vector_strict(
                 contextdb_core::VectorIndexRef::new(table.clone(), column.clone()),
                 &query_vec,
                 *k as usize,
@@ -1116,20 +1161,36 @@ pub(crate) fn execute_plan(
                 cascade: None,
             })
         }
-        PhysicalPlan::ShowVectorIndexes => Ok(QueryResult {
-            columns: vec![
-                "table".to_string(),
-                "column".to_string(),
-                "dimension".to_string(),
-                "quantization".to_string(),
-                "vector_count".to_string(),
-                "bytes".to_string(),
-            ],
-            rows: vec![],
-            rows_affected: 0,
-            trace: crate::database::QueryTrace::scan(),
-            cascade: None,
-        }),
+        PhysicalPlan::ShowVectorIndexes => {
+            let rows = db
+                .vector_index_infos()
+                .into_iter()
+                .map(|info| {
+                    vec![
+                        Value::Text(info.index.table),
+                        Value::Text(info.index.column),
+                        Value::Int64(info.dimension as i64),
+                        Value::Text(info.quantization.as_str().to_string()),
+                        Value::Int64(info.vector_count as i64),
+                        Value::Int64(info.bytes as i64),
+                    ]
+                })
+                .collect();
+            Ok(QueryResult {
+                columns: vec![
+                    "table".to_string(),
+                    "column".to_string(),
+                    "dimension".to_string(),
+                    "quantization".to_string(),
+                    "vector_count".to_string(),
+                    "bytes".to_string(),
+                ],
+                rows,
+                rows_affected: 0,
+                trace: crate::database::QueryTrace::scan(),
+                cascade: None,
+            })
+        }
         PhysicalPlan::Pipeline(plans) => {
             let mut last = QueryResult::empty();
             for p in plans {
@@ -1272,17 +1333,38 @@ fn exec_insert(
     let current_tx_max = Some(db.committed_watermark());
     let route_inserts_to_graph =
         p.table.eq_ignore_ascii_case("edges") || !insert_meta.dag_edge_types.is_empty();
-    let vector_column = insert_meta.columns.iter().find_map(|column| {
-        if matches!(column.column_type, contextdb_core::ColumnType::Vector(_)) {
-            Some(column.name.clone())
-        } else {
-            None
-        }
-    });
+    let vector_columns = vector_columns_for_meta(&insert_meta);
     let has_column_defaults = insert_meta
         .columns
         .iter()
         .any(|column| column.default.is_some());
+
+    if !vector_columns.is_empty() {
+        for row in &p.values {
+            let mut values = HashMap::new();
+            for (idx, expr) in row.iter().enumerate() {
+                let col = columns
+                    .get(idx)
+                    .ok_or_else(|| Error::PlanError("column/value count mismatch".to_string()))?;
+                let v = resolve_expr(expr, params)?;
+                values.insert(
+                    col.clone(),
+                    coerce_value_for_column_with_meta(
+                        &p.table,
+                        &insert_meta,
+                        col,
+                        v,
+                        current_tx_max,
+                        Some(txid),
+                    )?,
+                );
+            }
+            if has_column_defaults {
+                apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
+            }
+            validate_vector_columns(db, &p.table, &values)?;
+        }
+    }
 
     let mut rows_affected = 0;
     for row in &p.values {
@@ -1309,7 +1391,7 @@ fn exec_insert(
             apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
         }
 
-        if vector_column.is_some() {
+        if !vector_columns.is_empty() {
             validate_vector_columns(db, &p.table, &values)?;
         }
         let row_bytes = estimate_row_bytes_for_meta(&values, &insert_meta, false);
@@ -1336,12 +1418,7 @@ fn exec_insert(
         } else {
             None
         };
-        let vector_value = vector_column
-            .as_ref()
-            .and_then(|column| match values.get(column) {
-                Some(Value::Vector(vector)) => Some(vector.clone()),
-                _ => None,
-            });
+        let vector_values = vector_values_for_table(db, &p.table, &values);
 
         let row_id = if let Some(on_conflict) = &p.on_conflict {
             let conflict_col = &on_conflict.columns[0];
@@ -1391,11 +1468,18 @@ fn exec_insert(
                 }
                 Ok(UpsertResult::Updated) => {
                     if existing_has_vector && let Some(existing_row_id) = existing_row_id {
-                        db.delete_vector(
-                            txid,
-                            first_vector_index_for_table(db, &p.table),
-                            existing_row_id,
-                        )?;
+                        for index in vector_indexes_for_table(db, &p.table) {
+                            if db
+                                .vector_store_live_entry_for_row(
+                                    &index,
+                                    existing_row_id,
+                                    db.snapshot(),
+                                )
+                                .is_some()
+                            {
+                                db.delete_vector(txid, index, existing_row_id)?;
+                            }
+                        }
                     }
                     db.point_lookup_in_tx(
                         txid,
@@ -1448,20 +1532,19 @@ fn exec_insert(
             }
         }
 
-        if let Some((column, v)) = vector_column
-            .as_ref()
-            .and_then(|column| vector_value.clone().map(|v| (column.clone(), v)))
-            && row_id != RowId(0)
-            && let Err(err) = db.insert_vector(
-                txid,
-                contextdb_core::VectorIndexRef::new(&p.table, column),
-                row_id,
-                v,
-            )
-        {
-            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-            db.accountant().release(row_bytes);
-            return Err(err);
+        if row_id != RowId(0) {
+            for (column, v) in &vector_values {
+                if let Err(err) = db.insert_vector_strict(
+                    txid,
+                    contextdb_core::VectorIndexRef::new(&p.table, column.clone()),
+                    row_id,
+                    v.clone(),
+                ) {
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    db.accountant().release(row_bytes);
+                    return Err(err);
+                }
+            }
         }
 
         rows_affected += 1;
@@ -1494,8 +1577,13 @@ fn exec_delete(
         .collect();
 
     for row in &matched {
-        if db.has_live_vector(row.row_id, snapshot) {
-            db.delete_vector(txid, first_vector_index_for_table(db, &p.table), row.row_id)?;
+        for index in vector_indexes_for_table(db, &p.table) {
+            if db
+                .vector_store_live_entry_for_row(&index, row.row_id, snapshot)
+                .is_some()
+            {
+                db.delete_vector(txid, index, row.row_id)?;
+            }
         }
         db.delete_row(txid, &p.table, row.row_id)?;
     }
@@ -1550,10 +1638,19 @@ fn exec_update(
             .and_then(Value::as_text)
             .map(std::borrow::ToOwned::to_owned);
 
-        let old_has_vector = db.has_live_vector(row.row_id, snapshot);
         validate_vector_columns(db, &p.table, &values)?;
-        let new_vector = vector_value_for_table(db, &p.table, &values)
-            .map(|(column, vector)| (column, vector.clone()));
+        let assigned_vector_values: Vec<(String, Vec<f32>)> = p
+            .assignments
+            .iter()
+            .filter_map(|(column, _)| match values.get(column) {
+                Some(Value::Vector(vector)) => Some((column.clone(), vector.clone())),
+                _ => None,
+            })
+            .collect();
+        let assigned_vector_columns: HashSet<String> = assigned_vector_values
+            .iter()
+            .map(|(column, _)| column.clone())
+            .collect();
         let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
         db.accountant().try_allocate_for(
             new_row_bytes,
@@ -1567,13 +1664,16 @@ fn exec_update(
             db.accountant().release(new_row_bytes);
             return Err(err);
         }
-        if old_has_vector
-            && let Err(err) =
-                db.delete_vector(txid, first_vector_index_for_table(db, &p.table), row.row_id)
-        {
-            db.accountant().release(new_row_bytes);
-            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-            return Err(err);
+        for column in &assigned_vector_columns {
+            if let Err(err) = db.delete_vector(
+                txid,
+                contextdb_core::VectorIndexRef::new(&p.table, column.clone()),
+                row.row_id,
+            ) {
+                db.accountant().release(new_row_bytes);
+                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                return Err(err);
+            }
         }
 
         let new_row_id = match db.insert_row_replacing(txid, &p.table, values, row.row_id) {
@@ -1584,17 +1684,31 @@ fn exec_update(
                 return Err(err);
             }
         };
-        if let Some((column, vector)) = new_vector
-            && let Err(err) = db.insert_vector(
+        for index in vector_indexes_for_table(db, &p.table) {
+            if assigned_vector_columns.contains(&index.column) {
+                continue;
+            }
+            if let Some(old_entry) =
+                db.vector_store_live_entry_for_row(&index, row.row_id, snapshot)
+                && old_entry.deleted_tx.is_none()
+                && let Err(err) = db.move_vector(txid, index, row.row_id, new_row_id)
+            {
+                db.accountant().release(new_row_bytes);
+                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                return Err(err);
+            }
+        }
+        for (column, vector) in assigned_vector_values {
+            if let Err(err) = db.insert_vector_strict(
                 txid,
                 contextdb_core::VectorIndexRef::new(&p.table, column),
                 new_row_id,
                 vector,
-            )
-        {
-            db.accountant().release(new_row_bytes);
-            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-            return Err(err);
+            ) {
+                db.accountant().release(new_row_bytes);
+                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                return Err(err);
+            }
         }
         if let Err(err) =
             db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
@@ -4081,6 +4195,7 @@ fn extract_column_name(expr: &Expr) -> Option<String> {
 fn resolve_vector_from_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Vec<f32>> {
     match resolve_expr(expr, params)? {
         Value::Vector(v) => Ok(v),
+        Value::Text(text) if text.trim_start().starts_with('[') => parse_text_vector_literal(&text),
         Value::Text(name) => match params.get(&name) {
             Some(Value::Vector(v)) => Ok(v.clone()),
             _ => Err(Error::PlanError("vector parameter missing".to_string())),
@@ -4100,13 +4215,26 @@ fn validate_vector_columns(
         return Ok(());
     };
 
+    let use_index_identity = meta
+        .columns
+        .iter()
+        .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
+        .nth(1)
+        .is_some();
+
     for column in &meta.columns {
         if let contextdb_core::ColumnType::Vector(expected) = column.column_type
             && let Some(Value::Vector(vector)) = values.get(&column.name)
         {
             let got = vector.len();
             if got != expected {
-                return Err(Error::VectorDimensionMismatch { expected, got });
+                return Err(vector_dimension_error(
+                    table,
+                    &column.name,
+                    expected,
+                    got,
+                    use_index_identity,
+                ));
             }
         }
     }
@@ -4114,30 +4242,45 @@ fn validate_vector_columns(
     Ok(())
 }
 
-fn vector_value_for_table<'a>(
-    db: &Database,
-    table: &str,
-    values: &'a HashMap<String, Value>,
-) -> Option<(String, &'a Vec<f32>)> {
-    let meta = db.table_meta(table)?;
+fn vector_columns_for_meta(meta: &TableMeta) -> Vec<String> {
     meta.columns
         .iter()
-        .find_map(|column| match column.column_type {
-            contextdb_core::ColumnType::Vector(_) => match values.get(&column.name) {
-                Some(Value::Vector(vector)) => Some((column.name.clone(), vector)),
-                _ => None,
-            },
-            _ => None,
-        })
+        .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
+        .map(|column| column.name.clone())
+        .collect()
 }
 
-fn first_vector_index_for_table(db: &Database, table: &str) -> contextdb_core::VectorIndexRef {
+fn vector_values_for_table(
+    db: &Database,
+    table: &str,
+    values: &HashMap<String, Value>,
+) -> Vec<(String, Vec<f32>)> {
     db.table_meta(table)
-        .and_then(|meta| {
+        .map(|meta| {
             meta.columns
                 .iter()
-                .find(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
+                .filter_map(|column| match column.column_type {
+                    contextdb_core::ColumnType::Vector(_) => match values.get(&column.name) {
+                        Some(Value::Vector(vector)) => Some((column.name.clone(), vector.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn vector_indexes_for_table(db: &Database, table: &str) -> Vec<contextdb_core::VectorIndexRef> {
+    db.table_meta(table)
+        .map(|meta| {
+            meta.columns
+                .iter()
+                .filter(|column| {
+                    matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                })
                 .map(|column| contextdb_core::VectorIndexRef::new(table, column.name.clone()))
+                .collect()
         })
         .unwrap_or_default()
 }
@@ -4222,7 +4365,17 @@ fn coerce_value_for_column_with_meta(
                 expected: format_vector_type(dim),
                 actual: "TxId",
             }),
-            other => coerce_vector_value(other, dim),
+            other => {
+                let use_index_identity = meta
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                    })
+                    .nth(1)
+                    .is_some();
+                coerce_vector_value(table, col_name, other, dim, use_index_identity)
+            }
         },
         contextdb_core::ColumnType::Integer => match v {
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
@@ -4403,7 +4556,13 @@ fn coerce_timestamp_value(v: Value) -> Result<Value> {
     }
 }
 
-fn coerce_vector_value(v: Value, expected_dim: usize) -> Result<Value> {
+fn coerce_vector_value(
+    table: &str,
+    column: &str,
+    v: Value,
+    expected_dim: usize,
+    use_index_identity: bool,
+) -> Result<Value> {
     let vector = match v {
         Value::Null => return Ok(Value::Null),
         Value::Vector(vector) => vector,
@@ -4412,13 +4571,34 @@ fn coerce_vector_value(v: Value, expected_dim: usize) -> Result<Value> {
     };
 
     if vector.len() != expected_dim {
-        return Err(Error::VectorDimensionMismatch {
-            expected: expected_dim,
-            got: vector.len(),
-        });
+        return Err(vector_dimension_error(
+            table,
+            column,
+            expected_dim,
+            vector.len(),
+            use_index_identity,
+        ));
     }
 
     Ok(Value::Vector(vector))
+}
+
+fn vector_dimension_error(
+    table: &str,
+    column: &str,
+    expected: usize,
+    got: usize,
+    use_index_identity: bool,
+) -> Error {
+    if use_index_identity {
+        Error::VectorIndexDimensionMismatch {
+            index: contextdb_core::VectorIndexRef::new(table, column),
+            expected,
+            actual: got,
+        }
+    } else {
+        Error::VectorDimensionMismatch { expected, got }
+    }
 }
 
 fn parse_text_vector_literal(text: &str) -> Result<Vec<f32>> {
@@ -4589,6 +4769,16 @@ pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
         DataType::Json => contextdb_core::ColumnType::Json,
         DataType::Vector(dim) => contextdb_core::ColumnType::Vector(*dim as usize),
         DataType::TxId => contextdb_core::ColumnType::TxId,
+    }
+}
+
+fn map_vector_quantization(
+    quantization: contextdb_parser::ast::VectorQuantization,
+) -> contextdb_core::VectorQuantization {
+    match quantization {
+        contextdb_parser::ast::VectorQuantization::F32 => contextdb_core::VectorQuantization::F32,
+        contextdb_parser::ast::VectorQuantization::SQ8 => contextdb_core::VectorQuantization::SQ8,
+        contextdb_parser::ast::VectorQuantization::SQ4 => contextdb_core::VectorQuantization::SQ4,
     }
 }
 

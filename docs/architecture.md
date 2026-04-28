@@ -52,13 +52,17 @@ Dedicated adjacency index maintained incrementally as edges are inserted/deleted
 
 ### Vector (`contextdb-vector`)
 
-Secondary index over relational rows with `VECTOR(n)` columns.
+Secondary index over relational rows with `VECTOR(n)` columns. Index identity is
+the full `(table, column)` pair, so one table can carry separate text, image,
+audio, or policy embeddings with different dimensions and quantization choices.
 
 - Cosine similarity via `<=>` operator
+- `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` per column
 - Below ~1000 vectors: brute-force exact scan
 - At/above ~1000 vectors: HNSW (via `hnsw_rs`) with 10x overfetch + exact reranking
 - Pre-filtered search: WHERE clause narrows candidates before scoring
-- HNSW rebuilt from persisted vectors on `Database::open()` — no separate serialization
+- HNSW is built lazily per index; a search against one vector column does not
+  build sibling indexes
 - OOM during HNSW build falls back to brute-force via `catch_unwind`
 
 ---
@@ -103,7 +107,10 @@ Single-file storage via redb:
 - Flush-on-commit: every committed `WriteSet` is written to redb
 - On open: all data loaded from redb into memory, HNSW rebuilt
 - Crash-safe: redb provides atomic transactions
-- Tables: rows, DDL metadata, graph edges, vectors, counters
+- Tables: rows, DDL metadata, graph edges, vector entries, counters
+- Vector entries use one composite-key table keyed by `(table, column, row_id)`.
+- A `metadata` table stores `format_version = "1.0.0"`; missing markers are
+  treated as legacy stores, while unreadable markers are reported as corrupt.
 
 ---
 
@@ -160,9 +167,35 @@ pub struct CommitEvent {
 
 Fan-out to multiple subscribers. Dead channels are cleaned up automatically. Graceful shutdown disconnects all subscribers.
 
+## Memory Limit On Edge Devices
+
+`SET MEMORY_LIMIT`, `SHOW MEMORY_LIMIT`, and the `CONTEXTDB_MEMORY_LIMIT` /
+`--memory-limit` startup option all feed the same global memory accountant.
+Vector operations attribute allocations with tags such as
+`vector_insert@evidence.vector_text` and `build_hnsw@evidence.vector_vision` so
+operators can identify the offending index from errors.
+
+On a 2GB Jetson-class device, prefer SQ8 for high-dimensional evidence:
+
+```sql
+SET MEMORY_LIMIT '1536M';
+CREATE TABLE evidence (
+  id UUID PRIMARY KEY,
+  vector_text VECTOR(768) WITH (quantization = 'SQ8'),
+  vector_vision VECTOR(512) WITH (quantization = 'SQ8')
+);
+```
+
+`SHOW VECTOR_INDEXES` gives structured per-index counts and byte totals; use it
+instead of parsing memory operation tags.
+
 ---
 
 ## Sync
+
+The wire protocol is currently `PROTOCOL_VERSION = 2`. The server prints the
+supported protocol version in `contextdb-server --version` and logs it at
+startup; mismatched envelopes are rejected instead of being partially applied.
 
 ### Deployment Topology
 

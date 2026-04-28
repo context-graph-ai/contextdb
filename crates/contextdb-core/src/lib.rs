@@ -11,7 +11,7 @@ pub use memory::*;
 // crates must use fully-qualified paths at ambiguous sites.
 pub use table_meta::{
     ColumnDef, ColumnType, ForeignKeyReference, IndexDecl, IndexKind, PropagationRule,
-    SortDirection, StateMachineConstraint, TableMeta,
+    SortDirection, StateMachineConstraint, TableMeta, VectorQuantization,
 };
 pub use traits::*;
 pub use types::*;

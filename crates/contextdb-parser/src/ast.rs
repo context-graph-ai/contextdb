@@ -331,6 +331,7 @@ pub struct ColumnDef {
     pub references: Option<ForeignKey>,
     pub expires: bool,
     pub immutable: bool,
+    pub quantization: VectorQuantization,
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +373,14 @@ pub enum DataType {
     Json,
     Vector(u32),
     TxId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorQuantization {
+    #[default]
+    F32,
+    SQ8,
+    SQ4,
 }
 
 #[derive(Debug, Clone)]

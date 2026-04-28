@@ -7,7 +7,8 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
 - `cargo bench -p contextdb-parser --bench parser_throughput`
   - parser-only microbench
 - `cargo bench -p contextdb-engine --bench engine_throughput`
-  - developer smoke bench for local engine behavior
+  - developer smoke bench for local engine behavior, including named-vector
+    index smoke gates under the `nv_` filter
 - `cargo bench -p contextdb-engine --bench engine_full_throughput`
   - heavier engine benchmarks for larger write/reopen and mixed workflow paths
 - `cargo bench -p contextdb-engine --bench mixed_workflows_pr`
@@ -34,6 +35,7 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
 
 - smoke:
   - `timeout 180s cargo bench -p contextdb-engine --bench engine_throughput -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
+  - `timeout 900s cargo bench -p contextdb-engine --bench engine_throughput -- nv_ --save-baseline named-vector-indexes`
   - `timeout 180s cargo bench -p contextdb-server --bench server_throughput -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
 - PR:
   - `timeout 180s cargo bench -p contextdb-engine --bench engine_full_throughput -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
@@ -44,6 +46,11 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
   - `timeout 180s cargo bench -p contextdb-server --bench server_sync_system -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
 
 Always use `timeout` on heavier runs. If a benchmark spends the whole run on setup/build noise and never reaches useful Criterion output, treat that as a benchmark-shape problem to fix rather than a valid perf result.
+
+The named-vector `nv_` cases use bounded local defaults so they are practical as
+a smoke gate. Set `CONTEXTDB_NV_BENCH_FULL=1` or the per-case
+`CONTEXTDB_NV_*` sizing variables in `benches/engine_throughput.rs` when running
+the full ship-scale footprint, replay, and latency checks.
 
 ## Design Rules
 

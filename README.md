@@ -172,13 +172,34 @@ CREATE TABLE decisions (
 STATE MACHINE (status: active -> [superseded], draft -> [active, rejected])
 ```
 
+### Two-Vector Walkthrough
+
+```sql
+CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4), vector_vision VECTOR(8));
+INSERT INTO evidence (id, vector_text, vector_vision) VALUES
+  ('11111111-1111-1111-1111-111111111111', [1,0,0,0], [0,1,0,0,0,0,0,0]);
+SHOW VECTOR_INDEXES;
+SELECT id FROM evidence ORDER BY vector_text <=> '[1,0,0,0]' LIMIT 1;
+```
+
+Each `VECTOR(N)` column is its own index, keyed by `(table, column)`. Use
+`VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` to choose the per-column
+storage footprint; omitted quantization defaults to `F32`.
+
+### Upgrading From 0.3.x
+
+Opening a legacy vector store without the named-index format marker returns
+`LegacyVectorStoreDetected`. For teams upgrading from 0.3.x, recovery is
+explicit: sync from a peer already on the named-index storage format, or
+recreate the schema and reimport the data.
+
 ## What It Does
 
 **Relational (PostgreSQL-compatible SQL)** — SELECT, INSERT, UPDATE, DELETE, JOINs (INNER/LEFT), CTEs, upsert (`ON CONFLICT DO UPDATE`), DISTINCT, LIMIT, IN with subqueries, LIKE, BETWEEN, parameter binding (`$name`).
 
 **Graph (SQL/PGQ-style)** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded BFS, typed edges, variable-length paths (`{1,3}`), and direction control. DAG constraint enforcement prevents cycles. State propagation cascades changes along graph edges.
 
-**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Auto-switches between brute-force (< 1000 vectors) and HNSW indexing. Pre-filtered search narrows candidates before scoring.
+**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Every `VECTOR(N)` column is a named index; `SHOW VECTOR_INDEXES` reports table, column, dimension, quantization, vector count, and bytes. Auto-switches between brute-force (< 1000 vectors) and HNSW indexing. Pre-filtered search narrows candidates before scoring.
 
 **Unified transactions** — One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. MVCC with consistent snapshots — readers never block writers.
 
@@ -201,6 +222,7 @@ contextdb is designed for agentic memory, not data warehousing:
 - Append-heavy writes, small transactions
 - Configurable memory budget via `SET MEMORY_LIMIT` (no hard-coded ceiling)
 - Configurable file-growth budget via `SET DISK_LIMIT` / `SHOW DISK_LIMIT` or `--disk-limit` / `CONTEXTDB_DISK_LIMIT` for file-backed databases
+- See [Architecture](docs/architecture.md#memory-limit-on-edge-devices) for memory-limit behavior on edge devices.
 - Laptops, ARM64 devices (browser and mobile via Rust's WASM target are future directions)
 
 ## Documentation

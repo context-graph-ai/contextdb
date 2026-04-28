@@ -7,6 +7,7 @@ use contextdb_engine::sync_types::ConflictPolicies;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Max concurrent in-flight chunked push sessions. Rejects new chunk_ids past this limit.
@@ -76,7 +77,14 @@ impl SyncServer {
     }
 
     pub async fn run(&self) {
+        self.run_until(Arc::new(AtomicBool::new(false))).await;
+    }
+
+    pub async fn run_until(&self, shutdown: Arc<AtomicBool>) {
         let client = loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
             match async_nats::connect(&self.nats_url).await {
                 Ok(client) => break client,
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
@@ -84,6 +92,9 @@ impl SyncServer {
         };
 
         let (mut push_sub, mut pull_sub) = loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
             match self.bootstrap_subscriptions(&client).await {
                 Ok(subscriptions) => break subscriptions,
                 Err(err) => {
@@ -97,8 +108,9 @@ impl SyncServer {
             }
         };
         let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut shutdown_poll = tokio::time::interval(std::time::Duration::from_millis(50));
 
-        loop {
+        while !shutdown.load(Ordering::SeqCst) {
             tokio::select! {
                 maybe_msg = push_sub.next() => {
                     if let Some(msg) = maybe_msg
@@ -126,6 +138,7 @@ impl SyncServer {
                         tracing::info!(evicted = before - buf.len(), remaining = buf.len(), "chunk buffer cleanup");
                     }
                 }
+                _ = shutdown_poll.tick() => {}
             }
         }
     }
@@ -280,6 +293,10 @@ impl SyncServer {
                 if let Some(reply) = msg.reply {
                     client
                         .publish(reply, payload.into())
+                        .await
+                        .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                    client
+                        .flush()
                         .await
                         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
                 }

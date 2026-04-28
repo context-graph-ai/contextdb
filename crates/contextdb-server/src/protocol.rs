@@ -6,7 +6,7 @@ use contextdb_engine::sync_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -219,7 +219,7 @@ pub fn encode<T: Serialize>(msg_type: MessageType, msg: &T) -> Result<Vec<u8>, S
 pub fn decode(data: &[u8]) -> Result<Envelope, SyncError> {
     let envelope: Envelope =
         rmp_serde::from_slice(data).map_err(|e| SyncError::Serde(e.to_string()))?;
-    if envelope.version > PROTOCOL_VERSION {
+    if envelope.version != PROTOCOL_VERSION {
         return Err(SyncError::ProtocolVersionMismatch {
             received: envelope.version,
             supported: PROTOCOL_VERSION,

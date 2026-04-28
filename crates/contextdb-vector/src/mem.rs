@@ -10,7 +10,6 @@ const HNSW_THRESHOLD: usize = 1000;
 pub struct MemVectorExecutor<S: WriteSetApplicator> {
     store: Arc<VectorStore>,
     tx_mgr: Arc<TxManager<S>>,
-    hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
     accountant: Arc<MemoryAccountant>,
 }
 
@@ -26,28 +25,35 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     pub fn new_with_accountant(
         store: Arc<VectorStore>,
         tx_mgr: Arc<TxManager<S>>,
-        hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
+        _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
         accountant: Arc<MemoryAccountant>,
     ) -> Self {
         Self {
             store,
             tx_mgr,
-            hnsw,
             accountant,
         }
     }
 
     fn brute_force_search(
         &self,
+        index: &VectorIndexRef,
         query: &[f32],
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Vec<(RowId, f32)> {
-        let vectors = self.store.vectors.read();
-        let mut scored: Vec<(RowId, f32)> = Vec::new();
+    ) -> Result<Vec<(RowId, f32)>> {
+        let state = self.store.state(index)?;
+        if query.len() != state.dimension() {
+            return Err(Error::VectorIndexDimensionMismatch {
+                index: index.clone(),
+                expected: state.dimension(),
+                actual: query.len(),
+            });
+        }
 
-        for entry in vectors.iter() {
+        let mut scored: Vec<(RowId, f32)> = Vec::new();
+        for entry in state.all_entries().iter() {
             if !entry.visible_at(snapshot) {
                 continue;
             }
@@ -64,19 +70,21 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
-        scored
+        Ok(scored)
     }
 
-    fn build_hnsw_from_store(&self) -> Option<HnswIndex> {
-        let entries = self.store.all_entries();
-        let dim = self.store.dimension().unwrap_or(0);
-        let estimated_bytes = estimate_hnsw_bytes(entries.len(), dim);
+    fn build_hnsw_from_store(&self, index: &VectorIndexRef) -> Option<HnswIndex> {
+        let _build_guard = self.store.build_lock();
+        let state = self.store.try_state(index)?;
+        let entries = state.all_entries();
+        let dim = state.dimension();
+        let estimated_bytes = estimate_hnsw_bytes(entries.len(), dim, state.quantization());
         if self
             .accountant
             .try_allocate_for(
                 estimated_bytes,
                 "vector_index",
-                "build_hnsw",
+                &format!("build_hnsw@{}.{}", index.table, index.column),
                 "Reduce vector volume or raise MEMORY_LIMIT so the HNSW index can be built.",
             )
             .is_err()
@@ -84,15 +92,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return None;
         }
 
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             HnswIndex::new(&entries, dim)
         }))
-        .ok()
-        .inspect(|_| self.store.set_hnsw_bytes(estimated_bytes))
-        .or_else(|| {
+        .ok();
+        if built.is_none() {
             self.accountant.release(estimated_bytes);
-            None
-        })
+        } else {
+            state.set_hnsw_bytes(estimated_bytes);
+        }
+        built
     }
 }
 
@@ -105,52 +114,78 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
-        let _ = index;
         if k == 0 {
             return Ok(Vec::new());
         }
+        let Some(state) = self.store.try_state(&index) else {
+            if self.store.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(Error::UnknownVectorIndex { index });
+        };
+        if state.all_entries().is_empty() {
+            return Ok(Vec::new());
+        }
+        if query.len() != state.dimension() {
+            if self.store.index_count() == 1 {
+                return Err(Error::VectorDimensionMismatch {
+                    expected: state.dimension(),
+                    got: query.len(),
+                });
+            }
+            return Err(Error::VectorIndexDimensionMismatch {
+                index,
+                expected: state.dimension(),
+                actual: query.len(),
+            });
+        }
 
-        let use_hnsw = self.store.vector_count() >= HNSW_THRESHOLD;
+        let use_hnsw = state.all_entries().len() >= HNSW_THRESHOLD;
         if use_hnsw {
-            let once_lock = self
-                .hnsw
-                .get_or_init(|| RwLock::new(self.build_hnsw_from_store()));
+            let lock = state
+                .hnsw()
+                .get_or_init(|| RwLock::new(self.build_hnsw_from_store(&index)));
 
             {
-                let mut guard = once_lock.write();
+                let mut guard = lock.write();
                 if guard.is_none() {
-                    *guard = self.build_hnsw_from_store();
+                    *guard = self.build_hnsw_from_store(&index);
                 }
             }
 
-            let guard = once_lock.read();
+            let guard = lock.read();
             if let Some(hnsw) = guard.as_ref() {
-                let raw_candidates = hnsw.search(query, k)?;
+                let raw_candidates = match hnsw.search(query, k) {
+                    Ok(raw) => raw,
+                    Err(Error::VectorDimensionMismatch { expected, got }) => {
+                        return Err(Error::VectorIndexDimensionMismatch {
+                            index,
+                            expected,
+                            actual: got,
+                        });
+                    }
+                    Err(err) => return Err(err),
+                };
 
-                // If the HNSW graph has disconnected components, the search
-                // may not reach all indexed vectors. Detect this and fall back
-                // to brute-force so we never silently drop results.
                 if raw_candidates.len() < hnsw.len() {
-                    return Ok(self.brute_force_search(query, k, candidates, snapshot));
+                    return self.brute_force_search(&index, query, k, candidates, snapshot);
                 }
 
-                let vectors = self.store.vectors.read();
+                let entries = state.all_entries();
                 let mut visible = raw_candidates
                     .into_iter()
                     .filter_map(|(rid, _)| {
-                        vectors
+                        entries
                             .iter()
                             .find(|entry| entry.row_id == rid && entry.visible_at(snapshot))
-                            .map(|entry| {
+                            .and_then(|entry| {
                                 if let Some(cands) = candidates
                                     && !cands.contains(entry.row_id.0)
                                 {
                                     return None;
                                 }
-
                                 Some((entry.row_id, cosine_similarity(query, &entry.vector)))
                             })
-                            .unwrap_or(None)
                     })
                     .collect::<Vec<_>>();
 
@@ -160,7 +195,7 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             }
         }
 
-        Ok(self.brute_force_search(query, k, candidates, snapshot))
+        self.brute_force_search(&index, query, k, candidates, snapshot)
     }
 
     fn insert_vector(
@@ -170,19 +205,25 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
-        let got = vector.len();
-
-        {
-            let mut dim = self.store.dimension.write();
-            match *dim {
-                None => *dim = Some(got),
-                Some(expected) if expected != got => {
-                    return Err(Error::VectorDimensionMismatch { expected, got });
-                }
-                _ => {}
-            }
+        if self.store.try_state(&index).is_none() {
+            self.store
+                .register_index(index.clone(), vector.len(), VectorQuantization::F32);
         }
-
+        self.store
+            .validate_vector(&index, vector.len())
+            .map_err(|err| {
+                if let Error::VectorIndexDimensionMismatch {
+                    expected, actual, ..
+                } = err
+                {
+                    Error::VectorDimensionMismatch {
+                        expected,
+                        got: actual,
+                    }
+                } else {
+                    err
+                }
+            })?;
         let entry = VectorEntry {
             index,
             row_id,
@@ -200,18 +241,21 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
     }
 
     fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
-        let _ = index;
+        self.store.state(&index)?;
         self.tx_mgr.with_write_set(tx, |ws| {
-            ws.vector_deletes.push((row_id, tx));
+            ws.vector_deletes.push((index, row_id, tx));
         })?;
 
         Ok(())
     }
 }
 
-fn estimate_hnsw_bytes(entry_count: usize, dimension: usize) -> usize {
+fn estimate_hnsw_bytes(
+    entry_count: usize,
+    dimension: usize,
+    quantization: VectorQuantization,
+) -> usize {
     entry_count
-        .saturating_mul(dimension)
-        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_mul(quantization.storage_bytes(dimension))
         .saturating_mul(3)
 }

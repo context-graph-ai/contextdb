@@ -1282,6 +1282,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut inline_state_machine = None;
     let mut expires = false;
     let mut immutable_flag = false;
+    let mut quantization = VectorQuantization::F32;
     // Track if we saw the type token before column_constraints. If IMMUTABLE appears
     // as the column name (i.e. before the data_type position), Pest will parse it as
     // the identifier rule; we detect that case by the column name.
@@ -1294,7 +1295,10 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                 column_name_text = Some(ident.clone());
                 name = Some(ident);
             }
-            Rule::data_type => data_type = Some(build_data_type(p)?),
+            Rule::data_type => {
+                quantization = vector_quantization_for_data_type(&p)?;
+                data_type = Some(build_data_type(p)?);
+            }
             Rule::column_constraint => {
                 let c = p
                     .into_inner()
@@ -1404,6 +1408,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             references,
             expires,
             immutable: immutable_flag,
+            quantization,
         },
         inline_state_machine,
     ))
@@ -1617,6 +1622,38 @@ fn build_data_type(pair: Pair<'_, Rule>) -> Result<DataType> {
     } else {
         Err(Error::ParseError(format!("unsupported data type: {txt}")))
     }
+}
+
+fn vector_quantization_for_data_type(pair: &Pair<'_, Rule>) -> Result<VectorQuantization> {
+    let Some(vector_type) = pair
+        .clone()
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::vector_type)
+    else {
+        return Ok(VectorQuantization::F32);
+    };
+
+    for p in vector_type.into_inner() {
+        if p.as_rule() == Rule::vector_quantization_clause {
+            let value = p
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::vector_quantization_value)
+                .ok_or_else(|| Error::ParseError("missing vector quantization value".to_string()))?
+                .as_str()
+                .trim_matches('\'')
+                .to_ascii_uppercase();
+            return match value.as_str() {
+                "F32" => Ok(VectorQuantization::F32),
+                "SQ8" => Ok(VectorQuantization::SQ8),
+                "SQ4" => Ok(VectorQuantization::SQ4),
+                _ => Err(Error::ParseError(format!(
+                    "unsupported vector quantization '{value}'"
+                ))),
+            };
+        }
+    }
+
+    Ok(VectorQuantization::F32)
 }
 
 fn build_state_machine_option(pair: Pair<'_, Rule>) -> Result<StateMachineDef> {

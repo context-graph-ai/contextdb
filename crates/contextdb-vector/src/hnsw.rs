@@ -89,7 +89,7 @@ impl HnswIndex {
 
         HnswGraphStats {
             point_count: self.hnsw.get_nb_point(),
-            layer0_points: indexation.get_layer_nb_point(0),
+            layer0_points: self.hnsw.get_nb_point(),
             layer0_neighbor_edges,
             max_level_observed: self.hnsw.get_max_level_observed(),
             dimension: self.dimension,

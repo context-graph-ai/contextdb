@@ -40,7 +40,12 @@ impl ChangeSet {
                 .cloned()
                 .collect(),
             edges: self.edges.clone(),
-            vectors: self.vectors.clone(),
+            vectors: self
+                .vectors
+                .iter()
+                .filter(|v| include_dir(&v.index.table))
+                .cloned()
+                .collect(),
             ddl: self
                 .ddl
                 .iter()

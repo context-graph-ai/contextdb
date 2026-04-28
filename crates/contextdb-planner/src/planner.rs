@@ -262,10 +262,11 @@ fn plan_select_body(
         let vector_table = vector_base_table(&current)?.ok_or_else(|| {
             Error::PlanError("unable to resolve physical vector source table".to_string())
         })?;
+        let (column, query_expr) = vector_search_parts(&order.expr)?;
         current = PhysicalPlan::VectorSearch {
             table: vector_table,
-            column: "embedding".to_string(),
-            query_expr: order.expr.clone(),
+            column,
+            query_expr,
             k,
             candidates: Some(Box::new(current)),
         };
@@ -322,6 +323,20 @@ fn plan_select_body(
     }
 
     Ok(current)
+}
+
+fn vector_search_parts(expr: &Expr) -> Result<(String, Expr)> {
+    match expr {
+        Expr::CosineDistance { left, right } => match left.as_ref() {
+            Expr::Column(column) => Ok((column.column.clone(), right.as_ref().clone())),
+            _ => Err(Error::PlanError(
+                "left side of vector distance must be a column".to_string(),
+            )),
+        },
+        _ => Err(Error::PlanError(
+            "vector search requires a cosine distance expression".to_string(),
+        )),
+    }
 }
 
 fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {

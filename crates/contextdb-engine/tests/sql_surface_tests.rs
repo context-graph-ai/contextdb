@@ -3483,9 +3483,7 @@ fn integrity_06_create_table_honors_disk_budget() {
     let path = tmp.path().join("integrity-create-table.db");
     let db = Database::open(&path).unwrap();
 
-    let limit_kib = disk_limit_kib_for_path(&path, 0);
-    db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
-        .unwrap();
+    db.execute("SET DISK_LIMIT '1K'", &empty()).unwrap();
 
     let result = db.execute("CREATE TABLE blocked (id UUID PRIMARY KEY)", &empty());
     assert!(
@@ -3511,9 +3509,7 @@ fn integrity_07_alter_table_honors_disk_budget() {
     db.execute("CREATE TABLE items (id UUID PRIMARY KEY)", &empty())
         .unwrap();
 
-    let limit_kib = disk_limit_kib_for_path(&path, 0);
-    db.execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
-        .unwrap();
+    db.execute("SET DISK_LIMIT '1K'", &empty()).unwrap();
 
     let result = db.execute("ALTER TABLE items ADD COLUMN note TEXT", &empty());
     assert!(

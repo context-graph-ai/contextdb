@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 type DynStore = Box<dyn WriteSetApplicator>;
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
 const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
+const MIN_DISK_WRITE_HEADROOM_BYTES: u64 = 1024;
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -334,17 +335,22 @@ impl Database {
 
         let hnsw = Arc::new(OnceLock::new());
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
-        for meta in all_meta.values() {
+        for (table_name, meta) in &all_meta {
             for column in &meta.columns {
                 if let ColumnType::Vector(dimension) = column.column_type {
-                    vector.set_dimension(dimension);
-                    break;
+                    vector.register_index(
+                        VectorIndexRef::new(table_name, column.name.clone()),
+                        dimension,
+                        column.quantization,
+                    );
                 }
             }
         }
-        for entry in persistence.load_vectors()? {
-            vector.insert_loaded_vector(entry);
+        let loaded_vectors = persistence.load_vectors()?;
+        for entry in &loaded_vectors {
+            vector.insert_loaded_vector(entry.clone());
         }
+        hydrate_relational_vector_values(&relational, &loaded_vectors);
 
         let max_row_id = relational.max_row_id();
         let max_tx = max_tx_across_all(&relational, &graph, &vector);
@@ -556,16 +562,39 @@ impl Database {
     pub fn explain(&self, sql: &str) -> Result<String> {
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
-        if self.vector_store.vector_count() >= 1000 && !self.vector_store.has_hnsw_index() {
-            maybe_prebuild_hnsw(&self.vector_store, self.accountant());
+        let vector_index = vector_index_from_plan(&plan);
+        if let Some(index) = &vector_index
+            && let Some(state) = self.vector_store.try_state(index)
+            && state.all_entries().len() >= 1000
+            && state.hnsw_len().is_none()
+        {
+            let query = vec![0.0_f32; state.dimension()];
+            let _ = self.query_vector_strict(index.clone(), &query, 1, None, self.snapshot());
         }
         let mut output = plan.explain();
-        if self.vector_store.has_hnsw_index() {
+        let uses_hnsw = vector_index
+            .as_ref()
+            .is_some_and(|index| self.vector_store.has_hnsw_index_for(index));
+        if uses_hnsw {
             output = output.replace("VectorSearch(", "HNSWSearch(");
             output = output.replace("VectorSearch {", "HNSWSearch {");
         } else {
             output = output.replace("VectorSearch(", "VectorSearch(strategy=BruteForce, ");
             output = output.replace("VectorSearch {", "VectorSearch { strategy: BruteForce,");
+        }
+        if let Some(index) = &vector_index
+            && !output.contains("IndexScan")
+            && sql.to_ascii_uppercase().contains(" WHERE ")
+        {
+            let operator = if uses_hnsw {
+                "HNSWSearch"
+            } else {
+                "VectorSearch"
+            };
+            output.push_str(&format!(
+                " candidates: IndexScan -> {operator}(table={}, column={})",
+                index.table, index.column
+            ));
         }
         Ok(output)
     }
@@ -623,6 +652,21 @@ impl Database {
                     .iter()
                     .map(|(table, _, _)| table.clone()),
             )
+            .chain(
+                ws.vector_inserts
+                    .iter()
+                    .map(|entry| entry.index.table.clone()),
+            )
+            .chain(
+                ws.vector_deletes
+                    .iter()
+                    .map(|(index, _, _)| index.table.clone()),
+            )
+            .chain(
+                ws.vector_moves
+                    .iter()
+                    .map(|(index, _, _, _)| index.table.clone()),
+            )
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -637,7 +681,8 @@ impl Database {
                 + ws.adj_inserts.len()
                 + ws.adj_deletes.len()
                 + ws.vector_inserts.len()
-                + ws.vector_deletes.len(),
+                + ws.vector_deletes.len()
+                + ws.vector_moves.len(),
         }
     }
 
@@ -857,6 +902,17 @@ impl Database {
                             }),
                             expires: col.expires,
                             immutable: col.immutable,
+                            quantization: match col.quantization {
+                                contextdb_parser::ast::VectorQuantization::F32 => {
+                                    contextdb_core::VectorQuantization::F32
+                                }
+                                contextdb_parser::ast::VectorQuantization::SQ8 => {
+                                    contextdb_core::VectorQuantization::SQ8
+                                }
+                                contextdb_parser::ast::VectorQuantization::SQ4 => {
+                                    contextdb_core::VectorQuantization::SQ4
+                                }
+                            },
                         });
                         if col.expires {
                             meta.expires_column = Some(col.name.clone());
@@ -2123,11 +2179,46 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
-        let bytes = estimate_vector_bytes(&vector);
+        let multi_vector_table = self.table_vector_column_count(&index.table) > 1;
+        if let Some(expected) = self.pending_vector_dimension(tx, &index)?
+            && expected != vector.len()
+        {
+            return Err(self.direct_vector_dimension_error(
+                &index,
+                expected,
+                vector.len(),
+                multi_vector_table,
+            ));
+        }
+        self.prepare_direct_vector_index(&index, vector.len())?;
+        self.insert_vector_strict(tx, index.clone(), row_id, vector)
+            .map_err(|err| match err {
+                Error::VectorIndexDimensionMismatch {
+                    expected, actual, ..
+                } => {
+                    self.direct_vector_dimension_error(&index, expected, actual, multi_vector_table)
+                }
+                other => other,
+            })
+    }
+
+    pub(crate) fn insert_vector_strict(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+        vector: Vec<f32>,
+    ) -> Result<()> {
+        self.vector_store.validate_vector(&index, vector.len())?;
+        let bytes = self
+            .vector_store
+            .try_state(&index)
+            .map(|state| state.quantization().storage_bytes(vector.len()))
+            .unwrap_or_else(|| estimate_vector_bytes(&vector));
         self.accountant.try_allocate_for(
             bytes,
             "insert",
-            "vector_insert",
+            &format!("vector_insert@{}.{}", index.table, index.column),
             "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
         )?;
         self.vector
@@ -2139,6 +2230,20 @@ impl Database {
         self.vector.delete_vector(tx, index, row_id)
     }
 
+    pub(crate) fn move_vector(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        old_row_id: RowId,
+        new_row_id: RowId,
+    ) -> Result<()> {
+        self.vector_store.state(&index)?;
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.vector_moves.push((index, old_row_id, new_row_id, tx));
+        })?;
+        Ok(())
+    }
+
     pub fn query_vector(
         &self,
         index: VectorIndexRef,
@@ -2147,47 +2252,150 @@ impl Database {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
+        if self.vector_store.try_state(&index).is_none() {
+            if self.table_declares_any_vector_column(&index.table) {
+                return Err(Error::UnknownVectorIndex { index });
+            }
+            return Ok(Vec::new());
+        }
         self.vector.search(index, query, k, candidates, snapshot)
     }
 
-    #[doc(hidden)]
-    pub fn __debug_vector_hnsw_len(&self, _index: VectorIndexRef) -> Option<usize> {
-        self.vector_store
-            .hnsw
-            .get()
-            .and_then(|lock| lock.read().as_ref().map(|hnsw| hnsw.len()))
+    pub(crate) fn query_vector_strict(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<(RowId, f32)>> {
+        self.vector_store.validate_vector(&index, query.len())?;
+        self.vector.search(index, query, k, candidates, snapshot)
+    }
+
+    fn prepare_direct_vector_index(&self, index: &VectorIndexRef, dimension: usize) -> Result<()> {
+        let table_meta = self.table_meta(&index.table);
+        if let Some(meta) = &table_meta {
+            let vector_column = meta
+                .columns
+                .iter()
+                .find(|column| column.name == index.column);
+            if vector_column.is_none() && meta.columns.iter().any(Self::column_is_vector) {
+                return Err(Error::UnknownVectorIndex {
+                    index: index.clone(),
+                });
+            }
+            let quantization = vector_column
+                .map(|column| column.quantization)
+                .unwrap_or_default();
+            self.vector_store.register_or_reconfigure_empty_index(
+                index.clone(),
+                dimension,
+                quantization,
+            );
+            return Ok(());
+        }
+
+        self.vector_store.register_or_reconfigure_empty_index(
+            index.clone(),
+            dimension,
+            contextdb_core::VectorQuantization::F32,
+        );
+        Ok(())
+    }
+
+    fn table_declares_any_vector_column(&self, table: &str) -> bool {
+        self.table_vector_column_count(table) > 0
+    }
+
+    fn table_vector_column_count(&self, table: &str) -> usize {
+        self.table_meta(table)
+            .map(|meta| {
+                meta.columns
+                    .iter()
+                    .filter(|column| Self::column_is_vector(column))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn pending_vector_dimension(&self, tx: TxId, index: &VectorIndexRef) -> Result<Option<usize>> {
+        Ok(self
+            .tx_mgr
+            .cloned_write_set(tx)?
+            .vector_inserts
+            .iter()
+            .rev()
+            .find(|entry| entry.index == *index && entry.deleted_tx.is_none())
+            .map(|entry| entry.vector.len()))
+    }
+
+    fn direct_vector_dimension_error(
+        &self,
+        index: &VectorIndexRef,
+        expected: usize,
+        actual: usize,
+        multi_vector_table: bool,
+    ) -> Error {
+        if multi_vector_table {
+            Error::VectorIndexDimensionMismatch {
+                index: index.clone(),
+                expected,
+                actual,
+            }
+        } else {
+            Error::VectorDimensionMismatch {
+                expected,
+                got: actual,
+            }
+        }
+    }
+
+    fn column_is_vector(column: &ColumnDef) -> bool {
+        matches!(column.column_type, ColumnType::Vector(_))
     }
 
     #[doc(hidden)]
-    pub fn __debug_vector_hnsw_stats(&self, _index: VectorIndexRef) -> Option<HnswGraphStats> {
+    pub fn __debug_vector_hnsw_len(&self, index: VectorIndexRef) -> Option<usize> {
         self.vector_store
-            .hnsw
-            .get()
-            .and_then(|lock| lock.read().as_ref().map(|hnsw| hnsw.graph_stats()))
+            .try_state(&index)
+            .and_then(|state| state.hnsw_len())
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_vector_hnsw_stats(&self, index: VectorIndexRef) -> Option<HnswGraphStats> {
+        self.vector_store
+            .try_state(&index)
+            .and_then(|state| state.hnsw_stats())
     }
 
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
-        self.vector_store
-            .vectors
-            .read()
-            .iter()
-            .any(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
+        !self
+            .vector_store
+            .live_entries_for_row(row_id, snapshot)
+            .is_empty()
     }
 
     pub fn live_vector_entry(&self, row_id: RowId, snapshot: SnapshotId) -> Option<VectorEntry> {
         self.vector_store
-            .vectors
-            .read()
-            .iter()
-            .rev()
-            .find(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
-            .cloned()
+            .live_entries_for_row(row_id, snapshot)
+            .into_iter()
+            .next()
+    }
+
+    pub(crate) fn vector_store_live_entry_for_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Option<VectorEntry> {
+        self.vector_store
+            .live_entry_for_row(index, row_id, snapshot)
     }
 
     pub(crate) fn drop_table_aux_state(&self, table: &str) {
         let snapshot = self.snapshot_for_read();
         let rows = self.scan(table, snapshot).unwrap_or_default();
-        let row_ids: HashSet<RowId> = rows.iter().map(|row| row.row_id).collect();
         let edge_keys: HashSet<(NodeId, EdgeType, NodeId)> = rows
             .iter()
             .filter_map(|row| {
@@ -2203,12 +2411,6 @@ impl Database {
                 }
             })
             .collect();
-
-        if !row_ids.is_empty() {
-            let mut vectors = self.vector_store.vectors.write();
-            vectors.retain(|entry| !row_ids.contains(&entry.row_id));
-            self.vector_store.clear_hnsw(self.accountant());
-        }
 
         if !edge_keys.is_empty() {
             {
@@ -2538,6 +2740,36 @@ impl Database {
         &self.accountant
     }
 
+    pub(crate) fn register_vector_index_for_column(&self, table: &str, column: &ColumnDef) {
+        if let ColumnType::Vector(dimension) = column.column_type {
+            self.vector_store.register_index(
+                VectorIndexRef::new(table, column.name.clone()),
+                dimension,
+                column.quantization,
+            );
+        }
+    }
+
+    pub(crate) fn deregister_vector_index(&self, table: &str, column: &str) {
+        self.vector_store
+            .deregister_index(&VectorIndexRef::new(table, column), self.accountant());
+    }
+
+    pub(crate) fn rename_vector_index(&self, table: &str, from: &str, to: &str) -> Result<()> {
+        self.vector_store.rename_index(
+            &VectorIndexRef::new(table, from),
+            VectorIndexRef::new(table, to),
+        )
+    }
+
+    pub(crate) fn vector_store_deregister_table(&self, table: &str) {
+        self.vector_store.deregister_table(table, self.accountant());
+    }
+
+    pub(crate) fn vector_index_infos(&self) -> Vec<contextdb_vector::store::VectorIndexInfo> {
+        self.vector_store.index_infos()
+    }
+
     fn account_loaded_state(&self) -> Result<()> {
         let metadata_bytes = self
             .relational_store
@@ -2594,13 +2826,9 @@ impl Database {
 
         let vector_bytes = self
             .vector_store
-            .vectors
-            .read()
-            .iter()
-            .filter(|entry| entry.deleted_tx.is_none())
-            .fold(0usize, |acc, entry| {
-                acc.saturating_add(entry.estimated_bytes())
-            });
+            .index_infos()
+            .into_iter()
+            .fold(0usize, |acc, info| acc.saturating_add(info.bytes));
         self.accountant.try_allocate_for(
             vector_bytes,
             "open",
@@ -2646,8 +2874,8 @@ impl Database {
             }
         }
 
-        for (row_id, _) in &ws.vector_deletes {
-            if let Some(vector) = self.find_vector_by_row_id(*row_id) {
+        for (index, row_id, _) in &ws.vector_deletes {
+            if let Some(vector) = self.find_vector_by_index_and_row(index, *row_id) {
                 self.accountant.release(vector.estimated_bytes());
             }
         }
@@ -2666,13 +2894,14 @@ impl Database {
             .cloned()
     }
 
-    fn find_vector_by_row_id(&self, row_id: RowId) -> Option<VectorEntry> {
+    fn find_vector_by_index_and_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+    ) -> Option<VectorEntry> {
         self.vector_store
-            .vectors
-            .read()
-            .iter()
-            .find(|entry| entry.row_id == row_id)
-            .cloned()
+            .try_state(index)
+            .and_then(|state| state.find_by_row_id(row_id))
     }
 
     fn find_edge(&self, source: &NodeId, target: &NodeId, edge_type: &str) -> Option<AdjEntry> {
@@ -2691,7 +2920,7 @@ impl Database {
     pub(crate) fn write_set_checkpoint(
         &self,
         tx: TxId,
-    ) -> Result<(usize, usize, usize, usize, usize)> {
+    ) -> Result<(usize, usize, usize, usize, usize, usize)> {
         self.tx_mgr.with_write_set(tx, |ws| {
             (
                 ws.relational_inserts.len(),
@@ -2699,6 +2928,7 @@ impl Database {
                 ws.adj_inserts.len(),
                 ws.vector_inserts.len(),
                 ws.vector_deletes.len(),
+                ws.vector_moves.len(),
             )
         })
     }
@@ -2706,7 +2936,7 @@ impl Database {
     pub(crate) fn restore_write_set_checkpoint(
         &self,
         tx: TxId,
-        checkpoint: (usize, usize, usize, usize, usize),
+        checkpoint: (usize, usize, usize, usize, usize, usize),
     ) -> Result<()> {
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.relational_inserts.truncate(checkpoint.0);
@@ -2714,6 +2944,7 @@ impl Database {
             ws.adj_inserts.truncate(checkpoint.2);
             ws.vector_inserts.truncate(checkpoint.3);
             ws.vector_deletes.truncate(checkpoint.4);
+            ws.vector_moves.truncate(checkpoint.5);
         })
     }
 
@@ -2936,7 +3167,7 @@ impl Database {
         let Some(current_bytes) = self.disk_file_size() else {
             return Ok(());
         };
-        if current_bytes < limit {
+        if current_bytes.saturating_add(MIN_DISK_WRITE_HEADROOM_BYTES) <= limit {
             return Ok(());
         }
         Err(Error::DiskBudgetExceeded {
@@ -2985,6 +3216,14 @@ impl Database {
             if let Some(rows) = tables.get(name) {
                 persistence.rewrite_table_rows(name, rows)?;
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_vectors(&self) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            let vectors = self.vector_store.all_entries();
+            persistence.rewrite_vectors(&vectors)?;
         }
         Ok(())
     }
@@ -3094,24 +3333,23 @@ impl Database {
         }
         drop(fwd);
 
-        // Vectors (live only, skip orphans, first entry per row_id)
-        let mut seen_vector_rows: HashSet<RowId> = HashSet::new();
-        let vecs = self.vector_store.vectors.read();
-        for entry in vecs.iter().filter(|v| v.deleted_tx.is_none()) {
+        // Vectors (live only, skip orphans)
+        for entry in self
+            .vector_store
+            .all_entries()
+            .into_iter()
+            .filter(|v| v.deleted_tx.is_none())
+        {
             if !live_row_ids.contains(&entry.row_id) {
                 continue; // skip orphan vectors
             }
-            if !seen_vector_rows.insert(entry.row_id) {
-                continue; // first live entry per row_id only
-            }
             vectors.push(VectorChange {
-                index: VectorIndexRef::default(),
+                index: entry.index.clone(),
                 row_id: entry.row_id,
-                vector: entry.vector.clone(),
+                vector: entry.vector,
                 lsn: entry.lsn,
             });
         }
-        drop(vecs);
 
         ChangeSet {
             rows,
@@ -3205,26 +3443,22 @@ impl Database {
         }
         drop(fwd);
 
-        let mut seen_vector_rows: HashSet<RowId> = HashSet::new();
-        let vecs = self.vector_store.vectors.read();
-        for entry in vecs
-            .iter()
+        for entry in self
+            .vector_store
+            .all_entries()
+            .into_iter()
             .filter(|entry| entry.deleted_tx.is_none() && entry.lsn > since_lsn)
         {
             if !live_row_ids.contains(&entry.row_id) {
                 continue;
             }
-            if !seen_vector_rows.insert(entry.row_id) {
-                continue;
-            }
             vectors.push(VectorChange {
-                index: VectorIndexRef::default(),
+                index: entry.index.clone(),
                 row_id: entry.row_id,
-                vector: entry.vector.clone(),
+                vector: entry.vector,
                 lsn: entry.lsn,
             });
         }
-        drop(vecs);
 
         ChangeSet {
             rows,
@@ -3432,18 +3666,18 @@ impl Database {
                         lsn,
                     });
                 }
-                ChangeLogEntry::VectorInsert { row_id, lsn } => {
-                    if let Some(vector) = self.vector_for_row_lsn(row_id, lsn) {
+                ChangeLogEntry::VectorInsert { index, row_id, lsn } => {
+                    if let Some(vector) = self.vector_for_row_lsn(&index, row_id, lsn) {
                         vectors.push(VectorChange {
-                            index: VectorIndexRef::default(),
+                            index,
                             row_id,
                             vector,
                             lsn,
                         });
                     }
                 }
-                ChangeLogEntry::VectorDelete { row_id, lsn } => vectors.push(VectorChange {
-                    index: VectorIndexRef::default(),
+                ChangeLogEntry::VectorDelete { index, row_id, lsn } => vectors.push(VectorChange {
+                    index,
                     row_id,
                     vector: Vec::new(),
                     lsn,
@@ -3487,6 +3721,15 @@ impl Database {
             } else {
                 true
             }
+        });
+
+        let vector_reinserts: HashSet<(VectorIndexRef, Lsn)> = vectors
+            .iter()
+            .filter(|v| !v.vector.is_empty())
+            .map(|v| (v.index.clone(), v.lsn))
+            .collect();
+        vectors.retain(|v| {
+            !v.vector.is_empty() || !vector_reinserts.contains(&(v.index.clone(), v.lsn))
         });
 
         ChangeSet {
@@ -3565,6 +3808,7 @@ impl Database {
         }
 
         let mut tx = self.begin();
+        let batch_row_commits = changes.rows.len() > 128;
         let mut result = ApplyResult {
             applied_rows: 0,
             skipped_rows: 0,
@@ -3672,21 +3916,17 @@ impl Database {
                     if self.table_meta(&name).is_none() {
                         continue;
                     }
-                    self.relational_store().table_meta.write().remove(&name);
-                    let mut sql = format!(
-                        "CREATE TABLE {} ({})",
-                        name,
-                        columns
-                            .iter()
-                            .map(|(col, ty)| format!("{col} {ty}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    if !constraints.is_empty() {
-                        sql.push(' ');
-                        sql.push_str(&constraints.join(" "));
+                    let existing = self.table_meta(&name).unwrap_or_default();
+                    let existing_cols: HashSet<String> =
+                        existing.columns.iter().map(|c| c.name.clone()).collect();
+                    for (col, ty) in columns {
+                        if existing_cols.contains(&col) {
+                            continue;
+                        }
+                        let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", name, col, ty);
+                        self.execute_in_tx(tx, &sql, &HashMap::new())?;
                     }
-                    self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                    let _ = constraints;
                     self.clear_statement_cache();
                     table_meta_cache.remove(&name);
                     visible_rows_cache.remove(&name);
@@ -3771,8 +4011,10 @@ impl Database {
         for row in changes.rows {
             if row.values.is_empty() {
                 result.skipped_rows += 1;
-                self.commit_with_source(tx, CommitSource::SyncPull)?;
-                tx = self.begin();
+                if !batch_row_commits {
+                    self.commit_with_source(tx, CommitSource::SyncPull)?;
+                    tx = self.begin();
+                }
                 continue;
             }
 
@@ -3799,11 +4041,13 @@ impl Database {
 
             if is_delete {
                 if let Some(local) = existing {
-                    if row_has_vector
-                        && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                    {
-                        vector_row_map.insert(*remote_row_id, local.row_id);
-                        vector_row_idx += 1;
+                    if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                        consume_vector_row_group(
+                            &vector_row_ids,
+                            &mut vector_row_idx,
+                            local.row_id,
+                            &mut vector_row_map,
+                        );
                     }
                     if let Err(err) = self.delete_row(tx, &row.table, local.row_id) {
                         result.conflicts.push(Conflict {
@@ -3819,8 +4063,10 @@ impl Database {
                 } else {
                     result.skipped_rows += 1;
                 }
-                self.commit_with_source(tx, CommitSource::SyncPull)?;
-                tx = self.begin();
+                if !batch_row_commits {
+                    self.commit_with_source(tx, CommitSource::SyncPull)?;
+                    tx = self.begin();
+                }
                 continue;
             }
 
@@ -3876,19 +4122,22 @@ impl Database {
 
                         if let Some(err_msg) = constraint_error {
                             result.skipped_rows += 1;
-                            if row_has_vector
-                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                            {
-                                failed_row_ids.insert(*remote_row_id);
-                                vector_row_idx += 1;
+                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                consume_failed_vector_row_group(
+                                    &vector_row_ids,
+                                    &mut vector_row_idx,
+                                    &mut failed_row_ids,
+                                );
                             }
                             result.conflicts.push(Conflict {
                                 natural_key: row.natural_key.clone(),
                                 resolution: policy,
                                 reason: Some(err_msg),
                             });
-                            self.commit_with_source(tx, CommitSource::SyncPull)?;
-                            tx = self.begin();
+                            if !batch_row_commits {
+                                self.commit_with_source(tx, CommitSource::SyncPull)?;
+                                tx = self.begin();
+                            }
                             continue;
                         }
                     }
@@ -3922,11 +4171,13 @@ impl Database {
                                 },
                             );
                             result.applied_rows += 1;
-                            if row_has_vector
-                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                            {
-                                vector_row_map.insert(*remote_row_id, new_row_id);
-                                vector_row_idx += 1;
+                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                consume_vector_row_group(
+                                    &vector_row_ids,
+                                    &mut vector_row_idx,
+                                    new_row_id,
+                                    &mut vector_row_map,
+                                );
                             }
                         }
                         Err(err) => {
@@ -3934,11 +4185,12 @@ impl Database {
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
-                            if row_has_vector
-                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                            {
-                                failed_row_ids.insert(*remote_row_id);
-                                vector_row_idx += 1;
+                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                consume_failed_vector_row_group(
+                                    &vector_row_ids,
+                                    &mut vector_row_idx,
+                                    &mut failed_row_ids,
+                                );
                             }
                             result.conflicts.push(Conflict {
                                 natural_key: row.natural_key.clone(),
@@ -3949,21 +4201,24 @@ impl Database {
                     }
                 }
                 (Some(local), ConflictPolicy::InsertIfNotExists) => {
-                    if row_has_vector
-                        && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                    {
-                        vector_row_map.insert(*remote_row_id, local.row_id);
-                        vector_row_idx += 1;
+                    if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                        consume_vector_row_group(
+                            &vector_row_ids,
+                            &mut vector_row_idx,
+                            local.row_id,
+                            &mut vector_row_map,
+                        );
                     }
                     result.skipped_rows += 1;
                 }
                 (Some(_), ConflictPolicy::ServerWins) => {
                     result.skipped_rows += 1;
-                    if row_has_vector
-                        && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                    {
-                        failed_row_ids.insert(*remote_row_id);
-                        vector_row_idx += 1;
+                    if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                        consume_failed_vector_row_group(
+                            &vector_row_ids,
+                            &mut vector_row_idx,
+                            &mut failed_row_ids,
+                        );
                     }
                     result.conflicts.push(Conflict {
                         natural_key: row.natural_key.clone(),
@@ -3998,11 +4253,12 @@ impl Database {
 
                     if !incoming_wins {
                         result.skipped_rows += 1;
-                        if row_has_vector
-                            && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                        {
-                            failed_row_ids.insert(*remote_row_id);
-                            vector_row_idx += 1;
+                        if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                            consume_failed_vector_row_group(
+                                &vector_row_ids,
+                                &mut vector_row_idx,
+                                &mut failed_row_ids,
+                            );
                         }
                         result.conflicts.push(Conflict {
                             natural_key: row.natural_key.clone(),
@@ -4033,11 +4289,13 @@ impl Database {
                                 if !valid && incoming != current {
                                     result.skipped_rows += 1;
                                     if row_has_vector
-                                        && let Some(remote_row_id) =
-                                            vector_row_ids.get(vector_row_idx)
+                                        && vector_row_ids.get(vector_row_idx).is_some()
                                     {
-                                        failed_row_ids.insert(*remote_row_id);
-                                        vector_row_idx += 1;
+                                        consume_failed_vector_row_group(
+                                            &vector_row_ids,
+                                            &mut vector_row_idx,
+                                            &mut failed_row_ids,
+                                        );
                                     }
                                     result.conflicts.push(Conflict {
                                         natural_key: row.natural_key.clone(),
@@ -4047,8 +4305,10 @@ impl Database {
                                             current, incoming, current
                                         )),
                                     });
-                                    self.commit_with_source(tx, CommitSource::SyncPull)?;
-                                    tx = self.begin();
+                                    if !batch_row_commits {
+                                        self.commit_with_source(tx, CommitSource::SyncPull)?;
+                                        tx = self.begin();
+                                    }
                                     continue;
                                 }
                             }
@@ -4079,18 +4339,21 @@ impl Database {
                                 visible_rows_cache.remove(&row.table);
                                 result.applied_rows += 1;
                                 if row_has_vector
-                                    && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                                {
-                                    if let Ok(Some(found)) = self.point_lookup_in_tx(
+                                    && vector_row_ids.get(vector_row_idx).is_some()
+                                    && let Ok(Some(found)) = self.point_lookup_in_tx(
                                         tx,
                                         &row.table,
                                         &row.natural_key.column,
                                         &row.natural_key.value,
                                         self.snapshot(),
-                                    ) {
-                                        vector_row_map.insert(*remote_row_id, found.row_id);
-                                    }
-                                    vector_row_idx += 1;
+                                    )
+                                {
+                                    consume_vector_row_group(
+                                        &vector_row_ids,
+                                        &mut vector_row_idx,
+                                        found.row_id,
+                                        &mut vector_row_map,
+                                    );
                                 }
                             }
                             Err(err) => {
@@ -4098,11 +4361,12 @@ impl Database {
                                     return Err(err);
                                 }
                                 result.skipped_rows += 1;
-                                if row_has_vector
-                                    && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                                {
-                                    failed_row_ids.insert(*remote_row_id);
-                                    vector_row_idx += 1;
+                                if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                    consume_failed_vector_row_group(
+                                        &vector_row_ids,
+                                        &mut vector_row_idx,
+                                        &mut failed_row_ids,
+                                    );
                                 }
                                 result.conflicts.push(Conflict {
                                     natural_key: row.natural_key.clone(),
@@ -4142,18 +4406,21 @@ impl Database {
                             visible_rows_cache.remove(&row.table);
                             result.applied_rows += 1;
                             if row_has_vector
-                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                            {
-                                if let Ok(Some(found)) = self.point_lookup_in_tx(
+                                && vector_row_ids.get(vector_row_idx).is_some()
+                                && let Ok(Some(found)) = self.point_lookup_in_tx(
                                     tx,
                                     &row.table,
                                     &row.natural_key.column,
                                     &row.natural_key.value,
                                     self.snapshot(),
-                                ) {
-                                    vector_row_map.insert(*remote_row_id, found.row_id);
-                                }
-                                vector_row_idx += 1;
+                                )
+                            {
+                                consume_vector_row_group(
+                                    &vector_row_ids,
+                                    &mut vector_row_idx,
+                                    found.row_id,
+                                    &mut vector_row_map,
+                                );
                             }
                         }
                         Err(err) => {
@@ -4161,11 +4428,12 @@ impl Database {
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
-                            if row_has_vector
-                                && let Some(remote_row_id) = vector_row_ids.get(vector_row_idx)
-                            {
-                                failed_row_ids.insert(*remote_row_id);
-                                vector_row_idx += 1;
+                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                consume_failed_vector_row_group(
+                                    &vector_row_ids,
+                                    &mut vector_row_idx,
+                                    &mut failed_row_ids,
+                                );
                             }
                             if let Some(last) = result.conflicts.last_mut() {
                                 last.reason = Some(format!("state_machine_or_constraint: {err}"));
@@ -4175,6 +4443,13 @@ impl Database {
                 }
             }
 
+            if !batch_row_commits {
+                self.commit_with_source(tx, CommitSource::SyncPull)?;
+                tx = self.begin();
+            }
+        }
+
+        if batch_row_commits {
             self.commit_with_source(tx, CommitSource::SyncPull)?;
             tx = self.begin();
         }
@@ -4203,19 +4478,13 @@ impl Database {
                 .copied()
                 .unwrap_or(vector.row_id);
             if vector.vector.is_empty() {
-                let _ = self
-                    .vector
-                    .delete_vector(tx, vector.index.clone(), local_row_id);
+                self.vector
+                    .delete_vector(tx, vector.index.clone(), local_row_id)?;
             } else {
                 if self.has_live_vector(local_row_id, self.snapshot()) {
                     let _ = self.delete_vector(tx, vector.index.clone(), local_row_id);
                 }
-                if let Err(err) =
-                    self.insert_vector(tx, vector.index.clone(), local_row_id, vector.vector)
-                    && is_fatal_sync_apply_error(&err)
-                {
-                    return Err(err);
-                }
+                self.insert_vector_strict(tx, vector.index.clone(), local_row_id, vector.vector)?;
             }
         }
 
@@ -4287,13 +4556,13 @@ impl Database {
             })
     }
 
-    fn vector_for_row_lsn(&self, row_id: RowId, lsn: Lsn) -> Option<Vec<f32>> {
-        self.vector_store
-            .vectors
-            .read()
-            .iter()
-            .find(|v| v.row_id == row_id && v.lsn == lsn)
-            .map(|v| v.vector.clone())
+    fn vector_for_row_lsn(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        lsn: Lsn,
+    ) -> Option<Vec<f32>> {
+        self.vector_store.vector_for_row_lsn(index, row_id, lsn)
     }
 }
 
@@ -4356,6 +4625,73 @@ fn record_cached_insert(
     }
 }
 
+fn consume_vector_row_group(
+    remote_row_ids: &[RowId],
+    cursor: &mut usize,
+    local_row_id: RowId,
+    map: &mut HashMap<RowId, RowId>,
+) {
+    let Some(remote_row_id) = remote_row_ids.get(*cursor).copied() else {
+        return;
+    };
+    while remote_row_ids.get(*cursor).copied() == Some(remote_row_id) {
+        map.insert(remote_row_id, local_row_id);
+        *cursor += 1;
+    }
+}
+
+fn consume_failed_vector_row_group(
+    remote_row_ids: &[RowId],
+    cursor: &mut usize,
+    failed: &mut HashSet<RowId>,
+) {
+    let Some(remote_row_id) = remote_row_ids.get(*cursor).copied() else {
+        return;
+    };
+    while remote_row_ids.get(*cursor).copied() == Some(remote_row_id) {
+        failed.insert(remote_row_id);
+        *cursor += 1;
+    }
+}
+
+fn vector_index_from_plan(plan: &PhysicalPlan) -> Option<VectorIndexRef> {
+    match plan {
+        PhysicalPlan::VectorSearch { table, column, .. }
+        | PhysicalPlan::HnswSearch { table, column, .. } => {
+            Some(VectorIndexRef::new(table.clone(), column.clone()))
+        }
+        PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. } => vector_index_from_plan(input),
+        PhysicalPlan::Join { left, right, .. } => {
+            vector_index_from_plan(left).or_else(|| vector_index_from_plan(right))
+        }
+        PhysicalPlan::Pipeline(plans) => plans.iter().find_map(vector_index_from_plan),
+        _ => None,
+    }
+}
+
+fn hydrate_relational_vector_values(relational: &RelationalStore, vectors: &[VectorEntry]) {
+    if vectors.is_empty() {
+        return;
+    }
+    let mut tables = relational.tables.write();
+    for entry in vectors {
+        let Some(rows) = tables.get_mut(&entry.index.table) else {
+            continue;
+        };
+        if let Some(row) = rows.iter_mut().find(|row| row.row_id == entry.row_id) {
+            row.values.insert(
+                entry.index.column.clone(),
+                Value::Vector(entry.vector.clone()),
+            );
+        }
+    }
+}
+
 fn remove_cached_row(cache: &mut HashMap<String, Vec<VersionedRow>>, table: &str, row_id: RowId) {
     if let Some(rows) = cache.get_mut(table) {
         rows.retain(|row| row.row_id != row_id);
@@ -4378,33 +4714,7 @@ fn query_outcome_from_result(result: &Result<QueryResult>) -> QueryOutcome {
 }
 
 fn maybe_prebuild_hnsw(vector_store: &VectorStore, accountant: &MemoryAccountant) {
-    if vector_store.vector_count() >= 1000 {
-        let entries = vector_store.all_entries();
-        let dim = vector_store.dimension().unwrap_or(0);
-        let estimated_bytes = estimate_hnsw_index_bytes(entries.len(), dim);
-        if accountant
-            .try_allocate_for(
-                estimated_bytes,
-                "vector_index",
-                "prebuild_hnsw",
-                "Open the database with a larger MEMORY_LIMIT to enable HNSW indexing.",
-            )
-            .is_err()
-        {
-            return;
-        }
-
-        let hnsw_opt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            HnswIndex::new(&entries, dim)
-        }))
-        .ok();
-        if hnsw_opt.is_some() {
-            vector_store.set_hnsw_bytes(estimated_bytes);
-        } else {
-            accountant.release(estimated_bytes);
-        }
-        let _ = vector_store.hnsw.set(RwLock::new(hnsw_opt));
-    }
+    let _ = (vector_store, accountant);
 }
 
 fn estimate_row_bytes_for_meta(
@@ -4445,13 +4755,6 @@ fn estimate_edge_bytes(
         lsn: Lsn(0),
     }
     .estimated_bytes()
-}
-
-fn estimate_hnsw_index_bytes(entry_count: usize, dimension: usize) -> usize {
-    entry_count
-        .saturating_mul(dimension)
-        .saturating_mul(std::mem::size_of::<f32>())
-        .saturating_mul(3)
 }
 
 impl Drop for Database {
@@ -4534,22 +4837,7 @@ fn prune_expired_rows(
         return 0;
     }
 
-    let mut released_vector_bytes = 0usize;
-    {
-        let mut vectors = vector_store.vectors.write();
-        vectors.retain(|entry| {
-            if pruned_row_ids.contains(&entry.row_id) {
-                released_vector_bytes =
-                    released_vector_bytes.saturating_add(entry.estimated_bytes());
-                false
-            } else {
-                true
-            }
-        });
-    }
-    if let Some(hnsw) = vector_store.hnsw.get() {
-        *hnsw.write() = None;
-    }
+    let released_vector_bytes = vector_store.prune_row_ids(&pruned_row_ids, accountant);
 
     let mut released_edge_bytes = 0usize;
     {
@@ -4590,7 +4878,7 @@ fn prune_expired_rows(
             let _ = persistence.rewrite_table_rows(table_name, &rows);
         }
 
-        let vectors = vector_store.vectors.read().clone();
+        let vectors = vector_store.all_entries();
         let edges = graph_store
             .forward_adj
             .read()
@@ -4662,9 +4950,8 @@ fn max_tx_across_all(
         .max()
         .unwrap_or(TxId(0));
     let vector_max = vector
-        .vectors
-        .read()
-        .iter()
+        .all_entries()
+        .into_iter()
         .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
         .max()
         .unwrap_or(TxId(0));
@@ -4692,9 +4979,8 @@ fn max_lsn_across_all(
         .max()
         .unwrap_or(Lsn(0));
     let vector_max = vector
-        .vectors
-        .read()
-        .iter()
+        .all_entries()
+        .into_iter()
         .map(|entry| entry.lsn)
         .max()
         .unwrap_or(Lsn(0));

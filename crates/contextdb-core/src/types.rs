@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -112,9 +113,8 @@ pub struct Wallclock(pub u64);
 
 type WallclockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-fn wallclock_test_slot() -> &'static Mutex<Option<WallclockFn>> {
-    static SLOT: OnceLock<Mutex<Option<WallclockFn>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static WALLCLOCK_TEST_CLOCK: RefCell<Option<WallclockFn>> = RefCell::new(None);
 }
 
 impl Wallclock {
@@ -142,18 +142,16 @@ impl Wallclock {
     where
         F: Fn() -> u64 + Send + Sync + 'static,
     {
-        let mut slot = wallclock_test_slot()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *slot = Some(Arc::new(f));
+        WALLCLOCK_TEST_CLOCK.with(|slot| {
+            *slot.borrow_mut() = Some(Arc::new(f));
+        });
     }
 
     /// Test seam: drop any previously-installed clock closure.
     pub fn reset_test_clock() {
-        let mut slot = wallclock_test_slot()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *slot = None;
+        WALLCLOCK_TEST_CLOCK.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
     }
 
     /// Test seam alias used by TU10 — same semantics as `reset_test_clock`.
@@ -164,10 +162,7 @@ impl Wallclock {
     /// Internal accessor for the installed test clock.
     #[inline]
     fn test_clock() -> Option<WallclockFn> {
-        let slot = wallclock_test_slot()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        slot.clone()
+        WALLCLOCK_TEST_CLOCK.with(|slot| slot.borrow().clone())
     }
 }
 

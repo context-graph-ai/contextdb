@@ -9,7 +9,7 @@ use contextdb_cli::{auto_sync, repl};
 #[derive(Parser)]
 #[command(name = "contextdb-cli", version)]
 struct Args {
-    /// Database path (:memory: for in-memory)
+    /// Database path (:memory: for in-memory). Use `.help vector` for vector index syntax.
     path: String,
 
     /// NATS URL for sync (WebSocket for edge)

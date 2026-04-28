@@ -101,33 +101,33 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
 // ======== TU7 ========
 
 #[test]
-fn protocol_version_stays_at_one() {
-    use contextdb_server::protocol::Envelope;
+fn protocol_version_stays_at_two_for_named_vector_indexes() {
+    use contextdb_server::protocol::{Envelope, PROTOCOL_VERSION};
 
     // Construct the default envelope used by the pull path.
     let env = Envelope::default_pull_request();
     assert_eq!(
-        env.version, 1,
-        "Envelope.version must remain 1 across the TxId retype; got {}",
+        env.version, PROTOCOL_VERSION,
+        "Envelope.version must use the named-vector protocol version; got {}",
         env.version
     );
 
-    // Round-trip through rmp_serde; decoded version must still be 1.
+    // Round-trip through rmp_serde; decoded version must still match the protocol constant.
     let bytes = rmp_serde::to_vec(&env).expect("serialize Envelope via rmp_serde");
     let decoded: Envelope =
         rmp_serde::from_slice(&bytes).expect("deserialize Envelope via rmp_serde");
     assert_eq!(
-        decoded.version, 1,
-        "round-tripped Envelope.version must remain 1; got {}",
+        decoded.version, PROTOCOL_VERSION,
+        "round-tripped Envelope.version must match PROTOCOL_VERSION; got {}",
         decoded.version
     );
 
-    // The bytes must also contain the integer 1 as the version field's serialized form.
-    // rmp_serde encodes small u32 as a one-byte positive-fixint (0x01). Assert the payload
+    // The bytes must also contain the protocol version field's serialized form.
+    // rmp_serde encodes small u8 as a one-byte positive-fixint. Assert the payload
     // contains this byte in any field-ordering-independent form.
     assert!(
-        bytes.contains(&0x01),
-        "serialized Envelope must contain the positive-fixint byte 0x01 (version=1); bytes = {:?}",
+        bytes.contains(&PROTOCOL_VERSION),
+        "serialized Envelope must contain PROTOCOL_VERSION={PROTOCOL_VERSION}; bytes = {:?}",
         bytes
     );
 }

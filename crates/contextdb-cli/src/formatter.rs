@@ -2,10 +2,14 @@ use contextdb_core::Value;
 use contextdb_engine::QueryResult;
 
 pub fn format_query_result(result: &QueryResult) -> String {
-    if result.columns.is_empty() {
-        return String::new();
-    }
-    if result.rows.is_empty() {
+    format_query_result_with_empty_headers(result, false)
+}
+
+pub fn format_query_result_with_empty_headers(
+    result: &QueryResult,
+    show_empty_headers: bool,
+) -> String {
+    if result.columns.is_empty() || (result.rows.is_empty() && !show_empty_headers) {
         return String::new();
     }
 

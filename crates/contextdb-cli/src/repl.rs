@@ -1,4 +1,4 @@
-use crate::formatter::format_query_result;
+use crate::formatter::{format_query_result, format_query_result_with_empty_headers};
 use contextdb_core::{Error, TableMeta};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
@@ -8,6 +8,12 @@ use rustyline::error::ReadlineError;
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal};
 use std::sync::Arc;
+
+#[derive(Clone, Copy)]
+struct InputContext {
+    interactive: bool,
+    script_line: Option<usize>,
+}
 
 /// Run the REPL loop. Returns `true` if all commands succeeded, `false` if any error occurred.
 pub fn run(
@@ -44,8 +50,18 @@ fn run_interactive(
                     continue;
                 }
                 let _ = rl.add_history_entry(line);
-                if !process_input_line(db, sync_client, rt, line, true, sync_plugin, &mut had_error)
-                {
+                if !process_input_line(
+                    db,
+                    sync_client,
+                    rt,
+                    line,
+                    InputContext {
+                        interactive: true,
+                        script_line: None,
+                    },
+                    sync_plugin,
+                    &mut had_error,
+                ) {
                     break;
                 }
             }
@@ -65,13 +81,13 @@ fn run_scripted(
 ) -> bool {
     let mut had_error = false;
     let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
+    for (line_idx, line) in stdin.lock().lines().enumerate() {
         let line = match line {
             Ok(line) => line,
             Err(_) => break,
         };
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with("--") {
             continue;
         }
         if !process_input_line(
@@ -79,7 +95,10 @@ fn run_scripted(
             sync_client,
             rt,
             line,
-            false,
+            InputContext {
+                interactive: false,
+                script_line: Some(line_idx + 1),
+            },
             sync_plugin,
             &mut had_error,
         ) {
@@ -94,7 +113,7 @@ fn process_input_line(
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     line: &str,
-    interactive: bool,
+    input: InputContext,
     sync_plugin: Option<&SyncPlugin>,
     had_error: &mut bool,
 ) -> bool {
@@ -113,10 +132,10 @@ fn process_input_line(
         }
     } else {
         let upper = line.trim_start().to_uppercase();
-        if !interactive && upper.starts_with("INSERT") {
+        if !input.interactive && upper.starts_with("INSERT") {
             println!("{line}");
         }
-        if !execute_sql(db, line) {
+        if !execute_sql(db, line, input.script_line) {
             *had_error = true;
         }
     }
@@ -142,7 +161,16 @@ pub(crate) fn handle_meta_command(
     match cmd {
         ".quit" | ".exit" | "\\q" => return false,
         ".help" | "\\?" => {
+            if rest.eq_ignore_ascii_case("vector") {
+                println!("VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')");
+                println!("SHOW VECTOR_INDEXES");
+                println!(
+                    "Vector errors include LegacyVectorStoreDetected, StoreCorrupted, VectorIndexDimensionMismatch, and UnknownVectorIndex"
+                );
+                return true;
+            }
             println!(".help / \\?          Show this message");
+            println!(".help vector        Show vector index syntax and errors");
             println!(".quit/.exit / \\q    Exit REPL");
             println!(".tables / \\dt       List tables");
             println!(".schema / \\d <tbl>  Show table schema and constraints");
@@ -422,26 +450,101 @@ fn print_table_meta(table: &str, meta: &TableMeta) {
 }
 
 /// Execute a SQL statement and print the result. Returns `true` on success, `false` on error.
-fn execute_sql(db: &Database, sql: &str) -> bool {
+fn execute_sql(db: &Database, sql: &str, script_line: Option<usize>) -> bool {
     match db.execute(sql, &HashMap::new()) {
         Ok(result) => {
             if result.columns.is_empty() {
                 println!("ok (rows_affected={})", result.rows_affected);
             } else {
-                println!("{}", format_query_result(&result));
+                let show_empty_headers = sql
+                    .trim()
+                    .trim_end_matches(';')
+                    .eq_ignore_ascii_case("SHOW VECTOR_INDEXES");
+                let formatted = if show_empty_headers {
+                    format_query_result_with_empty_headers(&result, true)
+                } else {
+                    format_query_result(&result)
+                };
+                println!("{formatted}");
             }
             true
         }
         Err(e) => {
-            if is_fatal_cli_error(&e) {
-                eprintln!("Error: {}", e);
+            let legacy_vector_mismatch = render_legacy_vector_dimension_mismatch(db, sql, &e);
+            let rendered = if let Some(rendered) = legacy_vector_mismatch.as_ref() {
+                rendered.clone()
+            } else if matches!(e, Error::ParseError(_)) {
+                if let Some(line) = script_line {
+                    format!("line {line}: {e}")
+                } else {
+                    e.to_string()
+                }
+            } else {
+                e.to_string()
+            }
+            .replace('\n', " ");
+            if is_fatal_cli_error(&e) || legacy_vector_mismatch.is_some() {
+                eprintln!("Error: {rendered}");
                 false
             } else {
-                println!("Error: {}", e);
+                println!("Error: {rendered}");
                 true
             }
         }
     }
+}
+
+fn render_legacy_vector_dimension_mismatch(
+    db: &Database,
+    sql: &str,
+    error: &Error,
+) -> Option<String> {
+    let Error::VectorDimensionMismatch { expected, got } = error else {
+        return None;
+    };
+    let table = extract_insert_table(sql)?;
+    let meta = db.table_meta(&table)?;
+    let matching_columns = meta
+        .columns
+        .iter()
+        .filter_map(|column| match column.column_type {
+            contextdb_core::ColumnType::Vector(dimension) if dimension == *expected => {
+                Some(column.name.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [column] = matching_columns.as_slice() else {
+        return None;
+    };
+    Some(format!(
+        "vector index dimension mismatch on {table}.{column}: expected {expected}, got {got}"
+    ))
+}
+
+fn extract_insert_table(sql: &str) -> Option<String> {
+    let trimmed = sql.trim_start();
+    if !trimmed
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("insert"))
+    {
+        return None;
+    }
+    let rest = trimmed.get(6..)?.trim_start();
+    if !rest
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("into"))
+    {
+        return None;
+    }
+    let table = rest
+        .get(4..)?
+        .trim_start()
+        .trim_start_matches('"')
+        .split(|ch: char| ch.is_whitespace() || ch == '(' || ch == '"')
+        .next()?
+        .trim();
+    (!table.is_empty()).then(|| table.to_string())
 }
 
 pub fn is_fatal_cli_error_public(error: &Error) -> bool {
@@ -449,16 +552,21 @@ pub fn is_fatal_cli_error_public(error: &Error) -> bool {
 }
 
 fn is_fatal_cli_error(error: &Error) -> bool {
-    matches!(
-        error,
+    match error {
         Error::ParseError(_)
-            | Error::TableNotFound(_)
-            | Error::NotFound(_)
-            | Error::BfsDepthExceeded(_)
-            | Error::RecursiveCteNotSupported
-            | Error::WindowFunctionNotSupported
-            | Error::FullTextSearchNotSupported
-    )
+        | Error::TableNotFound(_)
+        | Error::NotFound(_)
+        | Error::BfsDepthExceeded(_)
+        | Error::RecursiveCteNotSupported
+        | Error::WindowFunctionNotSupported
+        | Error::FullTextSearchNotSupported
+        | Error::VectorIndexDimensionMismatch { .. }
+        | Error::UnknownVectorIndex { .. }
+        | Error::StoreCorrupted { .. }
+        | Error::LegacyVectorStoreDetected { .. } => true,
+        Error::MemoryBudgetExceeded { operation, .. } => operation.contains('@'),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

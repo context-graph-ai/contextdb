@@ -243,6 +243,8 @@ pub struct ColumnDef {
     pub expires: bool,
     #[serde(default)]
     pub immutable: bool,
+    #[serde(default)]
+    pub quantization: VectorQuantization,
 }
 
 // Custom `Deserialize` that tolerates prior on-disk schemas missing the
@@ -295,6 +297,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 // propagate — silently defaulting to `false` would let a
                 // corrupt payload pose as a non-immutable column.
                 let immutable = seq.next_element::<bool>()?.unwrap_or_default();
+                let quantization = seq
+                    .next_element::<VectorQuantization>()?
+                    .unwrap_or_default();
                 Ok(ColumnDef {
                     name,
                     column_type,
@@ -305,6 +310,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     references,
                     expires,
                     immutable,
+                    quantization,
                 })
             }
 
@@ -321,6 +327,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut references: Option<Option<ForeignKeyReference>> = None;
                 let mut expires: Option<bool> = None;
                 let mut immutable: Option<bool> = None;
+                let mut quantization: Option<VectorQuantization> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -333,6 +340,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "references" => references = Some(map.next_value()?),
                         "expires" => expires = Some(map.next_value()?),
                         "immutable" => immutable = Some(map.next_value()?),
+                        "quantization" => quantization = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -352,6 +360,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     references: references.unwrap_or_default(),
                     expires: expires.unwrap_or_default(),
                     immutable: immutable.unwrap_or_default(),
+                    quantization: quantization.unwrap_or_default(),
                 })
             }
         }
@@ -366,6 +375,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "references",
             "expires",
             "immutable",
+            "quantization",
         ];
         deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
     }
@@ -388,6 +398,32 @@ pub enum ColumnType {
     Vector(usize),
     Timestamp,
     TxId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VectorQuantization {
+    #[default]
+    F32,
+    SQ8,
+    SQ4,
+}
+
+impl VectorQuantization {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VectorQuantization::F32 => "F32",
+            VectorQuantization::SQ8 => "SQ8",
+            VectorQuantization::SQ4 => "SQ4",
+        }
+    }
+
+    pub fn storage_bytes(self, dimension: usize) -> usize {
+        match self {
+            VectorQuantization::F32 => dimension.saturating_mul(std::mem::size_of::<f32>()),
+            VectorQuantization::SQ8 => dimension.saturating_add(8),
+            VectorQuantization::SQ4 => dimension.div_ceil(2).saturating_add(8),
+        }
+    }
 }
 
 impl TableMeta {

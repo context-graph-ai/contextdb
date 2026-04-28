@@ -7,7 +7,8 @@ pub struct WriteSet {
     pub adj_inserts: Vec<AdjEntry>,
     pub adj_deletes: Vec<(NodeId, EdgeType, NodeId, TxId)>,
     pub vector_inserts: Vec<VectorEntry>,
-    pub vector_deletes: Vec<(RowId, TxId)>,
+    pub vector_deletes: Vec<(VectorIndexRef, RowId, TxId)>,
+    pub vector_moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
     pub commit_lsn: Option<Lsn>,
     pub propagation_in_progress: bool,
 }
@@ -24,6 +25,7 @@ impl WriteSet {
             && self.adj_deletes.is_empty()
             && self.vector_inserts.is_empty()
             && self.vector_deletes.is_empty()
+            && self.vector_moves.is_empty()
     }
 
     pub fn stamp_lsn(&mut self, lsn: Lsn) {

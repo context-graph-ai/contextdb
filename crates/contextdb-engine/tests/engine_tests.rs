@@ -892,7 +892,7 @@ fn test_vector_search_requires_limit() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         RowId(1),
-        vec![1.0, 0.0],
+        vec![1.0, 0.0, 0.0],
     )
     .unwrap();
     eng.commit(tx).unwrap();
@@ -901,7 +901,7 @@ fn test_vector_search_requires_limit() {
     let results = eng
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0],
+            &[1.0, 0.0, 0.0],
             0,
             None,
             snap,

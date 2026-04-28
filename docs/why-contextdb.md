@@ -23,7 +23,7 @@ This works until it doesn't:
 
 ## How contextdb Is Different
 
-contextdb replaces all three with one embedded database. One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three.
+contextdb replaces all three with one embedded database. One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. Multiple vector columns on the same table let a typed-evidence system keep text, vision, audio, or policy embeddings separate without leaving the database.
 
 | Capability | SQLite + extensions | contextdb |
 |---|---|---|

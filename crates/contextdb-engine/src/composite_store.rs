@@ -1,5 +1,5 @@
 use crate::sync_types::{DdlChange, NaturalKey};
-use contextdb_core::{EdgeType, Lsn, NodeId, Result, RowId, TableName, Value};
+use contextdb_core::{EdgeType, Lsn, NodeId, Result, RowId, TableName, Value, VectorIndexRef};
 use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
@@ -34,10 +34,12 @@ pub enum ChangeLogEntry {
         lsn: Lsn,
     },
     VectorInsert {
+        index: VectorIndexRef,
         row_id: RowId,
         lsn: Lsn,
     },
     VectorDelete {
+        index: VectorIndexRef,
         row_id: RowId,
         lsn: Lsn,
     },
@@ -139,13 +141,15 @@ impl CompositeStore {
 
         for entry in &ws.vector_inserts {
             log_entries.push(ChangeLogEntry::VectorInsert {
+                index: entry.index.clone(),
                 row_id: entry.row_id,
                 lsn,
             });
         }
 
-        for (row_id, _) in &ws.vector_deletes {
+        for (index, row_id, _) in &ws.vector_deletes {
             log_entries.push(ChangeLogEntry::VectorDelete {
+                index: index.clone(),
                 row_id: *row_id,
                 lsn,
             });
@@ -165,6 +169,8 @@ impl WriteSetApplicator for CompositeStore {
         self.graph.apply_deletes(ws.adj_deletes);
         self.vector.apply_inserts(ws.vector_inserts);
         self.vector.apply_deletes(ws.vector_deletes);
+        self.vector
+            .apply_moves(ws.vector_moves, ws.commit_lsn.unwrap_or(Lsn(0)));
         self.change_log.write().extend(log_entries);
         Ok(())
     }

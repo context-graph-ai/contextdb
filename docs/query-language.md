@@ -138,6 +138,35 @@ SHOW DISK_LIMIT
 
 NULL values display as `NULL`. Vectors display as `[0.1, 0.2, ...]`.
 
+Vector columns can choose per-index scalar quantization:
+
+```sql
+CREATE TABLE evidence (
+  id UUID PRIMARY KEY,
+  vector_text VECTOR(768) WITH (quantization = 'SQ8'),
+  vector_vision VECTOR(512) WITH (quantization = 'SQ4')
+);
+```
+
+Valid quantization values are `F32`, `SQ8`, and `SQ4`; the default is `F32`.
+Each vector column is a separate `(table, column)` index. Search routes to the
+column named in `ORDER BY`:
+
+```sql
+SELECT id FROM evidence
+WHERE source = 'camera-1'
+ORDER BY vector_vision <=> '[0,0,1,0]' LIMIT 5;
+```
+
+Inspect registered vector indexes with:
+
+```sql
+SHOW VECTOR_INDEXES;
+```
+
+It returns `table`, `column`, `dimension`, `quantization`, `vector_count`, and
+`bytes`.
+
 ---
 
 ## Column Constraints
@@ -675,4 +704,3 @@ User-declared index names must not begin with `__pk_` or `__unique_`.
 | `ColumnInIndex { table, column, index }` | `ALTER TABLE ... DROP COLUMN c RESTRICT` on a column referenced by an index |
 | `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table |
 | `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_` or `__unique_` (reserved for auto-indexes) |
-

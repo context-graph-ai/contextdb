@@ -69,6 +69,23 @@ The observation is immutable — it can never be modified or deleted. The `OBSER
 
 The `DAG('DEPENDS_ON', 'BASED_ON')` declaration means these specific edge types are acyclic — the engine rejects any insert that would create a cycle, checking both committed edges and pending writes in the current transaction. Other edge types in the same table (like `OBSERVED_ON`) can have cycles if needed.
 
+### Multi-Modal Evidence
+
+Evidence can carry independent vector indexes for different modalities:
+
+```sql
+CREATE TABLE evidence (
+  id UUID PRIMARY KEY,
+  source TEXT NOT NULL,
+  vector_text VECTOR(768) WITH (quantization = 'SQ8'),
+  vector_vision VECTOR(512) WITH (quantization = 'SQ8')
+);
+```
+
+`ORDER BY vector_text <=> $query` and `ORDER BY vector_vision <=> $query`
+route to different `(table, column)` indexes, each with its own dimension,
+quantization, and HNSW state.
+
 ---
 
 ## Scenario 2: Decisions With State Machines
