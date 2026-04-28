@@ -3167,17 +3167,33 @@ fn nv_indexed_filter_intersects_per_column_vector_search() {
         Some(&Value::Uuid(a_ids[2])),
         "filtered vector_text ANN must rank the nearest A row first, not merely return any A row"
     );
+    assert_eq!(
+        r.trace.physical_plan, "IndexScan -> VectorSearch",
+        "runtime trace must prove the indexed candidate set fed vector_text ANN; got {:?}",
+        r.trace
+    );
+    assert_eq!(r.trace.index_used.as_deref(), Some("idx_category"));
+    assert!(
+        r.trace
+            .predicates_pushed
+            .iter()
+            .any(|predicate| predicate.as_ref() == "category"),
+        "runtime trace must show category was pushed into the candidate IndexScan; got {:?}",
+        r.trace
+    );
+    assert!(
+        db.__rows_examined() <= a_ids.len() as u64,
+        "filtered ANN must read only the category='A' index postings before vector search; rows_examined={}",
+        db.__rows_examined()
+    );
 
-    // EXPLAIN proves the indexed scan feeds VectorSearch with the right (table, column).
-    let trace = db.explain(
+    let static_explain = db.explain(
         "SELECT id FROM evidence WHERE category = 'A' ORDER BY vector_text <=> '[0,0,1,0]' LIMIT 1"
     ).expect("explain");
     assert!(
-        trace.contains("IndexScan")
-            && trace.contains("VectorSearch")
-            && trace.contains("table=evidence")
-            && trace.contains("column=vector_text"),
-        "EXPLAIN must show IndexScan feeding VectorSearch(table=evidence, column=vector_text); got: {trace}"
+        static_explain.contains("VectorSearch")
+            && !static_explain.contains("candidates: IndexScan ->"),
+        "Database::explain must not forge an IndexScan candidate path; got: {static_explain}"
     );
 
     // Same WHERE, different ORDER BY column — the candidate set must be re-keyed per (table, column),
@@ -3210,6 +3226,17 @@ fn nv_indexed_filter_intersects_per_column_vector_search() {
         returned2.first(),
         Some(&Value::Uuid(a_ids[1])),
         "filtered vector_vision ANN must rank the nearest A row first, not merely return any A row"
+    );
+    assert_eq!(
+        r2.trace.physical_plan, "IndexScan -> VectorSearch",
+        "runtime trace must prove the indexed candidate set fed vector_vision ANN; got {:?}",
+        r2.trace
+    );
+    assert_eq!(r2.trace.index_used.as_deref(), Some("idx_category"));
+    assert!(
+        db.__rows_examined() <= a_ids.len() as u64,
+        "filtered vision ANN must read only the category='A' index postings before vector search; rows_examined={}",
+        db.__rows_examined()
     );
 }
 

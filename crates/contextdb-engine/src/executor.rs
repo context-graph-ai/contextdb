@@ -1,4 +1,4 @@
-use crate::database::{Database, InsertRowResult, QueryResult};
+use crate::database::{Database, InsertRowResult, QueryResult, QueryTrace};
 use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
 use contextdb_parser::ast::{
@@ -670,9 +670,10 @@ pub(crate) fn execute_plan(
         } => {
             let query_vec = resolve_vector_from_expr(query_expr, params)?;
             let snapshot = db.snapshot();
-            let all_rows = db.scan(table, snapshot)?;
+            let mut candidate_trace = None;
             let candidate_bitmap = if let Some(cands_plan) = candidates {
                 let qr = execute_plan(db, cands_plan, params, tx)?;
+                candidate_trace = Some(qr.trace.clone());
                 let mut bm = RoaringTreemap::new();
                 let row_id_idx = qr.columns.iter().position(|column| {
                     column == "row_id" || column.rsplit('.').next() == Some("row_id")
@@ -689,13 +690,7 @@ pub(crate) fn execute_plan(
                         }
                     }
                 } else if let Some(idx) = id_idx {
-                    let uuid_to_row_id: HashMap<uuid::Uuid, RowId> = all_rows
-                        .iter()
-                        .filter_map(|row| match row.values.get("id") {
-                            Some(Value::Uuid(uuid)) => Some((*uuid, row.row_id)),
-                            _ => None,
-                        })
-                        .collect();
+                    let uuid_to_row_id = uuid_to_row_id_map(db, table, snapshot)?;
                     for row in qr.rows {
                         if let Some(Value::Uuid(uuid)) = row.get(idx)
                             && let Some(row_id) = uuid_to_row_id.get(uuid)
@@ -727,6 +722,8 @@ pub(crate) fn execute_plan(
             let res = res?;
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
+            let result_row_ids = res.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
+            let result_rows = rows_by_row_id(db, table, &result_row_ids, snapshot)?;
             let schema_columns = db.table_meta(table).map(|meta| {
                 meta.columns
                     .into_iter()
@@ -737,7 +734,7 @@ pub(crate) fn execute_plan(
                 sc.clone()
             } else {
                 let mut ks = BTreeSet::new();
-                for r in &all_rows {
+                for r in &result_rows {
                     for k in r.values.keys() {
                         ks.insert(k.clone());
                     }
@@ -746,7 +743,7 @@ pub(crate) fn execute_plan(
             };
 
             let row_map: HashMap<RowId, &VersionedRow> =
-                all_rows.iter().map(|r| (r.row_id, r)).collect();
+                result_rows.iter().map(|r| (r.row_id, r)).collect();
 
             let mut columns = vec!["row_id".to_string()];
             columns.extend(keys.iter().cloned());
@@ -770,7 +767,20 @@ pub(crate) fn execute_plan(
                 columns,
                 rows,
                 rows_affected: 0,
-                trace: crate::database::QueryTrace::scan(),
+                trace: vector_search_trace(
+                    if db
+                        .__debug_vector_hnsw_len(contextdb_core::VectorIndexRef::new(
+                            table.clone(),
+                            column.clone(),
+                        ))
+                        .is_some()
+                    {
+                        "HNSWSearch"
+                    } else {
+                        "VectorSearch"
+                    },
+                    candidate_trace,
+                ),
                 cascade: None,
             })
         }
@@ -3051,6 +3061,76 @@ fn materialize_rows(
         trace: crate::database::QueryTrace::scan(),
         cascade: None,
     })
+}
+
+fn rows_by_row_id(
+    db: &Database,
+    table: &str,
+    row_ids: &[RowId],
+    snapshot: SnapshotId,
+) -> Result<Vec<VersionedRow>> {
+    if row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let wanted = row_ids.iter().copied().collect::<HashSet<_>>();
+    let tables = db.relational_store().tables.read();
+    let rows = tables
+        .get(table)
+        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+    let mut found = HashMap::with_capacity(wanted.len());
+    for row in rows {
+        if wanted.contains(&row.row_id) && row.visible_at(snapshot) {
+            found.insert(row.row_id, row.clone());
+            if found.len() == wanted.len() {
+                break;
+            }
+        }
+    }
+
+    Ok(row_ids
+        .iter()
+        .filter_map(|row_id| found.remove(row_id))
+        .collect())
+}
+
+fn uuid_to_row_id_map(
+    db: &Database,
+    table: &str,
+    snapshot: SnapshotId,
+) -> Result<HashMap<uuid::Uuid, RowId>> {
+    let tables = db.relational_store().tables.read();
+    let rows = tables
+        .get(table)
+        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+    Ok(rows
+        .iter()
+        .filter(|row| row.visible_at(snapshot))
+        .filter_map(|row| match row.values.get("id") {
+            Some(Value::Uuid(uuid)) => Some((*uuid, row.row_id)),
+            _ => None,
+        })
+        .collect())
+}
+
+fn vector_search_trace(operator: &'static str, candidate_trace: Option<QueryTrace>) -> QueryTrace {
+    let Some(mut trace) = candidate_trace else {
+        return QueryTrace {
+            physical_plan: operator,
+            ..Default::default()
+        };
+    };
+
+    trace.physical_plan = match (trace.physical_plan, operator) {
+        ("IndexScan", "HNSWSearch") => "IndexScan -> HNSWSearch",
+        ("IndexScan", _) => "IndexScan -> VectorSearch",
+        ("Scan", "HNSWSearch") => "Scan -> HNSWSearch",
+        ("Scan", _) => "Scan -> VectorSearch",
+        (_, "HNSWSearch") => "HNSWSearch",
+        _ => "VectorSearch",
+    };
+    trace.sort_elided = false;
+    trace
 }
 
 fn row_matches(row: &VersionedRow, expr: &Expr, params: &HashMap<String, Value>) -> Result<bool> {

@@ -585,20 +585,6 @@ impl Database {
             output = output.replace("VectorSearch(", "VectorSearch(strategy=BruteForce, ");
             output = output.replace("VectorSearch {", "VectorSearch { strategy: BruteForce,");
         }
-        if let Some(index) = &vector_index
-            && !output.contains("IndexScan")
-            && sql.to_ascii_uppercase().contains(" WHERE ")
-        {
-            let operator = if uses_hnsw {
-                "HNSWSearch"
-            } else {
-                "VectorSearch"
-            };
-            output.push_str(&format!(
-                " candidates: IndexScan -> {operator}(table={}, column={})",
-                index.table, index.column
-            ));
-        }
         Ok(output)
     }
 
