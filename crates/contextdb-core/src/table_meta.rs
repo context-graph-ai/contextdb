@@ -245,14 +245,14 @@ pub struct ColumnDef {
     pub immutable: bool,
     #[serde(default)]
     pub quantization: VectorQuantization,
+    #[serde(default)]
+    pub rank_policy: Option<RankPolicy>,
 }
 
 // Custom `Deserialize` that tolerates prior on-disk schemas missing the
-// `immutable` field (backward-compat, I5). Attempts to deserialize the full
-// nine-field struct; on sequence truncation at the trailing `immutable`
-// position, defaults it to `false`. JSON / other formats that distinguish
+// trailing fields (backward-compat, I5). JSON / other formats that distinguish
 // "missing field" from "required field" continue to work via `serde(default)`
-// on the field itself.
+// on the fields themselves.
 impl<'de> serde::Deserialize<'de> for ColumnDef {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -300,6 +300,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let quantization = seq
                     .next_element::<VectorQuantization>()?
                     .unwrap_or_default();
+                let rank_policy = seq
+                    .next_element::<Option<RankPolicy>>()?
+                    .unwrap_or_default();
                 Ok(ColumnDef {
                     name,
                     column_type,
@@ -311,6 +314,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     expires,
                     immutable,
                     quantization,
+                    rank_policy,
                 })
             }
 
@@ -328,6 +332,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut expires: Option<bool> = None;
                 let mut immutable: Option<bool> = None;
                 let mut quantization: Option<VectorQuantization> = None;
+                let mut rank_policy: Option<Option<RankPolicy>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -341,6 +346,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "expires" => expires = Some(map.next_value()?),
                         "immutable" => immutable = Some(map.next_value()?),
                         "quantization" => quantization = Some(map.next_value()?),
+                        "rank_policy" => rank_policy = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -361,6 +367,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     expires: expires.unwrap_or_default(),
                     immutable: immutable.unwrap_or_default(),
                     quantization: quantization.unwrap_or_default(),
+                    rank_policy: rank_policy.unwrap_or_default(),
                 })
             }
         }
@@ -376,9 +383,19 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "expires",
             "immutable",
             "quantization",
+            "rank_policy",
         ];
         deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankPolicy {
+    pub joined_table: String,
+    pub joined_column: String,
+    pub sort_key: String,
+    pub formula: String,
+    pub protected_index: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,10 +547,22 @@ impl ColumnDef {
             .as_ref()
             .map(|reference| 32 + reference.table.len() * 16 + reference.column.len() * 16)
             .unwrap_or(0);
+        let rank_policy_bytes = self
+            .rank_policy
+            .as_ref()
+            .map(|policy| {
+                40 + policy.joined_table.len() * 16
+                    + policy.joined_column.len() * 16
+                    + policy.sort_key.len() * 16
+                    + policy.formula.len() * 16
+                    + policy.protected_index.len() * 16
+            })
+            .unwrap_or(0);
         8 + self.name.len() * 16
             + self.column_type.estimated_bytes()
             + default_bytes
             + reference_bytes
+            + rank_policy_bytes
             + 8
     }
 }

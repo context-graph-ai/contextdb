@@ -37,6 +37,7 @@ testcontainers = "0.27"
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 regex = "1"
+tracing-subscriber = "0.3"
 
 [[test]]
 name = "integration"
@@ -65,3 +66,8 @@ path = "../../benches/mixed_workflows_pr.rs"
 name = "subscriptions_pr"
 harness = false
 path = "../../benches/subscriptions_pr.rs"
+
+[[bench]]
+name = "rank_policy_recall"
+harness = false
+path = "../../benches/rank_policy_recall.rs"

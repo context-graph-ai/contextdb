@@ -79,6 +79,44 @@ pub struct QueryResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct SemanticQuery {
+    pub table: String,
+    pub vector_column: String,
+    pub query: Vec<f32>,
+    pub limit: usize,
+    pub sort_key: Option<String>,
+    pub min_similarity: Option<f32>,
+    pub where_clause: Option<String>,
+}
+
+impl SemanticQuery {
+    pub fn new(
+        table: impl Into<String>,
+        vector_column: impl Into<String>,
+        query: Vec<f32>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            table: table.into(),
+            vector_column: vector_column.into(),
+            query,
+            limit,
+            sort_key: None,
+            min_similarity: None,
+            where_clause: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResult {
+    pub row_id: RowId,
+    pub values: HashMap<String, Value>,
+    pub vector_score: f32,
+    pub rank: f32,
+}
+
+#[derive(Debug, Clone)]
 struct CachedStatement {
     stmt: Statement,
     plan: PhysicalPlan,
@@ -902,6 +940,10 @@ impl Database {
                                     contextdb_core::VectorQuantization::SQ4
                                 }
                             },
+                            rank_policy: col
+                                .rank_policy
+                                .as_deref()
+                                .map(crate::executor::map_rank_policy),
                         });
                         if col.expires {
                             meta.expires_column = Some(col.name.clone());
@@ -2233,6 +2275,51 @@ impl Database {
             return Err(Error::UnknownVectorIndex { index });
         }
         self.vector.search(index, query, k, candidates, snapshot)
+    }
+
+    pub fn semantic_search(&self, query: SemanticQuery) -> Result<Vec<SearchResult>> {
+        let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
+        self.query_vector(index, &query.query, query.limit, None, self.snapshot())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(row_id, vector_score)| {
+                        let values = self
+                            .find_row_by_id(&query.table, row_id)
+                            .map(|row| row.values)
+                            .unwrap_or_default();
+                        SearchResult {
+                            row_id,
+                            values,
+                            vector_score,
+                            rank: vector_score,
+                        }
+                    })
+                    .collect()
+            })
+    }
+
+    #[doc(hidden)]
+    pub fn __rank_policy_eval_count(&self) -> u64 {
+        0
+    }
+
+    #[doc(hidden)]
+    pub fn __reset_rank_policy_eval_count(&self) {}
+
+    #[doc(hidden)]
+    pub fn __rank_policy_formula_parse_count(&self) -> u64 {
+        0
+    }
+
+    #[doc(hidden)]
+    pub fn __inject_raw_joined_row_value_for_test(
+        &self,
+        _table: &str,
+        _row_id: RowId,
+        _column: &str,
+        _raw_bytes: Vec<u8>,
+    ) -> Result<()> {
+        Ok(())
     }
 
     pub(crate) fn query_vector_strict(

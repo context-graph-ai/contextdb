@@ -56,6 +56,7 @@ select_core = {
     ~ join_clause*
     ~ where_clause?
     ~ order_by_clause?
+    ~ use_rank_clause?
     ~ limit_clause?
 }
 distinct_kw = { ^"DISTINCT" }
@@ -65,16 +66,17 @@ star = { "*" }
 select_item = { expr ~ (^"AS" ~ identifier)? }
 
 from_clause = { ^"FROM" ~ from_item ~ ("," ~ from_item)* }
-join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | order_by_start | limit_start | clause_end) }
+join_clause = { join_type ~ join_table_ref ~ ^"ON" ~ expr ~ &(join_type | where_start | order_by_start | use_rank_start | limit_start | clause_end) }
 join_table_ref = { identifier ~ (^"AS" ~ identifier | identifier ~ &(^"ON"))? }
 join_type = { (^"LEFT" ~ ^"JOIN") | (^"INNER" ~ ^"JOIN") }
 from_item = { graph_table | table_ref }
 table_ref = { identifier ~ ((^"AS")? ~ table_alias)? }
-table_alias = { !(join_type | where_start | order_by_start | limit_start | clause_end) ~ identifier }
+table_alias = { !(join_type | where_start | order_by_start | use_rank_start | limit_start | clause_end) ~ identifier }
 
-where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | limit_start | clause_end) }
+where_clause = { ^"WHERE" ~ expr ~ &(order_by_start | use_rank_start | limit_start | clause_end) }
 where_start = _{ ^"WHERE" }
 order_by_start = _{ ^"ORDER" ~ ^"BY" }
+use_rank_start = _{ ^"USE" ~ ^"RANK" }
 limit_start = _{ ^"LIMIT" }
 clause_end = _{ EOI | ";" | ")" | "," }
 
@@ -82,6 +84,8 @@ order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
 order_item = { cosine_expr | expr ~ sort_dir? }
 sort_dir = { ^"ASC" | ^"DESC" }
 cosine_expr = { additive_expr ~ "<=>" ~ additive_expr }
+
+use_rank_clause = { ^"USE" ~ ^"RANK" ~ identifier }
 
 limit_clause = { ^"LIMIT" ~ integer }
 
@@ -174,6 +178,7 @@ column_constraint = {
     | fk_propagation_clause
     | expires_constraint
     | immutable_constraint
+    | rank_policy_clause
     | state_machine_option
 }
 expires_constraint = { ^"EXPIRES" }
@@ -184,6 +189,19 @@ primary_key = { ^"PRIMARY" ~ ^"KEY" }
 unique = { ^"UNIQUE" }
 default_clause = { ^"DEFAULT" ~ expr }
 references_clause = { ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
+rank_policy_clause = {
+    ^"RANK_POLICY"
+    ~ "("
+    ~ rank_policy_join
+    ~ ","
+    ~ rank_policy_formula
+    ~ ","
+    ~ rank_policy_sort_key
+    ~ ")"
+}
+rank_policy_join = { ^"JOIN" ~ identifier ~ ^"ON" ~ identifier }
+rank_policy_formula = { ^"FORMULA" ~ string }
+rank_policy_sort_key = { ^"SORT_KEY" ~ identifier }
 fk_propagation_clause = {
     ^"ON"
     ~ ^"STATE"

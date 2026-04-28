@@ -105,6 +105,7 @@ pub(crate) fn execute_plan(
                         expires: c.expires,
                         immutable: c.immutable,
                         quantization: map_vector_quantization(c.quantization),
+                        rank_policy: c.rank_policy.as_deref().map(map_rank_policy),
                     })
                     .collect(),
                 immutable: p.immutable,
@@ -227,6 +228,7 @@ pub(crate) fn execute_plan(
                         expires: col.expires,
                         immutable: col.immutable,
                         quantization: map_vector_quantization(col.quantization),
+                        rank_policy: col.rank_policy.as_deref().map(map_rank_policy),
                     };
                     store
                         .alter_table_add_column(&p.table, core_col)
@@ -4810,6 +4812,18 @@ pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
         DataType::Json => contextdb_core::ColumnType::Json,
         DataType::Vector(dim) => contextdb_core::ColumnType::Vector(*dim as usize),
         DataType::TxId => contextdb_core::ColumnType::TxId,
+    }
+}
+
+pub(crate) fn map_rank_policy(
+    policy: &contextdb_parser::ast::RankPolicyAst,
+) -> contextdb_core::RankPolicy {
+    contextdb_core::RankPolicy {
+        joined_table: policy.joined_table.clone(),
+        joined_column: policy.joined_column.clone(),
+        sort_key: policy.sort_key.clone(),
+        formula: policy.formula.clone(),
+        protected_index: String::new(),
     }
 }
 

@@ -103,6 +103,7 @@ pub struct SelectBody {
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
+    pub use_rank: Option<String>,
     pub limit: Option<u64>,
 }
 
@@ -332,6 +333,15 @@ pub struct ColumnDef {
     pub expires: bool,
     pub immutable: bool,
     pub quantization: VectorQuantization,
+    pub rank_policy: Option<Box<RankPolicyAst>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankPolicyAst {
+    pub joined_table: String,
+    pub joined_column: String,
+    pub sort_key: String,
+    pub formula: String,
 }
 
 #[derive(Debug, Clone)]

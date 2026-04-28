@@ -930,6 +930,7 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
                             expires: c.expires,
                             immutable: c.immutable,
                             quantization: contextdb_core::VectorQuantization::F32,
+                            rank_policy: None,
                         })
                         .collect(),
                     ..TableMeta::default()

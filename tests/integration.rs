@@ -41,6 +41,8 @@ mod peak_rss_harness;
 mod persistence_tests;
 #[path = "integration/plugin_tests.rs"]
 mod plugin_tests;
+#[path = "integration/rank_policy_tests.rs"]
+mod rank_policy_tests;
 #[path = "integration/retention_tests.rs"]
 mod retention_tests;
 #[path = "integration/safety_integrity.rs"]

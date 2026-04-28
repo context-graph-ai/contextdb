@@ -125,6 +125,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     let mut joins = Vec::new();
     let mut where_clause = None;
     let mut order_by = Vec::new();
+    let mut use_rank = None;
     let mut limit = None;
 
     for p in pair.into_inner() {
@@ -145,6 +146,9 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
             Rule::order_by_clause => {
                 order_by = build_order_by_clause(p)?;
             }
+            Rule::use_rank_clause => {
+                use_rank = Some(build_use_rank_clause(p)?);
+            }
             Rule::limit_clause => {
                 limit = Some(build_limit_clause(p)?);
             }
@@ -159,6 +163,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
         joins,
         where_clause,
         order_by,
+        use_rank,
         limit,
     })
 }
@@ -579,6 +584,13 @@ fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
         .find(|p| p.as_rule() == Rule::integer)
         .ok_or_else(|| Error::ParseError("LIMIT missing value".to_string()))?;
     parse_u64(num.as_str(), "invalid LIMIT value")
+}
+
+fn build_use_rank_clause(pair: Pair<'_, Rule>) -> Result<String> {
+    pair.into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("USE RANK missing sort key".to_string()))
 }
 
 fn build_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
@@ -1283,6 +1295,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut expires = false;
     let mut immutable_flag = false;
     let mut quantization = VectorQuantization::F32;
+    let mut rank_policy = None;
     // Track if we saw the type token before column_constraints. If IMMUTABLE appears
     // as the column name (i.e. before the data_type position), Pest will parse it as
     // the identifier rule; we detect that case by the column name.
@@ -1372,6 +1385,11 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                         }
                         immutable_flag = true;
                     }
+                    Rule::rank_policy_clause => {
+                        if rank_policy.is_none() {
+                            rank_policy = Some(Box::new(build_rank_policy_clause(c)?));
+                        }
+                    }
                     Rule::state_machine_option => {
                         if inline_state_machine.is_some() {
                             return Err(Error::ParseError(
@@ -1409,9 +1427,57 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             expires,
             immutable: immutable_flag,
             quantization,
+            rank_policy,
         },
         inline_state_machine,
     ))
+}
+
+fn build_rank_policy_clause(pair: Pair<'_, Rule>) -> Result<RankPolicyAst> {
+    let mut joined_table = None;
+    let mut joined_column = None;
+    let mut formula = None;
+    let mut sort_key = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::rank_policy_join => {
+                let mut identifiers = p
+                    .into_inner()
+                    .filter(|part| part.as_rule() == Rule::identifier)
+                    .map(|part| parse_identifier(part.as_str()));
+                joined_table = identifiers.next();
+                joined_column = identifiers.next();
+            }
+            Rule::rank_policy_formula => {
+                let raw = p
+                    .into_inner()
+                    .find(|part| part.as_rule() == Rule::string)
+                    .ok_or_else(|| {
+                        Error::ParseError("RANK_POLICY FORMULA missing string".to_string())
+                    })?;
+                formula = Some(parse_string_literal(raw.as_str()));
+            }
+            Rule::rank_policy_sort_key => {
+                sort_key = p
+                    .into_inner()
+                    .find(|part| part.as_rule() == Rule::identifier)
+                    .map(|part| parse_identifier(part.as_str()));
+            }
+            other => return Err(unexpected_rule(other, "build_rank_policy_clause")),
+        }
+    }
+
+    Ok(RankPolicyAst {
+        joined_table: joined_table
+            .ok_or_else(|| Error::ParseError("RANK_POLICY JOIN missing table".to_string()))?,
+        joined_column: joined_column
+            .ok_or_else(|| Error::ParseError("RANK_POLICY JOIN missing column".to_string()))?,
+        formula: formula
+            .ok_or_else(|| Error::ParseError("RANK_POLICY FORMULA missing string".to_string()))?,
+        sort_key: sort_key
+            .ok_or_else(|| Error::ParseError("RANK_POLICY SORT_KEY missing key".to_string()))?,
+    })
 }
 
 fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {

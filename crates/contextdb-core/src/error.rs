@@ -29,6 +29,52 @@ pub enum Error {
     },
     #[error("unknown vector index {index:?}")]
     UnknownVectorIndex { index: VectorIndexRef },
+    #[error("rank policy column unknown")]
+    RankPolicyColumnUnknown { index: String, column: String },
+    #[error("rank policy column ambiguous")]
+    RankPolicyColumnAmbiguous { index: String, column: String },
+    #[error("rank policy column type mismatch")]
+    RankPolicyColumnType {
+        index: String,
+        column: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("rank policy join table unknown")]
+    RankPolicyJoinTableUnknown { index: String, table: String },
+    #[error("rank policy join column unknown")]
+    RankPolicyJoinColumnUnknown {
+        index: String,
+        table: String,
+        column: String,
+    },
+    #[error("rank policy join column unindexed")]
+    RankPolicyJoinColumnUnindexed {
+        index: String,
+        joined_table: String,
+        column: String,
+    },
+    #[error("rank policy not found")]
+    RankPolicyNotFound { index: String, sort_key: String },
+    #[error("rank policy formula parse failed")]
+    RankPolicyFormulaParse {
+        index: String,
+        position: usize,
+        reason: String,
+    },
+    #[error("USE RANK requires vector ORDER BY")]
+    UseRankRequiresVectorOrder,
+    #[error("USE RANK requires LIMIT")]
+    UseRankRequiresLimit,
+    #[error("drop blocked by rank policy")]
+    DropBlockedByRankPolicy {
+        table: Box<str>,
+        column: Option<Box<str>>,
+        dropped_index: Option<Box<str>>,
+        policy_table: Box<str>,
+        policy_column: Box<str>,
+        sort_key: Box<str>,
+    },
     #[error(
         "legacy vector store detected (format marker {found_format_marker:?}); rebuild required for release {expected_release} - sync from a 1.0+ peer or recreate the schema and reimport"
     )]
