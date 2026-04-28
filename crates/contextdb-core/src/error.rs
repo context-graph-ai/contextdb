@@ -21,8 +21,6 @@ pub enum Error {
     BfsDepthExceeded(u32),
     #[error("BFS visited set exceeded limit ({0})")]
     BfsVisitedExceeded(usize),
-    #[error("dimension mismatch: expected {expected}, got {got}")]
-    VectorDimensionMismatch { expected: usize, got: usize },
     #[error("vector index dimension mismatch on {index:?}: expected {expected}, got {actual}")]
     VectorIndexDimensionMismatch {
         index: VectorIndexRef,

@@ -1,6 +1,7 @@
 pub mod cosine;
 pub mod hnsw;
 pub mod mem;
+pub(crate) mod quantized;
 pub mod store;
 
 pub use cosine::cosine_similarity;

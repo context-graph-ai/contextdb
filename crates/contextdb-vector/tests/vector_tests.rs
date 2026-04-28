@@ -1,4 +1,4 @@
-use contextdb_core::{Error, RowId, Value, VectorExecutor, VectorIndexRef};
+use contextdb_core::{Error, RowId, Value, VectorExecutor, VectorIndexRef, VectorQuantization};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use contextdb_vector::{MemVectorExecutor, VectorStore, cosine_similarity};
 use roaring::RoaringTreemap;
@@ -23,6 +23,7 @@ impl WriteSetApplicator for TestStore {
 fn setup() -> (Arc<TxManager<TestStore>>, MemVectorExecutor<TestStore>) {
     let hnsw = Arc::new(OnceLock::new());
     let vector = Arc::new(VectorStore::new(hnsw.clone()));
+    vector.register_index(index(), 2, VectorQuantization::F32);
     let tx_mgr = Arc::new(TxManager::new(TestStore {
         vector: vector.clone(),
     }));
@@ -119,10 +120,11 @@ fn dimension_mismatch_errors() {
         .unwrap_err();
     assert!(matches!(
         err,
-        Error::VectorDimensionMismatch {
+        Error::VectorIndexDimensionMismatch {
+            index,
             expected: 2,
-            got: 3
-        }
+            actual: 3
+        } if index == VectorIndexRef::new("vectors", "embedding")
     ));
 }
 
@@ -135,10 +137,21 @@ fn k_zero_returns_empty_and_empty_store_returns_empty() {
             .is_empty()
     );
     assert!(
-        exec.search(index(), &[1.0], 10, None, tx_mgr.snapshot())
+        exec.search(index(), &[1.0, 0.0], 10, None, tx_mgr.snapshot())
             .unwrap()
             .is_empty()
     );
+    let err = exec
+        .search(index(), &[1.0], 10, None, tx_mgr.snapshot())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::VectorIndexDimensionMismatch {
+            index,
+            expected: 2,
+            actual: 1
+        } if index == VectorIndexRef::new("vectors", "embedding")
+    ));
 }
 
 #[test]

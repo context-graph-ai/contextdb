@@ -3,6 +3,18 @@ use contextdb_engine::Database;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+pub fn embedding384(values: &[f32]) -> Vec<f32> {
+    assert!(
+        values.len() <= 384,
+        "test embedding helper accepts at most 384 dimensions"
+    );
+    let mut vector = vec![0.0; 384];
+    for (slot, value) in vector.iter_mut().zip(values.iter()) {
+        *slot = *value;
+    }
+    vector
+}
+
 pub fn setup_ontology_db() -> Database {
     let db = Database::open_memory();
     let params = HashMap::new();
@@ -18,12 +30,12 @@ pub fn setup_ontology_db() -> Database {
     )
     .unwrap();
     db.execute(
-        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL)",
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL, embedding VECTOR(2))",
         &params,
     )
     .unwrap();
     db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT)",
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT, embedding VECTOR(2))",
         &params,
     )
     .unwrap();
@@ -86,12 +98,12 @@ pub fn setup_ontology_db_with_dag() -> Database {
     )
     .unwrap();
     db.execute(
-        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL)",
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL, embedding VECTOR(2))",
         &params,
     )
     .unwrap();
     db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT)",
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT, embedding VECTOR(2))",
         &params,
     )
     .unwrap();

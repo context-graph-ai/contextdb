@@ -136,8 +136,9 @@ impl Wallclock {
         )
     }
 
-    /// Test seam: install a closure that replaces the `SystemTime::now()` read.
-    /// Provides deterministic wall-clock for retention / sync / ordering tests.
+    /// Test seam: install a closure that replaces the `SystemTime::now()` read
+    /// on the calling thread. Tests that spawn worker threads must install the
+    /// seam inside each worker that is expected to observe mocked time.
     pub fn set_test_clock<F>(f: F)
     where
         F: Fn() -> u64 + Send + Sync + 'static,

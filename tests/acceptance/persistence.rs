@@ -1,5 +1,5 @@
 use super::common::*;
-use contextdb_core::{Error, MemoryAccountant, Value};
+use contextdb_core::{Error, MemoryAccountant, Value, VectorIndexRef};
 use contextdb_engine::Database;
 use std::fs;
 use std::path::Path;
@@ -1020,6 +1020,20 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
             recall_row[bytes_idx]
         );
     }
+    let storage_bytes = reopened
+        .__debug_vector_storage_bytes_per_entry(VectorIndexRef::new("recall", "vec"))
+        .expect("debug storage bytes for recall.vec");
+    assert_eq!(
+        storage_bytes.len(),
+        count,
+        "reopened recall.vec must retain one live vector payload per inserted row"
+    );
+    assert!(
+        storage_bytes
+            .iter()
+            .all(|bytes| *bytes <= contextdb_core::VectorQuantization::SQ8.storage_bytes(dim)),
+        "reopened SQ8 live storage must retain quantized payloads, not decoded f32 entries; got {storage_bytes:?}"
+    );
     let f32_db_path = tmp.path().join("q_f32_baseline.db");
     persist_vector_rows_for_footprint(&f32_db_path, "recall", dim, None, &inserted);
     let sq8_file_bytes = file_len(&db_path);
@@ -1128,6 +1142,20 @@ fn f113b_sq8_cross_batch_recall_stability() {
         accountant.usage().used < live_f32_baseline_bytes,
         "SQ8 live storage must stay below the raw f32 vector payload baseline under MEMORY_LIMIT; used={}, f32_baseline={live_f32_baseline_bytes}",
         accountant.usage().used
+    );
+    let storage_bytes = db
+        .__debug_vector_storage_bytes_per_entry(VectorIndexRef::new("crossbatch", "vec"))
+        .expect("debug storage bytes for crossbatch.vec");
+    assert_eq!(
+        storage_bytes.len(),
+        batch.len(),
+        "crossbatch.vec must retain one live vector payload per inserted row"
+    );
+    assert!(
+        storage_bytes
+            .iter()
+            .all(|bytes| *bytes <= contextdb_core::VectorQuantization::SQ8.storage_bytes(dim)),
+        "SQ8 live storage must retain quantized payloads under memory pressure; got {storage_bytes:?}"
     );
 
     let indexes = db
@@ -1273,6 +1301,20 @@ fn f113c_sq4_cross_batch_recall_stability() {
         accountant.usage().used < live_f32_baseline_bytes,
         "SQ4 live storage must stay below the raw f32 vector payload baseline under MEMORY_LIMIT; used={}, f32_baseline={live_f32_baseline_bytes}",
         accountant.usage().used
+    );
+    let storage_bytes = db
+        .__debug_vector_storage_bytes_per_entry(VectorIndexRef::new("crossbatch4", "vec"))
+        .expect("debug storage bytes for crossbatch4.vec");
+    assert_eq!(
+        storage_bytes.len(),
+        batch.len(),
+        "crossbatch4.vec must retain one live vector payload per inserted row"
+    );
+    assert!(
+        storage_bytes
+            .iter()
+            .all(|bytes| *bytes <= contextdb_core::VectorQuantization::SQ4.storage_bytes(dim)),
+        "SQ4 live storage must retain quantized payloads under memory pressure; got {storage_bytes:?}"
     );
 
     let indexes = db

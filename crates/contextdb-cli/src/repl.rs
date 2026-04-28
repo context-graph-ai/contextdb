@@ -470,10 +470,7 @@ fn execute_sql(db: &Database, sql: &str, script_line: Option<usize>) -> bool {
             true
         }
         Err(e) => {
-            let legacy_vector_mismatch = render_legacy_vector_dimension_mismatch(db, sql, &e);
-            let rendered = if let Some(rendered) = legacy_vector_mismatch.as_ref() {
-                rendered.clone()
-            } else if matches!(e, Error::ParseError(_)) {
+            let rendered = if matches!(e, Error::ParseError(_)) {
                 if let Some(line) = script_line {
                     format!("line {line}: {e}")
                 } else {
@@ -483,7 +480,7 @@ fn execute_sql(db: &Database, sql: &str, script_line: Option<usize>) -> bool {
                 e.to_string()
             }
             .replace('\n', " ");
-            if is_fatal_cli_error(&e) || legacy_vector_mismatch.is_some() {
+            if is_fatal_cli_error(&e) {
                 eprintln!("Error: {rendered}");
                 false
             } else {
@@ -492,59 +489,6 @@ fn execute_sql(db: &Database, sql: &str, script_line: Option<usize>) -> bool {
             }
         }
     }
-}
-
-fn render_legacy_vector_dimension_mismatch(
-    db: &Database,
-    sql: &str,
-    error: &Error,
-) -> Option<String> {
-    let Error::VectorDimensionMismatch { expected, got } = error else {
-        return None;
-    };
-    let table = extract_insert_table(sql)?;
-    let meta = db.table_meta(&table)?;
-    let matching_columns = meta
-        .columns
-        .iter()
-        .filter_map(|column| match column.column_type {
-            contextdb_core::ColumnType::Vector(dimension) if dimension == *expected => {
-                Some(column.name.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let [column] = matching_columns.as_slice() else {
-        return None;
-    };
-    Some(format!(
-        "vector index dimension mismatch on {table}.{column}: expected {expected}, got {got}"
-    ))
-}
-
-fn extract_insert_table(sql: &str) -> Option<String> {
-    let trimmed = sql.trim_start();
-    if !trimmed
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("insert"))
-    {
-        return None;
-    }
-    let rest = trimmed.get(6..)?.trim_start();
-    if !rest
-        .get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("into"))
-    {
-        return None;
-    }
-    let table = rest
-        .get(4..)?
-        .trim_start()
-        .trim_start_matches('"')
-        .split(|ch: char| ch.is_whitespace() || ch == '(' || ch == '"')
-        .next()?
-        .trim();
-    (!table.is_empty()).then(|| table.to_string())
 }
 
 pub fn is_fatal_cli_error_public(error: &Error) -> bool {

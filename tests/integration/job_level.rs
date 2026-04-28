@@ -54,7 +54,7 @@ fn job_03_vector_search_with_explain() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         row,
-        vec![1.0, 0.0],
+        embedding384(&[1.0, 0.0]),
     )
     .unwrap();
     db.commit(tx).unwrap();
@@ -62,7 +62,7 @@ fn job_03_vector_search_with_explain() {
     let out = db
         .execute(
             "SELECT * FROM observations ORDER BY embedding <=> $q LIMIT 1",
-            &make_params(vec![("q", Value::Vector(vec![1.0, 0.0]))]),
+            &make_params(vec![("q", Value::Vector(embedding384(&[1.0, 0.0])))]),
         )
         .unwrap();
     assert_eq!(out.rows.len(), 1);

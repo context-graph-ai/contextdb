@@ -102,14 +102,14 @@ fn vector_search_and_explain() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         r1,
-        vec![1.0, 0.0],
+        vec![1.0, 0.0, 0.0],
     )
     .unwrap();
     db.insert_vector(
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         r2,
-        vec![0.0, 1.0],
+        vec![0.0, 1.0, 0.0],
     )
     .unwrap();
     db.commit(tx).unwrap();
@@ -117,7 +117,7 @@ fn vector_search_and_explain() {
     let out = db
         .execute(
             "SELECT * FROM observations ORDER BY embedding <=> $q LIMIT 1",
-            &params(vec![("q", Value::Vector(vec![1.0, 0.0]))]),
+            &params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
     assert_eq!(out.rows.len(), 1);
@@ -219,7 +219,11 @@ fn vector_dimension_validation_via_sql() {
             ]),
         )
         .unwrap_err();
-    assert!(matches!(err, Error::VectorDimensionMismatch { .. }));
+    assert!(matches!(
+        err,
+        Error::VectorIndexDimensionMismatch { index, expected: 3, actual: 2 }
+            if index == contextdb_core::VectorIndexRef::new("observations", "embedding")
+    ));
 }
 
 #[test]

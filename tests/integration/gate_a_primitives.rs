@@ -1,4 +1,4 @@
-use super::helpers::{make_params, setup_ontology_db, setup_ontology_db_with_dag};
+use super::helpers::{embedding384, make_params, setup_ontology_db, setup_ontology_db_with_dag};
 use contextdb_core::Lsn;
 use contextdb_core::{Direction, Error, MemoryAccountant, UpsertResult, Value, VersionedRow};
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
@@ -1070,21 +1070,21 @@ fn a4_01_insert_and_search_basic() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         r1,
-        vec![1.0, 0.0, 0.0],
+        embedding384(&[1.0, 0.0, 0.0]),
     )
     .expect("v1");
     db.insert_vector(
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         r2,
-        vec![0.0, 1.0, 0.0],
+        embedding384(&[0.0, 1.0, 0.0]),
     )
     .expect("v2");
     db.insert_vector(
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         r3,
-        vec![0.0, 0.0, 1.0],
+        embedding384(&[0.0, 0.0, 1.0]),
     )
     .expect("v3");
     db.commit(tx).expect("commit");
@@ -1092,7 +1092,7 @@ fn a4_01_insert_and_search_basic() {
     let out = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0, 0.0],
+            &embedding384(&[1.0, 0.0, 0.0]),
             1,
             None,
             db.snapshot(),
@@ -1122,7 +1122,7 @@ fn a4_02_search_respects_k_limit() {
             tx,
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
             rid,
-            vec![idx as f32, 1.0, 0.0],
+            embedding384(&[idx as f32, 1.0, 0.0]),
         )
         .expect("insert vector");
     }
@@ -1131,7 +1131,7 @@ fn a4_02_search_respects_k_limit() {
     let out = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0, 0.0],
+            &embedding384(&[1.0, 0.0, 0.0]),
             3,
             None,
             db.snapshot(),
@@ -1161,7 +1161,7 @@ fn a4_03_search_with_candidate_prefilter() {
             tx,
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
             rid,
-            vec![1.0 - (idx as f32 * 0.01), 0.0, 0.0],
+            embedding384(&[1.0 - (idx as f32 * 0.01), 0.0, 0.0]),
         )
         .expect("insert vector");
         row_ids.push(rid);
@@ -1172,7 +1172,7 @@ fn a4_03_search_with_candidate_prefilter() {
     let out = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0, 0.0],
+            &embedding384(&[1.0, 0.0, 0.0]),
             5,
             Some(&candidates),
             db.snapshot(),
@@ -1190,7 +1190,7 @@ fn a4_04_search_empty_store() {
     let out = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0, 0.0],
+            &embedding384(&[1.0, 0.0, 0.0]),
             5,
             None,
             db.snapshot(),
@@ -1218,9 +1218,9 @@ fn a4_05_dimension_mismatch_error() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         rid,
-        vec![1.0, 0.0, 0.0],
+        embedding384(&[1.0, 0.0, 0.0]),
     )
-    .expect("insert 3d vector");
+    .expect("insert vector");
 
     let rid2 = db
         .insert_row(
@@ -1241,14 +1241,29 @@ fn a4_05_dimension_mismatch_error() {
     );
     assert!(matches!(
         err,
-        Err(Error::VectorDimensionMismatch {
-            expected: 3,
-            got: 5
-        })
+        Err(Error::VectorIndexDimensionMismatch {
+            index,
+            expected: 384,
+            actual: 5
+        }) if index == contextdb_core::VectorIndexRef::new("observations", "embedding")
     ));
 
     db.commit(tx).expect("commit");
-    // TODO: search-side dimension validation not yet implemented.
+    let err = db.query_vector(
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        &[1.0, 0.0, 0.0],
+        1,
+        None,
+        db.snapshot(),
+    );
+    assert!(matches!(
+        err,
+        Err(Error::VectorIndexDimensionMismatch {
+            index,
+            expected: 384,
+            actual: 3
+        }) if index == contextdb_core::VectorIndexRef::new("observations", "embedding")
+    ));
 }
 
 #[test]
@@ -1270,7 +1285,7 @@ fn a4_06_vector_deletion() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         rid,
-        vec![1.0, 0.0],
+        embedding384(&[1.0, 0.0]),
     )
     .expect("insert vector");
     db.commit(tx).expect("commit");
@@ -1286,7 +1301,7 @@ fn a4_06_vector_deletion() {
     assert!(
         !db.query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0],
+            &embedding384(&[1.0, 0.0]),
             5,
             None,
             db.snapshot()
@@ -1302,7 +1317,11 @@ fn a4_07_cosine_similarity_ordering() {
     let db = setup_ontology_db();
     let tx = db.begin();
     let mut ids = Vec::new();
-    for vector in [vec![1.0, 0.0], vec![0.9, 0.1], vec![0.0, 1.0]] {
+    for vector in [
+        embedding384(&[1.0, 0.0]),
+        embedding384(&[0.9, 0.1]),
+        embedding384(&[0.0, 1.0]),
+    ] {
         let rid = db
             .insert_row(
                 tx,
@@ -1328,7 +1347,7 @@ fn a4_07_cosine_similarity_ordering() {
     let out = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0],
+            &embedding384(&[1.0, 0.0]),
             3,
             None,
             db.snapshot(),
@@ -1399,7 +1418,7 @@ fn a4_09_search_k_zero_returns_empty() {
 #[test]
 fn a4_10_float32_precision_roundtrip() {
     let db = setup_ontology_db();
-    let input = [0.123_456_79_f32, -0.987_654_3_f32, 0.555_555_6_f32];
+    let input = embedding384(&[0.123_456_79_f32, -0.987_654_3_f32, 0.555_555_6_f32]);
     let obs_id = Uuid::new_v4();
 
     // Store embedding in the row's values map so we can retrieve it via point_lookup.
@@ -1412,7 +1431,7 @@ fn a4_10_float32_precision_roundtrip() {
                 ("id".to_string(), Value::Uuid(obs_id)),
                 ("entity_id".to_string(), Value::Uuid(Uuid::new_v4())),
                 ("data".to_string(), Value::Null),
-                ("embedding".to_string(), Value::Vector(input.to_vec())),
+                ("embedding".to_string(), Value::Vector(input.clone())),
             ]),
         )
         .expect("insert");
@@ -1420,7 +1439,7 @@ fn a4_10_float32_precision_roundtrip() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         rid,
-        input.to_vec(),
+        input.clone(),
     )
     .expect("insert vector");
     db.commit(tx).expect("commit");
@@ -2281,10 +2300,11 @@ fn a6_06_vector_dimension_enforced_at_insert() {
     );
     assert!(matches!(
         err,
-        Err(Error::VectorDimensionMismatch {
+        Err(Error::VectorIndexDimensionMismatch {
+            index,
             expected: 384,
-            got: 256
-        })
+            actual: 256
+        }) if index == contextdb_core::VectorIndexRef::new("observations", "embedding")
     ));
 }
 

@@ -107,7 +107,11 @@ fn f43_library_user_gets_typed_errors_not_strings() {
             ]),
         )
         .expect_err("dimension mismatch should error");
-    assert!(matches!(mismatch, Error::VectorDimensionMismatch { .. }));
+    assert!(matches!(
+        mismatch,
+        Error::VectorIndexDimensionMismatch { index, expected: 3, actual: 2 }
+            if index == contextdb_core::VectorIndexRef::new("vectors", "embedding")
+    ));
 }
 
 /// I ran 10 threads each committing 100 rows in separate transactions, and all 1000 rows were visible afterward.

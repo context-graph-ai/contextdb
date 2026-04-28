@@ -758,10 +758,11 @@ fn h16_dimension_mismatch_is_rejected_when_hnsw_would_be_active() {
 
     assert!(matches!(
         result,
-        Err(Error::VectorDimensionMismatch {
+        Err(Error::VectorIndexDimensionMismatch {
+            index,
             expected: 3,
-            got: 5
-        })
+            actual: 5
+        }) if index == contextdb_core::VectorIndexRef::new("items", "embedding")
     ));
 }
 

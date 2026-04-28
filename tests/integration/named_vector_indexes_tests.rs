@@ -3400,3 +3400,44 @@ fn nv19_unknown_index_apply_returns_typed_error() {
         "sync direction filtering must use VectorChange.index.table, not clone every vector change"
     );
 }
+
+#[test]
+fn nv19c_insert_vector_against_undeclared_index_fails() {
+    let db = Database::open_memory();
+    let tx = db.begin();
+    let result = db.insert_vector(
+        tx,
+        VectorIndexRef::new("nonexistent", "vector_x"),
+        RowId(1),
+        vec![0.0_f32; 4],
+    );
+    assert!(
+        matches!(
+            result,
+            Err(contextdb_core::Error::UnknownVectorIndex { ref index })
+                if *index == VectorIndexRef::new("nonexistent", "vector_x")
+        ),
+        "raw insert_vector must reject undeclared tables/indexes instead of auto-registering; got {result:?}"
+    );
+    db.rollback(tx).expect("rollback empty tx");
+}
+
+#[test]
+fn nv19d_query_vector_against_undeclared_table_fails() {
+    let db = Database::open_memory();
+    let result = db.query_vector(
+        VectorIndexRef::new("typo", "vector_text"),
+        &[0.0_f32; 4],
+        1,
+        None,
+        db.snapshot(),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(contextdb_core::Error::UnknownVectorIndex { ref index })
+                if *index == VectorIndexRef::new("typo", "vector_text")
+        ),
+        "raw query_vector must distinguish an undeclared table/index from an empty index; got {result:?}"
+    );
+}

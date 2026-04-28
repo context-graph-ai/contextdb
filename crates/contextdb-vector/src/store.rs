@@ -1,4 +1,4 @@
-use crate::HnswIndex;
+use crate::{HnswIndex, quantized::StoredVectorEntry};
 use contextdb_core::{
     Error, MemoryAccountant, Result, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuantization,
 };
@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 pub struct IndexState {
     dimension: usize,
     quantization: VectorQuantization,
-    vectors: RwLock<Vec<VectorEntry>>,
+    vectors: RwLock<Vec<StoredVectorEntry>>,
     hnsw: OnceLock<RwLock<Option<HnswIndex>>>,
     hnsw_bytes: AtomicUsize,
 }
@@ -48,16 +48,29 @@ impl IndexState {
             .read()
             .iter()
             .filter(|entry| entry.deleted_tx.is_none())
-            .map(|entry| self.quantization.storage_bytes(entry.vector.len()))
+            .map(StoredVectorEntry::estimated_bytes)
             .sum::<usize>();
         payload_bytes.saturating_add(self.hnsw_bytes.load(Ordering::SeqCst))
     }
 
-    pub fn all_entries(&self) -> Vec<VectorEntry> {
-        self.vectors.read().clone()
+    pub fn all_entries(&self, index: &VectorIndexRef) -> Vec<VectorEntry> {
+        self.vectors
+            .read()
+            .iter()
+            .map(|entry| entry.to_vector_entry(index.clone()))
+            .collect()
     }
 
-    pub fn find_by_row_id(&self, row_id: RowId) -> Option<VectorEntry> {
+    pub fn find_by_row_id(&self, index: &VectorIndexRef, row_id: RowId) -> Option<VectorEntry> {
+        self.vectors
+            .read()
+            .iter()
+            .rev()
+            .find(|entry| entry.row_id == row_id)
+            .map(|entry| entry.to_vector_entry(index.clone()))
+    }
+
+    fn stored_by_row_id(&self, row_id: RowId) -> Option<StoredVectorEntry> {
         self.vectors
             .read()
             .iter()
@@ -66,7 +79,20 @@ impl IndexState {
             .cloned()
     }
 
-    fn push_entry(&self, entry: VectorEntry) {
+    pub(crate) fn with_entries<R>(&self, f: impl FnOnce(&[StoredVectorEntry]) -> R) -> R {
+        let entries = self.vectors.read();
+        f(&entries)
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.vectors.read().len()
+    }
+
+    fn stored_entry(&self, entry: VectorEntry) -> StoredVectorEntry {
+        StoredVectorEntry::from_vector_entry(entry, self.quantization)
+    }
+
+    fn push_entry(&self, entry: StoredVectorEntry) {
         self.vectors.write().push(entry);
     }
 
@@ -80,12 +106,6 @@ impl IndexState {
             }
         }
         released
-    }
-
-    fn rewrite_entry_index(&self, index: &VectorIndexRef) {
-        for entry in self.vectors.write().iter_mut() {
-            entry.index = index.clone();
-        }
     }
 
     pub fn clear_hnsw(&self, accountant: &MemoryAccountant) {
@@ -124,6 +144,14 @@ impl IndexState {
 
     pub fn hnsw(&self) -> &OnceLock<RwLock<Option<HnswIndex>>> {
         &self.hnsw
+    }
+
+    pub fn storage_bytes_per_entry(&self) -> Vec<usize> {
+        self.vectors
+            .read()
+            .iter()
+            .map(StoredVectorEntry::estimated_bytes)
+            .collect()
     }
 }
 
@@ -174,7 +202,7 @@ impl VectorStore {
     ) {
         let mut registry = self.registry.write();
         match registry.get(&index) {
-            Some(state) if !state.all_entries().is_empty() => {}
+            Some(state) if state.entry_count() != 0 => {}
             Some(state) if state.dimension() == dimension => {}
             Some(_) | None => {
                 registry.insert(index, Arc::new(IndexState::new(dimension, quantization)));
@@ -216,7 +244,6 @@ impl VectorStore {
         let state = registry
             .remove(old)
             .ok_or_else(|| Error::UnknownVectorIndex { index: old.clone() })?;
-        state.rewrite_entry_index(&new);
         registry.insert(new, state);
         Ok(())
     }
@@ -259,12 +286,14 @@ impl VectorStore {
     pub fn apply_inserts(&self, inserts: Vec<VectorEntry>) {
         for entry in inserts {
             if let Some(state) = self.try_state(&entry.index) {
-                state.push_entry(entry.clone());
+                let stored_entry = state.stored_entry(entry);
+                let row_id = stored_entry.row_id;
+                state.push_entry(stored_entry.clone());
                 if let Some(lock) = state.hnsw().get() {
                     let guard = lock.write();
                     if let Some(hnsw) = guard.as_ref() {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            hnsw.insert(entry.row_id, &entry.vector);
+                            hnsw.insert(row_id, &stored_entry.vector);
                         }));
                     }
                 }
@@ -290,7 +319,7 @@ impl VectorStore {
     ) {
         for (index, old_row_id, new_row_id, tx) in moves {
             if let Some(state) = self.try_state(&index)
-                && let Some(old) = state.find_by_row_id(old_row_id)
+                && let Some(old) = state.stored_by_row_id(old_row_id)
                 && old.deleted_tx.is_none()
             {
                 state.tombstone_row(old_row_id, tx);
@@ -323,15 +352,16 @@ impl VectorStore {
             quantization,
         );
         if let Some(state) = self.try_state(&entry.index) {
-            state.push_entry(entry);
+            let stored_entry = state.stored_entry(entry);
+            state.push_entry(stored_entry);
         }
     }
 
     pub fn all_entries(&self) -> Vec<VectorEntry> {
         self.registry
             .read()
-            .values()
-            .flat_map(|state| state.all_entries())
+            .iter()
+            .flat_map(|(index, state)| state.all_entries(index))
             .collect()
     }
 
@@ -358,7 +388,7 @@ impl VectorStore {
     }
 
     pub fn entries_for_index(&self, index: &VectorIndexRef) -> Result<Vec<VectorEntry>> {
-        Ok(self.state(index)?.all_entries())
+        Ok(self.state(index)?.all_entries(index))
     }
 
     pub fn vector_count(&self) -> usize {
@@ -397,8 +427,8 @@ impl VectorStore {
     pub fn find_by_row_id(&self, row_id: RowId) -> Option<VectorEntry> {
         self.registry
             .read()
-            .values()
-            .find_map(|state| state.find_by_row_id(row_id))
+            .iter()
+            .find_map(|(index, state)| state.find_by_row_id(index, row_id))
     }
 
     pub fn live_entry_for_row(
@@ -408,11 +438,13 @@ impl VectorStore {
         snapshot: contextdb_core::SnapshotId,
     ) -> Option<VectorEntry> {
         self.try_state(index).and_then(|state| {
-            state
-                .all_entries()
-                .into_iter()
-                .rev()
-                .find(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
+            state.with_entries(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
+                    .map(|entry| entry.to_vector_entry(index.clone()))
+            })
         })
     }
 
@@ -423,8 +455,8 @@ impl VectorStore {
     ) -> Vec<VectorEntry> {
         self.registry
             .read()
-            .values()
-            .flat_map(|state| state.all_entries())
+            .iter()
+            .flat_map(|(index, state)| state.all_entries(index))
             .filter(|entry| entry.row_id == row_id && entry.visible_at(snapshot))
             .collect()
     }
@@ -436,12 +468,17 @@ impl VectorStore {
         lsn: contextdb_core::Lsn,
     ) -> Option<Vec<f32>> {
         self.try_state(index).and_then(|state| {
-            state
-                .all_entries()
-                .into_iter()
-                .find(|entry| entry.row_id == row_id && entry.lsn == lsn)
-                .map(|entry| entry.vector)
+            state.with_entries(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.row_id == row_id && entry.lsn == lsn)
+                    .map(|entry| entry.vector.to_f32())
+            })
         })
+    }
+
+    pub fn storage_bytes_per_entry(&self, index: &VectorIndexRef) -> Result<Vec<usize>> {
+        Ok(self.state(index)?.storage_bytes_per_entry())
     }
 
     pub fn index_infos(&self) -> Vec<VectorIndexInfo> {

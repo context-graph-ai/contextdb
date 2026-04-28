@@ -1,4 +1,4 @@
-use super::helpers::{setup_ontology_db, setup_propagation_ontology_db};
+use super::helpers::{embedding384, setup_ontology_db, setup_propagation_ontology_db};
 use contextdb_core::TxId;
 use contextdb_core::{Direction, Error, Value};
 use roaring::RoaringTreemap;
@@ -1575,7 +1575,7 @@ fn b5_06_cross_context_semantic_search() {
             tx,
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
             rid,
-            vec![1.0 - (idx as f32 * 0.1), idx as f32 * 0.1],
+            embedding384(&[1.0 - (idx as f32 * 0.1), idx as f32 * 0.1]),
         )
         .expect("vector");
         row_ids_ctx.push((rid.0, ctx.to_string()));
@@ -1586,7 +1586,7 @@ fn b5_06_cross_context_semantic_search() {
     let results = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0],
+            &embedding384(&[1.0, 0.0]),
             10,
             None,
             db.snapshot(),
@@ -3980,7 +3980,7 @@ fn b16_01_graph_to_relational_to_vector() {
             tx2,
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
             r.row_id,
-            vec![1.0 - (idx as f32 * 0.1), idx as f32 * 0.1],
+            embedding384(&[1.0 - (idx as f32 * 0.1), idx as f32 * 0.1]),
         )
         .expect("vector");
     }
@@ -3990,7 +3990,7 @@ fn b16_01_graph_to_relational_to_vector() {
     let vec_results = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0],
+            &embedding384(&[1.0, 0.0]),
             5,
             Some(&candidates),
             db.snapshot(),
@@ -4035,10 +4035,10 @@ fn b17_02_ann_output_shape() {
     let db = setup_ontology_db();
     let tx = db.begin();
     for vec in [
-        vec![1.0, 0.0, 0.0, 0.0],
-        vec![0.95, 0.05, 0.0, 0.0],
-        vec![0.9, 0.1, 0.0, 0.0],
-        vec![0.0, 1.0, 0.0, 0.0],
+        embedding384(&[1.0, 0.0, 0.0, 0.0]),
+        embedding384(&[0.95, 0.05, 0.0, 0.0]),
+        embedding384(&[0.9, 0.1, 0.0, 0.0]),
+        embedding384(&[0.0, 1.0, 0.0, 0.0]),
     ] {
         let rid = db
             .insert_row(
@@ -4063,7 +4063,7 @@ fn b17_02_ann_output_shape() {
     let out = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0, 0.0, 0.0],
+            &embedding384(&[1.0, 0.0, 0.0, 0.0]),
             3,
             None,
             db.snapshot(),
@@ -4510,7 +4510,7 @@ fn b18_04_high_frequency_write_throughput() {
             tx,
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
             rid,
-            vec![1.0, (i % 10) as f32],
+            embedding384(&[1.0, (i % 10) as f32]),
         )
         .expect("vec");
         row_ids.push(rid);
@@ -4524,7 +4524,7 @@ fn b18_04_high_frequency_write_throughput() {
     let out = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[1.0, 0.0],
+            &embedding384(&[1.0, 0.0]),
             5,
             None,
             db.snapshot(),
@@ -4571,14 +4571,14 @@ fn b18_06_person_reidentification_via_embedding() {
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         r1,
-        vec![1.0, 0.0],
+        embedding384(&[1.0, 0.0]),
     )
     .expect("v1");
     db.insert_vector(
         tx,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
         r2,
-        vec![0.0, 1.0],
+        embedding384(&[0.0, 1.0]),
     )
     .expect("v2");
     db.commit(tx).expect("commit");
@@ -4586,7 +4586,7 @@ fn b18_06_person_reidentification_via_embedding() {
     let top = db
         .query_vector(
             contextdb_core::VectorIndexRef::new("observations", "embedding"),
-            &[0.95, 0.05],
+            &embedding384(&[0.95, 0.05]),
             1,
             None,
             db.snapshot(),

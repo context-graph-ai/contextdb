@@ -58,6 +58,8 @@ audio, or policy embeddings with different dimensions and quantization choices.
 
 - Cosine similarity via `<=>` operator
 - `VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')` per column
+- SQ8/SQ4 columns keep quantized live payloads and quantized HNSW payloads;
+  f32 is reconstructed only at API/materialization boundaries
 - Below ~1000 vectors: brute-force exact scan
 - At/above ~1000 vectors: HNSW (via `hnsw_rs`) with 10x overfetch + exact reranking
 - Pre-filtered search: WHERE clause narrows candidates before scoring
@@ -186,7 +188,8 @@ CREATE TABLE evidence (
 );
 ```
 
-`SHOW VECTOR_INDEXES` gives structured per-index counts and byte totals; use it
+`SHOW VECTOR_INDEXES` gives structured per-index counts and live vector payload
+byte totals, including any materialized HNSW payload estimate; use it
 instead of parsing memory operation tags.
 
 ---

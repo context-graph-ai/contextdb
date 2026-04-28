@@ -3811,6 +3811,7 @@ async fn nt_14_large_bidirectional_vector_sync() {
     let known_edge_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
     let known_server_vector: Vec<f32> = (0..384).map(|i| 1.0 - (i as f32) / 384.0).collect();
     let mut known_edge_uuid: Option<Uuid> = None;
+    let mut known_server_uuid: Option<Uuid> = None;
 
     let tx_e = edge_db.begin();
     for i in 0..400usize {
@@ -3848,6 +3849,9 @@ async fn nt_14_large_bidirectional_vector_sync() {
     let tx_s = server_db.begin();
     for i in 0..400usize {
         let uuid = Uuid::new_v4();
+        if i == 0 {
+            known_server_uuid = Some(uuid);
+        }
         let vec: Vec<f32> = if i == 0 {
             known_server_vector.clone()
         } else {
@@ -3941,6 +3945,33 @@ async fn nt_14_large_bidirectional_vector_sync() {
             .len(),
         800,
         "edge must have 800 rows after pull"
+    );
+
+    let server_row_on_edge = edge_db
+        .point_lookup(
+            "observations",
+            "id",
+            &Value::Uuid(known_server_uuid.unwrap()),
+            edge_db.snapshot(),
+        )
+        .unwrap()
+        .expect("known server row must be present on edge after pull");
+    let mut server_candidate = roaring::RoaringTreemap::new();
+    server_candidate.insert(server_row_on_edge.row_id.0);
+    let server_candidate_search = edge_db
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &known_server_vector,
+            1,
+            Some(&server_candidate),
+            edge_db.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(server_candidate_search.len(), 1);
+    assert!(
+        server_candidate_search[0].1 > 0.999,
+        "server's planted vector must be indexed on edge, similarity={}",
+        server_candidate_search[0].1
     );
 
     let push_search = server_db

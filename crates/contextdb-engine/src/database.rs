@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 type DynStore = Box<dyn WriteSetApplicator>;
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
 const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
+// redb may need a small metadata page on the next write, especially for a new
+// file with the format metadata table. Keep the disk-limit error deterministic
+// instead of starting a write that cannot commit cleanly.
 const MIN_DISK_WRITE_HEADROOM_BYTES: u64 = 1024;
 
 #[derive(Debug, Clone)]
@@ -565,7 +568,7 @@ impl Database {
         let vector_index = vector_index_from_plan(&plan);
         if let Some(index) = &vector_index
             && let Some(state) = self.vector_store.try_state(index)
-            && state.all_entries().len() >= 1000
+            && state.entry_count() >= 1000
             && state.hnsw_len().is_none()
         {
             let query = vec![0.0_f32; state.dimension()];
@@ -2179,25 +2182,17 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
-        let multi_vector_table = self.table_vector_column_count(&index.table) > 1;
+        self.vector_store.state(&index)?;
         if let Some(expected) = self.pending_vector_dimension(tx, &index)?
             && expected != vector.len()
         {
-            return Err(self.direct_vector_dimension_error(
-                &index,
-                expected,
-                vector.len(),
-                multi_vector_table,
-            ));
+            return Err(self.direct_vector_dimension_error(&index, expected, vector.len()));
         }
-        self.prepare_direct_vector_index(&index, vector.len())?;
         self.insert_vector_strict(tx, index.clone(), row_id, vector)
             .map_err(|err| match err {
                 Error::VectorIndexDimensionMismatch {
                     expected, actual, ..
-                } => {
-                    self.direct_vector_dimension_error(&index, expected, actual, multi_vector_table)
-                }
+                } => self.direct_vector_dimension_error(&index, expected, actual),
                 other => other,
             })
     }
@@ -2210,11 +2205,7 @@ impl Database {
         vector: Vec<f32>,
     ) -> Result<()> {
         self.vector_store.validate_vector(&index, vector.len())?;
-        let bytes = self
-            .vector_store
-            .try_state(&index)
-            .map(|state| state.quantization().storage_bytes(vector.len()))
-            .unwrap_or_else(|| estimate_vector_bytes(&vector));
+        let bytes = self.vector_insert_accounted_bytes(&index, vector.len());
         self.accountant.try_allocate_for(
             bytes,
             "insert",
@@ -2253,10 +2244,7 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
         if self.vector_store.try_state(&index).is_none() {
-            if self.table_declares_any_vector_column(&index.table) {
-                return Err(Error::UnknownVectorIndex { index });
-            }
-            return Ok(Vec::new());
+            return Err(Error::UnknownVectorIndex { index });
         }
         self.vector.search(index, query, k, candidates, snapshot)
     }
@@ -2271,52 +2259,6 @@ impl Database {
     ) -> Result<Vec<(RowId, f32)>> {
         self.vector_store.validate_vector(&index, query.len())?;
         self.vector.search(index, query, k, candidates, snapshot)
-    }
-
-    fn prepare_direct_vector_index(&self, index: &VectorIndexRef, dimension: usize) -> Result<()> {
-        let table_meta = self.table_meta(&index.table);
-        if let Some(meta) = &table_meta {
-            let vector_column = meta
-                .columns
-                .iter()
-                .find(|column| column.name == index.column);
-            if vector_column.is_none() && meta.columns.iter().any(Self::column_is_vector) {
-                return Err(Error::UnknownVectorIndex {
-                    index: index.clone(),
-                });
-            }
-            let quantization = vector_column
-                .map(|column| column.quantization)
-                .unwrap_or_default();
-            self.vector_store.register_or_reconfigure_empty_index(
-                index.clone(),
-                dimension,
-                quantization,
-            );
-            return Ok(());
-        }
-
-        self.vector_store.register_or_reconfigure_empty_index(
-            index.clone(),
-            dimension,
-            contextdb_core::VectorQuantization::F32,
-        );
-        Ok(())
-    }
-
-    fn table_declares_any_vector_column(&self, table: &str) -> bool {
-        self.table_vector_column_count(table) > 0
-    }
-
-    fn table_vector_column_count(&self, table: &str) -> usize {
-        self.table_meta(table)
-            .map(|meta| {
-                meta.columns
-                    .iter()
-                    .filter(|column| Self::column_is_vector(column))
-                    .count()
-            })
-            .unwrap_or(0)
     }
 
     fn pending_vector_dimension(&self, tx: TxId, index: &VectorIndexRef) -> Result<Option<usize>> {
@@ -2335,24 +2277,23 @@ impl Database {
         index: &VectorIndexRef,
         expected: usize,
         actual: usize,
-        multi_vector_table: bool,
     ) -> Error {
-        if multi_vector_table {
-            Error::VectorIndexDimensionMismatch {
-                index: index.clone(),
-                expected,
-                actual,
-            }
-        } else {
-            Error::VectorDimensionMismatch {
-                expected,
-                got: actual,
-            }
+        Error::VectorIndexDimensionMismatch {
+            index: index.clone(),
+            expected,
+            actual,
         }
     }
 
-    fn column_is_vector(column: &ColumnDef) -> bool {
-        matches!(column.column_type, ColumnType::Vector(_))
+    pub(crate) fn vector_insert_accounted_bytes(
+        &self,
+        index: &VectorIndexRef,
+        dimension: usize,
+    ) -> usize {
+        self.vector_store
+            .try_state(index)
+            .map(|state| state.quantization().storage_bytes(dimension))
+            .unwrap_or_else(|| 24 + dimension.saturating_mul(std::mem::size_of::<f32>()))
     }
 
     #[doc(hidden)]
@@ -2367,6 +2308,14 @@ impl Database {
         self.vector_store
             .try_state(&index)
             .and_then(|state| state.hnsw_stats())
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_vector_storage_bytes_per_entry(
+        &self,
+        index: VectorIndexRef,
+    ) -> Result<Vec<usize>> {
+        self.vector_store.storage_bytes_per_entry(&index)
     }
 
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
@@ -2853,7 +2802,8 @@ impl Database {
         }
 
         for entry in &ws.vector_inserts {
-            self.accountant.release(entry.estimated_bytes());
+            self.accountant
+                .release(self.vector_insert_accounted_bytes(&entry.index, entry.vector.len()));
         }
     }
 
@@ -2876,7 +2826,8 @@ impl Database {
 
         for (index, row_id, _) in &ws.vector_deletes {
             if let Some(vector) = self.find_vector_by_index_and_row(index, *row_id) {
-                self.accountant.release(vector.estimated_bytes());
+                self.accountant
+                    .release(self.vector_insert_accounted_bytes(index, vector.vector.len()));
             }
         }
 
@@ -2901,7 +2852,7 @@ impl Database {
     ) -> Option<VectorEntry> {
         self.vector_store
             .try_state(index)
-            .and_then(|state| state.find_by_row_id(row_id))
+            .and_then(|state| state.find_by_row_id(index, row_id))
     }
 
     fn find_edge(&self, source: &NodeId, target: &NodeId, edge_type: &str) -> Option<AdjEntry> {
@@ -4733,10 +4684,6 @@ fn estimate_row_bytes_for_meta(
         bytes = bytes.saturating_add(32 + column.name.len() * 8 + value.estimated_bytes());
     }
     bytes
-}
-
-fn estimate_vector_bytes(vector: &[f32]) -> usize {
-    24 + vector.len().saturating_mul(std::mem::size_of::<f32>())
 }
 
 fn estimate_edge_bytes(

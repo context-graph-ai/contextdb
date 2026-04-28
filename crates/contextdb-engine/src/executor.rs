@@ -1402,6 +1402,7 @@ fn exec_insert(
             "Reduce row size or raise MEMORY_LIMIT before inserting more data.",
         )?;
         let checkpoint = db.write_set_checkpoint(txid)?;
+        let mut vector_allocations = Vec::new();
         let graph_edge = if route_inserts_to_graph {
             match (
                 values.get("source_id"),
@@ -1534,16 +1535,15 @@ fn exec_insert(
 
         if row_id != RowId(0) {
             for (column, v) in &vector_values {
-                if let Err(err) = db.insert_vector_strict(
-                    txid,
-                    contextdb_core::VectorIndexRef::new(&p.table, column.clone()),
-                    row_id,
-                    v.clone(),
-                ) {
+                let index = contextdb_core::VectorIndexRef::new(&p.table, column.clone());
+                let vector_bytes = db.vector_insert_accounted_bytes(&index, v.len());
+                if let Err(err) = db.insert_vector_strict(txid, index, row_id, v.clone()) {
                     let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                     db.accountant().release(row_bytes);
+                    release_accounted_bytes(db, &vector_allocations);
                     return Err(err);
                 }
+                vector_allocations.push(vector_bytes);
             }
         }
 
@@ -1659,6 +1659,7 @@ fn exec_update(
             "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
         )?;
         let checkpoint = db.write_set_checkpoint(txid)?;
+        let mut vector_allocations = Vec::new();
 
         if let Err(err) = db.delete_row(txid, &p.table, row.row_id) {
             db.accountant().release(new_row_bytes);
@@ -1699,21 +1700,21 @@ fn exec_update(
             }
         }
         for (column, vector) in assigned_vector_values {
-            if let Err(err) = db.insert_vector_strict(
-                txid,
-                contextdb_core::VectorIndexRef::new(&p.table, column),
-                new_row_id,
-                vector,
-            ) {
+            let index = contextdb_core::VectorIndexRef::new(&p.table, column);
+            let vector_bytes = db.vector_insert_accounted_bytes(&index, vector.len());
+            if let Err(err) = db.insert_vector_strict(txid, index, new_row_id, vector) {
                 db.accountant().release(new_row_bytes);
+                release_accounted_bytes(db, &vector_allocations);
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
+            vector_allocations.push(vector_bytes);
         }
         if let Err(err) =
             db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
         {
             db.accountant().release(new_row_bytes);
+            release_accounted_bytes(db, &vector_allocations);
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
             return Err(err);
         }
@@ -4215,26 +4216,13 @@ fn validate_vector_columns(
         return Ok(());
     };
 
-    let use_index_identity = meta
-        .columns
-        .iter()
-        .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
-        .nth(1)
-        .is_some();
-
     for column in &meta.columns {
         if let contextdb_core::ColumnType::Vector(expected) = column.column_type
             && let Some(Value::Vector(vector)) = values.get(&column.name)
         {
             let got = vector.len();
             if got != expected {
-                return Err(vector_dimension_error(
-                    table,
-                    &column.name,
-                    expected,
-                    got,
-                    use_index_identity,
-                ));
+                return Err(vector_dimension_error(table, &column.name, expected, got));
             }
         }
     }
@@ -4365,17 +4353,7 @@ fn coerce_value_for_column_with_meta(
                 expected: format_vector_type(dim),
                 actual: "TxId",
             }),
-            other => {
-                let use_index_identity = meta
-                    .columns
-                    .iter()
-                    .filter(|column| {
-                        matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
-                    })
-                    .nth(1)
-                    .is_some();
-                coerce_vector_value(table, col_name, other, dim, use_index_identity)
-            }
+            other => coerce_vector_value(table, col_name, other, dim),
         },
         contextdb_core::ColumnType::Integer => match v {
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
@@ -4556,13 +4534,7 @@ fn coerce_timestamp_value(v: Value) -> Result<Value> {
     }
 }
 
-fn coerce_vector_value(
-    table: &str,
-    column: &str,
-    v: Value,
-    expected_dim: usize,
-    use_index_identity: bool,
-) -> Result<Value> {
+fn coerce_vector_value(table: &str, column: &str, v: Value, expected_dim: usize) -> Result<Value> {
     let vector = match v {
         Value::Null => return Ok(Value::Null),
         Value::Vector(vector) => vector,
@@ -4576,28 +4548,17 @@ fn coerce_vector_value(
             column,
             expected_dim,
             vector.len(),
-            use_index_identity,
         ));
     }
 
     Ok(Value::Vector(vector))
 }
 
-fn vector_dimension_error(
-    table: &str,
-    column: &str,
-    expected: usize,
-    got: usize,
-    use_index_identity: bool,
-) -> Error {
-    if use_index_identity {
-        Error::VectorIndexDimensionMismatch {
-            index: contextdb_core::VectorIndexRef::new(table, column),
-            expected,
-            actual: got,
-        }
-    } else {
-        Error::VectorDimensionMismatch { expected, got }
+fn vector_dimension_error(table: &str, column: &str, expected: usize, got: usize) -> Error {
+    Error::VectorIndexDimensionMismatch {
+        index: contextdb_core::VectorIndexRef::new(table, column),
+        expected,
+        actual: got,
     }
 }
 
@@ -4830,6 +4791,12 @@ fn project_graph_frontier_rows(
             Ok(row)
         })
         .collect()
+}
+
+fn release_accounted_bytes(db: &Database, bytes: &[usize]) {
+    for bytes in bytes {
+        db.accountant().release(*bytes);
+    }
 }
 
 #[cfg(test)]
