@@ -1,5 +1,5 @@
 use crate::error::SyncError;
-use contextdb_core::{Lsn, RowId, Value};
+use contextdb_core::{Lsn, RowId, Value, VectorIndexRef};
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, VectorChange,
 };
@@ -115,10 +115,10 @@ pub struct ChunkAck {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireChangeSet {
+    pub ddl: Vec<WireDdlChange>,
     pub rows: Vec<WireRowChange>,
     pub edges: Vec<WireEdgeChange>,
     pub vectors: Vec<WireVectorChange>,
-    pub ddl: Vec<WireDdlChange>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -142,6 +142,7 @@ pub struct WireEdgeChange {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireVectorChange {
+    pub index: VectorIndexRef,
     pub row_id: RowId,
     pub vector: Vec<f32>,
     pub lsn: Lsn,
@@ -219,7 +220,10 @@ pub fn decode(data: &[u8]) -> Result<Envelope, SyncError> {
     let envelope: Envelope =
         rmp_serde::from_slice(data).map_err(|e| SyncError::Serde(e.to_string()))?;
     if envelope.version > PROTOCOL_VERSION {
-        return Err(SyncError::UnsupportedVersion(envelope.version));
+        return Err(SyncError::ProtocolVersionMismatch {
+            received: envelope.version,
+            supported: PROTOCOL_VERSION,
+        });
     }
     Ok(envelope)
 }
@@ -227,10 +231,10 @@ pub fn decode(data: &[u8]) -> Result<Envelope, SyncError> {
 impl From<ChangeSet> for WireChangeSet {
     fn from(value: ChangeSet) -> Self {
         Self {
+            ddl: value.ddl.into_iter().map(Into::into).collect(),
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             vectors: value.vectors.into_iter().map(Into::into).collect(),
-            ddl: value.ddl.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -238,10 +242,10 @@ impl From<ChangeSet> for WireChangeSet {
 impl From<WireChangeSet> for ChangeSet {
     fn from(value: WireChangeSet) -> Self {
         Self {
+            ddl: value.ddl.into_iter().map(Into::into).collect(),
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             vectors: value.vectors.into_iter().map(Into::into).collect(),
-            ddl: value.ddl.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -297,6 +301,7 @@ impl From<WireEdgeChange> for EdgeChange {
 impl From<VectorChange> for WireVectorChange {
     fn from(value: VectorChange) -> Self {
         Self {
+            index: value.index,
             row_id: value.row_id,
             vector: value.vector,
             lsn: value.lsn,
@@ -307,6 +312,7 @@ impl From<VectorChange> for WireVectorChange {
 impl From<WireVectorChange> for VectorChange {
     fn from(value: WireVectorChange) -> Self {
         Self {
+            index: value.index,
             row_id: value.row_id,
             vector: value.vector,
             lsn: value.lsn,

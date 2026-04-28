@@ -99,11 +99,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
     fn search(
         &self,
+        index: VectorIndexRef,
         query: &[f32],
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
+        let _ = index;
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -161,7 +163,13 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         Ok(self.brute_force_search(query, k, candidates, snapshot))
     }
 
-    fn insert_vector(&self, tx: TxId, row_id: RowId, vector: Vec<f32>) -> Result<()> {
+    fn insert_vector(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+        vector: Vec<f32>,
+    ) -> Result<()> {
         let got = vector.len();
 
         {
@@ -176,6 +184,7 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         }
 
         let entry = VectorEntry {
+            index,
             row_id,
             vector,
             created_tx: tx,
@@ -190,7 +199,8 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         Ok(())
     }
 
-    fn delete_vector(&self, tx: TxId, row_id: RowId) -> Result<()> {
+    fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
+        let _ = index;
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.vector_deletes.push((row_id, tx));
         })?;

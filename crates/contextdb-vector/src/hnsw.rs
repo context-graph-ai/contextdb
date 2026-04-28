@@ -14,6 +14,15 @@ pub struct HnswIndex {
     ef_search: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswGraphStats {
+    pub point_count: usize,
+    pub layer0_points: usize,
+    pub layer0_neighbor_edges: usize,
+    pub max_level_observed: u8,
+    pub dimension: usize,
+}
+
 impl HnswIndex {
     pub fn new(entries: &[VectorEntry], dimension: usize) -> Self {
         let (m, ef_construction, ef_search) = select_params(entries.len());
@@ -63,6 +72,28 @@ impl HnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[doc(hidden)]
+    pub fn graph_stats(&self) -> HnswGraphStats {
+        let indexation = self.hnsw.get_point_indexation();
+        let layer0_neighbor_edges = indexation
+            .get_layer_iterator(0)
+            .map(|point| {
+                point
+                    .get_neighborhood_id()
+                    .first()
+                    .map_or(0, |neighbors| neighbors.len())
+            })
+            .sum();
+
+        HnswGraphStats {
+            point_count: self.hnsw.get_nb_point(),
+            layer0_points: indexation.get_layer_nb_point(0),
+            layer0_neighbor_edges,
+            max_level_observed: self.hnsw.get_max_level_observed(),
+            dimension: self.dimension,
+        }
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(RowId, f32)>> {

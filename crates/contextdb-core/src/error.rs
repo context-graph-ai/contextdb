@@ -1,4 +1,4 @@
-use crate::types::TxId;
+use crate::types::{TxId, VectorIndexRef};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -23,6 +23,23 @@ pub enum Error {
     BfsVisitedExceeded(usize),
     #[error("dimension mismatch: expected {expected}, got {got}")]
     VectorDimensionMismatch { expected: usize, got: usize },
+    #[error("vector index dimension mismatch on {index:?}: expected {expected}, got {actual}")]
+    VectorIndexDimensionMismatch {
+        index: VectorIndexRef,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("unknown vector index {index:?}")]
+    UnknownVectorIndex { index: VectorIndexRef },
+    #[error(
+        "legacy vector store detected (format marker {found_format_marker:?}); rebuild required for release {expected_release} - sync from a 1.0+ peer or recreate the schema and reimport"
+    )]
+    LegacyVectorStoreDetected {
+        found_format_marker: String,
+        expected_release: String,
+    },
+    #[error("corrupt vector store at {path}: {reason}")]
+    StoreCorrupted { path: String, reason: String },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("transaction not found: {0}")]

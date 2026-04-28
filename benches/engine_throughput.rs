@@ -101,8 +101,13 @@ fn vector_insert_and_search(c: &mut Criterion) {
                         )]),
                     )
                     .unwrap();
-                db.insert_vector(tx, rid, vec![angle.cos(), angle.sin(), 0.0])
-                    .unwrap();
+                db.insert_vector(
+                    tx,
+                    contextdb_core::VectorIndexRef::new("obs", "embedding"),
+                    rid,
+                    vec![angle.cos(), angle.sin(), 0.0],
+                )
+                .unwrap();
             }
             db.commit(tx).unwrap();
         });
@@ -128,14 +133,25 @@ fn vector_insert_and_search(c: &mut Criterion) {
                     )]),
                 )
                 .unwrap();
-            db.insert_vector(tx, rid, vec![angle.cos(), angle.sin(), 0.0])
-                .unwrap();
+            db.insert_vector(
+                tx,
+                contextdb_core::VectorIndexRef::new("obs", "embedding"),
+                rid,
+                vec![angle.cos(), angle.sin(), 0.0],
+            )
+            .unwrap();
         }
         db.commit(tx).unwrap();
 
         b.iter(|| {
-            db.query_vector(&[1.0, 0.0, 0.0], 10, None, db.snapshot())
-                .unwrap();
+            db.query_vector(
+                contextdb_core::VectorIndexRef::new("obs", "embedding"),
+                &[1.0, 0.0, 0.0],
+                10,
+                None,
+                db.snapshot(),
+            )
+            .unwrap();
         });
     });
 

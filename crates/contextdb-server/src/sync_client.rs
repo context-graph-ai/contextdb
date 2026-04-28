@@ -1044,6 +1044,143 @@ mod tests {
     }
 
     #[test]
+    fn nv_snapshot_split_batches_emit_ddl_before_vector_batches_and_apply_cleanly() {
+        let table = "snapshot_split_evidence";
+        let ddl_only_marker = "ddl_order_marker_column";
+        let vector_column = "vector_later_marker_text";
+        let row_count = 10usize;
+        let large_payload = "x".repeat(120 * 1024);
+        let mut ids = Vec::new();
+        let mut rows = Vec::new();
+        let mut vectors = Vec::new();
+
+        for i in 0..row_count {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            let mut values = HashMap::new();
+            values.insert("id".to_string(), Value::Uuid(id));
+            values.insert("payload".to_string(), Value::Text(large_payload.clone()));
+            rows.push(RowChange {
+                table: table.to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values,
+                deleted: false,
+                lsn: Lsn((i + 1) as u64),
+            });
+            vectors.push(VectorChange {
+                index: contextdb_core::VectorIndexRef::new(table, vector_column),
+                row_id: RowId((i + 1) as u64),
+                vector: if i == 0 {
+                    vec![1.0, 0.0, 0.0, 0.0]
+                } else {
+                    vec![0.0, 1.0, 0.0, 0.0]
+                },
+                lsn: Lsn((i + 1) as u64),
+            });
+        }
+
+        let changeset = ChangeSet {
+            rows,
+            edges: Vec::new(),
+            vectors,
+            ddl: vec![contextdb_engine::sync_types::DdlChange::CreateTable {
+                name: table.to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                    ("payload".to_string(), "TEXT".to_string()),
+                    (ddl_only_marker.to_string(), "TEXT".to_string()),
+                    (vector_column.to_string(), "VECTOR(4)".to_string()),
+                ],
+                constraints: Vec::new(),
+            }],
+        };
+
+        let batches = split_changeset(changeset);
+        assert!(
+            batches.len() >= 2,
+            "snapshot-shaped changeset with large rows must exercise real split path; got {} batch(es)",
+            batches.len()
+        );
+        let first_ddl_idx = batches
+            .iter()
+            .position(|batch| !batch.ddl.is_empty())
+            .expect("split stream must include schema DDL");
+        let first_vector_idx = batches
+            .iter()
+            .position(|batch| !batch.vectors.is_empty())
+            .expect("split stream must include vector changes");
+        assert!(
+            first_ddl_idx <= first_vector_idx,
+            "first vector batch must not be emitted before schema DDL; first_ddl_idx={first_ddl_idx}, first_vector_idx={first_vector_idx}"
+        );
+        for (idx, batch) in batches.iter().enumerate().skip(first_ddl_idx + 1) {
+            assert!(
+                batch.ddl.is_empty(),
+                "schema DDL must appear once before vector replay, not again in batch {idx}"
+            );
+        }
+
+        if first_ddl_idx == first_vector_idx {
+            fn byte_pos(haystack: &[u8], needle: &str) -> usize {
+                haystack
+                    .windows(needle.len())
+                    .position(|window| window == needle.as_bytes())
+                    .unwrap_or_else(|| panic!("encoded batch must contain sentinel {needle:?}"))
+            }
+
+            let bytes = rmp_serde::to_vec(&WireChangeSet::from(batches[first_vector_idx].clone()))
+                .expect("encode split vector-bearing batch");
+            let ddl_marker_pos = byte_pos(&bytes, ddl_only_marker);
+            let vector_marker_pos = byte_pos(&bytes, vector_column);
+            assert!(
+                ddl_marker_pos < vector_marker_pos,
+                "vector-bearing split batch must serialize schema bytes before vector index bytes; \
+                 ddl_marker_pos={ddl_marker_pos}, vector_marker_pos={vector_marker_pos}, encoded_len={}",
+                bytes.len()
+            );
+        }
+
+        let receiver = Database::open_memory();
+        let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+        for (idx, batch) in batches.into_iter().enumerate() {
+            receiver
+                .apply_changes(batch, &policies)
+                .unwrap_or_else(|err| panic!("receiver must apply split batch {idx}: {err}"));
+        }
+
+        let rows = receiver
+            .execute(&format!("SELECT id FROM {table}"), &HashMap::new())
+            .expect("receiver must expose replayed rows after split apply");
+        assert_eq!(
+            rows.rows.len(),
+            row_count,
+            "fresh receiver must contain every row after applying split snapshot batches"
+        );
+
+        let mut params = HashMap::new();
+        params.insert("q".to_string(), Value::Vector(vec![1.0, 0.0, 0.0, 0.0]));
+        let nearest = receiver
+            .execute(
+                &format!("SELECT id FROM {table} ORDER BY {vector_column} <=> $q LIMIT 1"),
+                &params,
+            )
+            .expect("receiver must expose replayed vector index after split apply");
+        let id_idx = nearest
+            .columns
+            .iter()
+            .position(|column| column == "id")
+            .expect("nearest query must project id");
+        assert_eq!(
+            nearest.rows[0][id_idx],
+            Value::Uuid(ids[0]),
+            "replayed vector index must route to the declared table+column after split apply"
+        );
+    }
+
+    #[test]
     fn a14b_batch_splitting_accounts_for_vector_sizes() {
         let mut rows = Vec::new();
         let mut vectors = Vec::new();
@@ -1063,6 +1200,7 @@ mod tests {
                 lsn: Lsn(1),
             });
             vectors.push(VectorChange {
+                index: contextdb_core::VectorIndexRef::default(),
                 row_id: RowId(0),
                 vector: (0..384).map(|j| j as f32).collect(),
                 lsn: Lsn(1),
@@ -1157,6 +1295,7 @@ mod tests {
                 lsn: Lsn((i + 1) as u64),
             });
             vectors.push(VectorChange {
+                index: contextdb_core::VectorIndexRef::default(),
                 row_id: RowId((i + 1) as u64),
                 vector: vec![i as f32; 3],
                 lsn: Lsn((i + 1) as u64),

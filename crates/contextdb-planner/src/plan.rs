@@ -90,6 +90,7 @@ pub enum PhysicalPlan {
     ShowDiskLimit,
     SetSyncConflictPolicy(String),
     ShowSyncConflictPolicy,
+    ShowVectorIndexes,
 }
 
 impl PhysicalPlan {

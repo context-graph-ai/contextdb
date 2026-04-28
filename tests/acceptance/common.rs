@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
-use contextdb_core::{Direction, Error, Lsn, Value, VersionedRow};
+use contextdb_core::{Direction, Error, Lsn, Value, VectorIndexRef, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
-use contextdb_server::protocol::{MessageType, PullRequest, PullResponse, decode, encode};
-use contextdb_server::subjects::pull_subject;
+use contextdb_server::protocol::{
+    MessageType, PullRequest, PullResponse, PushRequest, PushResponse, decode, encode,
+};
+use contextdb_server::subjects::{pull_subject, push_subject};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
@@ -376,7 +378,7 @@ pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool)
     false
 }
 
-fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
+pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
     let start = Instant::now();
     loop {
         match child.try_wait().expect("CLI status poll") {
@@ -392,6 +394,132 @@ fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> 
             }
         }
     }
+}
+
+async fn wait_for_path(path: &Path, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for path to exist: {}", path.display());
+}
+
+pub(crate) async fn push_change_through_server(
+    nats_url: &str,
+    tenant_id: &str,
+    table: &str,
+    id: Uuid,
+    vector: Vec<f32>,
+) {
+    let tmp = TempDir::new().expect("tempdir for edge push");
+    let edge_path = temp_db_file(&tmp, "edge-push.db");
+    let db = Arc::new(Database::open(&edge_path).expect("open edge db"));
+    db.execute(
+        &format!(
+            "CREATE TABLE {table} (id UUID PRIMARY KEY, vector_text VECTOR({}))",
+            vector.len()
+        ),
+        &empty_params(),
+    )
+    .expect("create edge schema");
+
+    let tx = db.begin();
+    let row_id = db
+        .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
+        .expect("insert edge row");
+    db.insert_vector(
+        tx,
+        VectorIndexRef::new(table, "vector_text"),
+        row_id,
+        vector,
+    )
+    .expect("insert edge vector");
+    db.commit(tx).expect("commit edge row");
+
+    let client = contextdb_server::SyncClient::new(db, nats_url, tenant_id);
+    client.push().await.expect("push change through server");
+}
+
+pub(crate) async fn push_many_changes_through_server(
+    nats_url: &str,
+    tenant_id: &str,
+    table: &str,
+    ids: Vec<Uuid>,
+    dim: usize,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+    server_barrier_path: Option<PathBuf>,
+) {
+    let tmp = TempDir::new().expect("tempdir for edge push");
+    let edge_path = temp_db_file(&tmp, "edge-push-many.db");
+    let db = Arc::new(Database::open(&edge_path).expect("open edge db"));
+    db.execute(
+        &format!("CREATE TABLE {table} (id UUID PRIMARY KEY, vector_text VECTOR({dim}))"),
+        &empty_params(),
+    )
+    .expect("create edge schema");
+
+    let tx = db.begin();
+    for (offset, id) in ids.into_iter().enumerate() {
+        let row_id = db
+            .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
+            .expect("insert edge row");
+        let mut vector = vec![0.0_f32; dim];
+        vector[offset % dim] = 1.0;
+        db.insert_vector(
+            tx,
+            VectorIndexRef::new(table, "vector_text"),
+            row_id,
+            vector,
+        )
+        .expect("insert edge vector");
+    }
+    db.commit(tx).expect("commit edge rows");
+
+    let client = async_nats::connect(nats_url)
+        .await
+        .expect("connect to NATS for direct in-flight push");
+    let inbox = client.new_inbox();
+    let mut inbox_sub = client
+        .subscribe(inbox.clone())
+        .await
+        .expect("subscribe direct push inbox");
+    let request = PushRequest {
+        changeset: db.changes_since(Lsn(0)).into(),
+    };
+    let encoded =
+        encode(MessageType::PushRequest, &request).expect("encode direct in-flight push request");
+    client
+        .publish_with_reply(push_subject(tenant_id), inbox.clone(), encoded.into())
+        .await
+        .expect("publish direct in-flight push request");
+    client
+        .flush()
+        .await
+        .expect("flush direct in-flight push request");
+
+    if let Some(started) = started {
+        if let Some(path) = server_barrier_path {
+            wait_for_path(&path, Duration::from_secs(10)).await;
+        }
+        let _ = started.send(());
+    }
+
+    let msg = tokio::time::timeout(Duration::from_secs(15), inbox_sub.next())
+        .await
+        .expect("direct push must respond after graceful drain")
+        .expect("direct push inbox must stay open");
+    let envelope = decode(&msg.payload).expect("decode direct push response envelope");
+    let response: PushResponse =
+        rmp_serde::from_slice(&envelope.payload).expect("decode direct push response");
+    if let Some(err) = response.error {
+        panic!("direct push response error: {err}");
+    }
+    let _ = response
+        .result
+        .expect("direct push response must include apply result");
 }
 
 pub(crate) fn temp_db_file(tmp: &TempDir, name: &str) -> PathBuf {
@@ -512,8 +640,13 @@ pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64
     let row_id = db
         .insert_row(tx, "embeddings", values(vec![("id", Value::Uuid(id))]))
         .expect("insert embedding row");
-    db.insert_vector(tx, row_id, vector)
-        .expect("insert embedding vector");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("embeddings", "embedding"),
+        row_id,
+        vector,
+    )
+    .expect("insert embedding vector");
     db.commit(tx).expect("commit embedding row");
     row_id.0 as i64
 }

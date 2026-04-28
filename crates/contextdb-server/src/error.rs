@@ -8,8 +8,8 @@ pub enum SyncError {
     Engine(String),
     #[error("serialization error: {0}")]
     Serde(String),
-    #[error("unsupported protocol version: {0}")]
-    UnsupportedVersion(u8),
+    #[error("protocol version mismatch: received {received}, supported {supported}")]
+    ProtocolVersionMismatch { received: u8, supported: u8 },
     #[error("chunk reassembly error: {0}")]
     ChunkError(String),
 }

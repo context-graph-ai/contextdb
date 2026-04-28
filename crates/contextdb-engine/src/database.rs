@@ -18,7 +18,7 @@ use contextdb_parser::ast::{AlterAction, CreateTable, DataType};
 use contextdb_planner::PhysicalPlan;
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
 use contextdb_tx::{TxManager, WriteSetApplicator};
-use contextdb_vector::{HnswIndex, MemVectorExecutor, VectorStore};
+use contextdb_vector::{HnswGraphStats, HnswIndex, MemVectorExecutor, VectorStore};
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1892,7 +1892,18 @@ impl Database {
                 continue;
             }
             for row_id in self.logical_row_ids_for_uuid(ctx.tx, source.table, source.uuid) {
-                self.delete_vector(ctx.tx, row_id)?;
+                let index = self
+                    .table_meta(source.table)
+                    .and_then(|meta| {
+                        meta.columns
+                            .iter()
+                            .find(|column| {
+                                matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                            })
+                            .map(|column| VectorIndexRef::new(source.table, column.name.clone()))
+                    })
+                    .unwrap_or_default();
+                self.delete_vector(ctx.tx, index, row_id)?;
             }
         }
 
@@ -2105,7 +2116,13 @@ impl Database {
         Ok(props)
     }
 
-    pub fn insert_vector(&self, tx: TxId, row_id: RowId, vector: Vec<f32>) -> Result<()> {
+    pub fn insert_vector(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+        vector: Vec<f32>,
+    ) -> Result<()> {
         let bytes = estimate_vector_bytes(&vector);
         self.accountant.try_allocate_for(
             bytes,
@@ -2114,22 +2131,39 @@ impl Database {
             "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
         )?;
         self.vector
-            .insert_vector(tx, row_id, vector)
+            .insert_vector(tx, index, row_id, vector)
             .inspect_err(|_| self.accountant.release(bytes))
     }
 
-    pub fn delete_vector(&self, tx: TxId, row_id: RowId) -> Result<()> {
-        self.vector.delete_vector(tx, row_id)
+    pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
+        self.vector.delete_vector(tx, index, row_id)
     }
 
     pub fn query_vector(
         &self,
+        index: VectorIndexRef,
         query: &[f32],
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
-        self.vector.search(query, k, candidates, snapshot)
+        self.vector.search(index, query, k, candidates, snapshot)
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_vector_hnsw_len(&self, _index: VectorIndexRef) -> Option<usize> {
+        self.vector_store
+            .hnsw
+            .get()
+            .and_then(|lock| lock.read().as_ref().map(|hnsw| hnsw.len()))
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_vector_hnsw_stats(&self, _index: VectorIndexRef) -> Option<HnswGraphStats> {
+        self.vector_store
+            .hnsw
+            .get()
+            .and_then(|lock| lock.read().as_ref().map(|hnsw| hnsw.graph_stats()))
     }
 
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
@@ -3071,6 +3105,7 @@ impl Database {
                 continue; // first live entry per row_id only
             }
             vectors.push(VectorChange {
+                index: VectorIndexRef::default(),
                 row_id: entry.row_id,
                 vector: entry.vector.clone(),
                 lsn: entry.lsn,
@@ -3183,6 +3218,7 @@ impl Database {
                 continue;
             }
             vectors.push(VectorChange {
+                index: VectorIndexRef::default(),
                 row_id: entry.row_id,
                 vector: entry.vector.clone(),
                 lsn: entry.lsn,
@@ -3399,6 +3435,7 @@ impl Database {
                 ChangeLogEntry::VectorInsert { row_id, lsn } => {
                     if let Some(vector) = self.vector_for_row_lsn(row_id, lsn) {
                         vectors.push(VectorChange {
+                            index: VectorIndexRef::default(),
                             row_id,
                             vector,
                             lsn,
@@ -3406,6 +3443,7 @@ impl Database {
                     }
                 }
                 ChangeLogEntry::VectorDelete { row_id, lsn } => vectors.push(VectorChange {
+                    index: VectorIndexRef::default(),
                     row_id,
                     vector: Vec::new(),
                     lsn,
@@ -4165,12 +4203,15 @@ impl Database {
                 .copied()
                 .unwrap_or(vector.row_id);
             if vector.vector.is_empty() {
-                let _ = self.vector.delete_vector(tx, local_row_id);
+                let _ = self
+                    .vector
+                    .delete_vector(tx, vector.index.clone(), local_row_id);
             } else {
                 if self.has_live_vector(local_row_id, self.snapshot()) {
-                    let _ = self.delete_vector(tx, local_row_id);
+                    let _ = self.delete_vector(tx, vector.index.clone(), local_row_id);
                 }
-                if let Err(err) = self.insert_vector(tx, local_row_id, vector.vector)
+                if let Err(err) =
+                    self.insert_vector(tx, vector.index.clone(), local_row_id, vector.vector)
                     && is_fatal_sync_apply_error(&err)
                 {
                     return Err(err);

@@ -67,6 +67,7 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             Ok(PhysicalPlan::SetSyncConflictPolicy(policy.clone()))
         }
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
+        Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Ok(PhysicalPlan::Pipeline(vec![]))
         }

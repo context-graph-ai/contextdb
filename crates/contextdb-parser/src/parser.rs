@@ -62,6 +62,7 @@ pub fn parse(input: &str) -> Result<Statement> {
             Statement::SetSyncConflictPolicy(policy)
         }
         Rule::show_sync_conflict_policy => Statement::ShowSyncConflictPolicy,
+        Rule::show_vector_indexes_stmt => Statement::ShowVectorIndexes,
         Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
         Rule::show_memory_limit => Statement::ShowMemoryLimit,
         Rule::set_disk_limit => Statement::SetDiskLimit(build_set_disk_limit(inner)?),

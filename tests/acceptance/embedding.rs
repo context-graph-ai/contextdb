@@ -1,5 +1,5 @@
 use super::common::*;
-use contextdb_core::{Error, Value};
+use contextdb_core::{Error, Value, VectorIndexRef};
 use contextdb_engine::Database;
 use std::sync::Arc;
 use std::thread;
@@ -174,7 +174,13 @@ fn f98_concurrent_readers_and_one_writer_on_embedded_engine() {
         readers.push(thread::spawn(move || {
             for _ in 0..100 {
                 let _ = reader_db.execute("SELECT count(*) FROM observations", &empty_params());
-                let _ = reader_db.query_vector(&[1.0, 0.0, 0.0], 5, None, reader_db.snapshot());
+                let _ = reader_db.query_vector(
+                    contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                    &[1.0, 0.0, 0.0],
+                    5,
+                    None,
+                    reader_db.snapshot(),
+                );
             }
         }));
     }
@@ -359,4 +365,147 @@ fn f112_connection_string_api_is_obvious_for_common_cases() {
         !created_file,
         "Database::open(\":memory:\") should create an ephemeral DB, not a file named ':memory:'"
     );
+}
+
+// Named vector index RED tests from named-vector-indexes-tests.md.
+/// I created an `embeddings` table with a column literally named `embedding`, and a sibling `other` table with a
+/// column named `foo`. Each table got a vector that, if routing collapsed by row-id only, would WIN the wrong
+/// table's search at top-1 — proving routing is by (table, column) identity, not by the column name `embedding`
+/// or by row-id-only globality.
+#[test]
+fn f110_single_vector_column_preserves_single_index_semantics_with_disjoint_columns() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(8))",
+        &empty_params(),
+    )
+    .expect("create embeddings");
+    db.execute(
+        "CREATE TABLE other (id UUID PRIMARY KEY, foo VECTOR(8))",
+        &empty_params(),
+    )
+    .expect("create other");
+
+    // Insert a SINGLE vector into each table so each table's only candidate is unambiguous. Routing by row-id
+    // only would still return one result per table; we therefore additionally probe with a vector that, in a
+    // collapsed global store, would prefer the OTHER table's row id over the FROM-scoped one.
+    let probe = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let opposite = vec![0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+    let em_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO embeddings (id, embedding) VALUES ($id, $v)",
+        &params(vec![
+            ("id", Value::Uuid(em_id)),
+            ("v", Value::Vector(probe.clone())),
+        ]),
+    )
+    .expect("insert embeddings");
+
+    let foo_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO other (id, foo) VALUES ($id, $v)",
+        &params(vec![
+            ("id", Value::Uuid(foo_id)),
+            ("v", Value::Vector(opposite.clone())),
+        ]),
+    )
+    .expect("insert other");
+
+    // Probing embeddings.embedding with `probe` MUST return em_id. A no-op global store with both rows would
+    // also return em_id (it's closer), so this assertion alone is necessary but not sufficient.
+    let r1 = db
+        .execute(
+            "SELECT id FROM embeddings ORDER BY embedding <=> $q LIMIT 1",
+            &params(vec![("q", Value::Vector(probe.clone()))]),
+        )
+        .expect("search embeddings");
+    let id_idx = r1.columns.iter().position(|c| c == "id").unwrap();
+    assert_eq!(r1.rows[0][id_idx], Value::Uuid(em_id));
+
+    // Probing other.foo with `probe` MUST return foo_id. A no-op global store would return em_id (closer to
+    // probe than opposite); this assertion is the routing-discriminator.
+    let r2 = db
+        .execute(
+            "SELECT id FROM other ORDER BY foo <=> $q LIMIT 1",
+            &params(vec![("q", Value::Vector(probe))]),
+        )
+        .expect("search other");
+    assert_eq!(
+        r2.rows[0][id_idx],
+        Value::Uuid(foo_id),
+        "search of `other.foo` must return only `other`'s row, not the closer-by-cosine row in `embeddings.embedding`"
+    );
+}
+
+/// I inserted a 5-dim vector into evidence.vector_text VECTOR(4) on a table with two declared vector columns; the engine
+/// rejected the row with VectorIndexDimensionMismatch carrying the offending (table, column) — so cg can attribute the
+/// error to the right embedding space without ambiguity.
+#[test]
+fn f114_vector_index_dimension_mismatch_carries_index_identity() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE evidence (
+            id UUID PRIMARY KEY,
+            vector_text VECTOR(4),
+            vector_vision VECTOR(8)
+        )",
+        &empty_params(),
+    )
+    .expect("create evidence");
+
+    let result = db.execute(
+        "INSERT INTO evidence (id, vector_text, vector_vision) VALUES ($id, $t, $v)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("t", Value::Vector(vec![0.0_f32; 5])), // wrong: vector_text is dim 4
+            ("v", Value::Vector(vec![0.0_f32; 8])), // correct
+        ]),
+    );
+    match result {
+        Err(Error::VectorIndexDimensionMismatch {
+            index,
+            expected,
+            actual,
+        }) => {
+            assert_eq!(index, VectorIndexRef::new("evidence", "vector_text"));
+            assert_eq!(expected, 4);
+            assert_eq!(actual, 5);
+        }
+        other => panic!("expected VectorIndexDimensionMismatch with index identity, got {other:?}"),
+    }
+    let count = db
+        .execute("SELECT id FROM evidence", &empty_params())
+        .expect("select")
+        .rows
+        .len();
+    assert_eq!(count, 0, "rejected row must not be partially inserted");
+}
+/// On a table with two registered vector columns, I queried by an absent column; the error named that absent column,
+/// not a registered sibling.
+#[test]
+fn f115_query_against_unknown_vector_index_returns_typed_error_with_multi_column_table() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE evidence (
+            id UUID PRIMARY KEY,
+            vector_text VECTOR(4),
+            vector_known VECTOR(8)
+        )",
+        &empty_params(),
+    )
+    .expect("create evidence");
+
+    let result = db.execute(
+        "SELECT id FROM evidence ORDER BY vector_unknown <=> $q LIMIT 1",
+        &params(vec![("q", Value::Vector(vec![0.0_f32; 4]))]),
+    );
+    match result {
+        Err(Error::UnknownVectorIndex { index }) => {
+            assert_eq!(index, VectorIndexRef::new("evidence", "vector_unknown"));
+        }
+        other => {
+            panic!("expected UnknownVectorIndex {{ ('evidence','vector_unknown') }}, got {other:?}")
+        }
+    }
 }

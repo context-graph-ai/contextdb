@@ -1,7 +1,8 @@
 use bincode::config::standard;
 use bincode::serde::{decode_from_slice, encode_to_vec};
 use contextdb_core::{
-    AdjEntry, Lsn, RowId, SnapshotId, TxId, Value, VectorEntry, VersionedRow, Wallclock,
+    AdjEntry, Lsn, RowId, SnapshotId, TxId, Value, VectorEntry, VectorIndexRef, VersionedRow,
+    Wallclock,
 };
 use contextdb_engine::composite_store::ChangeLogEntry;
 use contextdb_engine::sync_types::{EdgeChange, RowChange, VectorChange};
@@ -359,6 +360,7 @@ fn wire_struct_round_trip_byte_identical() {
 
     // ---------- VectorEntry ----------
     let vec_entry = VectorEntry {
+        index: VectorIndexRef::default(),
         row_id: RowId(7),
         vector: vec![1.0f32, 2.0, 3.0],
         created_tx: TxId(3),
@@ -374,7 +376,13 @@ fn wire_struct_round_trip_byte_identical() {
     );
 
     #[derive(Serialize, Deserialize)]
+    struct VectorIndexRefMirror {
+        table: String,
+        column: String,
+    }
+    #[derive(Serialize, Deserialize)]
     struct VectorEntryMirror {
+        index: VectorIndexRefMirror,
         row_id: u64,
         vector: Vec<f32>,
         created_tx: u64,
@@ -382,6 +390,10 @@ fn wire_struct_round_trip_byte_identical() {
         lsn: u64,
     }
     let vec_mirror = VectorEntryMirror {
+        index: VectorIndexRefMirror {
+            table: String::new(),
+            column: String::new(),
+        },
         row_id: 7,
         vector: vec![1.0, 2.0, 3.0],
         created_tx: 3,
@@ -481,6 +493,7 @@ fn wire_struct_round_trip_byte_identical() {
 
     // ---------- VectorChange ----------
     let vec_change = VectorChange {
+        index: VectorIndexRef::default(),
         row_id: RowId(7),
         vector: vec![1.0f32, 2.0, 3.0],
         lsn: Lsn(11),
@@ -495,11 +508,16 @@ fn wire_struct_round_trip_byte_identical() {
 
     #[derive(Serialize, Deserialize)]
     struct VectorChangeMirror {
+        index: VectorIndexRefMirror,
         row_id: u64,
         vector: Vec<f32>,
         lsn: u64,
     }
     let vc_mirror = VectorChangeMirror {
+        index: VectorIndexRefMirror {
+            table: String::new(),
+            column: String::new(),
+        },
         row_id: 7,
         vector: vec![1.0, 2.0, 3.0],
         lsn: 11,

@@ -241,7 +241,13 @@ fn ds04_vectors_available_after_reopen() {
                 ]),
             )
             .unwrap();
-        db.insert_vector(tx, row_id, vec![0.6, 0.8, 0.0]).unwrap();
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            row_id,
+            vec![0.6, 0.8, 0.0],
+        )
+        .unwrap();
         db.commit(tx).unwrap();
         db.close().unwrap();
     }
@@ -434,7 +440,12 @@ fn ds08_idempotent_vector_reapply() {
         .insert_row(tx, "obs", vals(vec![("id", Value::Uuid(obs_id))]))
         .unwrap();
     source
-        .insert_vector(tx, row_id, vec![1.0, 0.0, 0.0])
+        .insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            row_id,
+            vec![1.0, 0.0, 0.0],
+        )
         .unwrap();
     source.commit(tx).unwrap();
 
@@ -451,7 +462,13 @@ fn ds08_idempotent_vector_reapply() {
         .unwrap();
 
     let results = receiver
-        .query_vector(&[1.0, 0.0, 0.0], 10, None, receiver.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            &[1.0, 0.0, 0.0],
+            10,
+            None,
+            receiver.snapshot(),
+        )
         .unwrap();
     assert_eq!(results.len(), 1, "vectors must not duplicate on re-apply");
     assert!(
@@ -655,7 +672,13 @@ fn ds13_vector_only_after_reopen() {
                 vals(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .unwrap();
-        db.insert_vector(tx, row_id, vec![0.0, 1.0, 0.0]).unwrap();
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("embeddings", "embedding"),
+            row_id,
+            vec![0.0, 1.0, 0.0],
+        )
+        .unwrap();
         db.commit(tx).unwrap();
         db.close().unwrap();
     }

@@ -1162,8 +1162,13 @@ fn a9_09_memory_to_memory_sync() {
         HashMap::new(),
     )
     .unwrap();
-    edge.insert_vector(tx, obs_row_id, vec![1.0, 0.0, 0.0])
-        .unwrap();
+    edge.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        obs_row_id,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     edge.commit(tx).unwrap();
 
     // Guard: server starts empty
@@ -1246,7 +1251,13 @@ fn a9_09_memory_to_memory_sync() {
 
     // Vector: ANN search finds the observation embedding
     let vec_result = server
-        .query_vector(&[1.0, 0.0, 0.0], 1, None, server.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            None,
+            server.snapshot(),
+        )
         .unwrap();
     assert_eq!(vec_result.len(), 1, "vector search must return 1 result");
 }
@@ -2411,7 +2422,14 @@ async fn nt_04_chunking_large_vector_payload() {
                 ]),
             )
             .unwrap();
-        edge_db.insert_vector(tx, row_id, vec).unwrap();
+        edge_db
+            .insert_vector(
+                tx,
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                row_id,
+                vec,
+            )
+            .unwrap();
     }
     edge_db.commit(tx).unwrap();
 
@@ -2448,7 +2466,13 @@ async fn nt_04_chunking_large_vector_payload() {
 
     // Vector search on server finds the planted vector (precision check)
     let search_result = server_db
-        .query_vector(&known_vector, 1, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &known_vector,
+            1,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     assert_eq!(search_result.len(), 1);
     assert!(
@@ -2653,7 +2677,14 @@ async fn nt_06_initial_sync_empty_edge() {
                 ]),
             )
             .unwrap();
-        server_db.insert_vector(tx, row_id, vec).unwrap();
+        server_db
+            .insert_vector(
+                tx,
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                row_id,
+                vec,
+            )
+            .unwrap();
     }
     // Graph edges
     server_db
@@ -2769,10 +2800,22 @@ async fn nt_06_initial_sync_empty_edge() {
     // Vectors intact: same top-3 ANN results
     let query_vec = [1.0_f32, 0.0, 0.0];
     let top3_edge = edge_db
-        .query_vector(&query_vec, 3, None, edge_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &query_vec,
+            3,
+            None,
+            edge_db.snapshot(),
+        )
         .unwrap();
     let top3_server = server_db
-        .query_vector(&query_vec, 3, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &query_vec,
+            3,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     // Compare similarity scores, NOT row_ids — row_ids are instance-local
     // and will differ between edge and server (design deviation #3)
@@ -3060,7 +3103,12 @@ async fn nt_09_cross_edge_embedding_clustering() {
             )
             .unwrap();
         edge_db
-            .insert_vector(tx, row_id, edge_embeddings[i].clone())
+            .insert_vector(
+                tx,
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                row_id,
+                edge_embeddings[i].clone(),
+            )
             .unwrap();
         edge_db.commit(tx).unwrap();
         obs_uuids.push(obs_id);
@@ -3090,7 +3138,13 @@ async fn nt_09_cross_edge_embedding_clustering() {
 
     // Cross-context vector query finds cluster
     let search_result = server_db
-        .query_vector(&base_embedding, 3, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &base_embedding,
+            3,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     assert_eq!(
         search_result.len(),
@@ -3458,7 +3512,14 @@ async fn nt_11_push_large_mixed_payload_chunked() {
                 ]),
             )
             .unwrap();
-        edge_db.insert_vector(tx, row_id, vec).unwrap();
+        edge_db
+            .insert_vector(
+                tx,
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                row_id,
+                vec,
+            )
+            .unwrap();
     }
     edge_db.commit(tx).unwrap();
 
@@ -3531,7 +3592,13 @@ async fn nt_11_push_large_mixed_payload_chunked() {
     );
 
     let search = server_db
-        .query_vector(&known_vector, 1, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &known_vector,
+            1,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     assert_eq!(search.len(), 1);
     assert!(
@@ -3767,7 +3834,14 @@ async fn nt_14_large_bidirectional_vector_sync() {
                 ]),
             )
             .unwrap();
-        edge_db.insert_vector(tx_e, row_id, vec).unwrap();
+        edge_db
+            .insert_vector(
+                tx_e,
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                row_id,
+                vec,
+            )
+            .unwrap();
     }
     edge_db.commit(tx_e).unwrap();
 
@@ -3792,7 +3866,14 @@ async fn nt_14_large_bidirectional_vector_sync() {
                 ]),
             )
             .unwrap();
-        server_db.insert_vector(tx_s, row_id, vec).unwrap();
+        server_db
+            .insert_vector(
+                tx_s,
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                row_id,
+                vec,
+            )
+            .unwrap();
     }
     server_db.commit(tx_s).unwrap();
 
@@ -3863,7 +3944,13 @@ async fn nt_14_large_bidirectional_vector_sync() {
     );
 
     let push_search = server_db
-        .query_vector(&known_edge_vector, 1, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &known_edge_vector,
+            1,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     assert_eq!(push_search.len(), 1);
     assert!(
@@ -3873,7 +3960,13 @@ async fn nt_14_large_bidirectional_vector_sync() {
     );
 
     let pull_search = edge_db
-        .query_vector(&known_server_vector, 1, None, edge_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &known_server_vector,
+            1,
+            None,
+            edge_db.snapshot(),
+        )
         .unwrap();
     assert_eq!(pull_search.len(), 1);
     assert!(
@@ -4342,8 +4435,13 @@ fn integrity_12_sync_delete_removes_vectors() {
             ]),
         )
         .unwrap();
-    db.insert_vector(target_tx, target_row_id, vec![1.0, 0.0, 0.0])
-        .unwrap();
+    db.insert_vector(
+        target_tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        target_row_id,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     db.commit(target_tx).unwrap();
 
     let changes = ChangeSet {
@@ -4362,6 +4460,7 @@ fn integrity_12_sync_delete_removes_vectors() {
         }],
         edges: vec![],
         vectors: vec![VectorChange {
+            index: contextdb_core::VectorIndexRef::new("observations", "embedding"),
             row_id: RowId(1),
             vector: Vec::new(),
             lsn: Lsn(10),
@@ -4421,8 +4520,13 @@ fn integrity_13_sync_upsert_refreshes_vector() {
             ]),
         )
         .unwrap();
-    db.insert_vector(target_tx, original_row_id, vec![1.0, 0.0, 0.0])
-        .unwrap();
+    db.insert_vector(
+        target_tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        original_row_id,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     db.commit(target_tx).unwrap();
 
     let new_vector = vec![0.0, 1.0, 0.0];
@@ -4443,6 +4547,7 @@ fn integrity_13_sync_upsert_refreshes_vector() {
         }],
         edges: vec![],
         vectors: vec![VectorChange {
+            index: contextdb_core::VectorIndexRef::new("observations", "embedding"),
             row_id: RowId(1),
             vector: new_vector.clone(),
             lsn: Lsn(10),
@@ -4466,7 +4571,13 @@ fn integrity_13_sync_upsert_refreshes_vector() {
         "sync upsert must update relational values"
     );
     let vector_hits = db
-        .query_vector(&new_vector, 1, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &new_vector,
+            1,
+            None,
+            db.snapshot(),
+        )
         .expect("vector search after sync upsert");
     assert_eq!(
         vector_hits.len(),

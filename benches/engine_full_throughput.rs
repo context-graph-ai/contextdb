@@ -126,6 +126,7 @@ fn mixed_workflow_latency(c: &mut Criterion) {
             .unwrap();
         db.insert_vector(
             tx,
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
             row_id,
             vec![1.0 - (idx as f32 * 0.02), idx as f32 * 0.02],
         )
@@ -160,8 +161,14 @@ fn mixed_workflow_latency(c: &mut Criterion) {
             for r in &candidate_obs {
                 candidates.insert(r.row_id.0);
             }
-            db.query_vector(&[1.0, 0.0], 5, Some(&candidates), db.snapshot())
-                .unwrap();
+            db.query_vector(
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                &[1.0, 0.0],
+                5,
+                Some(&candidates),
+                db.snapshot(),
+            )
+            .unwrap();
         });
     });
 }

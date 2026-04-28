@@ -1105,3 +1105,45 @@ async fn sync_e2e_value_txid_round_trip() {
         tx_id_used
     );
 }
+
+// Named vector index RED tests from named-vector-indexes-tests.md.
+/// I pushed an evidence row carrying both vector_text and vector_vision through the sync wire format, and the
+/// receiver decoded each change with the right (table, column) identity — the two columns did not collide.
+#[test]
+fn f111_sync_vector_change_round_trip_preserves_table_column_identity() {
+    use contextdb_core::{Lsn, RowId, VectorIndexRef};
+    use contextdb_engine::sync_types::{ChangeSet, VectorChange};
+    use contextdb_server::protocol::WireChangeSet;
+
+    let original = ChangeSet {
+        rows: vec![],
+        edges: vec![],
+        vectors: vec![
+            VectorChange {
+                index: VectorIndexRef::new("evidence", "vector_text"),
+                row_id: RowId(7),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                lsn: Lsn(42),
+            },
+            VectorChange {
+                index: VectorIndexRef::new("evidence", "vector_vision"),
+                row_id: RowId(7),
+                vector: vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                lsn: Lsn(42),
+            },
+        ],
+        ddl: vec![],
+    };
+    let wire: WireChangeSet = original.clone().into();
+    let bytes = rmp_serde::to_vec(&wire).expect("rmp_serde encode");
+    let decoded: WireChangeSet = rmp_serde::from_slice(&bytes).expect("rmp_serde decode");
+    let restored: ChangeSet = decoded.into();
+    assert_eq!(
+        restored.vectors[0].index,
+        VectorIndexRef::new("evidence", "vector_text")
+    );
+    assert_eq!(
+        restored.vectors[1].index,
+        VectorIndexRef::new("evidence", "vector_vision")
+    );
+}

@@ -50,7 +50,13 @@ fn job_03_vector_search_with_explain() {
             )]),
         )
         .unwrap();
-    db.insert_vector(tx, row, vec![1.0, 0.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        row,
+        vec![1.0, 0.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     let out = db
@@ -89,7 +95,13 @@ fn job_04_cross_subsystem_tx() {
         std::collections::HashMap::new(),
     )
     .unwrap();
-    db.insert_vector(tx, rid, vec![1.0, 0.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("entities", "embedding"),
+        rid,
+        vec![1.0, 0.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     assert_eq!(db.scan("entities", db.snapshot()).unwrap().len(), 1);

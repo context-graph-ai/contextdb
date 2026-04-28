@@ -1,5 +1,6 @@
 use contextdb_core::{
-    AdjEntry, Lsn, MemoryAccountant, RowId, SnapshotId, TxId, Value, VectorEntry, VersionedRow,
+    AdjEntry, Lsn, MemoryAccountant, RowId, SnapshotId, TxId, Value, VectorEntry, VectorIndexRef,
+    VersionedRow,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
@@ -95,6 +96,7 @@ fn mem_02_visible_at_uses_option_combinator() {
     assert!(!edge.visible_at(SnapshotId(7)));
 
     let vector = VectorEntry {
+        index: VectorIndexRef::default(),
         row_id: RowId(1),
         vector: vec![1.0, 2.0, 3.0],
         created_tx: TxId(1),

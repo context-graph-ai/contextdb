@@ -1277,13 +1277,24 @@ fn b5_01_find_similar_decisions() {
     }
     let tx2 = db.begin();
     for (idx, rid) in row_ids.iter().enumerate() {
-        db.insert_vector(tx2, *rid, vec![1.0 - (idx as f32 * 0.1), 0.0])
-            .expect("vector");
+        db.insert_vector(
+            tx2,
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            *rid,
+            vec![1.0 - (idx as f32 * 0.1), 0.0],
+        )
+        .expect("vector");
     }
     db.commit(tx2).expect("commit vectors");
 
     let out = db
-        .query_vector(&[1.0, 0.0], 3, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &[1.0, 0.0],
+            3,
+            None,
+            db.snapshot(),
+        )
         .expect("search");
     assert_eq!(out.len(), 3);
     assert!(out[0].1 >= out[1].1 && out[1].1 >= out[2].1);
@@ -1319,13 +1330,25 @@ fn b5_02_similarity_with_type_filter() {
         } else {
             vec![0.0, 1.0]
         };
-        db.insert_vector(tx, *rid, vec).expect("vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            *rid,
+            vec,
+        )
+        .expect("vector");
     }
     db.commit(tx).expect("commit");
 
     // Do vector search
     let results = db
-        .query_vector(&[1.0, 0.0], 5, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &[1.0, 0.0],
+            5,
+            None,
+            db.snapshot(),
+        )
         .expect("search");
     assert!(!results.is_empty());
 
@@ -1361,13 +1384,24 @@ fn b5_03_similarity_threshold() {
     let rows = decision_rows(&db);
     let tx2 = db.begin();
     for (i, r) in rows.iter().enumerate() {
-        db.insert_vector(tx2, r.row_id, vec![1.0 - (i as f32 * 0.4), 0.0])
-            .expect("vector");
+        db.insert_vector(
+            tx2,
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            r.row_id,
+            vec![1.0 - (i as f32 * 0.4), 0.0],
+        )
+        .expect("vector");
     }
     db.commit(tx2).expect("commit");
 
     let all = db
-        .query_vector(&[1.0, 0.0], 3, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &[1.0, 0.0],
+            3,
+            None,
+            db.snapshot(),
+        )
         .expect("search");
     let filtered: Vec<_> = all.into_iter().filter(|(_, sim)| *sim >= 0.5).collect();
     assert!(!filtered.is_empty());
@@ -1378,9 +1412,15 @@ fn b5_03_similarity_threshold() {
 fn b5_04_similarity_empty_store() {
     let db = setup_ontology_db();
     assert!(
-        db.query_vector(&[1.0, 0.0], 3, None, db.snapshot())
-            .expect("search")
-            .is_empty()
+        db.query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &[1.0, 0.0],
+            3,
+            None,
+            db.snapshot()
+        )
+        .expect("search")
+        .is_empty()
     );
 }
 
@@ -1411,7 +1451,13 @@ fn b5_05_compound_search_time_vector_confidence() {
                 ]),
             )
             .expect("insert");
-        db.insert_vector(tx, rid, vec).expect("vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            rid,
+            vec,
+        )
+        .expect("vector");
         db.insert_row(
             tx,
             "outcomes",
@@ -1446,7 +1492,13 @@ fn b5_05_compound_search_time_vector_confidence() {
 
     // (3) query_vector with candidates
     let vec_results = db
-        .query_vector(&[1.0, 0.0], 5, Some(&candidates), db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &[1.0, 0.0],
+            5,
+            Some(&candidates),
+            db.snapshot(),
+        )
         .expect("vector search");
     assert!(!vec_results.is_empty());
 
@@ -1519,15 +1571,26 @@ fn b5_06_cross_context_semantic_search() {
             )
             .expect("insert");
         // Spread vectors so all are findable
-        db.insert_vector(tx, rid, vec![1.0 - (idx as f32 * 0.1), idx as f32 * 0.1])
-            .expect("vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            rid,
+            vec![1.0 - (idx as f32 * 0.1), idx as f32 * 0.1],
+        )
+        .expect("vector");
         row_ids_ctx.push((rid.0, ctx.to_string()));
     }
     db.commit(tx).expect("commit");
 
     // query_vector without context restriction
     let results = db
-        .query_vector(&[1.0, 0.0], 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0],
+            10,
+            None,
+            db.snapshot(),
+        )
         .expect("search");
     assert_eq!(results.len(), 4);
 
@@ -3915,6 +3978,7 @@ fn b16_01_graph_to_relational_to_vector() {
     for (idx, r) in candidate_obs.iter().enumerate() {
         db.insert_vector(
             tx2,
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
             r.row_id,
             vec![1.0 - (idx as f32 * 0.1), idx as f32 * 0.1],
         )
@@ -3924,7 +3988,13 @@ fn b16_01_graph_to_relational_to_vector() {
 
     // Call query_vector with candidates and a query vector
     let vec_results = db
-        .query_vector(&[1.0, 0.0], 5, Some(&candidates), db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0],
+            5,
+            Some(&candidates),
+            db.snapshot(),
+        )
         .expect("vector search");
     assert!(
         !vec_results.is_empty(),
@@ -3980,12 +4050,24 @@ fn b17_02_ann_output_shape() {
                 ]),
             )
             .expect("insert");
-        db.insert_vector(tx, rid, vec).expect("vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            rid,
+            vec,
+        )
+        .expect("vector");
     }
     db.commit(tx).expect("commit");
 
     let out = db
-        .query_vector(&[1.0, 0.0, 0.0, 0.0], 3, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0, 0.0],
+            3,
+            None,
+            db.snapshot(),
+        )
         .expect("search");
     assert_eq!(out.len(), 3);
     assert!(out[0].1 >= out[1].1 && out[1].1 >= out[2].1);
@@ -4424,8 +4506,13 @@ fn b18_04_high_frequency_write_throughput() {
                 ]),
             )
             .expect("obs");
-        db.insert_vector(tx, rid, vec![1.0, (i % 10) as f32])
-            .expect("vec");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            rid,
+            vec![1.0, (i % 10) as f32],
+        )
+        .expect("vec");
         row_ids.push(rid);
     }
     db.commit(tx).expect("commit");
@@ -4435,7 +4522,13 @@ fn b18_04_high_frequency_write_throughput() {
         1000
     );
     let out = db
-        .query_vector(&[1.0, 0.0], 5, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0],
+            5,
+            None,
+            db.snapshot(),
+        )
         .expect("search");
     assert_eq!(out.len(), 5);
     assert!(out.iter().all(|(id, _)| row_ids.contains(id)));
@@ -4474,12 +4567,30 @@ fn b18_06_person_reidentification_via_embedding() {
             ]),
         )
         .expect("obs2");
-    db.insert_vector(tx, r1, vec![1.0, 0.0]).expect("v1");
-    db.insert_vector(tx, r2, vec![0.0, 1.0]).expect("v2");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        r1,
+        vec![1.0, 0.0],
+    )
+    .expect("v1");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        r2,
+        vec![0.0, 1.0],
+    )
+    .expect("v2");
     db.commit(tx).expect("commit");
 
     let top = db
-        .query_vector(&[0.95, 0.05], 1, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[0.95, 0.05],
+            1,
+            None,
+            db.snapshot(),
+        )
         .expect("search");
     assert_eq!(top.len(), 1);
     assert_eq!(top[0].0, r1);

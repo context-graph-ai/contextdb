@@ -710,8 +710,13 @@ fn f95_store_and_recall_an_interaction_in_one_transaction() {
         Default::default(),
     )
     .expect("insert graph edge");
-    db.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0])
-        .expect("insert vector");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("messages", "embedding"),
+        row_id,
+        vec![1.0, 0.0, 0.0],
+    )
+    .expect("insert vector");
     db.commit(tx).expect("commit interaction");
     let bfs = db
         .query_bfs(
@@ -761,7 +766,13 @@ fn f96_upsert_user_preference_preserves_graph_and_vector_consistency() {
     )
     .expect("upsert pref");
     let result = db
-        .query_vector(&[0.0, 1.0, 0.0], 1, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("prefs", "embedding"),
+            &[0.0, 1.0, 0.0],
+            1,
+            None,
+            db.snapshot(),
+        )
         .expect("updated vector");
     assert_eq!(result.len(), 1, "updated embedding must remain searchable");
     let row = db
@@ -1171,6 +1182,7 @@ fn f104_on_conflict_do_update_works_with_vector_columns() {
     .expect("upsert memory");
     let results = db
         .query_vector(
+            contextdb_core::VectorIndexRef::new("memories", "embedding"),
             &{
                 let mut v = vec![0.0; 384];
                 v[1] = 1.0;
@@ -2063,8 +2075,13 @@ fn f120_atomic_cross_subsystem_write() {
             ]),
         )
         .expect("insert decision row in tx");
-    db.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0])
-        .expect("insert vector in tx");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        row_id,
+        vec![1.0, 0.0, 0.0],
+    )
+    .expect("insert vector in tx");
     db.insert_edge(tx, decision, intention, "SERVES".into(), Default::default())
         .expect("insert SERVES edge in tx");
     db.insert_edge(tx, decision, entity, "BASED_ON".into(), Default::default())
@@ -2109,8 +2126,13 @@ fn f120_atomic_cross_subsystem_write() {
             ]),
         )
         .expect("insert decision row in tx (commit)");
-    db.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0])
-        .expect("insert vector in tx (commit)");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        row_id,
+        vec![1.0, 0.0, 0.0],
+    )
+    .expect("insert vector in tx (commit)");
     db.insert_edge(tx, decision, intention, "SERVES".into(), Default::default())
         .expect("insert SERVES edge in tx (commit)");
     db.insert_edge(tx, decision, entity, "BASED_ON".into(), Default::default())
@@ -2144,7 +2166,13 @@ fn f120_atomic_cross_subsystem_write() {
 
     // Verify: vector search finds the decision
     let vec_results = db
-        .query_vector(&[1.0, 0.0, 0.0], 1, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            None,
+            db.snapshot(),
+        )
         .expect("vector search after commit");
     assert_eq!(
         vec_results.len(),

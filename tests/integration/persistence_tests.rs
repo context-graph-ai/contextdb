@@ -314,15 +314,39 @@ fn p04_vectors_survive_reopen_and_ann_works() {
     let r3 = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
-    db.insert_vector(tx, r1, vec![1.0, 0.0, 0.0]).unwrap();
-    db.insert_vector(tx, r2, vec![0.0, 1.0, 0.0]).unwrap();
-    db.insert_vector(tx, r3, vec![0.7, 0.7, 0.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r1,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r2,
+        vec![0.0, 1.0, 0.0],
+    )
+    .unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r3,
+        vec![0.7, 0.7, 0.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
     let results = db2
-        .query_vector(&[0.9, 0.1, 0.0], 2, None, db2.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            &[0.9, 0.1, 0.0],
+            2,
+            None,
+            db2.snapshot(),
+        )
         .unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].0, r1);
@@ -348,16 +372,37 @@ fn p05_hnsw_recall_stable_across_reopen() {
                 values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .unwrap();
-        db.insert_vector(tx, rid, random_unit_vector(384, i))
-            .unwrap();
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("vecs", "embedding"),
+            rid,
+            random_unit_vector(384, i),
+        )
+        .unwrap();
     }
     db.commit(tx).unwrap();
     let query = random_unit_vector(384, 9_999);
-    let pre = db.query_vector(&query, 5, None, db.snapshot()).unwrap();
+    let pre = db
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("vecs", "embedding"),
+            &query,
+            5,
+            None,
+            db.snapshot(),
+        )
+        .unwrap();
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let post = db2.query_vector(&query, 5, None, db2.snapshot()).unwrap();
+    let post = db2
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("vecs", "embedding"),
+            &query,
+            5,
+            None,
+            db2.snapshot(),
+        )
+        .unwrap();
     let pre_ids = pre.iter().map(|r| r.0).collect::<HashSet<_>>();
     let post_ids = post.iter().map(|r| r.0).collect::<HashSet<_>>();
     assert_eq!(pre_ids, post_ids);
@@ -395,7 +440,13 @@ fn p06_cross_subsystem_atomic_persistence() {
         .unwrap();
     db.insert_edge(tx, dec_id, node_id, "SERVES".to_string(), HashMap::new())
         .unwrap();
-    db.insert_vector(tx, r1, vec![1.0, 0.0, 0.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        r1,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
     db.close().unwrap();
 
@@ -417,7 +468,13 @@ fn p06_cross_subsystem_atomic_persistence() {
     assert_eq!(bfs.nodes.len(), 1);
     assert_eq!(bfs.nodes[0].id, node_id);
     let results = db2
-        .query_vector(&[0.9, 0.1, 0.0], 1, None, db2.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &[0.9, 0.1, 0.0],
+            1,
+            None,
+            db2.snapshot(),
+        )
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, r1);
@@ -657,7 +714,13 @@ fn p12_open_memory_still_works() {
     .unwrap();
     db.insert_edge(tx, id1, id2, "LINKS".to_string(), HashMap::new())
         .unwrap();
-    db.insert_vector(tx, rid, vec![1.0, 0.0, 0.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("test", "embedding"),
+        rid,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     let row = db
@@ -677,7 +740,13 @@ fn p12_open_memory_still_works() {
     assert_eq!(bfs.nodes.len(), 1);
     assert_eq!(bfs.nodes[0].id, id2);
     let results = db
-        .query_vector(&[1.0, 0.0, 0.0], 1, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("test", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            None,
+            db.snapshot(),
+        )
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, rid);
@@ -729,7 +798,13 @@ fn p14_hnsw_recall_at_10_meets_threshold() {
             )
             .unwrap();
         let vec = random_unit_vector(384, i + 100);
-        db.insert_vector(tx, rid, vec.clone()).unwrap();
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("vecs", "embedding"),
+            rid,
+            vec.clone(),
+        )
+        .unwrap();
         vectors.push((rid, vec));
     }
     db.commit(tx).unwrap();
@@ -738,7 +813,13 @@ fn p14_hnsw_recall_at_10_meets_threshold() {
         .into_iter()
         .collect::<HashSet<_>>();
     let actual = db
-        .query_vector(&query, 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("vecs", "embedding"),
+            &query,
+            10,
+            None,
+            db.snapshot(),
+        )
         .unwrap()
         .into_iter()
         .map(|(rid, _)| rid)
@@ -777,9 +858,27 @@ fn p15_snapshot_query_sees_only_vectors_committed_before_snapshot() {
             values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
         )
         .unwrap();
-    db.insert_vector(tx1, r1, vec![1.0, 0.0, 0.0]).unwrap();
-    db.insert_vector(tx1, r2, vec![0.0, 1.0, 0.0]).unwrap();
-    db.insert_vector(tx1, r3, vec![0.0, 0.0, 1.0]).unwrap();
+    db.insert_vector(
+        tx1,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r1,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
+    db.insert_vector(
+        tx1,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r2,
+        vec![0.0, 1.0, 0.0],
+    )
+    .unwrap();
+    db.insert_vector(
+        tx1,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r3,
+        vec![0.0, 0.0, 1.0],
+    )
+    .unwrap();
     db.commit(tx1).unwrap();
     let old_snap = db.snapshot();
 
@@ -798,12 +897,30 @@ fn p15_snapshot_query_sees_only_vectors_committed_before_snapshot() {
             values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
         )
         .unwrap();
-    db.insert_vector(tx2, r4, vec![0.9, 0.1, 0.0]).unwrap();
-    db.insert_vector(tx2, r5, vec![0.5, 0.5, 0.5]).unwrap();
+    db.insert_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r4,
+        vec![0.9, 0.1, 0.0],
+    )
+    .unwrap();
+    db.insert_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        r5,
+        vec![0.5, 0.5, 0.5],
+    )
+    .unwrap();
     db.commit(tx2).unwrap();
 
     let results = db
-        .query_vector(&[1.0, 0.0, 0.0], 10, None, old_snap)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            &[1.0, 0.0, 0.0],
+            10,
+            None,
+            old_snap,
+        )
         .unwrap();
     let ids = results
         .into_iter()
@@ -1025,8 +1142,13 @@ fn p19_data_integrity_at_scale() {
                     values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
                 )
                 .unwrap();
-                db.insert_vector(tx, row_id, vec![angle.cos(), angle.sin(), 0.0])
-                    .unwrap();
+                db.insert_vector(
+                    tx,
+                    contextdb_core::VectorIndexRef::new("vec_t", "embedding"),
+                    row_id,
+                    vec![angle.cos(), angle.sin(), 0.0],
+                )
+                .unwrap();
                 vector_row_ids.push(row_id);
             }
         }
@@ -1047,7 +1169,13 @@ fn p19_data_integrity_at_scale() {
         .unwrap();
     assert_eq!(bfs.nodes.len(), 999);
     let ann = db2
-        .query_vector(&[1.0, 0.0, 0.0], 1, None, db2.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("vec_t", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            None,
+            db2.snapshot(),
+        )
         .unwrap();
     assert_eq!(ann[0].0, vector_row_ids[0]);
     for idx in [128usize, 256, 512, 1024, 4096, 8192] {
@@ -1074,8 +1202,13 @@ fn p20_dimension_mismatch_rejected_after_restart() {
     let rid = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
-    db.insert_vector(tx, rid, random_unit_vector(384, 123))
-        .unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        rid,
+        random_unit_vector(384, 123),
+    )
+    .unwrap();
     db.commit(tx).unwrap();
     db.close().unwrap();
 
@@ -1088,7 +1221,12 @@ fn p20_dimension_mismatch_rejected_after_restart() {
             values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
         )
         .unwrap();
-    let err = db2.insert_vector(tx2, rid2, random_unit_vector(256, 456));
+    let err = db2.insert_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        rid2,
+        random_unit_vector(256, 456),
+    );
     assert!(err.is_err());
 }
 
@@ -1203,13 +1341,25 @@ fn p25_vectors_survive_process_crash_without_close() {
     let rid = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
-    db.insert_vector(tx, rid, vec![1.0, 0.0, 0.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        rid,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
     drop(db);
 
     let db2 = Database::open(&path).unwrap();
     let results = db2
-        .query_vector(&[1.0, 0.0, 0.0], 1, None, db2.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            None,
+            db2.snapshot(),
+        )
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, rid);
@@ -1233,7 +1383,13 @@ fn p26_flush_on_commit_proven_when_drop_is_skipped() {
         .unwrap();
     db.insert_edge(tx, item_id, node_id, "SERVES".to_string(), HashMap::new())
         .unwrap();
-    db.insert_vector(tx, rid, vec![1.0, 0.0, 0.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("items", "embedding"),
+        rid,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
     forget(db);
 
@@ -1251,8 +1407,14 @@ fn p26_flush_on_commit_proven_when_drop_is_skipped() {
         node_id
     );
     assert_eq!(
-        db2.query_vector(&[1.0, 0.0, 0.0], 1, None, db2.snapshot())
-            .unwrap()[0]
+        db2.query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            None,
+            db2.snapshot()
+        )
+        .unwrap()[0]
             .0,
         rid
     );
@@ -1534,16 +1696,32 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
         let rid = db
             .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
             .unwrap();
-        db.insert_vector(tx, rid, v.clone()).unwrap();
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            rid,
+            v.clone(),
+        )
+        .unwrap();
         row_ids.push(rid);
     }
     db.commit(tx).unwrap();
 
     let tx2 = db.begin();
     db.delete_row(tx2, "obs", row_ids[0]).unwrap();
-    db.delete_vector(tx2, row_ids[0]).unwrap();
+    db.delete_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        row_ids[0],
+    )
+    .unwrap();
     db.delete_row(tx2, "obs", row_ids[1]).unwrap();
-    db.delete_vector(tx2, row_ids[1]).unwrap();
+    db.delete_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("obs", "embedding"),
+        row_ids[1],
+    )
+    .unwrap();
     db.commit(tx2).unwrap();
 
     db.close().unwrap();
@@ -1551,7 +1729,13 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
     let db2 = Database::open(&path).unwrap();
 
     let results = db2
-        .query_vector(&[1.0, 0.0, 0.0], 5, None, db2.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("obs", "embedding"),
+            &[1.0, 0.0, 0.0],
+            5,
+            None,
+            db2.snapshot(),
+        )
         .unwrap();
     let result_ids: HashSet<_> = results.iter().map(|(rid, _)| *rid).collect();
 

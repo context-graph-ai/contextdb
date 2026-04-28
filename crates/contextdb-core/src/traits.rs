@@ -61,13 +61,20 @@ pub trait GraphExecutor: Send + Sync {
 pub trait VectorExecutor: Send + Sync {
     fn search(
         &self,
+        index: VectorIndexRef,
         query: &[f32],
         k: usize,
         candidates: Option<&roaring::RoaringTreemap>,
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>>;
-    fn insert_vector(&self, tx: TxId, row_id: RowId, vector: Vec<f32>) -> Result<()>;
-    fn delete_vector(&self, tx: TxId, row_id: RowId) -> Result<()>;
+    fn insert_vector(
+        &self,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+        vector: Vec<f32>,
+    ) -> Result<()>;
+    fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()>;
 }
 
 pub trait TransactionManager: Send + Sync {

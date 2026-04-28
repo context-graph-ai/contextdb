@@ -12,6 +12,33 @@ use std::time::Instant;
 /// Max concurrent in-flight chunked push sessions. Rejects new chunk_ids past this limit.
 const MAX_CHUNK_SESSIONS: usize = 64;
 
+async fn maybe_wait_for_test_push_barrier(row_count: usize) {
+    let Some(min_rows) = std::env::var("CONTEXTDB_TEST_PUSH_BARRIER_MIN_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    if row_count < min_rows {
+        return;
+    }
+
+    let Some(barrier_path) = std::env::var_os("CONTEXTDB_TEST_PUSH_BARRIER_FILE") else {
+        return;
+    };
+    let Some(release_path) = std::env::var_os("CONTEXTDB_TEST_PUSH_RELEASE_FILE") else {
+        return;
+    };
+
+    let barrier_path = std::path::PathBuf::from(barrier_path);
+    let release_path = std::path::PathBuf::from(release_path);
+    let _ = std::fs::write(&barrier_path, b"push-handler-started");
+
+    while !release_path.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 pub struct SyncServer {
     db: Arc<Database>,
     nats_url: String,
@@ -233,6 +260,7 @@ impl SyncServer {
             MessageType::PushRequest => {
                 let request: PushRequest = rmp_serde::from_slice(&envelope.payload)
                     .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
+                maybe_wait_for_test_push_barrier(request.changeset.rows.len()).await;
                 let response = match self
                     .db
                     .apply_changes(request.changeset.into(), &self.policies)

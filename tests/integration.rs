@@ -32,6 +32,8 @@ mod indexed_scan_filter_tests;
 mod job_level;
 #[path = "integration/memory_accounting_tests.rs"]
 mod memory_accounting_tests;
+#[path = "integration/named_vector_indexes_tests.rs"]
+mod named_vector_indexes_tests;
 #[cfg(target_os = "linux")]
 #[path = "integration/peak_rss_harness.rs"]
 mod peak_rss_harness;

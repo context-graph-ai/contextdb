@@ -481,13 +481,25 @@ fn t07_vector_exclusion_basic() {
             ]),
         )
         .unwrap();
-    db.insert_vector(tx, row_id, vec128(0.5)).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        row_id,
+        vec128(0.5),
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     assert!(
-        !db.query_vector(&vec128(0.5), 10, None, db.snapshot())
-            .unwrap()
-            .is_empty()
+        !db.query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &vec128(0.5),
+            10,
+            None,
+            db.snapshot()
+        )
+        .unwrap()
+        .is_empty()
     );
 
     let tx2 = db.begin();
@@ -505,7 +517,13 @@ fn t07_vector_exclusion_basic() {
     db.commit(tx2).unwrap();
 
     let hits = db
-        .query_vector(&vec128(0.5), 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &vec128(0.5),
+            10,
+            None,
+            db.snapshot(),
+        )
         .unwrap();
     assert!(hits.iter().all(|(rid, _)| *rid != row_id));
 }
@@ -542,7 +560,13 @@ fn t08_fk_propagation_plus_vector_exclusion() {
             ]),
         )
         .unwrap();
-    db.insert_vector(tx, row_id, vec128(0.6)).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        row_id,
+        vec128(0.6),
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     let tx2 = db.begin();
@@ -561,7 +585,13 @@ fn t08_fk_propagation_plus_vector_exclusion() {
 
     assert_eq!(text(&get_row(&db, "decisions", d), "status"), "invalidated");
     let hits = db
-        .query_vector(&vec128(0.6), 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &vec128(0.6),
+            10,
+            None,
+            db.snapshot(),
+        )
         .unwrap();
     assert!(hits.iter().all(|(rid, _)| *rid != row_id));
 }
@@ -844,8 +874,20 @@ fn t15_end_to_end_fk_edge_vector_full_chain() {
         .unwrap();
     db.insert_edge(tx, b, a, "CITES".to_string(), HashMap::new())
         .unwrap();
-    db.insert_vector(tx, a_row, vec128(0.1)).unwrap();
-    db.insert_vector(tx, b_row, vec128(0.2)).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        a_row,
+        vec128(0.1),
+    )
+    .unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        b_row,
+        vec128(0.2),
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     let tx2 = db.begin();
@@ -866,7 +908,13 @@ fn t15_end_to_end_fk_edge_vector_full_chain() {
     assert_eq!(text(&get_row(&db, "decisions", b), "status"), "invalidated");
 
     let hits = db
-        .query_vector(&vec128(0.1), 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &vec128(0.1),
+            10,
+            None,
+            db.snapshot(),
+        )
         .unwrap();
     assert!(
         hits.iter().all(|(rid, _)| *rid != a_row && *rid != b_row),
@@ -894,7 +942,13 @@ fn t16_supersession_with_vector_exclusion() {
             ]),
         )
         .unwrap();
-    db.insert_vector(tx, row_id, vec128(0.7)).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+        row_id,
+        vec128(0.7),
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     let tx2 = db.begin();
@@ -916,7 +970,13 @@ fn t16_supersession_with_vector_exclusion() {
 
     assert_eq!(text(&get_row(&db, "decisions", d), "status"), "superseded");
     let hits = db
-        .query_vector(&vec128(0.7), 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("decisions", "embedding"),
+            &vec128(0.7),
+            10,
+            None,
+            db.snapshot(),
+        )
         .unwrap();
     assert!(hits.iter().all(|(rid, _)| *rid != row_id));
 }

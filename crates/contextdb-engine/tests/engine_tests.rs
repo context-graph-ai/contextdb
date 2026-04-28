@@ -69,7 +69,13 @@ fn test_cross_subsystem_atomic_commit() {
         HashMap::new(),
     )
     .unwrap();
-    eng.insert_vector(tx, row_id, vec![1.0, 0.0, 0.0]).unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        row_id,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
     eng.commit(tx).unwrap();
 
     let snap = eng.snapshot();
@@ -82,9 +88,15 @@ fn test_cross_subsystem_atomic_commit() {
         1
     );
     assert_eq!(
-        eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap)
-            .unwrap()
-            .len(),
+        eng.query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0],
+            10,
+            None,
+            snap
+        )
+        .unwrap()
+        .len(),
         1
     );
 
@@ -106,13 +118,26 @@ fn test_cross_subsystem_atomic_commit() {
         HashMap::new(),
     )
     .unwrap();
-    eng.insert_vector(tx2, RowId(999), vec![0.0, 1.0, 0.0])
-        .unwrap();
+    eng.insert_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(999),
+        vec![0.0, 1.0, 0.0],
+    )
+    .unwrap();
     eng.rollback(tx2).unwrap();
 
     let snap2 = eng.snapshot();
     assert_eq!(eng.scan("entities", snap2).unwrap().len(), 1);
-    let vec_results2 = eng.query_vector(&[0.0, 1.0, 0.0], 10, None, snap2).unwrap();
+    let vec_results2 = eng
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[0.0, 1.0, 0.0],
+            10,
+            None,
+            snap2,
+        )
+        .unwrap();
     assert_eq!(vec_results2.len(), 1);
     assert_eq!(vec_results2[0].0, row_id);
 }
@@ -136,7 +161,13 @@ fn test_rollback_across_all_subsystems() {
         .unwrap();
     eng.insert_edge(tx, a, b, "SERVES".into(), HashMap::new())
         .unwrap();
-    eng.insert_vector(tx, rid, vec![0.5, 0.5, 0.0]).unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        rid,
+        vec![0.5, 0.5, 0.0],
+    )
+    .unwrap();
     eng.rollback(tx).unwrap();
 
     let snap = eng.snapshot();
@@ -149,9 +180,15 @@ fn test_rollback_across_all_subsystems() {
         0
     );
     assert_eq!(
-        eng.query_vector(&[0.5, 0.5, 0.0], 10, None, snap)
-            .unwrap()
-            .len(),
+        eng.query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[0.5, 0.5, 0.0],
+            10,
+            None,
+            snap
+        )
+        .unwrap()
+        .len(),
         0
     );
 }
@@ -363,26 +400,76 @@ fn test_vector_search_with_prefilter() {
     let eng = setup_db();
 
     let tx = eng.begin();
-    eng.insert_vector(tx, RowId(1), vec![1.0, 0.0, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(2), vec![0.0, 1.0, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(3), vec![0.9, 0.1, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(4), vec![0.0, 0.0, 1.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(5), vec![0.5, 0.5, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(6), vec![-1.0, 0.0, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(7), vec![0.8, 0.2, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(8), vec![0.0, -1.0, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(9), vec![0.99, 0.01, 0.0])
-        .unwrap();
-    eng.insert_vector(tx, RowId(10), vec![0.1, 0.9, 0.0])
-        .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(1),
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(2),
+        vec![0.0, 1.0, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(3),
+        vec![0.9, 0.1, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(4),
+        vec![0.0, 0.0, 1.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(5),
+        vec![0.5, 0.5, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(6),
+        vec![-1.0, 0.0, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(7),
+        vec![0.8, 0.2, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(8),
+        vec![0.0, -1.0, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(9),
+        vec![0.99, 0.01, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(10),
+        vec![0.1, 0.9, 0.0],
+    )
+    .unwrap();
     eng.commit(tx).unwrap();
 
     let mut candidates = RoaringTreemap::new();
@@ -391,7 +478,13 @@ fn test_vector_search_with_prefilter() {
     }
 
     let results = eng
-        .query_vector(&[1.0, 0.0, 0.0], 3, Some(&candidates), eng.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0],
+            3,
+            Some(&candidates),
+            eng.snapshot(),
+        )
         .unwrap();
 
     for (rid, _) in &results {
@@ -447,9 +540,27 @@ fn test_unified_pipeline() {
     eng.insert_edge(tx, center, far, "RELATES_TO".into(), HashMap::new())
         .unwrap();
 
-    eng.insert_vector(tx, rid1, vec![1.0, 0.0, 0.0]).unwrap();
-    eng.insert_vector(tx, rid2, vec![0.9, 0.1, 0.0]).unwrap();
-    eng.insert_vector(tx, rid3, vec![0.0, 0.0, 1.0]).unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        rid1,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        rid2,
+        vec![0.9, 0.1, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        rid3,
+        vec![0.0, 0.0, 1.0],
+    )
+    .unwrap();
     eng.commit(tx).unwrap();
 
     let snap = eng.snapshot();
@@ -477,7 +588,13 @@ fn test_unified_pipeline() {
     assert_eq!(filtered_row_ids.len(), 2);
 
     let vec_results = eng
-        .query_vector(&[1.0, 0.0, 0.0], 1, Some(&filtered_row_ids), snap)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            Some(&filtered_row_ids),
+            snap,
+        )
         .unwrap();
     assert_eq!(vec_results.len(), 1);
     assert_eq!(vec_results[0].0, rid1);
@@ -668,25 +785,56 @@ fn test_vector_snapshot_isolation() {
     let eng = setup_db();
 
     let tx1 = eng.begin();
-    eng.insert_vector(tx1, RowId(1), vec![1.0, 0.0, 0.0])
-        .unwrap();
-    eng.insert_vector(tx1, RowId(2), vec![0.0, 1.0, 0.0])
-        .unwrap();
-    eng.insert_vector(tx1, RowId(3), vec![0.0, 0.0, 1.0])
-        .unwrap();
+    eng.insert_vector(
+        tx1,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(1),
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx1,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(2),
+        vec![0.0, 1.0, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx1,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(3),
+        vec![0.0, 0.0, 1.0],
+    )
+    .unwrap();
     eng.commit(tx1).unwrap();
 
     let snap1 = eng.snapshot();
 
     let tx2 = eng.begin();
-    eng.insert_vector(tx2, RowId(4), vec![0.7, 0.7, 0.0])
-        .unwrap();
-    eng.insert_vector(tx2, RowId(5), vec![0.5, 0.5, 0.5])
-        .unwrap();
+    eng.insert_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(4),
+        vec![0.7, 0.7, 0.0],
+    )
+    .unwrap();
+    eng.insert_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(5),
+        vec![0.5, 0.5, 0.5],
+    )
+    .unwrap();
     eng.commit(tx2).unwrap();
 
     let rids1: HashSet<RowId> = eng
-        .query_vector(&[1.0, 0.0, 0.0], 10, None, snap1)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0],
+            10,
+            None,
+            snap1,
+        )
         .unwrap()
         .iter()
         .map(|(r, _)| *r)
@@ -696,9 +844,15 @@ fn test_vector_snapshot_isolation() {
     assert!(!rids1.contains(&RowId(5)));
 
     assert_eq!(
-        eng.query_vector(&[1.0, 0.0, 0.0], 10, None, eng.snapshot())
-            .unwrap()
-            .len(),
+        eng.query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0],
+            10,
+            None,
+            eng.snapshot()
+        )
+        .unwrap()
+        .len(),
         5
     );
 }
@@ -716,9 +870,15 @@ fn test_empty_database() {
         0
     );
     assert_eq!(
-        eng.query_vector(&[1.0, 0.0, 0.0], 10, None, snap)
-            .unwrap()
-            .len(),
+        eng.query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0, 0.0],
+            10,
+            None,
+            snap
+        )
+        .unwrap()
+        .len(),
         0
     );
     assert_eq!(eng.scan("entities", snap).unwrap().len(), 0);
@@ -728,10 +888,24 @@ fn test_empty_database() {
 fn test_vector_search_requires_limit() {
     let eng = setup_db();
     let tx = eng.begin();
-    eng.insert_vector(tx, RowId(1), vec![1.0, 0.0]).unwrap();
+    eng.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        RowId(1),
+        vec![1.0, 0.0],
+    )
+    .unwrap();
     eng.commit(tx).unwrap();
 
     let snap = eng.snapshot();
-    let results = eng.query_vector(&[1.0, 0.0], 0, None, snap).unwrap();
+    let results = eng
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("observations", "embedding"),
+            &[1.0, 0.0],
+            0,
+            None,
+            snap,
+        )
+        .unwrap();
     assert_eq!(results.len(), 0);
 }

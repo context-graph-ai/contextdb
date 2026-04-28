@@ -86,7 +86,13 @@ fn measure_avg_recall(
     for seed in seeds {
         let query = random_unit_vector(DIMENSION, seed);
         let results = db
-            .query_vector(&query, k, None, db.snapshot())
+            .query_vector(
+                contextdb_core::VectorIndexRef::new("items", "embedding"),
+                &query,
+                k,
+                None,
+                db.snapshot(),
+            )
             .expect("vector search");
         let result_ids = results.iter().map(|r| r.0).collect::<HashSet<_>>();
         let truth_ids = brute_force_top_k(all_vectors, &query, k)
@@ -120,8 +126,13 @@ fn insert_items(db: &Database, count: u64, start_seed: u64) -> Vec<(RowId, Vec<f
             )
             .expect("insert row");
         let vec = random_unit_vector(DIMENSION, start_seed + i);
-        db.insert_vector(tx, rid, vec.clone())
-            .expect("insert vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            vec.clone(),
+        )
+        .expect("insert vector");
         rows.push((rid, vec));
     }
     db.commit(tx).expect("commit");
@@ -139,7 +150,13 @@ fn h01_below_threshold_uses_vector_search() {
         .expect("explain");
     let query = random_unit_vector(DIMENSION, 9_999);
     let results = db
-        .query_vector(&query, 5, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            5,
+            None,
+            db.snapshot(),
+        )
         .expect("query");
 
     assert!(explain.contains("VectorSearch"));
@@ -182,8 +199,13 @@ fn h03_transition_across_threshold_switches_explain() {
             values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
         )
         .expect("insert row");
-    db.insert_vector(tx, rid, random_unit_vector(DIMENSION, 999))
-        .expect("insert vector");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("items", "embedding"),
+        rid,
+        random_unit_vector(DIMENSION, 999),
+    )
+    .expect("insert vector");
     db.commit(tx).expect("commit");
     let explain_after = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
@@ -239,7 +261,12 @@ fn h06_deleted_vectors_are_excluded_under_hnsw() {
     let deleted_rids = all_rids[..300].iter().copied().collect::<HashSet<_>>();
     for rid in &all_rids[..300] {
         db.delete_row(tx, "items", *rid).expect("delete row");
-        db.delete_vector(tx, *rid).expect("delete vector");
+        db.delete_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            *rid,
+        )
+        .expect("delete vector");
     }
     db.commit(tx).expect("commit");
 
@@ -248,7 +275,13 @@ fn h06_deleted_vectors_are_excluded_under_hnsw() {
         .expect("explain");
     let query = random_unit_vector(DIMENSION, 9_999);
     let results = db
-        .query_vector(&query, 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            10,
+            None,
+            db.snapshot(),
+        )
         .expect("query");
 
     assert!(explain.contains("HNSWSearch"));
@@ -273,8 +306,13 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
                 values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .expect("insert row");
-        db.insert_vector(tx1, rid, random_unit_vector(DIMENSION, i))
-            .expect("insert vector");
+        db.insert_vector(
+            tx1,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            random_unit_vector(DIMENSION, i),
+        )
+        .expect("insert vector");
         tx1_rids.insert(rid);
     }
     db.commit(tx1).expect("commit tx1");
@@ -289,8 +327,13 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
                 values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .expect("insert row");
-        db.insert_vector(tx2, rid, random_unit_vector(DIMENSION, i))
-            .expect("insert vector");
+        db.insert_vector(
+            tx2,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            random_unit_vector(DIMENSION, i),
+        )
+        .expect("insert vector");
     }
     db.commit(tx2).expect("commit tx2");
 
@@ -299,7 +342,13 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
         .expect("explain");
     let query = random_unit_vector(DIMENSION, 9_999);
     let results = db
-        .query_vector(&query, 10, None, snap_after_tx1)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            10,
+            None,
+            snap_after_tx1,
+        )
         .expect("query");
 
     assert!(explain.contains("HNSWSearch"));
@@ -324,7 +373,13 @@ fn h08_prefiltered_search_respects_candidate_bitmap() {
         .expect("explain");
     let query = random_unit_vector(DIMENSION, 9_999);
     let results = db
-        .query_vector(&query, 10, Some(&candidates), db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            10,
+            Some(&candidates),
+            db.snapshot(),
+        )
         .expect("query");
 
     assert!(explain.contains("HNSWSearch"));
@@ -354,7 +409,13 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
             )
             .expect("insert row");
         let close_vec = perturb_vector(&query, 0.01, i);
-        db.insert_vector(tx, rid, close_vec).expect("insert vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            close_vec,
+        )
+        .expect("insert vector");
     }
     // 1090 vectors FAR from query
     for i in 10..1100 {
@@ -365,13 +426,24 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
                 values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .expect("insert row");
-        db.insert_vector(tx, rid, random_unit_vector(DIMENSION, i + 50_000))
-            .expect("insert vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            random_unit_vector(DIMENSION, i + 50_000),
+        )
+        .expect("insert vector");
     }
     db.commit(tx).expect("commit");
 
     let pre_results = db
-        .query_vector(&query, 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            10,
+            None,
+            db.snapshot(),
+        )
         .expect("pre query");
     let pre_ids = pre_results.iter().map(|r| r.0).collect::<HashSet<_>>();
     assert_eq!(pre_ids.len(), 10);
@@ -382,7 +454,13 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain");
     let post_results = db2
-        .query_vector(&query, 10, None, db2.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            10,
+            None,
+            db2.snapshot(),
+        )
         .expect("post query");
     let post_ids = post_results.iter().map(|r| r.0).collect::<HashSet<_>>();
 
@@ -407,8 +485,13 @@ fn h10_row_id_continuity_survives_reopen() {
                 values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .expect("insert row");
-        db.insert_vector(tx, rid, random_unit_vector(DIMENSION, i))
-            .expect("insert vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            random_unit_vector(DIMENSION, i),
+        )
+        .expect("insert vector");
         pre_rids.insert(rid);
     }
     db.commit(tx).expect("commit");
@@ -425,8 +508,13 @@ fn h10_row_id_continuity_survives_reopen() {
                 values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .expect("insert row");
-        db2.insert_vector(tx2, rid, random_unit_vector(DIMENSION, i))
-            .expect("insert vector");
+        db2.insert_vector(
+            tx2,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            random_unit_vector(DIMENSION, i),
+        )
+        .expect("insert vector");
         post_rids.insert(rid);
     }
     db2.commit(tx2).expect("commit");
@@ -448,7 +536,15 @@ fn h11_concurrent_reads_during_hnsw_search_do_not_panic() {
         handles.push(thread::spawn(move || {
             let query = random_unit_vector(DIMENSION, 7_000 + t);
             let snap = db_ref.snapshot();
-            let results = db_ref.query_vector(&query, 10, None, snap).expect("query");
+            let results = db_ref
+                .query_vector(
+                    contextdb_core::VectorIndexRef::new("items", "embedding"),
+                    &query,
+                    10,
+                    None,
+                    snap,
+                )
+                .expect("query");
             assert_eq!(results.len(), 10);
         }));
     }
@@ -476,12 +572,23 @@ fn h12_insert_after_hnsw_activation_is_searchable() {
             values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
         )
         .expect("insert row");
-    db.insert_vector(tx, rid_new, target_vec.clone())
-        .expect("insert vector");
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("items", "embedding"),
+        rid_new,
+        target_vec.clone(),
+    )
+    .expect("insert vector");
     db.commit(tx).expect("commit");
 
     let results = db
-        .query_vector(&target_vec, 1, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &target_vec,
+            1,
+            None,
+            db.snapshot(),
+        )
         .expect("query");
 
     assert!(explain.contains("HNSWSearch"));
@@ -515,7 +622,12 @@ fn h14_all_deleted_vectors_return_empty_results() {
     let tx = db.begin();
     for rid in &all_rids {
         db.delete_row(tx, "items", *rid).expect("delete row");
-        db.delete_vector(tx, *rid).expect("delete vector");
+        db.delete_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            *rid,
+        )
+        .expect("delete vector");
     }
     db.commit(tx).expect("commit");
 
@@ -524,7 +636,13 @@ fn h14_all_deleted_vectors_return_empty_results() {
         .expect("explain");
     let query = random_unit_vector(DIMENSION, 9_999);
     let results = db
-        .query_vector(&query, 10, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            10,
+            None,
+            db.snapshot(),
+        )
         .expect("query");
 
     assert!(explain.contains("HNSWSearch"));
@@ -553,7 +671,13 @@ fn h15_single_surviving_vector_is_returned() {
         } else {
             random_unit_vector(DIMENSION, i as u64)
         };
-        db.insert_vector(tx1, rid, vec).expect("insert vector");
+        db.insert_vector(
+            tx1,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            vec,
+        )
+        .expect("insert vector");
         if i == 500 {
             survivor_rid = rid;
         }
@@ -565,7 +689,12 @@ fn h15_single_surviving_vector_is_returned() {
     for rid in &all_rids {
         if *rid != survivor_rid {
             db.delete_row(tx2, "items", *rid).expect("delete row");
-            db.delete_vector(tx2, *rid).expect("delete vector");
+            db.delete_vector(
+                tx2,
+                contextdb_core::VectorIndexRef::new("items", "embedding"),
+                *rid,
+            )
+            .expect("delete vector");
         }
     }
     db.commit(tx2).expect("commit tx2");
@@ -574,7 +703,13 @@ fn h15_single_surviving_vector_is_returned() {
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 1")
         .expect("explain");
     let results = db
-        .query_vector(&survivor_vec, 1, None, db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &survivor_vec,
+            1,
+            None,
+            db.snapshot(),
+        )
         .expect("query");
 
     assert!(explain.contains("HNSWSearch"));
@@ -596,8 +731,13 @@ fn h16_dimension_mismatch_is_rejected_when_hnsw_would_be_active() {
                 values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
             )
             .expect("insert row");
-        db.insert_vector(tx1, rid, vec![1.0, 0.0, 0.0])
-            .expect("insert vector");
+        db.insert_vector(
+            tx1,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            vec![1.0, 0.0, 0.0],
+        )
+        .expect("insert vector");
     }
     db.commit(tx1).expect("commit");
 
@@ -609,7 +749,12 @@ fn h16_dimension_mismatch_is_rejected_when_hnsw_would_be_active() {
             values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
         )
         .expect("insert row");
-    let result = db.insert_vector(tx2, rid, vec![1.0, 0.0, 0.0, 0.0, 0.0]);
+    let result = db.insert_vector(
+        tx2,
+        contextdb_core::VectorIndexRef::new("items", "embedding"),
+        rid,
+        vec![1.0, 0.0, 0.0, 0.0, 0.0],
+    );
 
     assert!(matches!(
         result,
@@ -646,8 +791,13 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
         let rid = db
             .insert_row(tx, "items", values(vec![("id", Value::Uuid(uuid))]))
             .expect("insert row");
-        db.insert_vector(tx, rid, random_unit_vector(DIMENSION, i))
-            .expect("insert vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            random_unit_vector(DIMENSION, i),
+        )
+        .expect("insert vector");
         item_uuids.push(uuid);
     }
     db.commit(tx).expect("commit");
@@ -674,8 +824,13 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
     )
     .expect("insert edge");
     let vec_commit = random_unit_vector(DIMENSION, 8_888);
-    db.insert_vector(tx_commit, rid_commit, vec_commit.clone())
-        .expect("insert vector");
+    db.insert_vector(
+        tx_commit,
+        contextdb_core::VectorIndexRef::new("items", "embedding"),
+        rid_commit,
+        vec_commit.clone(),
+    )
+    .expect("insert vector");
     db.commit(tx_commit).expect("commit tx");
     let snapshot = db.snapshot();
 
@@ -697,7 +852,13 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
     assert_eq!(bfs.nodes.len(), 1);
     assert_eq!(bfs.nodes[0].id, item_uuids[0]);
     let vec_results = db
-        .query_vector(&vec_commit, 1, None, snapshot)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &vec_commit,
+            1,
+            None,
+            snapshot,
+        )
         .expect("vector query");
     assert_eq!(vec_results[0].0, rid_commit);
 
@@ -715,8 +876,13 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
     )
     .expect("insert edge");
     let vec_rb = random_unit_vector(DIMENSION, 7_777);
-    db.insert_vector(tx_rb, rid_rb, vec_rb.clone())
-        .expect("insert vector");
+    db.insert_vector(
+        tx_rb,
+        contextdb_core::VectorIndexRef::new("items", "embedding"),
+        rid_rb,
+        vec_rb.clone(),
+    )
+    .expect("insert vector");
     db.rollback(tx_rb).expect("rollback");
     let snapshot2 = db.snapshot();
 
@@ -736,7 +902,13 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
         .expect("bfs");
     assert!(bfs_rb.nodes.is_empty());
     let vec_results_rb = db
-        .query_vector(&vec_rb, 10, None, snapshot2)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &vec_rb,
+            10,
+            None,
+            snapshot2,
+        )
         .expect("vector query");
     assert!(vec_results_rb.iter().all(|(rid, _)| *rid != rid_rb));
 }
@@ -755,8 +927,13 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
         let rid = db
             .insert_row(tx, "items", values(vec![("id", Value::Uuid(uuid))]))
             .expect("insert row");
-        db.insert_vector(tx, rid, random_unit_vector(DIMENSION, i))
-            .expect("insert vector");
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            random_unit_vector(DIMENSION, i),
+        )
+        .expect("insert vector");
         all_uuids.push(uuid);
     }
     db.commit(tx).expect("commit");
@@ -786,7 +963,15 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain");
     let query = random_unit_vector(DIMENSION, 9_999);
-    let results = db2.query_vector(&query, 10, None, snapshot).expect("query");
+    let results = db2
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            &query,
+            10,
+            None,
+            snapshot,
+        )
+        .expect("query");
     let row = db2
         .point_lookup("items", "id", &Value::Uuid(all_uuids[0]), snapshot)
         .expect("point lookup");

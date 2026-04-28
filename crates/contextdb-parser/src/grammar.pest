@@ -19,6 +19,7 @@ stmt = _{
     | update_stmt
     | set_sync_conflict_policy
     | show_sync_conflict_policy
+    | show_vector_indexes_stmt
     | set_memory_limit
     | show_memory_limit
     | set_disk_limit
@@ -28,6 +29,7 @@ stmt = _{
 
 set_sync_conflict_policy = { ^"SET" ~ ^"SYNC_CONFLICT_POLICY" ~ "'" ~ conflict_policy_value ~ "'" }
 show_sync_conflict_policy = { ^"SHOW" ~ ^"SYNC_CONFLICT_POLICY" }
+show_vector_indexes_stmt = { ^"SHOW" ~ ^"VECTOR_INDEXES" }
 conflict_policy_value = { ^"latest_wins" | ^"server_wins" | ^"edge_wins" | ^"insert_if_not_exists" }
 set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ "'" ~ memory_limit_value ~ "'" }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
@@ -156,7 +158,11 @@ data_type = {
     | ^"JSON"
     | ^"TXID"
 }
-vector_type = { ^"VECTOR" ~ "(" ~ integer ~ ")" }
+vector_type = { ^"VECTOR" ~ "(" ~ integer ~ ")" ~ vector_quantization_clause? }
+vector_quantization_clause = {
+    ^"WITH" ~ "(" ~ ^"quantization" ~ "=" ~ vector_quantization_value ~ ")"
+}
+vector_quantization_value = @{ "'" ~ ("F32" | "SQ8" | "SQ4") ~ "'" }
 
 column_constraint = {
     not_null

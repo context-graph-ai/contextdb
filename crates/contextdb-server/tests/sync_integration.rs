@@ -1126,16 +1126,19 @@ async fn a10_vector_mapping_survives_failed_inserts() {
         edges: Vec::new(),
         vectors: vec![
             VectorChange {
+                index: contextdb_core::VectorIndexRef::new("t", "embedding"),
                 row_id: RowId(edge_row_a),
                 vector: vec![1.0, 0.0, 0.0],
                 lsn: Lsn(10),
             },
             VectorChange {
+                index: contextdb_core::VectorIndexRef::new("t", "embedding"),
                 row_id: RowId(edge_row_b),
                 vector: vec![0.0, 1.0, 0.0],
                 lsn: Lsn(11),
             },
             VectorChange {
+                index: contextdb_core::VectorIndexRef::new("t", "embedding"),
                 row_id: RowId(edge_row_c),
                 vector: vec![0.0, 0.0, 1.0],
                 lsn: Lsn(12),
@@ -1161,7 +1164,13 @@ async fn a10_vector_mapping_survives_failed_inserts() {
 
     // Verify row A's vector: search for [1.0, 0.0, 0.0] — must find with high similarity
     let search_a = server_db
-        .query_vector(&[1.0, 0.0, 0.0], 1, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("t", "embedding"),
+            &[1.0, 0.0, 0.0],
+            1,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     assert_eq!(search_a.len(), 1, "row A's vector must be findable");
     assert!(
@@ -1172,7 +1181,13 @@ async fn a10_vector_mapping_survives_failed_inserts() {
 
     // KEY ASSERTION: Verify row C's vector is [0.0, 0.0, 1.0], NOT [0.0, 1.0, 0.0]
     let search_c = server_db
-        .query_vector(&[0.0, 0.0, 1.0], 1, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("t", "embedding"),
+            &[0.0, 0.0, 1.0],
+            1,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     assert_eq!(search_c.len(), 1, "row C's vector must be findable");
     assert!(
@@ -1184,7 +1199,13 @@ async fn a10_vector_mapping_survives_failed_inserts() {
 
     // Additional: verify [0.0, 1.0, 0.0] (row B's vector) is NOT attached to any row
     let search_b = server_db
-        .query_vector(&[0.0, 1.0, 0.0], 1, None, server_db.snapshot())
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("t", "embedding"),
+            &[0.0, 1.0, 0.0],
+            1,
+            None,
+            server_db.snapshot(),
+        )
         .unwrap();
     if !search_b.is_empty() {
         assert!(

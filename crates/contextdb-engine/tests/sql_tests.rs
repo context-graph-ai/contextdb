@@ -98,8 +98,20 @@ fn vector_search_and_explain() {
             params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
         )
         .unwrap();
-    db.insert_vector(tx, r1, vec![1.0, 0.0]).unwrap();
-    db.insert_vector(tx, r2, vec![0.0, 1.0]).unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        r1,
+        vec![1.0, 0.0],
+    )
+    .unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("observations", "embedding"),
+        r2,
+        vec![0.0, 1.0],
+    )
+    .unwrap();
     db.commit(tx).unwrap();
 
     let out = db

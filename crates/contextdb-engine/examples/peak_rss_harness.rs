@@ -48,7 +48,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let vector = (0..16usize)
                 .map(|j| ((ordinal + j) % 17) as f32 / 17.0)
                 .collect::<Vec<_>>();
-            db.insert_vector(tx, row_id, vector)?;
+            db.insert_vector(
+                tx,
+                contextdb_core::VectorIndexRef::new("rss_items", "embedding"),
+                row_id,
+                vector,
+            )?;
             if let Some(&previous) = chain.last() {
                 db.insert_edge(
                     tx,
@@ -75,7 +80,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         "graph traversal after reopen must return reachable nodes"
     );
 
-    let vector_results = reopened.query_vector(&[0.0; 16], 5, None, snapshot)?;
+    let vector_results = reopened.query_vector(
+        contextdb_core::VectorIndexRef::new("rss_items", "embedding"),
+        &[0.0; 16],
+        5,
+        None,
+        snapshot,
+    )?;
     assert!(
         !vector_results.is_empty(),
         "vector query after reopen must return persisted rows"

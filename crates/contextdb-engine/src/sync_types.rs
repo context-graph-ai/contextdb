@@ -3,7 +3,7 @@
 //! These types define the public API for sync operations. The actual
 //! implementations are pending (all methods currently `unimplemented!()`).
 
-use contextdb_core::{Lsn, RowId, Value};
+use contextdb_core::{Lsn, RowId, Value, VectorIndexRef};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -77,6 +77,7 @@ pub struct EdgeChange {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorChange {
+    pub index: VectorIndexRef,
     pub row_id: RowId,
     pub vector: Vec<f32>,
     pub lsn: Lsn,

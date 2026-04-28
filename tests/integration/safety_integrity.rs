@@ -85,10 +85,20 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
             ]),
         )
         .unwrap();
-    db.insert_vector(tx, committed_parent_rid, vec![1.0, 0.0, 0.0])
-        .unwrap();
-    db.insert_vector(tx, committed_child_rid, vec![0.0, 1.0, 0.0])
-        .unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("entities", "embedding"),
+        committed_parent_rid,
+        vec![1.0, 0.0, 0.0],
+    )
+    .unwrap();
+    db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("entities", "embedding"),
+        committed_child_rid,
+        vec![0.0, 1.0, 0.0],
+    )
+    .unwrap();
     db.insert_edge(
         tx,
         committed_parent,
@@ -134,7 +144,13 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
     assert_eq!(bfs.nodes[0].id, committed_child);
 
     let committed_vectors = reopened
-        .query_vector(&[1.0, 0.0, 0.0], 10, None, snapshot)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("entities", "embedding"),
+            &[1.0, 0.0, 0.0],
+            10,
+            None,
+            snapshot,
+        )
         .unwrap();
     assert_eq!(committed_vectors.len(), 2);
     assert!(
@@ -162,7 +178,12 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
         )
         .unwrap();
     reopened
-        .insert_vector(tx2, ghost_rid, vec![0.0, 0.0, 1.0])
+        .insert_vector(
+            tx2,
+            contextdb_core::VectorIndexRef::new("entities", "embedding"),
+            ghost_rid,
+            vec![0.0, 0.0, 1.0],
+        )
         .unwrap();
     reopened
         .insert_edge(
@@ -185,7 +206,13 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
             .is_none()
     );
     let ghost_vectors = reopened_again
-        .query_vector(&[0.0, 0.0, 1.0], 10, None, snapshot)
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("entities", "embedding"),
+            &[0.0, 0.0, 1.0],
+            10,
+            None,
+            snapshot,
+        )
         .unwrap();
     assert!(ghost_vectors.iter().all(|(rid, _)| *rid != ghost_rid));
     assert_eq!(reopened_again.change_log_since(Lsn(0)).len(), 5);

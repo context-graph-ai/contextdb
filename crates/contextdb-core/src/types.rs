@@ -487,8 +487,24 @@ impl AdjEntry {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VectorIndexRef {
+    pub table: String,
+    pub column: String,
+}
+
+impl VectorIndexRef {
+    pub fn new(table: impl Into<String>, column: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            column: column.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorEntry {
+    pub index: VectorIndexRef,
     pub row_id: RowId,
     pub vector: Vec<f32>,
     pub created_tx: TxId,

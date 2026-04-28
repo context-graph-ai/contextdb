@@ -18,6 +18,7 @@ pub enum Statement {
     ShowDiskLimit,
     SetSyncConflictPolicy(String),
     ShowSyncConflictPolicy,
+    ShowVectorIndexes,
 }
 
 #[derive(Debug, Clone)]

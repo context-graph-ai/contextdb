@@ -127,7 +127,14 @@ fn setup_chunked_mixed_push(
                 ]),
             )
             .unwrap();
-        edge_db.insert_vector(tx, row_id, vec).unwrap();
+        edge_db
+            .insert_vector(
+                tx,
+                contextdb_core::VectorIndexRef::new("observations", "embedding"),
+                row_id,
+                vec,
+            )
+            .unwrap();
     }
     edge_db.commit(tx).unwrap();
 
