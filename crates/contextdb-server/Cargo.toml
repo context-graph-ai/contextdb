@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-server"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -9,9 +9,9 @@ readme = "../../README.md"
 description = "Sync server for contextdb — NATS-based replication with conflict resolution"
 
 [dependencies]
-contextdb-engine = { path = "../contextdb-engine", version = "0.3" }
-contextdb-core = { path = "../contextdb-core", version = "0.3" }
-contextdb-tx = { path = "../contextdb-tx", version = "0.3" }
+contextdb-engine = { path = "../contextdb-engine", version = "1.0" }
+contextdb-core = { path = "../contextdb-core", version = "1.0" }
+contextdb-tx = { path = "../contextdb-tx", version = "1.0" }
 uuid.workspace = true
 tokio.workspace = true
 async-nats.workspace = true

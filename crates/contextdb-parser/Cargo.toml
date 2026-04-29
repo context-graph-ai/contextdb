@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-parser"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ readme = "../../README.md"
 description = "SQL parser for contextdb with GRAPH_TABLE and vector extensions"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core", version = "0.3" }
+contextdb-core = { path = "../contextdb-core", version = "1.0" }
 pest.workspace = true
 pest_derive.workspace = true
 

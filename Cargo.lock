@@ -582,7 +582,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "contextdb-cli"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "clap",
  "contextdb-core",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-core"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "bincode 2.0.1",
  "contextdb-engine",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-engine"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "async-nats",
  "bincode 2.0.1",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-graph"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-parser"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "criterion",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-planner"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-relational"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-server"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "async-nats",
  "clap",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-tx"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "parking_lot",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-vector"
-version = "0.3.4"
+version = "1.0.0"
 dependencies = [
  "anndists",
  "contextdb-core",

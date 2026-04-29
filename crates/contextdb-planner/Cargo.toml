@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-planner"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -9,5 +9,5 @@ readme = "../../README.md"
 description = "Rule-based query planner for contextdb"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core", version = "0.3" }
-contextdb-parser = { path = "../contextdb-parser", version = "0.3" }
+contextdb-core = { path = "../contextdb-core", version = "1.0" }
+contextdb-parser = { path = "../contextdb-parser", version = "1.0" }

@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-cli"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -17,9 +17,9 @@ name = "contextdb-cli"
 path = "src/main.rs"
 
 [dependencies]
-contextdb-engine = { path = "../contextdb-engine", version = "0.3" }
-contextdb-core = { path = "../contextdb-core", version = "0.3" }
-contextdb-server = { path = "../contextdb-server", version = "0.3" }
+contextdb-engine = { path = "../contextdb-engine", version = "1.0" }
+contextdb-core = { path = "../contextdb-core", version = "1.0" }
+contextdb-server = { path = "../contextdb-server", version = "1.0" }
 rustyline.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -27,4 +27,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-contextdb-parser = { path = "../contextdb-parser", version = "0.3" }
+contextdb-parser = { path = "../contextdb-parser", version = "1.0" }

@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-relational"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ readme = "../../README.md"
 description = "Relational executor for contextdb — scan, insert, upsert, delete"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core", version = "0.3" }
-contextdb-tx = { path = "../contextdb-tx", version = "0.3" }
+contextdb-core = { path = "../contextdb-core", version = "1.0" }
+contextdb-tx = { path = "../contextdb-tx", version = "1.0" }
 parking_lot.workspace = true
 uuid.workspace = true

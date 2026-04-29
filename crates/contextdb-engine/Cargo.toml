@@ -1,6 +1,6 @@
 [package]
 name = "contextdb-engine"
-version = "0.3.4"
+version = "1.0.0"
 edition = "2024"
 authors.workspace = true
 license.workspace = true
@@ -9,13 +9,13 @@ readme = "../../README.md"
 description = "Embedded database engine for agentic memory — relational, graph, and vector under unified MVCC transactions"
 
 [dependencies]
-contextdb-core = { path = "../contextdb-core", version = "0.3" }
-contextdb-tx = { path = "../contextdb-tx", version = "0.3" }
-contextdb-relational = { path = "../contextdb-relational", version = "0.3" }
-contextdb-graph = { path = "../contextdb-graph", version = "0.3" }
-contextdb-vector = { path = "../contextdb-vector", version = "0.3" }
-contextdb-parser = { path = "../contextdb-parser", version = "0.3" }
-contextdb-planner = { path = "../contextdb-planner", version = "0.3" }
+contextdb-core = { path = "../contextdb-core", version = "1.0" }
+contextdb-tx = { path = "../contextdb-tx", version = "1.0" }
+contextdb-relational = { path = "../contextdb-relational", version = "1.0" }
+contextdb-graph = { path = "../contextdb-graph", version = "1.0" }
+contextdb-vector = { path = "../contextdb-vector", version = "1.0" }
+contextdb-parser = { path = "../contextdb-parser", version = "1.0" }
+contextdb-planner = { path = "../contextdb-planner", version = "1.0" }
 roaring.workspace = true
 uuid.workspace = true
 parking_lot.workspace = true
