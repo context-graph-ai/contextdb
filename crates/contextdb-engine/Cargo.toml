@@ -71,3 +71,38 @@ path = "../../benches/subscriptions_pr.rs"
 name = "rank_policy_recall"
 harness = false
 path = "../../benches/rank_policy_recall.rs"
+
+[[bench]]
+name = "indexed_scan_filter_pk_inserts"
+harness = false
+path = "../../benches/indexed_scan_filter_pk_inserts.rs"
+
+[[bench]]
+name = "indexed_scan_filter_file_backed_open"
+harness = false
+path = "../../benches/indexed_scan_filter_file_backed_open.rs"
+
+[[bench]]
+name = "indexed_scan_filter_in_memory_pk_inserts"
+harness = false
+path = "../../benches/indexed_scan_filter_in_memory_pk_inserts.rs"
+
+[[bench]]
+name = "indexed_scan_filter_cg_entity_list"
+harness = false
+path = "../../benches/indexed_scan_filter_cg_entity_list.rs"
+
+[[bench]]
+name = "indexed_scan_filter_non_id_pk_inserts"
+harness = false
+path = "../../benches/indexed_scan_filter_non_id_pk_inserts.rs"
+
+[[bench]]
+name = "acceptance_three_paradigm_query"
+harness = false
+path = "../../benches/acceptance_three_paradigm_query.rs"
+
+[[bench]]
+name = "sql_surface_distinct"
+harness = false
+path = "../../benches/sql_surface_distinct.rs"
