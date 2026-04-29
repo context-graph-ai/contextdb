@@ -37,6 +37,7 @@ pub enum PhysicalPlan {
         query_expr: Expr,
         k: u64,
         candidates: Option<Box<PhysicalPlan>>,
+        sort_key: Option<String>,
     },
     HnswSearch {
         table: String,
@@ -44,6 +45,7 @@ pub enum PhysicalPlan {
         query_expr: Expr,
         k: u64,
         candidates: Option<Box<PhysicalPlan>>,
+        sort_key: Option<String>,
     },
     Filter {
         input: Box<PhysicalPlan>,

@@ -1386,9 +1386,13 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                         immutable_flag = true;
                     }
                     Rule::rank_policy_clause => {
-                        if rank_policy.is_none() {
-                            rank_policy = Some(Box::new(build_rank_policy_clause(c)?));
+                        if rank_policy.is_some() {
+                            let col = column_name_text.as_deref().unwrap_or("column");
+                            return Err(Error::ParseError(format!(
+                                "duplicate RANK_POLICY constraint on column '{col}'"
+                            )));
                         }
+                        rank_policy = Some(Box::new(build_rank_policy_clause(c)?));
                     }
                     Rule::state_machine_option => {
                         if inline_state_machine.is_some() {
@@ -2025,7 +2029,11 @@ fn validate_select_body(body: &SelectBody) -> Result<()> {
         .any(|o| matches!(o.direction, SortDirection::CosineDistance))
         && body.limit.is_none()
     {
-        return Err(Error::UnboundedVectorSearch);
+        return if body.use_rank.is_some() {
+            Err(Error::UseRankRequiresLimit)
+        } else {
+            Err(Error::UnboundedVectorSearch)
+        };
     }
 
     for from in &body.from {

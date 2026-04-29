@@ -6,6 +6,7 @@ use crate::plugin::{
     CommitEvent, CommitSource, CorePlugin, DatabasePlugin, PluginHealth, QueryOutcome,
     SubscriptionMetrics,
 };
+use crate::rank_formula::{FormulaEvalError, RankFormula};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
@@ -113,6 +114,9 @@ pub struct SearchResult {
     pub row_id: RowId,
     pub values: HashMap<String, Value>,
     pub vector_score: f32,
+    /// Always populated. Equals the formula's computed value when the search
+    /// uses a rank policy via `sort_key`, and equals `vector_score` (raw
+    /// cosine) in all other cases. Callers never unwrap this field.
     pub rank: f32,
 }
 
@@ -174,6 +178,10 @@ pub struct Database {
     closed: AtomicBool,
     rows_examined: AtomicU64,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
+    rank_formula_cache: RwLock<HashMap<(String, String), Arc<RankFormula>>>,
+    rank_policy_eval_count: AtomicU64,
+    rank_policy_formula_parse_count: AtomicU64,
+    corrupt_joined_values: RwLock<HashSet<(String, RowId, String)>>,
 }
 
 pub(crate) enum InsertRowResult {
@@ -308,6 +316,10 @@ impl Database {
             closed: AtomicBool::new(false),
             rows_examined: AtomicU64::new(0),
             statement_cache: RwLock::new(HashMap::new()),
+            rank_formula_cache: RwLock::new(HashMap::new()),
+            rank_policy_eval_count: AtomicU64::new(0),
+            rank_policy_formula_parse_count: AtomicU64::new(0),
+            corrupt_joined_values: RwLock::new(HashSet::new()),
         }
     }
 
@@ -436,6 +448,7 @@ impl Database {
                 db.graph.register_dag_edge_types(&meta.dag_edge_types);
             }
         }
+        db.rebuild_rank_formula_cache_from_meta(&all_meta)?;
 
         db.account_loaded_state()?;
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
@@ -2278,47 +2291,169 @@ impl Database {
     }
 
     pub fn semantic_search(&self, query: SemanticQuery) -> Result<Vec<SearchResult>> {
+        self.semantic_search_with_candidates(query, None)
+    }
+
+    pub(crate) fn semantic_search_with_candidates(
+        &self,
+        query: SemanticQuery,
+        candidates: Option<RoaringTreemap>,
+    ) -> Result<Vec<SearchResult>> {
         let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
-        self.query_vector(index, &query.query, query.limit, None, self.snapshot())
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|(row_id, vector_score)| {
-                        let values = self
-                            .find_row_by_id(&query.table, row_id)
-                            .map(|row| row.values)
-                            .unwrap_or_default();
-                        SearchResult {
-                            row_id,
-                            values,
-                            vector_score,
-                            rank: vector_score,
-                        }
+        let snapshot = self.snapshot_for_read();
+        let meta = self
+            .table_meta(&query.table)
+            .ok_or_else(|| Error::TableNotFound(query.table.clone()))?;
+        let vector_column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == query.vector_column)
+            .ok_or_else(|| Error::UnknownVectorIndex {
+                index: index.clone(),
+            })?;
+
+        let mut candidate_bitmap = candidates;
+        if let Some(where_clause) = &query.where_clause {
+            let where_bitmap =
+                self.semantic_where_candidate_bitmap(&query.table, where_clause, snapshot)?;
+            candidate_bitmap = Some(match candidate_bitmap {
+                Some(mut existing) => {
+                    existing &= where_bitmap;
+                    existing
+                }
+                None => where_bitmap,
+            });
+        }
+
+        let Some(sort_key) = query.sort_key.as_deref() else {
+            let raw_k = if query.min_similarity.is_some() || candidate_bitmap.is_some() {
+                self.vector_entry_count(&index).max(query.limit)
+            } else {
+                query.limit
+            };
+            let mut rows = self.query_vector_strict(
+                index.clone(),
+                &query.query,
+                raw_k,
+                candidate_bitmap.as_ref(),
+                snapshot,
+            )?;
+            if let Some(min_similarity) = query.min_similarity {
+                rows.retain(|(_, score)| *score >= min_similarity);
+                rows.truncate(query.limit);
+            }
+            return rows
+                .into_iter()
+                .map(|(row_id, vector_score)| {
+                    let anchor = self.find_row_by_id_at(&query.table, row_id, snapshot)?;
+                    let values = self.search_result_values(&index, row_id, snapshot, anchor.values);
+                    Ok(SearchResult {
+                        row_id,
+                        values,
+                        vector_score,
+                        rank: vector_score,
                     })
-                    .collect()
-            })
+                })
+                .collect();
+        };
+
+        let Some(policy) = vector_column.rank_policy.as_ref() else {
+            return Err(Error::RankPolicyNotFound {
+                index: rank_index_name(&query.table, &query.vector_column),
+                sort_key: sort_key.to_string(),
+            });
+        };
+        if policy.sort_key != sort_key {
+            return Err(Error::RankPolicyNotFound {
+                index: rank_index_name(&query.table, &query.vector_column),
+                sort_key: sort_key.to_string(),
+            });
+        }
+        let formula = self.rank_formula(&query.table, &query.vector_column)?;
+        let entry_count = self.vector_entry_count(&index);
+        let internal_k = self.rank_policy_candidate_k(entry_count, query.limit);
+        let mut raw = self.query_vector_strict(
+            index.clone(),
+            &query.query,
+            internal_k,
+            candidate_bitmap.as_ref(),
+            snapshot,
+        )?;
+        if let Some(min_similarity) = query.min_similarity {
+            raw.retain(|(_, score)| *score >= min_similarity);
+        }
+
+        let mut ranked = Vec::with_capacity(raw.len());
+        for (row_id, vector_score) in raw {
+            let anchor = self.find_row_by_id_at(&query.table, row_id, snapshot)?;
+            let joined = self.joined_row_for_rank_policy(policy, &anchor, snapshot)?;
+            self.rank_policy_eval_count.fetch_add(1, Ordering::SeqCst);
+            let eval = formula.eval_with_resolver(vector_score, |column| {
+                self.resolve_rank_formula_column(policy, &anchor, joined.as_ref(), column)
+            });
+            let rank = match eval {
+                Ok(Some(rank)) => rank,
+                Ok(None) => f32::NAN,
+                Err(err) => {
+                    let error_row_id =
+                        if matches!(err, FormulaEvalError::CorruptJoinedColumn { .. }) {
+                            joined.as_ref().map(|row| row.row_id).unwrap_or(row_id)
+                        } else {
+                            row_id
+                        };
+                    self.warn_rank_eval_error(
+                        &query.table,
+                        &query.vector_column,
+                        error_row_id,
+                        &err,
+                    );
+                    continue;
+                }
+            };
+            let values = self.search_result_values(
+                &index,
+                row_id,
+                snapshot,
+                merged_rank_values(&anchor, joined.as_ref()),
+            );
+            ranked.push(SearchResult {
+                row_id,
+                values,
+                vector_score,
+                rank,
+            });
+        }
+        ranked.sort_by(compare_ranked_results);
+        ranked.truncate(query.limit);
+        Ok(ranked)
     }
 
     #[doc(hidden)]
     pub fn __rank_policy_eval_count(&self) -> u64 {
-        0
+        self.rank_policy_eval_count.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
-    pub fn __reset_rank_policy_eval_count(&self) {}
+    pub fn __reset_rank_policy_eval_count(&self) {
+        self.rank_policy_eval_count.store(0, Ordering::SeqCst);
+    }
 
     #[doc(hidden)]
     pub fn __rank_policy_formula_parse_count(&self) -> u64 {
-        0
+        self.rank_policy_formula_parse_count.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
     pub fn __inject_raw_joined_row_value_for_test(
         &self,
-        _table: &str,
-        _row_id: RowId,
-        _column: &str,
+        table: &str,
+        row_id: RowId,
+        column: &str,
         _raw_bytes: Vec<u8>,
     ) -> Result<()> {
+        self.corrupt_joined_values
+            .write()
+            .insert((table.to_string(), row_id, column.to_string()));
         Ok(())
     }
 
@@ -2332,6 +2467,273 @@ impl Database {
     ) -> Result<Vec<(RowId, f32)>> {
         self.vector_store.validate_vector(&index, query.len())?;
         self.vector.search(index, query, k, candidates, snapshot)
+    }
+
+    pub(crate) fn register_rank_formula(
+        &self,
+        table: &str,
+        column: &str,
+        formula: Arc<RankFormula>,
+    ) {
+        let mut cache = self.rank_formula_cache.write();
+        cache.insert((table.to_string(), column.to_string()), formula);
+        self.rank_policy_formula_parse_count
+            .store(cache.len() as u64, Ordering::SeqCst);
+    }
+
+    pub(crate) fn remove_rank_formula(&self, table: &str, column: &str) {
+        let mut cache = self.rank_formula_cache.write();
+        cache.remove(&(table.to_string(), column.to_string()));
+        self.rank_policy_formula_parse_count
+            .store(cache.len() as u64, Ordering::SeqCst);
+    }
+
+    pub(crate) fn remove_rank_formulas_for_table(&self, table: &str) {
+        let mut cache = self.rank_formula_cache.write();
+        cache.retain(|(policy_table, _), _| policy_table != table);
+        self.rank_policy_formula_parse_count
+            .store(cache.len() as u64, Ordering::SeqCst);
+    }
+
+    fn rebuild_rank_formula_cache_from_meta(
+        &self,
+        metas: &HashMap<String, TableMeta>,
+    ) -> Result<()> {
+        let mut cache = self.rank_formula_cache.write();
+        cache.clear();
+        for (table, meta) in metas {
+            for column in &meta.columns {
+                if let Some(policy) = &column.rank_policy {
+                    let formula = RankFormula::compile_for_index(
+                        &rank_index_name(table, &column.name),
+                        &policy.formula,
+                    )?;
+                    cache.insert((table.clone(), column.name.clone()), Arc::new(formula));
+                }
+            }
+        }
+        self.rank_policy_formula_parse_count
+            .store(cache.len() as u64, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn rank_formula(&self, table: &str, column: &str) -> Result<Arc<RankFormula>> {
+        self.rank_formula_cache
+            .read()
+            .get(&(table.to_string(), column.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "rank policy formula cache missing for {}",
+                    rank_index_name(table, column)
+                ))
+            })
+    }
+
+    fn vector_entry_count(&self, index: &VectorIndexRef) -> usize {
+        self.vector_store
+            .try_state(index)
+            .map(|state| state.entry_count())
+            .unwrap_or(0)
+    }
+
+    fn rank_policy_candidate_k(&self, entry_count: usize, limit: usize) -> usize {
+        if entry_count == 0 || limit == 0 {
+            return limit;
+        }
+        if entry_count < 1000 {
+            return entry_count;
+        }
+        entry_count
+            .saturating_sub(1)
+            .min(limit.saturating_mul(30).max(1500))
+            .max(limit)
+    }
+
+    fn semantic_where_candidate_bitmap(
+        &self,
+        table: &str,
+        where_clause: &str,
+        snapshot: SnapshotId,
+    ) -> Result<RoaringTreemap> {
+        let sql = format!("SELECT * FROM {table} WHERE {where_clause}");
+        let stmt = contextdb_parser::parse(&sql)?;
+        let expr = match stmt {
+            Statement::Select(select) => select
+                .body
+                .where_clause
+                .ok_or_else(|| Error::ParseError("semantic WHERE missing expression".into()))?,
+            _ => return Err(Error::ParseError("semantic WHERE parse failed".into())),
+        };
+        let mut bitmap = RoaringTreemap::new();
+        for row in self.scan(table, snapshot)? {
+            if crate::executor::row_matches(&row, &expr, &HashMap::new())? {
+                bitmap.insert(row.row_id.0);
+            }
+        }
+        Ok(bitmap)
+    }
+
+    fn find_row_by_id_at(
+        &self,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<VersionedRow> {
+        self.relational_store
+            .row_by_id(table, row_id, snapshot)
+            .ok_or_else(|| Error::NotFound(format!("row {row_id} in table {table}")))
+    }
+
+    fn joined_row_for_rank_policy(
+        &self,
+        policy: &RankPolicy,
+        anchor: &VersionedRow,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        if policy.anchor_column.is_empty() {
+            return Err(Error::Other(format!(
+                "rank policy on index {}.{} has no resolved anchor join column",
+                policy.joined_table, policy.joined_column
+            )));
+        }
+        let join_value = anchor
+            .values
+            .get(&policy.anchor_column)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if join_value == Value::Null {
+            return Ok(None);
+        }
+
+        let indexes = self.relational_store.indexes.read();
+        let storage = indexes
+            .get(&(policy.joined_table.clone(), policy.protected_index.clone()))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "rank policy protected index `{}` missing on table `{}`",
+                    policy.protected_index, policy.joined_table
+                ))
+            })?;
+        let Some((first_column, direction)) = storage.columns.first() else {
+            return Err(Error::Other(format!(
+                "rank policy protected index `{}` on `{}` has no columns",
+                policy.protected_index, policy.joined_table
+            )));
+        };
+        if first_column != &policy.joined_column {
+            return Err(Error::Other(format!(
+                "rank policy protected index `{}` on `{}` no longer leads with `{}`",
+                policy.protected_index, policy.joined_table, policy.joined_column
+            )));
+        }
+
+        let key_component = match direction {
+            SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(join_value.clone())),
+            SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(join_value.clone())),
+        };
+        let mut best_row_id: Option<RowId> = None;
+        let mut consider = |entries: &[contextdb_relational::IndexEntry]| {
+            for entry in entries {
+                if entry.visible_at(snapshot)
+                    && best_row_id.is_none_or(|current| current < entry.row_id)
+                {
+                    best_row_id = Some(entry.row_id);
+                }
+            }
+        };
+
+        if storage.columns.len() == 1 {
+            if let Some(entries) = storage.tree.get(&vec![key_component.clone()]) {
+                consider(entries);
+            }
+        } else {
+            for (key, entries) in storage.tree.range(vec![key_component.clone()]..) {
+                if key.first() != Some(&key_component) {
+                    break;
+                }
+                consider(entries);
+            }
+        }
+        drop(indexes);
+
+        let Some(row_id) = best_row_id else {
+            return Ok(None);
+        };
+        let Some(row) = self
+            .relational_store
+            .row_by_id(&policy.joined_table, row_id, snapshot)
+        else {
+            return Ok(None);
+        };
+        let Some(value) = row.values.get(&policy.joined_column) else {
+            return Ok(None);
+        };
+        if !values_equal_for_rank_join(value, &join_value) {
+            return Ok(None);
+        }
+        Ok(Some(row))
+    }
+
+    fn resolve_rank_formula_column(
+        &self,
+        policy: &RankPolicy,
+        anchor: &VersionedRow,
+        joined: Option<&VersionedRow>,
+        column: &str,
+    ) -> std::result::Result<Option<f32>, FormulaEvalError> {
+        if let Some(value) = anchor.values.get(column) {
+            return rank_value_to_number(value, column);
+        }
+        let Some(joined) = joined else {
+            return Ok(None);
+        };
+        if self.corrupt_joined_values.read().contains(&(
+            policy.joined_table.clone(),
+            joined.row_id,
+            column.to_string(),
+        )) {
+            return Err(FormulaEvalError::CorruptJoinedColumn {
+                column: column.to_string(),
+            });
+        }
+        let value = joined.values.get(column).unwrap_or(&Value::Null);
+        rank_value_to_number(value, column)
+    }
+
+    fn warn_rank_eval_error(
+        &self,
+        table: &str,
+        column: &str,
+        row_id: RowId,
+        err: &FormulaEvalError,
+    ) {
+        let mut reason = err.reason();
+        if reason.len() > 256 {
+            reason.truncate(253);
+            reason.push_str("...");
+        }
+        tracing::warn!(
+            name: "rank_policy_eval_error",
+            target: "rank_policy_eval_error",
+            index = %rank_index_name(table, column),
+            row_id = row_id.0,
+            reason = %reason,
+            "rank_policy_eval_error"
+        );
+    }
+
+    fn search_result_values(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+        mut values: HashMap<String, Value>,
+    ) -> HashMap<String, Value> {
+        if let Some(entry) = self.vector_store_live_entry_for_row(index, row_id, snapshot) {
+            values.insert(index.column.clone(), Value::Vector(entry.vector));
+        }
+        values
     }
 
     fn pending_vector_dimension(&self, tx: TxId, index: &VectorIndexRef) -> Result<Option<usize>> {
@@ -3284,10 +3686,10 @@ impl Database {
         let meta_guard = self.relational_store.table_meta.read();
         let tables_guard = self.relational_store.tables.read();
 
-        // DDL
-        for (name, meta) in meta_guard.iter() {
-            ddl.push(ddl_change_from_meta(name, meta));
-        }
+        // DDL. A full snapshot must be directly applyable to an empty peer:
+        // create joined tables and their user indexes before any table whose
+        // rank policy validates against them.
+        ddl.extend(full_snapshot_ddl(&meta_guard));
 
         // Rows (live only) — collect row_ids that have live rows for orphan vector filtering
         let mut live_row_ids: HashSet<RowId> = HashSet::new();
@@ -3859,29 +4261,19 @@ impl Database {
                                 .columns
                                 .iter()
                                 .map(|c| {
-                                    let ty = match c.column_type {
-                                        ColumnType::Integer => "INTEGER".to_string(),
-                                        ColumnType::Real => "REAL".to_string(),
-                                        ColumnType::Text => "TEXT".to_string(),
-                                        ColumnType::Boolean => "BOOLEAN".to_string(),
-                                        ColumnType::Json => "JSON".to_string(),
-                                        ColumnType::Uuid => "UUID".to_string(),
-                                        ColumnType::Vector(dim) => format!("VECTOR({dim})"),
-                                        ColumnType::Timestamp => "TIMESTAMP".to_string(),
-                                        ColumnType::TxId => "TXID".to_string(),
-                                    };
-                                    (c.name.clone(), ty)
+                                    (
+                                        c.name.clone(),
+                                        normalize_schema_type(&sql_type_for_meta_column(
+                                            c,
+                                            &local_meta.propagation_rules,
+                                        )),
+                                    )
                                 })
                                 .collect();
                             let remote_cols: Vec<(String, String)> = columns
                                 .iter()
                                 .map(|(col_name, col_type)| {
-                                    let base_type = col_type
-                                        .split_whitespace()
-                                        .next()
-                                        .unwrap_or(col_type)
-                                        .to_string();
-                                    (col_name.clone(), base_type)
+                                    (col_name.clone(), normalize_schema_type(col_type))
                                 })
                                 .collect();
                             let mut local_sorted = local_cols.clone();
@@ -3924,7 +4316,13 @@ impl Database {
                 }
                 DdlChange::DropTable { name } => {
                     if self.table_meta(&name).is_some() {
+                        if let Some(block) =
+                            crate::executor::rank_policy_drop_table_blocker(self, &name)
+                        {
+                            return Err(block);
+                        }
                         self.drop_table_aux_state(&name);
+                        self.remove_rank_formulas_for_table(&name);
                         self.relational_store().drop_table(&name);
                         self.remove_persisted_table(&name)?;
                         self.clear_statement_cache();
@@ -4008,6 +4406,11 @@ impl Database {
                             .map(|m| m.indexes.iter().any(|i| i.name == name))
                             .unwrap_or(false);
                         if exists {
+                            if let Some(block) =
+                                crate::executor::rank_policy_drop_index_blocker(self, &table, &name)
+                            {
+                                return Err(block);
+                            }
                             {
                                 let store = self.relational_store();
                                 let mut metas = store.table_meta.write();
@@ -4613,6 +5016,81 @@ fn cached_table_meta(
         .clone()
 }
 
+pub(crate) fn rank_index_name(table: &str, column: &str) -> String {
+    format!("{table}.{column}")
+}
+
+fn rank_value_to_number(
+    value: &Value,
+    column: &str,
+) -> std::result::Result<Option<f32>, FormulaEvalError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Float64(value) => Ok(Some(*value as f32)),
+        Value::Int64(value) => Ok(Some(*value as f32)),
+        Value::Bool(value) => Ok(Some(if *value { 1.0 } else { 0.0 })),
+        Value::Text(_) => Err(FormulaEvalError::UnsupportedType {
+            column: column.to_string(),
+            actual: "TEXT",
+        }),
+        Value::Json(_) => Err(FormulaEvalError::UnsupportedType {
+            column: column.to_string(),
+            actual: "JSON",
+        }),
+        Value::Uuid(_) => Err(FormulaEvalError::UnsupportedType {
+            column: column.to_string(),
+            actual: "UUID",
+        }),
+        Value::Vector(_) => Err(FormulaEvalError::UnsupportedType {
+            column: column.to_string(),
+            actual: "VECTOR",
+        }),
+        Value::Timestamp(_) => Err(FormulaEvalError::UnsupportedType {
+            column: column.to_string(),
+            actual: "TIMESTAMP",
+        }),
+        Value::TxId(_) => Err(FormulaEvalError::UnsupportedType {
+            column: column.to_string(),
+            actual: "TXID",
+        }),
+    }
+}
+
+fn merged_rank_values(
+    anchor: &VersionedRow,
+    joined: Option<&VersionedRow>,
+) -> HashMap<String, Value> {
+    let mut values = anchor.values.clone();
+    if let Some(joined) = joined {
+        for (key, value) in &joined.values {
+            values.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    values
+}
+
+fn values_equal_for_rank_join(left: &Value, right: &Value) -> bool {
+    if matches!((left, right), (Value::Null, _) | (_, Value::Null)) {
+        return false;
+    }
+    left == right
+}
+
+fn compare_ranked_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
+    rank_float_desc(left.rank, right.rank)
+        .then_with(|| rank_float_desc(left.vector_score, right.vector_score))
+        .then_with(|| right.row_id.cmp(&left.row_id))
+}
+
+fn rank_float_desc(left: f32, right: f32) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => right.total_cmp(&left),
+    }
+}
+
 fn cached_visible_rows<'a>(
     db: &Database,
     cache: &'a mut HashMap<String, Vec<VersionedRow>>,
@@ -5043,11 +5521,20 @@ fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {
 }
 
 fn ddl_change_from_meta(name: &str, meta: &TableMeta) -> DdlChange {
+    ddl_change_from_meta_excluding(name, meta, &HashSet::new())
+}
+
+fn ddl_change_from_meta_excluding(
+    name: &str,
+    meta: &TableMeta,
+    excluded_columns: &HashSet<String>,
+) -> DdlChange {
     DdlChange::CreateTable {
         name: name.to_string(),
         columns: meta
             .columns
             .iter()
+            .filter(|col| !excluded_columns.contains(&col.name))
             .map(|col| {
                 (
                     col.name.clone(),
@@ -5056,6 +5543,93 @@ fn ddl_change_from_meta(name: &str, meta: &TableMeta) -> DdlChange {
             })
             .collect(),
         constraints: create_table_constraints_from_meta(meta),
+    }
+}
+
+fn full_snapshot_ddl(metas: &HashMap<String, TableMeta>) -> Vec<DdlChange> {
+    let mut names = metas.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+
+    let mut emitted = HashSet::new();
+    let mut ddl = Vec::new();
+    while emitted.len() < names.len() {
+        let before = emitted.len();
+        for name in &names {
+            if emitted.contains(name) {
+                continue;
+            }
+            let Some(meta) = metas.get(name) else {
+                continue;
+            };
+            let deps_ready = meta
+                .columns
+                .iter()
+                .filter_map(|column| column.rank_policy.as_ref())
+                .all(|policy| {
+                    policy.joined_table == *name
+                        || !metas.contains_key(&policy.joined_table)
+                        || emitted.contains(&policy.joined_table)
+                });
+            if deps_ready {
+                push_snapshot_table_ddl(&mut ddl, name, meta);
+                emitted.insert(name.clone());
+            }
+        }
+        if emitted.len() == before {
+            for name in &names {
+                if !emitted.contains(name)
+                    && let Some(meta) = metas.get(name)
+                {
+                    push_snapshot_table_ddl(&mut ddl, name, meta);
+                    emitted.insert(name.clone());
+                }
+            }
+        }
+    }
+    ddl
+}
+
+fn push_snapshot_table_ddl(ddl: &mut Vec<DdlChange>, name: &str, meta: &TableMeta) {
+    let deferred_self_rank_columns = meta
+        .columns
+        .iter()
+        .filter(|column| {
+            column
+                .rank_policy
+                .as_ref()
+                .is_some_and(|policy| policy.joined_table == name)
+        })
+        .map(|column| column.name.clone())
+        .collect::<HashSet<_>>();
+    ddl.push(ddl_change_from_meta_excluding(
+        name,
+        meta,
+        &deferred_self_rank_columns,
+    ));
+    for index in &meta.indexes {
+        if index.kind == contextdb_core::IndexKind::UserDeclared {
+            ddl.push(DdlChange::CreateIndex {
+                table: name.to_string(),
+                name: index.name.clone(),
+                columns: index.columns.clone(),
+            });
+        }
+    }
+    if !deferred_self_rank_columns.is_empty() {
+        ddl.push(DdlChange::AlterTable {
+            name: name.to_string(),
+            columns: meta
+                .columns
+                .iter()
+                .map(|col| {
+                    (
+                        col.name.clone(),
+                        sql_type_for_meta_column(col, &meta.propagation_rules),
+                    )
+                })
+                .collect(),
+            constraints: create_table_constraints_from_meta(meta),
+        });
     }
 }
 
@@ -5078,6 +5652,7 @@ fn sql_type_for_ast_column(
     _rules: &[contextdb_parser::ast::AstPropagationRule],
 ) -> String {
     let mut ty = sql_type_for_ast(&col.data_type);
+    append_ast_quantization(&mut ty, col.quantization);
     if let Some(reference) = &col.references {
         ty.push_str(&format!(
             " REFERENCES {}({})",
@@ -5116,6 +5691,15 @@ fn sql_type_for_ast_column(
     if col.immutable {
         ty.push_str(" IMMUTABLE");
     }
+    if let Some(policy) = col.rank_policy.as_deref() {
+        ty.push_str(&format!(
+            " RANK_POLICY (JOIN {} ON {}, FORMULA '{}', SORT_KEY {})",
+            policy.joined_table,
+            policy.joined_column,
+            sql_quote(&policy.formula),
+            policy.sort_key
+        ));
+    }
     ty
 }
 
@@ -5131,6 +5715,7 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
         ColumnType::Timestamp => "TIMESTAMP".to_string(),
         ColumnType::TxId => "TXID".to_string(),
     };
+    append_core_quantization(&mut ty, col.quantization);
 
     let fk_rules = rules
         .iter()
@@ -5196,8 +5781,46 @@ fn sql_type_for_meta_column(col: &contextdb_core::ColumnDef, rules: &[Propagatio
     if col.immutable {
         ty.push_str(" IMMUTABLE");
     }
+    if let Some(policy) = &col.rank_policy {
+        ty.push_str(&format!(
+            " RANK_POLICY (JOIN {} ON {}, FORMULA '{}', SORT_KEY {})",
+            policy.joined_table,
+            policy.joined_column,
+            sql_quote(&policy.formula),
+            policy.sort_key
+        ));
+    }
 
     ty
+}
+
+fn append_ast_quantization(
+    ty: &mut String,
+    quantization: contextdb_parser::ast::VectorQuantization,
+) {
+    let quantization = match quantization {
+        contextdb_parser::ast::VectorQuantization::F32 => return,
+        contextdb_parser::ast::VectorQuantization::SQ8 => "SQ8",
+        contextdb_parser::ast::VectorQuantization::SQ4 => "SQ4",
+    };
+    ty.push_str(&format!(" WITH (quantization = '{quantization}')"));
+}
+
+fn append_core_quantization(ty: &mut String, quantization: contextdb_core::VectorQuantization) {
+    if !matches!(quantization, contextdb_core::VectorQuantization::F32) {
+        ty.push_str(&format!(
+            " WITH (quantization = '{}')",
+            quantization.as_str()
+        ));
+    }
+}
+
+fn sql_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn normalize_schema_type(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {

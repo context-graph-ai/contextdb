@@ -79,6 +79,7 @@ SELECT [DISTINCT] columns FROM table
   [INNER JOIN | LEFT JOIN other ON condition]
   [WHERE condition]
   [ORDER BY col [ASC|DESC]]
+  [USE RANK sort_key]
   [LIMIT n]
 ```
 
@@ -166,6 +167,140 @@ SHOW VECTOR_INDEXES;
 
 It returns `table`, `column`, `dimension`, `quantization`, `vector_count`, and
 `bytes`.
+
+### Rank Policies
+
+A `VECTOR(n)` column can declare a rank policy that combines raw cosine
+similarity with typed columns from the anchor row and one indexed joined row.
+The policy is attached to the specific `(table, vector_column)` index. Because
+the policy lives in schema, every caller that asks for the same `SORT_KEY` gets
+the same ranking behavior; applications do not need to copy formula text into
+each query.
+
+Grammar shape:
+
+```sql
+<column> VECTOR(n)
+  [WITH (quantization = 'F32' | 'SQ8' | 'SQ4')]
+  RANK_POLICY (
+    JOIN <joined_table> ON <joined_indexed_column>,
+    FORMULA '<rank expression>',
+    SORT_KEY <identifier>
+  )
+```
+
+```sql
+CREATE TABLE outcomes (
+  id UUID PRIMARY KEY,
+  decision_id UUID NOT NULL,
+  success BOOLEAN NOT NULL
+);
+
+CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);
+
+CREATE TABLE decisions (
+  id UUID PRIMARY KEY,
+  description TEXT NOT NULL,
+  confidence REAL,
+  embedding VECTOR(384) RANK_POLICY (
+    JOIN outcomes ON decision_id,
+    FORMULA 'coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
+    SORT_KEY effective_confidence
+  )
+);
+```
+
+Use the policy during vector search with `USE RANK <sort_key>`:
+
+```sql
+SELECT id, description
+FROM decisions
+ORDER BY embedding <=> $query USE RANK effective_confidence
+LIMIT 10;
+```
+
+Without `USE RANK`, the same query returns cosine ordering:
+
+```sql
+SELECT id, description
+FROM decisions
+ORDER BY embedding <=> $query
+LIMIT 3;
+
+-- id   description        vector_score
+-- d1   closest match      1.0
+-- d2   near match         0.75
+-- d3   weaker match       0.5
+```
+
+With the policy, ordering uses the formula before the final `LIMIT`:
+
+```sql
+SELECT id, description
+FROM decisions
+ORDER BY embedding <=> $query USE RANK effective_confidence
+LIMIT 3;
+
+-- id   description        vector_score   rank
+-- d2   near match         0.75           1.0
+-- d3   weaker match       0.5            0.5
+-- d1   closest match      1.0            0.0
+```
+
+`USE RANK` requires the vector `ORDER BY ... <=> ...` and `LIMIT` in the same
+query. Unknown sort keys return `RankPolicyNotFound`; there is no silent
+fallback to cosine ordering.
+
+Formula references use `{column}`. Supported operands are `REAL`, `INTEGER`,
+`BOOLEAN`, numeric literals, `{vector_score}`, `+`, `*`, parentheses, and
+`coalesce(expr, literal)`. `BOOLEAN` values coerce only inside the rank
+formula (`TRUE` = `1.0`, `FALSE` = `0.0`). `TEXT`, `JSON`, `VECTOR`, dotted
+refs, subqueries, `CASE`, subtraction, division, and arbitrary function calls
+are rejected at DDL time. `*` binds tighter than `+`; parentheses override
+precedence.
+
+`JOIN table ON column` is a single left-outer lookup through an existing index
+on the joined table. The joined column is resolved to an anchor-side join column
+at DDL time and the protected joined-table index is used at search time.
+Candidates with no joined row remain eligible; joined columns evaluate as
+`NULL`, so `coalesce` can provide a fallback. Dropping the joined table, joined
+column, resolved anchor join column, formula-referenced columns, or the
+protected join index is refused while the rank policy depends on it.
+
+Anchor-side join-column resolution is deterministic. If the joined column is
+the joined table's primary key, ContextDB first looks for
+`<singular_joined_table>_id` or `<joined_table>_id` on the anchor table, then
+falls back to a same-named anchor column, then the anchor primary key. For other
+joined columns, ContextDB uses a same-named anchor column when present,
+otherwise the anchor primary key. Ambiguous inferred anchor columns are rejected
+at DDL time.
+
+`min_similarity` applies to raw cosine before the rank formula runs. A candidate
+below the similarity floor is excluded even if its joined-row metric would have
+made the formula large.
+
+Current limits to account for in production designs:
+
+- On large HNSW-backed vector indexes, rank policies rank the ANN candidate set
+  returned by vector retrieval before applying the final top-k. They do not
+  force an exhaustive scan of every row in the corpus. If a formula does not
+  reference `{vector_score}`, use a larger search limit or an exact workflow
+  when cosine is a weak candidate generator for the metric being optimized.
+- If more than one joined row matches a candidate, the current policy uses one
+  matched row, chosen by highest internal `RowId`. Model joined data as a
+  single current summary row when ranking semantics need to be stable.
+- Formula `{column}` references resolve anchor-row columns before joined-row
+  columns. The reserved `{vector_score}` name cannot be shadowed, and an `id`
+  present on both sides is rejected as ambiguous. Avoid duplicate formula
+  column names until table-qualified references exist.
+- `JOIN table ON column` is rank-policy lookup syntax, not arbitrary SQL join
+  syntax. It does not support predicates, composite joins, aggregation, or
+  ordering.
+- The formula language is intentionally closed for safety. Functions such as
+  `min`, `max`, `clamp`, time decay, division, and subtraction are not part of
+  the current surface.
+- Sync currently round-trips rank policies through rendered DDL text. Structured
+  policy replication is a future hardening item.
 
 ---
 

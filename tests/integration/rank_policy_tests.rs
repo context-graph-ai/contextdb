@@ -1,5 +1,5 @@
 use contextdb_core::{Error, Lsn, Value, VectorIndexRef};
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use contextdb_engine::{Database, SearchResult, SemanticQuery};
 use std::collections::HashMap;
 use std::fmt;
@@ -1945,6 +1945,188 @@ fn sy02_peer_search_byte_identical() {
     .unwrap();
     expect_policy_order(&origin, &[ids[0], ids[2], ids[3], ids[1]]);
     expect_policy_order(&peer, &[ids[0], ids[2], ids[3], ids[1]]);
+}
+
+/// RED: persisted full snapshots emit joined-table dependencies before rank-policy anchor tables.
+#[test]
+fn sy03_persisted_full_snapshot_orders_rank_policy_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rank-sync.db");
+    {
+        let origin = Database::open(&path).unwrap();
+        create_standard_policy_schema(&origin);
+    }
+    let reopened = Database::open(&path).unwrap();
+    let changes = reopened.changes_since(Lsn(0));
+    let outcomes_table = changes
+        .ddl
+        .iter()
+        .position(
+            |change| matches!(change, DdlChange::CreateTable { name, .. } if name == "outcomes"),
+        )
+        .expect("outcomes CreateTable");
+    let outcomes_index = changes
+        .ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::CreateIndex { table, name, .. } if table == "outcomes" && name == "outcomes_decision_id_idx"))
+        .expect("outcomes CreateIndex");
+    let decisions_table = changes
+        .ddl
+        .iter()
+        .position(
+            |change| matches!(change, DdlChange::CreateTable { name, .. } if name == "decisions"),
+        )
+        .expect("decisions CreateTable");
+    assert!(
+        outcomes_table < outcomes_index && outcomes_index < decisions_table,
+        "rank-policy full snapshot DDL must create joined table + protected index before anchor table: {:?}",
+        changes.ddl
+    );
+
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+    assert_eq!(
+        rank_policy_meta(&peer, "decisions", "embedding"),
+        rank_policy_meta(&reopened, "decisions", "embedding")
+    );
+}
+
+/// RED: sync-applied DropTable respects rank-policy dependent-DDL RESTRICT.
+#[test]
+fn sy04_sync_drop_table_respects_rank_policy_restrict() {
+    let db = Database::open_memory();
+    create_standard_policy_schema(&db);
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropTable {
+                name: "outcomes".into(),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    match result {
+        Err(Error::DropBlockedByRankPolicy {
+            table,
+            policy_table,
+            policy_column,
+            sort_key,
+            ..
+        }) => {
+            assert_eq!(table.as_ref(), "outcomes");
+            assert_eq!(policy_table.as_ref(), "decisions");
+            assert_eq!(policy_column.as_ref(), "embedding");
+            assert_eq!(sort_key.as_ref(), "effective_confidence");
+        }
+        other => panic!("expected sync DropTable to be rank-policy blocked, got {other:?}"),
+    }
+}
+
+/// RED: sync-applied DropIndex respects rank-policy dependent-DDL RESTRICT.
+#[test]
+fn sy05_sync_drop_index_respects_rank_policy_restrict() {
+    let db = Database::open_memory();
+    create_standard_policy_schema(&db);
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropIndex {
+                table: "outcomes".into(),
+                name: "outcomes_decision_id_idx".into(),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    match result {
+        Err(Error::DropBlockedByRankPolicy {
+            table,
+            dropped_index,
+            policy_table,
+            policy_column,
+            sort_key,
+            ..
+        }) => {
+            assert_eq!(table.as_ref(), "outcomes");
+            assert_eq!(dropped_index.as_deref(), Some("outcomes_decision_id_idx"));
+            assert_eq!(policy_table.as_ref(), "decisions");
+            assert_eq!(policy_column.as_ref(), "embedding");
+            assert_eq!(sort_key.as_ref(), "effective_confidence");
+        }
+        other => panic!("expected sync DropIndex to be rank-policy blocked, got {other:?}"),
+    }
+}
+
+/// RED: full snapshots can apply a same-table rank policy after its protected index exists.
+#[test]
+fn sy06_persisted_full_snapshot_orders_same_table_rank_policy_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rank-self-sync.db");
+    {
+        let origin = Database::open(&path).unwrap();
+        origin
+            .execute(
+                "CREATE TABLE memories (id UUID PRIMARY KEY, confidence REAL)",
+                &empty_params(),
+            )
+            .unwrap();
+        origin
+            .execute(
+                "CREATE INDEX memories_id_idx ON memories(id)",
+                &empty_params(),
+            )
+            .unwrap();
+        origin
+            .execute(
+                "ALTER TABLE memories ADD COLUMN embedding VECTOR(2) RANK_POLICY (
+                    JOIN memories ON id,
+                    FORMULA '{vector_score} * coalesce({confidence}, 1.0)',
+                    SORT_KEY self_weighted
+                )",
+                &empty_params(),
+            )
+            .unwrap();
+    }
+    let reopened = Database::open(&path).unwrap();
+    let changes = reopened.changes_since(Lsn(0));
+    let memories_table = changes
+        .ddl
+        .iter()
+        .position(
+            |change| matches!(change, DdlChange::CreateTable { name, .. } if name == "memories"),
+        )
+        .expect("memories CreateTable");
+    let memories_index = changes
+        .ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::CreateIndex { table, name, .. } if table == "memories" && name == "memories_id_idx"))
+        .expect("memories CreateIndex");
+    let memories_alter = changes
+        .ddl
+        .iter()
+        .position(
+            |change| matches!(change, DdlChange::AlterTable { name, .. } if name == "memories"),
+        )
+        .expect("memories AlterTable");
+    assert!(
+        memories_table < memories_index && memories_index < memories_alter,
+        "same-table rank-policy snapshot must create table, then protected index, then add policy column: {:?}",
+        changes.ddl
+    );
+
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+    assert_eq!(
+        rank_policy_meta(&peer, "memories", "embedding"),
+        rank_policy_meta(&reopened, "memories", "embedding")
+    );
 }
 
 /// RED: sort_key Some populates formula rank and raw vector_score distinctly.

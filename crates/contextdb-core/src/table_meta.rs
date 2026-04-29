@@ -393,6 +393,8 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
 pub struct RankPolicy {
     pub joined_table: String,
     pub joined_column: String,
+    #[serde(default)]
+    pub anchor_column: String,
     pub sort_key: String,
     pub formula: String,
     pub protected_index: String,
@@ -553,6 +555,7 @@ impl ColumnDef {
             .map(|policy| {
                 40 + policy.joined_table.len() * 16
                     + policy.joined_column.len() * 16
+                    + policy.anchor_column.len() * 16
                     + policy.sort_key.len() * 16
                     + policy.formula.len() * 16
                     + policy.protected_index.len() * 16

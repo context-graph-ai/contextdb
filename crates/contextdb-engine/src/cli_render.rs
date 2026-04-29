@@ -2,7 +2,7 @@
 
 use crate::Database;
 use contextdb_core::Value;
-use contextdb_core::table_meta::{ColumnType, TableMeta};
+use contextdb_core::table_meta::{ColumnType, TableMeta, VectorQuantization};
 use std::fmt::Write;
 
 /// Render a column type as a DDL token.
@@ -44,6 +44,12 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
         }
         first = false;
         let mut ty = render_column_type(&col.column_type);
+        if !matches!(col.quantization, VectorQuantization::F32) {
+            ty.push_str(&format!(
+                " WITH (quantization = '{}')",
+                col.quantization.as_str()
+            ));
+        }
         if !col.nullable && !col.primary_key {
             ty.push_str(" NOT NULL");
         }
@@ -52,6 +58,15 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
         }
         if col.immutable {
             ty.push_str(" IMMUTABLE");
+        }
+        if let Some(policy) = &col.rank_policy {
+            ty.push_str(&format!(
+                " RANK_POLICY (JOIN {} ON {}, FORMULA '{}', SORT_KEY {})",
+                policy.joined_table,
+                policy.joined_column,
+                policy.formula.replace('\'', "''"),
+                policy.sort_key
+            ));
         }
         write!(&mut buf, "  {} {}", col.name, ty).unwrap();
     }

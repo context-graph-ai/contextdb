@@ -255,10 +255,20 @@ fn plan_select_body(
         .first()
         .is_some_and(|order| matches!(order.direction, SortDirection::CosineDistance));
 
+    if body.use_rank.is_some() && !uses_vector_search {
+        return Err(Error::UseRankRequiresVectorOrder);
+    }
+
     if let Some(order) = body.order_by.first()
         && matches!(order.direction, SortDirection::CosineDistance)
     {
-        let k = body.limit.ok_or(Error::UnboundedVectorSearch)?;
+        let k = body.limit.ok_or_else(|| {
+            if body.use_rank.is_some() {
+                Error::UseRankRequiresLimit
+            } else {
+                Error::UnboundedVectorSearch
+            }
+        })?;
         let vector_table = vector_base_table(&current)?.ok_or_else(|| {
             Error::PlanError("unable to resolve physical vector source table".to_string())
         })?;
@@ -269,6 +279,7 @@ fn plan_select_body(
             query_expr,
             k,
             candidates: Some(Box::new(current)),
+            sort_key: body.use_rank.clone(),
         };
     }
 

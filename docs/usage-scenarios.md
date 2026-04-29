@@ -578,6 +578,8 @@ CREATE TABLE outcomes (
   measured_at TIMESTAMP DEFAULT NOW()
 ) IMMUTABLE
 
+CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);
+
 -- Link decision to its outcome
 -- edges table already exists from earlier scenarios
 ```
@@ -592,23 +594,99 @@ INSERT INTO edges (id, source_id, target_id, edge_type)
 VALUES ($edge_id, $decision_id, $outcome_id, 'HAS_OUTCOME');
 ```
 
-Now precedent search factors in outcomes — decisions that worked rank higher:
+Declare the outcome-weighted rank policy on the decision vector:
 
 ```sql
-WITH similar AS (
-  SELECT d.id, d.description, d.confidence
-  FROM decisions d
-  WHERE d.status IN ('active', 'superseded')
-  ORDER BY d.embedding <=> $task_embedding
-  LIMIT 20
-)
-SELECT s.id, s.description, s.confidence,
-       o.success, o.impact
-FROM similar s
-LEFT JOIN outcomes o ON o.decision_id = s.id
+CREATE TABLE decisions (
+  id UUID PRIMARY KEY,
+  description TEXT NOT NULL,
+  status TEXT NOT NULL,
+  confidence REAL,
+  embedding VECTOR(384) RANK_POLICY (
+    JOIN outcomes ON decision_id,
+    FORMULA 'coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
+    SORT_KEY effective_confidence
+  )
+) STATE MACHINE (status: active -> [invalidated, superseded])
 ```
 
-The application computes effective confidence: `decision.confidence * outcome.success_rate`. Decisions with poor outcomes sink in rankings. The agent learns from experience, not just similarity.
+Now precedent search factors in outcomes inside the vector top-k selection:
+
+```sql
+SELECT id, description, confidence
+FROM decisions
+WHERE status IN ('active', 'superseded')
+ORDER BY embedding <=> $task_embedding USE RANK effective_confidence
+LIMIT 20
+```
+
+The engine looks up `outcomes.decision_id` through the protected
+`outcomes_decision_id_idx` index and compares it with each decision's `id`.
+It computes effective confidence before applying `LIMIT`. Decisions with poor
+outcomes sink in rankings. The agent learns from experience, not just
+similarity.
+For production schemas, keep the joined outcome table as one current summary row
+per decision. Multi-row history tables should be summarized before ranking
+until rank policies grow explicit aggregation or "latest outcome" semantics.
+
+### Annotated-Corpus Semantic Search
+
+The same mechanism works outside decisions and outcomes. A corpus table can own
+embeddings while a separate annotation table stores a per-document metric such
+as editor approval, freshness, or compliance score.
+
+```sql
+CREATE TABLE annotations (
+  id UUID PRIMARY KEY,
+  document_id UUID NOT NULL,
+  approved BOOLEAN NOT NULL,
+  quality REAL NOT NULL
+);
+CREATE INDEX annotations_document_id_idx ON annotations(document_id);
+
+CREATE TABLE documents (
+  id UUID PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  embedding VECTOR(384) RANK_POLICY (
+    JOIN annotations ON document_id,
+    FORMULA 'coalesce({quality}, 1.0) * coalesce({approved}, 1.0)',
+    SORT_KEY editorial_rank
+  )
+);
+```
+
+Here `annotations.document_id` is looked up through
+`annotations_document_id_idx` and compared with `documents.id`.
+
+Raw similarity returns the nearest documents:
+
+```sql
+SELECT id, title
+FROM documents
+ORDER BY embedding <=> $query_embedding
+LIMIT 3
+```
+
+Ranked search uses the annotation metric before applying the final limit:
+
+```sql
+SELECT id, title
+FROM documents
+ORDER BY embedding <=> $query_embedding USE RANK editorial_rank
+LIMIT 3
+```
+
+Example ordering:
+
+```text
+raw cosine:   draft-a, final-b, note-c
+rank policy:  final-b, note-c, draft-a
+```
+
+This keeps the engine schema-agnostic: it does not know what "approved" or
+"quality" means. It only evaluates the declared formula against the candidate
+set and applies the top-k cutoff after ranking.
 
 ---
 

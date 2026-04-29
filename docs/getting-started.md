@@ -117,6 +117,81 @@ SELECT value FROM observations WHERE tag = 'pay';
 `.explain` shows which plan ran — `IndexScan` for the filtered select above,
 `Scan` for a query whose WHERE clause does not match a declared index.
 
+## Rank Vector Search by Outcomes
+
+Vector search can use a schema-declared rank policy when cosine similarity is
+not the only signal. The joined column must be indexed:
+
+```bash
+contextdb-cli :memory: <<'SQL'
+CREATE TABLE outcomes (
+  id UUID PRIMARY KEY,
+  decision_id UUID NOT NULL,
+  success BOOLEAN NOT NULL
+);
+CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);
+
+CREATE TABLE decisions (
+  id UUID PRIMARY KEY,
+  description TEXT NOT NULL,
+  confidence REAL,
+  embedding VECTOR(2) RANK_POLICY (
+    JOIN outcomes ON decision_id,
+    FORMULA 'coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
+    SORT_KEY effective_confidence
+  )
+);
+
+INSERT INTO decisions (id, description, confidence, embedding) VALUES
+  ('11111111-1111-1111-1111-111111111111', 'closest but failed', 1.0, [1.0, 0.0]),
+  ('22222222-2222-2222-2222-222222222222', 'less similar but worked', 1.0, [0.5, 0.0]),
+  ('33333333-3333-3333-3333-333333333333', 'fallback with no outcome', 0.25, [0.75, 0.0]);
+
+INSERT INTO outcomes (id, decision_id, success) VALUES
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '11111111-1111-1111-1111-111111111111', FALSE),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '22222222-2222-2222-2222-222222222222', TRUE);
+
+SELECT id, description, confidence
+FROM decisions
+ORDER BY embedding <=> [1.0, 0.0] USE RANK effective_confidence
+LIMIT 5;
+SQL
+```
+
+Expected ordering:
+
+```text
+22222222-2222-2222-2222-222222222222 | less similar but worked | 1.0
+33333333-3333-3333-3333-333333333333 | fallback with no outcome | 0.25
+11111111-1111-1111-1111-111111111111 | closest but failed | 1.0
+```
+
+The formula and join path are resolved at DDL time, stored with the schema, and
+replicated through sync. `JOIN outcomes ON decision_id` looks up
+`outcomes.decision_id` through `outcomes_decision_id_idx` and compares it with
+`decisions.id`. Search results are ranked by the formula before the top-k
+cutoff. On large HNSW-backed indexes, this ranking applies to the vector
+candidates returned by ANN retrieval; use a single current summary row on the
+joined side when outcome ranking must be deterministic.
+
+Rank policies are schema. To change a policy today, recreate the affected table
+with the new `RANK_POLICY` clause and reload the rows:
+
+```sql
+DROP TABLE decisions;
+
+CREATE TABLE decisions (
+  id UUID PRIMARY KEY,
+  description TEXT NOT NULL,
+  confidence REAL,
+  embedding VECTOR(2) RANK_POLICY (
+    JOIN outcomes ON decision_id,
+    FORMULA 'coalesce({vector_score}, 0.0) * coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
+    SORT_KEY effective_confidence
+  )
+);
+```
+
 ## Persist to Disk
 
 Replace `:memory:` with a file path. Everything else works the same:

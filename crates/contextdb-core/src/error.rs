@@ -29,44 +29,64 @@ pub enum Error {
     },
     #[error("unknown vector index {index:?}")]
     UnknownVectorIndex { index: VectorIndexRef },
-    #[error("rank policy column unknown")]
+    #[error("rank policy on index `{index}` references unknown column `{column}`")]
     RankPolicyColumnUnknown { index: String, column: String },
-    #[error("rank policy column ambiguous")]
+    #[error(
+        "rank policy on index `{index}` references ambiguous column `{column}` (present on both anchor and joined table); rename one of the columns -- the rank-formula grammar does not support table-qualified column references"
+    )]
     RankPolicyColumnAmbiguous { index: String, column: String },
-    #[error("rank policy column type mismatch")]
+    #[error(
+        "rank policy on index `{index}` references column `{column}` of type {actual}; expected {expected}"
+    )]
     RankPolicyColumnType {
         index: String,
         column: String,
         expected: String,
         actual: String,
     },
-    #[error("rank policy join table unknown")]
+    #[error("rank policy on index `{index}` joins unknown table `{table}`")]
     RankPolicyJoinTableUnknown { index: String, table: String },
-    #[error("rank policy join column unknown")]
+    #[error(
+        "rank policy on index `{index}` joins column `{column}` not present on table `{table}`"
+    )]
     RankPolicyJoinColumnUnknown {
         index: String,
         table: String,
         column: String,
     },
-    #[error("rank policy join column unindexed")]
+    #[error(
+        "rank policy on index `{index}` joins column `{joined_table}.{column}` which has no index; add: CREATE INDEX {joined_table}_{column}_idx ON {joined_table}({column});"
+    )]
     RankPolicyJoinColumnUnindexed {
         index: String,
         joined_table: String,
         column: String,
     },
-    #[error("rank policy not found")]
+    #[error("rank policy sort key `{sort_key}` not found on index `{index}`")]
     RankPolicyNotFound { index: String, sort_key: String },
-    #[error("rank policy formula parse failed")]
+    #[error(
+        "rank policy formula on index `{index}` failed to parse at position {position}: {reason}"
+    )]
     RankPolicyFormulaParse {
         index: String,
         position: usize,
         reason: String,
     },
-    #[error("USE RANK requires vector ORDER BY")]
+    #[error("USE RANK requires ORDER BY embedding <=> $param in the same query")]
     UseRankRequiresVectorOrder,
-    #[error("USE RANK requires LIMIT")]
+    #[error("USE RANK requires LIMIT in the same query")]
     UseRankRequiresLimit,
-    #[error("drop blocked by rank policy")]
+    #[error(
+        "{}",
+        drop_blocked_rank_policy_display(
+            table,
+            column,
+            dropped_index,
+            policy_table,
+            policy_column,
+            sort_key
+        )
+    )]
     DropBlockedByRankPolicy {
         table: Box<str>,
         column: Option<Box<str>>,
@@ -192,6 +212,29 @@ pub enum Error {
     ColumnNotFound { table: String, column: String },
     #[error("{0}")]
     Other(String),
+}
+
+fn drop_blocked_rank_policy_display(
+    table: &str,
+    column: &Option<Box<str>>,
+    dropped_index: &Option<Box<str>>,
+    policy_table: &str,
+    policy_column: &str,
+    sort_key: &str,
+) -> String {
+    if let Some(column) = column {
+        return format!(
+            "cannot drop or rename column `{table}.{column}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+        );
+    }
+    if let Some(index) = dropped_index {
+        return format!(
+            "cannot drop index `{index}` on `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+        );
+    }
+    format!(
+        "cannot drop table `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+    )
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

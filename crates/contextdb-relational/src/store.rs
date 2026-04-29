@@ -74,6 +74,7 @@ impl IndexStorage {
 
 pub struct RelationalStore {
     pub tables: RwLock<HashMap<TableName, Vec<VersionedRow>>>,
+    row_positions: RwLock<HashMap<(TableName, RowId), usize>>,
     pub table_meta: RwLock<HashMap<TableName, TableMeta>>,
     /// (table, index_name) → IndexStorage. Lives alongside TableMeta.indexes
     /// so readers / writers can look up the physical B-tree without needing a
@@ -96,6 +97,7 @@ impl RelationalStore {
     pub fn new() -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
+            row_positions: RwLock::new(HashMap::new()),
             table_meta: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
             index_write_lock_count: AtomicU64::new(0),
@@ -114,6 +116,7 @@ impl RelationalStore {
     pub fn apply_inserts(&self, inserts: Vec<(TableName, VersionedRow)>) {
         let mut tables = self.tables.write();
         let mut indexes = self.indexes.write();
+        let mut row_positions = self.row_positions.write();
         for (table_name, row) in inserts {
             let entry = IndexEntry {
                 row_id: row.row_id,
@@ -127,7 +130,10 @@ impl RelationalStore {
                 let key = index_key_for_row(&idx.columns, &row.values);
                 idx.insert_posting(key, entry.clone());
             }
-            tables.entry(table_name).or_default().push(row);
+            let row_id = row.row_id;
+            let rows = tables.entry(table_name.clone()).or_default();
+            row_positions.insert((table_name, row_id), rows.len());
+            rows.push(row);
         }
     }
 
@@ -182,11 +188,29 @@ impl RelationalStore {
                 idx.insert_posting(key, entry.clone());
             }
         }
-        self.tables
+        let mut tables = self.tables.write();
+        let rows = tables.entry(name.to_string()).or_default();
+        self.row_positions
             .write()
-            .entry(name.to_string())
-            .or_default()
-            .push(row);
+            .insert((name.to_string(), row.row_id), rows.len());
+        rows.push(row);
+    }
+
+    pub fn row_by_id(
+        &self,
+        table: &str,
+        row_id: RowId,
+        snapshot: contextdb_core::SnapshotId,
+    ) -> Option<VersionedRow> {
+        let tables = self.tables.read();
+        let positions = self.row_positions.read();
+        let position = *positions.get(&(table.to_string(), row_id))?;
+        drop(positions);
+        tables
+            .get(table)
+            .and_then(|rows| rows.get(position))
+            .filter(|row| row.row_id == row_id && row.visible_at(snapshot))
+            .cloned()
     }
 
     pub fn max_row_id(&self) -> RowId {
@@ -204,6 +228,9 @@ impl RelationalStore {
 
     pub fn drop_table(&self, name: &str) {
         self.tables.write().remove(name);
+        self.row_positions
+            .write()
+            .retain(|(table, _), _| table != name);
         self.table_meta.write().remove(name);
         // Drop all indexes whose key-table matches; releases BTreeMap storage.
         let mut indexes = self.indexes.write();
