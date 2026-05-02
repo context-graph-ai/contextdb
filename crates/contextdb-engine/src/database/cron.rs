@@ -15,6 +15,7 @@ pub(super) struct CronState {
     waiters: Condvar,
     dispatch_lock: Mutex<()>,
     running_schedules: Mutex<HashSet<String>>,
+    callback_owner_threads: Mutex<HashMap<thread::ThreadId, usize>>,
     pause_count: AtomicU64,
 }
 
@@ -57,6 +58,11 @@ struct ReservedCronRun {
     decision: DueDecision,
 }
 
+struct CronCallbackThreadGuard<'a> {
+    cron: &'a CronState,
+    owner: thread::ThreadId,
+}
+
 impl CronState {
     pub(super) fn new() -> Self {
         Self {
@@ -71,8 +77,21 @@ impl CronState {
             waiters: Condvar::new(),
             dispatch_lock: Mutex::new(()),
             running_schedules: Mutex::new(HashSet::new()),
+            callback_owner_threads: Mutex::new(HashMap::new()),
             pause_count: AtomicU64::new(0),
         }
+    }
+
+    pub(super) fn callback_active_on_other_thread(&self) -> bool {
+        let current = thread::current().id();
+        let owners = self.callback_owner_threads.lock();
+        !owners.is_empty() && !owners.contains_key(&current)
+    }
+
+    fn enter_callback_thread_scope(&self) -> CronCallbackThreadGuard<'_> {
+        let owner = thread::current().id();
+        *self.callback_owner_threads.lock().entry(owner).or_default() += 1;
+        CronCallbackThreadGuard { cron: self, owner }
     }
 
     pub(super) fn resume_tickler(&self) {
@@ -82,6 +101,19 @@ impl CronState {
                 Some(count.saturating_sub(1))
             });
         self.waiters.notify_all();
+    }
+}
+
+impl Drop for CronCallbackThreadGuard<'_> {
+    fn drop(&mut self) {
+        let mut owners = self.cron.callback_owner_threads.lock();
+        match owners.get_mut(&self.owner) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                owners.remove(&self.owner);
+            }
+            None => {}
+        }
     }
 }
 
@@ -428,16 +460,11 @@ impl Database {
     }
 
     fn run_cron_callback_transaction(&self, callback: CronCallback) -> Result<Lsn> {
+        let _callback_thread = self.cron.enter_callback_thread_scope();
         let tx = self.begin();
         let result = self.tx_mgr.commit_with_reserved_lsn_callback(
             tx,
             |reserved_lsn| {
-                let prior_session = {
-                    let mut session = self.session_tx.lock();
-                    let prior = *session;
-                    *session = Some(tx);
-                    prior
-                };
                 let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
                     let prior_lsn = slot.replace(Some(reserved_lsn));
                     let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
@@ -451,7 +478,6 @@ impl Database {
                     slot.replace(prior_lsn);
                     result
                 });
-                *self.session_tx.lock() = prior_session;
                 match callback_result {
                     Ok(result) => result,
                     Err(payload) => Err(Error::Other(format!(

@@ -935,6 +935,11 @@ impl Database {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
             panic!("transaction control is not allowed inside cron callbacks");
         }
+        if self.cron.callback_active_on_other_thread() {
+            panic!(
+                "transaction control is not allowed from another thread while a cron callback is active"
+            );
+        }
         self.tx_mgr.begin()
     }
 
@@ -945,6 +950,12 @@ impl Database {
                 "transaction control is not allowed inside cron callbacks".to_string(),
             ));
         }
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::Other(
+                "transaction control is not allowed from another thread while a cron callback is active"
+                    .to_string(),
+            ));
+        }
         self.commit_with_source(tx, CommitSource::User)
     }
 
@@ -953,6 +964,12 @@ impl Database {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
             return Err(Error::Other(
                 "transaction control is not allowed inside cron callbacks".to_string(),
+            ));
+        }
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::Other(
+                "transaction control is not allowed from another thread while a cron callback is active"
+                    .to_string(),
             ));
         }
         let ws = self.tx_mgr.rollback_write_set(tx)?;
@@ -974,7 +991,8 @@ impl Database {
         let _operation = self.open_operation()?;
         if let Some(cached) = self.cached_statement(sql) {
             self.assert_statement_allowed_inside_cron_callback(&cached.stmt)?;
-            let active_tx = *self.session_tx.lock();
+            self.assert_statement_allowed_during_cross_thread_cron_callback(&cached.stmt)?;
+            let active_tx = self.active_session_tx();
             return self.execute_statement_with_plan(
                 &cached.stmt,
                 sql,
@@ -986,6 +1004,7 @@ impl Database {
 
         let stmt = contextdb_parser::parse(sql)?;
         self.assert_statement_allowed_inside_cron_callback(&stmt)?;
+        self.assert_statement_allowed_during_cross_thread_cron_callback(&stmt)?;
 
         match &stmt {
             Statement::Begin => {
@@ -1037,8 +1056,18 @@ impl Database {
             _ => {}
         }
 
-        let active_tx = *self.session_tx.lock();
+        let active_tx = self.active_session_tx();
         self.execute_statement(&stmt, sql, params, active_tx)
+    }
+
+    fn active_session_tx(&self) -> Option<TxId> {
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            let this_db = self as *const Self as usize;
+            if CRON_CALLBACK_DB.with(|slot| slot.get()) == Some(this_db) {
+                return CRON_CALLBACK_TX.with(|slot| slot.get());
+            }
+        }
+        *self.session_tx.lock()
     }
 
     fn assert_statement_allowed_inside_cron_callback(&self, stmt: &Statement) -> Result<()> {
@@ -1052,7 +1081,7 @@ impl Database {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get())
             && Self::statement_requires_cron_bound_handle(stmt)
         {
-            let active_tx = *self.session_tx.lock();
+            let active_tx = self.active_session_tx();
             let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
             let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
             let this_db = self as *const Self as usize;
@@ -1066,7 +1095,29 @@ impl Database {
         Ok(())
     }
 
+    fn assert_statement_allowed_during_cross_thread_cron_callback(
+        &self,
+        stmt: &Statement,
+    ) -> Result<()> {
+        if self.cron.callback_active_on_other_thread()
+            && (Self::statement_forbidden_inside_cron_callback(stmt)
+                || Self::statement_requires_cron_bound_handle(stmt))
+        {
+            return Err(Error::Other(
+                "database writes from other threads are not allowed while a cron callback is active"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn assert_cron_callback_tx_bound_handle(&self, tx: TxId) -> Result<()> {
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::Other(
+                "database writes from other threads are not allowed while a cron callback is active"
+                    .to_string(),
+            ));
+        }
         if !CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
             return Ok(());
         }
@@ -1222,6 +1273,7 @@ impl Database {
             ));
         }
         let stmt = contextdb_parser::parse(sql)?;
+        self.assert_statement_allowed_during_cross_thread_cron_callback(&stmt)?;
         self.execute_statement(&stmt, sql, params, Some(tx))
     }
 
@@ -4186,6 +4238,12 @@ impl Database {
                 "cannot close database from inside an active operation".to_string(),
             ));
         }
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::Other(
+                "cannot close database from another thread while a cron callback is active"
+                    .to_string(),
+            ));
+        }
         let _operation_barrier = self.operation_gate.write();
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -5863,6 +5921,12 @@ impl Database {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
             return Err(Error::Other(
                 "apply_changes is not allowed inside cron callbacks".to_string(),
+            ));
+        }
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::Other(
+                "apply_changes is not allowed from another thread while a cron callback is active"
+                    .to_string(),
             ));
         }
         // Per I14: the whole batch takes the index-maintenance lock once.

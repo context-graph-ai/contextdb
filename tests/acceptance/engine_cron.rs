@@ -887,3 +887,86 @@ fn t27_15_scoped_open_does_not_start_persisted_tickler() {
     );
     admin.close().unwrap();
 }
+
+/// REGRESSION GUARD — cron tx binding is confined to the callback owner thread.
+#[test]
+fn t27_16_callback_rejects_cross_thread_handle_use() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE cron_items (id UUID PRIMARY KEY, note TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE SCHEDULE s EVERY '100 MILLISECONDS' TX (cb)",
+        &empty(),
+    )
+    .unwrap();
+    let _pause = db.pause_cron_tickler_for_test();
+    let read_tx = db.begin();
+
+    let captured_db = db.clone();
+    db.register_cron_callback("cb", move |db_handle| {
+        std::thread::scope(|scope| {
+            let supplied_join = scope.spawn(|| {
+                let mut p = HashMap::new();
+                p.insert("id".into(), Value::Uuid(Uuid::from_u128(0xA)));
+                p.insert("note".into(), Value::Text("supplied-thread".into()));
+                db_handle.execute("INSERT INTO cron_items (id, note) VALUES ($id, $note)", &p)
+            });
+
+            let captured = captured_db.clone();
+            let captured_join = scope.spawn(move || {
+                let mut p = HashMap::new();
+                p.insert("id".into(), Value::Uuid(Uuid::from_u128(0xB)));
+                p.insert("note".into(), Value::Text("captured-thread".into()));
+                captured.execute("INSERT INTO cron_items (id, note) VALUES ($id, $note)", &p)
+            });
+
+            let reader = captured_db.clone();
+            let read_join = scope
+                .spawn(move || reader.execute_in_tx(read_tx, "SELECT * FROM cron_items", &empty()));
+
+            let supplied = supplied_join.join().expect("supplied thread panicked");
+            let captured = captured_join.join().expect("captured thread panicked");
+            let read = read_join.join().expect("read thread panicked");
+            assert!(
+                supplied.is_err(),
+                "cron callback must not expose its tx-bound handle to other threads"
+            );
+            assert!(
+                captured.is_err(),
+                "cron callback must not let same-engine captured handles write from other threads"
+            );
+            assert!(
+                read.is_ok(),
+                "cross-thread tx-bound reads must remain allowed while cron writes are isolated"
+            );
+        });
+
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(0xC)));
+        p.insert("note".into(), Value::Text("owner-thread".into()));
+        db_handle.execute("INSERT INTO cron_items (id, note) VALUES ($id, $note)", &p)?;
+        Ok(())
+    })
+    .unwrap();
+
+    std::thread::sleep(Duration::from_millis(150));
+    let fires = db
+        .cron_run_due_now_for_test()
+        .expect("cross-thread rejection must not poison cron");
+    assert_eq!(fires, 1);
+
+    let rows = db.scan("cron_items", db.snapshot()).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the owner-thread callback write should commit"
+    );
+    assert_eq!(
+        rows[0].values.get("note"),
+        Some(&Value::Text("owner-thread".into()))
+    );
+    db.rollback(read_tx).unwrap();
+}
