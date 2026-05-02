@@ -111,6 +111,96 @@ fn t9_01_unprincipalled_handle_refused_on_acl_table() {
     );
 }
 
+/// REGRESSION GUARD — t9_01b: constrained non-principal handles are not ACL admins.
+#[test]
+fn t9_01b_constrained_handle_without_principal_refused_on_acl_table() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("context_no_principal.redb");
+    seed_acl_db(&path);
+    {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute(
+                "CREATE TABLE memos_edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+                &empty(),
+            )
+            .unwrap();
+        let mut edge = HashMap::new();
+        edge.insert("eid".into(), Value::Uuid(Uuid::from_u128(50)));
+        edge.insert("src".into(), Value::Uuid(Uuid::from_u128(1)));
+        edge.insert("tgt".into(), Value::Uuid(Uuid::from_u128(2)));
+        admin
+            .execute(
+                "INSERT INTO memos_edges (id, source_id, target_id, edge_type) VALUES ($eid, $src, $tgt, 'LINKS')",
+                &edge,
+            )
+            .unwrap();
+        admin.close().unwrap();
+    }
+
+    let h = Database::open_with_contexts(
+        &path,
+        BTreeSet::from([ContextId::new(Uuid::from_u128(0xA))]),
+    )
+    .unwrap();
+    let err = assert_error(
+        h.execute("SELECT body FROM memos", &empty()),
+        "a constrained handle without a principal must not read ACL-protected SQL rows",
+    );
+    assert!(
+        matches!(err, Error::PrincipalRequired { ref table } if table == "memos"),
+        "got: {err}"
+    );
+    let err = assert_error(
+        h.scan("memos", h.snapshot()),
+        "a constrained handle without a principal must not direct-scan ACL-protected rows",
+    );
+    assert!(
+        matches!(err, Error::PrincipalRequired { ref table } if table == "memos"),
+        "got: {err}"
+    );
+    let tx = h.begin();
+    let err = assert_error(
+        h.insert_edge(
+            tx,
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            "LINKS".into(),
+            HashMap::new(),
+        ),
+        "a constrained handle without a principal must not direct-insert graph edges touching ACL-protected endpoints",
+    );
+    assert!(
+        matches!(err, Error::PrincipalRequired { ref table } if table == "memos"),
+        "got: {err}"
+    );
+    h.commit(tx).unwrap();
+    let tx = h.begin();
+    let err = assert_error(
+        h.delete_edge(tx, Uuid::from_u128(1), Uuid::from_u128(2), "LINKS"),
+        "a constrained handle without a principal must not direct-delete graph edges touching ACL-protected endpoints",
+    );
+    assert!(
+        matches!(err, Error::PrincipalRequired { ref table } if table == "memos"),
+        "got: {err}"
+    );
+    h.commit(tx).unwrap();
+    drop(h);
+    let admin = Database::open(&path).unwrap();
+    assert!(
+        admin
+            .get_edge_properties(
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                "LINKS",
+                admin.snapshot(),
+            )
+            .unwrap()
+            .is_some(),
+        "failed direct delete_edge must not remove an ACL endpoint edge"
+    );
+}
+
 /// RED — t9_02
 #[test]
 fn t9_02_principal_a_sees_only_granted_rows() {
@@ -175,11 +265,6 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
         .find(|row| matches!(row.values.get("id"), Some(Value::Uuid(u)) if *u == granted_row))
         .expect("acl_a fixture row missing")
         .row_id;
-    let target_row_id = rows
-        .iter()
-        .find(|row| matches!(row.values.get("id"), Some(Value::Uuid(u)) if *u == target_row))
-        .expect("acl_b fixture row missing")
-        .row_id;
     drop(admin);
     let h = Database::open_as_principal(&path, Principal::Agent("a1".into())).unwrap();
 
@@ -217,28 +302,13 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
     let mut p = HashMap::new();
     p.insert("id".into(), Value::Uuid(target_row));
     p.insert("body".into(), Value::Text("hijack".into()));
-    let err = assert_error(
-        h.execute("UPDATE memos SET body = $body WHERE id = $id", &p),
-        "agent a1 cannot write to acl_b row",
+    let update = h
+        .execute("UPDATE memos SET body = $body WHERE id = $id", &p)
+        .unwrap();
+    assert_eq!(
+        update.rows_affected, 0,
+        "UPDATE predicate targeting an ACL-denied row must behave as no visible match"
     );
-    match err {
-        Error::AclDenied {
-            table,
-            row_id,
-            principal,
-        } => {
-            assert_eq!(table, "memos", "AclDenied must carry the table name");
-            assert_eq!(
-                row_id, target_row_id,
-                "AclDenied for denied UPDATE must carry the existing row id"
-            );
-            assert!(
-                matches!(principal, Principal::Agent(ref a) if a == "a1"),
-                "AclDenied must carry the writer's principal; got {principal:?}"
-            );
-        }
-        other => panic!("expected AclDenied, got: {other:?}"),
-    }
     let mut flip = HashMap::new();
     flip.insert("id".into(), Value::Uuid(granted_row));
     flip.insert("aid".into(), Value::Uuid(denied_acl));
@@ -253,28 +323,11 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
         Principal::Agent("a1".into()),
         "ACL write gate must evaluate UPDATE post-image, not only the pre-image",
     );
-    let err = assert_error(
-        h.execute("DELETE FROM memos WHERE id = $id", &p),
-        "agent a1 cannot delete acl_b row",
+    let delete = h.execute("DELETE FROM memos WHERE id = $id", &p).unwrap();
+    assert_eq!(
+        delete.rows_affected, 0,
+        "DELETE predicate targeting an ACL-denied row must behave as no visible match"
     );
-    match err {
-        Error::AclDenied {
-            table,
-            row_id,
-            principal,
-        } => {
-            assert_eq!(table, "memos", "AclDenied must carry the table name");
-            assert_eq!(
-                row_id, target_row_id,
-                "AclDenied for denied DELETE must carry the existing row id"
-            );
-            assert!(
-                matches!(principal, Principal::Agent(ref a) if a == "a1"),
-                "AclDenied must carry the writer's principal; got {principal:?}"
-            );
-        }
-        other => panic!("expected AclDenied for denied DELETE, got: {other:?}"),
-    }
 
     drop(h);
     let admin = Database::open(&path).unwrap();
@@ -910,5 +963,82 @@ fn t9_10_acl_constraint_on_acl_grants_table_rejected() {
     assert!(
         matches!(err, Error::SchemaInvalid { ref reason } if reason.contains("acl_grants")),
         "got: {err}"
+    );
+}
+
+/// RED — t9_11: grant tables carrying context metadata must be scoped too.
+#[test]
+fn t9_11_acl_grant_rows_respect_context_constraints() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("grant_context.redb");
+    let ctx_a = Uuid::from_u128(0xCA);
+    let ctx_b = Uuid::from_u128(0xCB);
+    let acl_a = Uuid::from_u128(0xA);
+    let acl_b = Uuid::from_u128(0xB);
+
+    {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute(
+                "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, \
+                 principal_id TEXT, acl_id UUID, context_id UUID CONTEXT_ID)",
+                &empty(),
+            )
+            .unwrap();
+        admin
+            .execute(
+                "CREATE TABLE memos (id UUID PRIMARY KEY, body TEXT, \
+                 acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+                &empty(),
+            )
+            .unwrap();
+        for (id, acl, ctx) in [
+            (Uuid::from_u128(100), acl_a, ctx_a),
+            (Uuid::from_u128(101), acl_b, ctx_b),
+        ] {
+            let mut p = HashMap::new();
+            p.insert("id".into(), Value::Uuid(id));
+            p.insert("kind".into(), Value::Text("Agent".into()));
+            p.insert("principal".into(), Value::Text("a1".into()));
+            p.insert("acl".into(), Value::Uuid(acl));
+            p.insert("ctx".into(), Value::Uuid(ctx));
+            admin
+                .execute(
+                    "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id, context_id) \
+                     VALUES ($id, $kind, $principal, $acl, $ctx)",
+                    &p,
+                )
+                .unwrap();
+        }
+        for (id, body, acl) in [
+            (Uuid::from_u128(1), "visible-grant", acl_a),
+            (Uuid::from_u128(2), "hidden-grant", acl_b),
+        ] {
+            let mut p = HashMap::new();
+            p.insert("id".into(), Value::Uuid(id));
+            p.insert("body".into(), Value::Text(body.into()));
+            p.insert("acl".into(), Value::Uuid(acl));
+            admin
+                .execute(
+                    "INSERT INTO memos (id, body, acl_id) VALUES ($id, $body, $acl)",
+                    &p,
+                )
+                .unwrap();
+        }
+        admin.close().unwrap();
+    }
+
+    let h = Database::open_with_constraints(
+        &path,
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        None,
+        Some(Principal::Agent("a1".into())),
+    )
+    .unwrap();
+    let r = h.execute("SELECT body FROM memos", &empty()).unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Text("visible-grant".into())]],
+        "out-of-context ACL grant row must not authorize protected data"
     );
 }

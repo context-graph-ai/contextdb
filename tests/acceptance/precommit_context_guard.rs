@@ -1,6 +1,9 @@
 use contextdb_core::types::ContextId;
-use contextdb_core::{Direction, Error, Value, VectorIndexRef};
+use contextdb_core::{Direction, Error, Lsn, Value, VectorIndexRef};
 use contextdb_engine::Database;
+use contextdb_engine::sync_types::{
+    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use tempfile::TempDir;
@@ -145,15 +148,12 @@ fn t4_03_update_other_context_rejected() {
     let mut p = HashMap::new();
     p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
     p.insert("body".into(), Value::Text("hijacked".into()));
-    let err = assert_error(
-        scoped.execute("UPDATE memos SET body = $body WHERE id = $id", &p),
-        "UPDATE on ctx-b row from ctx-a handle must be rejected",
-    );
-    assert_context_violation(
-        err,
-        ctx_b,
-        &[ctx_a],
-        "UPDATE on ctx-b row from ctx-a handle",
+    let result = scoped
+        .execute("UPDATE memos SET body = $body WHERE id = $id", &p)
+        .unwrap();
+    assert_eq!(
+        result.rows_affected, 0,
+        "UPDATE predicate targeting a hidden ctx-b row must behave as no visible match"
     );
     drop(scoped);
     let admin = Database::open(&path).unwrap();
@@ -181,18 +181,15 @@ fn t4_04_delete_other_context_rejected() {
 
     let scoped =
         Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
-    let err = assert_error(
-        scoped.execute(
+    let result = scoped
+        .execute(
             "DELETE FROM memos WHERE id = '00000000-0000-0000-0000-000000000001'",
             &empty(),
-        ),
-        "DELETE on ctx-b row from ctx-a handle must be rejected",
-    );
-    assert_context_violation(
-        err,
-        ctx_b,
-        &[ctx_a],
-        "DELETE on ctx-b row from ctx-a handle",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows_affected, 0,
+        "DELETE predicate targeting a hidden ctx-b row must behave as no visible match"
     );
     drop(scoped);
     let admin = Database::open(&path).unwrap();
@@ -631,14 +628,23 @@ fn t4_08_admin_handle_sees_all_contexts() {
 /// REGRESSION GUARD — t4_09
 #[test]
 fn t4_09_table_without_context_id_unaffected() {
-    let scoped =
-        Database::open_memory_with_contexts(BTreeSet::from([ContextId::new(Uuid::from_u128(0xA))]));
-    scoped
-        .execute(
-            "CREATE TABLE plain (id UUID PRIMARY KEY, v TEXT, context_id UUID)",
-            &empty(),
-        )
-        .unwrap();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("plain.redb");
+    {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute(
+                "CREATE TABLE plain (id UUID PRIMARY KEY, v TEXT, context_id UUID)",
+                &empty(),
+            )
+            .unwrap();
+        admin.close().unwrap();
+    }
+    let scoped = Database::open_with_contexts(
+        &path,
+        BTreeSet::from([ContextId::new(Uuid::from_u128(0xA))]),
+    )
+    .unwrap();
     let mut p = HashMap::new();
     p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
     p.insert("v".into(), Value::Text("anything".into()));
@@ -784,4 +790,546 @@ fn t4_12_update_post_image_label_flip_rejected() {
         vec![vec![Value::Uuid(ctx_a)]],
         "denied context flip must leave the row in ctx-a"
     );
+}
+
+/// RED — t4_13: direct scan_filter predicates must not observe denied rows.
+#[test]
+fn t4_13_scan_filter_predicate_sees_only_context_visible_rows() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scan_filter.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    seed_memos(&path, &[(1, "visible", ctx_a), (2, "hidden", ctx_b)]);
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let observed = std::cell::RefCell::new(Vec::new());
+    let rows = scoped
+        .scan_filter("memos", scoped.snapshot(), &|row| {
+            if let Some(Value::Text(body)) = row.values.get("body") {
+                observed.borrow_mut().push(body.clone());
+            }
+            true
+        })
+        .unwrap();
+
+    assert_eq!(rows.len(), 1, "scan_filter must return only visible rows");
+    assert_eq!(
+        observed.into_inner(),
+        vec!["visible".to_string()],
+        "scan_filter predicate must not be invoked with hidden row values"
+    );
+}
+
+/// RED — t4_14: sync apply's raw insert helper must not bypass context gates.
+#[test]
+fn t4_14_sync_apply_does_not_insert_other_context_rows() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("sync_apply.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    seed_memos(&path, &[]);
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let row_id = Uuid::from_u128(20);
+    let result = scoped
+        .apply_changes(
+            ChangeSet {
+                rows: vec![RowChange {
+                    table: "memos".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(row_id),
+                    },
+                    values: HashMap::from([
+                        ("id".into(), Value::Uuid(row_id)),
+                        ("body".into(), Value::Text("from-sync".into())),
+                        ("context_id".into(), Value::Uuid(ctx_b)),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(1),
+                }],
+                ..ChangeSet::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+
+    assert_eq!(result.applied_rows, 0, "denied sync row must not apply");
+    assert_eq!(result.skipped_rows, 1, "denied sync row must be skipped");
+    assert_eq!(
+        result.conflicts.len(),
+        1,
+        "denied sync row should surface as a conflict"
+    );
+    drop(scoped);
+    let admin = Database::open(&path).unwrap();
+    let rows = admin.scan("memos", admin.snapshot()).unwrap();
+    assert_eq!(rows.len(), 0, "sync apply must not persist ctx-b row");
+}
+
+/// RED — t4_15: state propagation must not mutate out-of-context child rows.
+#[test]
+fn t4_15_state_propagation_respects_context_on_children() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("propagate.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let parent = Uuid::from_u128(1);
+    let child = Uuid::from_u128(2);
+
+    {
+        let admin = Database::open(&path).unwrap();
+        admin.execute(
+            "CREATE TABLE parents (id UUID PRIMARY KEY, status TEXT, context_id UUID CONTEXT_ID) \
+             STATE MACHINE (status: active -> [archived])",
+            &empty(),
+        )
+        .unwrap();
+        admin
+            .execute(
+                "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) \
+             ON STATE archived PROPAGATE SET archived, status TEXT, context_id UUID CONTEXT_ID) \
+             STATE MACHINE (status: active -> [archived])",
+                &empty(),
+            )
+            .unwrap();
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(parent));
+        p.insert("status".into(), Value::Text("active".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx_a));
+        admin
+            .execute(
+                "INSERT INTO parents (id, status, context_id) VALUES ($id, $status, $ctx)",
+                &p,
+            )
+            .unwrap();
+        let mut c = HashMap::new();
+        c.insert("id".into(), Value::Uuid(child));
+        c.insert("parent".into(), Value::Uuid(parent));
+        c.insert("status".into(), Value::Text("active".into()));
+        c.insert("ctx".into(), Value::Uuid(ctx_b));
+        admin
+            .execute(
+                "INSERT INTO children (id, parent_id, status, context_id) \
+                 VALUES ($id, $parent, $status, $ctx)",
+                &c,
+            )
+            .unwrap();
+        admin.close().unwrap();
+    }
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let mut params = HashMap::new();
+    params.insert("id".into(), Value::Uuid(parent));
+    params.insert("status".into(), Value::Text("archived".into()));
+    let err = assert_error(
+        scoped.execute(
+            "UPDATE parents SET status = $status WHERE id = $id",
+            &params,
+        ),
+        "ctx-a update must not propagate into ctx-b child",
+    );
+    assert_context_violation(
+        err,
+        ctx_b,
+        &[ctx_a],
+        "propagation into ctx-b child must be rejected",
+    );
+    drop(scoped);
+
+    let admin = Database::open(&path).unwrap();
+    let parent_status = admin
+        .execute("SELECT status FROM parents", &empty())
+        .unwrap();
+    let child_status = admin
+        .execute("SELECT status FROM children", &empty())
+        .unwrap();
+    assert_eq!(
+        parent_status.rows,
+        vec![vec![Value::Text("active".into())]],
+        "failed propagation must roll back the parent transition"
+    );
+    assert_eq!(
+        child_status.rows,
+        vec![vec![Value::Text("active".into())]],
+        "failed propagation must leave the ctx-b child unchanged"
+    );
+}
+
+/// RED — t4_16: protected edge-row metadata hides edges even when endpoints are visible.
+#[test]
+fn t4_16_graph_edge_metadata_context_gate_hides_visible_endpoint_edge() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("edge_metadata.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let n1 = Uuid::from_u128(1);
+    let n2 = Uuid::from_u128(2);
+
+    {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute(
+                "CREATE TABLE nodes (id UUID PRIMARY KEY, label TEXT, context_id UUID CONTEXT_ID)",
+                &empty(),
+            )
+            .unwrap();
+        admin
+            .execute(
+                "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, \
+                 edge_type TEXT, context_id UUID CONTEXT_ID)",
+                &empty(),
+            )
+            .unwrap();
+        for (id, label) in [(n1, "source"), (n2, "target")] {
+            let mut p = HashMap::new();
+            p.insert("id".into(), Value::Uuid(id));
+            p.insert("label".into(), Value::Text(label.into()));
+            p.insert("ctx".into(), Value::Uuid(ctx_a));
+            admin
+                .execute(
+                    "INSERT INTO nodes (id, label, context_id) VALUES ($id, $label, $ctx)",
+                    &p,
+                )
+                .unwrap();
+        }
+        let mut e = HashMap::new();
+        e.insert("id".into(), Value::Uuid(Uuid::from_u128(50)));
+        e.insert("source".into(), Value::Uuid(n1));
+        e.insert("target".into(), Value::Uuid(n2));
+        e.insert("ctx".into(), Value::Uuid(ctx_b));
+        admin
+            .execute(
+                "INSERT INTO edges (id, source_id, target_id, edge_type, context_id) \
+                 VALUES ($id, $source, $target, 'LINKS', $ctx)",
+                &e,
+            )
+            .unwrap();
+        admin.close().unwrap();
+    }
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let graph_rows = scoped
+        .execute(
+            "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) \
+             WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS (b.id AS b_id))",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(
+        graph_rows.rows.len(),
+        0,
+        "GRAPH_TABLE must hide edge whose metadata row is ctx-b"
+    );
+    let direct = scoped
+        .query_bfs(
+            n1,
+            Some(&["LINKS".to_string()]),
+            Direction::Outgoing,
+            1,
+            scoped.snapshot(),
+        )
+        .unwrap();
+    assert!(
+        direct.nodes.is_empty(),
+        "direct graph traversal must hide metadata-denied edge; nodes={:?}",
+        direct.nodes
+    );
+    assert_eq!(
+        scoped.edge_count(n1, "LINKS", scoped.snapshot()).unwrap(),
+        0,
+        "edge_count must hide metadata-denied edge"
+    );
+    assert!(
+        scoped
+            .get_edge_properties(n1, n2, "LINKS", scoped.snapshot())
+            .unwrap()
+            .is_none(),
+        "get_edge_properties must hide metadata-denied edge"
+    );
+    let tx = scoped.begin();
+    let err = assert_error(
+        scoped.delete_edge(tx, n1, n2, "LINKS"),
+        "delete_edge must not delete metadata-denied edge",
+    );
+    assert_context_violation(
+        err,
+        ctx_b,
+        &[ctx_a],
+        "delete_edge must gate protected edge metadata row",
+    );
+    scoped.commit(tx).unwrap();
+}
+
+/// RED — t4_17: sync extraction from a scoped handle must not leak hidden rows or DDL.
+#[test]
+fn t4_17_changes_since_filters_context_rows_and_schema() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("changes_since.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    seed_memos(&path, &[(1, "visible", ctx_a), (2, "hidden", ctx_b)]);
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let changes = scoped.changes_since(Lsn(0));
+    assert!(
+        changes.ddl.is_empty(),
+        "constrained changes_since must not leak schema DDL"
+    );
+    assert_eq!(
+        changes.rows.len(),
+        1,
+        "constrained changes_since must include only visible row changes"
+    );
+    assert_eq!(
+        changes.rows[0].values.get("body"),
+        Some(&Value::Text("visible".into())),
+        "hidden ctx-b row must not appear in changes_since"
+    );
+}
+
+/// REGRESSION GUARD — t4_17b: a visible row moved out of scope must emit a scoped delete.
+#[test]
+fn t4_17b_changes_since_emits_delete_when_row_moves_out_of_context_after_ddl_lsn_gap() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("changes_move.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    seed_memos(&path, &[(1, "visible", ctx_a)]);
+
+    let admin = Database::open(&path).unwrap();
+    let since = admin.current_lsn();
+    admin
+        .execute("CREATE TABLE unrelated (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("ctx".into(), Value::Uuid(ctx_b));
+    admin
+        .execute("UPDATE memos SET context_id = $ctx WHERE id = $id", &p)
+        .unwrap();
+    admin.close().unwrap();
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let changes = scoped.changes_since(since);
+    assert!(
+        changes.ddl.is_empty(),
+        "scoped change streams must not expose schema DDL"
+    );
+    assert_eq!(
+        changes.rows.len(),
+        1,
+        "moving a previously visible row out of context must emit one scoped delete"
+    );
+    assert!(changes.rows[0].deleted);
+    assert_eq!(
+        changes.rows[0].natural_key.value,
+        Value::Uuid(Uuid::from_u128(1))
+    );
+}
+
+/// RED — t4_18: sync DDL apply requires an admin handle.
+#[test]
+fn t4_18_scoped_apply_changes_rejects_ddl() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("sync_ddl.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    seed_memos(&path, &[]);
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let err = assert_error(
+        scoped.apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::DropTable {
+                    name: "memos".into(),
+                }],
+                ..ChangeSet::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        ),
+        "scoped sync apply must reject DDL changes",
+    );
+    assert!(
+        matches!(err, Error::Other(ref message) if message.contains("admin database handle")),
+        "expected admin-handle DDL rejection, got {err:?}"
+    );
+    drop(scoped);
+
+    let admin = Database::open(&path).unwrap();
+    assert!(
+        admin.table_meta("memos").is_some(),
+        "rejected scoped DDL apply must leave schema intact"
+    );
+}
+
+/// RED — t4_19: scoped handles must not expose raw DDL/log or vector payload bypasses.
+#[test]
+fn t4_19_scoped_raw_helpers_respect_context_boundary() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("raw_helpers.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let hidden_row_id = {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute(
+                "CREATE TABLE memos (id UUID PRIMARY KEY, embedding VECTOR(3), context_id UUID CONTEXT_ID)",
+                &empty(),
+            )
+            .unwrap();
+        for (id, ctx, vector) in [
+            (Uuid::from_u128(1), ctx_a, vec![1.0, 0.0, 0.0]),
+            (Uuid::from_u128(2), ctx_b, vec![0.0, 1.0, 0.0]),
+        ] {
+            let mut p = HashMap::new();
+            p.insert("id".into(), Value::Uuid(id));
+            p.insert("v".into(), Value::Vector(vector));
+            p.insert("ctx".into(), Value::Uuid(ctx));
+            admin
+                .execute(
+                    "INSERT INTO memos (id, embedding, context_id) VALUES ($id, $v, $ctx)",
+                    &p,
+                )
+                .unwrap();
+        }
+        let hidden = admin
+            .scan("memos", admin.snapshot())
+            .unwrap()
+            .into_iter()
+            .find(|row| matches!(row.values.get("context_id"), Some(Value::Uuid(ctx)) if *ctx == ctx_b))
+            .expect("hidden vector fixture row missing")
+            .row_id;
+        admin.close().unwrap();
+        hidden
+    };
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    assert!(
+        scoped.ddl_log_since(Lsn(0)).is_empty(),
+        "scoped raw DDL log helper must not expose schema"
+    );
+    let row_changes = scoped.change_log_rows_since(Lsn(0)).unwrap();
+    assert_eq!(
+        row_changes.len(),
+        1,
+        "scoped raw row log helper must include only visible row changes"
+    );
+    assert_eq!(
+        row_changes[0].values.get("context_id"),
+        Some(&Value::Uuid(ctx_a)),
+        "raw row log helper leaked hidden context row"
+    );
+    assert!(
+        !scoped.has_live_vector(hidden_row_id, scoped.snapshot()),
+        "has_live_vector must hide vectors attached to hidden rows"
+    );
+    assert!(
+        scoped
+            .live_vector_entry(hidden_row_id, scoped.snapshot())
+            .is_none(),
+        "live_vector_entry must not return hidden vector payloads"
+    );
+}
+
+/// RED — t4_20: scoped handles must not run normal SQL DDL.
+#[test]
+fn t4_20_scoped_sql_ddl_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("sql_ddl.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    seed_memos(&path, &[]);
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let err = assert_error(
+        scoped.execute("DROP TABLE memos", &empty()),
+        "scoped handle must not run SQL DDL",
+    );
+    assert!(
+        matches!(err, Error::Other(ref message) if message.contains("admin database handle")),
+        "expected admin DDL rejection, got {err:?}"
+    );
+    drop(scoped);
+    let admin = Database::open(&path).unwrap();
+    assert!(admin.table_meta("memos").is_some());
+}
+
+/// REGRESSION GUARD — t4_21: constrained handles fail closed on graph-only edges.
+#[test]
+fn t4_21_scoped_graph_only_edges_require_relational_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("graph_only.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let n1 = Uuid::from_u128(1);
+    let n2 = Uuid::from_u128(2);
+    {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute(
+                "CREATE TABLE nodes (id UUID PRIMARY KEY, label TEXT, context_id UUID CONTEXT_ID)",
+                &empty(),
+            )
+            .unwrap();
+        for (id, label) in [(n1, "a"), (n2, "b")] {
+            let mut p = HashMap::new();
+            p.insert("id".into(), Value::Uuid(id));
+            p.insert("label".into(), Value::Text(label.into()));
+            p.insert("ctx".into(), Value::Uuid(ctx_a));
+            admin
+                .execute(
+                    "INSERT INTO nodes (id, label, context_id) VALUES ($id, $label, $ctx)",
+                    &p,
+                )
+                .unwrap();
+        }
+        let tx = admin.begin();
+        admin
+            .insert_edge(tx, n1, n2, "LOOSE".into(), HashMap::new())
+            .unwrap();
+        admin.commit(tx).unwrap();
+        admin.close().unwrap();
+    }
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(ctx_a)])).unwrap();
+    let edge_types = vec!["LOOSE".to_string()];
+    let traversal = scoped
+        .query_bfs(
+            n1,
+            Some(edge_types.as_slice()),
+            Direction::Outgoing,
+            1,
+            scoped.snapshot(),
+        )
+        .unwrap();
+    assert!(
+        traversal.nodes.is_empty(),
+        "scoped traversal must not expose graph-only edges with no gated metadata row"
+    );
+    assert!(
+        scoped
+            .get_edge_properties(n1, n2, "LOOSE", scoped.snapshot())
+            .unwrap()
+            .is_none(),
+        "scoped edge property lookup must hide graph-only edges with no gated metadata row"
+    );
+
+    let tx = scoped.begin();
+    let err = assert_error(
+        scoped.insert_edge(tx, n1, n2, "NEW".into(), HashMap::new()),
+        "scoped direct graph-only insert must be rejected without relational metadata",
+    );
+    assert!(
+        matches!(err, Error::ContextScopeViolation { .. }),
+        "expected ContextScopeViolation for metadata-less direct graph write, got {err:?}"
+    );
+    scoped.rollback(tx).unwrap();
 }

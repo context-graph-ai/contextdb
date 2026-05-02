@@ -22,7 +22,7 @@ use contextdb_tx::{TxManager, WriteSetApplicator};
 use contextdb_vector::{HnswGraphStats, HnswIndex, MemVectorExecutor, VectorStore};
 use parking_lot::{Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -31,12 +31,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 type DynStore = Box<dyn WriteSetApplicator>;
+type GatedBfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
+type GatedGraphNeighbor = (NodeId, EdgeType, HashMap<String, Value>, NodeId, NodeId);
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
 const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
 // redb may need a small metadata page on the next write, especially for a new
 // file with the format metadata table. Keep the disk-limit error deterministic
 // instead of starting a write that cannot commit cleanly.
 const MIN_DISK_WRITE_HEADROOM_BYTES: u64 = 1024;
+
+mod gate;
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -237,6 +241,7 @@ pub struct Database {
     session_tx: Mutex<Option<TxId>>,
     instance_id: uuid::Uuid,
     plugin: Arc<dyn DatabasePlugin>,
+    access: AccessConstraints,
     accountant: Arc<MemoryAccountant>,
     conflict_policies: RwLock<ConflictPolicies>,
     subscriptions: Mutex<SubscriptionState>,
@@ -249,9 +254,25 @@ pub struct Database {
     rows_examined: AtomicU64,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
     rank_formula_cache: RwLock<HashMap<(String, String), Arc<RankFormula>>>,
+    acl_grant_cache: RwLock<HashMap<AclGrantCacheKey, Arc<HashSet<uuid::Uuid>>>>,
     rank_policy_eval_count: AtomicU64,
     rank_policy_formula_parse_count: AtomicU64,
     corrupt_joined_values: RwLock<HashSet<(String, RowId, String)>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AccessConstraints {
+    contexts: Option<BTreeSet<ContextId>>,
+    scope_labels: Option<BTreeSet<ScopeLabel>>,
+    principal: Option<Principal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AclGrantCacheKey {
+    principal: Principal,
+    ref_table: String,
+    ref_column: String,
+    snapshot: SnapshotId,
 }
 
 pub(crate) enum InsertRowResult {
@@ -557,6 +578,7 @@ impl Database {
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
             plugin,
+            access: AccessConstraints::default(),
             accountant,
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
             subscriptions: Mutex::new(SubscriptionState::new()),
@@ -569,6 +591,7 @@ impl Database {
             rows_examined: AtomicU64::new(0),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: RwLock::new(HashMap::new()),
+            acl_grant_cache: RwLock::new(HashMap::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
             corrupt_joined_values: RwLock::new(HashSet::new()),
@@ -595,43 +618,37 @@ impl Database {
         path: P,
         contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
     ) -> Result<Self> {
-        let _ = contexts;
-        Self::open(path)
+        Self::open_with_constraints(path, Some(contexts), None, None)
     }
 
     pub fn open_memory_with_contexts(
         contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
     ) -> Self {
-        let _ = contexts;
-        Self::open_memory()
+        Self::open_memory_with_constraints(Some(contexts), None, None)
     }
 
     pub fn open_with_scope_labels<P: AsRef<Path>>(
         path: P,
         labels: std::collections::BTreeSet<contextdb_core::types::ScopeLabel>,
     ) -> Result<Self> {
-        let _ = labels;
-        Self::open(path)
+        Self::open_with_constraints(path, None, Some(labels), None)
     }
 
     pub fn open_memory_with_scope_labels(
         labels: std::collections::BTreeSet<contextdb_core::types::ScopeLabel>,
     ) -> Self {
-        let _ = labels;
-        Self::open_memory()
+        Self::open_memory_with_constraints(None, Some(labels), None)
     }
 
     pub fn open_as_principal<P: AsRef<Path>>(
         path: P,
         principal: contextdb_core::types::Principal,
     ) -> Result<Self> {
-        let _ = principal;
-        Self::open(path)
+        Self::open_with_constraints(path, None, None, Some(principal))
     }
 
     pub fn open_memory_as_principal(principal: contextdb_core::types::Principal) -> Self {
-        let _ = principal;
-        Self::open_memory()
+        Self::open_memory_with_constraints(None, None, Some(principal))
     }
 
     pub fn open_with_constraints<P: AsRef<Path>>(
@@ -640,8 +657,12 @@ impl Database {
         scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
         principal: Option<contextdb_core::types::Principal>,
     ) -> Result<Self> {
-        let _ = (contexts, scope_labels, principal);
-        Self::open(path)
+        let db = Self::open(path)?;
+        Ok(db.with_access_constraints(AccessConstraints {
+            contexts,
+            scope_labels,
+            principal,
+        }))
     }
 
     pub fn open_memory_with_constraints(
@@ -649,8 +670,16 @@ impl Database {
         scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
         principal: Option<contextdb_core::types::Principal>,
     ) -> Self {
-        let _ = (contexts, scope_labels, principal);
-        Self::open_memory()
+        Self::open_memory().with_access_constraints(AccessConstraints {
+            contexts,
+            scope_labels,
+            principal,
+        })
+    }
+
+    fn with_access_constraints(mut self, access: AccessConstraints) -> Self {
+        self.access = access;
+        self
     }
 
     fn open_loaded(
@@ -1455,10 +1484,14 @@ impl Database {
         // `n <= max(committed_watermark, tx)` so writes inside an active
         // transaction can reference their own allocated TxId. The error,
         // when fired, still reports `committed_watermark` per plan B7.
-        let values =
+        let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
+        self.complete_insert_access_values(table, &mut values)?;
         self.validate_row_constraints(tx, table, &values, None)?;
-        self.relational.insert(tx, table, values)
+        let row_id = self.relational_store.new_row_id();
+        self.assert_row_write_allowed(table, row_id, &values, self.snapshot())?;
+        self.relational
+            .insert_with_row_id(tx, table, row_id, values, self.snapshot())
     }
 
     /// UPDATE-aware insert: the UPDATE path first deletes the old row and
@@ -1473,9 +1506,11 @@ impl Database {
         values: HashMap<ColName, Value>,
         old_row_id: RowId,
     ) -> Result<RowId> {
-        let values =
+        let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
+        self.complete_insert_access_values(table, &mut values)?;
         self.validate_row_constraints(tx, table, &values, Some(old_row_id))?;
+        self.assert_row_write_allowed(table, old_row_id, &values, self.snapshot())?;
         self.relational
             .insert_with_row_id(tx, table, old_row_id, values, self.snapshot())
     }
@@ -1491,7 +1526,10 @@ impl Database {
     ) -> Result<RowId> {
         let values = self.coerce_row_for_insert(table, values, None, None)?;
         self.validate_row_constraints(tx, table, &values, None)?;
-        self.relational.insert(tx, table, values)
+        let row_id = self.relational_store.new_row_id();
+        self.assert_row_write_allowed(table, row_id, &values, self.snapshot())?;
+        self.relational
+            .insert_with_row_id(tx, table, row_id, values, self.snapshot())
     }
 
     pub(crate) fn upsert_row_for_sync(
@@ -1502,7 +1540,67 @@ impl Database {
         values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
         let values = self.coerce_row_for_insert(table, values, None, None)?;
-        self.upsert_row(tx, table, conflict_col, values)
+        let snapshot = self.snapshot_for_read();
+        let existing_row = values
+            .get(conflict_col)
+            .map(|conflict_value| {
+                self.point_lookup_in_tx(tx, table, conflict_col, conflict_value, snapshot)
+            })
+            .transpose()?
+            .flatten();
+        let existing_row_id = existing_row.as_ref().map(|row| row.row_id);
+
+        if let (Some(existing), Some(meta)) = (existing_row.as_ref(), self.table_meta(table)) {
+            for col_def in meta.columns.iter().filter(|c| c.immutable) {
+                let Some(incoming) = values.get(&col_def.name) else {
+                    continue;
+                };
+                let existing_value = existing.values.get(&col_def.name);
+                if existing_value != Some(incoming) {
+                    return Err(Error::ImmutableColumn {
+                        table: table.to_string(),
+                        column: col_def.name.clone(),
+                    });
+                }
+            }
+        }
+
+        self.validate_row_constraints(tx, table, &values, existing_row_id)?;
+
+        let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
+        let meta = self.table_meta(table);
+        let new_state = meta
+            .as_ref()
+            .and_then(|m| m.state_machine.as_ref())
+            .and_then(|sm| values.get(&sm.column))
+            .and_then(Value::as_text)
+            .map(std::borrow::ToOwned::to_owned);
+
+        if let Some(existing) = existing_row.as_ref() {
+            self.assert_row_write_allowed(table, existing.row_id, &existing.values, snapshot)?;
+            self.assert_row_write_allowed(table, existing.row_id, &values, snapshot)?;
+            let result = self
+                .relational
+                .upsert(tx, table, conflict_col, values, snapshot)?;
+            if let (Some(uuid), Some(state), Some(_meta)) =
+                (row_uuid, new_state.as_deref(), meta.as_ref())
+                && matches!(result, UpsertResult::Updated)
+            {
+                self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
+            }
+            return Ok(result);
+        }
+
+        let row_id = self.relational_store.new_row_id();
+        self.assert_row_write_allowed(table, row_id, &values, snapshot)?;
+        self.relational
+            .insert_with_row_id(tx, table, row_id, values, snapshot)?;
+        if let (Some(uuid), Some(state), Some(_meta)) =
+            (row_uuid, new_state.as_deref(), meta.as_ref())
+        {
+            self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
+        }
+        Ok(UpsertResult::Inserted)
     }
 
     /// Route each row cell through `coerce_value_for_column` for variant
@@ -1552,13 +1650,17 @@ impl Database {
         &self,
         tx: TxId,
         table: &str,
-        values: HashMap<ColName, Value>,
+        mut values: HashMap<ColName, Value>,
     ) -> Result<InsertRowResult> {
+        self.complete_insert_access_values(table, &mut values)?;
         match self.check_row_constraints(tx, table, &values, None, true)? {
-            RowConstraintCheck::Valid => self
-                .relational
-                .insert(tx, table, values)
-                .map(InsertRowResult::Inserted),
+            RowConstraintCheck::Valid => {
+                let row_id = self.relational_store.new_row_id();
+                self.assert_row_write_allowed(table, row_id, &values, self.snapshot())?;
+                self.relational
+                    .insert_with_row_id(tx, table, row_id, values, self.snapshot())
+                    .map(InsertRowResult::Inserted)
+            }
             RowConstraintCheck::DuplicateUniqueNoOp => Ok(InsertRowResult::NoOp),
         }
     }
@@ -1568,9 +1670,10 @@ impl Database {
         tx: TxId,
         table: &str,
         conflict_col: &str,
-        values: HashMap<ColName, Value>,
+        mut values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
         let _operation = self.open_operation()?;
+        self.complete_insert_access_values(table, &mut values)?;
         let snapshot = self.snapshot_for_read();
         let existing_row = values
             .get(conflict_col)
@@ -1598,6 +1701,31 @@ impl Database {
             }
         }
         self.validate_row_constraints(tx, table, &values, existing_row_id)?;
+        if let Some(existing) = existing_row.as_ref() {
+            self.assert_row_write_allowed(table, existing.row_id, &existing.values, snapshot)?;
+            self.assert_row_write_allowed(table, existing.row_id, &values, snapshot)?;
+        } else {
+            let row_id = self.relational_store.new_row_id();
+            self.assert_row_write_allowed(table, row_id, &values, snapshot)?;
+
+            let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
+            let meta = self.table_meta(table);
+            let new_state = meta
+                .as_ref()
+                .and_then(|m| m.state_machine.as_ref())
+                .and_then(|sm| values.get(&sm.column))
+                .and_then(Value::as_text)
+                .map(std::borrow::ToOwned::to_owned);
+
+            self.relational
+                .insert_with_row_id(tx, table, row_id, values, snapshot)?;
+            if let (Some(uuid), Some(state), Some(_meta)) =
+                (row_uuid, new_state.as_deref(), meta.as_ref())
+            {
+                self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
+            }
+            return Ok(UpsertResult::Inserted);
+        }
 
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
         let meta = self.table_meta(table);
@@ -2215,6 +2343,14 @@ impl Database {
                 Value::Text(entry.target_state.clone()),
             );
 
+            self.assert_row_write_allowed(
+                &entry.table,
+                existing.row_id,
+                &existing.values,
+                snapshot,
+            )?;
+            self.assert_row_write_allowed(&entry.table, existing.row_id, &next_values, snapshot)?;
+
             let upsert_outcome =
                 self.relational
                     .upsert(tx, &entry.table, "id", next_values, snapshot);
@@ -2436,17 +2572,17 @@ impl Database {
 
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation()?;
+        self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot())?;
         self.relational.delete(tx, table, row_id)
     }
 
     pub fn scan(&self, table: &str, snapshot: SnapshotId) -> Result<Vec<VersionedRow>> {
         let _operation = self.open_operation()?;
-        self.relational.scan(table, snapshot)
+        let rows = self.relational.scan(table, snapshot)?;
+        self.filter_rows_for_read(table, rows, snapshot)
     }
 
-    /// Scan a table with visibility over the tx's in-flight write-set layered on
-    /// top of the committed snapshot.
-    pub(crate) fn scan_in_tx(
+    pub(crate) fn scan_in_tx_raw(
         &self,
         tx: TxId,
         table: &str,
@@ -2501,7 +2637,9 @@ impl Database {
         predicate: &dyn Fn(&VersionedRow) -> bool,
     ) -> Result<Vec<VersionedRow>> {
         let _operation = self.open_operation()?;
-        self.relational.scan_filter(table, snapshot, predicate)
+        let rows = self.relational.scan(table, snapshot)?;
+        let rows = self.filter_rows_for_read(table, rows, snapshot)?;
+        Ok(rows.into_iter().filter(|row| predicate(row)).collect())
     }
 
     pub fn point_lookup(
@@ -2512,7 +2650,18 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
         let _operation = self.open_operation()?;
-        self.relational.point_lookup(table, col, value, snapshot)
+        self.assert_table_read_allowed(table)?;
+        let Some(row) = self.relational.point_lookup(table, col, value, snapshot)? else {
+            return Ok(None);
+        };
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        if self.read_allowed_for_row(table, &meta, &row, snapshot)? {
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn point_lookup_in_tx(
@@ -2563,6 +2712,10 @@ impl Database {
         properties: HashMap<String, Value>,
     ) -> Result<bool> {
         let _operation = self.open_operation()?;
+        let snapshot = self.snapshot();
+        self.assert_node_write_allowed(source, snapshot)?;
+        self.assert_node_write_allowed(target, snapshot)?;
+        self.assert_graph_edge_write_allowed(Some(tx), source, target, &edge_type, snapshot)?;
         let bytes = estimate_edge_bytes(source, target, &edge_type, &properties);
         self.accountant.try_allocate_for(
             bytes,
@@ -2596,6 +2749,10 @@ impl Database {
         edge_type: &str,
     ) -> Result<()> {
         let _operation = self.open_operation()?;
+        let snapshot = self.snapshot();
+        self.assert_node_write_allowed(source, snapshot)?;
+        self.assert_node_write_allowed(target, snapshot)?;
+        self.assert_graph_edge_write_allowed(Some(tx), source, target, edge_type, snapshot)?;
         self.graph.delete_edge(tx, source, target, edge_type)
     }
 
@@ -2608,8 +2765,12 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<TraversalResult> {
         let _operation = self.open_operation()?;
-        self.graph
-            .bfs(start, edge_types, direction, 1, max_depth, snapshot)
+        if self.access_is_admin() {
+            self.graph
+                .bfs(start, edge_types, direction, 1, max_depth, snapshot)
+        } else {
+            self.query_bfs_gated(start, edge_types, direction, 1, max_depth, snapshot)
+        }
     }
 
     pub fn edge_count(
@@ -2619,7 +2780,29 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<usize> {
         let _operation = self.open_operation()?;
-        Ok(self.graph.edge_count(source, edge_type, snapshot))
+        if self.access_is_admin() {
+            return Ok(self.graph.edge_count(source, edge_type, snapshot));
+        }
+        if !self.node_read_allowed(source, snapshot)? {
+            return Ok(0);
+        }
+        let edge_types = [edge_type.to_string()];
+        let mut count = 0;
+        for (target, edge_type, _, edge_source, edge_target) in self
+            .graph_neighbors_with_orientation(
+                source,
+                Some(&edge_types),
+                Direction::Outgoing,
+                snapshot,
+            )?
+        {
+            if self.node_read_allowed(target, snapshot)?
+                && self.edge_read_allowed(edge_source, edge_target, &edge_type, snapshot)?
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn get_edge_properties(
@@ -2630,6 +2813,13 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Option<HashMap<String, Value>>> {
         let _operation = self.open_operation()?;
+        if !self.access_is_admin()
+            && (!self.node_read_allowed(source, snapshot)?
+                || !self.node_read_allowed(target, snapshot)?
+                || !self.edge_read_allowed(source, target, edge_type, snapshot)?)
+        {
+            return Ok(None);
+        }
         let props = self
             .graph_store
             .forward_adj
@@ -2658,6 +2848,7 @@ impl Database {
     ) -> Result<()> {
         let _operation = self.open_operation()?;
         self.vector_store.state(&index)?;
+        self.assert_existing_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         if let Some(expected) = self.pending_vector_dimension(tx, &index)?
             && expected != vector.len()
         {
@@ -2680,6 +2871,7 @@ impl Database {
         vector: Vec<f32>,
     ) -> Result<()> {
         self.vector_store.validate_vector(&index, vector.len())?;
+        self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         let bytes = self.vector_insert_accounted_bytes(&index, vector.len());
         self.accountant.try_allocate_for(
             bytes,
@@ -2763,6 +2955,7 @@ impl Database {
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation()?;
         self.vector_store.state(&index)?;
+        self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         let existing_live = self
             .vector_store
             .live_entry_for_row(&index, row_id, self.snapshot())
@@ -2942,7 +3135,10 @@ impl Database {
         if self.vector_store.try_state(&index).is_none() {
             return Err(Error::UnknownVectorIndex { index });
         }
-        self.vector.search(index, query, k, candidates, snapshot)
+        let effective_candidates =
+            self.effective_read_candidates(&index.table, snapshot, candidates)?;
+        self.vector
+            .search(index, query, k, effective_candidates.as_ref(), snapshot)
     }
 
     pub fn semantic_search(&self, query: SemanticQuery) -> Result<Vec<SearchResult>> {
@@ -3126,7 +3322,10 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
         self.vector_store.validate_vector(&index, query.len())?;
-        self.vector.search(index, query, k, candidates, snapshot)
+        let effective_candidates =
+            self.effective_read_candidates(&index.table, snapshot, candidates)?;
+        self.vector
+            .search(index, query, k, effective_candidates.as_ref(), snapshot)
     }
 
     pub(crate) fn register_rank_formula(
@@ -3332,6 +3531,9 @@ impl Database {
         if !values_equal_for_rank_join(value, &join_value) {
             return Ok(None);
         }
+        if !self.row_read_allowed_for_change(&policy.joined_table, &row, snapshot) {
+            return Ok(None);
+        }
         Ok(Some(row))
     }
 
@@ -3482,10 +3684,10 @@ impl Database {
 
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
         let _operation = self.assert_open_operation();
-        !self
-            .vector_store
+        self.vector_store
             .live_entries_for_row(row_id, snapshot)
-            .is_empty()
+            .into_iter()
+            .any(|entry| self.row_id_read_allowed_for_change(&entry.index.table, row_id, snapshot))
     }
 
     pub fn live_vector_entry(&self, row_id: RowId, snapshot: SnapshotId) -> Option<VectorEntry> {
@@ -3493,7 +3695,7 @@ impl Database {
         self.vector_store
             .live_entries_for_row(row_id, snapshot)
             .into_iter()
-            .next()
+            .find(|entry| self.row_id_read_allowed_for_change(&entry.index.table, row_id, snapshot))
     }
 
     pub(crate) fn vector_store_live_entry_for_row(
@@ -3586,6 +3788,10 @@ impl Database {
     #[doc(hidden)]
     pub fn change_log_rows_since(&self, since: Lsn) -> Result<Vec<RowChange>> {
         let _operation = self.open_operation()?;
+        let changes = self.changes_since(since);
+        if !self.access_is_admin() {
+            return Ok(changes.rows);
+        }
         let entries = self.change_log_since(since);
         let tables = self.relational_store.tables.read();
         let mut out = Vec::new();
@@ -4433,7 +4639,70 @@ impl Database {
 
     pub fn change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
         let _operation = self.assert_open_operation();
+        if !self.access_is_admin() {
+            return self.gated_change_log_since(since_lsn);
+        }
         self.with_commit_lock(|| self.change_log_since_unlocked(since_lsn))
+    }
+
+    fn gated_change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
+        let changes = self.changes_since(since_lsn);
+        let mut entries = Vec::new();
+        for row in changes.rows {
+            if row.deleted {
+                entries.push(ChangeLogEntry::RowDelete {
+                    table: row.table,
+                    row_id: RowId(0),
+                    natural_key: row.natural_key,
+                    lsn: row.lsn,
+                });
+            } else if let Some(row_id) = self.row_id_for_natural_key(
+                &row.table,
+                &row.natural_key.column,
+                &row.natural_key.value,
+                self.snapshot_at(row.lsn),
+            ) {
+                entries.push(ChangeLogEntry::RowInsert {
+                    table: row.table,
+                    row_id,
+                    lsn: row.lsn,
+                });
+            }
+        }
+        for edge in changes.edges {
+            if matches!(edge.properties.get("__deleted"), Some(Value::Bool(true))) {
+                entries.push(ChangeLogEntry::EdgeDelete {
+                    source: edge.source,
+                    target: edge.target,
+                    edge_type: edge.edge_type,
+                    lsn: edge.lsn,
+                });
+            } else {
+                entries.push(ChangeLogEntry::EdgeInsert {
+                    source: edge.source,
+                    target: edge.target,
+                    edge_type: edge.edge_type,
+                    lsn: edge.lsn,
+                });
+            }
+        }
+        for vector in changes.vectors {
+            if vector.vector.is_empty() {
+                entries.push(ChangeLogEntry::VectorDelete {
+                    index: vector.index,
+                    row_id: vector.row_id,
+                    lsn: vector.lsn,
+                });
+            } else {
+                entries.push(ChangeLogEntry::VectorInsert {
+                    index: vector.index,
+                    row_id: vector.row_id,
+                    lsn: vector.lsn,
+                });
+            }
+        }
+        entries.sort_by_key(ChangeLogEntry::lsn);
+        entries
     }
 
     fn change_log_since_unlocked(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
@@ -4444,6 +4713,9 @@ impl Database {
 
     pub fn ddl_log_since(&self, since_lsn: Lsn) -> Vec<DdlChange> {
         let _operation = self.assert_open_operation();
+        if !self.access_is_admin() {
+            return Vec::new();
+        }
         self.with_commit_lock(|| self.ddl_log_since_unlocked(since_lsn))
     }
 
@@ -4468,7 +4740,9 @@ impl Database {
         // DDL. A full snapshot must be directly applyable to an empty peer:
         // create joined tables and their user indexes before any table whose
         // rank policy validates against them.
-        ddl.extend(full_snapshot_ddl(&meta_guard));
+        if self.access_is_admin() {
+            ddl.extend(full_snapshot_ddl(&meta_guard));
+        }
 
         // Rows (live only) — collect row_ids that have live rows for orphan vector filtering
         let mut live_row_ids: HashSet<RowId> = HashSet::new();
@@ -4502,6 +4776,9 @@ impl Database {
                 continue;
             }
             for row in table_rows.iter().filter(|r| r.deleted_tx.is_none()) {
+                if !self.row_read_allowed_for_change(table_name, row, self.snapshot()) {
+                    continue;
+                }
                 let key_val = match row.values.get(&key_col) {
                     Some(v) => v.clone(),
                     None => continue,
@@ -4527,6 +4804,14 @@ impl Database {
         let fwd = self.graph_store.forward_adj.read();
         for (_source, entries) in fwd.iter() {
             for entry in entries.iter().filter(|e| e.deleted_tx.is_none()) {
+                if !self.graph_edge_read_allowed_for_change(
+                    entry.source,
+                    entry.target,
+                    &entry.edge_type,
+                    self.snapshot(),
+                ) {
+                    continue;
+                }
                 edges.push(EdgeChange {
                     source: entry.source,
                     target: entry.target,
@@ -4608,6 +4893,9 @@ impl Database {
                 continue;
             }
             for row in table_rows.iter().filter(|row| row.deleted_tx.is_none()) {
+                if !self.row_read_allowed_for_change(table_name, row, self.snapshot()) {
+                    continue;
+                }
                 live_row_ids.insert(row.row_id);
                 if row.lsn <= since_lsn {
                     continue;
@@ -4637,6 +4925,14 @@ impl Database {
                 .iter()
                 .filter(|entry| entry.deleted_tx.is_none() && entry.lsn > since_lsn)
             {
+                if !self.graph_edge_read_allowed_for_change(
+                    entry.source,
+                    entry.target,
+                    &entry.edge_type,
+                    SnapshotId(entry.lsn.0),
+                ) {
+                    continue;
+                }
                 edges.push(EdgeChange {
                     source: entry.source,
                     target: entry.target,
@@ -5095,11 +5391,14 @@ impl Database {
             return self.persisted_state_since(since_lsn);
         }
 
-        let (ddl, change_entries) = self.with_commit_lock(|| {
+        let (mut ddl, change_entries) = self.with_commit_lock(|| {
             let ddl = self.ddl_log_since_unlocked(since_lsn);
             let changes = self.change_log_since_unlocked(since_lsn);
             (ddl, changes)
         });
+        if !self.access_is_admin() {
+            ddl.clear();
+        }
 
         let mut rows = Vec::new();
         let mut edges = Vec::new();
@@ -5108,7 +5407,11 @@ impl Database {
         for entry in change_entries {
             match entry {
                 ChangeLogEntry::RowInsert { table, row_id, lsn } => {
-                    if let Some((natural_key, values)) = self.row_change_values(&table, row_id, lsn)
+                    let snapshot = self.snapshot_at(lsn);
+                    if let Some(row) = self.row_for_change(&table, row_id, lsn)
+                        && self.row_read_allowed_for_change(&table, &row, snapshot)
+                        && let Some((natural_key, values)) =
+                            self.row_change_values_from_row(&table, &row)
                     {
                         rows.push(RowChange {
                             table,
@@ -5123,8 +5426,18 @@ impl Database {
                     table,
                     natural_key,
                     lsn,
-                    ..
+                    row_id,
                 } => {
+                    let snapshot = self.snapshot_before_lsn(lsn);
+                    if !self.access_is_admin() {
+                        let Some(row) = self.row_visible_at_snapshot(&table, row_id, snapshot)
+                        else {
+                            continue;
+                        };
+                        if !self.row_read_allowed_for_change(&table, &row, snapshot) {
+                            continue;
+                        }
+                    }
                     let mut values = HashMap::new();
                     values.insert("__deleted".to_string(), Value::Bool(true));
                     rows.push(RowChange {
@@ -5141,6 +5454,14 @@ impl Database {
                     edge_type,
                     lsn,
                 } => {
+                    if !self.graph_edge_read_allowed_for_change(
+                        source,
+                        target,
+                        &edge_type,
+                        self.snapshot_at(lsn),
+                    ) {
+                        continue;
+                    }
                     let properties = self
                         .edge_properties(source, target, &edge_type, lsn)
                         .unwrap_or_default();
@@ -5158,6 +5479,14 @@ impl Database {
                     edge_type,
                     lsn,
                 } => {
+                    if !self.graph_edge_read_allowed_for_change(
+                        source,
+                        target,
+                        &edge_type,
+                        self.snapshot_before_lsn(lsn),
+                    ) {
+                        continue;
+                    }
                     let mut properties = HashMap::new();
                     properties.insert("__deleted".to_string(), Value::Bool(true));
                     edges.push(EdgeChange {
@@ -5169,7 +5498,12 @@ impl Database {
                     });
                 }
                 ChangeLogEntry::VectorInsert { index, row_id, lsn } => {
-                    if let Some(vector) = self.vector_for_row_lsn(&index, row_id, lsn) {
+                    if self.row_id_read_allowed_for_change(
+                        &index.table,
+                        row_id,
+                        self.snapshot_at(lsn),
+                    ) && let Some(vector) = self.vector_for_row_lsn(&index, row_id, lsn)
+                    {
                         vectors.push(VectorChange {
                             index,
                             row_id,
@@ -5178,12 +5512,20 @@ impl Database {
                         });
                     }
                 }
-                ChangeLogEntry::VectorDelete { index, row_id, lsn } => vectors.push(VectorChange {
-                    index,
-                    row_id,
-                    vector: Vec::new(),
-                    lsn,
-                }),
+                ChangeLogEntry::VectorDelete { index, row_id, lsn } => {
+                    if self.row_id_read_allowed_for_change(
+                        &index.table,
+                        row_id,
+                        self.snapshot_before_lsn(lsn),
+                    ) {
+                        vectors.push(VectorChange {
+                            index,
+                            row_id,
+                            vector: Vec::new(),
+                            lsn,
+                        });
+                    }
+                }
             }
         }
 
@@ -5367,6 +5709,11 @@ impl Database {
         // acquisition happens for the scope of this call.
         self.relational_store.bump_index_write_lock_count();
         self.plugin.on_sync_pull(&mut changes)?;
+        if !self.access_is_admin() && !changes.ddl.is_empty() {
+            return Err(Error::Other(
+                "sync DDL apply requires an admin database handle".to_string(),
+            ));
+        }
         self.check_disk_budget("sync_pull")?;
         self.preflight_sync_apply_memory(&changes, policies)?;
 
@@ -5387,8 +5734,10 @@ impl Database {
 
         let atomic_mixed_apply = !changes.edges.is_empty() || !changes.vectors.is_empty();
         let mut tx = self.begin();
-        let commit_each_row = !atomic_mixed_apply && changes.rows.len() <= 128;
-        let batch_row_commits = !atomic_mixed_apply && changes.rows.len() > 128;
+        let commit_each_row =
+            self.access_is_admin() && !atomic_mixed_apply && changes.rows.len() <= 128;
+        let batch_row_commits =
+            self.access_is_admin() && !atomic_mixed_apply && changes.rows.len() > 128;
         let mut result = ApplyResult {
             applied_rows: 0,
             skipped_rows: 0,
@@ -6107,7 +6456,7 @@ impl Database {
                     let _ = self.delete_vector(tx, vector.index.clone(), local_row_id);
                 }
                 if let Err(err) =
-                    self.insert_vector_strict(tx, vector.index.clone(), local_row_id, vector.vector)
+                    self.insert_vector(tx, vector.index.clone(), local_row_id, vector.vector)
                 {
                     let _ = self.rollback(tx);
                     return Err(err);
@@ -6120,20 +6469,40 @@ impl Database {
         Ok(result)
     }
 
-    fn row_change_values(
+    fn row_for_change(&self, table: &str, row_id: RowId, lsn: Lsn) -> Option<VersionedRow> {
+        let tables = self.relational_store.tables.read();
+        let rows = tables.get(table)?;
+        rows.iter()
+            .rev()
+            .find(|r| r.row_id == row_id && r.lsn == lsn)
+            .or_else(|| rows.iter().rev().find(|r| r.row_id == row_id))
+            .cloned()
+    }
+
+    fn row_visible_at_snapshot(
         &self,
         table: &str,
         row_id: RowId,
-        lsn: Lsn,
-    ) -> Option<(NaturalKey, HashMap<String, Value>)> {
+        snapshot: SnapshotId,
+    ) -> Option<VersionedRow> {
         let tables = self.relational_store.tables.read();
-        let meta = self.relational_store.table_meta.read();
         let rows = tables.get(table)?;
-        let row = rows
-            .iter()
+        rows.iter()
             .rev()
-            .find(|r| r.row_id == row_id && r.lsn == lsn)
-            .or_else(|| rows.iter().rev().find(|r| r.row_id == row_id))?;
+            .find(|row| row.row_id == row_id && row.visible_at(snapshot))
+            .cloned()
+    }
+
+    fn snapshot_before_lsn(&self, lsn: Lsn) -> SnapshotId {
+        self.snapshot_at(Lsn(lsn.0.saturating_sub(1)))
+    }
+
+    fn row_change_values_from_row(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+    ) -> Option<(NaturalKey, HashMap<String, Value>)> {
+        let meta = self.relational_store.table_meta.read();
         let key_col = meta
             .get(table)
             .and_then(|m| m.natural_key_column.clone())
@@ -6167,6 +6536,62 @@ impl Database {
             },
             values,
         ))
+    }
+
+    fn row_id_for_natural_key(
+        &self,
+        table: &str,
+        key_col: &str,
+        key_value: &Value,
+        snapshot: SnapshotId,
+    ) -> Option<RowId> {
+        self.relational_store
+            .tables
+            .read()
+            .get(table)?
+            .iter()
+            .rev()
+            .find(|row| row.visible_at(snapshot) && row.values.get(key_col) == Some(key_value))
+            .map(|row| row.row_id)
+    }
+
+    fn row_read_allowed_for_change(
+        &self,
+        table: &str,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+    ) -> bool {
+        let Some(meta) = self.table_meta(table) else {
+            return false;
+        };
+        self.read_allowed_for_row(table, &meta, row, snapshot)
+            .unwrap_or(false)
+    }
+
+    fn row_id_read_allowed_for_change(
+        &self,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> bool {
+        let Some(row) = self.row_visible_at_snapshot(table, row_id, snapshot) else {
+            return false;
+        };
+        self.row_read_allowed_for_change(table, &row, snapshot)
+    }
+
+    fn graph_edge_read_allowed_for_change(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+        snapshot: SnapshotId,
+    ) -> bool {
+        self.node_read_allowed(source, snapshot).unwrap_or(false)
+            && self.node_read_allowed(target, snapshot).unwrap_or(false)
+            && self
+                .edge_read_allowed(source, target, edge_type, snapshot)
+                .unwrap_or(false)
     }
 
     fn edge_properties(

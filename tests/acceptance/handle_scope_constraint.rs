@@ -428,9 +428,9 @@ fn t6_04_edge_graph_traversal_excludes_server_only_rows() {
     );
     assert_scope_violation(
         err,
-        "server",
-        &["edge"],
-        "direct insert_edge from edge handle to server-scoped node",
+        "edge",
+        &[],
+        "direct insert_edge from edge handle must enforce endpoint WRITE labels, not only read visibility",
     );
     edge.commit(tx).unwrap();
 
@@ -441,9 +441,9 @@ fn t6_04_edge_graph_traversal_excludes_server_only_rows() {
     );
     assert_scope_violation(
         err,
-        "server",
-        &["edge"],
-        "direct delete_edge from edge handle touching server-scoped node",
+        "edge",
+        &[],
+        "direct delete_edge from edge handle must enforce endpoint WRITE labels, not only read visibility",
     );
     edge.commit(tx).unwrap();
     drop(edge);
@@ -792,15 +792,10 @@ fn t6_09_edge_cannot_flip_label_to_server() {
         "edge handle must not flip a row's label to server",
     );
     p.insert("id".into(), Value::Uuid(Uuid::from_u128(2)));
-    let err = assert_error(
-        edge.execute("DELETE FROM rows WHERE id = $id", &p),
-        "edge handle must not delete a server-labelled row",
-    );
-    assert_scope_violation(
-        err,
-        "server",
-        &["edge"],
-        "edge handle must not delete a server-labelled row",
+    let delete = edge.execute("DELETE FROM rows WHERE id = $id", &p).unwrap();
+    assert_eq!(
+        delete.rows_affected, 0,
+        "DELETE predicate targeting a server-labelled hidden row must behave as no visible match"
     );
     drop(edge);
     let admin = Database::open(&path).unwrap();

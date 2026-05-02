@@ -25,7 +25,15 @@ pub(crate) fn execute_plan(
 ) -> Result<QueryResult> {
     match plan {
         PhysicalPlan::CreateTable(p) => {
+            require_admin_for_create_table(db)?;
             db.check_disk_budget("CREATE TABLE")?;
+            if p.name.eq_ignore_ascii_case("acl_grants")
+                && p.columns.iter().any(|column| column.acl_ref.is_some())
+            {
+                return Err(Error::SchemaInvalid {
+                    reason: "acl_grants cannot itself declare ACL-protected columns".to_string(),
+                });
+            }
             let expires_column = expires_column_name(&p.columns)?;
             // Auto-generate implicit indexes for PK / UNIQUE columns and
             // composite UNIQUE constraints, so constraint probes run at
@@ -160,6 +168,7 @@ pub(crate) fn execute_plan(
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::DropTable(name) => {
+            require_admin_for_ddl(db)?;
             if let Some(block) = rank_policy_drop_table_blocker(db, name) {
                 return Err(block);
             }
@@ -177,6 +186,7 @@ pub(crate) fn execute_plan(
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::AlterTable(p) => {
+            require_admin_for_ddl(db)?;
             db.check_disk_budget("ALTER TABLE")?;
             let store = db.relational_store();
             let mut rewrite_vectors_after_alter = false;
@@ -592,7 +602,19 @@ pub(crate) fn execute_plan(
                         let resolved_filter = resolve_in_subqueries(db, filter_expr, params, tx)?;
                         resolve_graph_start_nodes_from_filter(db, &resolved_filter, params)?
                     } else {
-                        vec![]
+                        let first_step = steps.first().ok_or_else(|| {
+                            Error::PlanError("graph plan missing traversal step".to_string())
+                        })?;
+                        let edge_types_ref = if first_step.edge_types.is_empty() {
+                            None
+                        } else {
+                            Some(first_step.edge_types.as_slice())
+                        };
+                        db.graph_start_nodes_for_match(
+                            edge_types_ref,
+                            first_step.direction,
+                            db.snapshot(),
+                        )?
                     }
                 }
                 Err(err) => return Err(err),
@@ -629,14 +651,25 @@ pub(crate) fn execute_plan(
                     let mut next = Vec::new();
 
                     for (bindings, start, base_depth) in &frontier {
-                        let res = db.graph().bfs(
-                            *start,
-                            edge_types_ref,
-                            step.direction,
-                            step.min_depth,
-                            step.max_depth,
-                            snapshot,
-                        )?;
+                        let res = if db.has_access_constraints_for_query() {
+                            db.query_bfs_gated(
+                                *start,
+                                edge_types_ref,
+                                step.direction,
+                                step.min_depth,
+                                step.max_depth,
+                                snapshot,
+                            )?
+                        } else {
+                            db.graph().bfs(
+                                *start,
+                                edge_types_ref,
+                                step.direction,
+                                step.min_depth,
+                                step.max_depth,
+                                snapshot,
+                            )?
+                        };
                         for node in res.nodes {
                             let total_depth = base_depth.saturating_add(node.depth);
                             let mut next_bindings = bindings.clone();
@@ -1116,8 +1149,14 @@ pub(crate) fn execute_plan(
                 cascade: None,
             })
         }
-        PhysicalPlan::CreateIndex(p) => exec_create_index(db, p),
-        PhysicalPlan::DropIndex(p) => exec_drop_index(db, p),
+        PhysicalPlan::CreateIndex(p) => {
+            require_admin_for_ddl(db)?;
+            exec_create_index(db, p)
+        }
+        PhysicalPlan::DropIndex(p) => {
+            require_admin_for_ddl(db)?;
+            exec_drop_index(db, p)
+        }
         PhysicalPlan::IndexScan {
             table,
             index,
@@ -1390,6 +1429,24 @@ fn eval_query_result_expr(
     }
 }
 
+fn require_admin_for_create_table(db: &Database) -> Result<()> {
+    if db.has_context_or_principal_constraints() {
+        return Err(Error::Other(
+            "DDL requires an admin database handle".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_admin_for_ddl(db: &Database) -> Result<()> {
+    if db.has_access_constraints_for_query() {
+        return Err(Error::Other(
+            "DDL requires an admin database handle".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn exec_insert(
     db: &Database,
     p: &InsertPlan,
@@ -1412,8 +1469,9 @@ fn exec_insert(
 
     // Statement-scoped snapshot of the committed TxId watermark for TXID bound checks.
     let current_tx_max = Some(db.committed_watermark());
-    let route_inserts_to_graph =
-        p.table.eq_ignore_ascii_case("edges") || !insert_meta.dag_edge_types.is_empty();
+    let route_inserts_to_graph = p.table.eq_ignore_ascii_case("edges")
+        || !insert_meta.dag_edge_types.is_empty()
+        || has_edge_columns(&insert_meta);
     let vector_columns = vector_columns_for_meta(&insert_meta);
     let has_insert_completion = insert_meta.columns.iter().any(|column| {
         column.default.is_some()
@@ -1443,6 +1501,7 @@ fn exec_insert(
             if has_insert_completion {
                 apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
             }
+            db.complete_insert_access_values(&p.table, &mut values)?;
             validate_vector_columns(db, &p.table, &values)?;
         }
     }
@@ -1471,6 +1530,7 @@ fn exec_insert(
         if has_insert_completion {
             apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
         }
+        db.complete_insert_access_values(&p.table, &mut values)?;
 
         if !vector_columns.is_empty() {
             validate_vector_columns(db, &p.table, &values)?;
@@ -1642,7 +1702,8 @@ fn exec_delete(
 ) -> Result<QueryResult> {
     let txid = tx.ok_or_else(|| Error::Other("missing tx for delete".to_string()))?;
     let snapshot = db.snapshot();
-    let rows = db.scan(&p.table, snapshot)?;
+    let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
+    let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
     let resolved_where = p
         .where_clause
         .as_ref()
@@ -1656,6 +1717,10 @@ fn exec_delete(
                 .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
         })
         .collect();
+
+    for row in &matched {
+        db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+    }
 
     for row in &matched {
         for index in vector_indexes_for_table(db, &p.table) {
@@ -1683,7 +1748,8 @@ fn exec_update(
     let snapshot = db.snapshot();
     // Use in-tx scan so prior statements in a BEGIN/COMMIT block are visible:
     // the old row must not shadow a previously-updated in-tx row.
-    let rows = db.scan_in_tx(txid, &p.table, snapshot)?;
+    let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
+    let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
     let resolved_where = p
         .where_clause
         .as_ref()
@@ -1700,7 +1766,18 @@ fn exec_update(
 
     let current_tx_max = Some(db.committed_watermark());
 
+    struct PlannedUpdate {
+        row: VersionedRow,
+        values: HashMap<String, Value>,
+        row_uuid: Option<uuid::Uuid>,
+        new_state: Option<String>,
+        assigned_vector_values: Vec<(String, Vec<f32>)>,
+        assigned_vector_columns: HashSet<String>,
+    }
+
+    let mut planned = Vec::with_capacity(matched.len());
     for row in &matched {
+        db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
         let mut values = row.values.clone();
         for (k, vexpr) in &p.assignments {
             let value = eval_assignment_expr(vexpr, &row.values, params)?;
@@ -1720,6 +1797,7 @@ fn exec_update(
             .map(std::borrow::ToOwned::to_owned);
 
         validate_vector_columns(db, &p.table, &values)?;
+        db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
         let assigned_vector_values: Vec<(String, Vec<f32>)> = p
             .assignments
             .iter()
@@ -1732,6 +1810,23 @@ fn exec_update(
             .iter()
             .map(|(column, _)| column.clone())
             .collect();
+        planned.push(PlannedUpdate {
+            row: row.clone(),
+            values,
+            row_uuid,
+            new_state,
+            assigned_vector_values,
+            assigned_vector_columns,
+        });
+    }
+
+    for plan in planned {
+        let row = plan.row;
+        let values = plan.values;
+        let row_uuid = plan.row_uuid;
+        let new_state = plan.new_state;
+        let assigned_vector_values = plan.assigned_vector_values;
+        let assigned_vector_columns = plan.assigned_vector_columns;
         let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
         db.accountant().try_allocate_for(
             new_row_bytes,
@@ -1742,10 +1837,6 @@ fn exec_update(
         let checkpoint = db.write_set_checkpoint(txid)?;
         let mut vector_allocations = Vec::new();
 
-        if let Err(err) = db.delete_row(txid, &p.table, row.row_id) {
-            db.accountant().release(new_row_bytes);
-            return Err(err);
-        }
         for column in &assigned_vector_columns {
             if let Err(err) = db.delete_vector(
                 txid,
@@ -1756,6 +1847,10 @@ fn exec_update(
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
+        }
+        if let Err(err) = db.delete_row(txid, &p.table, row.row_id) {
+            db.accountant().release(new_row_bytes);
+            return Err(err);
         }
 
         let new_row_id = match db.insert_row_replacing(txid, &p.table, values, row.row_id) {
@@ -2682,6 +2777,7 @@ fn execute_index_scan(
         out.retain(|row| !deleted_row_ids.contains(&row.row_id));
         out.extend(overlay.matching_inserts);
     }
+    out = db.filter_rows_for_read(table, out, snapshot)?;
     Ok((out, rows_examined))
 }
 
@@ -4389,6 +4485,12 @@ fn vector_columns_for_meta(meta: &TableMeta) -> Vec<String> {
         .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
         .map(|column| column.name.clone())
         .collect()
+}
+
+fn has_edge_columns(meta: &TableMeta) -> bool {
+    ["source_id", "target_id", "edge_type"]
+        .into_iter()
+        .all(|name| meta.columns.iter().any(|column| column.name == name))
 }
 
 fn vector_values_for_table(
