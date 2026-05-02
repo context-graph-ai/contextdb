@@ -95,6 +95,64 @@ impl<S: WriteSetApplicator> TxManager<S> {
             .map_err(|failure| failure.error)
     }
 
+    pub fn commit_with_reserved_lsn_callback<F, G>(
+        &self,
+        tx: TxId,
+        before_commit: F,
+        prepare: G,
+    ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
+    where
+        F: FnOnce(Lsn) -> Result<()>,
+        G: FnOnce(&WriteSet) -> Result<()>,
+    {
+        let _lock = self.commit_mutex.lock();
+        let reserved_lsn = self.next_lsn.load(Ordering::SeqCst);
+        if let Err(error) = before_commit(reserved_lsn) {
+            return Err(CommitFailure {
+                error,
+                write_set: None,
+            });
+        }
+
+        let mut ws = {
+            let mut active = self.active_txs.lock();
+            active.remove(&tx).ok_or(CommitFailure {
+                error: Error::TxNotFound(tx),
+                write_set: None,
+            })?
+        };
+        ws.canonicalize_final_state();
+        if ws.is_empty() {
+            return Ok((self.current_lsn(), ws));
+        }
+        let visibility_tx = self.visibility_tx_for_commit(tx, ws.visibility_floor);
+        ws.reassign_tx(tx, visibility_tx);
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
+        debug_assert_eq!(lsn, reserved_lsn);
+        ws.stamp_lsn(lsn);
+        if let Err(error) = prepare(&ws) {
+            self.next_lsn.store(lsn, Ordering::SeqCst);
+            return Err(CommitFailure {
+                error,
+                write_set: Some(Box::new(ws)),
+            });
+        }
+
+        let applied_ws = ws.clone();
+        if let Err(error) = self.store.apply(ws) {
+            self.next_lsn.store(lsn, Ordering::SeqCst);
+            return Err(CommitFailure {
+                error,
+                write_set: Some(Box::new(applied_ws)),
+            });
+        }
+        self.commit_index.lock().insert(lsn, visibility_tx);
+        self.committed_watermark
+            .fetch_max(visibility_tx, Ordering::SeqCst);
+        self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+        Ok((lsn, applied_ws))
+    }
+
     pub fn commit_with_lsn_prepared<F>(
         &self,
         tx: TxId,

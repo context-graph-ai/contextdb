@@ -1,6 +1,7 @@
 use crate::common::run_cli_script;
-use contextdb_core::{TxId, Value, VersionedRow};
+use contextdb_core::{ContextId, TxId, Value, VersionedRow};
 use contextdb_engine::{CronAuditKind, Database};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -746,4 +747,143 @@ fn t27_12_registered_callback_error_rolls_back_partial_writes_and_audits() {
         }),
         "callback failure audit entry must persist across reopen; got {persisted:?}"
     );
+}
+
+/// REGRESSION GUARD — schedule DDL is engine-admin only, not scoped-handle mutable.
+#[test]
+fn t27_13_scoped_handle_cannot_create_or_drop_schedule() {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("cron_scoped_ddl.redb");
+    {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute("CREATE SCHEDULE s EVERY '1 SECOND' TX (cb)", &empty())
+            .unwrap();
+        admin.close().unwrap();
+    }
+
+    let scoped =
+        Database::open_with_contexts(&path, BTreeSet::from([ContextId::new(Uuid::from_u128(1))]))
+            .unwrap();
+    let create = scoped.execute("CREATE SCHEDULE scoped EVERY '1 SECOND' TX (cb)", &empty());
+    assert!(
+        create.is_err(),
+        "context-scoped handle must not create engine-wide schedules"
+    );
+    let drop_schedule = scoped.execute("DROP SCHEDULE s", &empty());
+    assert!(
+        drop_schedule.is_err(),
+        "context-scoped handle must not drop engine-wide schedules"
+    );
+    let register = scoped.register_cron_callback("cb", |_| Ok(()));
+    assert!(
+        register.is_err(),
+        "context-scoped handle must not bind engine-wide callbacks"
+    );
+    scoped.close().unwrap();
+}
+
+/// REGRESSION GUARD — callback transaction cannot re-enter DDL or tx control.
+#[test]
+fn t27_14_callback_rejects_nested_ddl_and_transaction_control() {
+    let db = Arc::new(Database::open_memory());
+    let captured_db = Arc::new(Database::open_memory());
+    captured_db
+        .execute("CREATE TABLE captured (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    captured_db.execute("BEGIN", &empty()).unwrap();
+    let mut cached_params = HashMap::new();
+    cached_params.insert("id".into(), Value::Uuid(Uuid::from_u128(0xCAFE)));
+    captured_db
+        .execute("INSERT INTO captured (id) VALUES ($id)", &cached_params)
+        .unwrap();
+    db.execute(
+        "CREATE SCHEDULE s EVERY '500 MILLISECONDS' TX (cb)",
+        &empty(),
+    )
+    .unwrap();
+
+    let captured_outer = captured_db.clone();
+    db.register_cron_callback("cb", move |db_handle| {
+        let ddl = db_handle.execute("CREATE TABLE illegal (id UUID PRIMARY KEY)", &empty());
+        assert!(
+            ddl.is_err(),
+            "cron callback must reject nested DDL instead of deadlocking"
+        );
+        let commit = db_handle.execute("COMMIT", &empty());
+        assert!(
+            commit.is_err(),
+            "cron callback must reject nested transaction control instead of deadlocking"
+        );
+        let explicit_tx = db_handle.execute_in_tx(
+            TxId(999),
+            "CREATE TABLE also_illegal (id UUID PRIMARY KEY)",
+            &empty(),
+        );
+        assert!(
+            explicit_tx.is_err(),
+            "cron callback must reject execute_in_tx instead of re-entering commit locks"
+        );
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::new_v4()));
+        let captured_autocommit =
+            captured_outer.execute("INSERT INTO captured (id) VALUES ($id)", &p);
+        assert!(
+            captured_autocommit.is_err(),
+            "cron callback must reject autocommit writes through captured handles"
+        );
+        let mut direct_values = HashMap::new();
+        direct_values.insert("id".into(), Value::Uuid(Uuid::new_v4()));
+        let captured_direct = captured_outer.insert_row(TxId(1), "captured", direct_values);
+        assert!(
+            captured_direct.is_err(),
+            "cron callback must reject direct tx-bound writes through captured handles"
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    let _pause = db.pause_cron_tickler_for_test();
+    std::thread::sleep(Duration::from_millis(700));
+    let fires = db
+        .cron_run_due_now_for_test()
+        .expect("nested DDL/tx-control rejection must not poison cron");
+    assert_eq!(fires, 1);
+}
+
+/// REGRESSION GUARD — scoped opens load cron state but do not run engine-wide schedules.
+#[test]
+fn t27_15_scoped_open_does_not_start_persisted_tickler() {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped_open_tickler.redb");
+    {
+        let admin = Database::open(&path).unwrap();
+        admin
+            .execute(
+                "CREATE SCHEDULE orphan EVERY '200 MILLISECONDS' TX (missing_cb)",
+                &empty(),
+            )
+            .unwrap();
+        admin.close().unwrap();
+    }
+
+    {
+        let scoped = Database::open_with_contexts(
+            &path,
+            BTreeSet::from([ContextId::new(Uuid::from_u128(1))]),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        scoped.close().unwrap();
+    }
+
+    let admin = Database::open(&path).unwrap();
+    let audit = admin.cron_audit_log_for_test();
+    assert!(
+        audit.is_empty(),
+        "scoped open must not run persisted schedules or write missing-callback audit entries; got {audit:?}"
+    );
+    admin.close().unwrap();
 }

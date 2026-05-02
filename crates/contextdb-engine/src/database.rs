@@ -22,7 +22,9 @@ use contextdb_tx::{TxManager, WriteSetApplicator};
 use contextdb_vector::{HnswGraphStats, HnswIndex, MemVectorExecutor, VectorStore};
 use parking_lot::{Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -40,7 +42,9 @@ const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
 // instead of starting a write that cannot commit cleanly.
 const MIN_DISK_WRITE_HEADROOM_BYTES: u64 = 1024;
 
+mod cron;
 mod gate;
+use cron::CronState;
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -124,14 +128,14 @@ pub struct SearchResult {
     pub rank: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronAuditEntry {
     pub schedule_name: String,
     pub kind: CronAuditKind,
     pub at_lsn: Lsn,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CronAuditKind {
     Fired,
     MissedSkipped,
@@ -139,9 +143,20 @@ pub enum CronAuditKind {
     Failed(String),
 }
 
-#[derive(Debug)]
 pub struct CronPauseGuard {
-    _private: (),
+    cron: Arc<CronState>,
+}
+
+impl std::fmt::Debug for CronPauseGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CronPauseGuard").finish_non_exhaustive()
+    }
+}
+
+impl Drop for CronPauseGuard {
+    fn drop(&mut self) {
+        self.cron.resume_tickler();
+    }
 }
 
 #[derive(Debug)]
@@ -220,6 +235,14 @@ impl QueryResult {
 thread_local! {
     static SNAPSHOT_OVERRIDE: std::cell::RefCell<Option<SnapshotId>> =
         const { std::cell::RefCell::new(None) };
+    static CRON_LSN_OVERRIDE: std::cell::RefCell<Option<Lsn>> =
+        const { std::cell::RefCell::new(None) };
+    static CRON_CALLBACK_TX: std::cell::Cell<Option<TxId>> =
+        const { std::cell::Cell::new(None) };
+    static CRON_CALLBACK_DB: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static CRON_CALLBACK_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -244,9 +267,10 @@ pub struct Database {
     access: AccessConstraints,
     accountant: Arc<MemoryAccountant>,
     conflict_policies: RwLock<ConflictPolicies>,
-    subscriptions: Mutex<SubscriptionState>,
+    subscriptions: Arc<Mutex<SubscriptionState>>,
     pruning_runtime: Mutex<PruningRuntime>,
     pruning_guard: Arc<Mutex<()>>,
+    cron: Arc<CronState>,
     disk_limit: AtomicU64,
     disk_limit_startup_ceiling: AtomicU64,
     sync_watermark: Arc<AtomicLsn>,
@@ -258,6 +282,7 @@ pub struct Database {
     rank_policy_eval_count: AtomicU64,
     rank_policy_formula_parse_count: AtomicU64,
     corrupt_joined_values: RwLock<HashSet<(String, RowId, String)>>,
+    resource_owner: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -581,9 +606,10 @@ impl Database {
             access: AccessConstraints::default(),
             accountant,
             conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
-            subscriptions: Mutex::new(SubscriptionState::new()),
+            subscriptions: Arc::new(Mutex::new(SubscriptionState::new())),
             pruning_runtime: Mutex::new(PruningRuntime::new()),
             pruning_guard: Arc::new(Mutex::new(())),
+            cron: Arc::new(CronState::new()),
             disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
             disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
             sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
@@ -595,6 +621,7 @@ impl Database {
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
             corrupt_joined_values: RwLock::new(HashSet::new()),
+            resource_owner: true,
         }
     }
 
@@ -657,12 +684,30 @@ impl Database {
         scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
         principal: Option<contextdb_core::types::Principal>,
     ) -> Result<Self> {
-        let db = Self::open(path)?;
-        Ok(db.with_access_constraints(AccessConstraints {
+        let access = AccessConstraints {
             contexts,
             scope_labels,
             principal,
-        }))
+        };
+        let path = path.as_ref();
+        let db = if path.as_os_str() == ":memory:" {
+            Self::open_memory_internal(
+                Arc::new(CorePlugin),
+                Arc::new(MemoryAccountant::no_limit()),
+            )?
+        } else {
+            let db = Self::open_loaded(
+                path,
+                Arc::new(CorePlugin),
+                Arc::new(MemoryAccountant::no_limit()),
+                None,
+            )?;
+            db.plugin.on_open()?;
+            db
+        };
+        let db = db.with_access_constraints(access);
+        db.start_cron_tickler_if_schedules_present();
+        Ok(db)
     }
 
     pub fn open_memory_with_constraints(
@@ -838,6 +883,7 @@ impl Database {
 
         db.account_loaded_state()?;
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
+        db.load_cron_state_from_persistence()?;
 
         Ok(db)
     }
@@ -886,16 +932,29 @@ impl Database {
 
     pub fn begin(&self) -> TxId {
         let _operation = self.assert_open_operation();
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            panic!("transaction control is not allowed inside cron callbacks");
+        }
         self.tx_mgr.begin()
     }
 
     pub fn commit(&self, tx: TxId) -> Result<()> {
         let _operation = self.open_operation()?;
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "transaction control is not allowed inside cron callbacks".to_string(),
+            ));
+        }
         self.commit_with_source(tx, CommitSource::User)
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
         let _operation = self.open_operation()?;
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "transaction control is not allowed inside cron callbacks".to_string(),
+            ));
+        }
         let ws = self.tx_mgr.rollback_write_set(tx)?;
         self.release_insert_allocations(&ws);
         Ok(())
@@ -914,6 +973,7 @@ impl Database {
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         let _operation = self.open_operation()?;
         if let Some(cached) = self.cached_statement(sql) {
+            self.assert_statement_allowed_inside_cron_callback(&cached.stmt)?;
             let active_tx = *self.session_tx.lock();
             return self.execute_statement_with_plan(
                 &cached.stmt,
@@ -925,6 +985,7 @@ impl Database {
         }
 
         let stmt = contextdb_parser::parse(sql)?;
+        self.assert_statement_allowed_inside_cron_callback(&stmt)?;
 
         match &stmt {
             Statement::Begin => {
@@ -952,8 +1013,73 @@ impl Database {
             _ => {}
         }
 
+        match &stmt {
+            Statement::CreateSchedule {
+                name,
+                every,
+                callback,
+                missed_tick_policy,
+                catch_up_within_seconds,
+            } => {
+                self.create_cron_schedule(
+                    name,
+                    every,
+                    callback,
+                    missed_tick_policy.as_deref(),
+                    *catch_up_within_seconds,
+                )?;
+                return Ok(QueryResult::empty());
+            }
+            Statement::DropSchedule { name } => {
+                self.drop_cron_schedule(name)?;
+                return Ok(QueryResult::empty());
+            }
+            _ => {}
+        }
+
         let active_tx = *self.session_tx.lock();
         self.execute_statement(&stmt, sql, params, active_tx)
+    }
+
+    fn assert_statement_allowed_inside_cron_callback(&self, stmt: &Statement) -> Result<()> {
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get())
+            && Self::statement_forbidden_inside_cron_callback(stmt)
+        {
+            return Err(Error::Other(
+                "DDL and transaction control are not allowed inside cron callbacks".to_string(),
+            ));
+        }
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get())
+            && Self::statement_requires_cron_bound_handle(stmt)
+        {
+            let active_tx = *self.session_tx.lock();
+            let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
+            let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
+            let this_db = self as *const Self as usize;
+            if active_tx.is_none() || active_tx != cron_tx || cron_db != Some(this_db) {
+                return Err(Error::Other(
+                    "cron callback writes must use the supplied tx-bound database handle"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_cron_callback_tx_bound_handle(&self, tx: TxId) -> Result<()> {
+        if !CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Ok(());
+        }
+        let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
+        let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
+        let this_db = self as *const Self as usize;
+        if cron_tx == Some(tx) && cron_db == Some(this_db) {
+            Ok(())
+        } else {
+            Err(Error::Other(
+                "cron callback writes must use the supplied tx-bound database handle".to_string(),
+            ))
+        }
     }
 
     fn cached_statement(&self, sql: &str) -> Option<Arc<CachedStatement>> {
@@ -985,6 +1111,36 @@ impl Database {
         matches!((stmt, plan), (Statement::Insert(ins), PhysicalPlan::Insert(_))
             if !ins.table.eq_ignore_ascii_case("GRAPH")
                 && !ins.table.eq_ignore_ascii_case("__edges"))
+    }
+
+    fn statement_forbidden_inside_cron_callback(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Begin
+                | Statement::Commit
+                | Statement::Rollback
+                | Statement::CreateTable(_)
+                | Statement::AlterTable(_)
+                | Statement::DropTable(_)
+                | Statement::CreateIndex(_)
+                | Statement::DropIndex(_)
+                | Statement::CreateSchedule { .. }
+                | Statement::DropSchedule { .. }
+                | Statement::CreateEventType { .. }
+                | Statement::CreateSink { .. }
+                | Statement::CreateRoute { .. }
+                | Statement::DropRoute { .. }
+                | Statement::SetMemoryLimit(_)
+                | Statement::SetDiskLimit(_)
+                | Statement::SetSyncConflictPolicy(_)
+        )
+    }
+
+    fn statement_requires_cron_bound_handle(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Delete(_) | Statement::Update(_)
+        )
     }
 
     pub(crate) fn clear_statement_cache(&self) {
@@ -1060,6 +1216,11 @@ impl Database {
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
         let _operation = self.open_operation()?;
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "execute_in_tx is not allowed inside cron callbacks".to_string(),
+            ));
+        }
         let stmt = contextdb_parser::parse(sql)?;
         self.execute_statement(&stmt, sql, params, Some(tx))
     }
@@ -1480,6 +1641,7 @@ impl Database {
         values: HashMap<ColName, Value>,
     ) -> Result<RowId> {
         let _operation = self.open_operation()?;
+        self.assert_cron_callback_tx_bound_handle(tx)?;
         // Statement-scoped bound: `Value::TxId(n)` must satisfy
         // `n <= max(committed_watermark, tx)` so writes inside an active
         // transaction can reference their own allocated TxId. The error,
@@ -1673,6 +1835,7 @@ impl Database {
         mut values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
         let _operation = self.open_operation()?;
+        self.assert_cron_callback_tx_bound_handle(tx)?;
         self.complete_insert_access_values(table, &mut values)?;
         let snapshot = self.snapshot_for_read();
         let existing_row = values
@@ -2572,6 +2735,7 @@ impl Database {
 
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation()?;
+        self.assert_cron_callback_tx_bound_handle(tx)?;
         self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot())?;
         self.relational.delete(tx, table, row_id)
     }
@@ -2712,6 +2876,7 @@ impl Database {
         properties: HashMap<String, Value>,
     ) -> Result<bool> {
         let _operation = self.open_operation()?;
+        self.assert_cron_callback_tx_bound_handle(tx)?;
         let snapshot = self.snapshot();
         self.assert_node_write_allowed(source, snapshot)?;
         self.assert_node_write_allowed(target, snapshot)?;
@@ -2749,6 +2914,7 @@ impl Database {
         edge_type: &str,
     ) -> Result<()> {
         let _operation = self.open_operation()?;
+        self.assert_cron_callback_tx_bound_handle(tx)?;
         let snapshot = self.snapshot();
         self.assert_node_write_allowed(source, snapshot)?;
         self.assert_node_write_allowed(target, snapshot)?;
@@ -2847,6 +3013,7 @@ impl Database {
         vector: Vec<f32>,
     ) -> Result<()> {
         let _operation = self.open_operation()?;
+        self.assert_cron_callback_tx_bound_handle(tx)?;
         self.vector_store.state(&index)?;
         self.assert_existing_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         if let Some(expected) = self.pending_vector_dimension(tx, &index)?
@@ -2954,6 +3121,7 @@ impl Database {
 
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation()?;
+        self.assert_cron_callback_tx_bound_handle(tx)?;
         self.vector_store.state(&index)?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         let existing_live = self
@@ -4008,6 +4176,11 @@ impl Database {
 
     pub fn close(&self) -> Result<()> {
         let db_id = self as *const Self as usize;
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "cannot close database from inside a cron callback".to_string(),
+            ));
+        }
         if DB_OPERATION_STACK.with(|stack| stack.borrow().contains(&db_id)) {
             return Err(Error::Other(
                 "cannot close database from inside an active operation".to_string(),
@@ -4024,12 +4197,15 @@ impl Database {
             }
             let _ = self.tx_mgr.rollback(tx);
         }
+        self.stop_cron_tickler();
         self.stop_pruning_thread();
-        self.subscriptions.lock().subscribers.clear();
-        if let Some(persistence) = &self.persistence {
-            persistence.close();
+        if self.resource_owner {
+            self.subscriptions.lock().subscribers.clear();
+            if let Some(persistence) = &self.persistence {
+                persistence.close();
+            }
+            self.release_open_registry();
         }
-        self.release_open_registry();
         self.plugin.on_close()
     }
 
@@ -4069,6 +4245,7 @@ impl Database {
     ) -> Result<Self> {
         let db = Self::open_loaded(path, plugin, Arc::new(MemoryAccountant::no_limit()), None)?;
         db.plugin.on_open()?;
+        db.start_cron_tickler_if_schedules_present();
         Ok(db)
     }
 
@@ -4093,6 +4270,7 @@ impl Database {
         }
         let db = Self::open_loaded(path, plugin, accountant, startup_disk_limit)?;
         db.plugin.on_open()?;
+        db.start_cron_tickler_if_schedules_present();
         Ok(db)
     }
 
@@ -5587,6 +5765,9 @@ impl Database {
     /// Returns the current LSN of this database.
     pub fn current_lsn(&self) -> Lsn {
         let _operation = self.assert_open_operation();
+        if let Some(lsn) = CRON_LSN_OVERRIDE.with(|slot| *slot.borrow()) {
+            return lsn;
+        }
         self.tx_mgr.current_lsn()
     }
 
@@ -5602,35 +5783,11 @@ impl Database {
         self.tx_mgr.peek_next_tx()
     }
 
-    pub fn register_cron_callback<F>(&self, name: &str, callback: F) -> Result<()>
-    where
-        F: Fn(&Database) -> Result<()> + Send + Sync + 'static,
-    {
-        let _operation = self.open_operation()?;
-        let _ = (name, callback);
-        Ok(())
-    }
-
-    pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
-        let _operation = self.open_operation()?;
-        Ok(0)
-    }
-
-    pub fn pause_cron_tickler_for_test(&self) -> CronPauseGuard {
-        let _operation = self.assert_open_operation();
-        CronPauseGuard { _private: () }
-    }
-
     pub fn pause_after_relational_apply_for_test(&self) -> ApplyPhasePauseGuard {
         let _operation = self.assert_open_operation();
         let inner = self.apply_phase_pause.clone();
         let generation = inner.arm();
         ApplyPhasePauseGuard { inner, generation }
-    }
-
-    pub fn cron_audit_log_for_test(&self) -> Vec<CronAuditEntry> {
-        let _operation = self.assert_open_operation();
-        Vec::new()
     }
 
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
@@ -5703,6 +5860,11 @@ impl Database {
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
         let _operation = self.open_operation()?;
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "apply_changes is not allowed inside cron callbacks".to_string(),
+            ));
+        }
         // Per I14: the whole batch takes the index-maintenance lock once.
         // Per-row commits reuse the same guard via the per-row apply that
         // runs inside the tx manager's commit_mutex, so no second write
@@ -6893,16 +7055,19 @@ impl Drop for Database {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.stop_cron_tickler();
         let runtime = self.pruning_runtime.get_mut();
         runtime.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = runtime.handle.take() {
             let _ = handle.join();
         }
-        self.subscriptions.lock().subscribers.clear();
-        if let Some(persistence) = &self.persistence {
-            persistence.close();
+        if self.resource_owner {
+            self.subscriptions.lock().subscribers.clear();
+            if let Some(persistence) = &self.persistence {
+                persistence.close();
+            }
+            self.release_open_registry();
         }
-        self.release_open_registry();
     }
 }
 
