@@ -1,5 +1,5 @@
 use crate::database::Database;
-use contextdb_core::{Error, Result, Value};
+use contextdb_core::{ColumnType, Error, Result, Value};
 use contextdb_parser::ast::{Expr, Literal};
 use contextdb_planner::PhysicalPlan;
 use std::collections::HashMap;
@@ -88,6 +88,9 @@ pub fn validate_dml(
                     .iter()
                     .filter(|column| !column.nullable && !column.primary_key)
                 {
+                    if matches!(column.column_type, ColumnType::TxId) {
+                        continue;
+                    }
                     if let Some(index) = columns.iter().position(|name| name == &column.name) {
                         let value = row
                             .get(index)

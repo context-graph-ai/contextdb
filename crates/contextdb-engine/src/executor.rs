@@ -1415,10 +1415,10 @@ fn exec_insert(
     let route_inserts_to_graph =
         p.table.eq_ignore_ascii_case("edges") || !insert_meta.dag_edge_types.is_empty();
     let vector_columns = vector_columns_for_meta(&insert_meta);
-    let has_column_defaults = insert_meta
-        .columns
-        .iter()
-        .any(|column| column.default.is_some());
+    let has_insert_completion = insert_meta.columns.iter().any(|column| {
+        column.default.is_some()
+            || (!column.nullable && matches!(column.column_type, ColumnType::TxId))
+    });
 
     if !vector_columns.is_empty() {
         for row in &p.values {
@@ -1430,7 +1430,7 @@ fn exec_insert(
                 let v = resolve_expr(expr, params)?;
                 values.insert(
                     col.clone(),
-                    coerce_value_for_column_with_meta(
+                    coerce_insert_value_for_column_with_meta(
                         &p.table,
                         &insert_meta,
                         col,
@@ -1440,7 +1440,7 @@ fn exec_insert(
                     )?,
                 );
             }
-            if has_column_defaults {
+            if has_insert_completion {
                 apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
             }
             validate_vector_columns(db, &p.table, &values)?;
@@ -1457,7 +1457,7 @@ fn exec_insert(
             let v = resolve_expr(expr, params)?;
             values.insert(
                 col.clone(),
-                coerce_value_for_column_with_meta(
+                coerce_insert_value_for_column_with_meta(
                     &p.table,
                     &insert_meta,
                     col,
@@ -1468,7 +1468,7 @@ fn exec_insert(
             );
         }
 
-        if has_column_defaults {
+        if has_insert_completion {
             apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
         }
 
@@ -4559,6 +4559,31 @@ fn coerce_value_for_column_with_meta(
     }
 }
 
+fn coerce_insert_value_for_column_with_meta(
+    table: &str,
+    meta: &TableMeta,
+    col_name: &str,
+    v: Value,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
+    let should_auto_stamp_null = meta
+        .columns
+        .iter()
+        .find(|column| column.name == col_name)
+        .is_some_and(|column| {
+            !column.nullable
+                && matches!(column.column_type, contextdb_core::ColumnType::TxId)
+                && matches!(&v, Value::Null)
+        });
+    if should_auto_stamp_null {
+        let tx = active_tx.ok_or_else(|| Error::Other("missing active tx".to_string()))?;
+        return Ok(Value::TxId(tx));
+    }
+
+    coerce_value_for_column_with_meta(table, meta, col_name, v, current_tx_max, active_tx)
+}
+
 fn format_vector_type(dim: usize) -> &'static str {
     // We need &'static str for the error variant. Fall back to a lookup for common dims.
     match dim {
@@ -4749,6 +4774,14 @@ fn apply_missing_column_defaults(
     let current_tx_max = Some(db.committed_watermark());
 
     for column in &meta.columns {
+        if !column.nullable && matches!(column.column_type, ColumnType::TxId) {
+            if matches!(values.get(&column.name), None | Some(Value::Null)) {
+                let tx = active_tx.ok_or_else(|| Error::Other("missing active tx".to_string()))?;
+                values.insert(column.name.clone(), Value::TxId(tx));
+            }
+            continue;
+        }
+
         if values.contains_key(&column.name) {
             continue;
         }
