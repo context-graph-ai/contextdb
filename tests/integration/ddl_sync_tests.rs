@@ -128,7 +128,12 @@ fn ds02_ddl_in_changeset_after_reopen() {
         }
         DdlChange::DropTable { .. } => unreachable!(),
         DdlChange::AlterTable { .. } => unreachable!(),
-        DdlChange::CreateIndex { .. } | DdlChange::DropIndex { .. } => unreachable!(),
+        DdlChange::CreateIndex { .. }
+        | DdlChange::DropIndex { .. }
+        | DdlChange::CreateEventType { .. }
+        | DdlChange::CreateSink { .. }
+        | DdlChange::CreateRoute { .. }
+        | DdlChange::DropRoute { .. } => unreachable!(),
     }
     let workflows_ddl = cs
         .ddl
@@ -152,7 +157,12 @@ fn ds02_ddl_in_changeset_after_reopen() {
         }
         DdlChange::DropTable { .. } => unreachable!(),
         DdlChange::AlterTable { .. } => unreachable!(),
-        DdlChange::CreateIndex { .. } | DdlChange::DropIndex { .. } => unreachable!(),
+        DdlChange::CreateIndex { .. }
+        | DdlChange::DropIndex { .. }
+        | DdlChange::CreateEventType { .. }
+        | DdlChange::CreateSink { .. }
+        | DdlChange::CreateRoute { .. }
+        | DdlChange::DropRoute { .. } => unreachable!(),
     }
 }
 

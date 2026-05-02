@@ -1,11 +1,12 @@
 use crate::composite_store::ChangeLogEntry;
+use crate::database::event_bus::{EventBusPersistenceCommit, PreparedSinkEvent, SinkQueueEntry};
 use crate::sync_types::DdlChange;
 use contextdb_core::{
     AdjEntry, ColumnType, Error, Lsn, Result, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
     VectorQuantization, VersionedRow,
 };
 use contextdb_tx::WriteSet;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -22,6 +23,7 @@ const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config"
 const CHANGE_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("change_log");
 const DDL_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ddl_log");
 const COMMIT_INDEX_TABLE: TableDefinition<u64, u64> = TableDefinition::new("commit_index");
+const SINK_AUDIT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("__sink_audit");
 const GRAPH_FWD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_fwd");
 const GRAPH_REV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_rev");
 const VECTORS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_entries");
@@ -58,6 +60,17 @@ struct PersistedVectorEntry {
     created_tx: contextdb_core::TxId,
     deleted_tx: Option<contextdb_core::TxId>,
     lsn: Lsn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SinkAuditEntry {
+    lsn: Lsn,
+    kind: SinkAuditKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum SinkAuditKind {
+    QueueOverflow { sink: String, dropped_count: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +403,17 @@ impl RedbPersistence {
     }
 
     pub fn flush_data_with_logs(&self, ws: &WriteSet, change_log: &[ChangeLogEntry]) -> Result<()> {
+        self.flush_data_with_logs_and_sink_events(ws, change_log, &[], None, usize::MAX)
+    }
+
+    pub(crate) fn flush_data_with_logs_and_sink_events(
+        &self,
+        ws: &WriteSet,
+        change_log: &[ChangeLogEntry],
+        sink_events: &[PreparedSinkEvent],
+        event_bus_ddl: Option<&EventBusPersistenceCommit>,
+        max_sink_queue_depth: usize,
+    ) -> Result<()> {
         let table_meta = self.load_all_table_meta()?;
         let vector_quantization = Self::vector_quantization_map(&table_meta);
         self.with_db(|db| {
@@ -595,6 +619,92 @@ impl RedbPersistence {
                 }
             }
 
+            if !sink_events.is_empty() {
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut overflow_audits = Vec::new();
+                let mut by_sink: BTreeMap<&str, Vec<(usize, &SinkQueueEntry)>> = BTreeMap::new();
+                for (index, (sink, entry)) in sink_events.iter().enumerate() {
+                    by_sink
+                        .entry(sink.as_str())
+                        .or_default()
+                        .push((index, entry));
+                }
+                for (sink, entries) in by_sink {
+                    let table_name = Self::sink_queue_table_name(sink);
+                    let table_def: TableDefinition<u64, &[u8]> =
+                        TableDefinition::new(table_name.as_str());
+                    let mut table = write_txn
+                        .open_table(table_def)
+                        .map_err(Self::storage_error)?;
+                    let mut existing = table.len().map_err(Self::storage_error)? as usize;
+                    for (index, entry) in entries {
+                        let overflow_id = if existing >= max_sink_queue_depth {
+                            table
+                                .first()
+                                .map_err(Self::storage_error)?
+                                .map(|(key, _)| key.value())
+                        } else {
+                            None
+                        };
+                        if let Some(id) = overflow_id {
+                            table.remove(id).map_err(Self::storage_error)?;
+                            existing = existing.saturating_sub(1);
+                            overflow_audits.push((index, sink.to_string()));
+                        }
+                        let encoded = Self::encode(entry)?;
+                        table
+                            .insert(entry.id, encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        existing = existing.saturating_add(1);
+                    }
+                }
+                if !overflow_audits.is_empty() {
+                    let mut audit_table = write_txn
+                        .open_table(SINK_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (index, sink) in overflow_audits {
+                        let key = Self::sink_audit_key(lsn, index, &sink);
+                        let audit = SinkAuditEntry {
+                            lsn,
+                            kind: SinkAuditKind::QueueOverflow {
+                                sink,
+                                dropped_count: 1,
+                            },
+                        };
+                        let encoded = Self::encode(&audit)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+
+            if let Some(event_bus_ddl) = event_bus_ddl {
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (key, encoded) in &event_bus_ddl.config_values {
+                        config_table
+                            .insert(*key, encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+                if !event_bus_ddl.ddl.is_empty() {
+                    let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                    let mut ddl_table = write_txn
+                        .open_table(DDL_LOG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (index, change) in event_bus_ddl.ddl.iter().enumerate() {
+                        let key = Self::ddl_log_key_for_index(lsn, index, event_bus_ddl.ddl.len());
+                        let encoded = Self::encode(change)?;
+                        ddl_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -651,6 +761,63 @@ impl RedbPersistence {
         })
     }
 
+    pub(crate) fn encode_config_value<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+        Self::encode(value)
+    }
+
+    pub fn flush_encoded_config_values_and_append_ddl_log(
+        &self,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+    ) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn flush_encoded_config_values(&self, config_values: Vec<(&str, Vec<u8>)>) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
     pub fn remove_config_value(&self, key: &str) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
@@ -659,6 +826,80 @@ impl RedbPersistence {
                     .open_table(CONFIG_TABLE)
                     .map_err(Self::storage_error)?;
                 config_table.remove(key).map_err(Self::storage_error)?;
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn load_sink_queue<T: serde::de::DeserializeOwned>(&self, sink: &str) -> Result<Vec<T>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table_name = Self::sink_queue_table_name(sink);
+            let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(table_name.as_str());
+            let table = match read_txn.open_table(table_def) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let mut entries = Vec::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (_, value) = entry.map_err(Self::storage_error)?;
+                entries.push(Self::decode(value.value())?);
+            }
+            Ok(entries)
+        })
+    }
+
+    pub fn update_sink_queue_entry<T: serde::Serialize>(
+        &self,
+        sink: &str,
+        remove_id: Option<u64>,
+        put: Option<(u64, &T)>,
+    ) -> Result<()> {
+        if remove_id.is_none() && put.is_none() {
+            return Ok(());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let table_name = Self::sink_queue_table_name(sink);
+                let table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+                if let Some(id) = remove_id {
+                    table.remove(id).map_err(Self::storage_error)?;
+                }
+                if let Some((id, entry)) = put {
+                    let encoded = Self::encode(entry)?;
+                    table
+                        .insert(id, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_sink_queue_entries(&self, sink: &str, remove_ids: &[u64]) -> Result<()> {
+        if remove_ids.is_empty() {
+            return Ok(());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let table_name = Self::sink_queue_table_name(sink);
+                let table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+                for id in remove_ids {
+                    table.remove(*id).map_err(Self::storage_error)?;
+                }
             }
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -966,8 +1207,11 @@ impl RedbPersistence {
             let mut entries = Vec::new();
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (key, value) = entry.map_err(Self::storage_error)?;
+                let key = key.value();
                 let lsn = key
-                    .value()
+                    .split_once(':')
+                    .map(|(lsn, _)| lsn)
+                    .unwrap_or(key)
                     .parse::<u64>()
                     .map_err(|err| Error::Other(format!("invalid ddl log key: {err}")))?;
                 entries.push((Lsn(lsn), Self::decode(value.value())?));
@@ -1210,6 +1454,14 @@ impl RedbPersistence {
         format!("rel_{name}")
     }
 
+    fn sink_queue_table_name(sink: &str) -> String {
+        format!("__sink_queue_{sink}")
+    }
+
+    fn sink_audit_key(lsn: Lsn, index: usize, sink: &str) -> String {
+        format!("{:020}:{index:06}:{sink}", lsn.0)
+    }
+
     fn rel_row_key(row: &VersionedRow) -> Vec<u8> {
         let mut key = Vec::with_capacity(24);
         key.extend_from_slice(&row.row_id.0.to_be_bytes());
@@ -1228,6 +1480,14 @@ impl RedbPersistence {
 
     fn ddl_log_key(lsn: Lsn) -> String {
         format!("{:020}", lsn.0)
+    }
+
+    fn ddl_log_key_for_index(lsn: Lsn, index: usize, count: usize) -> String {
+        if count <= 1 {
+            Self::ddl_log_key(lsn)
+        } else {
+            format!("{:020}:{index:06}", lsn.0)
+        }
     }
 
     fn graph_fwd_key(entry: &AdjEntry) -> Vec<u8> {

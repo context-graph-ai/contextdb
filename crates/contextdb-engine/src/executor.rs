@@ -181,6 +181,7 @@ pub(crate) fn execute_plan(
             db.persist_vectors()?;
             db.persist_graph_edges()?;
             db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn))?;
+            db.remove_event_bus_definitions_for_table(name)?;
             db.accountant().release(bytes_to_release);
             db.clear_statement_cache();
             Ok(QueryResult::empty_with_affected(0))

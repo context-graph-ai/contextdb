@@ -31,6 +31,18 @@ impl ChangeSet {
                 .unwrap_or(SyncDirection::Both);
             include.contains(&dir)
         };
+        let include_event_table =
+            |table: &str| directions.is_empty() || (!table.is_empty() && include_dir(table));
+        let included_route_sinks = self
+            .ddl
+            .iter()
+            .filter_map(|d| match d {
+                DdlChange::CreateRoute { table, sink, .. } if include_event_table(table) => {
+                    Some(sink.clone())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
 
         ChangeSet {
             rows: self
@@ -55,6 +67,12 @@ impl ChangeSet {
                     DdlChange::AlterTable { name, .. } => include_dir(name),
                     DdlChange::CreateIndex { table, .. } => include_dir(table),
                     DdlChange::DropIndex { table, .. } => include_dir(table),
+                    DdlChange::CreateEventType { table, .. } => include_event_table(table),
+                    DdlChange::CreateSink { name, .. } => {
+                        directions.is_empty() || included_route_sinks.contains(name)
+                    }
+                    DdlChange::CreateRoute { table, .. } => include_event_table(table),
+                    DdlChange::DropRoute { table, .. } => include_event_table(table),
                 })
                 .cloned()
                 .collect(),
@@ -111,6 +129,29 @@ pub enum DdlChange {
     DropIndex {
         table: String,
         name: String,
+    },
+    CreateEventType {
+        name: String,
+        trigger: String,
+        table: String,
+    },
+    CreateSink {
+        name: String,
+        sink_type: String,
+        url: Option<String>,
+    },
+    CreateRoute {
+        name: String,
+        event_type: String,
+        sink: String,
+        #[serde(default)]
+        table: String,
+        where_in: Option<(String, Vec<String>)>,
+    },
+    DropRoute {
+        name: String,
+        #[serde(default)]
+        table: String,
     },
 }
 

@@ -174,6 +174,29 @@ pub enum WireDdlChange {
         table: String,
         name: String,
     },
+    CreateEventType {
+        name: String,
+        trigger: String,
+        table: String,
+    },
+    CreateSink {
+        name: String,
+        sink_type: String,
+        url: Option<String>,
+    },
+    CreateRoute {
+        name: String,
+        event_type: String,
+        sink: String,
+        #[serde(default)]
+        table: String,
+        where_in: Option<(String, Vec<String>)>,
+    },
+    DropRoute {
+        name: String,
+        #[serde(default)]
+        table: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -364,6 +387,38 @@ impl From<DdlChange> for WireDdlChange {
                 }
             }
             DdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
+            DdlChange::CreateEventType {
+                name,
+                trigger,
+                table,
+            } => Self::CreateEventType {
+                name,
+                trigger,
+                table,
+            },
+            DdlChange::CreateSink {
+                name,
+                sink_type,
+                url,
+            } => Self::CreateSink {
+                name,
+                sink_type,
+                url,
+            },
+            DdlChange::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            } => Self::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            },
+            DdlChange::DropRoute { name, table } => Self::DropRoute { name, table },
         }
     }
 }
@@ -413,6 +468,38 @@ impl From<WireDdlChange> for DdlChange {
                 }
             }
             WireDdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
+            WireDdlChange::CreateEventType {
+                name,
+                trigger,
+                table,
+            } => Self::CreateEventType {
+                name,
+                trigger,
+                table,
+            },
+            WireDdlChange::CreateSink {
+                name,
+                sink_type,
+                url,
+            } => Self::CreateSink {
+                name,
+                sink_type,
+                url,
+            },
+            WireDdlChange::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            } => Self::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            },
+            WireDdlChange::DropRoute { name, table } => Self::DropRoute { name, table },
         }
     }
 }

@@ -387,6 +387,10 @@ impl DatabasePlugin for DdlVetoPlugin {
             DdlChange::AlterTable { .. } => "AlterTable",
             DdlChange::CreateIndex { .. } => "CreateIndex",
             DdlChange::DropIndex { .. } => "DropIndex",
+            DdlChange::CreateEventType { .. } => "CreateEventType",
+            DdlChange::CreateSink { .. } => "CreateSink",
+            DdlChange::CreateRoute { .. } => "CreateRoute",
+            DdlChange::DropRoute { .. } => "DropRoute",
         };
         if variant_name == self.reject_variant {
             Err(Error::PluginRejected {
@@ -1138,6 +1142,48 @@ fn p18_post_query_success_outcome() {
     assert!(select_pq.is_some(), "post_query must fire for SELECT");
     assert!(
         matches!(&select_pq.unwrap().1, QueryOutcome::Success { row_count } if *row_count == 1)
+    );
+}
+
+#[test]
+fn p18b_event_bus_ddl_follows_query_ddl_post_query_lifecycle() {
+    let (plugin, events) = CapturingPlugin::new();
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let p = HashMap::new();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT)",
+        &p,
+    )
+    .unwrap();
+    events.lock().unwrap().clear();
+
+    db.execute(
+        "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+        &p,
+    )
+    .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &p).unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &p)
+        .unwrap();
+
+    let ev = events.lock().unwrap();
+    let on_query_count = ev
+        .iter()
+        .filter(|event| matches!(event, HookEvent::OnQuery(_)))
+        .count();
+    let on_ddl_count = ev
+        .iter()
+        .filter(|event| matches!(event, HookEvent::OnDdl(_)))
+        .count();
+    let post_query_count = ev
+        .iter()
+        .filter(|event| matches!(event, HookEvent::PostQuery(_, QueryOutcome::Success { .. })))
+        .count();
+    assert_eq!(on_query_count, 3, "EventBus DDL must fire on_query");
+    assert_eq!(on_ddl_count, 3, "EventBus DDL must fire on_ddl");
+    assert_eq!(
+        post_query_count, 3,
+        "EventBus DDL must fire successful post_query"
     );
 }
 

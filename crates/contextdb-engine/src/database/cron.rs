@@ -462,6 +462,7 @@ impl Database {
     fn run_cron_callback_transaction(&self, callback: CronCallback) -> Result<Lsn> {
         let _callback_thread = self.cron.enter_callback_thread_scope();
         let tx = self.begin();
+        let mut pending_sink_events = Vec::new();
         let result = self.tx_mgr.commit_with_reserved_lsn_callback(
             tx,
             |reserved_lsn| {
@@ -490,6 +491,13 @@ impl Database {
                 if !ws.is_empty() {
                     self.validate_foreign_keys_in_write_set(ws)?;
                     self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
+                    pending_sink_events = self.prepare_sink_events_for_write_set(ws)?;
+                    if self.persistence.is_some()
+                        && let Some(lsn) = ws.commit_lsn
+                    {
+                        self.event_bus
+                            .stage_sink_events_for_persistence(lsn, pending_sink_events.clone());
+                    }
                 }
                 Ok(())
             },
@@ -500,11 +508,15 @@ impl Database {
                 if !ws.is_empty() {
                     self.release_delete_allocations(&ws);
                     self.plugin.post_commit(&ws, CommitSource::AutoCommit);
+                    self.publish_prepared_sink_events_to_memory(pending_sink_events);
                     self.publish_commit_event_if_subscribers(&ws, CommitSource::AutoCommit, lsn);
                 }
                 Ok(lsn)
             }
             Err(failure) => {
+                if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
+                    self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                }
                 if let Some(ws) = failure.write_set {
                     self.release_insert_allocations(&ws);
                 } else {
@@ -590,6 +602,8 @@ impl Database {
             pruning_runtime: Mutex::new(PruningRuntime::new()),
             pruning_guard: self.pruning_guard.clone(),
             cron: self.cron.clone(),
+            event_bus: self.event_bus.clone(),
+            pending_event_bus_ddl: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
             disk_limit_startup_ceiling: AtomicU64::new(
                 self.disk_limit_startup_ceiling.load(Ordering::SeqCst),

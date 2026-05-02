@@ -161,6 +161,19 @@ impl<S: WriteSetApplicator> TxManager<S> {
     where
         F: FnOnce(&WriteSet) -> Result<()>,
     {
+        self.commit_with_lsn_prepared_and_applied(tx, prepare, |_, _| {})
+    }
+
+    pub fn commit_with_lsn_prepared_and_applied<F, G>(
+        &self,
+        tx: TxId,
+        prepare: F,
+        after_apply: G,
+    ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
+    where
+        F: FnOnce(&WriteSet) -> Result<()>,
+        G: FnOnce(Lsn, &WriteSet),
+    {
         let _lock = self.commit_mutex.lock();
         let mut ws = {
             let mut active = self.active_txs.lock();
@@ -197,6 +210,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
         self.committed_watermark
             .fetch_max(visibility_tx, Ordering::SeqCst);
         self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
+        after_apply(lsn, &applied_ws);
         Ok((lsn, applied_ws))
     }
 

@@ -43,8 +43,10 @@ const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
 const MIN_DISK_WRITE_HEADROOM_BYTES: u64 = 1024;
 
 mod cron;
-mod gate;
+pub(crate) mod event_bus;
+pub(crate) mod gate;
 use cron::CronState;
+use event_bus::EventBusState;
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -181,7 +183,7 @@ impl Drop for ApplyPhasePauseGuard {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SinkEvent {
     pub event_type: String,
     pub table: String,
@@ -271,6 +273,8 @@ pub struct Database {
     pruning_runtime: Mutex<PruningRuntime>,
     pruning_guard: Arc<Mutex<()>>,
     cron: Arc<CronState>,
+    event_bus: Arc<EventBusState>,
+    pending_event_bus_ddl: Mutex<HashMap<TxId, Vec<DdlChange>>>,
     disk_limit: AtomicU64,
     disk_limit_startup_ceiling: AtomicU64,
     sync_watermark: Arc<AtomicLsn>,
@@ -580,6 +584,7 @@ impl Database {
         accountant: Arc<MemoryAccountant>,
         disk_limit: Option<u64>,
         disk_limit_startup_ceiling: Option<u64>,
+        event_bus: Arc<EventBusState>,
     ) -> Self {
         Self {
             tx_mgr: tx_mgr.clone(),
@@ -610,6 +615,8 @@ impl Database {
             pruning_runtime: Mutex::new(PruningRuntime::new()),
             pruning_guard: Arc::new(Mutex::new(())),
             cron: Arc::new(CronState::new()),
+            event_bus,
+            pending_event_bus_ddl: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
             disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
             sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
@@ -847,7 +854,9 @@ impl Database {
             accountant.clone(),
             apply_phase_pause.clone(),
         );
-        let persistent = PersistentCompositeStore::new(composite, persistence.clone());
+        let event_bus = Arc::new(EventBusState::new());
+        let persistent =
+            PersistentCompositeStore::new(composite, persistence.clone(), Some(event_bus.clone()));
         let store: DynStore = Box::new(persistent);
         let tx_mgr = Arc::new(TxManager::new_with_counters_and_commit_index(
             store,
@@ -872,6 +881,7 @@ impl Database {
             accountant,
             effective_disk_limit,
             startup_disk_ceiling,
+            event_bus,
         );
 
         for meta in all_meta.values() {
@@ -884,6 +894,7 @@ impl Database {
         db.account_loaded_state()?;
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         db.load_cron_state_from_persistence()?;
+        db.load_event_bus_state_from_persistence()?;
 
         Ok(db)
     }
@@ -909,6 +920,7 @@ impl Database {
             apply_phase_pause.clone(),
         ));
         let tx_mgr = Arc::new(TxManager::new(store));
+        let event_bus = Arc::new(EventBusState::new());
 
         let db = Self::build_db(
             tx_mgr,
@@ -925,6 +937,7 @@ impl Database {
             accountant,
             None,
             None,
+            event_bus,
         );
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         Ok(db)
@@ -973,6 +986,7 @@ impl Database {
             ));
         }
         let ws = self.tx_mgr.rollback_write_set(tx)?;
+        self.pending_event_bus_ddl.lock().remove(&tx);
         self.release_insert_allocations(&ws);
         Ok(())
     }
@@ -1278,15 +1292,49 @@ impl Database {
     }
 
     fn commit_with_source(&self, tx: TxId, source: CommitSource) -> Result<()> {
-        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_prepared(tx, |ws| {
-            if !ws.is_empty() {
-                self.validate_foreign_keys_in_write_set(ws)?;
-                self.plugin.pre_commit(ws, source)?;
-            }
-            Ok(())
-        }) {
+        let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
+        self.commit_with_source_and_event_bus_ddl(tx, source, &event_bus_ddl)
+    }
+
+    fn commit_with_source_and_event_bus_ddl(
+        &self,
+        tx: TxId,
+        source: CommitSource,
+        event_bus_ddl: &[DdlChange],
+    ) -> Result<()> {
+        let mut pending_sink_events = Vec::new();
+        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_prepared_and_applied(
+            tx,
+            |ws| {
+                if !ws.is_empty() {
+                    self.validate_foreign_keys_in_write_set(ws)?;
+                    if let Some(lsn) = ws.commit_lsn {
+                        self.stage_event_bus_ddl_for_commit(lsn, event_bus_ddl)?;
+                    }
+                    self.plugin.pre_commit(ws, source)?;
+                    pending_sink_events = self
+                        .prepare_sink_events_for_write_set_with_event_bus_ddl(ws, event_bus_ddl)?;
+                    if self.persistence.is_some()
+                        && let Some(lsn) = ws.commit_lsn
+                    {
+                        self.event_bus
+                            .stage_sink_events_for_persistence(lsn, pending_sink_events.clone());
+                    }
+                }
+                Ok(())
+            },
+            |lsn, ws| {
+                if !ws.is_empty() {
+                    self.publish_staged_event_bus_ddl_commit(lsn);
+                }
+            },
+        ) {
             Ok(committed) => committed,
             Err(failure) => {
+                if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
+                    self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                    self.discard_staged_event_bus_ddl_commit(lsn);
+                }
                 if let Some(ws) = &failure.write_set {
                     self.release_insert_allocations(ws);
                 }
@@ -1297,7 +1345,10 @@ impl Database {
         if !ws.is_empty() {
             self.release_delete_allocations(&ws);
             self.plugin.post_commit(&ws, source);
+            self.publish_prepared_sink_events_to_memory(pending_sink_events);
             self.publish_commit_event_if_subscribers(&ws, source, lsn);
+        } else if !event_bus_ddl.is_empty() {
+            self.apply_event_bus_ddl_batch(event_bus_ddl.to_vec())?;
         }
 
         Ok(())
@@ -1416,8 +1467,15 @@ impl Database {
     ) -> Result<QueryResult> {
         self.plugin.on_query(sql)?;
 
-        if let Some(change) = self.ddl_change_for_statement(stmt).as_ref() {
+        if let Some(change) = self.ddl_change_for_statement(stmt, tx).as_ref() {
             self.plugin.on_ddl(change)?;
+        }
+
+        let started = Instant::now();
+        if let Some(result) = self.execute_event_bus_statement(stmt, tx) {
+            let outcome = query_outcome_from_result(&result);
+            self.plugin.post_query(sql, started.elapsed(), &outcome);
+            return result;
         }
 
         // Handle INSERT INTO GRAPH / __edges as a virtual table routing to the graph store.
@@ -1428,7 +1486,6 @@ impl Database {
             return self.execute_graph_insert(ins, params, tx);
         }
 
-        let started = Instant::now();
         let result = (|| {
             if let Some(plan) = cached_plan {
                 return self.run_planned_statement(stmt, plan, params, tx);
@@ -1447,6 +1504,33 @@ impl Database {
         let outcome = query_outcome_from_result(&result);
         self.plugin.post_query(sql, duration, &outcome);
         result.map(strip_internal_row_id)
+    }
+
+    fn execute_event_bus_statement(
+        &self,
+        stmt: &Statement,
+        tx: Option<TxId>,
+    ) -> Option<Result<QueryResult>> {
+        if !matches!(
+            stmt,
+            Statement::CreateEventType { .. }
+                | Statement::CreateSink { .. }
+                | Statement::CreateRoute { .. }
+                | Statement::DropRoute { .. }
+        ) {
+            return None;
+        }
+        let change = self
+            .ddl_change_for_statement(stmt, tx)
+            .expect("event bus statement has DDL change");
+        Some(match tx {
+            Some(tx) => self
+                .stage_event_bus_ddl_in_tx(tx, change)
+                .map(|()| QueryResult::empty()),
+            None => self
+                .apply_event_bus_ddl_from_user(vec![change])
+                .map(|()| QueryResult::empty()),
+        })
     }
 
     fn run_planned_statement(
@@ -1538,7 +1622,7 @@ impl Database {
         Ok(QueryResult::empty_with_affected(count))
     }
 
-    fn ddl_change_for_statement(&self, stmt: &Statement) -> Option<DdlChange> {
+    fn ddl_change_for_statement(&self, stmt: &Statement, tx: Option<TxId>) -> Option<DdlChange> {
         match stmt {
             Statement::CreateTable(ct) => Some(ddl_change_from_create_table(ct)),
             Statement::DropTable(dt) => Some(DdlChange::DropTable {
@@ -1652,6 +1736,51 @@ impl Database {
                     constraints: create_table_constraints_from_meta(&meta),
                 })
             }
+            Statement::CreateEventType { name, when, table } => Some(DdlChange::CreateEventType {
+                name: name.clone(),
+                trigger: match when {
+                    contextdb_parser::ast::EventTypeTrigger::Insert => "INSERT",
+                    contextdb_parser::ast::EventTypeTrigger::Update => "UPDATE",
+                    contextdb_parser::ast::EventTypeTrigger::Delete => "DELETE",
+                }
+                .to_string(),
+                table: table.clone(),
+            }),
+            Statement::CreateSink {
+                name,
+                sink_type,
+                url,
+            } => Some(DdlChange::CreateSink {
+                name: name.clone(),
+                sink_type: match sink_type {
+                    contextdb_parser::ast::SinkType::Webhook => "WEBHOOK",
+                    contextdb_parser::ast::SinkType::Callback => "CALLBACK",
+                }
+                .to_string(),
+                url: url.clone(),
+            }),
+            Statement::CreateRoute {
+                name,
+                event_type,
+                sink,
+                where_in,
+            } => Some(DdlChange::CreateRoute {
+                name: name.clone(),
+                event_type: event_type.clone(),
+                sink: sink.clone(),
+                table: self
+                    .event_bus_table_for_event_type_with_pending(tx, event_type)
+                    .unwrap_or_default(),
+                where_in: where_in
+                    .as_ref()
+                    .map(|where_in| (where_in.column.clone(), where_in.values.clone())),
+            }),
+            Statement::DropRoute { name } => Some(DdlChange::DropRoute {
+                name: name.clone(),
+                table: self
+                    .event_bus_table_for_route_with_pending(tx, name)
+                    .unwrap_or_default(),
+            }),
             _ => None,
         }
     }
@@ -4253,9 +4382,11 @@ impl Database {
             if let Ok(ws) = self.tx_mgr.cloned_write_set(tx) {
                 self.release_insert_allocations(&ws);
             }
+            self.pending_event_bus_ddl.lock().remove(&tx);
             let _ = self.tx_mgr.rollback(tx);
         }
         self.stop_cron_tickler();
+        self.stop_event_bus_threads();
         self.stop_pruning_thread();
         if self.resource_owner {
             self.subscriptions.lock().subscribers.clear();
@@ -4978,6 +5109,8 @@ impl Database {
         // rank policy validates against them.
         if self.access_is_admin() {
             ddl.extend(full_snapshot_ddl(&meta_guard));
+            let live_tables = meta_guard.keys().cloned().collect::<HashSet<_>>();
+            ddl.extend(self.event_bus_snapshot_ddl_for_tables(&live_tables));
         }
 
         // Rows (live only) — collect row_ids that have live rows for orphan vector filtering
@@ -5354,6 +5487,10 @@ impl Database {
                         meta.indexes.retain(|index| index.name != *name);
                     }
                 }
+                DdlChange::CreateEventType { .. }
+                | DdlChange::CreateSink { .. }
+                | DdlChange::CreateRoute { .. }
+                | DdlChange::DropRoute { .. } => {}
             }
         }
 
@@ -5420,6 +5557,10 @@ impl Database {
                         meta.indexes.retain(|index| index.name != *name);
                     }
                 }
+                DdlChange::CreateEventType { .. }
+                | DdlChange::CreateSink { .. }
+                | DdlChange::CreateRoute { .. }
+                | DdlChange::DropRoute { .. } => {}
             }
         }
 
@@ -5465,7 +5606,12 @@ impl Database {
                 DdlChange::DropTable { name } => {
                     vector_dims.retain(|index, _| index.table != *name);
                 }
-                DdlChange::CreateIndex { .. } | DdlChange::DropIndex { .. } => {}
+                DdlChange::CreateIndex { .. }
+                | DdlChange::DropIndex { .. }
+                | DdlChange::CreateEventType { .. }
+                | DdlChange::CreateSink { .. }
+                | DdlChange::CreateRoute { .. }
+                | DdlChange::DropRoute { .. } => {}
             }
         }
 
@@ -5504,7 +5650,11 @@ impl Database {
                 }
                 DdlChange::DropTable { .. }
                 | DdlChange::CreateIndex { .. }
-                | DdlChange::DropIndex { .. } => {}
+                | DdlChange::DropIndex { .. }
+                | DdlChange::CreateEventType { .. }
+                | DdlChange::CreateSink { .. }
+                | DdlChange::CreateRoute { .. }
+                | DdlChange::DropRoute { .. } => {}
             }
         }
 
@@ -5863,43 +6013,6 @@ impl Database {
         rx
     }
 
-    pub fn register_sink<F>(
-        &self,
-        name: &str,
-        principal: Option<contextdb_core::types::Principal>,
-        deliver: F,
-    ) -> Result<()>
-    where
-        F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
-    {
-        let _operation = self.open_operation()?;
-        let _ = (name, principal, deliver);
-        Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn __debug_register_sink_with_constraints_for_test<F>(
-        &self,
-        name: &str,
-        contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
-        scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
-        principal: Option<contextdb_core::types::Principal>,
-        deliver: F,
-    ) -> Result<()>
-    where
-        F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
-    {
-        let _operation = self.open_operation()?;
-        let _ = (name, contexts, scope_labels, principal, deliver);
-        Ok(())
-    }
-
-    pub fn sink_metrics_for_test(&self, sink: &str) -> SinkMetrics {
-        let _operation = self.assert_open_operation();
-        let _ = sink;
-        SinkMetrics::default()
-    }
-
     /// Returns health metrics for the subscription system.
     pub fn subscription_health(&self) -> SubscriptionMetrics {
         let _operation = self.assert_open_operation();
@@ -5959,11 +6072,24 @@ impl Database {
         self.preflight_sync_ddl_mixed_apply(&changes)?;
 
         let atomic_mixed_apply = !changes.edges.is_empty() || !changes.vectors.is_empty();
+        let has_event_bus_ddl = changes.ddl.iter().any(|ddl| {
+            matches!(
+                ddl,
+                DdlChange::CreateEventType { .. }
+                    | DdlChange::CreateSink { .. }
+                    | DdlChange::CreateRoute { .. }
+                    | DdlChange::DropRoute { .. }
+            )
+        });
         let mut tx = self.begin();
-        let commit_each_row =
-            self.access_is_admin() && !atomic_mixed_apply && changes.rows.len() <= 128;
-        let batch_row_commits =
-            self.access_is_admin() && !atomic_mixed_apply && changes.rows.len() > 128;
+        let commit_each_row = self.access_is_admin()
+            && !atomic_mixed_apply
+            && !has_event_bus_ddl
+            && changes.rows.len() <= 128;
+        let batch_row_commits = self.access_is_admin()
+            && !atomic_mixed_apply
+            && !has_event_bus_ddl
+            && changes.rows.len() > 128;
         let mut result = ApplyResult {
             applied_rows: 0,
             skipped_rows: 0,
@@ -5976,6 +6102,7 @@ impl Database {
         let mut failed_row_ids: HashSet<RowId> = HashSet::new();
         let mut table_meta_cache: HashMap<String, Option<TableMeta>> = HashMap::new();
         let mut visible_rows_cache: HashMap<String, Vec<VersionedRow>> = HashMap::new();
+        let mut event_bus_ddl = Vec::new();
 
         let ddl_result = (|| -> Result<()> {
             for ddl in changes.ddl.clone() {
@@ -6061,6 +6188,7 @@ impl Database {
                             self.persist_vectors()?;
                             self.persist_graph_edges()?;
                             self.allocate_ddl_lsn(|lsn| self.log_drop_table_ddl(&name, lsn))?;
+                            self.remove_event_bus_definitions_for_table(&name)?;
                             self.accountant().release(bytes_to_release);
                             self.clear_statement_cache();
                         }
@@ -6167,8 +6295,21 @@ impl Database {
                         }
                         table_meta_cache.remove(&table);
                     }
+                    event_ddl @ (DdlChange::CreateEventType { .. }
+                    | DdlChange::CreateSink { .. }
+                    | DdlChange::CreateRoute { .. }
+                    | DdlChange::DropRoute { .. }) => {
+                        event_bus_ddl.push(event_ddl);
+                    }
                 }
             }
+            event_bus_ddl.retain(|ddl| match ddl {
+                DdlChange::CreateEventType { table, .. } | DdlChange::CreateRoute { table, .. } => {
+                    table.is_empty() || self.table_meta(table).is_some()
+                }
+                _ => true,
+            });
+            self.validate_event_bus_ddl_batch(&event_bus_ddl)?;
             Ok(())
         })();
         if let Err(err) = ddl_result {
@@ -6690,7 +6831,7 @@ impl Database {
             }
         }
 
-        self.commit_with_source(tx, CommitSource::SyncPull)?;
+        self.commit_with_source_and_event_bus_ddl(tx, CommitSource::SyncPull, &event_bus_ddl)?;
         result.new_lsn = self.current_lsn();
         Ok(result)
     }
@@ -7120,6 +7261,7 @@ impl Drop for Database {
             return;
         }
         self.stop_cron_tickler();
+        self.stop_event_bus_threads();
         let runtime = self.pruning_runtime.get_mut();
         runtime.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = runtime.handle.take() {

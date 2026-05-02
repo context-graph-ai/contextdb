@@ -1,5 +1,8 @@
 use crate::common::run_cli_script;
-use contextdb_core::Value;
+use contextdb_core::{Lsn, Value};
+use contextdb_engine::sync_types::{
+    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange, SyncDirection,
+};
 use contextdb_engine::{Database, SinkError, SinkEvent};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1146,6 +1149,537 @@ DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000002'
     );
 }
 
+#[test]
+fn t5_15_durable_acl_replay_uses_route_time_gate_snapshot_after_schema_drop() {
+    use contextdb_core::types::Principal;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("bus-acl-route-time.redb");
+    let script = "\
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
+CREATE SINK alice_sink TYPE callback
+CREATE ROUTE r EVENT secret_event TO alice_sink
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'route-time-only', '00000000-0000-0000-0000-00000000000a')
+DROP TABLE secrets
+DROP TABLE acl_grants
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed durable ACL event and drop source schema; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Database::open(&path).unwrap();
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink(
+        "alice_sink",
+        Some(Principal::Agent("alice".into())),
+        move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "queued delivery must use the route-time ACL grants even after source/grant tables are gone"
+    );
+    assert_eq!(
+        captured[0].row_values.get("body"),
+        Some(&Value::Text("route-time-only".into()))
+    );
+}
+
+#[test]
+fn t5_16_principal_scoped_sink_uses_handle_principal_when_registration_omits_one() {
+    use contextdb_core::types::Principal;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("bus-principal-handle.redb");
+    let script = "\
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
+CREATE SINK alice_sink TYPE callback
+CREATE ROUTE r EVENT secret_event TO alice_sink
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'granted', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'denied', '00000000-0000-0000-0000-00000000000b')
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed durable ACL events; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Database::open_as_principal(&path, Principal::Agent("alice".into())).unwrap();
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("alice_sink", None, move |e| {
+        log_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "principal-scoped sink registration with None must use the handle principal, not ACL bypass"
+    );
+    assert_eq!(
+        captured[0].row_values.get("body"),
+        Some(&Value::Text("granted".into()))
+    );
+}
+
+#[test]
+fn t5_17_context_scoped_sink_without_principal_does_not_bypass_acl() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let db = Database::open_memory();
+    let ctx_a = Uuid::from_u128(0xCA);
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, context_id UUID CONTEXT_ID, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE secret_event WHEN INSERT ON secrets",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK scoped_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT secret_event TO scoped_sink", &empty())
+        .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.__debug_register_sink_with_constraints_for_test(
+        "scoped_sink",
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        None,
+        None,
+        move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("body".into(), Value::Text("must-not-leak".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    p.insert("acl".into(), Value::Uuid(Uuid::from_u128(0xA)));
+    db.execute(
+        "INSERT INTO secrets (id, body, context_id, acl_id) VALUES ($id, $body, $ctx, $acl)",
+        &p,
+    )
+    .unwrap();
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "context-scoped sink without principal must not receive ACL-gated events"
+    );
+}
+
+#[test]
+fn t5_18_event_bus_ddl_full_snapshot_recreates_working_route_on_peer() {
+    let source = Database::open_memory();
+    declare_inv_schema(&source);
+    let changes = source.changes_since(Lsn(0));
+    assert!(
+        changes.ddl.iter().any(
+            |ddl| matches!(ddl, DdlChange::CreateEventType { name, .. } if name == "inv_match")
+        ),
+        "full sync snapshot must include CREATE EVENT TYPE"
+    );
+    assert!(
+        changes
+            .ddl
+            .iter()
+            .any(|ddl| matches!(ddl, DdlChange::CreateSink { name, .. } if name == "slack")),
+        "full sync snapshot must include CREATE SINK"
+    );
+    assert!(
+        changes.ddl.iter().any(
+            |ddl| matches!(ddl, DdlChange::CreateRoute { name, .. } if name == "inv_to_slack")
+        ),
+        "full sync snapshot must include CREATE ROUTE"
+    );
+
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    peer.register_sink("slack", None, move |event| {
+        log_cb.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .unwrap();
+    insert_inv(&peer, "warning", "synced-route");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "peer reconstructed from sync DDL must route future events"
+    );
+    assert_eq!(captured[0].event_type, "inv_match");
+}
+
+#[test]
+fn t5_19_event_bus_ddl_direction_filter_does_not_emit_orphan_routes() {
+    let source = Database::open_memory();
+    declare_inv_schema(&source);
+    let changes = source.changes_since(Lsn(0));
+
+    let filtered_out = changes.filter_by_direction(
+        &HashMap::from([("invalidations".to_string(), SyncDirection::None)]),
+        &[SyncDirection::Push, SyncDirection::Both],
+    );
+    assert!(
+        filtered_out.ddl.iter().all(|ddl| !matches!(
+            ddl,
+            DdlChange::CreateEventType { .. }
+                | DdlChange::CreateRoute { .. }
+                | DdlChange::DropRoute { .. }
+        )),
+        "excluding the event table must not emit event types or routes without their source table"
+    );
+    assert!(
+        filtered_out
+            .ddl
+            .iter()
+            .all(|ddl| !matches!(ddl, DdlChange::CreateSink { .. })),
+        "excluding the event table must not leak unrelated sink definitions"
+    );
+    Database::open_memory()
+        .apply_changes(
+            filtered_out,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let filtered_in = changes.filter_by_direction(
+        &HashMap::from([("invalidations".to_string(), SyncDirection::Push)]),
+        &[SyncDirection::Push, SyncDirection::Both],
+    );
+    assert!(
+        filtered_in
+            .ddl
+            .iter()
+            .any(|ddl| matches!(ddl, DdlChange::CreateSink { name, .. } if name == "slack")),
+        "including the event table must keep the sink needed by its route"
+    );
+    assert!(
+        filtered_in.ddl.iter().any(
+            |ddl| matches!(ddl, DdlChange::CreateRoute { name, .. } if name == "inv_to_slack")
+        ),
+        "including the event table must keep the route"
+    );
+}
+
+#[test]
+fn t5_20_failed_sync_event_bus_ddl_does_not_persist_partial_sink() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE existing (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let changes = contextdb_engine::sync_types::ChangeSet {
+        ddl: vec![
+            DdlChange::CreateSink {
+                name: "partial".into(),
+                sink_type: "CALLBACK".into(),
+                url: None,
+            },
+            DdlChange::CreateRoute {
+                name: "bad_route".into(),
+                event_type: "missing_event".into(),
+                sink: "partial".into(),
+                table: "existing".into(),
+                where_in: None,
+            },
+        ],
+        ..Default::default()
+    };
+    assert!(
+        db.apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins)
+        )
+        .is_err(),
+        "invalid EventBus DDL batch must fail"
+    );
+    assert!(
+        db.register_sink("partial", None, |_| Ok(())).is_err(),
+        "failed sync batch must not leave behind a durable or in-memory sink"
+    );
+}
+
+#[test]
+fn t5_21_full_snapshot_omits_event_bus_ddl_for_dropped_source_table() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    db.execute("DROP TABLE invalidations", &empty()).unwrap();
+    let changes = db.changes_since(Lsn(0));
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+    assert!(
+        peer.register_sink("slack", None, |_| Ok(())).is_ok(),
+        "global sink DDL may remain applyable"
+    );
+    assert!(
+        peer.execute(
+            "CREATE ROUTE should_fail EVENT inv_match TO slack",
+            &empty()
+        )
+        .is_err(),
+        "replaying history through a dropped source table must not leave orphan event types/routes"
+    );
+}
+
+#[test]
+fn t5_22_execute_in_tx_event_bus_ddl_is_not_a_noop() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    let tx = db.begin();
+    db.execute_in_tx(tx, "CREATE SINK tx_sink TYPE callback", &empty())
+        .unwrap();
+    db.commit(tx).unwrap();
+    db.execute("CREATE ROUTE tx_route EVENT inv_match TO tx_sink", &empty())
+        .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("tx_sink", None, move |event| {
+        log_cb.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .unwrap();
+    insert_inv(&db, "warning", "tx-ddl");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "EventBus DDL through execute_in_tx must create real schema state"
+    );
+}
+
+#[test]
+fn t5_23_idempotent_event_bus_sync_ddl_does_not_echo_log() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    let before_lsn = db.current_lsn();
+    let before_ddl = db.ddl_log_since(Lsn(0));
+
+    db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateEventType {
+                    name: "inv_match".into(),
+                    trigger: "INSERT".into(),
+                    table: "invalidations".into(),
+                },
+                DdlChange::CreateSink {
+                    name: "slack".into(),
+                    sink_type: "CALLBACK".into(),
+                    url: None,
+                },
+                DdlChange::CreateRoute {
+                    name: "inv_to_slack".into(),
+                    event_type: "inv_match".into(),
+                    sink: "slack".into(),
+                    table: "invalidations".into(),
+                    where_in: None,
+                },
+            ],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.current_lsn(),
+        before_lsn,
+        "idempotent EventBus DDL replay must not allocate an echo LSN"
+    );
+    assert_eq!(
+        format!("{:?}", db.ddl_log_since(Lsn(0))),
+        format!("{before_ddl:?}"),
+        "idempotent EventBus DDL replay must not append duplicate DDL"
+    );
+}
+
+#[test]
+fn t5_24_failed_sync_event_bus_ddl_rolls_back_rows_in_same_changeset() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE existing (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let id = Uuid::from_u128(0xABCD);
+    let changes = ChangeSet {
+        ddl: vec![
+            DdlChange::CreateSink {
+                name: "partial".into(),
+                sink_type: "CALLBACK".into(),
+                url: None,
+            },
+            DdlChange::CreateRoute {
+                name: "bad_route".into(),
+                event_type: "missing_event".into(),
+                sink: "partial".into(),
+                table: "existing".into(),
+                where_in: None,
+            },
+        ],
+        rows: vec![RowChange {
+            table: "existing".into(),
+            natural_key: NaturalKey {
+                column: "id".into(),
+                value: Value::Uuid(id),
+            },
+            values: HashMap::from([("id".into(), Value::Uuid(id))]),
+            deleted: false,
+            lsn: Lsn(42),
+        }],
+        ..Default::default()
+    };
+
+    assert!(
+        db.apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins)
+        )
+        .is_err(),
+        "invalid EventBus DDL must reject the whole incoming changeset"
+    );
+    let rows = db.execute("SELECT * FROM existing", &empty()).unwrap();
+    assert_eq!(
+        rows.rows.len(),
+        0,
+        "rows in the same incoming changeset must not commit ahead of failed EventBus DDL"
+    );
+}
+
+#[test]
+fn t5_25_event_bus_ddl_rollback_does_not_leak_sink() {
+    let db = Database::open_memory();
+    let before_lsn = db.current_lsn();
+    db.execute("BEGIN", &empty()).unwrap();
+    db.execute("CREATE SINK rollback_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("ROLLBACK", &empty()).unwrap();
+
+    assert!(
+        db.register_sink("rollback_sink", None, |_| Ok(())).is_err(),
+        "EventBus DDL staged inside a rolled-back transaction must not become registerable"
+    );
+    assert_eq!(
+        db.current_lsn(),
+        before_lsn,
+        "rolled-back EventBus DDL must not allocate a durable DDL LSN"
+    );
+}
+
+#[test]
+fn t5_26_event_bus_ddl_in_tx_routes_rows_from_same_commit() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+        &empty(),
+    )
+    .unwrap();
+
+    db.execute("BEGIN", &empty()).unwrap();
+    db.execute("CREATE SINK tx_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE tx_route EVENT inv_match TO tx_sink", &empty())
+        .unwrap();
+    insert_inv(&db, "warning", "same-commit");
+    db.execute("COMMIT", &empty()).unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("tx_sink", None, move |event| {
+        log_cb.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "EventBus DDL committed with rows must route those same-commit row events"
+    );
+}
+
+#[test]
+fn t5_27_standalone_sink_survives_sync_snapshot_without_route() {
+    let source = Database::open_memory();
+    source
+        .execute("CREATE SINK standalone TYPE callback", &empty())
+        .unwrap();
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        source.changes_since(Lsn(0)),
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    assert!(
+        peer.register_sink("standalone", None, |_| Ok(())).is_ok(),
+        "standalone sink definitions are customer configuration and must sync even before routes exist"
+    );
+}
+
 /// RED — t5_14: SinkMetrics field accuracy across permanent_failures and queued.
 #[test]
 fn t5_14_sink_metrics_field_accuracy() {
@@ -1212,10 +1746,9 @@ fn t5_14_sink_metrics_field_accuracy() {
     while Instant::now() <= deadline_q {
         let m = db.sink_metrics_for_test("held");
         if m.queued > 0 {
-            assert!(
-                m.queued >= 1,
-                "at least 1 event queued mid-delivery; got {}",
-                m.queued
+            assert_eq!(
+                m.queued, 3,
+                "queued must count queued entries once, including the in-flight front entry"
             );
             assert_eq!(m.delivered, 0, "delivered must be 0 while held");
             saw_held_queue = true;
