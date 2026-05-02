@@ -463,6 +463,17 @@ impl VectorStore {
         }
     }
 
+    pub fn replace_loaded_vectors(&self, entries: Vec<VectorEntry>) {
+        let _build_guard = self.build_mutex.lock();
+        for state in self.registry.read().values() {
+            state.vectors.write().clear();
+            state.drop_hnsw_without_accounting();
+        }
+        for entry in entries {
+            self.insert_loaded_vector(entry);
+        }
+    }
+
     pub fn all_entries(&self) -> Vec<VectorEntry> {
         self.registry
             .read()

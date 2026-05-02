@@ -489,10 +489,11 @@ fn p03_pre_commit_source_autocommit() {
         pre_commits[0],
         HookEvent::PreCommit(CommitSource::AutoCommit, _)
     ));
-    // pre_commit fires BEFORE stamp_and_apply — commit_lsn must be None at this point
+    // pre_commit sees the same frozen, stamped WriteSet that will be applied
+    // and later passed to post_commit.
     assert!(
-        matches!(pre_commits[0], HookEvent::PreCommit(_, None)),
-        "pre_commit must see unstamped WriteSet (commit_lsn == None)"
+        matches!(pre_commits[0], HookEvent::PreCommit(_, Some(_))),
+        "pre_commit must see stamped WriteSet"
     );
 }
 

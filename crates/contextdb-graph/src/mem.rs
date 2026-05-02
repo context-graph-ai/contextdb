@@ -234,11 +234,9 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         }
 
         let duplicate_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
-            let inserted = ws
-                .adj_inserts
+            ws.adj_inserts
                 .iter()
-                .any(|e| e.source == source && e.target == target && e.edge_type == edge_type);
-            inserted && !deleted_in_ws
+                .any(|e| e.source == source && e.target == target && e.edge_type == edge_type)
         })?;
         if duplicate_in_ws {
             return Ok(false);
@@ -280,9 +278,31 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
     }
 
     fn delete_edge(&self, tx: TxId, source: NodeId, target: NodeId, edge_type: &str) -> Result<()> {
+        let committed_edge_exists = {
+            let fwd = self.store.forward_adj.read();
+            fwd.get(&source).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.target == target
+                        && entry.edge_type == edge_type
+                        && entry.deleted_tx.is_none()
+                })
+            })
+        };
+
         self.tx_mgr.with_write_set(tx, |ws| {
-            ws.adj_deletes
-                .push((source, edge_type.to_string(), target, tx));
+            ws.adj_inserts.retain(|entry| {
+                !(entry.source == source && entry.target == target && entry.edge_type == edge_type)
+            });
+
+            if committed_edge_exists
+                && !ws
+                    .adj_deletes
+                    .iter()
+                    .any(|(s, et, t, _)| *s == source && *t == target && et == edge_type)
+            {
+                ws.adj_deletes
+                    .push((source, edge_type.to_string(), target, tx));
+            }
         })?;
         Ok(())
     }

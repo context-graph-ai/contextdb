@@ -1,5 +1,9 @@
-use contextdb_core::{Direction, SnapshotId, Value, VectorIndexRef};
+use contextdb_core::{Direction, MemoryAccountant, RowId, SnapshotId, Value, VectorIndexRef};
 use contextdb_engine::Database;
+use contextdb_engine::sync_types::{
+    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
+    VectorChange,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -885,4 +889,931 @@ fn t21_08_graph_plus_vector_atomic_no_torn_reads() {
         0,
         "graph+vector torn read observed"
     );
+}
+
+#[test]
+fn t21_09_insert_then_update_same_tx_keeps_final_row() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::from_u128(0x2109);
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(id));
+    p.insert("v1".into(), Value::Vector(vec![1.0, 0.0, 0.0]));
+    p.insert("v2".into(), Value::Vector(vec![0.0, 1.0, 0.0]));
+
+    db.execute("BEGIN", &empty()).unwrap();
+    db.execute(
+        "INSERT INTO items (id, name, embedding) VALUES ($id, 'draft', $v1)",
+        &p,
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE items SET name = 'final', embedding = $v2 WHERE id = $id",
+        &p,
+    )
+    .unwrap();
+    db.execute("COMMIT", &empty()).unwrap();
+
+    let rows = db.scan("items", db.snapshot()).unwrap();
+    assert_eq!(rows.len(), 1, "insert-then-update must commit one row");
+    assert_eq!(
+        rows[0].values.get("name"),
+        Some(&Value::Text("final".to_string()))
+    );
+    let hits = db
+        .query_vector(
+            VectorIndexRef::new("items", "embedding"),
+            &[0.0, 1.0, 0.0],
+            1,
+            None,
+            db.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(
+        hits.first().map(|(row_id, _)| *row_id),
+        Some(rows[0].row_id)
+    );
+}
+
+#[test]
+fn t21_10_snapshot_at_lsn_survives_reopen_after_later_mutations() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("atomic-visible.db");
+    let source_id = Uuid::from_u128(0x2110);
+    let target_id = Uuid::from_u128(0x2111);
+    let later_id = Uuid::from_u128(0x2112);
+
+    let (event_lsn, target_row_id) = {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, embedding VECTOR(3) WITH (quantization = 'SQ8'))",
+            &empty(),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        let mut fixture = HashMap::new();
+        fixture.insert("src".into(), Value::Uuid(source_id));
+        fixture.insert("target".into(), Value::Uuid(target_id));
+        fixture.insert("v0".into(), Value::Vector(vec![1.0, 0.0, 0.0]));
+        db.execute(
+            "INSERT INTO entities (id, name, embedding) VALUES ($src, 'source', $v0)",
+            &fixture,
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO entities (id, name, embedding) VALUES ($target, 'pre', $v0)",
+            &fixture,
+        )
+        .unwrap();
+
+        let rx = db.subscribe();
+        let mut event_values = HashMap::new();
+        event_values.insert("eid".into(), Value::Uuid(Uuid::from_u128(0x2113)));
+        event_values.insert("src".into(), Value::Uuid(source_id));
+        event_values.insert("target".into(), Value::Uuid(target_id));
+        event_values.insert("v_event".into(), Value::Vector(vec![0.0, 1.0, 0.0]));
+        db.execute("BEGIN", &empty()).unwrap();
+        db.execute(
+            "UPDATE entities SET name = 'event-target', embedding = $v_event WHERE id = $target",
+            &event_values,
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($eid, $src, $target, 'LINKS')",
+            &event_values,
+        )
+        .unwrap();
+        db.execute("COMMIT", &empty()).unwrap();
+        let event = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event commit must publish");
+        let target_row_id = db
+            .scan("entities", db.snapshot())
+            .unwrap()
+            .into_iter()
+            .find(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == target_id))
+            .unwrap()
+            .row_id;
+
+        let mut later = HashMap::new();
+        later.insert("later".into(), Value::Uuid(later_id));
+        later.insert("target".into(), Value::Uuid(target_id));
+        later.insert("v_later".into(), Value::Vector(vec![0.0, 0.0, 1.0]));
+        db.execute(
+            "INSERT INTO entities (id, name, embedding) VALUES ($later, 'later', $v_later)",
+            &later,
+        )
+        .unwrap();
+        let tx = db.begin();
+        db.delete_edge(tx, source_id, target_id, "LINKS").unwrap();
+        db.commit(tx).unwrap();
+        db.execute(
+            "UPDATE entities SET name = 'current-target', embedding = $v_later WHERE id = $target",
+            &later,
+        )
+        .unwrap();
+        db.close().unwrap();
+        (event.lsn, target_row_id)
+    };
+
+    let reopened = Database::open(&path).unwrap();
+    let snap = reopened.snapshot_at(event_lsn);
+    let rows = reopened.scan("entities", snap).unwrap();
+    let event_target = rows
+        .iter()
+        .find(|row| {
+            matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == target_id)
+                && matches!(row.values.get("name"), Some(Value::Text(name)) if name == "event-target")
+        })
+        .expect("event snapshot after reopen must see the event-time target row");
+    assert_eq!(
+        event_target.values.get("embedding"),
+        Some(&Value::Vector(vec![0.0, 1.0, 0.0])),
+        "SQ8 relational vector hydration must target the event-time row version"
+    );
+    let mut indexed = HashMap::new();
+    indexed.insert("target".into(), Value::Uuid(target_id));
+    let indexed_historical = reopened
+        .execute_at_snapshot(
+            "SELECT name, embedding FROM entities WHERE id = $target",
+            &indexed,
+            snap,
+        )
+        .unwrap();
+    assert_eq!(indexed_historical.trace.physical_plan, "IndexScan");
+    assert_eq!(
+        indexed_historical.rows,
+        vec![vec![
+            Value::Text("event-target".to_string()),
+            Value::Vector(vec![0.0, 1.0, 0.0])
+        ]],
+        "historical IndexScan must materialize the row version visible at the event LSN"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == later_id)),
+        "event snapshot after reopen must exclude later rows"
+    );
+    assert_eq!(
+        reopened.edge_count(source_id, "LINKS", snap).unwrap_or(0),
+        1,
+        "event snapshot after reopen must see event-time edge"
+    );
+    assert_eq!(
+        reopened
+            .live_vector_entry(target_row_id, snap)
+            .expect("event-time vector must survive reopen")
+            .vector,
+        vec![0.0, 1.0, 0.0]
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn t21_11_snapshot_at_lsn_preserves_reinserted_graph_edge_after_reopen() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("graph-history.db");
+    let source_id = Uuid::from_u128(0x2114);
+    let target_id = Uuid::from_u128(0x2115);
+
+    let (insert_lsn, delete_lsn, reinsert_lsn) = {
+        let db = Database::open(&path).unwrap();
+        let rx = db.subscribe();
+
+        let tx = db.begin();
+        db.insert_edge(
+            tx,
+            source_id,
+            target_id,
+            "LINKS".to_string(),
+            HashMap::new(),
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+        let insert_lsn = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("insert edge event must publish")
+            .lsn;
+
+        let tx = db.begin();
+        db.delete_edge(tx, source_id, target_id, "LINKS").unwrap();
+        db.commit(tx).unwrap();
+        let delete_lsn = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("delete edge event must publish")
+            .lsn;
+
+        let tx = db.begin();
+        db.insert_edge(
+            tx,
+            source_id,
+            target_id,
+            "LINKS".to_string(),
+            HashMap::new(),
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+        let reinsert_lsn = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reinsert edge event must publish")
+            .lsn;
+
+        db.close().unwrap();
+        (insert_lsn, delete_lsn, reinsert_lsn)
+    };
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .edge_count(source_id, "LINKS", reopened.snapshot_at(insert_lsn))
+            .unwrap_or(0),
+        1,
+        "reopened snapshot at the original insert LSN must retain the first edge version"
+    );
+    assert_eq!(
+        reopened
+            .edge_count(source_id, "LINKS", reopened.snapshot_at(delete_lsn))
+            .unwrap_or(0),
+        0,
+        "reopened snapshot at the delete LSN must hide the deleted edge"
+    );
+    assert_eq!(
+        reopened
+            .edge_count(source_id, "LINKS", reopened.snapshot_at(reinsert_lsn))
+            .unwrap_or(0),
+        1,
+        "reopened snapshot at the reinsert LSN must expose the new edge version"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn t21_12_reconstructed_commit_index_is_backfilled_before_new_commits() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("commit-index-backfill.db");
+    let old_id = Uuid::from_u128(0x2116);
+    let new_id = Uuid::from_u128(0x2117);
+
+    let old_lsn = {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, label TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        let rx = db.subscribe();
+        db.execute(
+            "INSERT INTO items (id, label) VALUES ($id, 'old')",
+            &HashMap::from([("id".to_string(), Value::Uuid(old_id))]),
+        )
+        .unwrap();
+        let lsn = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old commit event must publish")
+            .lsn;
+        db.close().unwrap();
+        lsn
+    };
+
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write_txn = redb_db.begin_write().unwrap();
+    let commit_index: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("commit_index");
+    let _ = write_txn.delete_table(commit_index);
+    write_txn.commit().unwrap();
+    drop(redb_db);
+
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO items (id, label) VALUES ($id, 'new')",
+            &HashMap::from([("id".to_string(), Value::Uuid(new_id))]),
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+
+    let reopened = Database::open(&path).unwrap();
+    let old_rows = reopened
+        .scan("items", reopened.snapshot_at(old_lsn))
+        .unwrap();
+    assert!(
+        old_rows
+            .iter()
+            .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == old_id)),
+        "reopened snapshot_at(old_lsn) must still resolve through the backfilled commit index"
+    );
+    assert!(
+        !old_rows
+            .iter()
+            .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == new_id)),
+        "old snapshot must not floor to the later commit-index entry after backfill"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn t21_13_same_tx_graph_delete_then_reinsert_keeps_new_edge() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("graph-delete-reinsert.db");
+    let source_id = Uuid::from_u128(0x2118);
+    let target_id = Uuid::from_u128(0x2119);
+
+    {
+        let db = Database::open(&path).unwrap();
+        let tx = db.begin();
+        db.insert_edge(
+            tx,
+            source_id,
+            target_id,
+            "LINKS".to_string(),
+            HashMap::new(),
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+
+        let tx = db.begin();
+        db.delete_edge(tx, source_id, target_id, "LINKS").unwrap();
+        db.insert_edge(
+            tx,
+            source_id,
+            target_id,
+            "LINKS".to_string(),
+            HashMap::new(),
+        )
+        .unwrap();
+        assert!(
+            !db.insert_edge(
+                tx,
+                source_id,
+                target_id,
+                "LINKS".to_string(),
+                HashMap::new(),
+            )
+            .unwrap(),
+            "a replayed same-tx insert after delete+reinsert must dedupe to final state"
+        );
+        db.commit(tx).unwrap();
+        assert_eq!(db.edge_count(source_id, "LINKS", db.snapshot()).unwrap(), 1);
+        db.close().unwrap();
+    }
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .edge_count(source_id, "LINKS", reopened.snapshot())
+            .unwrap(),
+        1,
+        "same-tx graph delete+reinsert must survive persistence"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn t21_14_mixed_sync_edge_error_rolls_back_rows() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, label TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS')",
+        &empty(),
+    )
+    .unwrap();
+    let id = Uuid::from_u128(0x2120);
+    let changes = ChangeSet {
+        rows: vec![RowChange {
+            table: "items".to_string(),
+            natural_key: NaturalKey {
+                column: "id".to_string(),
+                value: Value::Uuid(id),
+            },
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                (
+                    "label".to_string(),
+                    Value::Text("should-rollback".to_string()),
+                ),
+            ]),
+            deleted: false,
+            lsn: contextdb_core::Lsn(1),
+        }],
+        edges: vec![EdgeChange {
+            source: id,
+            target: id,
+            edge_type: "DEPENDS".to_string(),
+            properties: HashMap::new(),
+            lsn: contextdb_core::Lsn(1),
+        }],
+        vectors: Vec::new(),
+        ddl: Vec::new(),
+    };
+
+    let err = db
+        .apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .expect_err("self-cycle sync edge must reject the mixed batch");
+    assert!(
+        matches!(err, contextdb_core::Error::CycleDetected { .. }),
+        "expected cycle rejection, got {err:?}"
+    );
+    assert!(
+        db.scan("items", db.snapshot()).unwrap().is_empty(),
+        "mixed sync batch must not commit rows when graph apply fails"
+    );
+}
+
+#[test]
+fn t21_16_mixed_sync_vector_error_rolls_back_rows() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, label TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let id = Uuid::from_u128(0x2123);
+    let changes = ChangeSet {
+        rows: vec![RowChange {
+            table: "items".to_string(),
+            natural_key: NaturalKey {
+                column: "id".to_string(),
+                value: Value::Uuid(id),
+            },
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                (
+                    "label".to_string(),
+                    Value::Text("should-rollback".to_string()),
+                ),
+            ]),
+            deleted: false,
+            lsn: contextdb_core::Lsn(1),
+        }],
+        edges: Vec::new(),
+        vectors: vec![contextdb_engine::sync_types::VectorChange {
+            index: VectorIndexRef::new("items", "embedding"),
+            row_id: contextdb_core::RowId(1),
+            vector: vec![1.0, 0.0],
+            lsn: contextdb_core::Lsn(1),
+        }],
+        ddl: Vec::new(),
+    };
+
+    let err = db
+        .apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .expect_err("bad vector dimension must reject the mixed batch");
+    assert!(
+        matches!(
+            err,
+            contextdb_core::Error::VectorIndexDimensionMismatch { .. }
+        ),
+        "expected vector dimension rejection, got {err:?}"
+    );
+    assert!(
+        db.scan("items", db.snapshot()).unwrap().is_empty(),
+        "mixed sync batch must not commit rows when vector apply fails"
+    );
+}
+
+#[test]
+fn t21_15_legacy_nonmonotonic_txids_are_repaired_on_reopen() {
+    use redb::ReadableTable;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct PersistedVersionedRow {
+        row_id: contextdb_core::RowId,
+        values: HashMap<String, PersistedValue>,
+        created_tx: contextdb_core::TxId,
+        deleted_tx: Option<contextdb_core::TxId>,
+        lsn: contextdb_core::Lsn,
+        created_at: Option<contextdb_core::Wallclock>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    enum PersistedValue {
+        Plain(Value),
+        Vector(PersistedVector),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    enum PersistedVector {
+        F32(Vec<f32>),
+        SQ8 {
+            min: f32,
+            max: f32,
+            len: u32,
+            payload: Vec<u8>,
+        },
+        SQ4 {
+            min: f32,
+            max: f32,
+            len: u32,
+            payload: Vec<u8>,
+        },
+    }
+
+    fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+        bincode::serde::encode_to_vec(value, bincode::config::standard()).unwrap()
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .unwrap()
+            .0
+    }
+
+    fn row_key(row: &PersistedVersionedRow) -> Vec<u8> {
+        let mut key = Vec::with_capacity(24);
+        key.extend_from_slice(&row.row_id.0.to_be_bytes());
+        key.extend_from_slice(&row.created_tx.0.to_be_bytes());
+        key.extend_from_slice(&row.lsn.0.to_be_bytes());
+        key
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("legacy-nonmonotonic.db");
+    let first_id = Uuid::from_u128(0x2121);
+    let second_id = Uuid::from_u128(0x2122);
+    let (first_lsn, second_lsn) = {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, label TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        let rx = db.subscribe();
+        db.execute(
+            "INSERT INTO items (id, label) VALUES ($id, 'first')",
+            &HashMap::from([("id".to_string(), Value::Uuid(first_id))]),
+        )
+        .unwrap();
+        let first_lsn = rx.recv_timeout(Duration::from_secs(2)).unwrap().lsn;
+        db.execute(
+            "INSERT INTO items (id, label) VALUES ($id, 'second')",
+            &HashMap::from([("id".to_string(), Value::Uuid(second_id))]),
+        )
+        .unwrap();
+        let second_lsn = rx.recv_timeout(Duration::from_secs(2)).unwrap().lsn;
+        db.close().unwrap();
+        (first_lsn, second_lsn)
+    };
+
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write_txn = redb_db.begin_write().unwrap();
+    let rel_items: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("rel_items");
+    let mut rows = Vec::new();
+    {
+        let table = write_txn.open_table(rel_items).unwrap();
+        for entry in table.iter().unwrap() {
+            let (_, value) = entry.unwrap();
+            let mut row: PersistedVersionedRow = decode(value.value());
+            match row.values.get("label") {
+                Some(PersistedValue::Plain(Value::Text(label))) if label == "first" => {
+                    row.created_tx = contextdb_core::TxId(2);
+                }
+                Some(PersistedValue::Plain(Value::Text(label))) if label == "second" => {
+                    row.created_tx = contextdb_core::TxId(1);
+                }
+                _ => {}
+            }
+            rows.push(row);
+        }
+    }
+    write_txn.delete_table(rel_items).unwrap();
+    {
+        let mut table = write_txn.open_table(rel_items).unwrap();
+        for row in &rows {
+            table
+                .insert(row_key(row).as_slice(), encode(row).as_slice())
+                .unwrap();
+        }
+    }
+    let commit_index: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("commit_index");
+    let _ = write_txn.delete_table(commit_index);
+    write_txn.commit().unwrap();
+    drop(redb_db);
+
+    let repaired = Database::open(&path).unwrap();
+    let first_rows = repaired
+        .scan("items", repaired.snapshot_at(first_lsn))
+        .unwrap();
+    assert!(
+        first_rows
+            .iter()
+            .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == first_id)),
+        "first LSN snapshot must still see the first row after TxId repair"
+    );
+    assert!(
+        !first_rows
+            .iter()
+            .any(|row| matches!(row.values.get("id"), Some(Value::Uuid(id)) if *id == second_id)),
+        "first LSN snapshot must not leak the later lower-Tx row"
+    );
+    let second_rows = repaired
+        .scan("items", repaired.snapshot_at(second_lsn))
+        .unwrap();
+    assert_eq!(second_rows.len(), 2);
+    repaired.close().unwrap();
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .scan("items", reopened.snapshot_at(second_lsn))
+            .unwrap()
+            .len(),
+        2,
+        "TxId repair must be durable"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn t21_17_fk_validation_uses_same_tx_final_state() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE parents (id UUID PRIMARY KEY, name TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id))",
+        &empty(),
+    )
+    .unwrap();
+
+    let parent_id = Uuid::from_u128(0x2117);
+    let child_id = Uuid::from_u128(0x2118);
+    let params = HashMap::from([
+        ("parent_id".to_string(), Value::Uuid(parent_id)),
+        ("child_id".to_string(), Value::Uuid(child_id)),
+    ]);
+    db.execute(
+        "INSERT INTO parents (id, name) VALUES ($parent_id, 'before')",
+        &params,
+    )
+    .unwrap();
+
+    db.execute("BEGIN", &empty()).unwrap();
+    db.execute(
+        "UPDATE parents SET name = 'after' WHERE id = $parent_id",
+        &params,
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO children (id, parent_id) VALUES ($child_id, $parent_id)",
+        &params,
+    )
+    .unwrap();
+    db.execute("COMMIT", &empty())
+        .expect("FK validation must accept parent final state after same-tx update");
+
+    assert_eq!(db.scan("children", db.snapshot()).unwrap().len(), 1);
+}
+
+#[test]
+fn t21_18_mixed_sync_ddl_vector_error_does_not_apply_ddl() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4))",
+        &empty(),
+    )
+    .unwrap();
+
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                rows: vec![],
+                edges: vec![],
+                vectors: vec![VectorChange {
+                    index: VectorIndexRef::new("evidence", "vector_vision"),
+                    row_id: contextdb_core::RowId(1),
+                    vector: vec![1.0, 0.0, 0.0],
+                    lsn: contextdb_core::Lsn(10),
+                }],
+                ddl: vec![DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![("vector_vision".to_string(), "VECTOR(8)".to_string())],
+                    constraints: vec![],
+                }],
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .expect_err("invalid mixed DDL+vector batch must fail before DDL side effects");
+    assert!(
+        matches!(
+            err,
+            contextdb_core::Error::VectorIndexDimensionMismatch { .. }
+        ),
+        "unexpected error for invalid mixed DDL+vector batch: {err}"
+    );
+    assert!(
+        db.table_meta("evidence")
+            .unwrap()
+            .columns
+            .iter()
+            .all(|column| column.name != "vector_vision"),
+        "failed mixed DDL+vector batch must not leave the new vector column registered"
+    );
+}
+
+#[test]
+fn t21_19_mixed_sync_ddl_edge_error_does_not_apply_ddl() {
+    let db = Database::open_memory();
+    let id = Uuid::from_u128(0x2119);
+
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                rows: vec![],
+                edges: vec![EdgeChange {
+                    source: id,
+                    target: id,
+                    edge_type: "DEPENDS".to_string(),
+                    properties: HashMap::new(),
+                    lsn: contextdb_core::Lsn(10),
+                }],
+                vectors: vec![],
+                ddl: vec![DdlChange::CreateTable {
+                    name: "edges".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("source_id".to_string(), "UUID".to_string()),
+                        ("target_id".to_string(), "UUID".to_string()),
+                        ("edge_type".to_string(), "TEXT".to_string()),
+                    ],
+                    constraints: vec!["DAG('DEPENDS')".to_string()],
+                }],
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .expect_err("invalid mixed DDL+edge batch must fail before DDL side effects");
+
+    assert!(
+        matches!(err, contextdb_core::Error::CycleDetected { .. }),
+        "unexpected error for invalid mixed DDL+edge batch: {err}"
+    );
+    assert!(
+        db.table_meta("edges").is_none(),
+        "failed mixed DDL+edge batch must not leave the new edge table registered"
+    );
+}
+
+#[test]
+fn t21_20_sync_drop_table_removes_vector_state_and_persists() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("sync-drop-vector.db");
+    let id = Uuid::from_u128(0x2120);
+    let source = Uuid::from_u128(0x2121);
+    let target = Uuid::from_u128(0x2122);
+    let index = VectorIndexRef::new("items", "embedding");
+
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS')",
+            &empty(),
+        )
+        .unwrap();
+        let params = HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("v".to_string(), Value::Vector(vec![1.0, 0.0, 0.0])),
+            ("edge_id".to_string(), Value::Uuid(Uuid::from_u128(0x2123))),
+            ("source".to_string(), Value::Uuid(source)),
+            ("target".to_string(), Value::Uuid(target)),
+        ]);
+        db.execute(
+            "INSERT INTO items (id, embedding) VALUES ($id, $v)",
+            &params,
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($edge_id, $source, $target, 'DEPENDS')",
+            &params,
+        )
+        .unwrap();
+        assert!(
+            !db.query_vector(index.clone(), &[1.0, 0.0, 0.0], 1, None, db.snapshot())
+                .unwrap()
+                .is_empty(),
+            "guard: vector must exist before sync DropTable"
+        );
+        assert_eq!(
+            db.edge_count(source, "DEPENDS", db.snapshot()).unwrap(),
+            1,
+            "guard: graph edge must exist before sync DropTable"
+        );
+
+        db.apply_changes(
+            ChangeSet {
+                rows: vec![],
+                edges: vec![],
+                vectors: vec![],
+                ddl: vec![
+                    DdlChange::DropTable {
+                        name: "items".to_string(),
+                    },
+                    DdlChange::DropTable {
+                        name: "edges".to_string(),
+                    },
+                ],
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .expect("sync DropTable should apply");
+
+        assert!(db.table_meta("items").is_none());
+        assert!(db.table_meta("edges").is_none());
+        assert!(matches!(
+            db.query_vector(index.clone(), &[1.0, 0.0, 0.0], 1, None, db.snapshot()),
+            Err(contextdb_core::Error::UnknownVectorIndex { .. })
+        ));
+        assert_eq!(
+            db.edge_count(source, "DEPENDS", db.snapshot()).unwrap(),
+            0,
+            "sync DropTable must remove graph edges in memory"
+        );
+        db.close().unwrap();
+    }
+
+    let reopened = Database::open(&path).unwrap();
+    assert!(reopened.table_meta("items").is_none());
+    assert!(reopened.table_meta("edges").is_none());
+    assert!(matches!(
+        reopened.query_vector(index, &[1.0, 0.0, 0.0], 1, None, reopened.snapshot()),
+        Err(contextdb_core::Error::UnknownVectorIndex { .. })
+    ));
+    assert_eq!(
+        reopened
+            .edge_count(source, "DEPENDS", reopened.snapshot())
+            .unwrap(),
+        0,
+        "sync DropTable must durably remove graph edges"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn t21_21_mixed_sync_ddl_vector_memory_error_does_not_apply_ddl() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(1300));
+    let db = Database::open_memory_with_accountant(accountant);
+    let index = VectorIndexRef::new("evidence", "embedding");
+
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                rows: vec![],
+                edges: vec![],
+                vectors: vec![VectorChange {
+                    index: index.clone(),
+                    row_id: RowId(1),
+                    vector: vec![1.0; 256],
+                    lsn: contextdb_core::Lsn(1),
+                }],
+                ddl: vec![DdlChange::CreateTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("embedding".to_string(), "VECTOR(256)".to_string()),
+                    ],
+                    constraints: vec![],
+                }],
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .expect_err("projected DDL+vector memory must fail before DDL side effects");
+
+    assert!(
+        matches!(err, contextdb_core::Error::MemoryBudgetExceeded { .. }),
+        "unexpected error for projected memory failure: {err}"
+    );
+    assert!(
+        db.table_meta("evidence").is_none(),
+        "failed mixed DDL+vector memory batch must not register the table"
+    );
+    assert!(matches!(
+        db.query_vector(index, &[1.0; 256], 1, None, db.snapshot()),
+        Err(contextdb_core::Error::UnknownVectorIndex { .. })
+    ));
 }

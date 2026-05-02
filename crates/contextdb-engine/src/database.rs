@@ -1,4 +1,4 @@
-use crate::composite_store::{ChangeLogEntry, CompositeStore};
+use crate::composite_store::{ApplyPhasePause, ChangeLogEntry, CompositeStore};
 use crate::executor::execute_plan;
 use crate::persistence::RedbPersistence;
 use crate::persistent_store::PersistentCompositeStore;
@@ -142,16 +142,24 @@ pub struct CronPauseGuard {
 
 #[derive(Debug)]
 pub struct ApplyPhasePauseGuard {
-    _private: (),
+    inner: Arc<ApplyPhasePause>,
+    generation: u64,
 }
 
 impl ApplyPhasePauseGuard {
     pub fn wait_until_reached(&self, timeout: Duration) -> bool {
-        let _ = timeout;
-        false
+        self.inner.wait_until_reached(self.generation, timeout)
     }
 
-    pub fn release(&self) {}
+    pub fn release(&self) {
+        self.inner.release(self.generation);
+    }
+}
+
+impl Drop for ApplyPhasePauseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,6 +230,7 @@ pub struct Database {
     persistence: Option<Arc<RedbPersistence>>,
     open_registry_path: Mutex<Option<PathBuf>>,
     operation_gate: RwLock<()>,
+    apply_phase_pause: Arc<ApplyPhasePause>,
     relational: MemRelationalExecutor<DynStore>,
     graph: MemGraphExecutor<DynStore>,
     vector: MemVectorExecutor<DynStore>,
@@ -520,6 +529,7 @@ impl Database {
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         persistence: Option<Arc<RedbPersistence>>,
         open_registry_path: Option<PathBuf>,
+        apply_phase_pause: Arc<ApplyPhasePause>,
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
         disk_limit: Option<u64>,
@@ -535,6 +545,7 @@ impl Database {
             persistence,
             open_registry_path: Mutex::new(open_registry_path),
             operation_gate: RwLock::new(()),
+            apply_phase_pause,
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
             vector: MemVectorExecutor::new_with_accountant(
@@ -707,30 +718,69 @@ impl Database {
         for entry in &loaded_vectors {
             vector.insert_loaded_vector(entry.clone());
         }
+
+        let loaded_change_log = persistence.load_change_log()?;
+        let loaded_ddl_log = persistence.load_ddl_log()?;
+        let mut commit_index = persistence.load_commit_index()?;
+        let reconstructed_commit_index =
+            commit_index_across_all(&relational, &graph, &vector, &loaded_change_log);
+        let mut missing_commit_index = BTreeMap::new();
+        for (lsn, tx) in reconstructed_commit_index {
+            if let std::collections::btree_map::Entry::Vacant(slot) = commit_index.entry(lsn) {
+                slot.insert(tx);
+                missing_commit_index.insert(lsn, tx);
+            }
+        }
+        let mut loaded_vectors = loaded_vectors;
+        let repaired_visibility_order = repair_visibility_tx_order_if_needed(
+            &relational,
+            &graph,
+            &vector,
+            loaded_vectors.as_mut_slice(),
+            &all_meta,
+            &persistence,
+            &mut commit_index,
+        )?;
+        if repaired_visibility_order {
+            persistence.rewrite_commit_index(&commit_index)?;
+        } else if !missing_commit_index.is_empty() {
+            persistence.flush_commit_index_entries(&missing_commit_index)?;
+        }
         hydrate_relational_vector_values(&relational, &loaded_vectors);
 
         let max_row_id = relational.max_row_id();
         let max_tx = max_tx_across_all(&relational, &graph, &vector);
-        let max_lsn = max_lsn_across_all(&relational, &graph, &vector);
+        let commit_index_max_lsn = commit_index.keys().next_back().copied().unwrap_or(Lsn(0));
+        let ddl_max_lsn = loaded_ddl_log
+            .iter()
+            .map(|(lsn, _)| *lsn)
+            .max()
+            .unwrap_or(Lsn(0));
+        let max_lsn = max_lsn_across_all(&relational, &graph, &vector)
+            .max(commit_index_max_lsn)
+            .max(ddl_max_lsn);
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
-        let change_log = Arc::new(RwLock::new(persistence.load_change_log()?));
-        let ddl_log = Arc::new(RwLock::new(persistence.load_ddl_log()?));
-        let composite = CompositeStore::new(
+        let change_log = Arc::new(RwLock::new(loaded_change_log));
+        let ddl_log = Arc::new(RwLock::new(loaded_ddl_log));
+        let apply_phase_pause = Arc::new(ApplyPhasePause::new());
+        let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
             vector.clone(),
             change_log.clone(),
             ddl_log.clone(),
             accountant.clone(),
+            apply_phase_pause.clone(),
         );
         let persistent = PersistentCompositeStore::new(composite, persistence.clone());
         let store: DynStore = Box::new(persistent);
-        let tx_mgr = Arc::new(TxManager::new_with_counters(
+        let tx_mgr = Arc::new(TxManager::new_with_counters_and_commit_index(
             store,
             TxId(max_tx.0.saturating_add(1)),
             Lsn(max_lsn.0.saturating_add(1)),
             max_tx,
+            commit_index,
         ));
 
         let db = Self::build_db(
@@ -743,6 +793,7 @@ impl Database {
             ddl_log,
             Some(persistence),
             Some(registry_reservation.disarm()),
+            apply_phase_pause,
             plugin,
             accountant,
             effective_disk_limit,
@@ -772,19 +823,33 @@ impl Database {
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
         let change_log = Arc::new(RwLock::new(Vec::new()));
         let ddl_log = Arc::new(RwLock::new(Vec::new()));
-        let store: DynStore = Box::new(CompositeStore::new(
+        let apply_phase_pause = Arc::new(ApplyPhasePause::new());
+        let store: DynStore = Box::new(CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
             vector.clone(),
             change_log.clone(),
             ddl_log.clone(),
             accountant.clone(),
+            apply_phase_pause.clone(),
         ));
         let tx_mgr = Arc::new(TxManager::new(store));
 
         let db = Self::build_db(
-            tx_mgr, relational, graph, vector, hnsw, change_log, ddl_log, None, None, plugin,
-            accountant, None, None,
+            tx_mgr,
+            relational,
+            graph,
+            vector,
+            hnsw,
+            change_log,
+            ddl_log,
+            None,
+            None,
+            apply_phase_pause,
+            plugin,
+            accountant,
+            None,
+            None,
         );
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         Ok(db)
@@ -802,9 +867,9 @@ impl Database {
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
         let _operation = self.open_operation()?;
-        let ws = self.tx_mgr.cloned_write_set(tx)?;
+        let ws = self.tx_mgr.rollback_write_set(tx)?;
         self.release_insert_allocations(&ws);
-        self.tx_mgr.rollback(tx)
+        Ok(())
     }
 
     pub fn snapshot(&self) -> SnapshotId {
@@ -814,8 +879,7 @@ impl Database {
 
     pub fn snapshot_at(&self, lsn: Lsn) -> SnapshotId {
         let _operation = self.assert_open_operation();
-        let _ = lsn;
-        self.snapshot()
+        self.tx_mgr.snapshot_at_lsn(lsn)
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
@@ -972,27 +1036,24 @@ impl Database {
     }
 
     fn commit_with_source(&self, tx: TxId, source: CommitSource) -> Result<()> {
-        let mut ws = self.tx_mgr.cloned_write_set(tx)?;
-
-        if !ws.is_empty()
-            && let Err(err) = self.validate_foreign_keys_in_tx(tx)
-        {
-            let _ = self.rollback(tx);
-            return Err(err);
-        }
-
-        if !ws.is_empty()
-            && let Err(err) = self.plugin.pre_commit(&ws, source)
-        {
-            let _ = self.rollback(tx);
-            return Err(err);
-        }
-
-        let lsn = self.tx_mgr.commit_with_lsn(tx)?;
+        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_prepared(tx, |ws| {
+            if !ws.is_empty() {
+                self.validate_foreign_keys_in_write_set(ws)?;
+                self.plugin.pre_commit(ws, source)?;
+            }
+            Ok(())
+        }) {
+            Ok(committed) => committed,
+            Err(failure) => {
+                if let Some(ws) = &failure.write_set {
+                    self.release_insert_allocations(ws);
+                }
+                return Err(failure.error);
+            }
+        };
 
         if !ws.is_empty() {
             self.release_delete_allocations(&ws);
-            ws.stamp_lsn(lsn);
             self.plugin.post_commit(&ws, source);
             self.publish_commit_event_if_subscribers(&ws, source, lsn);
         }
@@ -1415,7 +1476,8 @@ impl Database {
         let values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
         self.validate_row_constraints(tx, table, &values, Some(old_row_id))?;
-        self.relational.insert(tx, table, values)
+        self.relational
+            .insert_with_row_id(tx, table, old_row_id, values, self.snapshot())
     }
 
     /// Internal variant used by sync-apply: skips the TXID bound check because
@@ -1993,17 +2055,13 @@ impl Database {
         Ok(overlap)
     }
 
-    fn validate_foreign_keys_in_tx(&self, tx: TxId) -> Result<()> {
+    fn validate_foreign_keys_in_write_set(&self, ws: &contextdb_tx::WriteSet) -> Result<()> {
         // Constraint probe — FK existence checks must see the committed
         // watermark, not any read-side snapshot override.
         let snapshot = self.snapshot();
-        let relational_inserts = self
-            .tx_mgr
-            .with_write_set(tx, |ws| ws.relational_inserts.clone())?;
-
-        for (table, row) in relational_inserts {
+        for (table, row) in &ws.relational_inserts {
             let meta = self
-                .table_meta(&table)
+                .table_meta(table)
                 .ok_or_else(|| Error::TableNotFound(table.clone()))?;
             for column in &meta.columns {
                 let Some(reference) = &column.references else {
@@ -2015,10 +2073,33 @@ impl Database {
                 if *value == Value::Null {
                     continue;
                 }
-                if self
-                    .point_lookup_in_tx(tx, &reference.table, &reference.column, value, snapshot)?
-                    .is_none()
-                {
+                let staged_deletes: HashSet<RowId> = ws
+                    .relational_deletes
+                    .iter()
+                    .filter(|(table, _, _)| table == &reference.table)
+                    .map(|(_, row_id, _)| *row_id)
+                    .collect();
+                let mut seen_staged_rows = HashSet::new();
+                let staged_match = ws
+                    .relational_inserts
+                    .iter()
+                    .rev()
+                    .any(|(insert_table, row)| {
+                        insert_table == &reference.table
+                            && seen_staged_rows.insert(row.row_id)
+                            && row.values.get(&reference.column) == Some(value)
+                    });
+                let committed_match = self
+                    .relational
+                    .point_lookup_with_tx(
+                        None,
+                        &reference.table,
+                        &reference.column,
+                        value,
+                        snapshot,
+                    )?
+                    .is_some_and(|row| !staged_deletes.contains(&row.row_id));
+                if !staged_match && !committed_match {
                     return Err(Error::ForeignKeyViolation {
                         table: table.clone(),
                         column: column.name.clone(),
@@ -3514,7 +3595,12 @@ impl Database {
                     let Some(rows) = tables.get(&table) else {
                         continue;
                     };
-                    let Some(row) = rows.iter().find(|r| r.row_id == row_id) else {
+                    let Some(row) = rows
+                        .iter()
+                        .rev()
+                        .find(|r| r.row_id == row_id && r.lsn == lsn)
+                        .or_else(|| rows.iter().rev().find(|r| r.row_id == row_id))
+                    else {
                         continue;
                     };
                     let natural_key = row
@@ -4078,9 +4164,9 @@ impl Database {
         &self.relational_store
     }
 
-    pub(crate) fn allocate_ddl_lsn<F, R>(&self, f: F) -> R
+    pub(crate) fn allocate_ddl_lsn<F, R>(&self, f: F) -> Result<R>
     where
-        F: FnOnce(Lsn) -> R,
+        F: FnOnce(Lsn) -> Result<R>,
     {
         self.tx_mgr.allocate_ddl_lsn(f)
     }
@@ -4099,10 +4185,10 @@ impl Database {
         lsn: Lsn,
     ) -> Result<()> {
         let change = ddl_change_from_meta(name, meta);
-        self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
         }
+        self.ddl_log.write().push((lsn, change));
         Ok(())
     }
 
@@ -4110,10 +4196,10 @@ impl Database {
         let change = DdlChange::DropTable {
             name: name.to_string(),
         };
-        self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
         }
+        self.ddl_log.write().push((lsn, change));
         Ok(())
     }
 
@@ -4132,10 +4218,10 @@ impl Database {
                 .collect(),
             constraints: create_table_constraints_from_meta(meta),
         };
-        self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
         }
+        self.ddl_log.write().push((lsn, change));
         Ok(())
     }
 
@@ -4151,10 +4237,10 @@ impl Database {
             name: name.to_string(),
             columns: columns.to_vec(),
         };
-        self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
         }
+        self.ddl_log.write().push((lsn, change));
         Ok(())
     }
 
@@ -4163,10 +4249,10 @@ impl Database {
             table: table.to_string(),
             name: name.to_string(),
         };
-        self.ddl_log.write().push((lsn, change.clone()));
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
         }
+        self.ddl_log.write().push((lsn, change));
         Ok(())
     }
 
@@ -4323,6 +4409,20 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn persist_graph_edges(&self) -> Result<()> {
+        if let Some(persistence) = &self.persistence {
+            let edges = self
+                .graph_store
+                .forward_adj
+                .read()
+                .values()
+                .flat_map(|entries| entries.iter().cloned())
+                .collect::<Vec<_>>();
+            persistence.rewrite_graph_edges(&edges)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove_persisted_table(&self, name: &str) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             persistence.remove_table_meta(name)?;
@@ -4333,6 +4433,10 @@ impl Database {
 
     pub fn change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
         let _operation = self.assert_open_operation();
+        self.with_commit_lock(|| self.change_log_since_unlocked(since_lsn))
+    }
+
+    fn change_log_since_unlocked(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
         let log = self.change_log.read();
         let start = log.partition_point(|e| e.lsn() <= since_lsn);
         log[start..].to_vec()
@@ -4340,6 +4444,10 @@ impl Database {
 
     pub fn ddl_log_since(&self, since_lsn: Lsn) -> Vec<DdlChange> {
         let _operation = self.assert_open_operation();
+        self.with_commit_lock(|| self.ddl_log_since_unlocked(since_lsn))
+    }
+
+    fn ddl_log_since_unlocked(&self, since_lsn: Lsn) -> Vec<DdlChange> {
         let ddl = self.ddl_log.read();
         let start = ddl.partition_point(|(lsn, _)| *lsn <= since_lsn);
         ddl[start..].iter().map(|(_, c)| c.clone()).collect()
@@ -4576,23 +4684,32 @@ impl Database {
         };
         let available = usage.available.unwrap_or(limit);
         let mut required = 0usize;
+        let projected_meta = self.projected_sync_table_meta(&changes.ddl);
+        required = required.saturating_add(self.projected_sync_ddl_metadata_bytes(&changes.ddl));
 
         for row in &changes.rows {
             if row.deleted || row.values.is_empty() {
                 continue;
             }
+            let table_meta = projected_meta
+                .get(&row.table)
+                .ok_or_else(|| Error::TableNotFound(row.table.clone()))?;
 
             let policy = policies
                 .per_table
                 .get(&row.table)
                 .copied()
                 .unwrap_or(policies.default);
-            let existing = self.point_lookup(
-                &row.table,
-                &row.natural_key.column,
-                &row.natural_key.value,
-                self.snapshot(),
-            )?;
+            let existing = if self.table_meta(&row.table).is_some() {
+                self.point_lookup(
+                    &row.table,
+                    &row.natural_key.column,
+                    &row.natural_key.value,
+                    self.snapshot(),
+                )?
+            } else {
+                None
+            };
 
             if existing.is_some()
                 && matches!(
@@ -4603,11 +4720,11 @@ impl Database {
                 continue;
             }
 
-            required = required.saturating_add(
-                self.table_meta(&row.table)
-                    .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
-                    .unwrap_or_else(|| estimate_row_value_bytes(&row.values)),
-            );
+            required = required.saturating_add(estimate_row_bytes_for_meta(
+                &row.values,
+                table_meta,
+                false,
+            ));
         }
 
         for edge in &changes.edges {
@@ -4621,12 +4738,21 @@ impl Database {
             if vector.vector.is_empty() {
                 continue;
             }
-            required = required.saturating_add(
-                24 + vector
-                    .vector
-                    .len()
-                    .saturating_mul(std::mem::size_of::<f32>()),
-            );
+            let bytes = projected_meta
+                .get(&vector.index.table)
+                .and_then(|meta| {
+                    meta.columns
+                        .iter()
+                        .find(|column| column.name == vector.index.column)
+                        .map(|column| column.quantization.storage_bytes(vector.vector.len()))
+                })
+                .unwrap_or_else(|| {
+                    vector
+                        .vector
+                        .len()
+                        .saturating_mul(std::mem::size_of::<f32>())
+                });
+            required = required.saturating_add(24 + bytes);
         }
 
         if required > available {
@@ -4645,6 +4771,274 @@ impl Database {
         Ok(())
     }
 
+    fn projected_sync_table_meta(&self, ddl: &[DdlChange]) -> HashMap<String, TableMeta> {
+        let mut projected = self.relational_store.table_meta.read().clone();
+
+        for change in ddl {
+            match change {
+                DdlChange::CreateTable {
+                    name,
+                    columns,
+                    constraints,
+                } => {
+                    projected
+                        .entry(name.clone())
+                        .or_insert_with(|| rough_sync_table_meta(columns, constraints));
+                }
+                DdlChange::AlterTable { name, columns, .. } => {
+                    if let Some(meta) = projected.get_mut(name) {
+                        let mut existing = meta
+                            .columns
+                            .iter()
+                            .map(|column| column.name.clone())
+                            .collect::<HashSet<_>>();
+                        for (column, ty) in columns {
+                            if existing.insert(column.clone()) {
+                                meta.columns.push(rough_sync_column_def(column, ty));
+                            }
+                        }
+                    }
+                }
+                DdlChange::DropTable { name } => {
+                    projected.remove(name);
+                }
+                DdlChange::CreateIndex {
+                    table,
+                    name,
+                    columns,
+                } => {
+                    if let Some(meta) = projected.get_mut(table)
+                        && !meta.indexes.iter().any(|index| index.name == *name)
+                    {
+                        meta.indexes.push(IndexDecl {
+                            name: name.clone(),
+                            columns: columns.clone(),
+                            kind: IndexKind::UserDeclared,
+                        });
+                    }
+                }
+                DdlChange::DropIndex { table, name } => {
+                    if let Some(meta) = projected.get_mut(table) {
+                        meta.indexes.retain(|index| index.name != *name);
+                    }
+                }
+            }
+        }
+
+        projected
+    }
+
+    fn projected_sync_ddl_metadata_bytes(&self, ddl: &[DdlChange]) -> usize {
+        let mut projected = self.relational_store.table_meta.read().clone();
+        let mut required = 0usize;
+
+        for change in ddl {
+            match change {
+                DdlChange::CreateTable {
+                    name,
+                    columns,
+                    constraints,
+                } => {
+                    if !projected.contains_key(name) {
+                        let meta = rough_sync_table_meta(columns, constraints);
+                        required = required.saturating_add(meta.estimated_bytes());
+                        projected.insert(name.clone(), meta);
+                    }
+                }
+                DdlChange::AlterTable { name, columns, .. } => {
+                    if let Some(meta) = projected.get_mut(name) {
+                        let before = meta.estimated_bytes();
+                        let mut existing = meta
+                            .columns
+                            .iter()
+                            .map(|column| column.name.clone())
+                            .collect::<HashSet<_>>();
+                        for (column, ty) in columns {
+                            if existing.insert(column.clone()) {
+                                meta.columns.push(rough_sync_column_def(column, ty));
+                            }
+                        }
+                        required =
+                            required.saturating_add(meta.estimated_bytes().saturating_sub(before));
+                    }
+                }
+                DdlChange::DropTable { name } => {
+                    projected.remove(name);
+                }
+                DdlChange::CreateIndex {
+                    table,
+                    name,
+                    columns,
+                } => {
+                    if let Some(meta) = projected.get_mut(table)
+                        && !meta.indexes.iter().any(|index| index.name == *name)
+                    {
+                        let before = meta.estimated_bytes();
+                        meta.indexes.push(IndexDecl {
+                            name: name.clone(),
+                            columns: columns.clone(),
+                            kind: IndexKind::UserDeclared,
+                        });
+                        required =
+                            required.saturating_add(meta.estimated_bytes().saturating_sub(before));
+                    }
+                }
+                DdlChange::DropIndex { table, name } => {
+                    if let Some(meta) = projected.get_mut(table) {
+                        meta.indexes.retain(|index| index.name != *name);
+                    }
+                }
+            }
+        }
+
+        required
+    }
+
+    fn preflight_sync_ddl_mixed_apply(&self, changes: &ChangeSet) -> Result<()> {
+        if changes.ddl.is_empty() {
+            return Ok(());
+        }
+
+        let projected_dag_edge_types = self.projected_sync_dag_edge_types(&changes.ddl);
+        self.preflight_sync_edge_cycles(changes, &projected_dag_edge_types)?;
+
+        let mut vector_dims = HashMap::new();
+        {
+            let meta = self.relational_store.table_meta.read();
+            for (table, table_meta) in meta.iter() {
+                for column in &table_meta.columns {
+                    if let ColumnType::Vector(dimension) = column.column_type {
+                        vector_dims.insert(
+                            VectorIndexRef::new(table.clone(), column.name.clone()),
+                            dimension,
+                        );
+                    }
+                }
+            }
+        }
+
+        for ddl in &changes.ddl {
+            match ddl {
+                DdlChange::CreateTable { name, columns, .. }
+                | DdlChange::AlterTable { name, columns, .. } => {
+                    for (column, ty) in columns {
+                        if let Some(dimension) = ddl_vector_dimension(ty) {
+                            vector_dims.insert(
+                                VectorIndexRef::new(name.clone(), column.clone()),
+                                dimension,
+                            );
+                        }
+                    }
+                }
+                DdlChange::DropTable { name } => {
+                    vector_dims.retain(|index, _| index.table != *name);
+                }
+                DdlChange::CreateIndex { .. } | DdlChange::DropIndex { .. } => {}
+            }
+        }
+
+        for vector in &changes.vectors {
+            let Some(expected) = vector_dims.get(&vector.index).copied() else {
+                return Err(Error::UnknownVectorIndex {
+                    index: vector.index.clone(),
+                });
+            };
+            if !vector.vector.is_empty() && vector.vector.len() != expected {
+                return Err(Error::VectorIndexDimensionMismatch {
+                    index: vector.index.clone(),
+                    expected,
+                    actual: vector.vector.len(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn projected_sync_dag_edge_types(&self, ddl: &[DdlChange]) -> HashSet<EdgeType> {
+        let mut edge_types = HashSet::new();
+        {
+            let meta = self.relational_store.table_meta.read();
+            for table_meta in meta.values() {
+                edge_types.extend(table_meta.dag_edge_types.iter().cloned());
+            }
+        }
+
+        for change in ddl {
+            match change {
+                DdlChange::CreateTable { constraints, .. }
+                | DdlChange::AlterTable { constraints, .. } => {
+                    edge_types.extend(ddl_dag_edge_types(constraints));
+                }
+                DdlChange::DropTable { .. }
+                | DdlChange::CreateIndex { .. }
+                | DdlChange::DropIndex { .. } => {}
+            }
+        }
+
+        edge_types
+    }
+
+    fn preflight_sync_edge_cycles(
+        &self,
+        changes: &ChangeSet,
+        dag_edge_types: &HashSet<EdgeType>,
+    ) -> Result<()> {
+        if dag_edge_types.is_empty() || changes.edges.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = self.snapshot_for_read();
+        let mut adjacency: HashMap<EdgeType, HashMap<NodeId, HashSet<NodeId>>> = HashMap::new();
+        {
+            let forward = self.graph_store.forward_adj.read();
+            for entries in forward.values() {
+                for edge in entries {
+                    if edge.visible_at(snapshot) && dag_edge_types.contains(&edge.edge_type) {
+                        adjacency
+                            .entry(edge.edge_type.clone())
+                            .or_default()
+                            .entry(edge.source)
+                            .or_default()
+                            .insert(edge.target);
+                    }
+                }
+            }
+        }
+
+        for edge in &changes.edges {
+            if !dag_edge_types.contains(&edge.edge_type) {
+                continue;
+            }
+
+            let by_type = adjacency.entry(edge.edge_type.clone()).or_default();
+            let is_delete = matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)));
+            if is_delete {
+                if let Some(targets) = by_type.get_mut(&edge.source) {
+                    targets.remove(&edge.target);
+                    if targets.is_empty() {
+                        by_type.remove(&edge.source);
+                    }
+                }
+                continue;
+            }
+
+            if edge.source == edge.target
+                || sync_projected_edge_has_path(by_type, edge.target, edge.source)
+            {
+                return Err(Error::CycleDetected {
+                    edge_type: edge.edge_type.clone(),
+                    source_node: edge.source,
+                    target_node: edge.target,
+                });
+            }
+
+            by_type.entry(edge.source).or_default().insert(edge.target);
+        }
+
+        Ok(())
+    }
+
     /// Extracts changes from this database since the given LSN.
     pub fn changes_since(&self, since_lsn: Lsn) -> ChangeSet {
         let _operation = self.assert_open_operation();
@@ -4655,15 +5049,24 @@ impl Database {
 
         // Check if the ephemeral logs can serve the requested watermark.
         // After restart, both logs are empty but stores may have data — fall back to snapshot.
-        let log = self.change_log.read();
-        let change_first_lsn = log.first().map(|e| e.lsn());
-        let change_log_empty = log.is_empty();
-        drop(log);
+        let (change_first_lsn, change_log_empty, ddl_first_lsn, ddl_log_empty) = self
+            .with_commit_lock(|| {
+                let log = self.change_log.read();
+                let change_first_lsn = log.first().map(|e| e.lsn());
+                let change_log_empty = log.is_empty();
+                drop(log);
 
-        let ddl = self.ddl_log.read();
-        let ddl_first_lsn = ddl.first().map(|(lsn, _)| *lsn);
-        let ddl_log_empty = ddl.is_empty();
-        drop(ddl);
+                let ddl = self.ddl_log.read();
+                let ddl_first_lsn = ddl.first().map(|(lsn, _)| *lsn);
+                let ddl_log_empty = ddl.is_empty();
+
+                (
+                    change_first_lsn,
+                    change_log_empty,
+                    ddl_first_lsn,
+                    ddl_log_empty,
+                )
+            });
 
         let has_table_data = !self
             .relational_store
@@ -4693,8 +5096,8 @@ impl Database {
         }
 
         let (ddl, change_entries) = self.with_commit_lock(|| {
-            let ddl = self.ddl_log_since(since_lsn);
-            let changes = self.change_log_since(since_lsn);
+            let ddl = self.ddl_log_since_unlocked(since_lsn);
+            let changes = self.change_log_since_unlocked(since_lsn);
             (ddl, changes)
         });
 
@@ -4705,7 +5108,8 @@ impl Database {
         for entry in change_entries {
             match entry {
                 ChangeLogEntry::RowInsert { table, row_id, lsn } => {
-                    if let Some((natural_key, values)) = self.row_change_values(&table, row_id) {
+                    if let Some((natural_key, values)) = self.row_change_values(&table, row_id, lsn)
+                    {
                         rows.push(RowChange {
                             table,
                             natural_key,
@@ -4877,7 +5281,9 @@ impl Database {
 
     pub fn pause_after_relational_apply_for_test(&self) -> ApplyPhasePauseGuard {
         let _operation = self.assert_open_operation();
-        ApplyPhasePauseGuard { _private: () }
+        let inner = self.apply_phase_pause.clone();
+        let generation = inner.arm();
+        ApplyPhasePauseGuard { inner, generation }
     }
 
     pub fn cron_audit_log_for_test(&self) -> Vec<CronAuditEntry> {
@@ -4977,9 +5383,12 @@ impl Database {
                 }
             }
         }
+        self.preflight_sync_ddl_mixed_apply(&changes)?;
 
+        let atomic_mixed_apply = !changes.edges.is_empty() || !changes.vectors.is_empty();
         let mut tx = self.begin();
-        let batch_row_commits = changes.rows.len() > 128;
+        let commit_each_row = !atomic_mixed_apply && changes.rows.len() <= 128;
+        let batch_row_commits = !atomic_mixed_apply && changes.rows.len() > 128;
         let mut result = ApplyResult {
             applied_rows: 0,
             skipped_rows: 0,
@@ -4993,40 +5402,41 @@ impl Database {
         let mut table_meta_cache: HashMap<String, Option<TableMeta>> = HashMap::new();
         let mut visible_rows_cache: HashMap<String, Vec<VersionedRow>> = HashMap::new();
 
-        for ddl in changes.ddl.clone() {
-            match ddl {
-                DdlChange::CreateTable {
-                    name,
-                    columns,
-                    constraints,
-                } => {
-                    if self.table_meta(&name).is_some() {
-                        if let Some(local_meta) = self.table_meta(&name) {
-                            let local_cols: Vec<(String, String)> = local_meta
-                                .columns
-                                .iter()
-                                .map(|c| {
-                                    (
-                                        c.name.clone(),
-                                        normalize_schema_type(&sql_type_for_meta_column(
-                                            c,
-                                            &local_meta.propagation_rules,
-                                        )),
-                                    )
-                                })
-                                .collect();
-                            let remote_cols: Vec<(String, String)> = columns
-                                .iter()
-                                .map(|(col_name, col_type)| {
-                                    (col_name.clone(), normalize_schema_type(col_type))
-                                })
-                                .collect();
-                            let mut local_sorted = local_cols.clone();
-                            local_sorted.sort();
-                            let mut remote_sorted = remote_cols.clone();
-                            remote_sorted.sort();
-                            if local_sorted != remote_sorted {
-                                result.conflicts.push(Conflict {
+        let ddl_result = (|| -> Result<()> {
+            for ddl in changes.ddl.clone() {
+                match ddl {
+                    DdlChange::CreateTable {
+                        name,
+                        columns,
+                        constraints,
+                    } => {
+                        if self.table_meta(&name).is_some() {
+                            if let Some(local_meta) = self.table_meta(&name) {
+                                let local_cols: Vec<(String, String)> = local_meta
+                                    .columns
+                                    .iter()
+                                    .map(|c| {
+                                        (
+                                            c.name.clone(),
+                                            normalize_schema_type(&sql_type_for_meta_column(
+                                                c,
+                                                &local_meta.propagation_rules,
+                                            )),
+                                        )
+                                    })
+                                    .collect();
+                                let remote_cols: Vec<(String, String)> = columns
+                                    .iter()
+                                    .map(|(col_name, col_type)| {
+                                        (col_name.clone(), normalize_schema_type(col_type))
+                                    })
+                                    .collect();
+                                let mut local_sorted = local_cols.clone();
+                                local_sorted.sort();
+                                let mut remote_sorted = remote_cols.clone();
+                                remote_sorted.sort();
+                                if local_sorted != remote_sorted {
+                                    result.conflicts.push(Conflict {
                                     natural_key: NaturalKey {
                                         column: "table".to_string(),
                                         value: Value::Text(name.clone()),
@@ -5037,153 +5447,164 @@ impl Database {
                                         local_cols, remote_cols
                                     )),
                                 });
+                                }
                             }
-                        }
-                        continue;
-                    }
-                    let mut sql = format!(
-                        "CREATE TABLE {} ({})",
-                        name,
-                        columns
-                            .iter()
-                            .map(|(col, ty)| format!("{col} {ty}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    if !constraints.is_empty() {
-                        sql.push(' ');
-                        sql.push_str(&constraints.join(" "));
-                    }
-                    self.execute_in_tx(tx, &sql, &HashMap::new())?;
-                    self.clear_statement_cache();
-                    table_meta_cache.remove(&name);
-                    visible_rows_cache.remove(&name);
-                }
-                DdlChange::DropTable { name } => {
-                    if self.table_meta(&name).is_some() {
-                        if let Some(block) =
-                            crate::executor::rank_policy_drop_table_blocker(self, &name)
-                        {
-                            return Err(block);
-                        }
-                        self.drop_table_aux_state(&name);
-                        self.remove_rank_formulas_for_table(&name);
-                        self.relational_store().drop_table(&name);
-                        self.remove_persisted_table(&name)?;
-                        self.clear_statement_cache();
-                    }
-                    table_meta_cache.remove(&name);
-                    visible_rows_cache.remove(&name);
-                }
-                DdlChange::AlterTable {
-                    name,
-                    columns,
-                    constraints,
-                } => {
-                    if self.table_meta(&name).is_none() {
-                        continue;
-                    }
-                    let existing = self.table_meta(&name).unwrap_or_default();
-                    let existing_cols: HashSet<String> =
-                        existing.columns.iter().map(|c| c.name.clone()).collect();
-                    for (col, ty) in columns {
-                        if existing_cols.contains(&col) {
                             continue;
                         }
-                        let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", name, col, ty);
-                        self.execute_in_tx(tx, &sql, &HashMap::new())?;
-                    }
-                    let _ = constraints;
-                    self.clear_statement_cache();
-                    table_meta_cache.remove(&name);
-                    visible_rows_cache.remove(&name);
-                }
-                DdlChange::CreateIndex {
-                    table,
-                    name,
-                    columns,
-                } => {
-                    // Apply at the receiver: write IndexDecl into
-                    // TableMeta.indexes, register storage, rebuild over
-                    // locally-resident rows. Emit a matching DDL log entry.
-                    // Silently skipping on missing table would hide sync
-                    // divergence; surface it as TableNotFound so the caller
-                    // can see which index couldn't land.
-                    if self.table_meta(&table).is_none() {
-                        return Err(Error::TableNotFound(table.clone()));
-                    }
-                    let already = self
-                        .table_meta(&table)
-                        .map(|m| m.indexes.iter().any(|i| i.name == name))
-                        .unwrap_or(false);
-                    if !already {
-                        {
-                            let store = self.relational_store();
-                            let mut metas = store.table_meta.write();
-                            if let Some(m) = metas.get_mut(&table) {
-                                m.indexes.push(contextdb_core::IndexDecl {
-                                    name: name.clone(),
-                                    columns: columns.clone(),
-                                    kind: contextdb_core::IndexKind::UserDeclared,
-                                });
-                            }
-                        }
-                        self.relational_store().create_index_storage(
-                            &table,
-                            &name,
-                            columns.clone(),
+                        let mut sql = format!(
+                            "CREATE TABLE {} ({})",
+                            name,
+                            columns
+                                .iter()
+                                .map(|(col, ty)| format!("{col} {ty}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
-                        self.relational_store().rebuild_index(&table, &name);
-                        if let Some(table_meta) = self.table_meta(&table) {
-                            self.persist_table_meta(&table, &table_meta)?;
+                        if !constraints.is_empty() {
+                            sql.push(' ');
+                            sql.push_str(&constraints.join(" "));
                         }
-                        self.allocate_ddl_lsn(|lsn| {
-                            self.log_create_index_ddl(&table, &name, &columns, lsn)
-                        })?;
+                        self.execute_in_tx(tx, &sql, &HashMap::new())?;
                         self.clear_statement_cache();
+                        table_meta_cache.remove(&name);
+                        visible_rows_cache.remove(&name);
                     }
-                    table_meta_cache.remove(&table);
-                }
-                DdlChange::DropIndex { table, name } => {
-                    if self.table_meta(&table).is_some() {
-                        let exists = self
-                            .table_meta(&table)
-                            .map(|m| m.indexes.iter().any(|i| i.name == name))
-                            .unwrap_or(false);
-                        if exists {
+                    DdlChange::DropTable { name } => {
+                        if self.table_meta(&name).is_some() {
                             if let Some(block) =
-                                crate::executor::rank_policy_drop_index_blocker(self, &table, &name)
+                                crate::executor::rank_policy_drop_table_blocker(self, &name)
                             {
                                 return Err(block);
                             }
+                            let bytes_to_release =
+                                crate::executor::estimate_drop_table_bytes(self, &name);
+                            self.drop_table_aux_state(&name);
+                            self.remove_rank_formulas_for_table(&name);
+                            self.vector_store_deregister_table(&name);
+                            self.relational_store().drop_table(&name);
+                            self.remove_persisted_table(&name)?;
+                            self.persist_vectors()?;
+                            self.persist_graph_edges()?;
+                            self.allocate_ddl_lsn(|lsn| self.log_drop_table_ddl(&name, lsn))?;
+                            self.accountant().release(bytes_to_release);
+                            self.clear_statement_cache();
+                        }
+                        table_meta_cache.remove(&name);
+                        visible_rows_cache.remove(&name);
+                    }
+                    DdlChange::AlterTable {
+                        name,
+                        columns,
+                        constraints,
+                    } => {
+                        if self.table_meta(&name).is_none() {
+                            continue;
+                        }
+                        let existing = self.table_meta(&name).unwrap_or_default();
+                        let existing_cols: HashSet<String> =
+                            existing.columns.iter().map(|c| c.name.clone()).collect();
+                        for (col, ty) in columns {
+                            if existing_cols.contains(&col) {
+                                continue;
+                            }
+                            let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", name, col, ty);
+                            self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                        }
+                        let _ = constraints;
+                        self.clear_statement_cache();
+                        table_meta_cache.remove(&name);
+                        visible_rows_cache.remove(&name);
+                    }
+                    DdlChange::CreateIndex {
+                        table,
+                        name,
+                        columns,
+                    } => {
+                        // Apply at the receiver: write IndexDecl into
+                        // TableMeta.indexes, register storage, rebuild over
+                        // locally-resident rows. Emit a matching DDL log entry.
+                        // Silently skipping on missing table would hide sync
+                        // divergence; surface it as TableNotFound so the caller
+                        // can see which index couldn't land.
+                        if self.table_meta(&table).is_none() {
+                            return Err(Error::TableNotFound(table.clone()));
+                        }
+                        let already = self
+                            .table_meta(&table)
+                            .map(|m| m.indexes.iter().any(|i| i.name == name))
+                            .unwrap_or(false);
+                        if !already {
                             {
                                 let store = self.relational_store();
                                 let mut metas = store.table_meta.write();
                                 if let Some(m) = metas.get_mut(&table) {
-                                    m.indexes.retain(|i| i.name != name);
+                                    m.indexes.push(contextdb_core::IndexDecl {
+                                        name: name.clone(),
+                                        columns: columns.clone(),
+                                        kind: contextdb_core::IndexKind::UserDeclared,
+                                    });
                                 }
                             }
-                            self.relational_store().drop_index_storage(&table, &name);
+                            self.relational_store().create_index_storage(
+                                &table,
+                                &name,
+                                columns.clone(),
+                            );
+                            self.relational_store().rebuild_index(&table, &name);
                             if let Some(table_meta) = self.table_meta(&table) {
                                 self.persist_table_meta(&table, &table_meta)?;
                             }
                             self.allocate_ddl_lsn(|lsn| {
-                                self.log_drop_index_ddl(&table, &name, lsn)
+                                self.log_create_index_ddl(&table, &name, &columns, lsn)
                             })?;
                             self.clear_statement_cache();
                         }
+                        table_meta_cache.remove(&table);
                     }
-                    table_meta_cache.remove(&table);
+                    DdlChange::DropIndex { table, name } => {
+                        if self.table_meta(&table).is_some() {
+                            let exists = self
+                                .table_meta(&table)
+                                .map(|m| m.indexes.iter().any(|i| i.name == name))
+                                .unwrap_or(false);
+                            if exists {
+                                if let Some(block) = crate::executor::rank_policy_drop_index_blocker(
+                                    self, &table, &name,
+                                ) {
+                                    return Err(block);
+                                }
+                                {
+                                    let store = self.relational_store();
+                                    let mut metas = store.table_meta.write();
+                                    if let Some(m) = metas.get_mut(&table) {
+                                        m.indexes.retain(|i| i.name != name);
+                                    }
+                                }
+                                self.relational_store().drop_index_storage(&table, &name);
+                                if let Some(table_meta) = self.table_meta(&table) {
+                                    self.persist_table_meta(&table, &table_meta)?;
+                                }
+                                self.allocate_ddl_lsn(|lsn| {
+                                    self.log_drop_index_ddl(&table, &name, lsn)
+                                })?;
+                                self.clear_statement_cache();
+                            }
+                        }
+                        table_meta_cache.remove(&table);
+                    }
                 }
             }
+            Ok(())
+        })();
+        if let Err(err) = ddl_result {
+            let _ = self.rollback(tx);
+            return Err(err);
         }
-
-        self.preflight_sync_apply_memory(&changes, policies)?;
 
         for row in changes.rows {
             if row.values.is_empty() {
                 result.skipped_rows += 1;
-                if !batch_row_commits {
+                if commit_each_row {
                     self.commit_with_source(tx, CommitSource::SyncPull)?;
                     tx = self.begin();
                 }
@@ -5196,13 +5617,19 @@ impl Database {
                 .copied()
                 .unwrap_or(policies.default);
 
-            let existing = cached_point_lookup(
+            let existing = match cached_point_lookup(
                 self,
                 &mut visible_rows_cache,
                 &row.table,
                 &row.natural_key.column,
                 &row.natural_key.value,
-            )?;
+            ) {
+                Ok(existing) => existing,
+                Err(err) => {
+                    let _ = self.rollback(tx);
+                    return Err(err);
+                }
+            };
             let is_delete = row.deleted;
             let row_has_vector = cached_table_meta(self, &mut table_meta_cache, &row.table)
                 .is_some_and(|meta| {
@@ -5235,7 +5662,7 @@ impl Database {
                 } else {
                     result.skipped_rows += 1;
                 }
-                if !batch_row_commits {
+                if commit_each_row {
                     self.commit_with_source(tx, CommitSource::SyncPull)?;
                     tx = self.begin();
                 }
@@ -5271,17 +5698,24 @@ impl Database {
                         let has_unique = meta.columns.iter().any(|c| c.unique && !c.primary_key);
                         if constraint_error.is_none() && has_unique {
                             for col_def in &meta.columns {
+                                let visible_rows = match cached_visible_rows(
+                                    self,
+                                    &mut visible_rows_cache,
+                                    &row.table,
+                                ) {
+                                    Ok(rows) => rows,
+                                    Err(err) => {
+                                        let _ = self.rollback(tx);
+                                        return Err(err);
+                                    }
+                                };
                                 if col_def.unique
                                     && !col_def.primary_key
                                     && let Some(new_val) = values.get(&col_def.name)
                                     && *new_val != Value::Null
-                                    && cached_visible_rows(
-                                        self,
-                                        &mut visible_rows_cache,
-                                        &row.table,
-                                    )?
-                                    .iter()
-                                    .any(|r| r.values.get(&col_def.name) == Some(new_val))
+                                    && visible_rows
+                                        .iter()
+                                        .any(|r| r.values.get(&col_def.name) == Some(new_val))
                                 {
                                     constraint_error = Some(format!(
                                         "UNIQUE constraint violated: {}.{}",
@@ -5306,7 +5740,7 @@ impl Database {
                                 resolution: policy,
                                 reason: Some(err_msg),
                             });
-                            if !batch_row_commits {
+                            if commit_each_row {
                                 self.commit_with_source(tx, CommitSource::SyncPull)?;
                                 tx = self.begin();
                             }
@@ -5318,13 +5752,15 @@ impl Database {
                     let mut overflow: Option<Error> = None;
                     for v in values.values() {
                         if let Value::TxId(incoming) = v
-                            && let Err(err) = self.tx_mgr.advance_for_sync(&row.table, *incoming)
+                            && let Err(err) =
+                                self.tx_mgr.advance_for_sync(tx, &row.table, *incoming)
                         {
                             overflow = Some(err);
                             break;
                         }
                     }
                     if let Some(err) = overflow {
+                        let _ = self.rollback(tx);
                         return Err(err);
                     }
 
@@ -5354,6 +5790,7 @@ impl Database {
                         }
                         Err(err) => {
                             if is_fatal_sync_apply_error(&err) {
+                                let _ = self.rollback(tx);
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
@@ -5477,7 +5914,7 @@ impl Database {
                                             current, incoming, current
                                         )),
                                     });
-                                    if !batch_row_commits {
+                                    if commit_each_row {
                                         self.commit_with_source(tx, CommitSource::SyncPull)?;
                                         tx = self.begin();
                                     }
@@ -5491,13 +5928,14 @@ impl Database {
                         for v in values.values() {
                             if let Value::TxId(incoming) = v
                                 && let Err(err) =
-                                    self.tx_mgr.advance_for_sync(&row.table, *incoming)
+                                    self.tx_mgr.advance_for_sync(tx, &row.table, *incoming)
                             {
                                 overflow = Some(err);
                                 break;
                             }
                         }
                         if let Some(err) = overflow {
+                            let _ = self.rollback(tx);
                             return Err(err);
                         }
 
@@ -5530,6 +5968,7 @@ impl Database {
                             }
                             Err(err) => {
                                 if is_fatal_sync_apply_error(&err) {
+                                    let _ = self.rollback(tx);
                                     return Err(err);
                                 }
                                 result.skipped_rows += 1;
@@ -5558,13 +5997,15 @@ impl Database {
                     let mut overflow: Option<Error> = None;
                     for v in values.values() {
                         if let Value::TxId(incoming) = v
-                            && let Err(err) = self.tx_mgr.advance_for_sync(&row.table, *incoming)
+                            && let Err(err) =
+                                self.tx_mgr.advance_for_sync(tx, &row.table, *incoming)
                         {
                             overflow = Some(err);
                             break;
                         }
                     }
                     if let Some(err) = overflow {
+                        let _ = self.rollback(tx);
                         return Err(err);
                     }
 
@@ -5597,6 +6038,7 @@ impl Database {
                         }
                         Err(err) => {
                             if is_fatal_sync_apply_error(&err) {
+                                let _ = self.rollback(tx);
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
@@ -5615,7 +6057,7 @@ impl Database {
                 }
             }
 
-            if !batch_row_commits {
+            if commit_each_row {
                 self.commit_with_source(tx, CommitSource::SyncPull)?;
                 tx = self.begin();
             }
@@ -5629,15 +6071,21 @@ impl Database {
         for edge in changes.edges {
             let is_delete = matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)));
             if is_delete {
-                let _ = self.delete_edge(tx, edge.source, edge.target, &edge.edge_type);
+                if let Err(err) = self.delete_edge(tx, edge.source, edge.target, &edge.edge_type) {
+                    let _ = self.rollback(tx);
+                    return Err(err);
+                }
             } else {
-                let _ = self.insert_edge(
+                if let Err(err) = self.insert_edge(
                     tx,
                     edge.source,
                     edge.target,
                     edge.edge_type,
                     edge.properties,
-                );
+                ) {
+                    let _ = self.rollback(tx);
+                    return Err(err);
+                }
             }
         }
 
@@ -5650,12 +6098,20 @@ impl Database {
                 .copied()
                 .unwrap_or(vector.row_id);
             if vector.vector.is_empty() {
-                self.delete_vector(tx, vector.index.clone(), local_row_id)?;
+                if let Err(err) = self.delete_vector(tx, vector.index.clone(), local_row_id) {
+                    let _ = self.rollback(tx);
+                    return Err(err);
+                }
             } else {
                 if self.has_live_vector(local_row_id, self.snapshot()) {
                     let _ = self.delete_vector(tx, vector.index.clone(), local_row_id);
                 }
-                self.insert_vector_strict(tx, vector.index.clone(), local_row_id, vector.vector)?;
+                if let Err(err) =
+                    self.insert_vector_strict(tx, vector.index.clone(), local_row_id, vector.vector)
+                {
+                    let _ = self.rollback(tx);
+                    return Err(err);
+                }
             }
         }
 
@@ -5668,11 +6124,16 @@ impl Database {
         &self,
         table: &str,
         row_id: RowId,
+        lsn: Lsn,
     ) -> Option<(NaturalKey, HashMap<String, Value>)> {
         let tables = self.relational_store.tables.read();
         let meta = self.relational_store.table_meta.read();
         let rows = tables.get(table)?;
-        let row = rows.iter().find(|r| r.row_id == row_id)?;
+        let row = rows
+            .iter()
+            .rev()
+            .find(|r| r.row_id == row_id && r.lsn == lsn)
+            .or_else(|| rows.iter().rev().find(|r| r.row_id == row_id))?;
         let key_col = meta
             .get(table)
             .and_then(|m| m.natural_key_column.clone())
@@ -5929,7 +6390,9 @@ fn hydrate_relational_vector_values(relational: &RelationalStore, vectors: &[Vec
         let Some(rows) = tables.get_mut(&entry.index.table) else {
             continue;
         };
-        if let Some(row) = rows.iter_mut().find(|row| row.row_id == entry.row_id) {
+        if let Some(row) = rows.iter_mut().find(|row| {
+            row.row_id == entry.row_id && row.created_tx == entry.created_tx && row.lsn == entry.lsn
+        }) {
             row.values.insert(
                 entry.index.column.clone(),
                 Value::Vector(entry.vector.clone()),
@@ -6230,6 +6693,230 @@ fn max_lsn_across_all(
         .unwrap_or(Lsn(0));
 
     relational_max.max(graph_max).max(vector_max)
+}
+
+fn commit_index_across_all(
+    relational: &RelationalStore,
+    graph: &GraphStore,
+    vector: &VectorStore,
+    change_log: &[ChangeLogEntry],
+) -> BTreeMap<Lsn, TxId> {
+    let mut index = BTreeMap::new();
+    let mut add_entry = |lsn: Lsn, tx: TxId| {
+        if lsn != Lsn(0) {
+            index
+                .entry(lsn)
+                .and_modify(|current: &mut TxId| *current = (*current).max(tx))
+                .or_insert(tx);
+        }
+    };
+    let relational_rows = relational
+        .tables
+        .read()
+        .iter()
+        .map(|(table, rows)| (table.clone(), rows.clone()))
+        .collect::<Vec<_>>();
+    for row in relational
+        .tables
+        .read()
+        .values()
+        .flat_map(|rows| rows.iter().cloned())
+    {
+        add_entry(row.lsn, row.created_tx);
+    }
+    let graph_entries = graph
+        .forward_adj
+        .read()
+        .values()
+        .flat_map(|entries| entries.iter().cloned())
+        .collect::<Vec<_>>();
+    for entry in graph
+        .forward_adj
+        .read()
+        .values()
+        .flat_map(|entries| entries.iter().cloned())
+    {
+        add_entry(entry.lsn, entry.created_tx);
+    }
+    let vector_entries = vector.all_entries();
+    for entry in &vector_entries {
+        add_entry(entry.lsn, entry.created_tx);
+    }
+
+    for entry in change_log {
+        match entry {
+            ChangeLogEntry::RowInsert { .. }
+            | ChangeLogEntry::EdgeInsert { .. }
+            | ChangeLogEntry::VectorInsert { .. } => {}
+            ChangeLogEntry::RowDelete {
+                table, row_id, lsn, ..
+            } => {
+                if let Some(deleted_tx) = relational_rows
+                    .iter()
+                    .find(|(candidate, _)| candidate == table)
+                    .and_then(|(_, rows)| {
+                        rows.iter()
+                            .filter(|row| {
+                                row.row_id == *row_id && row.lsn < *lsn && row.deleted_tx.is_some()
+                            })
+                            .max_by_key(|row| row.lsn)
+                            .and_then(|row| row.deleted_tx)
+                    })
+                {
+                    add_entry(*lsn, deleted_tx);
+                }
+            }
+            ChangeLogEntry::EdgeDelete {
+                source,
+                target,
+                edge_type,
+                lsn,
+            } => {
+                if let Some(deleted_tx) = graph_entries
+                    .iter()
+                    .filter(|edge| {
+                        edge.source == *source
+                            && edge.target == *target
+                            && edge.edge_type == *edge_type
+                            && edge.lsn < *lsn
+                            && edge.deleted_tx.is_some()
+                    })
+                    .max_by_key(|edge| edge.lsn)
+                    .and_then(|edge| edge.deleted_tx)
+                {
+                    add_entry(*lsn, deleted_tx);
+                }
+            }
+            ChangeLogEntry::VectorDelete {
+                index: vector_index,
+                row_id,
+                lsn,
+            } => {
+                if let Some(deleted_tx) = vector_entries
+                    .iter()
+                    .filter(|vector| {
+                        vector.index == *vector_index
+                            && vector.row_id == *row_id
+                            && vector.lsn < *lsn
+                            && vector.deleted_tx.is_some()
+                    })
+                    .max_by_key(|vector| vector.lsn)
+                    .and_then(|vector| vector.deleted_tx)
+                {
+                    add_entry(*lsn, deleted_tx);
+                }
+            }
+        }
+    }
+    index
+}
+
+fn repair_visibility_tx_order_if_needed(
+    relational: &RelationalStore,
+    graph: &GraphStore,
+    vector: &VectorStore,
+    loaded_vectors: &mut [VectorEntry],
+    table_meta: &HashMap<String, TableMeta>,
+    persistence: &RedbPersistence,
+    commit_index: &mut BTreeMap<Lsn, TxId>,
+) -> Result<bool> {
+    let mut previous = TxId(0);
+    let mut needs_repair = false;
+    for tx in commit_index.values() {
+        if *tx < previous {
+            needs_repair = true;
+            break;
+        }
+        previous = *tx;
+    }
+    if !needs_repair {
+        return Ok(false);
+    }
+
+    let mut tx_remap = HashMap::new();
+    for (idx, tx) in commit_index.values().copied().enumerate() {
+        tx_remap.entry(tx).or_insert(TxId(idx as u64 + 1));
+    }
+
+    for tx in commit_index.values_mut() {
+        if let Some(mapped) = tx_remap.get(tx) {
+            *tx = *mapped;
+        }
+    }
+
+    let mut table_rows = {
+        let mut tables = relational.tables.write();
+        for rows in tables.values_mut() {
+            for row in rows.iter_mut() {
+                remap_tx_id(&mut row.created_tx, &tx_remap);
+                if let Some(deleted_tx) = &mut row.deleted_tx {
+                    remap_tx_id(deleted_tx, &tx_remap);
+                }
+            }
+        }
+        tables
+            .iter()
+            .map(|(table, rows)| (table.clone(), rows.clone()))
+            .collect::<Vec<_>>()
+    };
+    for (table, meta) in table_meta {
+        for decl in &meta.indexes {
+            relational.rebuild_index(table, &decl.name);
+        }
+    }
+
+    let graph_edges = {
+        let mut edges = graph
+            .forward_adj
+            .read()
+            .values()
+            .flat_map(|entries| entries.iter().cloned())
+            .collect::<Vec<_>>();
+        for edge in &mut edges {
+            remap_tx_id(&mut edge.created_tx, &tx_remap);
+            if let Some(deleted_tx) = &mut edge.deleted_tx {
+                remap_tx_id(deleted_tx, &tx_remap);
+            }
+        }
+
+        let mut forward = HashMap::new();
+        let mut reverse = HashMap::new();
+        for edge in &edges {
+            forward
+                .entry(edge.source)
+                .or_insert_with(Vec::new)
+                .push(edge.clone());
+            reverse
+                .entry(edge.target)
+                .or_insert_with(Vec::new)
+                .push(edge.clone());
+        }
+        *graph.forward_adj.write() = forward;
+        *graph.reverse_adj.write() = reverse;
+        edges
+    };
+
+    for entry in loaded_vectors.iter_mut() {
+        remap_tx_id(&mut entry.created_tx, &tx_remap);
+        if let Some(deleted_tx) = &mut entry.deleted_tx {
+            remap_tx_id(deleted_tx, &tx_remap);
+        }
+    }
+    vector.replace_loaded_vectors(loaded_vectors.to_vec());
+
+    for (table, rows) in table_rows.drain(..) {
+        persistence.rewrite_table_rows(&table, &rows)?;
+    }
+    persistence.rewrite_graph_edges(&graph_edges)?;
+    persistence.rewrite_vectors(loaded_vectors)?;
+
+    Ok(true)
+}
+
+fn remap_tx_id(tx: &mut TxId, tx_remap: &HashMap<TxId, TxId>) {
+    if let Some(mapped) = tx_remap.get(tx) {
+        *tx = *mapped;
+    }
 }
 
 fn is_fatal_sync_apply_error(err: &Error) -> bool {
@@ -6557,6 +7244,161 @@ fn sql_quote(value: &str) -> String {
 
 fn normalize_schema_type(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn ddl_vector_dimension(value: &str) -> Option<usize> {
+    let upper = value.to_ascii_uppercase();
+    let start = upper.find("VECTOR(")? + "VECTOR(".len();
+    let end = upper[start..].find(')')? + start;
+    upper[start..end].trim().parse().ok()
+}
+
+fn ddl_dag_edge_types(constraints: &[String]) -> Vec<EdgeType> {
+    let mut edge_types = Vec::new();
+    for constraint in constraints {
+        let upper = constraint.to_ascii_uppercase();
+        let Some(dag_start) = upper.find("DAG") else {
+            continue;
+        };
+        let Some(paren_offset) = upper[dag_start..].find('(') else {
+            continue;
+        };
+        let values_start = dag_start + paren_offset + 1;
+        let Some(end_offset) = upper[values_start..].find(')') else {
+            continue;
+        };
+        let values_end = values_start + end_offset;
+        for raw in constraint[values_start..values_end].split(',') {
+            let edge_type = raw
+                .trim()
+                .trim_matches(|ch: char| ch == '\'' || ch == '"' || ch.is_whitespace());
+            if !edge_type.is_empty() {
+                edge_types.push(edge_type.to_string());
+            }
+        }
+    }
+
+    edge_types
+}
+
+fn rough_sync_table_meta(columns: &[(String, String)], constraints: &[String]) -> TableMeta {
+    let column_defs = columns
+        .iter()
+        .map(|(name, ty)| rough_sync_column_def(name, ty))
+        .collect::<Vec<_>>();
+    let indexes = column_defs
+        .iter()
+        .filter(|column| {
+            (column.primary_key || column.unique)
+                && !matches!(column.column_type, ColumnType::Json | ColumnType::Vector(_))
+        })
+        .map(|column| IndexDecl {
+            name: if column.primary_key {
+                format!("__pk_{}", column.name)
+            } else {
+                format!("__unique_{}", column.name)
+            },
+            columns: vec![(column.name.clone(), SortDirection::Asc)],
+            kind: IndexKind::Auto,
+        })
+        .collect();
+
+    TableMeta {
+        columns: column_defs,
+        immutable: constraints
+            .iter()
+            .any(|constraint| constraint.eq_ignore_ascii_case("IMMUTABLE")),
+        state_machine: None,
+        dag_edge_types: ddl_dag_edge_types(constraints),
+        unique_constraints: Vec::new(),
+        natural_key_column: None,
+        propagation_rules: Vec::new(),
+        default_ttl_seconds: None,
+        sync_safe: false,
+        expires_column: None,
+        indexes,
+    }
+}
+
+fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
+    let upper = normalize_schema_type(ty).to_ascii_uppercase();
+    let primary_key = upper.contains("PRIMARY KEY");
+    let unique = upper.contains("UNIQUE");
+    let expires = upper.contains("EXPIRES");
+    let immutable = upper.contains("IMMUTABLE");
+    let quantization = if upper.contains("SQ4") {
+        VectorQuantization::SQ4
+    } else if upper.contains("SQ8") {
+        VectorQuantization::SQ8
+    } else {
+        VectorQuantization::F32
+    };
+    let column_type = if let Some(dimension) = ddl_vector_dimension(ty) {
+        ColumnType::Vector(dimension)
+    } else if upper.starts_with("UUID") {
+        ColumnType::Uuid
+    } else if upper.starts_with("TEXT") {
+        ColumnType::Text
+    } else if upper.starts_with("INTEGER") || upper.starts_with("INT") {
+        ColumnType::Integer
+    } else if upper.starts_with("REAL") || upper.starts_with("FLOAT") || upper.starts_with("DOUBLE")
+    {
+        ColumnType::Real
+    } else if upper.starts_with("BOOLEAN") || upper.starts_with("BOOL") {
+        ColumnType::Boolean
+    } else if upper.starts_with("TIMESTAMP") {
+        ColumnType::Timestamp
+    } else if upper.starts_with("TXID") {
+        ColumnType::TxId
+    } else if upper.starts_with("JSON") {
+        ColumnType::Json
+    } else {
+        ColumnType::Text
+    };
+
+    ColumnDef {
+        name: name.to_string(),
+        column_type,
+        nullable: !primary_key && !upper.contains("NOT NULL"),
+        primary_key,
+        unique,
+        default: None,
+        references: None,
+        expires,
+        immutable,
+        quantization,
+        rank_policy: None,
+        context_id: upper.contains("CONTEXT_ID"),
+        scope_label: None,
+        acl_ref: None,
+    }
+}
+
+fn sync_projected_edge_has_path(
+    adjacency: &HashMap<NodeId, HashSet<NodeId>>,
+    start: NodeId,
+    goal: NodeId,
+) -> bool {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(start);
+    queue.push_back(start);
+
+    while let Some(current) = queue.pop_front() {
+        let Some(targets) = adjacency.get(&current) else {
+            continue;
+        };
+        for target in targets {
+            if *target == goal {
+                return true;
+            }
+            if visited.insert(*target) {
+                queue.push_back(*target);
+            }
+        }
+    }
+
+    false
 }
 
 fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {

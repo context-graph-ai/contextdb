@@ -42,6 +42,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
 
         if let Some(tx_id) = tx {
             let _ = self.tx_mgr.with_write_set(tx_id, |ws| {
+                let committed_row_ids: std::collections::HashSet<RowId> =
+                    result.iter().map(|row| row.row_id).collect();
                 let deleted_row_ids: std::collections::HashSet<RowId> = ws
                     .relational_deletes
                     .iter()
@@ -49,10 +51,22 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     .map(|(_, row_id, _)| *row_id)
                     .collect();
                 result.retain(|row| !deleted_row_ids.contains(&row.row_id));
-                for (t, row) in &ws.relational_inserts {
-                    if t == table && !deleted_row_ids.contains(&row.row_id) {
-                        result.push(row.clone());
-                    }
+                let mut seen_inserts = std::collections::HashSet::new();
+                let mut inserts = ws
+                    .relational_inserts
+                    .iter()
+                    .rev()
+                    .filter(|(t, row)| {
+                        t == table
+                            && seen_inserts.insert(row.row_id)
+                            && (!deleted_row_ids.contains(&row.row_id)
+                                || committed_row_ids.contains(&row.row_id))
+                    })
+                    .map(|(_, row)| row.clone())
+                    .collect::<Vec<_>>();
+                inserts.reverse();
+                for row in inserts {
+                    result.push(row);
                 }
             });
         }
@@ -137,6 +151,38 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         self.validate_state_transition(tx, table, &values, snapshot)?;
 
         let row_id = self.store.new_row_id();
+        let row = VersionedRow {
+            row_id,
+            values,
+            created_tx: tx,
+            deleted_tx: None,
+            lsn: contextdb_core::Lsn(0),
+            created_at: Some(contextdb_core::Wallclock(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            )),
+        };
+
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.relational_inserts.push((table.to_string(), row));
+        })?;
+
+        Ok(row_id)
+    }
+
+    pub fn insert_with_row_id(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        values: HashMap<ColName, Value>,
+        snapshot: SnapshotId,
+    ) -> Result<RowId> {
+        self.ensure_table_exists(table)?;
+        self.validate_state_transition(tx, table, &values, snapshot)?;
+
         let row = VersionedRow {
             row_id,
             values,
@@ -249,7 +295,23 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
         }
 
         self.tx_mgr.with_write_set(tx, |ws| {
-            ws.relational_deletes.push((table.to_string(), row_id, tx));
+            let table_name = table.to_string();
+            let committed_row_exists = self
+                .store
+                .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
+                .is_some();
+
+            ws.relational_inserts
+                .retain(|(t, row)| !(t == table && row.row_id == row_id));
+
+            if committed_row_exists
+                && !ws
+                    .relational_deletes
+                    .iter()
+                    .any(|(t, deleted_row_id, _)| t == table && *deleted_row_id == row_id)
+            {
+                ws.relational_deletes.push((table_name, row_id, tx));
+            }
         })?;
 
         Ok(())

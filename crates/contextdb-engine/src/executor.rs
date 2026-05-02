@@ -169,6 +169,8 @@ pub(crate) fn execute_plan(
             db.vector_store_deregister_table(name);
             db.relational_store().drop_table(name);
             db.remove_persisted_table(name)?;
+            db.persist_vectors()?;
+            db.persist_graph_edges()?;
             db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn))?;
             db.accountant().release(bytes_to_release);
             db.clear_statement_cache();
@@ -2657,18 +2659,17 @@ fn execute_index_scan(
     if row_ids.is_empty() {
         return Ok((Vec::new(), rows_examined));
     }
-    let tables = db.relational_store().tables.read();
-    let rows_slice = tables.get(table);
     let mut out: Vec<VersionedRow> = Vec::with_capacity(row_ids.len());
-    if let Some(rows) = rows_slice {
-        let by_id: HashMap<RowId, &VersionedRow> = rows.iter().map(|r| (r.row_id, r)).collect();
+    let tables = db.relational_store().tables.read();
+    if let Some(rows) = tables.get(table) {
+        let visible_by_id: HashMap<RowId, &VersionedRow> = rows
+            .iter()
+            .filter(|row| row.visible_at(snapshot))
+            .map(|row| (row.row_id, row))
+            .collect();
         for rid in &row_ids {
-            if let Some(r) = by_id.get(rid) {
-                // Layered-visibility check: apply same rule as scan_with_tx so
-                // deletes/inserts from the active tx are honored.
-                if (*r).visible_at(snapshot) {
-                    out.push((**r).clone());
-                }
+            if let Some(r) = visible_by_id.get(rid) {
+                out.push((**r).clone());
             }
         }
     }
@@ -3050,7 +3051,7 @@ fn dedupe_graph_frontier(
     best.into_values().collect()
 }
 
-fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
+pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     let meta = db.table_meta(table);
     let metadata_bytes = meta.as_ref().map(TableMeta::estimated_bytes).unwrap_or(0);
     let snapshot = db.snapshot();

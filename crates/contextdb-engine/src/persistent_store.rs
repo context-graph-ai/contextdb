@@ -19,7 +19,7 @@ impl WriteSetApplicator for PersistentCompositeStore {
     fn apply(&self, ws: WriteSet) -> Result<()> {
         let log_entries = self.inner.build_change_log_entries(&ws);
         self.persistence.flush_data_with_logs(&ws, &log_entries)?;
-        self.inner.apply(ws)
+        self.inner.apply_exact(ws)
     }
 
     fn new_row_id(&self) -> RowId {

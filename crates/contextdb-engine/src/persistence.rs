@@ -1,13 +1,13 @@
 use crate::composite_store::ChangeLogEntry;
 use crate::sync_types::DdlChange;
 use contextdb_core::{
-    AdjEntry, ColumnType, Error, Lsn, Result, TableMeta, Value, VectorEntry, VectorIndexRef,
+    AdjEntry, ColumnType, Error, Lsn, Result, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
     VectorQuantization, VersionedRow,
 };
 use contextdb_tx::WriteSet;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
@@ -21,6 +21,7 @@ const FORMAT_METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 const CHANGE_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("change_log");
 const DDL_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ddl_log");
+const COMMIT_INDEX_TABLE: TableDefinition<u64, u64> = TableDefinition::new("commit_index");
 const GRAPH_FWD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_fwd");
 const GRAPH_REV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_rev");
 const VECTORS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_entries");
@@ -394,39 +395,44 @@ impl RedbPersistence {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
 
+            for (table, row_id, deleted_tx) in &ws.relational_deletes {
+                let table_name = Self::rel_table_name(table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut redb_table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+                let mut live_versions = Vec::new();
+                for entry in redb_table.iter().map_err(Self::storage_error)? {
+                    let (key, value) = entry.map_err(Self::storage_error)?;
+                    let row = Self::decode_versioned_row(value.value(), table_meta.get(table))?;
+                    if row.row_id == *row_id && row.deleted_tx.is_none() {
+                        live_versions.push((key.value().to_vec(), row));
+                    }
+                }
+                if live_versions.is_empty() {
+                    return Err(Error::NotFound(format!("row {row_id} in table {table}")));
+                }
+                for (key, mut row) in live_versions {
+                    row.deleted_tx = Some(*deleted_tx);
+                    let encoded = Self::encode_versioned_row(&row, table_meta.get(table))?;
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
             for (table, row) in &ws.relational_inserts {
                 let table_name = Self::rel_table_name(table);
-                let table_def: TableDefinition<u64, &[u8]> =
+                let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
                 let mut redb_table = write_txn
                     .open_table(table_def)
                     .map_err(Self::storage_error)?;
                 let encoded = Self::encode_versioned_row(row, table_meta.get(table))?;
+                let key = Self::rel_row_key(row);
                 redb_table
-                    .insert(row.row_id.0, encoded.as_slice())
-                    .map_err(Self::storage_error)?;
-            }
-
-            for (table, row_id, deleted_tx) in &ws.relational_deletes {
-                let table_name = Self::rel_table_name(table);
-                let table_def: TableDefinition<u64, &[u8]> =
-                    TableDefinition::new(table_name.as_str());
-                let mut redb_table = write_txn
-                    .open_table(table_def)
-                    .map_err(Self::storage_error)?;
-                let bytes = {
-                    let existing = redb_table
-                        .get(row_id.0)
-                        .map_err(Self::storage_error)?
-                        .ok_or_else(|| Error::NotFound(format!("row {row_id} in table {table}")))?;
-                    let bytes: &[u8] = existing.value();
-                    bytes.to_vec()
-                };
-                let mut row = Self::decode_versioned_row(&bytes, table_meta.get(table))?;
-                row.deleted_tx = Some(*deleted_tx);
-                let encoded = Self::encode_versioned_row(&row, table_meta.get(table))?;
-                redb_table
-                    .insert(row_id.0, encoded.as_slice())
+                    .insert(key.as_slice(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
             }
 
@@ -438,38 +444,42 @@ impl RedbPersistence {
                     .open_table(GRAPH_REV_TABLE)
                     .map_err(Self::storage_error)?;
 
+                for (source, edge_type, target, deleted_tx) in &ws.adj_deletes {
+                    let mut live_versions = Vec::new();
+                    for entry in fwd_table.iter().map_err(Self::storage_error)? {
+                        let (key, value) = entry.map_err(Self::storage_error)?;
+                        let edge: AdjEntry = Self::decode(value.value())?;
+                        if edge.source == *source
+                            && edge.target == *target
+                            && edge.edge_type == *edge_type
+                            && edge.deleted_tx.is_none()
+                        {
+                            live_versions.push((key.value().to_vec(), edge));
+                        }
+                    }
+                    if live_versions.is_empty() {
+                        return Err(Error::NotFound(format!(
+                            "edge {source} -[{edge_type}]-> {target} in graph_fwd"
+                        )));
+                    }
+                    for (fwd_key, mut edge) in live_versions {
+                        edge.deleted_tx = Some(*deleted_tx);
+                        let encoded = Self::encode(&edge)?;
+                        let rev_key = Self::graph_rev_key(&edge);
+
+                        fwd_table
+                            .insert(fwd_key.as_slice(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        rev_table
+                            .insert(rev_key.as_slice(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+
                 for entry in &ws.adj_inserts {
                     let encoded = Self::encode(entry)?;
                     let fwd_key = Self::graph_fwd_key(entry);
                     let rev_key = Self::graph_rev_key(entry);
-                    fwd_table
-                        .insert(fwd_key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                    rev_table
-                        .insert(rev_key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                }
-
-                for (source, edge_type, target, deleted_tx) in &ws.adj_deletes {
-                    let fwd_key = Self::graph_fwd_key_parts(source, target, edge_type);
-                    let rev_key = Self::graph_rev_key_parts(source, target, edge_type);
-
-                    let bytes = {
-                        let fwd_existing = fwd_table
-                            .get(fwd_key.as_slice())
-                            .map_err(Self::storage_error)?
-                            .ok_or_else(|| {
-                                Error::NotFound(format!(
-                                    "edge {source} -[{edge_type}]-> {target} in graph_fwd"
-                                ))
-                            })?;
-                        let bytes: &[u8] = fwd_existing.value();
-                        bytes.to_vec()
-                    };
-                    let mut edge: AdjEntry = Self::decode(&bytes)?;
-                    edge.deleted_tx = Some(*deleted_tx);
-                    let encoded = Self::encode(&edge)?;
-
                     fwd_table
                         .insert(fwd_key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
@@ -485,25 +495,31 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
 
                 for (index, row_id, deleted_tx) in &ws.vector_deletes {
-                    let key = Self::vector_key_parts(index, *row_id);
-                    let bytes = {
-                        let existing = vectors_table
-                            .get(key.as_slice())
-                            .map_err(Self::storage_error)?
-                            .ok_or_else(|| Error::NotFound(format!("vector row {row_id}")))?;
-                        let bytes: &[u8] = existing.value();
-                        bytes.to_vec()
-                    };
-                    let mut entry = Self::decode_vector_entry(&bytes)?;
-                    entry.deleted_tx = Some(*deleted_tx);
-                    let quantization = vector_quantization
-                        .get(&entry.index)
-                        .copied()
-                        .unwrap_or_default();
-                    let encoded = Self::encode_vector_entry(&entry, quantization)?;
-                    vectors_table
-                        .insert(key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
+                    let mut live_versions = Vec::new();
+                    for entry in vectors_table.iter().map_err(Self::storage_error)? {
+                        let (key, value) = entry.map_err(Self::storage_error)?;
+                        let vector_entry = Self::decode_vector_entry(value.value())?;
+                        if vector_entry.index == *index
+                            && vector_entry.row_id == *row_id
+                            && vector_entry.deleted_tx.is_none()
+                        {
+                            live_versions.push((key.value().to_vec(), vector_entry));
+                        }
+                    }
+                    if live_versions.is_empty() {
+                        return Err(Error::NotFound(format!("vector row {row_id}")));
+                    }
+                    for (key, mut entry) in live_versions {
+                        entry.deleted_tx = Some(*deleted_tx);
+                        let quantization = vector_quantization
+                            .get(&entry.index)
+                            .copied()
+                            .unwrap_or_default();
+                        let encoded = Self::encode_vector_entry(&entry, quantization)?;
+                        vectors_table
+                            .insert(key.as_slice(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
                 }
 
                 for entry in &ws.vector_inserts {
@@ -519,37 +535,50 @@ impl RedbPersistence {
                 }
 
                 for (index, old_row_id, new_row_id, tx) in &ws.vector_moves {
-                    let old_key = Self::vector_key_parts(index, *old_row_id);
-                    let bytes = {
-                        let existing = vectors_table
-                            .get(old_key.as_slice())
-                            .map_err(Self::storage_error)?
-                            .ok_or_else(|| Error::NotFound(format!("vector row {old_row_id}")))?;
-                        let bytes: &[u8] = existing.value();
-                        bytes.to_vec()
-                    };
-                    let mut old_entry = Self::decode_vector_entry(&bytes)?;
-                    old_entry.deleted_tx = Some(*tx);
-                    let quantization = vector_quantization
-                        .get(&old_entry.index)
-                        .copied()
-                        .unwrap_or_default();
-                    let old_encoded = Self::encode_vector_entry(&old_entry, quantization)?;
-                    vectors_table
-                        .insert(old_key.as_slice(), old_encoded.as_slice())
-                        .map_err(Self::storage_error)?;
+                    let mut live_versions = Vec::new();
+                    for entry in vectors_table.iter().map_err(Self::storage_error)? {
+                        let (key, value) = entry.map_err(Self::storage_error)?;
+                        let vector_entry = Self::decode_vector_entry(value.value())?;
+                        if vector_entry.index == *index
+                            && vector_entry.row_id == *old_row_id
+                            && vector_entry.deleted_tx.is_none()
+                        {
+                            live_versions.push((key.value().to_vec(), vector_entry));
+                        }
+                    }
+                    if live_versions.is_empty() {
+                        return Err(Error::NotFound(format!("vector row {old_row_id}")));
+                    }
+                    for (old_key, mut old_entry) in live_versions {
+                        old_entry.deleted_tx = Some(*tx);
+                        let quantization = vector_quantization
+                            .get(&old_entry.index)
+                            .copied()
+                            .unwrap_or_default();
+                        let old_encoded = Self::encode_vector_entry(&old_entry, quantization)?;
+                        vectors_table
+                            .insert(old_key.as_slice(), old_encoded.as_slice())
+                            .map_err(Self::storage_error)?;
 
-                    let mut new_entry = old_entry;
-                    new_entry.row_id = *new_row_id;
-                    new_entry.created_tx = *tx;
-                    new_entry.deleted_tx = None;
-                    new_entry.lsn = ws.commit_lsn.unwrap_or(Lsn(0));
-                    let new_key = Self::vector_key(&new_entry);
-                    let new_encoded = Self::encode_vector_entry(&new_entry, quantization)?;
-                    vectors_table
-                        .insert(new_key.as_slice(), new_encoded.as_slice())
-                        .map_err(Self::storage_error)?;
+                        let mut new_entry = old_entry;
+                        new_entry.row_id = *new_row_id;
+                        new_entry.created_tx = *tx;
+                        new_entry.deleted_tx = None;
+                        new_entry.lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                        let new_key = Self::vector_key(&new_entry);
+                        let new_encoded = Self::encode_vector_entry(&new_entry, quantization)?;
+                        vectors_table
+                            .insert(new_key.as_slice(), new_encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
                 }
+            }
+
+            if let (Some(lsn), Some(tx)) = (ws.commit_lsn, Self::write_set_visibility_tx(ws)) {
+                let mut table = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                table.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
             }
 
             if !change_log.is_empty() {
@@ -570,7 +599,6 @@ impl RedbPersistence {
             Ok(())
         })
     }
-
     pub fn flush_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
@@ -682,10 +710,20 @@ impl RedbPersistence {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             let table_name = Self::rel_table_name(name);
-            let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(table_name.as_str());
-            let _ = write_txn
-                .delete_table(table_def)
-                .map_err(Self::storage_error)?;
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            let legacy_table_def: TableDefinition<u64, &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(legacy_table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -697,16 +735,20 @@ impl RedbPersistence {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             {
                 let table_name = Self::rel_table_name(name);
-                let table_def: TableDefinition<u64, &[u8]> =
+                let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
                 let _ = write_txn.delete_table(table_def);
+                let legacy_table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let _ = write_txn.delete_table(legacy_table_def);
                 let mut redb_table = write_txn
                     .open_table(table_def)
                     .map_err(Self::storage_error)?;
                 for row in rows {
                     let encoded = Self::encode_versioned_row(row, table_meta.get(name))?;
+                    let key = Self::rel_row_key(row);
                     redb_table
-                        .insert(row.row_id.0, encoded.as_slice())
+                        .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -813,17 +855,36 @@ impl RedbPersistence {
     }
 
     pub fn load_relational_table(&self, name: &str) -> Result<Vec<VersionedRow>> {
-        self.with_db(|db| {
+        let (rows, migrate_legacy_table) = self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let table_meta = Self::load_table_meta_in_read_txn(&read_txn, name)?;
             let table_name = Self::rel_table_name(name);
-            let table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(table_name.as_str());
-            let table = match read_txn.open_table(table_def) {
-                Ok(table) => table,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match read_txn.open_table(table_def) {
+                Ok(table) => {
+                    let mut rows = Vec::new();
+                    for entry in table.iter().map_err(Self::storage_error)? {
+                        let (_, value) = entry.map_err(Self::storage_error)?;
+                        rows.push(Self::decode_versioned_row(
+                            value.value(),
+                            table_meta.as_ref(),
+                        )?);
+                    }
+                    return Ok((rows, false));
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), false)),
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
                 Err(err) => return Err(Self::storage_error(err)),
             };
 
+            let legacy_table_def: TableDefinition<u64, &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            let table = match read_txn.open_table(legacy_table_def) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), false)),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
             let mut rows = Vec::new();
             for entry in table.iter().map_err(Self::storage_error)? {
                 let (_, value) = entry.map_err(Self::storage_error)?;
@@ -832,8 +893,12 @@ impl RedbPersistence {
                     table_meta.as_ref(),
                 )?);
             }
-            Ok(rows)
-        })
+            Ok((rows, true))
+        })?;
+        if migrate_legacy_table {
+            self.rewrite_table_rows(name, &rows)?;
+        }
+        Ok(rows)
     }
 
     pub fn load_all_tables(&self) -> Result<HashMap<String, Vec<VersionedRow>>> {
@@ -911,6 +976,60 @@ impl RedbPersistence {
         })
     }
 
+    pub fn load_commit_index(&self) -> Result<BTreeMap<Lsn, TxId>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read_txn.open_table(COMMIT_INDEX_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+
+            let mut index = BTreeMap::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (lsn, tx) = entry.map_err(Self::storage_error)?;
+                index.insert(Lsn(lsn.value()), TxId(tx.value()));
+            }
+            Ok(index)
+        })
+    }
+
+    pub fn flush_commit_index_entries(&self, entries: &BTreeMap<Lsn, TxId>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut table = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (lsn, tx) in entries {
+                    table.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn rewrite_commit_index(&self, entries: &BTreeMap<Lsn, TxId>) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let _ = write_txn.delete_table(COMMIT_INDEX_TABLE);
+            {
+                let mut table = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (lsn, tx) in entries {
+                    table.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
     fn load_graph_table(&self, definition: TableDefinition<&[u8], &[u8]>) -> Result<Vec<AdjEntry>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -961,6 +1080,39 @@ impl RedbPersistence {
             }
         }
         indexes
+    }
+
+    fn write_set_visibility_tx(ws: &WriteSet) -> Option<TxId> {
+        ws.relational_inserts
+            .iter()
+            .flat_map(|(_, row)| std::iter::once(row.created_tx).chain(row.deleted_tx))
+            .chain(
+                ws.relational_deletes
+                    .iter()
+                    .map(|(_, _, deleted_tx)| *deleted_tx),
+            )
+            .chain(
+                ws.adj_inserts
+                    .iter()
+                    .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx)),
+            )
+            .chain(
+                ws.adj_deletes
+                    .iter()
+                    .map(|(_, _, _, deleted_tx)| *deleted_tx),
+            )
+            .chain(
+                ws.vector_inserts
+                    .iter()
+                    .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx)),
+            )
+            .chain(
+                ws.vector_deletes
+                    .iter()
+                    .map(|(_, _, deleted_tx)| *deleted_tx),
+            )
+            .chain(ws.vector_moves.iter().map(|(_, _, _, tx)| *tx))
+            .max()
     }
 
     fn column_quantization(meta: Option<&TableMeta>, column_name: &str) -> VectorQuantization {
@@ -1058,6 +1210,14 @@ impl RedbPersistence {
         format!("rel_{name}")
     }
 
+    fn rel_row_key(row: &VersionedRow) -> Vec<u8> {
+        let mut key = Vec::with_capacity(24);
+        key.extend_from_slice(&row.row_id.0.to_be_bytes());
+        key.extend_from_slice(&row.created_tx.0.to_be_bytes());
+        key.extend_from_slice(&row.lsn.0.to_be_bytes());
+        key
+    }
+
     fn meta_key(name: &str) -> String {
         format!("table:{name}")
     }
@@ -1071,40 +1231,36 @@ impl RedbPersistence {
     }
 
     fn graph_fwd_key(entry: &AdjEntry) -> Vec<u8> {
-        Self::graph_fwd_key_parts(&entry.source, &entry.target, &entry.edge_type)
+        let mut key = Vec::with_capacity(48 + entry.edge_type.len());
+        key.extend_from_slice(entry.source.as_bytes());
+        key.extend_from_slice(entry.target.as_bytes());
+        key.extend_from_slice(entry.edge_type.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&entry.created_tx.0.to_be_bytes());
+        key.extend_from_slice(&entry.lsn.0.to_be_bytes());
+        key
     }
 
     fn graph_rev_key(entry: &AdjEntry) -> Vec<u8> {
-        Self::graph_rev_key_parts(&entry.source, &entry.target, &entry.edge_type)
+        let mut key = Vec::with_capacity(48 + entry.edge_type.len());
+        key.extend_from_slice(entry.target.as_bytes());
+        key.extend_from_slice(entry.source.as_bytes());
+        key.extend_from_slice(entry.edge_type.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&entry.created_tx.0.to_be_bytes());
+        key.extend_from_slice(&entry.lsn.0.to_be_bytes());
+        key
     }
 
     fn vector_key(entry: &VectorEntry) -> Vec<u8> {
-        Self::vector_key_parts(&entry.index, entry.row_id)
-    }
-
-    fn vector_key_parts(index: &VectorIndexRef, row_id: contextdb_core::RowId) -> Vec<u8> {
-        let mut key = Vec::with_capacity(index.table.len() + index.column.len() + 18);
-        key.extend_from_slice(index.table.as_bytes());
+        let mut key = Vec::with_capacity(entry.index.table.len() + entry.index.column.len() + 34);
+        key.extend_from_slice(entry.index.table.as_bytes());
         key.push(0);
-        key.extend_from_slice(index.column.as_bytes());
+        key.extend_from_slice(entry.index.column.as_bytes());
         key.push(0);
-        key.extend_from_slice(&row_id.0.to_be_bytes());
-        key
-    }
-
-    fn graph_fwd_key_parts(source: &uuid::Uuid, target: &uuid::Uuid, edge_type: &str) -> Vec<u8> {
-        let mut key = Vec::with_capacity(32 + edge_type.len());
-        key.extend_from_slice(source.as_bytes());
-        key.extend_from_slice(target.as_bytes());
-        key.extend_from_slice(edge_type.as_bytes());
-        key
-    }
-
-    fn graph_rev_key_parts(source: &uuid::Uuid, target: &uuid::Uuid, edge_type: &str) -> Vec<u8> {
-        let mut key = Vec::with_capacity(32 + edge_type.len());
-        key.extend_from_slice(target.as_bytes());
-        key.extend_from_slice(source.as_bytes());
-        key.extend_from_slice(edge_type.as_bytes());
+        key.extend_from_slice(&entry.row_id.0.to_be_bytes());
+        key.extend_from_slice(&entry.created_tx.0.to_be_bytes());
+        key.extend_from_slice(&entry.lsn.0.to_be_bytes());
         key
     }
 

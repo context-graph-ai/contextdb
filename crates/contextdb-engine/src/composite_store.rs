@@ -4,9 +4,10 @@ use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
 use contextdb_vector::VectorStore;
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChangeLogEntry {
@@ -65,6 +66,78 @@ pub struct CompositeStore {
     pub change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     accountant: Arc<contextdb_core::MemoryAccountant>,
+    apply_phase_pause: Arc<ApplyPhasePause>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ApplyPhasePause {
+    state: Mutex<ApplyPhasePauseState>,
+    waiters: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ApplyPhasePauseState {
+    generation: u64,
+    armed: bool,
+    reached: bool,
+    released: bool,
+}
+
+impl ApplyPhasePause {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(ApplyPhasePauseState::default()),
+            waiters: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn arm(&self) -> u64 {
+        let mut state = self.state.lock();
+        state.generation = state.generation.saturating_add(1);
+        state.armed = true;
+        state.reached = false;
+        state.released = false;
+        self.waiters.notify_all();
+        state.generation
+    }
+
+    pub(crate) fn wait_until_reached(&self, generation: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while state.generation == generation && state.armed && !state.reached {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            self.waiters
+                .wait_for(&mut state, deadline.saturating_duration_since(now));
+        }
+        state.generation == generation && state.reached
+    }
+
+    pub(crate) fn release(&self, generation: u64) {
+        let mut state = self.state.lock();
+        if state.generation == generation && state.armed {
+            state.released = true;
+            self.waiters.notify_all();
+        }
+    }
+
+    fn maybe_pause(&self) {
+        let mut state = self.state.lock();
+        if !state.armed || state.released {
+            return;
+        }
+        state.reached = true;
+        self.waiters.notify_all();
+        while state.armed && !state.released {
+            self.waiters.wait(&mut state);
+        }
+        state.armed = false;
+        state.reached = false;
+        state.released = false;
+        self.waiters.notify_all();
+    }
 }
 
 impl CompositeStore {
@@ -76,6 +149,26 @@ impl CompositeStore {
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         accountant: Arc<contextdb_core::MemoryAccountant>,
     ) -> Self {
+        Self::new_with_apply_phase_pause(
+            relational,
+            graph,
+            vector,
+            change_log,
+            ddl_log,
+            accountant,
+            Arc::new(ApplyPhasePause::new()),
+        )
+    }
+
+    pub(crate) fn new_with_apply_phase_pause(
+        relational: Arc<RelationalStore>,
+        graph: Arc<GraphStore>,
+        vector: Arc<VectorStore>,
+        change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+        ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
+        accountant: Arc<contextdb_core::MemoryAccountant>,
+        apply_phase_pause: Arc<ApplyPhasePause>,
+    ) -> Self {
         Self {
             relational,
             graph,
@@ -83,6 +176,7 @@ impl CompositeStore {
             change_log,
             ddl_log,
             accountant,
+            apply_phase_pause,
         }
     }
 
@@ -160,16 +254,15 @@ impl CompositeStore {
 
         log_entries
     }
-}
 
-impl WriteSetApplicator for CompositeStore {
-    fn apply(&self, ws: WriteSet) -> Result<()> {
+    pub(crate) fn apply_exact(&self, ws: WriteSet) -> Result<()> {
         let log_entries = self.build_change_log_entries(&ws);
 
-        self.relational.apply_inserts(ws.relational_inserts);
         self.relational.apply_deletes(ws.relational_deletes);
-        self.graph.apply_inserts(ws.adj_inserts);
+        self.relational.apply_inserts(ws.relational_inserts);
+        self.apply_phase_pause.maybe_pause();
         self.graph.apply_deletes(ws.adj_deletes);
+        self.graph.apply_inserts(ws.adj_inserts);
         self.vector.apply_changes_with_accountant(
             ws.vector_deletes,
             ws.vector_inserts,
@@ -179,6 +272,12 @@ impl WriteSetApplicator for CompositeStore {
         );
         self.change_log.write().extend(log_entries);
         Ok(())
+    }
+}
+
+impl WriteSetApplicator for CompositeStore {
+    fn apply(&self, ws: WriteSet) -> Result<()> {
+        self.apply_exact(ws)
     }
 
     fn new_row_id(&self) -> RowId {

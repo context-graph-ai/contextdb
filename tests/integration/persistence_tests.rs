@@ -1,7 +1,7 @@
 use contextdb_core::*;
 use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, NaturalKey, RowChange};
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -153,6 +153,68 @@ fn p01_relational_rows_survive_reopen() {
         .unwrap()
         .unwrap();
     assert_eq!(text(&found2, "name"), "beta");
+}
+
+#[test]
+fn p01b_legacy_u64_relational_table_migrates_to_versioned_keys() {
+    use redb::{ReadableDatabase, ReadableTable};
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("legacy-relational.db");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO items (id, name) VALUES ($id, 'legacy')",
+        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write_txn = redb_db.begin_write().unwrap();
+    let versioned_def: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("rel_items");
+    let legacy_def: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("rel_items");
+    let mut legacy_rows = Vec::new();
+    {
+        let versioned = write_txn.open_table(versioned_def).unwrap();
+        for entry in versioned.iter().unwrap() {
+            let (key, value) = entry.unwrap();
+            let row_id = u64::from_be_bytes(key.value()[..8].try_into().unwrap());
+            legacy_rows.push((row_id, value.value().to_vec()));
+        }
+    }
+    write_txn.delete_table(versioned_def).unwrap();
+    {
+        let mut legacy = write_txn.open_table(legacy_def).unwrap();
+        for (row_id, bytes) in &legacy_rows {
+            legacy.insert(*row_id, bytes.as_slice()).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+    drop(redb_db);
+
+    let reopened = Database::open(&path).unwrap();
+    let row = reopened
+        .point_lookup("items", "id", &Value::Uuid(id), reopened.snapshot())
+        .unwrap()
+        .expect("legacy row must load after migration");
+    assert_eq!(text(&row, "name"), "legacy");
+    reopened.close().unwrap();
+
+    let redb_db = redb::Database::open(&path).unwrap();
+    let read_txn = redb_db.begin_read().unwrap();
+    assert!(read_txn.open_table(versioned_def).is_ok());
+    assert!(matches!(
+        read_txn.open_table(legacy_def),
+        Err(redb::TableError::TableTypeMismatch { .. })
+            | Err(redb::TableError::TableDoesNotExist(_))
+    ));
 }
 
 #[test]
@@ -2147,4 +2209,96 @@ fn p34_cli_memory_mode_smoke_test() {
         !stdout2.contains("memory_val"),
         "memory_val should not persist across :memory: sessions, stdout: {stdout2}"
     );
+}
+
+#[test]
+fn p35_ddl_only_lsn_survives_reopen_before_next_data_commit() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("ddl-lsn.db");
+    let id = Uuid::from_u128(0x3500);
+
+    let ddl_lsn = {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let ddl_lsn = db.current_lsn();
+        assert!(
+            ddl_lsn.0 > 0,
+            "DDL-only database must expose a committed LSN"
+        );
+        db.close().unwrap();
+        ddl_lsn
+    };
+
+    let db = Database::open(&path).unwrap();
+    assert!(
+        db.current_lsn().0 >= ddl_lsn.0,
+        "reopen must preserve DDL-only LSN watermark"
+    );
+    db.execute(
+        "INSERT INTO t (id, v) VALUES ($id, 'after-reopen')",
+        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+    )
+    .unwrap();
+    assert!(
+        db.current_lsn().0 > ddl_lsn.0,
+        "post-reopen data commit must not reuse the DDL LSN"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn p36_noop_sync_commit_does_not_reuse_lsn_after_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("noop-sync-lsn.db");
+    let id = Uuid::from_u128(0x3600);
+
+    let before_lsn = {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let before_lsn = db.current_lsn();
+        db.apply_changes(
+            contextdb_engine::sync_types::ChangeSet {
+                rows: vec![RowChange {
+                    table: "t".to_string(),
+                    natural_key: NaturalKey {
+                        column: "id".to_string(),
+                        value: Value::Uuid(id),
+                    },
+                    values: HashMap::new(),
+                    deleted: false,
+                    lsn: Lsn(100),
+                }],
+                edges: vec![],
+                vectors: vec![],
+                ddl: vec![],
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+        assert_eq!(
+            db.current_lsn(),
+            before_lsn,
+            "fully skipped sync apply must not allocate a durable-invisible LSN"
+        );
+        db.close().unwrap();
+        before_lsn
+    };
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.current_lsn(), before_lsn);
+    db.execute(
+        "INSERT INTO t (id, v) VALUES ($id, 'after-noop')",
+        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+    )
+    .unwrap();
+    assert!(db.current_lsn().0 > before_lsn.0);
+    db.close().unwrap();
 }

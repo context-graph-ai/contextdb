@@ -1,4 +1,5 @@
 use contextdb_core::*;
+use std::collections::HashSet;
 
 #[derive(Debug, Default, Clone)]
 pub struct WriteSet {
@@ -10,6 +11,7 @@ pub struct WriteSet {
     pub vector_deletes: Vec<(VectorIndexRef, RowId, TxId)>,
     pub vector_moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
     pub commit_lsn: Option<Lsn>,
+    pub visibility_floor: Option<TxId>,
     pub propagation_in_progress: bool,
 }
 
@@ -41,6 +43,71 @@ impl WriteSet {
 
         for entry in &mut self.vector_inserts {
             entry.lsn = lsn;
+        }
+    }
+
+    pub fn canonicalize_final_state(&mut self) {
+        if self.relational_inserts.len() > 1 {
+            let mut seen = HashSet::new();
+            let mut inserts = self
+                .relational_inserts
+                .drain(..)
+                .rev()
+                .filter(|(table, row)| seen.insert((table.clone(), row.row_id)))
+                .collect::<Vec<_>>();
+            inserts.reverse();
+            self.relational_inserts = inserts;
+        }
+    }
+
+    pub fn reassign_tx(&mut self, from: TxId, to: TxId) {
+        if from == to {
+            return;
+        }
+
+        for (_, row) in &mut self.relational_inserts {
+            if row.created_tx == from {
+                row.created_tx = to;
+            }
+            if row.deleted_tx == Some(from) {
+                row.deleted_tx = Some(to);
+            }
+        }
+        for (_, _, deleted_tx) in &mut self.relational_deletes {
+            if *deleted_tx == from {
+                *deleted_tx = to;
+            }
+        }
+        for entry in &mut self.adj_inserts {
+            if entry.created_tx == from {
+                entry.created_tx = to;
+            }
+            if entry.deleted_tx == Some(from) {
+                entry.deleted_tx = Some(to);
+            }
+        }
+        for (_, _, _, deleted_tx) in &mut self.adj_deletes {
+            if *deleted_tx == from {
+                *deleted_tx = to;
+            }
+        }
+        for entry in &mut self.vector_inserts {
+            if entry.created_tx == from {
+                entry.created_tx = to;
+            }
+            if entry.deleted_tx == Some(from) {
+                entry.deleted_tx = Some(to);
+            }
+        }
+        for (_, _, deleted_tx) in &mut self.vector_deletes {
+            if *deleted_tx == from {
+                *deleted_tx = to;
+            }
+        }
+        for (_, _, _, tx) in &mut self.vector_moves {
+            if *tx == from {
+                *tx = to;
+            }
         }
     }
 }

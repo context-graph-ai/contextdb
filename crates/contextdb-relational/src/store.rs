@@ -143,7 +143,11 @@ impl RelationalStore {
         for (table_name, row_id, deleted_tx) in deletes {
             let row_values: Option<HashMap<String, Value>> = tables
                 .get(&table_name)
-                .and_then(|rows| rows.iter().find(|r| r.row_id == row_id))
+                .and_then(|rows| {
+                    rows.iter()
+                        .rev()
+                        .find(|r| r.row_id == row_id && r.deleted_tx.is_none())
+                })
                 .map(|r| r.values.clone());
             if let Some(values) = row_values {
                 for ((t, _), idx) in indexes.iter_mut() {
@@ -206,11 +210,16 @@ impl RelationalStore {
         let positions = self.row_positions.read();
         let position = *positions.get(&(table.to_string(), row_id))?;
         drop(positions);
-        tables
-            .get(table)
-            .and_then(|rows| rows.get(position))
+        let rows = tables.get(table)?;
+        rows.get(position)
             .filter(|row| row.row_id == row_id && row.visible_at(snapshot))
             .cloned()
+            .or_else(|| {
+                rows.iter()
+                    .rev()
+                    .find(|row| row.row_id == row_id && row.visible_at(snapshot))
+                    .cloned()
+            })
     }
 
     pub fn max_row_id(&self) -> RowId {
