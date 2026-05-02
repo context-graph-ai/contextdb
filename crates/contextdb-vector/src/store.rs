@@ -42,6 +42,15 @@ impl IndexState {
             .count()
     }
 
+    pub fn max_tx(&self) -> TxId {
+        self.vectors
+            .read()
+            .iter()
+            .flat_map(|entry| std::iter::once(entry.created_tx).chain(entry.deleted_tx))
+            .max()
+            .unwrap_or_default()
+    }
+
     pub fn byte_count(&self) -> usize {
         let payload_bytes = self
             .vectors
@@ -118,6 +127,13 @@ impl IndexState {
         }
     }
 
+    fn drop_hnsw_without_accounting(&self) {
+        self.hnsw_bytes.store(0, Ordering::SeqCst);
+        if let Some(lock) = self.hnsw.get() {
+            *lock.write() = None;
+        }
+    }
+
     pub fn hnsw_len(&self) -> Option<usize> {
         self.hnsw
             .get()
@@ -128,6 +144,27 @@ impl IndexState {
         self.hnsw
             .get()
             .and_then(|lock| lock.read().as_ref().map(|hnsw| hnsw.graph_stats()))
+    }
+
+    pub fn raw_hnsw_search(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+    ) -> Option<Result<Vec<(RowId, f32)>>> {
+        self.hnsw.get().and_then(|lock| {
+            lock.read()
+                .as_ref()
+                .map(|hnsw| hnsw.search(index, query, k))
+        })
+    }
+
+    pub fn raw_hnsw_entry_count_for_row(&self, row_id: RowId) -> Option<usize> {
+        self.hnsw.get().and_then(|lock| {
+            lock.read()
+                .as_ref()
+                .map(|hnsw| hnsw.raw_entry_count_for_row(row_id))
+        })
     }
 
     pub fn set_hnsw(&self, hnsw: Option<HnswIndex>, bytes: usize) {
@@ -211,12 +248,14 @@ impl VectorStore {
     }
 
     pub fn deregister_index(&self, index: &VectorIndexRef, accountant: &MemoryAccountant) {
+        let _build_guard = self.build_mutex.lock();
         if let Some(state) = self.registry.write().remove(index) {
             state.clear_hnsw(accountant);
         }
     }
 
     pub fn deregister_table(&self, table: &str, accountant: &MemoryAccountant) {
+        let _build_guard = self.build_mutex.lock();
         let removed = {
             let mut registry = self.registry.write();
             let keys = registry
@@ -284,17 +323,35 @@ impl VectorStore {
     }
 
     pub fn apply_inserts(&self, inserts: Vec<VectorEntry>) {
+        self.apply_inserts_with_accountant(inserts, None);
+    }
+
+    pub fn apply_inserts_with_accountant(
+        &self,
+        inserts: Vec<VectorEntry>,
+        accountant: Option<&MemoryAccountant>,
+    ) {
+        let _build_guard = self.build_mutex.lock();
+        self.apply_inserts_unlocked(inserts, accountant);
+    }
+
+    fn apply_inserts_unlocked(
+        &self,
+        inserts: Vec<VectorEntry>,
+        accountant: Option<&MemoryAccountant>,
+    ) {
         for entry in inserts {
             if let Some(state) = self.try_state(&entry.index) {
                 let stored_entry = state.stored_entry(entry);
-                let row_id = stored_entry.row_id;
-                state.push_entry(stored_entry.clone());
+                state.push_entry(stored_entry);
                 if let Some(lock) = state.hnsw().get() {
-                    let guard = lock.write();
-                    if let Some(hnsw) = guard.as_ref() {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            hnsw.insert(row_id, &stored_entry.vector);
-                        }));
+                    let was_built = lock.read().is_some();
+                    if was_built {
+                        if let Some(accountant) = accountant {
+                            state.clear_hnsw(accountant);
+                        } else {
+                            state.drop_hnsw_without_accounting();
+                        }
                     }
                 }
             }
@@ -302,11 +359,30 @@ impl VectorStore {
     }
 
     pub fn apply_deletes(&self, deletes: Vec<(VectorIndexRef, RowId, TxId)>) {
+        self.apply_deletes_with_accountant(deletes, None);
+    }
+
+    pub fn apply_deletes_with_accountant(
+        &self,
+        deletes: Vec<(VectorIndexRef, RowId, TxId)>,
+        accountant: Option<&MemoryAccountant>,
+    ) {
+        let _build_guard = self.build_mutex.lock();
+        self.apply_deletes_unlocked(deletes, accountant);
+    }
+
+    fn apply_deletes_unlocked(
+        &self,
+        deletes: Vec<(VectorIndexRef, RowId, TxId)>,
+        accountant: Option<&MemoryAccountant>,
+    ) {
         for (index, row_id, deleted_tx) in deletes {
             if let Some(state) = self.try_state(&index) {
                 state.tombstone_row(row_id, deleted_tx);
-                if let Some(lock) = state.hnsw().get() {
-                    *lock.write() = None;
+                if let Some(accountant) = accountant {
+                    state.clear_hnsw(accountant);
+                } else {
+                    state.drop_hnsw_without_accounting();
                 }
             }
         }
@@ -317,28 +393,58 @@ impl VectorStore {
         moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
         lsn: contextdb_core::Lsn,
     ) {
+        self.apply_moves_with_accountant(moves, lsn, None);
+    }
+
+    pub fn apply_moves_with_accountant(
+        &self,
+        moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
+        lsn: contextdb_core::Lsn,
+        accountant: Option<&MemoryAccountant>,
+    ) {
+        let _build_guard = self.build_mutex.lock();
+        self.apply_moves_unlocked(moves, lsn, accountant);
+    }
+
+    fn apply_moves_unlocked(
+        &self,
+        moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
+        lsn: contextdb_core::Lsn,
+        accountant: Option<&MemoryAccountant>,
+    ) {
         for (index, old_row_id, new_row_id, tx) in moves {
             if let Some(state) = self.try_state(&index)
                 && let Some(old) = state.stored_by_row_id(old_row_id)
                 && old.deleted_tx.is_none()
             {
                 state.tombstone_row(old_row_id, tx);
+                if let Some(accountant) = accountant {
+                    state.clear_hnsw(accountant);
+                } else {
+                    state.drop_hnsw_without_accounting();
+                }
                 let mut moved = old;
                 moved.row_id = new_row_id;
                 moved.created_tx = tx;
                 moved.deleted_tx = None;
                 moved.lsn = lsn;
                 state.push_entry(moved.clone());
-                if let Some(lock) = state.hnsw().get() {
-                    let guard = lock.write();
-                    if let Some(hnsw) = guard.as_ref() {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            hnsw.insert(moved.row_id, &moved.vector);
-                        }));
-                    }
-                }
             }
         }
+    }
+
+    pub fn apply_changes_with_accountant(
+        &self,
+        deletes: Vec<(VectorIndexRef, RowId, TxId)>,
+        inserts: Vec<VectorEntry>,
+        moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
+        lsn: contextdb_core::Lsn,
+        accountant: Option<&MemoryAccountant>,
+    ) {
+        let _build_guard = self.build_mutex.lock();
+        self.apply_deletes_unlocked(deletes, accountant);
+        self.apply_inserts_unlocked(inserts, accountant);
+        self.apply_moves_unlocked(moves, lsn, accountant);
     }
 
     pub fn insert_loaded_vector(&self, entry: VectorEntry) {
@@ -370,6 +476,7 @@ impl VectorStore {
         row_ids: &std::collections::HashSet<RowId>,
         accountant: &MemoryAccountant,
     ) -> usize {
+        let _build_guard = self.build_mutex.lock();
         let mut released = 0usize;
         for state in self.registry.read().values() {
             let mut vectors = state.vectors.write();
@@ -413,15 +520,36 @@ impl VectorStore {
     }
 
     pub fn clear_hnsw(&self, accountant: &MemoryAccountant) {
+        let _build_guard = self.build_mutex.lock();
         for state in self.registry.read().values() {
             state.clear_hnsw(accountant);
         }
     }
 
     pub fn clear_hnsw_for(&self, index: &VectorIndexRef, accountant: &MemoryAccountant) {
+        let _build_guard = self.build_mutex.lock();
         if let Some(state) = self.try_state(index) {
             state.clear_hnsw(accountant);
         }
+    }
+
+    pub fn raw_hnsw_search(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+    ) -> Option<Result<Vec<(RowId, f32)>>> {
+        self.try_state(index)
+            .and_then(|state| state.raw_hnsw_search(index, query, k))
+    }
+
+    pub fn raw_hnsw_entry_count_for_row(
+        &self,
+        index: &VectorIndexRef,
+        row_id: RowId,
+    ) -> Option<usize> {
+        self.try_state(index)
+            .and_then(|state| state.raw_hnsw_entry_count_for_row(row_id))
     }
 
     pub fn find_by_row_id(&self, row_id: RowId) -> Option<VectorEntry> {

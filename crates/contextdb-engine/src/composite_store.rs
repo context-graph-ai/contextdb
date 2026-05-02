@@ -64,6 +64,7 @@ pub struct CompositeStore {
     pub vector: Arc<VectorStore>,
     pub change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
+    accountant: Arc<contextdb_core::MemoryAccountant>,
 }
 
 impl CompositeStore {
@@ -73,6 +74,7 @@ impl CompositeStore {
         vector: Arc<VectorStore>,
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
+        accountant: Arc<contextdb_core::MemoryAccountant>,
     ) -> Self {
         Self {
             relational,
@@ -80,6 +82,7 @@ impl CompositeStore {
             vector,
             change_log,
             ddl_log,
+            accountant,
         }
     }
 
@@ -139,18 +142,18 @@ impl CompositeStore {
             });
         }
 
-        for entry in &ws.vector_inserts {
-            log_entries.push(ChangeLogEntry::VectorInsert {
-                index: entry.index.clone(),
-                row_id: entry.row_id,
-                lsn,
-            });
-        }
-
         for (index, row_id, _) in &ws.vector_deletes {
             log_entries.push(ChangeLogEntry::VectorDelete {
                 index: index.clone(),
                 row_id: *row_id,
+                lsn,
+            });
+        }
+
+        for entry in &ws.vector_inserts {
+            log_entries.push(ChangeLogEntry::VectorInsert {
+                index: entry.index.clone(),
+                row_id: entry.row_id,
                 lsn,
             });
         }
@@ -167,10 +170,13 @@ impl WriteSetApplicator for CompositeStore {
         self.relational.apply_deletes(ws.relational_deletes);
         self.graph.apply_inserts(ws.adj_inserts);
         self.graph.apply_deletes(ws.adj_deletes);
-        self.vector.apply_inserts(ws.vector_inserts);
-        self.vector.apply_deletes(ws.vector_deletes);
-        self.vector
-            .apply_moves(ws.vector_moves, ws.commit_lsn.unwrap_or(Lsn(0)));
+        self.vector.apply_changes_with_accountant(
+            ws.vector_deletes,
+            ws.vector_inserts,
+            ws.vector_moves,
+            ws.commit_lsn.unwrap_or(Lsn(0)),
+            Some(&self.accountant),
+        );
         self.change_log.write().extend(log_entries);
         Ok(())
     }

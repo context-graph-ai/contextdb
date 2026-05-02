@@ -304,6 +304,22 @@ fn t17_03_delete_one_insert_other_in_same_tx_both_visible() {
     assert_eq!(q_new.len(), 1);
     assert_eq!(q_new[0].0, row_id_b);
     assert!(q_new[0].1 > 0.99);
+
+    let q_b_old = db
+        .query_vector(
+            VectorIndexRef::new("memories", "embedding"),
+            &[0.0, 1.0, 0.0],
+            1,
+            None,
+            db.snapshot(),
+        )
+        .unwrap();
+    if !q_b_old.is_empty() && q_b_old[0].0 == row_id_b {
+        assert!(
+            q_b_old[0].1 < 0.5,
+            "row B's original vector must be replaced, not duplicated"
+        );
+    }
 }
 
 /// REGRESSION GUARD — t17_04: insert without preceding delete still visible at commit.
@@ -508,4 +524,245 @@ fn t17_07_update_embedding_via_sql_recall_returns_new_vector() {
             "SQL UPDATE must not leave the old vector behind"
         );
     }
+}
+
+/// REGRESSION GUARD — t17_09: delete cancels all same-tx pending inserts for the row.
+#[test]
+fn t17_09_same_tx_pending_inserts_then_delete_leave_no_vector_after_reopen() {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("insert_then_delete.redb");
+
+    let row_id;
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE memories (id UUID PRIMARY KEY, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+
+        let tx = db.begin();
+        let mut values = HashMap::new();
+        values.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+        row_id = db.insert_row(tx, "memories", values).unwrap();
+        db.commit(tx).unwrap();
+
+        let idx = VectorIndexRef::new("memories", "embedding");
+        let tx = db.begin();
+        db.insert_vector(tx, idx.clone(), row_id, vec![1.0, 0.0, 0.0])
+            .unwrap();
+        db.insert_vector(tx, idx.clone(), row_id, vec![0.0, 0.0, 1.0])
+            .unwrap();
+        db.delete_vector(tx, idx.clone(), row_id).unwrap();
+        db.commit(tx).unwrap();
+
+        let hits = db
+            .query_vector(idx, &[0.0, 0.0, 1.0], 10, None, db.snapshot())
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "insert+insert+delete in one tx must leave no live vector; hits={hits:?}"
+        );
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let idx = VectorIndexRef::new("memories", "embedding");
+    let hits = db
+        .query_vector(idx, &[1.0, 0.0, 0.0], 10, None, db.snapshot())
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "same-tx canceled inserts must not reappear after reopen; row_id={row_id:?}, hits={hits:?}"
+    );
+}
+
+/// REGRESSION GUARD — t17_10: repeated same-row inserts in one tx are last-write-wins.
+#[test]
+fn t17_10_same_tx_repeated_inserts_keep_only_latest_after_reopen() {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("repeated_inserts.redb");
+
+    let row_id;
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE memories (id UUID PRIMARY KEY, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+
+        let tx = db.begin();
+        let mut values = HashMap::new();
+        values.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+        row_id = db.insert_row(tx, "memories", values).unwrap();
+        db.commit(tx).unwrap();
+
+        let idx = VectorIndexRef::new("memories", "embedding");
+        let tx = db.begin();
+        db.insert_vector(tx, idx.clone(), row_id, vec![1.0, 0.0, 0.0])
+            .unwrap();
+        db.insert_vector(tx, idx.clone(), row_id, vec![0.0, 0.0, 1.0])
+            .unwrap();
+        db.commit(tx).unwrap();
+
+        let old_hits = db
+            .query_vector(idx.clone(), &[1.0, 0.0, 0.0], 10, None, db.snapshot())
+            .unwrap();
+        for (hit_row_id, score) in &old_hits {
+            assert!(
+                *hit_row_id != row_id || *score < 0.5,
+                "old same-tx insert must not stay live before reopen; hits={old_hits:?}"
+            );
+        }
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let idx = VectorIndexRef::new("memories", "embedding");
+    let hits = db
+        .query_vector(idx.clone(), &[0.0, 0.0, 1.0], 10, None, db.snapshot())
+        .unwrap();
+    assert!(
+        !hits.is_empty() && hits[0].0 == row_id && hits[0].1 > 0.99,
+        "latest same-tx insert must survive reopen; hits={hits:?}"
+    );
+    let old_hits = db
+        .query_vector(idx, &[1.0, 0.0, 0.0], 10, None, db.snapshot())
+        .unwrap();
+    for (hit_row_id, score) in &old_hits {
+        assert!(
+            *hit_row_id != row_id || *score < 0.5,
+            "old same-tx insert must not reappear after reopen; hits={old_hits:?}"
+        );
+    }
+}
+
+/// REGRESSION GUARD — t17_11: a pending vector move cannot resurrect an old vector after replacement.
+#[test]
+fn t17_11_move_then_vector_replacement_in_same_tx_does_not_resurrect_old_vector() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE memories (id UUID PRIMARY KEY, label TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::from_u128(1);
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(id));
+    p.insert("label".into(), Value::Text("old".into()));
+    p.insert("v".into(), Value::Vector(vec![1.0, 0.0, 0.0]));
+    db.execute(
+        "INSERT INTO memories (id, label, embedding) VALUES ($id, $label, $v)",
+        &p,
+    )
+    .unwrap();
+
+    let tx = db.begin();
+    let mut p1 = HashMap::new();
+    p1.insert("id".into(), Value::Uuid(id));
+    p1.insert("label".into(), Value::Text("renamed".into()));
+    db.execute_in_tx(tx, "UPDATE memories SET label = $label WHERE id = $id", &p1)
+        .unwrap();
+
+    let mut p2 = HashMap::new();
+    p2.insert("id".into(), Value::Uuid(id));
+    p2.insert("v".into(), Value::Vector(vec![0.0, 0.0, 1.0]));
+    db.execute_in_tx(tx, "UPDATE memories SET embedding = $v WHERE id = $id", &p2)
+        .unwrap();
+    db.commit(tx).unwrap();
+
+    let idx = VectorIndexRef::new("memories", "embedding");
+    let hits = db
+        .query_vector(idx.clone(), &[0.0, 0.0, 1.0], 10, None, db.snapshot())
+        .unwrap();
+    assert!(
+        !hits.is_empty() && hits[0].1 > 0.99,
+        "replacement vector must be live after move+replace tx; hits={hits:?}"
+    );
+
+    let old_hits = db
+        .query_vector(idx, &[1.0, 0.0, 0.0], 10, None, db.snapshot())
+        .unwrap();
+    for (_, score) in &old_hits {
+        assert!(
+            *score < 0.5,
+            "pending move resurrected the old vector after replacement; hits={old_hits:?}"
+        );
+    }
+}
+
+/// REGRESSION GUARD — t17_12: chained row rewrites in one tx keep the vector on the final row.
+#[test]
+fn t17_12_chained_same_tx_updates_move_vector_to_final_row_after_reopen() {
+    use tempfile::TempDir;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("chained_moves.redb");
+
+    let final_row_id;
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE memories (id UUID PRIMARY KEY, label TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+
+        let id = Uuid::from_u128(1);
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(id));
+        p.insert("label".into(), Value::Text("a".into()));
+        p.insert("v".into(), Value::Vector(vec![1.0, 0.0, 0.0]));
+        db.execute(
+            "INSERT INTO memories (id, label, embedding) VALUES ($id, $label, $v)",
+            &p,
+        )
+        .unwrap();
+
+        let tx = db.begin();
+        let mut p1 = HashMap::new();
+        p1.insert("id".into(), Value::Uuid(id));
+        p1.insert("label".into(), Value::Text("b".into()));
+        db.execute_in_tx(tx, "UPDATE memories SET label = $label WHERE id = $id", &p1)
+            .unwrap();
+
+        let mut p2 = HashMap::new();
+        p2.insert("id".into(), Value::Uuid(id));
+        p2.insert("label".into(), Value::Text("c".into()));
+        db.execute_in_tx(tx, "UPDATE memories SET label = $label WHERE id = $id", &p2)
+            .unwrap();
+        db.commit(tx).unwrap();
+
+        let rows = db.scan("memories", db.snapshot()).unwrap();
+        assert_eq!(rows.len(), 1, "fixture should leave one final row");
+        final_row_id = rows[0].row_id;
+        assert_eq!(
+            rows[0].values.get("label"),
+            Some(&Value::Text("c".into())),
+            "final row should be the second update"
+        );
+
+        let idx = VectorIndexRef::new("memories", "embedding");
+        let hits = db
+            .query_vector(idx, &[1.0, 0.0, 0.0], 10, None, db.snapshot())
+            .unwrap();
+        assert!(
+            !hits.is_empty() && hits[0].0 == final_row_id && hits[0].1 > 0.99,
+            "vector must move through chained same-tx updates to the final row; hits={hits:?}"
+        );
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let idx = VectorIndexRef::new("memories", "embedding");
+    let hits = db
+        .query_vector(idx, &[1.0, 0.0, 0.0], 10, None, db.snapshot())
+        .unwrap();
+    assert!(
+        !hits.is_empty() && hits[0].0 == final_row_id && hits[0].1 > 0.99,
+        "chained vector move must survive reopen on the final row; hits={hits:?}"
+    );
 }

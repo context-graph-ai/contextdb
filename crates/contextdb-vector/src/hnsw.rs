@@ -3,13 +3,13 @@ use anndists::dist::distances::{DistCosine, Distance};
 use contextdb_core::{Error, Result, RowId, VectorIndexRef, VectorQuantization};
 use hnsw_rs::hnsw::Hnsw;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct HnswIndex {
     hnsw: HnswInner,
     id_to_row: RwLock<HashMap<usize, RowId>>,
-    row_to_id: RwLock<HashMap<RowId, usize>>,
+    exact_rows: RwLock<HashMap<Vec<u8>, Vec<RowId>>>,
     next_id: AtomicUsize,
     dimension: usize,
     quantization: VectorQuantization,
@@ -47,8 +47,21 @@ impl HnswIndex {
         dimension: usize,
         quantization: VectorQuantization,
     ) -> Self {
-        let (m, ef_construction, ef_search) = select_params(entries.len(), quantization);
-        let max_elements = entries.len().max(1);
+        let mut sorted_entries = entries
+            .iter()
+            .filter(|entry| entry.deleted_tx.is_none())
+            .collect::<Vec<_>>();
+        sorted_entries.sort_by_key(|entry| {
+            (
+                entry.lsn,
+                entry.created_tx,
+                insertion_key(entry),
+                entry.row_id,
+            )
+        });
+
+        let (m, ef_construction, ef_search) = select_params(sorted_entries.len(), quantization);
+        let max_elements = sorted_entries.len().max(1);
         let hnsw = match quantization {
             VectorQuantization::F32 => {
                 let mut hnsw = Hnsw::new(m, max_elements, 16, ef_construction, DistCosine);
@@ -69,27 +82,28 @@ impl HnswIndex {
                 HnswInner::Quantized(hnsw)
             }
         };
-        let id_to_row = RwLock::new(HashMap::with_capacity(entries.len()));
-        let row_to_id = RwLock::new(HashMap::with_capacity(entries.len()));
-        let mut sorted_entries = entries.iter().collect::<Vec<_>>();
-        sorted_entries.sort_by_key(|entry| {
-            (
-                insertion_key(entry),
-                entry.lsn,
-                entry.created_tx,
-                entry.row_id,
-            )
-        });
+        let id_to_row = RwLock::new(HashMap::with_capacity(sorted_entries.len()));
+        let exact_rows = RwLock::new(HashMap::<Vec<u8>, Vec<RowId>>::with_capacity(
+            sorted_entries.len(),
+        ));
+        let mut inserted_count = 0usize;
 
         match &hnsw {
             HnswInner::F32(index) => {
                 let data = sorted_entries
                     .iter()
-                    .enumerate()
-                    .filter_map(|(data_id, entry)| {
+                    .filter_map(|entry| {
                         entry.vector.as_f32_slice().map(|vector| {
+                            let data_id = inserted_count;
+                            inserted_count += 1;
                             id_to_row.write().insert(data_id, entry.row_id);
-                            row_to_id.write().insert(entry.row_id, data_id);
+                            if let Some(key) = exact_key_for_stored_vector(&entry.vector) {
+                                exact_rows
+                                    .write()
+                                    .entry(key)
+                                    .or_default()
+                                    .push(entry.row_id);
+                            }
                             (vector.to_vec(), data_id)
                         })
                     })
@@ -103,12 +117,19 @@ impl HnswIndex {
             HnswInner::Quantized(index) => {
                 let data = sorted_entries
                     .iter()
-                    .enumerate()
-                    .filter_map(|(data_id, entry)| {
+                    .filter_map(|entry| {
                         let encoded = entry.vector.to_hnsw_u8();
                         (!encoded.is_empty()).then(|| {
+                            let data_id = inserted_count;
+                            inserted_count += 1;
                             id_to_row.write().insert(data_id, entry.row_id);
-                            row_to_id.write().insert(entry.row_id, data_id);
+                            if let Some(key) = exact_key_for_stored_vector(&entry.vector) {
+                                exact_rows
+                                    .write()
+                                    .entry(key)
+                                    .or_default()
+                                    .push(entry.row_id);
+                            }
                             (encoded, data_id)
                         })
                     })
@@ -124,19 +145,12 @@ impl HnswIndex {
         Self {
             hnsw,
             id_to_row,
-            row_to_id,
-            next_id: AtomicUsize::new(entries.len()),
+            exact_rows,
+            next_id: AtomicUsize::new(inserted_count),
             dimension,
             quantization,
             ef_search,
         }
-    }
-
-    pub(crate) fn insert(&self, row_id: RowId, vector: &StoredVector) {
-        let data_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        insert_into_hnsw(&self.hnsw, vector, data_id);
-        self.id_to_row.write().insert(data_id, row_id);
-        self.row_to_id.write().insert(row_id, data_id);
     }
 
     /// Number of vectors currently indexed in the HNSW graph.
@@ -192,34 +206,66 @@ impl HnswIndex {
             }
         };
         let id_to_row = self.id_to_row.read();
+        let cap = ef.max(k);
+        let mut scored = Vec::with_capacity(
+            cap.saturating_add(neighbors.len())
+                .min(cap.saturating_mul(2)),
+        );
+        if let Some(key) = exact_key_for_query(query, self.quantization)
+            && let Some(row_ids) = self.exact_rows.read().get(&key)
+        {
+            scored.extend(row_ids.iter().take(cap).map(|row_id| (*row_id, 1.0)));
+        }
 
-        Ok(neighbors
-            .into_iter()
-            .filter_map(|neighbor| {
-                id_to_row
-                    .get(&neighbor.d_id)
-                    .copied()
-                    .map(|row_id| (row_id, 1.0 - neighbor.distance))
-            })
-            .collect())
+        scored.extend(neighbors.into_iter().filter_map(|neighbor| {
+            id_to_row
+                .get(&neighbor.d_id)
+                .copied()
+                .map(|row_id| (row_id, 1.0 - neighbor.distance))
+        }));
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen = HashSet::new();
+        scored.retain(|(row_id, _)| seen.insert(*row_id));
+        scored.truncate(cap);
+        Ok(scored)
+    }
+
+    #[doc(hidden)]
+    pub fn raw_entry_count_for_row(&self, row_id: RowId) -> usize {
+        self.id_to_row
+            .read()
+            .values()
+            .filter(|indexed_row| **indexed_row == row_id)
+            .count()
     }
 }
 
-fn insert_into_hnsw(hnsw: &HnswInner, vector: &StoredVector, data_id: usize) {
-    match hnsw {
-        HnswInner::F32(hnsw) => {
-            let Some(vector) = vector.as_f32_slice() else {
-                return;
-            };
-            hnsw.insert((vector, data_id));
-        }
-        HnswInner::Quantized(hnsw) => {
+fn exact_key_for_stored_vector(vector: &StoredVector) -> Option<Vec<u8>> {
+    match vector {
+        StoredVector::F32(values) => Some(f32_exact_key(values)),
+        StoredVector::SQ8 { .. } | StoredVector::SQ4 { .. } => {
             let encoded = vector.to_hnsw_u8();
-            if !encoded.is_empty() {
-                hnsw.insert((&encoded, data_id));
-            }
+            (!encoded.is_empty()).then_some(encoded)
         }
     }
+}
+
+fn exact_key_for_query(query: &[f32], quantization: VectorQuantization) -> Option<Vec<u8>> {
+    match quantization {
+        VectorQuantization::F32 => Some(f32_exact_key(query)),
+        VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
+            let encoded = StoredVector::from_f32(query, quantization).to_hnsw_u8();
+            (!encoded.is_empty()).then_some(encoded)
+        }
+    }
+}
+
+fn f32_exact_key(values: &[f32]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        key.extend_from_slice(&value.to_bits().to_be_bytes());
+    }
+    key
 }
 
 fn hnsw_stats<T, D>(hnsw: &Hnsw<'_, T, D>) -> (usize, usize, u8)

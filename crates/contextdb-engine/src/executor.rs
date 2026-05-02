@@ -1768,11 +1768,7 @@ fn exec_update(
             if assigned_vector_columns.contains(&index.column) {
                 continue;
             }
-            if let Some(old_entry) =
-                db.vector_store_live_entry_for_row(&index, row.row_id, snapshot)
-                && old_entry.deleted_tx.is_none()
-                && let Err(err) = db.move_vector(txid, index, row.row_id, new_row_id)
-            {
+            if let Err(err) = db.move_vector(txid, index, row.row_id, new_row_id) {
                 db.accountant().release(new_row_bytes);
                 let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);

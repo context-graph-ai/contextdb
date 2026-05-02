@@ -537,6 +537,7 @@ impl Database {
             vector.clone(),
             change_log.clone(),
             ddl_log.clone(),
+            accountant.clone(),
         );
         let persistent = PersistentCompositeStore::new(composite, persistence.clone());
         let store: DynStore = Box::new(persistent);
@@ -591,6 +592,7 @@ impl Database {
             vector.clone(),
             change_log.clone(),
             ddl_log.clone(),
+            accountant.clone(),
         ));
         let tx_mgr = Arc::new(TxManager::new(store));
 
@@ -743,7 +745,8 @@ impl Database {
         let vector_index = vector_index_from_plan(&plan);
         if let Some(index) = &vector_index
             && let Some(state) = self.vector_store.try_state(index)
-            && state.entry_count() >= 1000
+            && state.vector_count() >= 1000
+            && state.max_tx() <= TxId::from_snapshot(self.snapshot())
             && state.hnsw_len().is_none()
         {
             let query = vec![0.0_f32; state.dimension()];
@@ -2396,13 +2399,144 @@ impl Database {
             &format!("vector_insert@{}.{}", index.table, index.column),
             "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
         )?;
-        self.vector
-            .insert_vector(tx, index, row_id, vector)
-            .inspect_err(|_| self.accountant.release(bytes))
+        let existing_live = self
+            .vector_store
+            .live_entry_for_row(&index, row_id, self.snapshot())
+            .is_some();
+        let entry = VectorEntry {
+            index: index.clone(),
+            row_id,
+            vector,
+            created_tx: tx,
+            deleted_tx: None,
+            lsn: Lsn(0),
+        };
+        let replaced_inserts = match self.tx_mgr.with_write_set(tx, |ws| {
+            let mut replaced_inserts = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_inserts.len() {
+                if ws.vector_inserts[pos].index == index && ws.vector_inserts[pos].row_id == row_id
+                {
+                    replaced_inserts.push(ws.vector_inserts.remove(pos));
+                } else {
+                    pos += 1;
+                }
+            }
+
+            let mut moved_sources = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_moves.len() {
+                let (move_index, old_row_id, new_row_id, _) = &ws.vector_moves[pos];
+                if *move_index == index && *new_row_id == row_id {
+                    moved_sources.push(*old_row_id);
+                    ws.vector_moves.remove(pos);
+                } else {
+                    pos += 1;
+                }
+            }
+            for old_row_id in moved_sources {
+                if !ws
+                    .vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == old_row_id
+                    })
+                {
+                    ws.vector_deletes.push((index.clone(), old_row_id, tx));
+                }
+            }
+
+            let already_deleted =
+                ws.vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == row_id
+                    });
+            if existing_live && !already_deleted {
+                ws.vector_deletes.push((index.clone(), row_id, tx));
+            }
+            ws.vector_inserts.push(entry);
+            replaced_inserts
+        }) {
+            Ok(replaced_inserts) => replaced_inserts,
+            Err(err) => {
+                self.accountant.release(bytes);
+                return Err(err);
+            }
+        };
+        for replaced in replaced_inserts {
+            self.accountant.release(
+                self.vector_insert_accounted_bytes(&replaced.index, replaced.vector.len()),
+            );
+        }
+        Ok(())
     }
 
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
-        self.vector.delete_vector(tx, index, row_id)
+        self.vector_store.state(&index)?;
+        let existing_live = self
+            .vector_store
+            .live_entry_for_row(&index, row_id, self.snapshot())
+            .is_some();
+        let canceled_inserts = self.tx_mgr.with_write_set(tx, |ws| {
+            let mut canceled_inserts = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_inserts.len() {
+                if ws.vector_inserts[pos].index == index && ws.vector_inserts[pos].row_id == row_id
+                {
+                    canceled_inserts.push(ws.vector_inserts.remove(pos));
+                } else {
+                    pos += 1;
+                }
+            }
+            let mut moved_sources = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_moves.len() {
+                let (move_index, old_row_id, new_row_id, _) = &ws.vector_moves[pos];
+                if *move_index == index && *new_row_id == row_id {
+                    moved_sources.push(*old_row_id);
+                    ws.vector_moves.remove(pos);
+                } else {
+                    pos += 1;
+                }
+            }
+            let pending_move_from_row =
+                ws.vector_moves
+                    .iter()
+                    .any(|(move_index, old_row_id, _, _)| {
+                        *move_index == index && *old_row_id == row_id
+                    });
+            let canceled_move_to_row = !moved_sources.is_empty();
+            for old_row_id in moved_sources {
+                if !ws
+                    .vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == old_row_id
+                    })
+                {
+                    ws.vector_deletes.push((index.clone(), old_row_id, tx));
+                }
+            }
+            let already_deleted =
+                ws.vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == row_id
+                    });
+            if !pending_move_from_row
+                && ((canceled_inserts.is_empty() && !canceled_move_to_row) || existing_live)
+                && !already_deleted
+            {
+                ws.vector_deletes.push((index, row_id, tx));
+            }
+            canceled_inserts
+        })?;
+        for entry in canceled_inserts {
+            self.accountant
+                .release(self.vector_insert_accounted_bytes(&entry.index, entry.vector.len()));
+        }
+        Ok(())
     }
 
     pub(crate) fn move_vector(
@@ -2413,9 +2547,97 @@ impl Database {
         new_row_id: RowId,
     ) -> Result<()> {
         self.vector_store.state(&index)?;
-        self.tx_mgr.with_write_set(tx, |ws| {
-            ws.vector_moves.push((index, old_row_id, new_row_id, tx));
+        let existing_live = self
+            .vector_store
+            .live_entry_for_row(&index, old_row_id, self.snapshot())
+            .is_some();
+        let replaced_inserts = self.tx_mgr.with_write_set(tx, |ws| {
+            let old_row_deleted =
+                ws.vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == old_row_id
+                    });
+
+            let mut moving_insert = None;
+            let mut replaced_inserts = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_inserts.len() {
+                if ws.vector_inserts[pos].index == index
+                    && ws.vector_inserts[pos].row_id == old_row_id
+                {
+                    let entry = ws.vector_inserts.remove(pos);
+                    if let Some(previous) = moving_insert.replace(entry) {
+                        replaced_inserts.push(previous);
+                    }
+                } else {
+                    pos += 1;
+                }
+            }
+
+            let mut moved_any = moving_insert.is_some();
+            let mut has_move_from_old = false;
+            for (move_index, source_row_id, destination_row_id, _) in &mut ws.vector_moves {
+                if *move_index != index {
+                    continue;
+                }
+                if *destination_row_id == old_row_id {
+                    *destination_row_id = new_row_id;
+                    moved_any = true;
+                }
+                if *source_row_id == old_row_id {
+                    *destination_row_id = new_row_id;
+                    has_move_from_old = true;
+                    moved_any = true;
+                }
+            }
+
+            if !moved_any && existing_live && !old_row_deleted {
+                ws.vector_moves
+                    .push((index.clone(), old_row_id, new_row_id, tx));
+                moved_any = true;
+                has_move_from_old = true;
+            }
+
+            if moved_any {
+                let mut pos = 0;
+                while pos < ws.vector_inserts.len() {
+                    if ws.vector_inserts[pos].index == index
+                        && ws.vector_inserts[pos].row_id == new_row_id
+                    {
+                        replaced_inserts.push(ws.vector_inserts.remove(pos));
+                    } else {
+                        pos += 1;
+                    }
+                }
+            }
+
+            if let Some(mut entry) = moving_insert {
+                entry.row_id = new_row_id;
+                ws.vector_inserts.push(entry);
+            } else if has_move_from_old {
+                let mut seen_move_from_old = false;
+                ws.vector_moves.retain(|(move_index, source_row_id, _, _)| {
+                    if *move_index == index && *source_row_id == old_row_id {
+                        if seen_move_from_old {
+                            false
+                        } else {
+                            seen_move_from_old = true;
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                });
+            }
+
+            replaced_inserts
         })?;
+        for replaced in replaced_inserts {
+            self.accountant.release(
+                self.vector_insert_accounted_bytes(&replaced.index, replaced.vector.len()),
+            );
+        }
         Ok(())
     }
 
@@ -2935,8 +3157,9 @@ impl Database {
         query: &[f32],
         k: usize,
     ) -> Option<Vec<(RowId, f32)>> {
-        let _ = (index, query, k);
-        None
+        self.vector_store
+            .raw_hnsw_search(&index, query, k)
+            .and_then(Result::ok)
     }
 
     #[doc(hidden)]
@@ -2945,8 +3168,8 @@ impl Database {
         index: VectorIndexRef,
         row_id: RowId,
     ) -> Option<usize> {
-        let _ = (index, row_id);
-        None
+        self.vector_store
+            .raw_hnsw_entry_count_for_row(&index, row_id)
     }
 
     #[doc(hidden)]
@@ -4313,13 +4536,13 @@ impl Database {
             }
         });
 
-        let vector_reinserts: HashSet<(VectorIndexRef, Lsn)> = vectors
+        let vector_reinserts: HashSet<(VectorIndexRef, RowId, Lsn)> = vectors
             .iter()
             .filter(|v| !v.vector.is_empty())
-            .map(|v| (v.index.clone(), v.lsn))
+            .map(|v| (v.index.clone(), v.row_id, v.lsn))
             .collect();
         vectors.retain(|v| {
-            !v.vector.is_empty() || !vector_reinserts.contains(&(v.index.clone(), v.lsn))
+            !v.vector.is_empty() || !vector_reinserts.contains(&(v.index.clone(), v.row_id, v.lsn))
         });
 
         ChangeSet {
@@ -5127,8 +5350,7 @@ impl Database {
                 .copied()
                 .unwrap_or(vector.row_id);
             if vector.vector.is_empty() {
-                self.vector
-                    .delete_vector(tx, vector.index.clone(), local_row_id)?;
+                self.delete_vector(tx, vector.index.clone(), local_row_id)?;
             } else {
                 if self.has_live_vector(local_row_id, self.snapshot()) {
                     let _ = self.delete_vector(tx, vector.index.clone(), local_row_id);

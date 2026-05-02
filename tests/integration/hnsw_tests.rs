@@ -258,8 +258,8 @@ fn h06_deleted_vectors_are_excluded_under_hnsw() {
     let all_rids = all_vectors.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
 
     let tx = db.begin();
-    let deleted_rids = all_rids[..300].iter().copied().collect::<HashSet<_>>();
-    for rid in &all_rids[..300] {
+    let deleted_rids = all_rids[..100].iter().copied().collect::<HashSet<_>>();
+    for rid in &all_rids[..100] {
         db.delete_row(tx, "items", *rid).expect("delete row");
         db.delete_vector(
             tx,
@@ -645,7 +645,7 @@ fn h14_all_deleted_vectors_return_empty_results() {
         )
         .expect("query");
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(!explain.contains("HNSWSearch"));
     assert!(results.is_empty());
 }
 
@@ -712,7 +712,7 @@ fn h15_single_surviving_vector_is_returned() {
         )
         .expect("query");
 
-    assert!(explain.contains("HNSWSearch"));
+    assert!(!explain.contains("HNSWSearch"));
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, survivor_rid);
 }

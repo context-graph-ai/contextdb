@@ -419,18 +419,6 @@ impl RedbPersistence {
                     .open_table(VECTORS_TABLE)
                     .map_err(Self::storage_error)?;
 
-                for entry in &ws.vector_inserts {
-                    let quantization = vector_quantization
-                        .get(&entry.index)
-                        .copied()
-                        .unwrap_or_default();
-                    let encoded = Self::encode_vector_entry(entry, quantization)?;
-                    let key = Self::vector_key(entry);
-                    vectors_table
-                        .insert(key.as_slice(), encoded.as_slice())
-                        .map_err(Self::storage_error)?;
-                }
-
                 for (index, row_id, deleted_tx) in &ws.vector_deletes {
                     let key = Self::vector_key_parts(index, *row_id);
                     let bytes = {
@@ -448,6 +436,18 @@ impl RedbPersistence {
                         .copied()
                         .unwrap_or_default();
                     let encoded = Self::encode_vector_entry(&entry, quantization)?;
+                    vectors_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+
+                for entry in &ws.vector_inserts {
+                    let quantization = vector_quantization
+                        .get(&entry.index)
+                        .copied()
+                        .unwrap_or_default();
+                    let encoded = Self::encode_vector_entry(entry, quantization)?;
+                    let key = Self::vector_key(entry);
                     vectors_table
                         .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;

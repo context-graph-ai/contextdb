@@ -77,11 +77,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Ok(scored)
     }
 
-    fn build_hnsw_from_store(&self, index: &VectorIndexRef) -> Option<HnswIndex> {
-        let _build_guard = self.store.build_lock();
-        let state = self.store.try_state(index)?;
+    fn build_hnsw_from_state(
+        &self,
+        index: &VectorIndexRef,
+        state: &crate::store::IndexState,
+    ) -> Option<HnswIndex> {
         let dim = state.dimension();
-        let entry_count = state.entry_count();
+        let entry_count = state.vector_count();
         let estimated_bytes = estimate_hnsw_bytes(entry_count, dim, state.quantization());
         if self
             .accountant
@@ -135,16 +137,22 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
             return Ok(Vec::new());
         }
 
-        let use_hnsw = state.entry_count() >= HNSW_THRESHOLD;
+        let snapshot_tx = TxId::from_snapshot(snapshot);
+        if state.max_tx() > snapshot_tx {
+            return self.brute_force_search(&index, query, k, candidates, snapshot);
+        }
+        let use_hnsw = state.vector_count() >= HNSW_THRESHOLD;
         if use_hnsw {
-            let lock = state
-                .hnsw()
-                .get_or_init(|| RwLock::new(self.build_hnsw_from_store(&index)));
+            let lock = state.hnsw().get_or_init(|| RwLock::new(None));
 
-            {
+            if lock.read().is_none() {
+                let _build_guard = self.store.build_lock();
+                if state.max_tx() > snapshot_tx || state.vector_count() < HNSW_THRESHOLD {
+                    return self.brute_force_search(&index, query, k, candidates, snapshot);
+                }
                 let mut guard = lock.write();
                 if guard.is_none() {
-                    *guard = self.build_hnsw_from_store(&index);
+                    *guard = self.build_hnsw_from_state(&index, &state);
                 }
             }
 
@@ -215,15 +223,52 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
     ) -> Result<()> {
         self.store.validate_vector(&index, vector.len())?;
         let entry = VectorEntry {
-            index,
+            index: index.clone(),
             row_id,
             vector,
             created_tx: tx,
             deleted_tx: None,
             lsn: contextdb_core::Lsn(0),
         };
+        let existing_live = self
+            .store
+            .live_entry_for_row(&index, row_id, self.tx_mgr.snapshot())
+            .is_some();
 
         self.tx_mgr.with_write_set(tx, |ws| {
+            ws.vector_inserts
+                .retain(|pending| !(pending.index == index && pending.row_id == row_id));
+            let mut moved_sources = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_moves.len() {
+                let (move_index, old_row_id, new_row_id, _) = &ws.vector_moves[pos];
+                if *move_index == index && *new_row_id == row_id {
+                    moved_sources.push(*old_row_id);
+                    ws.vector_moves.remove(pos);
+                } else {
+                    pos += 1;
+                }
+            }
+            for old_row_id in moved_sources {
+                if !ws
+                    .vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == old_row_id
+                    })
+                {
+                    ws.vector_deletes.push((index.clone(), old_row_id, tx));
+                }
+            }
+            let already_deleted =
+                ws.vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == row_id
+                    });
+            if existing_live && !already_deleted {
+                ws.vector_deletes.push((index.clone(), row_id, tx));
+            }
             ws.vector_inserts.push(entry);
         })?;
 
@@ -232,8 +277,56 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
 
     fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         self.store.state(&index)?;
+        let existing_live = self
+            .store
+            .live_entry_for_row(&index, row_id, self.tx_mgr.snapshot())
+            .is_some();
         self.tx_mgr.with_write_set(tx, |ws| {
-            ws.vector_deletes.push((index, row_id, tx));
+            let insert_count = ws.vector_inserts.len();
+            ws.vector_inserts
+                .retain(|entry| !(entry.index == index && entry.row_id == row_id));
+            let canceled_insert = ws.vector_inserts.len() != insert_count;
+            let mut moved_sources = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_moves.len() {
+                let (move_index, old_row_id, new_row_id, _) = &ws.vector_moves[pos];
+                if *move_index == index && *new_row_id == row_id {
+                    moved_sources.push(*old_row_id);
+                    ws.vector_moves.remove(pos);
+                } else {
+                    pos += 1;
+                }
+            }
+            let pending_move_from_row =
+                ws.vector_moves
+                    .iter()
+                    .any(|(move_index, old_row_id, _, _)| {
+                        *move_index == index && *old_row_id == row_id
+                    });
+            let canceled_move_to_row = !moved_sources.is_empty();
+            for old_row_id in moved_sources {
+                if !ws
+                    .vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == old_row_id
+                    })
+                {
+                    ws.vector_deletes.push((index.clone(), old_row_id, tx));
+                }
+            }
+            let already_deleted =
+                ws.vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == row_id
+                    });
+            if !pending_move_from_row
+                && ((!canceled_insert && !canceled_move_to_row) || existing_live)
+                && !already_deleted
+            {
+                ws.vector_deletes.push((index, row_id, tx));
+            }
         })?;
 
         Ok(())
@@ -250,5 +343,12 @@ fn estimate_hnsw_bytes(
         VectorQuantization::SQ8 => dimension.saturating_add(12),
         VectorQuantization::SQ4 => dimension.div_ceil(2).saturating_add(12),
     };
-    entry_count.saturating_mul(entry_bytes).saturating_mul(3)
+    let exact_key_bytes = entry_bytes
+        .saturating_add(std::mem::size_of::<RowId>())
+        .saturating_add(64);
+    entry_count.saturating_mul(
+        entry_bytes
+            .saturating_mul(3)
+            .saturating_add(exact_key_bytes),
+    )
 }
