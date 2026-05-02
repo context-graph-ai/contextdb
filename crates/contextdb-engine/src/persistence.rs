@@ -8,8 +8,13 @@ use contextdb_tx::WriteSet;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::sync::Mutex;
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const FORMAT_METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
@@ -24,6 +29,8 @@ const CURRENT_FORMAT_VERSION: &str = "1.0.0";
 
 pub struct RedbPersistence {
     path: std::path::PathBuf,
+    lock_file: Mutex<Option<File>>,
+    db: Mutex<Option<redb::Database>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,14 +190,27 @@ fn vector_min_max(vector: &[f32]) -> (f32, f32) {
 
 impl RedbPersistence {
     pub fn create(path: &Path) -> Result<Self> {
-        Self::acquire_pid_lock(path)?;
-        let result = (|| {
-            let db = redb::Database::create(path).map_err(Self::storage_error)?;
-            Self::write_format_marker(&db)?;
-            Ok(Self {
-                path: path.to_path_buf(),
-            })
-        })();
+        let lock_file = Self::acquire_pid_lock(path)?;
+        let result = match redb::Database::create(path)
+            .map_err(|err| Self::storage_open_error(path, &lock_file, err))
+        {
+            Ok(db) => match Self::write_format_marker(&db) {
+                Ok(()) => Ok(Self {
+                    path: path.to_path_buf(),
+                    lock_file: Mutex::new(Some(lock_file)),
+                    db: Mutex::new(Some(db)),
+                }),
+                Err(err) => {
+                    drop(db);
+                    drop(lock_file);
+                    Err(err)
+                }
+            },
+            Err(err) => {
+                drop(lock_file);
+                Err(err)
+            }
+        };
         if result.is_err() {
             Self::release_pid_lock(path);
         }
@@ -198,14 +218,25 @@ impl RedbPersistence {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        Self::acquire_pid_lock(path)?;
-        let result = (|| {
-            let db = Self::open_db_checked(path)?;
-            Self::validate_format_marker(&db, path)?;
-            Ok(Self {
-                path: path.to_path_buf(),
-            })
-        })();
+        let lock_file = Self::acquire_pid_lock(path)?;
+        let result = match Self::open_db_checked(path, &lock_file) {
+            Ok(db) => match Self::validate_format_marker(&db, path) {
+                Ok(()) => Ok(Self {
+                    path: path.to_path_buf(),
+                    lock_file: Mutex::new(Some(lock_file)),
+                    db: Mutex::new(Some(db)),
+                }),
+                Err(err) => {
+                    drop(db);
+                    drop(lock_file);
+                    Err(err)
+                }
+            },
+            Err(err) => {
+                drop(lock_file);
+                Err(err)
+            }
+        };
         if result.is_err() {
             Self::release_pid_lock(path);
         }
@@ -213,41 +244,75 @@ impl RedbPersistence {
     }
 
     pub fn close(&self) {
-        Self::release_pid_lock(&self.path);
+        let db = self.db.lock().expect("redb mutex poisoned").take();
+        drop(db);
+        let lock_file = self
+            .lock_file
+            .lock()
+            .expect("pid lock mutex poisoned")
+            .take();
+        if lock_file.is_some() {
+            drop(lock_file);
+            Self::release_pid_lock(&self.path);
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// PID-based advisory lock. Writes current PID to a .lock file.
-    /// On open, checks if the .lock file exists and if the PID in it is still alive.
-    fn acquire_pid_lock(path: &Path) -> Result<()> {
+    /// PID-based advisory lock backed by an OS file lock.
+    ///
+    /// The lock file may remain after a crash; the kernel lock is released when
+    /// the process exits, so stale files are reclaimed without unlink races.
+    fn acquire_pid_lock(path: &Path) -> Result<File> {
         let lock_path = path.with_extension("lock");
-        if lock_path.exists()
-            && let Ok(contents) = std::fs::read_to_string(&lock_path)
-            && let Ok(pid) = contents.trim().parse::<u32>()
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
         {
-            let proc_path = format!("/proc/{}", pid);
-            if std::path::Path::new(&proc_path).exists() && pid != std::process::id() {
-                return Err(Error::Other(
-                    "database is locked (another process may have it open)".to_string(),
-                ));
-            }
-            // Either PID not running (stale lock) or same process — overwrite
+            Ok(file) => file,
+            Err(err) => return Err(Self::storage_error(err)),
+        };
+        if !try_lock_exclusive(&file)? {
+            let holder_pid = read_lock_pid_for_locked_file(&mut file).unwrap_or(0);
+            return Err(Error::DatabaseLocked {
+                holder_pid,
+                path: path.to_path_buf(),
+            });
         }
-        std::fs::write(&lock_path, std::process::id().to_string()).map_err(Self::storage_error)?;
-        Ok(())
+        if let Err(err) = file.set_len(0) {
+            unlock_file(&file);
+            return Err(Self::storage_error(err));
+        }
+        if let Err(err) = file.seek(SeekFrom::Start(0)) {
+            unlock_file(&file);
+            return Err(Self::storage_error(err));
+        }
+        if let Err(err) = write!(file, "{}", std::process::id()) {
+            unlock_file(&file);
+            return Err(Self::storage_error(err));
+        }
+        if let Err(err) = file.sync_all() {
+            unlock_file(&file);
+            return Err(Self::storage_error(err));
+        }
+        Ok(file)
     }
 
     fn release_pid_lock(path: &Path) {
-        let lock_path = path.with_extension("lock");
-        let _ = std::fs::remove_file(&lock_path);
+        let _ = path;
     }
 
-    fn open_db_checked(path: &Path) -> Result<redb::Database> {
+    fn open_db_checked(path: &Path, lock_file: &File) -> Result<redb::Database> {
         match catch_unwind(AssertUnwindSafe(|| redb::Database::open(path))) {
             Ok(Ok(db)) => Ok(db),
+            Ok(Err(err)) if err.to_string().contains("already open") => {
+                Err(Self::locked_database_error(path, lock_file))
+            }
             Ok(Err(err)) => Err(Error::StoreCorrupted {
                 path: path.display().to_string(),
                 reason: format!("metadata/format could not be read: {err}"),
@@ -1065,14 +1130,154 @@ impl RedbPersistence {
         }
     }
 
+    fn storage_open_error(path: &Path, lock_file: &File, err: impl std::fmt::Display) -> Error {
+        let msg = err.to_string();
+        if msg.contains("already open") {
+            Self::locked_database_error(path, lock_file)
+        } else {
+            Self::storage_error(msg)
+        }
+    }
+
+    fn locked_database_error(path: &Path, lock_file: &File) -> Error {
+        let holder_pid = active_file_lock_owner_pid(path)
+            .or_else(|| {
+                let mut lock_file = lock_file.try_clone().ok()?;
+                read_lock_pid_for_locked_file(&mut lock_file)
+            })
+            .unwrap_or(0);
+        Error::DatabaseLocked {
+            holder_pid,
+            path: path.to_path_buf(),
+        }
+    }
+
     fn with_db<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
-        let db = redb::Database::open(&self.path).map_err(Self::storage_error)?;
-        f(&db)
+        let lock_guard = self.lock_file.lock().expect("pid lock mutex poisoned");
+        if lock_guard.is_none() {
+            return Err(Error::Other("database persistence is closed".to_string()));
+        }
+        let db_guard = self.db.lock().expect("redb mutex poisoned");
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(|| Error::Other("database persistence is closed".to_string()))?;
+        f(db)
     }
 }
 
 impl Drop for RedbPersistence {
     fn drop(&mut self) {
-        Self::release_pid_lock(&self.path);
+        let db = self.db.lock().expect("redb mutex poisoned").take();
+        drop(db);
+        if let Some(file) = self
+            .lock_file
+            .lock()
+            .expect("pid lock mutex poisoned")
+            .take()
+        {
+            drop(file);
+            Self::release_pid_lock(&self.path);
+        }
     }
+}
+
+fn read_lock_pid(file: &mut File) -> Option<u32> {
+    let mut contents = String::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_to_string(&mut contents).ok()?;
+    contents.trim().parse::<u32>().ok()
+}
+
+fn read_lock_pid_for_locked_file(file: &mut File) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(pid) = active_lock_owner_pid(file) {
+            return Some(pid);
+        }
+    }
+    read_lock_pid_after_holder_settles(file)
+}
+
+fn read_lock_pid_after_holder_settles(file: &mut File) -> Option<u32> {
+    let first = read_lock_pid(file);
+    let mut latest = first;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let current = read_lock_pid(file);
+        if current.is_some() {
+            latest = current;
+        }
+        if current.is_some() && current != first {
+            return current;
+        }
+    }
+    latest
+}
+
+#[cfg(target_os = "linux")]
+fn active_lock_owner_pid(file: &File) -> Option<u32> {
+    let metadata = file.metadata().ok()?;
+    let (dev_major, dev_minor) = linux_dev_major_minor(metadata.dev());
+    let inode = metadata.ino();
+    let locks = std::fs::read_to_string("/proc/locks").ok()?;
+    for line in locks.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 6 || fields[3] != "WRITE" {
+            continue;
+        }
+        let Ok(pid) = fields[4].parse::<u32>() else {
+            continue;
+        };
+        let Some((lock_major, lock_minor, lock_inode)) = parse_proc_lock_device_inode(fields[5])
+        else {
+            continue;
+        };
+        if lock_major == dev_major && lock_minor == dev_minor && lock_inode == inode {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn active_file_lock_owner_pid(path: &Path) -> Option<u32> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    active_lock_owner_pid(&file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn active_file_lock_owner_pid(_path: &Path) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_lock_device_inode(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.split(':');
+    let major = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let minor = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let inode = parts.next()?.parse::<u64>().ok()?;
+    Some((major, minor, inode))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dev_major_minor(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major, minor)
+}
+
+fn try_lock_exclusive(file: &File) -> Result<bool> {
+    match fs2::FileExt::try_lock_exclusive(file) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(err) => Err(Error::Other(format!("pid lock error: {err}"))),
+    }
+}
+
+fn unlock_file(file: &File) {
+    let _ = fs2::FileExt::unlock(file);
 }

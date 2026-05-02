@@ -4,9 +4,9 @@ use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::io::Write;
-use std::mem::forget;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1047,7 +1047,9 @@ async fn p17_edge_pushes_to_server_both_survive_restart() {
     client.push().await.unwrap();
 
     handle.abort();
+    let _ = handle.await;
     drop(client);
+    drop(server);
     drop(edge_db);
     drop(server_db);
 
@@ -1367,33 +1369,51 @@ fn p25_vectors_survive_process_crash_without_close() {
 
 #[test]
 fn p26_flush_on_commit_proven_when_drop_is_skipped() {
+    if let Ok(path) = env::var("CONTEXTDB_P26_CHILD_PATH") {
+        let path = std::path::PathBuf::from(path);
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, embedding VECTOR(3))",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let tx = db.begin();
+        let item_id = Uuid::from_u128(1);
+        let node_id = Uuid::from_u128(2);
+        let rid = db
+            .insert_row(tx, "items", values(vec![("id", Value::Uuid(item_id))]))
+            .unwrap();
+        db.insert_edge(tx, item_id, node_id, "SERVES".to_string(), HashMap::new())
+            .unwrap();
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            vec![1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+        std::process::exit(0);
+    }
+
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("forget.db");
-    let db = Database::open(&path).unwrap();
-    db.execute(
-        "CREATE TABLE items (id UUID PRIMARY KEY, embedding VECTOR(3))",
-        &HashMap::new(),
-    )
-    .unwrap();
-    let tx = db.begin();
     let item_id = Uuid::from_u128(1);
     let node_id = Uuid::from_u128(2);
-    let rid = db
-        .insert_row(tx, "items", values(vec![("id", Value::Uuid(item_id))]))
+    let child = Command::new(env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("persistence_tests::p26_flush_on_commit_proven_when_drop_is_skipped")
+        .arg("--nocapture")
+        .env("CONTEXTDB_P26_CHILD_PATH", &path)
+        .status()
         .unwrap();
-    db.insert_edge(tx, item_id, node_id, "SERVES".to_string(), HashMap::new())
-        .unwrap();
-    db.insert_vector(
-        tx,
-        contextdb_core::VectorIndexRef::new("items", "embedding"),
-        rid,
-        vec![1.0, 0.0, 0.0],
-    )
-    .unwrap();
-    db.commit(tx).unwrap();
-    forget(db);
+    assert!(
+        child.success(),
+        "child process should commit then exit without running Database::drop"
+    );
 
     let db2 = Database::open(&path).unwrap();
+    let rid = db2.scan("items", db2.snapshot()).unwrap()[0].row_id;
     assert!(
         db2.point_lookup("items", "id", &Value::Uuid(item_id), db2.snapshot())
             .unwrap()

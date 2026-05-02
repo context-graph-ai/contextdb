@@ -20,10 +20,10 @@ use contextdb_planner::PhysicalPlan;
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
 use contextdb_tx::{TxManager, WriteSetApplicator};
 use contextdb_vector::{HnswGraphStats, HnswIndex, MemVectorExecutor, VectorStore};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
@@ -208,6 +208,8 @@ impl QueryResult {
 thread_local! {
     static SNAPSHOT_OVERRIDE: std::cell::RefCell<Option<SnapshotId>> =
         const { std::cell::RefCell::new(None) };
+    static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub struct Database {
@@ -218,6 +220,8 @@ pub struct Database {
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
     ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     persistence: Option<Arc<RedbPersistence>>,
+    open_registry_path: Mutex<Option<PathBuf>>,
+    operation_gate: RwLock<()>,
     relational: MemRelationalExecutor<DynStore>,
     graph: MemGraphExecutor<DynStore>,
     vector: MemVectorExecutor<DynStore>,
@@ -261,6 +265,183 @@ enum ConstraintProbe {
     NoIndex,
     NoMatch,
     Match(RowId),
+}
+
+static OPEN_FILE_DATABASES: OnceLock<OpenFileRegistry> = OnceLock::new();
+
+fn open_file_registry() -> &'static OpenFileRegistry {
+    OPEN_FILE_DATABASES.get_or_init(|| OpenFileRegistry {
+        entries: Mutex::new(BTreeMap::new()),
+        waiters: Condvar::new(),
+    })
+}
+
+fn canonical_database_path(path: &Path) -> Result<PathBuf> {
+    canonical_database_path_inner(path, 0)
+}
+
+fn canonical_database_path_inner(path: &Path, depth: usize) -> Result<PathBuf> {
+    if depth > 32 {
+        return Err(Error::Other(format!(
+            "too many symlink levels while canonicalizing {}",
+            path.display()
+        )));
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        let target = std::fs::read_link(path)
+            .map_err(|err| Error::Other(format!("read_link {}: {err}", path.display())))?;
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+        return canonical_database_path_inner(&resolved, depth + 1);
+    }
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .map_err(|err| Error::Other(format!("canonicalize {}: {err}", path.display())));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        Error::Other(format!(
+            "database path must include a file name: {}",
+            path.display()
+        ))
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|err| Error::Other(format!("canonicalize {}: {err}", parent.display())))?;
+    Ok(canonical_parent.join(file_name))
+}
+
+struct OpenRegistryReservation {
+    path: PathBuf,
+    active: bool,
+}
+
+struct OpenFileRegistry {
+    entries: Mutex<BTreeMap<PathBuf, OpenRegistryState>>,
+    waiters: Condvar,
+}
+
+#[derive(Clone, Copy)]
+enum OpenRegistryState {
+    Opening { pid: u32 },
+    Open { pid: u32 },
+}
+
+impl OpenRegistryState {
+    fn pid(self) -> u32 {
+        match self {
+            Self::Opening { pid } | Self::Open { pid } => pid,
+        }
+    }
+
+    fn is_opening(self) -> bool {
+        matches!(self, Self::Opening { .. })
+    }
+}
+
+struct DatabaseOperationGuard<'a> {
+    db_id: usize,
+    _lock: Option<parking_lot::RwLockReadGuard<'a, ()>>,
+}
+
+impl Drop for DatabaseOperationGuard<'_> {
+    fn drop(&mut self) {
+        DB_OPERATION_STACK.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(
+                popped,
+                Some(self.db_id),
+                "database operation stack mismatch"
+            );
+        });
+    }
+}
+
+impl OpenRegistryReservation {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        let registry = open_file_registry();
+        let mut entries = registry.entries.lock();
+        loop {
+            match entries.get(&path).copied() {
+                Some(state) if state.is_opening() => {
+                    registry.waiters.wait(&mut entries);
+                }
+                Some(state) => {
+                    return Err(Error::DatabaseLocked {
+                        holder_pid: state.pid(),
+                        path,
+                    });
+                }
+                None => {
+                    entries.insert(
+                        path.clone(),
+                        OpenRegistryState::Opening {
+                            pid: std::process::id(),
+                        },
+                    );
+                    return Ok(Self { path, active: true });
+                }
+            }
+        }
+    }
+
+    fn disarm(mut self) -> PathBuf {
+        let registry = open_file_registry();
+        let mut entries = registry.entries.lock();
+        entries.insert(
+            self.path.clone(),
+            OpenRegistryState::Open {
+                pid: std::process::id(),
+            },
+        );
+        registry.waiters.notify_all();
+        self.active = false;
+        self.path.clone()
+    }
+}
+
+impl Drop for OpenRegistryReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let registry = open_file_registry();
+            let mut entries = registry.entries.lock();
+            if entries
+                .get(&self.path)
+                .copied()
+                .is_some_and(|state| state.is_opening() && state.pid() == std::process::id())
+            {
+                entries.remove(&self.path);
+                registry.waiters.notify_all();
+            }
+        }
+    }
+}
+
+fn release_open_registry_path(path: &Path) {
+    let registry = open_file_registry();
+    let mut entries = registry.entries.lock();
+    if entries
+        .get(path)
+        .copied()
+        .is_some_and(|state| state.pid() == std::process::id())
+    {
+        entries.remove(path);
+        registry.waiters.notify_all();
+    }
+}
+
+fn closed_database_error() -> Error {
+    Error::Other("database handle is closed".to_string())
 }
 
 impl std::fmt::Debug for Database {
@@ -338,6 +519,7 @@ impl Database {
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         persistence: Option<Arc<RedbPersistence>>,
+        open_registry_path: Option<PathBuf>,
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
         disk_limit: Option<u64>,
@@ -351,6 +533,8 @@ impl Database {
             change_log,
             ddl_log,
             persistence,
+            open_registry_path: Mutex::new(open_registry_path),
+            operation_gate: RwLock::new(()),
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
             vector: MemVectorExecutor::new_with_accountant(
@@ -464,11 +648,12 @@ impl Database {
         mut accountant: Arc<MemoryAccountant>,
         startup_disk_limit: Option<u64>,
     ) -> Result<Self> {
-        let path = path.as_ref();
-        let persistence = if path.exists() {
-            Arc::new(RedbPersistence::open(path)?)
+        let canonical_path = canonical_database_path(path.as_ref())?;
+        let registry_reservation = OpenRegistryReservation::acquire(canonical_path.clone())?;
+        let persistence = if canonical_path.exists() {
+            Arc::new(RedbPersistence::open(&canonical_path)?)
         } else {
-            Arc::new(RedbPersistence::create(path)?)
+            Arc::new(RedbPersistence::create(&canonical_path)?)
         };
         if accountant.usage().limit.is_none()
             && let Some(limit) = persistence.load_config_value::<usize>("memory_limit")?
@@ -557,6 +742,7 @@ impl Database {
             change_log,
             ddl_log,
             Some(persistence),
+            Some(registry_reservation.disarm()),
             plugin,
             accountant,
             effective_disk_limit,
@@ -597,37 +783,43 @@ impl Database {
         let tx_mgr = Arc::new(TxManager::new(store));
 
         let db = Self::build_db(
-            tx_mgr, relational, graph, vector, hnsw, change_log, ddl_log, None, plugin, accountant,
-            None, None,
+            tx_mgr, relational, graph, vector, hnsw, change_log, ddl_log, None, None, plugin,
+            accountant, None, None,
         );
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         Ok(db)
     }
 
     pub fn begin(&self) -> TxId {
+        let _operation = self.assert_open_operation();
         self.tx_mgr.begin()
     }
 
     pub fn commit(&self, tx: TxId) -> Result<()> {
+        let _operation = self.open_operation()?;
         self.commit_with_source(tx, CommitSource::User)
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
+        let _operation = self.open_operation()?;
         let ws = self.tx_mgr.cloned_write_set(tx)?;
         self.release_insert_allocations(&ws);
         self.tx_mgr.rollback(tx)
     }
 
     pub fn snapshot(&self) -> SnapshotId {
+        let _operation = self.assert_open_operation();
         self.tx_mgr.snapshot()
     }
 
     pub fn snapshot_at(&self, lsn: Lsn) -> SnapshotId {
+        let _operation = self.assert_open_operation();
         let _ = lsn;
         self.snapshot()
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        let _operation = self.open_operation()?;
         if let Some(cached) = self.cached_statement(sql) {
             let active_tx = *self.session_tx.lock();
             return self.execute_statement_with_plan(
@@ -708,6 +900,7 @@ impl Database {
 
     #[doc(hidden)]
     pub fn __statement_cache_len(&self) -> usize {
+        let _operation = self.assert_open_operation();
         self.statement_cache.read().len()
     }
 
@@ -740,6 +933,7 @@ impl Database {
     }
 
     pub fn explain(&self, sql: &str) -> Result<String> {
+        let _operation = self.open_operation()?;
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
         let vector_index = vector_index_from_plan(&plan);
@@ -772,6 +966,7 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
+        let _operation = self.open_operation()?;
         let stmt = contextdb_parser::parse(sql)?;
         self.execute_statement(&stmt, sql, params, Some(tx))
     }
@@ -1194,6 +1389,7 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<RowId> {
+        let _operation = self.open_operation()?;
         // Statement-scoped bound: `Value::TxId(n)` must satisfy
         // `n <= max(committed_watermark, tx)` so writes inside an active
         // transaction can reference their own allocated TxId. The error,
@@ -1312,6 +1508,7 @@ impl Database {
         conflict_col: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
+        let _operation = self.open_operation()?;
         let snapshot = self.snapshot_for_read();
         let existing_row = values
             .get(conflict_col)
@@ -2157,10 +2354,12 @@ impl Database {
     }
 
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
+        let _operation = self.open_operation()?;
         self.relational.delete(tx, table, row_id)
     }
 
     pub fn scan(&self, table: &str, snapshot: SnapshotId) -> Result<Vec<VersionedRow>> {
+        let _operation = self.open_operation()?;
         self.relational.scan(table, snapshot)
     }
 
@@ -2220,6 +2419,7 @@ impl Database {
         snapshot: SnapshotId,
         predicate: &dyn Fn(&VersionedRow) -> bool,
     ) -> Result<Vec<VersionedRow>> {
+        let _operation = self.open_operation()?;
         self.relational.scan_filter(table, snapshot, predicate)
     }
 
@@ -2230,6 +2430,7 @@ impl Database {
         value: &Value,
         snapshot: SnapshotId,
     ) -> Result<Option<VersionedRow>> {
+        let _operation = self.open_operation()?;
         self.relational.point_lookup(table, col, value, snapshot)
     }
 
@@ -2280,6 +2481,7 @@ impl Database {
         edge_type: EdgeType,
         properties: HashMap<String, Value>,
     ) -> Result<bool> {
+        let _operation = self.open_operation()?;
         let bytes = estimate_edge_bytes(source, target, &edge_type, &properties);
         self.accountant.try_allocate_for(
             bytes,
@@ -2312,6 +2514,7 @@ impl Database {
         target: NodeId,
         edge_type: &str,
     ) -> Result<()> {
+        let _operation = self.open_operation()?;
         self.graph.delete_edge(tx, source, target, edge_type)
     }
 
@@ -2323,6 +2526,7 @@ impl Database {
         max_depth: u32,
         snapshot: SnapshotId,
     ) -> Result<TraversalResult> {
+        let _operation = self.open_operation()?;
         self.graph
             .bfs(start, edge_types, direction, 1, max_depth, snapshot)
     }
@@ -2333,6 +2537,7 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
     ) -> Result<usize> {
+        let _operation = self.open_operation()?;
         Ok(self.graph.edge_count(source, edge_type, snapshot))
     }
 
@@ -2343,6 +2548,7 @@ impl Database {
         edge_type: &str,
         snapshot: SnapshotId,
     ) -> Result<Option<HashMap<String, Value>>> {
+        let _operation = self.open_operation()?;
         let props = self
             .graph_store
             .forward_adj
@@ -2369,6 +2575,7 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
+        let _operation = self.open_operation()?;
         self.vector_store.state(&index)?;
         if let Some(expected) = self.pending_vector_dimension(tx, &index)?
             && expected != vector.len()
@@ -2473,6 +2680,7 @@ impl Database {
     }
 
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
+        let _operation = self.open_operation()?;
         self.vector_store.state(&index)?;
         let existing_live = self
             .vector_store
@@ -2649,6 +2857,7 @@ impl Database {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
+        let _operation = self.open_operation()?;
         if self.vector_store.try_state(&index).is_none() {
             return Err(Error::UnknownVectorIndex { index });
         }
@@ -2656,6 +2865,7 @@ impl Database {
     }
 
     pub fn semantic_search(&self, query: SemanticQuery) -> Result<Vec<SearchResult>> {
+        let _operation = self.open_operation()?;
         self.semantic_search_with_candidates(query, None)
     }
 
@@ -2795,16 +3005,19 @@ impl Database {
 
     #[doc(hidden)]
     pub fn __rank_policy_eval_count(&self) -> u64 {
+        let _operation = self.assert_open_operation();
         self.rank_policy_eval_count.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
     pub fn __reset_rank_policy_eval_count(&self) {
+        let _operation = self.assert_open_operation();
         self.rank_policy_eval_count.store(0, Ordering::SeqCst);
     }
 
     #[doc(hidden)]
     pub fn __rank_policy_formula_parse_count(&self) -> u64 {
+        let _operation = self.assert_open_operation();
         self.rank_policy_formula_parse_count.load(Ordering::SeqCst)
     }
 
@@ -2816,6 +3029,7 @@ impl Database {
         column: &str,
         _raw_bytes: Vec<u8>,
     ) -> Result<()> {
+        let _operation = self.open_operation()?;
         self.corrupt_joined_values
             .write()
             .insert((table.to_string(), row_id, column.to_string()));
@@ -3138,6 +3352,7 @@ impl Database {
 
     #[doc(hidden)]
     pub fn __debug_vector_hnsw_len(&self, index: VectorIndexRef) -> Option<usize> {
+        let _operation = self.assert_open_operation();
         self.vector_store
             .try_state(&index)
             .and_then(|state| state.hnsw_len())
@@ -3145,6 +3360,7 @@ impl Database {
 
     #[doc(hidden)]
     pub fn __debug_vector_hnsw_stats(&self, index: VectorIndexRef) -> Option<HnswGraphStats> {
+        let _operation = self.assert_open_operation();
         self.vector_store
             .try_state(&index)
             .and_then(|state| state.hnsw_stats())
@@ -3157,6 +3373,7 @@ impl Database {
         query: &[f32],
         k: usize,
     ) -> Option<Vec<(RowId, f32)>> {
+        let _operation = self.assert_open_operation();
         self.vector_store
             .raw_hnsw_search(&index, query, k)
             .and_then(Result::ok)
@@ -3168,6 +3385,7 @@ impl Database {
         index: VectorIndexRef,
         row_id: RowId,
     ) -> Option<usize> {
+        let _operation = self.assert_open_operation();
         self.vector_store
             .raw_hnsw_entry_count_for_row(&index, row_id)
     }
@@ -3177,10 +3395,12 @@ impl Database {
         &self,
         index: VectorIndexRef,
     ) -> Result<Vec<usize>> {
+        let _operation = self.open_operation()?;
         self.vector_store.storage_bytes_per_entry(&index)
     }
 
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
+        let _operation = self.assert_open_operation();
         !self
             .vector_store
             .live_entries_for_row(row_id, snapshot)
@@ -3188,6 +3408,7 @@ impl Database {
     }
 
     pub fn live_vector_entry(&self, row_id: RowId, snapshot: SnapshotId) -> Option<VectorEntry> {
+        let _operation = self.assert_open_operation();
         self.vector_store
             .live_entries_for_row(row_id, snapshot)
             .into_iter()
@@ -3246,10 +3467,12 @@ impl Database {
     }
 
     pub fn table_names(&self) -> Vec<String> {
+        let _operation = self.assert_open_operation();
         self.relational_store.table_names()
     }
 
     pub fn table_meta(&self, table: &str) -> Option<TableMeta> {
+        let _operation = self.assert_open_operation();
         self.relational_store.table_meta(table)
     }
 
@@ -3281,6 +3504,7 @@ impl Database {
     /// `RowChange` the receiver can replay. row_id order is preserved.
     #[doc(hidden)]
     pub fn change_log_rows_since(&self, since: Lsn) -> Result<Vec<RowChange>> {
+        let _operation = self.open_operation()?;
         let entries = self.change_log_since(since);
         let tables = self.relational_store.tables.read();
         let mut out = Vec::new();
@@ -3336,16 +3560,19 @@ impl Database {
     /// Count of base rows the executor touched during the most recent query.
     #[doc(hidden)]
     pub fn __rows_examined(&self) -> u64 {
+        let _operation = self.assert_open_operation();
         self.rows_examined.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
     pub fn __reset_rows_examined(&self) {
+        let _operation = self.assert_open_operation();
         self.rows_examined.store(0, Ordering::SeqCst);
     }
 
     #[doc(hidden)]
     pub fn __bump_rows_examined(&self, delta: u64) {
+        let _operation = self.assert_open_operation();
         self.rows_examined.fetch_add(delta, Ordering::SeqCst);
     }
 
@@ -3353,12 +3580,14 @@ impl Database {
     /// `apply_changes` bumps this once per batch; per-row commits do not.
     #[doc(hidden)]
     pub fn __index_write_lock_count(&self) -> u64 {
+        let _operation = self.assert_open_operation();
         self.relational_store.index_write_lock_count()
     }
 
     /// Total entries across every registered index's BTreeMap.
     #[doc(hidden)]
     pub fn __introspect_indexes_total_entries(&self) -> u64 {
+        let _operation = self.assert_open_operation();
         self.relational_store.introspect_indexes_total_entries()
     }
 
@@ -3373,6 +3602,7 @@ impl Database {
         column: &str,
         value: Value,
     ) -> Result<QueryResult> {
+        let _operation = self.open_operation()?;
         let covered = self.index_covers_column(table, column)
             || self
                 .relational_store
@@ -3405,6 +3635,7 @@ impl Database {
 
     /// Run one pruning cycle. Called by the background loop or manually in tests.
     pub fn run_pruning_cycle(&self) -> u64 {
+        let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
         prune_expired_rows(
             &self.relational_store,
@@ -3418,6 +3649,7 @@ impl Database {
 
     /// Set the pruning loop interval. Test-only API.
     pub fn set_pruning_interval(&self, interval: Duration) {
+        let _operation = self.assert_open_operation();
         self.stop_pruning_thread();
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -3453,10 +3685,12 @@ impl Database {
     }
 
     pub fn sync_watermark(&self) -> Lsn {
+        let _operation = self.assert_open_operation();
         self.sync_watermark.load(Ordering::SeqCst)
     }
 
     pub fn set_sync_watermark(&self, watermark: Lsn) {
+        let _operation = self.assert_open_operation();
         self.sync_watermark.store(watermark, Ordering::SeqCst);
     }
 
@@ -3481,19 +3715,59 @@ impl Database {
     }
 
     pub fn close(&self) -> Result<()> {
+        let db_id = self as *const Self as usize;
+        if DB_OPERATION_STACK.with(|stack| stack.borrow().contains(&db_id)) {
+            return Err(Error::Other(
+                "cannot close database from inside an active operation".to_string(),
+            ));
+        }
+        let _operation_barrier = self.operation_gate.write();
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let tx = self.session_tx.lock().take();
         if let Some(tx) = tx {
-            self.rollback(tx)?;
+            if let Ok(ws) = self.tx_mgr.cloned_write_set(tx) {
+                self.release_insert_allocations(&ws);
+            }
+            let _ = self.tx_mgr.rollback(tx);
         }
         self.stop_pruning_thread();
         self.subscriptions.lock().subscribers.clear();
         if let Some(persistence) = &self.persistence {
             persistence.close();
         }
+        self.release_open_registry();
         self.plugin.on_close()
+    }
+
+    fn open_operation(&self) -> Result<DatabaseOperationGuard<'_>> {
+        let db_id = self as *const Self as usize;
+        let nested = DB_OPERATION_STACK.with(|stack| stack.borrow().contains(&db_id));
+        if nested {
+            DB_OPERATION_STACK.with(|stack| stack.borrow_mut().push(db_id));
+            return Ok(DatabaseOperationGuard { db_id, _lock: None });
+        }
+
+        let lock = self.operation_gate.read();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(closed_database_error());
+        }
+        DB_OPERATION_STACK.with(|stack| stack.borrow_mut().push(db_id));
+        Ok(DatabaseOperationGuard {
+            db_id,
+            _lock: Some(lock),
+        })
+    }
+
+    fn assert_open_operation(&self) -> DatabaseOperationGuard<'_> {
+        self.open_operation().expect("database handle is closed")
+    }
+
+    fn release_open_registry(&self) {
+        if let Some(path) = self.open_registry_path.lock().take() {
+            release_open_registry_path(&path);
+        }
     }
 
     /// File-backed database with custom plugin.
@@ -3525,16 +3799,6 @@ impl Database {
         if path.as_os_str() == ":memory:" {
             return Self::open_memory_with_plugin_and_accountant(plugin, accountant);
         }
-        let accountant = if let Some(limit) = persisted_memory_limit(path)? {
-            let usage = accountant.usage();
-            if usage.limit.is_none() && usage.startup_ceiling.is_none() {
-                Arc::new(MemoryAccountant::with_budget(limit))
-            } else {
-                accountant
-            }
-        } else {
-            accountant
-        };
         let db = Self::open_loaded(path, plugin, accountant, startup_disk_limit)?;
         db.plugin.on_open()?;
         Ok(db)
@@ -3763,16 +4027,19 @@ impl Database {
 
     /// Get a clone of the current conflict policies.
     pub fn conflict_policies(&self) -> ConflictPolicies {
+        let _operation = self.assert_open_operation();
         self.conflict_policies.read().clone()
     }
 
     /// Set the default conflict policy.
     pub fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
+        let _operation = self.assert_open_operation();
         self.conflict_policies.write().default = policy;
     }
 
     /// Set a per-table conflict policy.
     pub fn set_table_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
+        let _operation = self.assert_open_operation();
         self.conflict_policies
             .write()
             .per_table
@@ -3781,18 +4048,25 @@ impl Database {
 
     /// Remove a per-table conflict policy override.
     pub fn drop_table_conflict_policy(&self, table: &str) {
+        let _operation = self.assert_open_operation();
         self.conflict_policies.write().per_table.remove(table);
     }
 
     pub fn plugin(&self) -> &dyn DatabasePlugin {
+        assert!(
+            !self.closed.load(Ordering::SeqCst),
+            "database handle is closed"
+        );
         self.plugin.as_ref()
     }
 
     pub fn plugin_health(&self) -> PluginHealth {
+        let _operation = self.assert_open_operation();
         self.plugin.health()
     }
 
     pub fn plugin_describe(&self) -> serde_json::Value {
+        let _operation = self.assert_open_operation();
         self.plugin.describe()
     }
 
@@ -3914,6 +4188,7 @@ impl Database {
     }
 
     pub fn set_disk_limit(&self, limit: Option<u64>) -> Result<()> {
+        let _operation = self.open_operation()?;
         if self.persistence.is_none() {
             self.disk_limit.store(0, Ordering::SeqCst);
             return Ok(());
@@ -3941,6 +4216,7 @@ impl Database {
     }
 
     pub fn disk_limit(&self) -> Option<u64> {
+        let _operation = self.assert_open_operation();
         match self.disk_limit.load(Ordering::SeqCst) {
             0 => None,
             bytes => Some(bytes),
@@ -3948,6 +4224,7 @@ impl Database {
     }
 
     pub fn disk_limit_startup_ceiling(&self) -> Option<u64> {
+        let _operation = self.assert_open_operation();
         match self.disk_limit_startup_ceiling.load(Ordering::SeqCst) {
             0 => None,
             bytes => Some(bytes),
@@ -3955,6 +4232,7 @@ impl Database {
     }
 
     pub fn disk_file_size(&self) -> Option<u64> {
+        let _operation = self.assert_open_operation();
         self.persistence
             .as_ref()
             .map(|persistence| std::fs::metadata(persistence.path()).map(|meta| meta.len()))
@@ -3974,6 +4252,7 @@ impl Database {
     }
 
     pub fn check_disk_budget(&self, operation: &str) -> Result<()> {
+        let _operation = self.open_operation()?;
         let Some(limit) = self.disk_limit() else {
             return Ok(());
         };
@@ -3993,6 +4272,7 @@ impl Database {
     }
 
     pub fn persisted_sync_watermarks(&self, tenant_id: &str) -> Result<(Lsn, Lsn)> {
+        let _operation = self.open_operation()?;
         let Some(persistence) = &self.persistence else {
             return Ok((Lsn(0), Lsn(0)));
         };
@@ -4008,6 +4288,7 @@ impl Database {
     }
 
     pub fn persist_sync_push_watermark(&self, tenant_id: &str, watermark: Lsn) -> Result<()> {
+        let _operation = self.open_operation()?;
         if let Some(persistence) = &self.persistence {
             persistence
                 .flush_config_value(&format!("sync_push_watermark:{tenant_id}"), &watermark.0)?;
@@ -4016,6 +4297,7 @@ impl Database {
     }
 
     pub fn persist_sync_pull_watermark(&self, tenant_id: &str, watermark: Lsn) -> Result<()> {
+        let _operation = self.open_operation()?;
         if let Some(persistence) = &self.persistence {
             persistence
                 .flush_config_value(&format!("sync_pull_watermark:{tenant_id}"), &watermark.0)?;
@@ -4050,12 +4332,14 @@ impl Database {
     }
 
     pub fn change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
+        let _operation = self.assert_open_operation();
         let log = self.change_log.read();
         let start = log.partition_point(|e| e.lsn() <= since_lsn);
         log[start..].to_vec()
     }
 
     pub fn ddl_log_since(&self, since_lsn: Lsn) -> Vec<DdlChange> {
+        let _operation = self.assert_open_operation();
         let ddl = self.ddl_log.read();
         let start = ddl.partition_point(|(lsn, _)| *lsn <= since_lsn);
         ddl[start..].iter().map(|(_, c)| c.clone()).collect()
@@ -4363,6 +4647,7 @@ impl Database {
 
     /// Extracts changes from this database since the given LSN.
     pub fn changes_since(&self, since_lsn: Lsn) -> ChangeSet {
+        let _operation = self.assert_open_operation();
         // Future watermark guard
         if since_lsn > self.current_lsn() {
             return ChangeSet::default();
@@ -4555,16 +4840,19 @@ impl Database {
 
     /// Returns the current LSN of this database.
     pub fn current_lsn(&self) -> Lsn {
+        let _operation = self.assert_open_operation();
         self.tx_mgr.current_lsn()
     }
 
     /// Returns the highest-committed TxId on this database.
     pub fn committed_watermark(&self) -> TxId {
+        let _operation = self.assert_open_operation();
         self.tx_mgr.current_tx_max()
     }
 
     /// Returns the next TxId the allocator will issue on this database.
     pub fn next_tx(&self) -> TxId {
+        let _operation = self.assert_open_operation();
         self.tx_mgr.peek_next_tx()
     }
 
@@ -4572,34 +4860,41 @@ impl Database {
     where
         F: Fn(&Database) -> Result<()> + Send + Sync + 'static,
     {
+        let _operation = self.open_operation()?;
         let _ = (name, callback);
         Ok(())
     }
 
     pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
+        let _operation = self.open_operation()?;
         Ok(0)
     }
 
     pub fn pause_cron_tickler_for_test(&self) -> CronPauseGuard {
+        let _operation = self.assert_open_operation();
         CronPauseGuard { _private: () }
     }
 
     pub fn pause_after_relational_apply_for_test(&self) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
         ApplyPhasePauseGuard { _private: () }
     }
 
     pub fn cron_audit_log_for_test(&self) -> Vec<CronAuditEntry> {
+        let _operation = self.assert_open_operation();
         Vec::new()
     }
 
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
     /// after each commit.
     pub fn subscribe(&self) -> Receiver<CommitEvent> {
+        let _operation = self.assert_open_operation();
         self.subscribe_with_capacity(DEFAULT_SUBSCRIPTION_CAPACITY)
     }
 
     /// Subscribe with a custom channel capacity.
     pub fn subscribe_with_capacity(&self, capacity: usize) -> Receiver<CommitEvent> {
+        let _operation = self.assert_open_operation();
         let (tx, rx) = mpsc::sync_channel(capacity.max(1));
         self.subscriptions.lock().subscribers.push(tx);
         rx
@@ -4614,6 +4909,7 @@ impl Database {
     where
         F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
     {
+        let _operation = self.open_operation()?;
         let _ = (name, principal, deliver);
         Ok(())
     }
@@ -4630,17 +4926,20 @@ impl Database {
     where
         F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
     {
+        let _operation = self.open_operation()?;
         let _ = (name, contexts, scope_labels, principal, deliver);
         Ok(())
     }
 
     pub fn sink_metrics_for_test(&self, sink: &str) -> SinkMetrics {
+        let _operation = self.assert_open_operation();
         let _ = sink;
         SinkMetrics::default()
     }
 
     /// Returns health metrics for the subscription system.
     pub fn subscription_health(&self) -> SubscriptionMetrics {
+        let _operation = self.assert_open_operation();
         let subscriptions = self.subscriptions.lock();
         SubscriptionMetrics {
             active_channels: subscriptions.subscribers.len(),
@@ -4655,6 +4954,7 @@ impl Database {
         mut changes: ChangeSet,
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
+        let _operation = self.open_operation()?;
         // Per I14: the whole batch takes the index-maintenance lock once.
         // Per-row commits reuse the same guard via the per-row apply that
         // runs inside the tx manager's commit_mutex, so no second write
@@ -5701,6 +6001,7 @@ fn estimate_edge_bytes(
 
 impl Drop for Database {
     fn drop(&mut self) {
+        let _operation_barrier = self.operation_gate.write();
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -5713,6 +6014,7 @@ impl Drop for Database {
         if let Some(persistence) = &self.persistence {
             persistence.close();
         }
+        self.release_open_registry();
     }
 }
 
@@ -5928,16 +6230,6 @@ fn max_lsn_across_all(
         .unwrap_or(Lsn(0));
 
     relational_max.max(graph_max).max(vector_max)
-}
-
-fn persisted_memory_limit(path: &Path) -> Result<Option<usize>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let persistence = RedbPersistence::open(path)?;
-    let limit = persistence.load_config_value::<usize>("memory_limit")?;
-    persistence.close();
-    Ok(limit)
 }
 
 fn is_fatal_sync_apply_error(err: &Error) -> bool {

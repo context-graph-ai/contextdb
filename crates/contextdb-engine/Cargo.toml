@@ -27,6 +27,7 @@ redb = { workspace = true }
 bincode = { workspace = true }
 smallvec = "1"
 time.workspace = true
+fs2 = "0.4"
 
 [dev-dependencies]
 contextdb-server = { path = "../contextdb-server" }
