@@ -14,6 +14,12 @@ stmt = _{
     | drop_table_stmt
     | create_index_stmt
     | drop_index_stmt
+    | create_schedule_stmt
+    | drop_schedule_stmt
+    | create_event_type_stmt
+    | create_sink_stmt
+    | create_route_stmt
+    | drop_route_stmt
     | insert_stmt
     | delete_stmt
     | update_stmt
@@ -179,8 +185,19 @@ column_constraint = {
     | expires_constraint
     | immutable_constraint
     | rank_policy_clause
+    | context_id_constraint
+    | scope_label_split
+    | scope_label_simple
+    | acl_constraint
     | state_machine_option
 }
+context_id_constraint = { ^"CONTEXT_ID" }
+scope_label_simple = { ^"SCOPE_LABEL" ~ "(" ~ string ~ ("," ~ string)* ~ ")" }
+scope_label_split = {
+    ^"SCOPE_LABEL_READ" ~ "(" ~ string ~ ("," ~ string)* ~ ")"
+    ~ ^"WRITE" ~ "(" ~ string ~ ("," ~ string)* ~ ")"
+}
+acl_constraint = { ^"ACL" ~ ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
 expires_constraint = { ^"EXPIRES" }
 immutable_constraint = { ^"IMMUTABLE" }
 not_null = { ^"NOT" ~ ^"NULL" }
@@ -275,6 +292,44 @@ index_sort_direction = { ^"ASC" | ^"DESC" }
 drop_index_stmt = {
     ^"DROP" ~ ^"INDEX" ~ if_exists? ~ identifier ~ ^"ON" ~ identifier
 }
+
+create_schedule_stmt = {
+    ^"CREATE" ~ ^"SCHEDULE" ~ identifier
+    ~ ^"EVERY" ~ string
+    ~ ^"TX" ~ "(" ~ identifier ~ ")"
+    ~ missed_tick_clause?
+}
+missed_tick_clause = {
+    ^"MISSED_TICK_POLICY" ~ string
+    ~ (^"WITHIN" ~ integer ~ ^"SECONDS")?
+}
+drop_schedule_stmt = { ^"DROP" ~ ^"SCHEDULE" ~ identifier }
+
+create_event_type_stmt = {
+    ^"CREATE" ~ ^"EVENT" ~ ^"TYPE" ~ identifier
+    ~ ^"WHEN" ~ event_trigger
+    ~ ^"ON" ~ identifier
+}
+event_trigger = { ^"INSERT" | ^"UPDATE" | ^"DELETE" }
+
+create_sink_stmt = {
+    ^"CREATE" ~ ^"SINK" ~ identifier
+    ~ ^"TYPE" ~ sink_type
+    ~ sink_url_clause?
+}
+sink_type = { ^"webhook" | ^"callback" }
+sink_url_clause = { ^"URL" ~ string }
+
+create_route_stmt = {
+    ^"CREATE" ~ ^"ROUTE" ~ identifier
+    ~ ^"EVENT" ~ identifier
+    ~ ^"TO" ~ identifier
+    ~ route_where_clause?
+}
+route_where_clause = {
+    ^"WHERE" ~ identifier ~ ^"IN" ~ "(" ~ string ~ ("," ~ string)* ~ ")"
+}
+drop_route_stmt = { ^"DROP" ~ ^"ROUTE" ~ identifier }
 
 insert_stmt = {
     ^"INSERT"

@@ -120,6 +120,63 @@ pub struct SearchResult {
     pub rank: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronAuditEntry {
+    pub schedule_name: String,
+    pub kind: CronAuditKind,
+    pub at_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronAuditKind {
+    Fired,
+    MissedSkipped,
+    MissedCaughtUp { ticks: u32 },
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub struct CronPauseGuard {
+    _private: (),
+}
+
+#[derive(Debug)]
+pub struct ApplyPhasePauseGuard {
+    _private: (),
+}
+
+impl ApplyPhasePauseGuard {
+    pub fn wait_until_reached(&self, timeout: Duration) -> bool {
+        let _ = timeout;
+        false
+    }
+
+    pub fn release(&self) {}
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SinkEvent {
+    pub event_type: String,
+    pub table: String,
+    pub row_values: HashMap<String, Value>,
+    pub severity: String,
+    pub at_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinkError {
+    Transient(String),
+    Permanent(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SinkMetrics {
+    pub delivered: u64,
+    pub queued: u64,
+    pub retried: u64,
+    pub permanent_failures: u64,
+}
+
 #[derive(Debug, Clone)]
 struct CachedStatement {
     stmt: Statement,
@@ -339,6 +396,68 @@ impl Database {
         .expect("failed to open in-memory database")
     }
 
+    pub fn open_with_contexts<P: AsRef<Path>>(
+        path: P,
+        contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
+    ) -> Result<Self> {
+        let _ = contexts;
+        Self::open(path)
+    }
+
+    pub fn open_memory_with_contexts(
+        contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
+    ) -> Self {
+        let _ = contexts;
+        Self::open_memory()
+    }
+
+    pub fn open_with_scope_labels<P: AsRef<Path>>(
+        path: P,
+        labels: std::collections::BTreeSet<contextdb_core::types::ScopeLabel>,
+    ) -> Result<Self> {
+        let _ = labels;
+        Self::open(path)
+    }
+
+    pub fn open_memory_with_scope_labels(
+        labels: std::collections::BTreeSet<contextdb_core::types::ScopeLabel>,
+    ) -> Self {
+        let _ = labels;
+        Self::open_memory()
+    }
+
+    pub fn open_as_principal<P: AsRef<Path>>(
+        path: P,
+        principal: contextdb_core::types::Principal,
+    ) -> Result<Self> {
+        let _ = principal;
+        Self::open(path)
+    }
+
+    pub fn open_memory_as_principal(principal: contextdb_core::types::Principal) -> Self {
+        let _ = principal;
+        Self::open_memory()
+    }
+
+    pub fn open_with_constraints<P: AsRef<Path>>(
+        path: P,
+        contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
+        scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
+        principal: Option<contextdb_core::types::Principal>,
+    ) -> Result<Self> {
+        let _ = (contexts, scope_labels, principal);
+        Self::open(path)
+    }
+
+    pub fn open_memory_with_constraints(
+        contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
+        scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
+        principal: Option<contextdb_core::types::Principal>,
+    ) -> Self {
+        let _ = (contexts, scope_labels, principal);
+        Self::open_memory()
+    }
+
     fn open_loaded(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -499,6 +618,11 @@ impl Database {
 
     pub fn snapshot(&self) -> SnapshotId {
         self.tx_mgr.snapshot()
+    }
+
+    pub fn snapshot_at(&self, lsn: Lsn) -> SnapshotId {
+        let _ = lsn;
+        self.snapshot()
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
@@ -957,6 +1081,25 @@ impl Database {
                                 .rank_policy
                                 .as_deref()
                                 .map(crate::executor::map_rank_policy),
+                            context_id: col.context_id,
+                            scope_label: col.scope_label.as_deref().map(|scope| match scope {
+                                contextdb_parser::ast::ScopeLabelConstraint::Simple { labels } => {
+                                    contextdb_core::ScopeLabelKind::Simple {
+                                        write_labels: labels.clone(),
+                                    }
+                                }
+                                contextdb_parser::ast::ScopeLabelConstraint::Split {
+                                    read,
+                                    write,
+                                } => contextdb_core::ScopeLabelKind::Split {
+                                    read_labels: read.clone(),
+                                    write_labels: write.clone(),
+                                },
+                            }),
+                            acl_ref: col.acl_ref.as_ref().map(|acl| contextdb_core::AclRef {
+                                ref_table: acl.ref_table.clone(),
+                                ref_column: acl.ref_column.clone(),
+                            }),
                         });
                         if col.expires {
                             meta.expires_column = Some(col.name.clone());
@@ -2786,6 +2929,27 @@ impl Database {
     }
 
     #[doc(hidden)]
+    pub fn __debug_vector_hnsw_raw_search_for_test(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+    ) -> Option<Vec<(RowId, f32)>> {
+        let _ = (index, query, k);
+        None
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_vector_hnsw_raw_entry_count_for_row_for_test(
+        &self,
+        index: VectorIndexRef,
+        row_id: RowId,
+    ) -> Option<usize> {
+        let _ = (index, row_id);
+        None
+    }
+
+    #[doc(hidden)]
     pub fn __debug_vector_storage_bytes_per_entry(
         &self,
         index: VectorIndexRef,
@@ -4181,6 +4345,30 @@ impl Database {
         self.tx_mgr.peek_next_tx()
     }
 
+    pub fn register_cron_callback<F>(&self, name: &str, callback: F) -> Result<()>
+    where
+        F: Fn(&Database) -> Result<()> + Send + Sync + 'static,
+    {
+        let _ = (name, callback);
+        Ok(())
+    }
+
+    pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    pub fn pause_cron_tickler_for_test(&self) -> CronPauseGuard {
+        CronPauseGuard { _private: () }
+    }
+
+    pub fn pause_after_relational_apply_for_test(&self) -> ApplyPhasePauseGuard {
+        ApplyPhasePauseGuard { _private: () }
+    }
+
+    pub fn cron_audit_log_for_test(&self) -> Vec<CronAuditEntry> {
+        Vec::new()
+    }
+
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
     /// after each commit.
     pub fn subscribe(&self) -> Receiver<CommitEvent> {
@@ -4192,6 +4380,40 @@ impl Database {
         let (tx, rx) = mpsc::sync_channel(capacity.max(1));
         self.subscriptions.lock().subscribers.push(tx);
         rx
+    }
+
+    pub fn register_sink<F>(
+        &self,
+        name: &str,
+        principal: Option<contextdb_core::types::Principal>,
+        deliver: F,
+    ) -> Result<()>
+    where
+        F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
+    {
+        let _ = (name, principal, deliver);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_register_sink_with_constraints_for_test<F>(
+        &self,
+        name: &str,
+        contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
+        scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
+        principal: Option<contextdb_core::types::Principal>,
+        deliver: F,
+    ) -> Result<()>
+    where
+        F: Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync + 'static,
+    {
+        let _ = (name, contexts, scope_labels, principal, deliver);
+        Ok(())
+    }
+
+    pub fn sink_metrics_for_test(&self, sink: &str) -> SinkMetrics {
+        let _ = sink;
+        SinkMetrics::default()
     }
 
     /// Returns health metrics for the subscription system.

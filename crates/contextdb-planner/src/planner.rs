@@ -68,6 +68,12 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         }
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
+        Statement::CreateSchedule { .. }
+        | Statement::DropSchedule { .. }
+        | Statement::CreateEventType { .. }
+        | Statement::CreateSink { .. }
+        | Statement::CreateRoute { .. }
+        | Statement::DropRoute { .. } => Ok(PhysicalPlan::Pipeline(vec![])),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Ok(PhysicalPlan::Pipeline(vec![]))
         }

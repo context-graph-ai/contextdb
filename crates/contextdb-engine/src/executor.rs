@@ -4929,6 +4929,24 @@ fn core_column_from_ast(
         immutable: col.immutable,
         quantization: map_vector_quantization(col.quantization),
         rank_policy,
+        context_id: col.context_id,
+        scope_label: col.scope_label.as_deref().map(|scope| match scope {
+            contextdb_parser::ast::ScopeLabelConstraint::Simple { labels } => {
+                contextdb_core::ScopeLabelKind::Simple {
+                    write_labels: labels.clone(),
+                }
+            }
+            contextdb_parser::ast::ScopeLabelConstraint::Split { read, write } => {
+                contextdb_core::ScopeLabelKind::Split {
+                    read_labels: read.clone(),
+                    write_labels: write.clone(),
+                }
+            }
+        }),
+        acl_ref: col.acl_ref.as_ref().map(|acl| contextdb_core::AclRef {
+            ref_table: acl.ref_table.clone(),
+            ref_column: acl.ref_column.clone(),
+        }),
     }
 }
 
@@ -4965,6 +4983,9 @@ fn ast_column_from_core(col: contextdb_core::ColumnDef) -> contextdb_parser::ast
             }
         },
         rank_policy: None,
+        context_id: col.context_id,
+        scope_label: None,
+        acl_ref: None,
     }
 }
 

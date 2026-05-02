@@ -345,6 +345,31 @@ pub enum DirectedValue {
 
 pub type IndexKey = Vec<DirectedValue>;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ContextId(pub Uuid);
+
+impl ContextId {
+    pub fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ScopeLabel(pub String);
+
+impl ScopeLabel {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Principal {
+    System,
+    Agent(String),
+    Human(String),
+}
+
 impl PartialEq for TotalOrdAsc {
     fn eq(&self, other: &Self) -> bool {
         value_total_cmp(&self.0, &other.0).is_eq()

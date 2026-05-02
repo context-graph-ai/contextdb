@@ -19,6 +19,54 @@ pub enum Statement {
     SetSyncConflictPolicy(String),
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
+    CreateSchedule {
+        name: String,
+        every: String,
+        callback: String,
+        missed_tick_policy: Option<String>,
+        catch_up_within_seconds: Option<u32>,
+    },
+    DropSchedule {
+        name: String,
+    },
+    CreateEventType {
+        name: String,
+        when: EventTypeTrigger,
+        table: String,
+    },
+    CreateSink {
+        name: String,
+        sink_type: SinkType,
+        url: Option<String>,
+    },
+    CreateRoute {
+        name: String,
+        event_type: String,
+        sink: String,
+        where_in: Option<RouteWhereIn>,
+    },
+    DropRoute {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventTypeTrigger {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinkType {
+    Webhook,
+    Callback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteWhereIn {
+    pub column: String,
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +382,26 @@ pub struct ColumnDef {
     pub immutable: bool,
     pub quantization: VectorQuantization,
     pub rank_policy: Option<Box<RankPolicyAst>>,
+    pub context_id: bool,
+    pub scope_label: Option<Box<ScopeLabelConstraint>>,
+    pub acl_ref: Option<Box<AclConstraint>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeLabelConstraint {
+    Simple {
+        labels: Vec<String>,
+    },
+    Split {
+        read: Vec<String>,
+        write: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclConstraint {
+    pub ref_table: String,
+    pub ref_column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

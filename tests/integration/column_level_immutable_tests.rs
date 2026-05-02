@@ -931,6 +931,9 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
                             immutable: c.immutable,
                             quantization: contextdb_core::VectorQuantization::F32,
                             rank_policy: None,
+                            context_id: c.context_id,
+                            scope_label: None,
+                            acl_ref: None,
                         })
                         .collect(),
                     ..TableMeta::default()

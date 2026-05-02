@@ -10,6 +10,10 @@ pub mod schema_enforcer;
 pub mod sync;
 pub mod sync_types;
 
+pub use database::{
+    ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, SinkError, SinkEvent,
+    SinkMetrics,
+};
 pub use database::{CascadeReport, Database, IndexCandidate, QueryResult, QueryTrace};
 pub use database::{SearchResult, SemanticQuery};
 pub use sync::{ChangeApplication, ChangeTracking};

@@ -1,4 +1,4 @@
-use crate::types::{TxId, VectorIndexRef};
+use crate::types::{Principal, RowId, TxId, VectorIndexRef};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -210,6 +210,33 @@ pub enum Error {
     },
     #[error("column not found: {table}.{column}")]
     ColumnNotFound { table: String, column: String },
+    #[error("database is locked: another process (pid {holder_pid}) holds {path:?}")]
+    DatabaseLocked {
+        holder_pid: u32,
+        path: std::path::PathBuf,
+    },
+    #[error("context scope violation: requested {requested:?}, allowed {allowed:?}")]
+    ContextScopeViolation {
+        requested: crate::types::ContextId,
+        allowed: std::collections::BTreeSet<crate::types::ContextId>,
+    },
+    #[error("scope label violation: requested {requested:?}, allowed {allowed:?}")]
+    ScopeLabelViolation {
+        requested: crate::types::ScopeLabel,
+        allowed: std::collections::BTreeSet<crate::types::ScopeLabel>,
+    },
+    #[error("principal required for read on table `{table}`")]
+    PrincipalRequired { table: String },
+    #[error("ACL denied on `{table}` row {row_id:?} for principal {principal:?}")]
+    AclDenied {
+        table: String,
+        row_id: RowId,
+        principal: Principal,
+    },
+    #[error("missed cron ticks exceeded policy: {ticks} ticks missed under '{policy}'")]
+    MissedTicksExceeded { ticks: u32, policy: String },
+    #[error("schema invalid: {reason}")]
+    SchemaInvalid { reason: String },
     #[error("{0}")]
     Other(String),
 }

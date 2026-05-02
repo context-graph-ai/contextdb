@@ -106,3 +106,28 @@ path = "../../benches/acceptance_three_paradigm_query.rs"
 name = "sql_surface_distinct"
 harness = false
 path = "../../benches/sql_surface_distinct.rs"
+
+[[bench]]
+name = "tier1_atomic_visibility_under_contention"
+harness = false
+path = "../../benches/tier1_atomic_visibility_under_contention.rs"
+
+[[bench]]
+name = "tier1_event_bus_throughput"
+harness = false
+path = "../../benches/tier1_event_bus_throughput.rs"
+
+[[bench]]
+name = "tier1_context_guard_overhead"
+harness = false
+path = "../../benches/tier1_context_guard_overhead.rs"
+
+[[bench]]
+name = "tier1_scope_label_overhead"
+harness = false
+path = "../../benches/tier1_scope_label_overhead.rs"
+
+[[bench]]
+name = "tier1_acl_overhead"
+harness = false
+path = "../../benches/tier1_acl_overhead.rs"

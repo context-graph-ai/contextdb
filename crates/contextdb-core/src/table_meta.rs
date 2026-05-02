@@ -227,6 +227,23 @@ pub struct StateMachineConstraint {
     pub transitions: HashMap<String, Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeLabelKind {
+    Simple {
+        write_labels: Vec<String>,
+    },
+    Split {
+        read_labels: Vec<String>,
+        write_labels: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AclRef {
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnDef {
     pub name: String,
@@ -247,6 +264,12 @@ pub struct ColumnDef {
     pub quantization: VectorQuantization,
     #[serde(default)]
     pub rank_policy: Option<RankPolicy>,
+    #[serde(default)]
+    pub context_id: bool,
+    #[serde(default)]
+    pub scope_label: Option<ScopeLabelKind>,
+    #[serde(default)]
+    pub acl_ref: Option<AclRef>,
 }
 
 // Custom `Deserialize` that tolerates prior on-disk schemas missing the
@@ -303,6 +326,11 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let rank_policy = seq
                     .next_element::<Option<RankPolicy>>()?
                     .unwrap_or_default();
+                let context_id = seq.next_element::<bool>()?.unwrap_or_default();
+                let scope_label = seq
+                    .next_element::<Option<ScopeLabelKind>>()?
+                    .unwrap_or_default();
+                let acl_ref = seq.next_element::<Option<AclRef>>()?.unwrap_or_default();
                 Ok(ColumnDef {
                     name,
                     column_type,
@@ -315,6 +343,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     immutable,
                     quantization,
                     rank_policy,
+                    context_id,
+                    scope_label,
+                    acl_ref,
                 })
             }
 
@@ -333,6 +364,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut immutable: Option<bool> = None;
                 let mut quantization: Option<VectorQuantization> = None;
                 let mut rank_policy: Option<Option<RankPolicy>> = None;
+                let mut context_id: Option<bool> = None;
+                let mut scope_label: Option<Option<ScopeLabelKind>> = None;
+                let mut acl_ref: Option<Option<AclRef>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -347,6 +381,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "immutable" => immutable = Some(map.next_value()?),
                         "quantization" => quantization = Some(map.next_value()?),
                         "rank_policy" => rank_policy = Some(map.next_value()?),
+                        "context_id" => context_id = Some(map.next_value()?),
+                        "scope_label" => scope_label = Some(map.next_value()?),
+                        "acl_ref" => acl_ref = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -368,6 +405,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     immutable: immutable.unwrap_or_default(),
                     quantization: quantization.unwrap_or_default(),
                     rank_policy: rank_policy.unwrap_or_default(),
+                    context_id: context_id.unwrap_or_default(),
+                    scope_label: scope_label.unwrap_or_default(),
+                    acl_ref: acl_ref.unwrap_or_default(),
                 })
             }
         }
@@ -384,6 +424,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "immutable",
             "quantization",
             "rank_policy",
+            "context_id",
+            "scope_label",
+            "acl_ref",
         ];
         deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
     }
@@ -561,11 +604,40 @@ impl ColumnDef {
                     + policy.protected_index.len() * 16
             })
             .unwrap_or(0);
+        let scope_label_bytes = self
+            .scope_label
+            .as_ref()
+            .map(|kind| match kind {
+                ScopeLabelKind::Simple { write_labels } => {
+                    24 + write_labels
+                        .iter()
+                        .map(|s| 16 + s.len() * 16)
+                        .sum::<usize>()
+                }
+                ScopeLabelKind::Split {
+                    read_labels,
+                    write_labels,
+                } => {
+                    40 + read_labels.iter().map(|s| 16 + s.len() * 16).sum::<usize>()
+                        + write_labels
+                            .iter()
+                            .map(|s| 16 + s.len() * 16)
+                            .sum::<usize>()
+                }
+            })
+            .unwrap_or(0);
+        let acl_ref_bytes = self
+            .acl_ref
+            .as_ref()
+            .map(|acl| 32 + acl.ref_table.len() * 16 + acl.ref_column.len() * 16)
+            .unwrap_or(0);
         8 + self.name.len() * 16
             + self.column_type.estimated_bytes()
             + default_bytes
             + reference_bytes
             + rank_policy_bytes
+            + scope_label_bytes
+            + acl_ref_bytes
             + 8
     }
 }
