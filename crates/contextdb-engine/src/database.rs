@@ -37,6 +37,7 @@ type GatedBfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
 type GatedGraphNeighbor = (NodeId, EdgeType, HashMap<String, Value>, NodeId, NodeId);
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
 const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
+const SAME_PROCESS_REOPEN_RETRY: Duration = Duration::from_millis(500);
 // redb may need a small metadata page on the next write, especially for a new
 // file with the format metadata table. Keep the disk-limit error deterministic
 // instead of starting a write that cannot commit cleanly.
@@ -486,6 +487,47 @@ impl Drop for OpenRegistryReservation {
     }
 }
 
+fn acquire_registry_and_persistence(
+    canonical_path: &Path,
+) -> Result<(OpenRegistryReservation, Arc<RedbPersistence>)> {
+    let retry_deadline = Instant::now() + SAME_PROCESS_REOPEN_RETRY;
+
+    loop {
+        let registry_reservation =
+            match OpenRegistryReservation::acquire(canonical_path.to_path_buf()) {
+                Ok(reservation) => reservation,
+                Err(Error::DatabaseLocked { holder_pid, path })
+                    if holder_pid == std::process::id()
+                        && path == canonical_path
+                        && Instant::now() < retry_deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+        let persistence = if canonical_path.exists() {
+            RedbPersistence::open(canonical_path)
+        } else {
+            RedbPersistence::create(canonical_path)
+        };
+
+        match persistence {
+            Ok(persistence) => return Ok((registry_reservation, Arc::new(persistence))),
+            Err(Error::DatabaseLocked { holder_pid, path })
+                if holder_pid == std::process::id()
+                    && path == canonical_path
+                    && Instant::now() < retry_deadline =>
+            {
+                drop(registry_reservation);
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn release_open_registry_path(path: &Path) {
     let registry = open_file_registry();
     let mut entries = registry.entries.lock();
@@ -741,12 +783,8 @@ impl Database {
         startup_disk_limit: Option<u64>,
     ) -> Result<Self> {
         let canonical_path = canonical_database_path(path.as_ref())?;
-        let registry_reservation = OpenRegistryReservation::acquire(canonical_path.clone())?;
-        let persistence = if canonical_path.exists() {
-            Arc::new(RedbPersistence::open(&canonical_path)?)
-        } else {
-            Arc::new(RedbPersistence::create(&canonical_path)?)
-        };
+        let (registry_reservation, persistence) =
+            acquire_registry_and_persistence(&canonical_path)?;
         if accountant.usage().limit.is_none()
             && let Some(limit) = persistence.load_config_value::<usize>("memory_limit")?
         {
