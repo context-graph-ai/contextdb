@@ -13,6 +13,26 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+fn current_test_exe_for_child() -> PathBuf {
+    let path = env::current_exe().expect("current test executable path");
+    if path.exists() {
+        return path;
+    }
+
+    // Other acceptance tests invoke Cargo, which can unlink the on-disk test
+    // binary while this process is still running. Linux keeps /proc/self/exe
+    // executable in that case.
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/proc/self/exe")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        path
+    }
+}
+
 fn assert_error<T>(result: contextdb_core::Result<T>, message: &str) -> Error {
     let err = result.err();
     assert!(err.is_some(), "{message}: expected Err, got Ok");
@@ -466,7 +486,7 @@ fn t19_11_lockfile_unlink_does_not_split_cross_process_authority() {
         "expected same-process DatabaseLocked, got: {err:?}"
     );
 
-    let child = Command::new(env::current_exe().unwrap())
+    let child = Command::new(current_test_exe_for_child())
         .arg("--exact")
         .arg("db_lock_visibility::t19_11_lockfile_unlink_does_not_split_cross_process_authority")
         .arg("--nocapture")
