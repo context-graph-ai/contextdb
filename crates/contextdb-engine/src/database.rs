@@ -1,5 +1,5 @@
 use crate::composite_store::{ApplyPhasePause, ChangeLogEntry, CompositeStore};
-use crate::executor::execute_plan;
+use crate::executor::{apply_on_conflict_updates, execute_plan};
 use crate::persistence::RedbPersistence;
 use crate::persistent_store::PersistentCompositeStore;
 use crate::plugin::{
@@ -15,10 +15,10 @@ use crate::sync_types::{
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
 use contextdb_parser::Statement;
-use contextdb_parser::ast::{AlterAction, CreateTable, DataType};
-use contextdb_planner::PhysicalPlan;
-use contextdb_relational::{MemRelationalExecutor, RelationalStore};
-use contextdb_tx::{TxManager, WriteSetApplicator};
+use contextdb_parser::ast::{AlterAction, CreateTable, DataType, Expr};
+use contextdb_planner::{OnConflictPlan, PhysicalPlan};
+use contextdb_relational::{MemRelationalExecutor, RelationalStore, index_key_from_values};
+use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use contextdb_vector::{HnswGraphStats, HnswIndex, MemVectorExecutor, VectorStore};
 use parking_lot::{Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type DynStore = Box<dyn WriteSetApplicator>;
 type GatedBfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
@@ -276,6 +276,7 @@ pub struct Database {
     cron: Arc<CronState>,
     event_bus: Arc<EventBusState>,
     pending_event_bus_ddl: Mutex<HashMap<TxId, Vec<DdlChange>>>,
+    pending_commit_metadata: Mutex<HashMap<TxId, PendingCommitMetadata>>,
     disk_limit: AtomicU64,
     disk_limit_startup_ceiling: AtomicU64,
     sync_watermark: Arc<AtomicLsn>,
@@ -308,6 +309,56 @@ struct AclGrantCacheKey {
 pub(crate) enum InsertRowResult {
     Inserted(RowId),
     NoOp,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WriteSetCounts {
+    relational_inserts: usize,
+    relational_deletes: usize,
+    adj_inserts: usize,
+    adj_deletes: usize,
+    vector_inserts: usize,
+    vector_deletes: usize,
+    vector_moves: usize,
+}
+
+#[derive(Debug, Default)]
+struct PendingCommitMetadata {
+    conditional_update_guards: Vec<PendingConditionalUpdateGuard>,
+    upsert_intents: Vec<PendingUpsertIntent>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UpsertIntentDetails {
+    pub insert_values: HashMap<ColName, Value>,
+    pub conflict_columns: Vec<ColName>,
+    pub update_columns: Vec<(ColName, Expr)>,
+    pub params: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingConditionalUpdateGuard {
+    table: TableName,
+    row_id: RowId,
+    predicates: Vec<(ColName, Value)>,
+    before: WriteSetCounts,
+    after: WriteSetCounts,
+}
+
+#[derive(Debug, Clone)]
+struct PendingUpsertIntent {
+    table: TableName,
+    row_id: RowId,
+    active_tx: TxId,
+    insert_values: HashMap<ColName, Value>,
+    conflict_columns: Vec<ColName>,
+    update_columns: Vec<(ColName, Expr)>,
+    params: HashMap<String, Value>,
+}
+
+#[derive(Debug, Default)]
+struct CommitValidationOutcome {
+    conditional_noop_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -659,6 +710,7 @@ impl Database {
             cron: Arc::new(CronState::new()),
             event_bus,
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
+            pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
             disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
             sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
@@ -1025,6 +1077,7 @@ impl Database {
         }
         let ws = self.tx_mgr.rollback_write_set(tx)?;
         self.pending_event_bus_ddl.lock().remove(&tx);
+        self.pending_commit_metadata.lock().remove(&tx);
         self.release_insert_allocations(&ws);
         Ok(())
     }
@@ -1270,8 +1323,16 @@ impl Database {
                 let tx = self.begin();
                 let result = execute_plan(self, plan, params, Some(tx));
                 match result {
-                    Ok(qr) => {
-                        self.commit_with_source(tx, CommitSource::AutoCommit)?;
+                    Ok(mut qr) => {
+                        let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
+                        let validation = self.commit_with_source_and_event_bus_ddl(
+                            tx,
+                            CommitSource::AutoCommit,
+                            &event_bus_ddl,
+                        )?;
+                        qr.rows_affected = qr
+                            .rows_affected
+                            .saturating_sub(validation.conditional_noop_count);
                         Ok(qr)
                     }
                     Err(e) => {
@@ -1332,6 +1393,7 @@ impl Database {
     fn commit_with_source(&self, tx: TxId, source: CommitSource) -> Result<()> {
         let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
         self.commit_with_source_and_event_bus_ddl(tx, source, &event_bus_ddl)
+            .map(|_| ())
     }
 
     fn commit_with_source_and_event_bus_ddl(
@@ -1339,13 +1401,17 @@ impl Database {
         tx: TxId,
         source: CommitSource,
         event_bus_ddl: &[DdlChange],
-    ) -> Result<()> {
+    ) -> Result<CommitValidationOutcome> {
         let mut pending_sink_events = Vec::new();
-        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_prepared_and_applied(
+        let mut validation_outcome = CommitValidationOutcome::default();
+        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_prepared_and_applied_mut(
             tx,
             |ws| {
                 if !ws.is_empty() {
-                    self.validate_foreign_keys_in_write_set(ws)?;
+                    if source != CommitSource::SyncPull {
+                        self.rewrite_txid_placeholders(tx, ws)?;
+                    }
+                    validation_outcome = self.commit_validate(tx, ws)?;
                     if let Some(lsn) = ws.commit_lsn {
                         self.stage_event_bus_ddl_for_commit(lsn, event_bus_ddl)?;
                     }
@@ -1376,9 +1442,11 @@ impl Database {
                 if let Some(ws) = &failure.write_set {
                     self.release_insert_allocations(ws);
                 }
+                self.pending_commit_metadata.lock().remove(&tx);
                 return Err(failure.error);
             }
         };
+        self.pending_commit_metadata.lock().remove(&tx);
 
         if !ws.is_empty() {
             self.release_delete_allocations(&ws);
@@ -1389,7 +1457,7 @@ impl Database {
             self.apply_event_bus_ddl_batch(event_bus_ddl.to_vec())?;
         }
 
-        Ok(())
+        Ok(validation_outcome)
     }
 
     fn build_commit_event(
@@ -2034,7 +2102,9 @@ impl Database {
         mut values: HashMap<ColName, Value>,
     ) -> Result<InsertRowResult> {
         self.complete_insert_access_values(table, &mut values)?;
-        match self.check_row_constraints(tx, table, &values, None, true)? {
+        let allow_duplicate_unique_noop =
+            !self.table_meta(table).is_some_and(|meta| meta.immutable);
+        match self.check_row_constraints(tx, table, &values, None, allow_duplicate_unique_noop)? {
             RowConstraintCheck::Valid => {
                 let row_id = self.relational_store.new_row_id();
                 self.assert_row_write_allowed(table, row_id, &values, self.snapshot())?;
@@ -2155,15 +2225,34 @@ impl Database {
         skip_row_id: Option<RowId>,
         allow_duplicate_unique_noop: bool,
     ) -> Result<RowConstraintCheck> {
-        let metas = self.relational_store.table_meta.read();
-        let meta = metas
-            .get(table)
-            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
         // Constraint probes MUST see the current committed watermark, not any
         // thread-local override. A PK/UNIQUE violation on a committed row must
         // be detected even if the caller pinned a pre-violation snapshot for
         // read visibility.
         let snapshot = self.snapshot();
+        self.check_row_constraints_at_snapshot(
+            tx,
+            table,
+            values,
+            skip_row_id,
+            allow_duplicate_unique_noop,
+            snapshot,
+        )
+    }
+
+    fn check_row_constraints_at_snapshot(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+        skip_row_id: Option<RowId>,
+        allow_duplicate_unique_noop: bool,
+        snapshot: SnapshotId,
+    ) -> Result<RowConstraintCheck> {
+        let metas = self.relational_store.table_meta.read();
+        let meta = metas
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
 
         // Scan the whole table only when no index covers any PK / UNIQUE
         // column we need to probe. Pulled lazily so the fast path skips it.
@@ -2565,10 +2654,868 @@ impl Database {
         Ok(overlap)
     }
 
-    fn validate_foreign_keys_in_write_set(&self, ws: &contextdb_tx::WriteSet) -> Result<()> {
-        // Constraint probe — FK existence checks must see the committed
-        // watermark, not any read-side snapshot override.
+    pub(crate) fn rewrite_txid_placeholders(
+        &self,
+        origin_tx: TxId,
+        ws: &mut WriteSet,
+    ) -> Result<()> {
+        for (table, row) in &mut ws.relational_inserts {
+            self.rewrite_txid_placeholders_in_values(
+                table,
+                origin_tx,
+                row.created_tx,
+                &mut row.values,
+            );
+        }
+        Ok(())
+    }
+
+    fn rewrite_txid_placeholders_in_values(
+        &self,
+        table: &str,
+        origin_tx: TxId,
+        canonical_tx: TxId,
+        values: &mut HashMap<ColName, Value>,
+    ) {
+        let Some(meta) = self.table_meta(table) else {
+            return;
+        };
+        for column in meta
+            .columns
+            .iter()
+            .filter(|column| !column.nullable && matches!(column.column_type, ColumnType::TxId))
+        {
+            if matches!(values.get(&column.name), Some(Value::TxId(tx)) if *tx == origin_tx) {
+                values.insert(column.name.clone(), Value::TxId(canonical_tx));
+            }
+        }
+    }
+
+    fn commit_validate(
+        &self,
+        origin_tx: TxId,
+        ws: &mut WriteSet,
+    ) -> Result<CommitValidationOutcome> {
+        let metadata = self
+            .pending_commit_metadata
+            .lock()
+            .remove(&origin_tx)
+            .unwrap_or_default();
         let snapshot = self.snapshot();
+        let conditional_noop_count =
+            self.revalidate_conditional_updates(ws, snapshot, &metadata.conditional_update_guards)?;
+        self.validate_unique_constraints_in_write_set(ws, snapshot, &metadata.upsert_intents)?;
+        self.validate_foreign_keys_in_write_set(ws, snapshot)?;
+        Ok(CommitValidationOutcome {
+            conditional_noop_count,
+        })
+    }
+
+    fn deleted_row_ids_for_table(ws: &WriteSet, table: &str) -> HashSet<RowId> {
+        ws.relational_deletes
+            .iter()
+            .filter(|(t, _, _)| t == table)
+            .map(|(_, row_id, _)| *row_id)
+            .collect()
+    }
+
+    fn committed_unique_conflict(
+        &self,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+        snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>,
+    ) -> Result<Option<VersionedRow>> {
+        if columns.is_empty() || columns.len() != values.len() {
+            return Ok(None);
+        }
+
+        fn visible_posting(
+            entries: &[contextdb_relational::IndexEntry],
+            snapshot: SnapshotId,
+            skip_deleted: &HashSet<RowId>,
+        ) -> Option<RowId> {
+            entries
+                .iter()
+                .find(|entry| !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot))
+                .map(|entry| entry.row_id)
+        }
+
+        let (index_checked, indexed_row_id) = {
+            let indexes = self.relational_store.indexes.read();
+            if columns.len() == 1 {
+                let column = &columns[0];
+                let table_key = table.to_string();
+                let pk_key = (table_key.clone(), format!("__pk_{column}"));
+                let unique_key = (table_key, format!("__unique_{column}"));
+                let storage = indexes
+                    .get(&pk_key)
+                    .or_else(|| indexes.get(&unique_key))
+                    .or_else(|| {
+                        indexes.iter().find_map(|((t, _), idx)| {
+                            if t == table && idx.columns.len() == 1 && idx.columns[0].0 == *column {
+                                Some(idx)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                match storage {
+                    Some(storage) => {
+                        let key = index_key_from_values(&storage.columns[..1], values);
+                        (
+                            true,
+                            storage.tree.get(&key).and_then(|entries| {
+                                visible_posting(entries, snapshot, skip_deleted)
+                            }),
+                        )
+                    }
+                    None => (false, None),
+                }
+            } else {
+                let storage = indexes.iter().find_map(|((t, _), idx)| {
+                    if t == table
+                        && idx.columns.len() >= columns.len()
+                        && idx
+                            .columns
+                            .iter()
+                            .zip(columns.iter())
+                            .all(|((have, _), want)| have == want)
+                    {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                });
+                match storage {
+                    Some(storage) => {
+                        let prefix =
+                            index_key_from_values(&storage.columns[..columns.len()], values);
+                        let row_id = if storage.columns.len() == columns.len() {
+                            storage.tree.get(&prefix).and_then(|entries| {
+                                visible_posting(entries, snapshot, skip_deleted)
+                            })
+                        } else {
+                            storage
+                                .tree
+                                .range(prefix.clone()..)
+                                .take_while(|(key, _)| {
+                                    key.len() >= prefix.len() && key[..prefix.len()] == prefix[..]
+                                })
+                                .find_map(|(_, entries)| {
+                                    visible_posting(entries, snapshot, skip_deleted)
+                                })
+                        };
+                        (true, row_id)
+                    }
+                    None => (false, None),
+                }
+            }
+        };
+
+        if let Some(row_id) = indexed_row_id {
+            return Ok(self.relational_store.row_by_id(table, row_id, snapshot));
+        }
+        if index_checked {
+            return Ok(None);
+        }
+
+        let rows = self
+            .relational
+            .scan_filter_with_tx(None, table, snapshot, &|row| {
+                !skip_deleted.contains(&row.row_id)
+                    && columns
+                        .iter()
+                        .zip(values.iter())
+                        .all(|(column, value)| row.values.get(column) == Some(value))
+            })?;
+        Ok(rows.into_iter().next())
+    }
+
+    fn staged_unique_conflict_in_write_set(
+        ws: &WriteSet,
+        insert_index: usize,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+    ) -> Option<RowId> {
+        ws.relational_inserts.iter().enumerate().find_map(
+            |(other_index, (other_table, other_row))| {
+                if other_index == insert_index || other_table != table {
+                    return None;
+                }
+                if ws.relational_inserts[insert_index].1.row_id == other_row.row_id {
+                    return None;
+                }
+                columns
+                    .iter()
+                    .zip(values.iter())
+                    .all(|(column, value)| other_row.values.get(column) == Some(value))
+                    .then_some(other_row.row_id)
+            },
+        )
+    }
+
+    fn indexed_visible_row_exists(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>,
+    ) -> Option<bool> {
+        use contextdb_core::{DirectedValue, TotalOrdAsc, TotalOrdDesc};
+
+        let indexes = self.relational_store.indexes.read();
+        let table_key = table.to_string();
+        let pk_key = (table_key.clone(), format!("__pk_{column}"));
+        let unique_key = (table_key, format!("__unique_{column}"));
+        let storage = indexes
+            .get(&pk_key)
+            .or_else(|| indexes.get(&unique_key))
+            .or_else(|| {
+                indexes.iter().find_map(|((t, _), idx)| {
+                    if t == table && idx.columns.len() == 1 && idx.columns[0].0 == column {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+            })?;
+        let key = match storage.columns.first().map(|(_, direction)| direction) {
+            Some(SortDirection::Desc) => vec![DirectedValue::Desc(TotalOrdDesc(value.clone()))],
+            _ => vec![DirectedValue::Asc(TotalOrdAsc(value.clone()))],
+        };
+        Some(storage.tree.get(&key).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot))
+        }))
+    }
+
+    fn visible_row_exists_by_column(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>,
+    ) -> Result<bool> {
+        if let Some(exists) =
+            self.indexed_visible_row_exists(table, column, value, snapshot, skip_deleted)
+        {
+            return Ok(exists);
+        }
+
+        let rows = self
+            .relational
+            .scan_filter_with_tx(None, table, snapshot, &|row| {
+                !skip_deleted.contains(&row.row_id) && row.values.get(column) == Some(value)
+            })?;
+        Ok(!rows.is_empty())
+    }
+
+    fn apply_commit_time_upsert(
+        &self,
+        ws: &mut WriteSet,
+        insert_index: usize,
+        columns: &[String],
+        conflict_row: &VersionedRow,
+        upsert_intents: &[PendingUpsertIntent],
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        let Some(intent) = upsert_intents.iter().find(|intent| {
+            intent.table == ws.relational_inserts[insert_index].0
+                && intent.row_id == ws.relational_inserts[insert_index].1.row_id
+                && intent.conflict_columns == columns
+        }) else {
+            return Ok(false);
+        };
+
+        let (table, incoming) = ws.relational_inserts[insert_index].clone();
+        let on_conflict = OnConflictPlan {
+            columns: intent.conflict_columns.clone(),
+            update_columns: intent.update_columns.clone(),
+        };
+        let mut original_insert_values = intent.insert_values.clone();
+        self.rewrite_txid_placeholders_in_values(
+            &table,
+            intent.active_tx,
+            incoming.created_tx,
+            &mut original_insert_values,
+        );
+        let mut values = apply_on_conflict_updates(
+            self,
+            &table,
+            original_insert_values.clone(),
+            conflict_row,
+            &on_conflict,
+            &intent.params,
+            Some(intent.active_tx),
+        )?;
+        self.rewrite_txid_placeholders_in_values(
+            &table,
+            intent.active_tx,
+            incoming.created_tx,
+            &mut values,
+        );
+        for (column, incoming_value) in &incoming.values {
+            if original_insert_values.get(column) != Some(incoming_value) {
+                values.insert(column.clone(), incoming_value.clone());
+            }
+        }
+        self.validate_commit_time_upsert_replacement(&table, conflict_row, &values, snapshot)?;
+
+        let incoming_row_bytes = self
+            .table_meta(&table)
+            .map(|meta| estimate_row_bytes_for_meta(&incoming.values, &meta, false))
+            .unwrap_or_else(|| incoming.estimated_bytes());
+        let replacement_row_bytes = self
+            .table_meta(&table)
+            .map(|meta| estimate_row_bytes_for_meta(&values, &meta, false))
+            .unwrap_or_else(|| {
+                let mut replacement = incoming.clone();
+                replacement.values = values.clone();
+                replacement.estimated_bytes()
+            });
+        let extra_row_bytes = replacement_row_bytes.saturating_sub(incoming_row_bytes);
+        if extra_row_bytes > 0 {
+            self.accountant.try_allocate_for(
+                extra_row_bytes,
+                "insert",
+                "commit_time_upsert_row_rewrite",
+                "Reduce row size or raise MEMORY_LIMIT before committing this UPSERT.",
+            )?;
+        }
+
+        let mut replacement = incoming;
+        let incoming_row_id = replacement.row_id;
+        replacement.row_id = conflict_row.row_id;
+        replacement.values = values;
+        if let Err(err) = self.reconcile_commit_time_upsert_vectors(
+            ws,
+            &table,
+            incoming_row_id,
+            conflict_row.row_id,
+            &replacement.values,
+            replacement.created_tx,
+            replacement.lsn,
+            snapshot,
+        ) {
+            if extra_row_bytes > 0 {
+                self.accountant.release(extra_row_bytes);
+            }
+            return Err(err);
+        }
+        if incoming_row_bytes > replacement_row_bytes {
+            self.accountant
+                .release(incoming_row_bytes - replacement_row_bytes);
+        }
+        let row_uuid = replacement
+            .values
+            .get("id")
+            .and_then(Value::as_uuid)
+            .copied();
+        let new_state = self
+            .table_meta(&table)
+            .and_then(|meta| meta.state_machine)
+            .and_then(|sm| replacement.values.get(&sm.column))
+            .and_then(Value::as_text)
+            .map(std::borrow::ToOwned::to_owned);
+        let changed = replacement
+            .values
+            .iter()
+            .any(|(column, value)| conflict_row.values.get(column) != Some(value));
+        ws.relational_inserts[insert_index] = (table.clone(), replacement);
+        if !ws
+            .relational_deletes
+            .iter()
+            .any(|(t, row_id, _)| t == &table && *row_id == conflict_row.row_id)
+        {
+            ws.relational_deletes.push((
+                table.clone(),
+                conflict_row.row_id,
+                ws.relational_inserts[insert_index].1.created_tx,
+            ));
+        }
+        if changed && let (Some(uuid), Some(state)) = (row_uuid, new_state.as_deref()) {
+            let replacement_tx = ws.relational_inserts[insert_index].1.created_tx;
+            self.propagate_state_change_in_prepared_write_set(
+                ws,
+                replacement_tx,
+                &table,
+                Some(uuid),
+                Some(state),
+                snapshot,
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn validate_commit_time_upsert_replacement(
+        &self,
+        table: &str,
+        conflict_row: &VersionedRow,
+        values: &HashMap<ColName, Value>,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        if self.relational_store().is_immutable(table) {
+            return Err(Error::ImmutableTable(table.to_string()));
+        }
+        self.assert_row_write_allowed(table, conflict_row.row_id, &conflict_row.values, snapshot)?;
+        self.assert_row_write_allowed(table, conflict_row.row_id, values, snapshot)?;
+        self.validate_commit_time_upsert_state_transition(table, conflict_row, values)?;
+        self.validate_commit_time_upsert_vectors(table, values)
+    }
+
+    fn validate_commit_time_upsert_state_transition(
+        &self,
+        table: &str,
+        conflict_row: &VersionedRow,
+        values: &HashMap<ColName, Value>,
+    ) -> Result<()> {
+        let Some(meta) = self.table_meta(table) else {
+            return Ok(());
+        };
+        let Some(state_machine) = meta.state_machine else {
+            return Ok(());
+        };
+
+        let old_state = conflict_row
+            .values
+            .get(&state_machine.column)
+            .and_then(Value::as_text);
+        let new_state = values.get(&state_machine.column).and_then(Value::as_text);
+        let (Some(old_state), Some(new_state)) = (old_state, new_state) else {
+            return Ok(());
+        };
+
+        if self.relational_store().validate_state_transition(
+            table,
+            &state_machine.column,
+            old_state,
+            new_state,
+        ) {
+            return Ok(());
+        }
+
+        Err(Error::InvalidStateTransition(format!(
+            "{old_state} -> {new_state}"
+        )))
+    }
+
+    fn validate_commit_time_upsert_vectors(
+        &self,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+    ) -> Result<()> {
+        let Some(meta) = self.table_meta(table) else {
+            return Ok(());
+        };
+
+        for column in &meta.columns {
+            if let ColumnType::Vector(expected) = column.column_type
+                && let Some(Value::Vector(vector)) = values.get(&column.name)
+            {
+                let got = vector.len();
+                if got != expected {
+                    return Err(self.direct_vector_dimension_error(
+                        &VectorIndexRef::new(table, column.name.clone()),
+                        expected,
+                        got,
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_commit_time_upsert_vectors(
+        &self,
+        ws: &mut WriteSet,
+        table: &str,
+        incoming_row_id: RowId,
+        conflict_row_id: RowId,
+        replacement_values: &HashMap<ColName, Value>,
+        replacement_tx: TxId,
+        replacement_lsn: Lsn,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        let Some(meta) = self.table_meta(table) else {
+            return Ok(());
+        };
+        let vector_columns = meta
+            .columns
+            .iter()
+            .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        if vector_columns.is_empty() {
+            return Ok(());
+        }
+
+        let mut pending_by_column = HashMap::<ColName, VectorEntry>::new();
+        let mut pos = 0;
+        while pos < ws.vector_inserts.len() {
+            let entry = &ws.vector_inserts[pos];
+            if entry.index.table == table && entry.row_id == incoming_row_id {
+                let entry = ws.vector_inserts.remove(pos);
+                if let Some(replaced) = pending_by_column.insert(entry.index.column.clone(), entry)
+                {
+                    self.accountant.release(
+                        self.vector_insert_accounted_bytes(&replaced.index, replaced.vector.len()),
+                    );
+                }
+            } else {
+                pos += 1;
+            }
+        }
+
+        for column in vector_columns {
+            let index = VectorIndexRef::new(table, column.clone());
+            let existing = self.vector_store_live_entry_for_row(&index, conflict_row_id, snapshot);
+            let final_vector = match replacement_values.get(&column) {
+                Some(Value::Vector(vector)) => Some(vector.clone()),
+                _ => None,
+            };
+            let Some(final_vector) = final_vector else {
+                if let Some(pending) = pending_by_column.remove(&column) {
+                    self.accountant.release(
+                        self.vector_insert_accounted_bytes(&pending.index, pending.vector.len()),
+                    );
+                }
+                if existing.is_some()
+                    && !ws
+                        .vector_deletes
+                        .iter()
+                        .any(|(pending_index, pending_row_id, _)| {
+                            *pending_index == index && *pending_row_id == conflict_row_id
+                        })
+                {
+                    ws.vector_deletes
+                        .push((index.clone(), conflict_row_id, replacement_tx));
+                }
+                continue;
+            };
+
+            if existing
+                .as_ref()
+                .is_some_and(|entry| entry.vector == final_vector)
+            {
+                if let Some(pending) = pending_by_column.remove(&column) {
+                    self.accountant.release(
+                        self.vector_insert_accounted_bytes(&pending.index, pending.vector.len()),
+                    );
+                }
+                continue;
+            }
+
+            if existing.is_some()
+                && !ws
+                    .vector_deletes
+                    .iter()
+                    .any(|(pending_index, pending_row_id, _)| {
+                        *pending_index == index && *pending_row_id == conflict_row_id
+                    })
+            {
+                ws.vector_deletes
+                    .push((index.clone(), conflict_row_id, replacement_tx));
+            }
+
+            let mut entry = match pending_by_column.remove(&column) {
+                Some(mut pending) if pending.vector == final_vector => {
+                    pending.row_id = conflict_row_id;
+                    pending.created_tx = replacement_tx;
+                    pending.deleted_tx = None;
+                    pending.lsn = replacement_lsn;
+                    pending
+                }
+                Some(pending) => {
+                    self.accountant.release(
+                        self.vector_insert_accounted_bytes(&pending.index, pending.vector.len()),
+                    );
+                    let bytes = self.vector_insert_accounted_bytes(&index, final_vector.len());
+                    self.accountant.try_allocate_for(
+                        bytes,
+                        "insert",
+                        &format!("vector_insert@{}.{}", index.table, index.column),
+                        "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
+                    )?;
+                    VectorEntry {
+                        index: index.clone(),
+                        row_id: conflict_row_id,
+                        vector: final_vector.clone(),
+                        created_tx: replacement_tx,
+                        deleted_tx: None,
+                        lsn: replacement_lsn,
+                    }
+                }
+                None => {
+                    let bytes = self.vector_insert_accounted_bytes(&index, final_vector.len());
+                    self.accountant.try_allocate_for(
+                        bytes,
+                        "insert",
+                        &format!("vector_insert@{}.{}", index.table, index.column),
+                        "Reduce vector dimensionality, insert fewer rows, or raise MEMORY_LIMIT.",
+                    )?;
+                    VectorEntry {
+                        index: index.clone(),
+                        row_id: conflict_row_id,
+                        vector: final_vector.clone(),
+                        created_tx: replacement_tx,
+                        deleted_tx: None,
+                        lsn: replacement_lsn,
+                    }
+                }
+            };
+            entry.index = index;
+
+            let mut replaced_entries = Vec::new();
+            let mut pos = 0;
+            while pos < ws.vector_inserts.len() {
+                if ws.vector_inserts[pos].index == entry.index
+                    && ws.vector_inserts[pos].row_id == conflict_row_id
+                {
+                    replaced_entries.push(ws.vector_inserts.remove(pos));
+                } else {
+                    pos += 1;
+                }
+            }
+            for replaced in replaced_entries {
+                self.accountant.release(
+                    self.vector_insert_accounted_bytes(&replaced.index, replaced.vector.len()),
+                );
+            }
+            ws.vector_inserts.push(entry);
+        }
+
+        for pending in pending_by_column.into_values() {
+            self.accountant
+                .release(self.vector_insert_accounted_bytes(&pending.index, pending.vector.len()));
+        }
+        Ok(())
+    }
+
+    fn apply_original_commit_time_upsert_if_needed(
+        &self,
+        ws: &mut WriteSet,
+        insert_index: usize,
+        skip_deleted: &HashSet<RowId>,
+        upsert_intents: &[PendingUpsertIntent],
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        let (table, row) = ws.relational_inserts[insert_index].clone();
+        for intent in upsert_intents.iter().filter(|intent| {
+            intent.table == table
+                && intent.row_id == row.row_id
+                && !intent.conflict_columns.is_empty()
+        }) {
+            let mut insert_values = intent.insert_values.clone();
+            self.rewrite_txid_placeholders_in_values(
+                &table,
+                intent.active_tx,
+                row.created_tx,
+                &mut insert_values,
+            );
+            let mut conflict_values = Vec::with_capacity(intent.conflict_columns.len());
+            let mut has_null = false;
+            for column in &intent.conflict_columns {
+                match insert_values.get(column) {
+                    Some(Value::Null) | None => {
+                        has_null = true;
+                        break;
+                    }
+                    Some(value) => conflict_values.push(value.clone()),
+                }
+            }
+            if has_null {
+                continue;
+            }
+
+            let Some(conflict) = self.committed_unique_conflict(
+                &table,
+                &intent.conflict_columns,
+                &conflict_values,
+                snapshot,
+                skip_deleted,
+            )?
+            else {
+                continue;
+            };
+            if self.apply_commit_time_upsert(
+                ws,
+                insert_index,
+                &intent.conflict_columns,
+                &conflict,
+                upsert_intents,
+                snapshot,
+            )? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn validate_unique_constraints_in_write_set(
+        &self,
+        ws: &mut WriteSet,
+        snapshot: SnapshotId,
+        upsert_intents: &[PendingUpsertIntent],
+    ) -> Result<()> {
+        let mut index = 0;
+        while index < ws.relational_inserts.len() {
+            let (table, row) = ws.relational_inserts[index].clone();
+            let meta = self
+                .table_meta(&table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            let skip_deleted = Self::deleted_row_ids_for_table(ws, &table);
+            let mut transformed_upsert = false;
+
+            if self.apply_original_commit_time_upsert_if_needed(
+                ws,
+                index,
+                &skip_deleted,
+                upsert_intents,
+                snapshot,
+            )? {
+                // Re-check the rewritten post-image against every UNIQUE
+                // constraint before moving on. Prepared state propagation can
+                // remove earlier staged rows, so restart rather than trusting
+                // the old vector index.
+                index = 0;
+                continue;
+            }
+
+            for column in meta
+                .columns
+                .iter()
+                .filter(|column| column.primary_key || column.unique)
+            {
+                let Some(value) = row.values.get(&column.name) else {
+                    continue;
+                };
+                if *value == Value::Null {
+                    continue;
+                }
+                let columns = vec![column.name.clone()];
+                let values = vec![value.clone()];
+                if Self::staged_unique_conflict_in_write_set(ws, index, &table, &columns, &values)
+                    .is_some()
+                {
+                    return Err(Error::UniqueViolation {
+                        table,
+                        column: column.name.clone(),
+                    });
+                }
+                if let Some(conflict) = self.committed_unique_conflict(
+                    &table,
+                    &columns,
+                    &values,
+                    snapshot,
+                    &skip_deleted,
+                )? {
+                    if self.apply_commit_time_upsert(
+                        ws,
+                        index,
+                        &columns,
+                        &conflict,
+                        upsert_intents,
+                        snapshot,
+                    )? {
+                        transformed_upsert = true;
+                        break;
+                    }
+                    return Err(Error::UniqueViolation {
+                        table,
+                        column: column.name.clone(),
+                    });
+                }
+            }
+            if transformed_upsert {
+                // Re-check the rewritten post-image against every UNIQUE
+                // constraint before moving on. Prepared state propagation can
+                // remove earlier staged rows, so restart rather than trusting
+                // the old vector index.
+                index = 0;
+                continue;
+            }
+
+            for unique_constraint in &meta.unique_constraints {
+                let mut values = Vec::with_capacity(unique_constraint.len());
+                let mut has_null = false;
+                for column in unique_constraint {
+                    match row.values.get(column) {
+                        Some(Value::Null) | None => {
+                            has_null = true;
+                            break;
+                        }
+                        Some(value) => values.push(value.clone()),
+                    }
+                }
+                if has_null {
+                    continue;
+                }
+                if Self::staged_unique_conflict_in_write_set(
+                    ws,
+                    index,
+                    &table,
+                    unique_constraint,
+                    &values,
+                )
+                .is_some()
+                {
+                    return Err(Error::UniqueViolation {
+                        table,
+                        column: unique_constraint.first().cloned().unwrap_or_default(),
+                    });
+                }
+                if let Some(conflict) = self.committed_unique_conflict(
+                    &table,
+                    unique_constraint,
+                    &values,
+                    snapshot,
+                    &skip_deleted,
+                )? {
+                    if self.apply_commit_time_upsert(
+                        ws,
+                        index,
+                        unique_constraint,
+                        &conflict,
+                        upsert_intents,
+                        snapshot,
+                    )? {
+                        transformed_upsert = true;
+                        break;
+                    }
+                    return Err(Error::UniqueViolation {
+                        table,
+                        column: unique_constraint.first().cloned().unwrap_or_default(),
+                    });
+                }
+            }
+            if transformed_upsert {
+                // Re-check the rewritten post-image against every UNIQUE
+                // constraint before moving on. Prepared state propagation can
+                // remove earlier staged rows, so restart rather than trusting
+                // the old vector index.
+                index = 0;
+                continue;
+            }
+
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn validate_foreign_keys_in_write_set(
+        &self,
+        ws: &WriteSet,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
         for (table, row) in &ws.relational_inserts {
             let meta = self
                 .table_meta(table)
@@ -2583,32 +3530,18 @@ impl Database {
                 if *value == Value::Null {
                     continue;
                 }
-                let staged_deletes: HashSet<RowId> = ws
-                    .relational_deletes
-                    .iter()
-                    .filter(|(table, _, _)| table == &reference.table)
-                    .map(|(_, row_id, _)| *row_id)
-                    .collect();
-                let mut seen_staged_rows = HashSet::new();
-                let staged_match = ws
-                    .relational_inserts
-                    .iter()
-                    .rev()
-                    .any(|(insert_table, row)| {
-                        insert_table == &reference.table
-                            && seen_staged_rows.insert(row.row_id)
-                            && row.values.get(&reference.column) == Some(value)
-                    });
-                let committed_match = self
-                    .relational
-                    .point_lookup_with_tx(
-                        None,
-                        &reference.table,
-                        &reference.column,
-                        value,
-                        snapshot,
-                    )?
-                    .is_some_and(|row| !staged_deletes.contains(&row.row_id));
+                let staged_deletes = Self::deleted_row_ids_for_table(ws, &reference.table);
+                let staged_match = ws.relational_inserts.iter().any(|(insert_table, row)| {
+                    insert_table == &reference.table
+                        && row.values.get(&reference.column) == Some(value)
+                });
+                let committed_match = self.visible_row_exists_by_column(
+                    &reference.table,
+                    &reference.column,
+                    value,
+                    snapshot,
+                    &staged_deletes,
+                )?;
                 if !staged_match && !committed_match {
                     return Err(Error::ForeignKeyViolation {
                         table: table.clone(),
@@ -2619,7 +3552,136 @@ impl Database {
             }
         }
 
+        let reverse_refs = {
+            let metas = self.relational_store.table_meta.read();
+            metas
+                .iter()
+                .flat_map(|(child_table, meta)| {
+                    meta.columns.iter().filter_map(|column| {
+                        column.references.as_ref().map(|reference| {
+                            (
+                                reference.table.clone(),
+                                reference.column.clone(),
+                                child_table.clone(),
+                                column.name.clone(),
+                            )
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (parent_table, parent_row_id, _) in &ws.relational_deletes {
+            let Some(parent_row) =
+                self.relational_store
+                    .row_by_id(parent_table, *parent_row_id, snapshot)
+            else {
+                continue;
+            };
+            for (ref_table, ref_column, child_table, child_column) in &reverse_refs {
+                if ref_table != parent_table {
+                    continue;
+                }
+                let Some(parent_value) = parent_row.values.get(ref_column) else {
+                    continue;
+                };
+                let parent_replaced_with_same_key =
+                    ws.relational_inserts.iter().any(|(insert_table, row)| {
+                        insert_table == parent_table
+                            && row.values.get(ref_column) == Some(parent_value)
+                    });
+                if parent_replaced_with_same_key {
+                    continue;
+                }
+                let child_deletes = Self::deleted_row_ids_for_table(ws, child_table);
+                if self.visible_row_exists_by_column(
+                    child_table,
+                    child_column,
+                    parent_value,
+                    snapshot,
+                    &child_deletes,
+                )? {
+                    return Err(Error::ForeignKeyViolation {
+                        table: child_table.clone(),
+                        column: child_column.clone(),
+                        ref_table: parent_table.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    fn revalidate_conditional_updates(
+        &self,
+        ws: &mut WriteSet,
+        snapshot: SnapshotId,
+        guards: &[PendingConditionalUpdateGuard],
+    ) -> Result<u64> {
+        let mut conditional_noop_count = 0_u64;
+        for guard in guards.iter().rev() {
+            let matches = self
+                .relational_store
+                .row_by_id(&guard.table, guard.row_id, snapshot)
+                .is_some_and(|row| {
+                    guard
+                        .predicates
+                        .iter()
+                        .all(|(column, value)| row.values.get(column) == Some(value))
+                });
+            if matches {
+                continue;
+            }
+
+            self.release_insert_allocations_for_slice(ws, guard.before, guard.after);
+            remove_write_set_slice(ws, guard.before, guard.after);
+            conditional_noop_count = conditional_noop_count.saturating_add(1);
+        }
+        Ok(conditional_noop_count)
+    }
+
+    fn release_insert_allocations_for_slice(
+        &self,
+        ws: &WriteSet,
+        before: WriteSetCounts,
+        after: WriteSetCounts,
+    ) {
+        for (table, row) in ws
+            .relational_inserts
+            .iter()
+            .skip(before.relational_inserts)
+            .take(
+                after
+                    .relational_inserts
+                    .saturating_sub(before.relational_inserts),
+            )
+        {
+            let bytes = self
+                .table_meta(table)
+                .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                .unwrap_or_else(|| row.estimated_bytes());
+            self.accountant.release(bytes);
+        }
+
+        for edge in ws
+            .adj_inserts
+            .iter()
+            .skip(before.adj_inserts)
+            .take(after.adj_inserts.saturating_sub(before.adj_inserts))
+        {
+            self.accountant.release(edge.estimated_bytes());
+        }
+
+        for entry in ws
+            .vector_inserts
+            .iter()
+            .skip(before.vector_inserts)
+            .take(after.vector_inserts.saturating_sub(before.vector_inserts))
+        {
+            self.accountant
+                .release(self.vector_insert_accounted_bytes(&entry.index, entry.vector.len()));
+        }
     }
 
     pub(crate) fn propagate_state_change_if_needed(
@@ -2794,6 +3856,627 @@ impl Database {
             return Err(err);
         }
 
+        Ok(())
+    }
+
+    fn propagate_state_change_in_prepared_write_set(
+        &self,
+        ws: &mut WriteSet,
+        tx: TxId,
+        table: &str,
+        row_uuid: Option<uuid::Uuid>,
+        new_state: Option<&str>,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        let (Some(uuid), Some(state)) = (row_uuid, new_state) else {
+            return Ok(());
+        };
+        if ws.propagation_in_progress {
+            return Ok(());
+        }
+
+        ws.propagation_in_progress = true;
+        let result = self.propagate_in_prepared_write_set(ws, tx, table, uuid, state, snapshot);
+        ws.propagation_in_progress = false;
+        result
+    }
+
+    fn propagate_in_prepared_write_set(
+        &self,
+        ws: &mut WriteSet,
+        tx: TxId,
+        table: &str,
+        row_uuid: uuid::Uuid,
+        new_state: &str,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        let metas = self.relational_store().table_meta.read().clone();
+        let mut queue: VecDeque<PropagationQueueEntry> = VecDeque::new();
+        let mut visited: HashSet<(String, uuid::Uuid)> = HashSet::new();
+        let mut abort_violation: Option<Error> = None;
+        let ctx = PropagationContext {
+            tx,
+            snapshot,
+            metas: &metas,
+        };
+        let root = PropagationSource {
+            table,
+            uuid: row_uuid,
+            state: new_state,
+            depth: 0,
+        };
+
+        self.enqueue_fk_children_in_prepared_write_set(ws, &ctx, &mut queue, root);
+        self.enqueue_edge_children_in_prepared_write_set(ws, &ctx, &mut queue, root)?;
+        self.apply_vector_exclusions_in_prepared_write_set(ws, &ctx, root)?;
+
+        while let Some(entry) = queue.pop_front() {
+            if !visited.insert((entry.table.clone(), entry.uuid)) {
+                continue;
+            }
+
+            let Some(meta) = metas.get(&entry.table) else {
+                continue;
+            };
+
+            let Some(state_machine) = &meta.state_machine else {
+                let msg = format!(
+                    "warning: propagation target table {} has no state machine",
+                    entry.table
+                );
+                eprintln!("{msg}");
+                if entry.abort_on_failure && abort_violation.is_none() {
+                    abort_violation = Some(Error::PropagationAborted {
+                        table: entry.table.clone(),
+                        column: String::new(),
+                        from: String::new(),
+                        to: entry.target_state.clone(),
+                    });
+                }
+                continue;
+            };
+
+            let state_column = state_machine.column.clone();
+            let Some(existing) = self.point_lookup_in_prepared_write_set(
+                ws,
+                &entry.table,
+                "id",
+                &Value::Uuid(entry.uuid),
+                snapshot,
+            )?
+            else {
+                continue;
+            };
+
+            let from_state = existing
+                .values
+                .get(&state_column)
+                .and_then(Value::as_text)
+                .unwrap_or("")
+                .to_string();
+
+            let mut next_values = existing.values.clone();
+            next_values.insert(
+                state_column.clone(),
+                Value::Text(entry.target_state.clone()),
+            );
+
+            self.assert_row_write_allowed(
+                &entry.table,
+                existing.row_id,
+                &existing.values,
+                snapshot,
+            )?;
+            self.assert_row_write_allowed(&entry.table, existing.row_id, &next_values, snapshot)?;
+
+            let reached_state = match self.upsert_row_in_prepared_write_set(
+                ws,
+                tx,
+                &entry.table,
+                &state_column,
+                &existing,
+                next_values,
+            ) {
+                Ok(true) => entry.target_state.as_str(),
+                Ok(false) => continue,
+                Err(Error::InvalidStateTransition(_)) => {
+                    eprintln!(
+                        "warning: skipped invalid propagated transition {}.{} {} -> {}",
+                        entry.table, state_column, from_state, entry.target_state
+                    );
+                    if entry.abort_on_failure && abort_violation.is_none() {
+                        abort_violation = Some(Error::PropagationAborted {
+                            table: entry.table.clone(),
+                            column: state_column.clone(),
+                            from: from_state,
+                            to: entry.target_state.clone(),
+                        });
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            let propagated = PropagationSource {
+                table: &entry.table,
+                uuid: entry.uuid,
+                state: reached_state,
+                depth: entry.depth,
+            };
+            self.enqueue_edge_children_in_prepared_write_set(ws, &ctx, &mut queue, propagated)?;
+            self.apply_vector_exclusions_in_prepared_write_set(ws, &ctx, propagated)?;
+            self.enqueue_fk_children_in_prepared_write_set(ws, &ctx, &mut queue, propagated);
+        }
+
+        if let Some(err) = abort_violation {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn enqueue_fk_children_in_prepared_write_set(
+        &self,
+        ws: &WriteSet,
+        ctx: &PropagationContext<'_>,
+        queue: &mut VecDeque<PropagationQueueEntry>,
+        source: PropagationSource<'_>,
+    ) {
+        for (owner_table, owner_meta) in ctx.metas {
+            for rule in &owner_meta.propagation_rules {
+                let PropagationRule::ForeignKey {
+                    fk_column,
+                    referenced_table,
+                    trigger_state,
+                    target_state,
+                    max_depth,
+                    abort_on_failure,
+                    ..
+                } = rule
+                else {
+                    continue;
+                };
+
+                if referenced_table != source.table || trigger_state != source.state {
+                    continue;
+                }
+
+                if source.depth >= *max_depth {
+                    continue;
+                }
+
+                let rows = match self.scan_filter_in_prepared_write_set(
+                    ws,
+                    owner_table,
+                    ctx.snapshot,
+                    &|row| row.values.get(fk_column) == Some(&Value::Uuid(source.uuid)),
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        eprintln!(
+                            "warning: propagation scan failed for {owner_table}.{fk_column}: {err}"
+                        );
+                        continue;
+                    }
+                };
+
+                for row in rows {
+                    if let Some(id) = row.values.get("id").and_then(Value::as_uuid).copied() {
+                        queue.push_back(PropagationQueueEntry {
+                            table: owner_table.clone(),
+                            uuid: id,
+                            target_state: target_state.clone(),
+                            depth: source.depth + 1,
+                            abort_on_failure: *abort_on_failure,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn enqueue_edge_children_in_prepared_write_set(
+        &self,
+        ws: &WriteSet,
+        ctx: &PropagationContext<'_>,
+        queue: &mut VecDeque<PropagationQueueEntry>,
+        source: PropagationSource<'_>,
+    ) -> Result<()> {
+        let Some(meta) = ctx.metas.get(source.table) else {
+            return Ok(());
+        };
+
+        for rule in &meta.propagation_rules {
+            let PropagationRule::Edge {
+                edge_type,
+                direction,
+                trigger_state,
+                target_state,
+                max_depth,
+                abort_on_failure,
+            } = rule
+            else {
+                continue;
+            };
+
+            if trigger_state != source.state || source.depth >= *max_depth {
+                continue;
+            }
+
+            let bfs = self.query_bfs(
+                source.uuid,
+                Some(std::slice::from_ref(edge_type)),
+                *direction,
+                1,
+                ctx.snapshot,
+            )?;
+
+            for node in bfs.nodes {
+                if self
+                    .point_lookup_in_prepared_write_set(
+                        ws,
+                        source.table,
+                        "id",
+                        &Value::Uuid(node.id),
+                        ctx.snapshot,
+                    )?
+                    .is_some()
+                {
+                    queue.push_back(PropagationQueueEntry {
+                        table: source.table.to_string(),
+                        uuid: node.id,
+                        target_state: target_state.clone(),
+                        depth: source.depth + 1,
+                        abort_on_failure: *abort_on_failure,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_vector_exclusions_in_prepared_write_set(
+        &self,
+        ws: &mut WriteSet,
+        ctx: &PropagationContext<'_>,
+        source: PropagationSource<'_>,
+    ) -> Result<()> {
+        let Some(meta) = ctx.metas.get(source.table) else {
+            return Ok(());
+        };
+
+        for rule in &meta.propagation_rules {
+            let PropagationRule::VectorExclusion { trigger_state } = rule else {
+                continue;
+            };
+            if trigger_state != source.state {
+                continue;
+            }
+            let Some(index) = self.table_meta(source.table).and_then(|meta| {
+                meta.columns
+                    .iter()
+                    .find(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                    .map(|column| VectorIndexRef::new(source.table, column.name.clone()))
+            }) else {
+                continue;
+            };
+            for row_id in self.logical_row_ids_for_uuid_in_prepared_write_set(
+                ws,
+                source.table,
+                source.uuid,
+                ctx.snapshot,
+            )? {
+                self.delete_vector_in_prepared_write_set(
+                    ws,
+                    ctx.tx,
+                    index.clone(),
+                    row_id,
+                    ctx.snapshot,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn scan_in_prepared_write_set(
+        &self,
+        ws: &WriteSet,
+        table: &str,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<VersionedRow>> {
+        let tables = self.relational_store.tables.read();
+        let rows = tables
+            .get(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+
+        let mut result: Vec<VersionedRow> = rows
+            .iter()
+            .filter(|row| row.visible_at(snapshot))
+            .cloned()
+            .collect();
+
+        let committed_row_ids: HashSet<RowId> = result.iter().map(|row| row.row_id).collect();
+        let deleted_row_ids: HashSet<RowId> = ws
+            .relational_deletes
+            .iter()
+            .filter(|(delete_table, _, _)| delete_table == table)
+            .map(|(_, row_id, _)| *row_id)
+            .collect();
+        result.retain(|row| !deleted_row_ids.contains(&row.row_id));
+
+        let mut seen_inserts = HashSet::new();
+        let mut inserts = ws
+            .relational_inserts
+            .iter()
+            .rev()
+            .filter(|(insert_table, row)| {
+                insert_table == table
+                    && seen_inserts.insert(row.row_id)
+                    && (!deleted_row_ids.contains(&row.row_id)
+                        || committed_row_ids.contains(&row.row_id))
+            })
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        inserts.reverse();
+        result.extend(inserts);
+
+        Ok(result)
+    }
+
+    fn scan_filter_in_prepared_write_set(
+        &self,
+        ws: &WriteSet,
+        table: &str,
+        snapshot: SnapshotId,
+        predicate: &dyn Fn(&VersionedRow) -> bool,
+    ) -> Result<Vec<VersionedRow>> {
+        Ok(self
+            .scan_in_prepared_write_set(ws, table, snapshot)?
+            .into_iter()
+            .filter(predicate)
+            .collect())
+    }
+
+    fn point_lookup_in_prepared_write_set(
+        &self,
+        ws: &WriteSet,
+        table: &str,
+        col: &str,
+        value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        Ok(self
+            .scan_in_prepared_write_set(ws, table, snapshot)?
+            .into_iter()
+            .find(|row| row.values.get(col) == Some(value)))
+    }
+
+    fn row_by_id_in_prepared_write_set(
+        &self,
+        ws: &WriteSet,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        Ok(self
+            .scan_in_prepared_write_set(ws, table, snapshot)?
+            .into_iter()
+            .find(|row| row.row_id == row_id))
+    }
+
+    fn logical_row_ids_for_uuid_in_prepared_write_set(
+        &self,
+        ws: &WriteSet,
+        table: &str,
+        uuid: uuid::Uuid,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<RowId>> {
+        Ok(self
+            .scan_in_prepared_write_set(ws, table, snapshot)?
+            .into_iter()
+            .filter(|row| row.values.get("id") == Some(&Value::Uuid(uuid)))
+            .map(|row| row.row_id)
+            .collect())
+    }
+
+    fn upsert_row_in_prepared_write_set(
+        &self,
+        ws: &mut WriteSet,
+        tx: TxId,
+        table: &str,
+        state_column: &str,
+        existing: &VersionedRow,
+        next_values: HashMap<ColName, Value>,
+    ) -> Result<bool> {
+        if self.relational_store().is_immutable(table) {
+            return Err(Error::ImmutableTable(table.to_string()));
+        }
+
+        let old_state = existing
+            .values
+            .get(state_column)
+            .and_then(Value::as_text)
+            .unwrap_or("");
+        let new_state = next_values
+            .get(state_column)
+            .and_then(Value::as_text)
+            .unwrap_or("");
+        if !self.relational_store().validate_state_transition(
+            table,
+            state_column,
+            old_state,
+            new_state,
+        ) {
+            return Err(Error::InvalidStateTransition(format!(
+                "{old_state} -> {new_state}"
+            )));
+        }
+
+        let changed = next_values
+            .iter()
+            .any(|(column, value)| existing.values.get(column) != Some(value));
+        if !changed {
+            return Ok(false);
+        }
+
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        let row_bytes = estimate_row_bytes_for_meta(&next_values, &meta, false);
+        self.accountant.try_allocate_for(
+            row_bytes,
+            "update",
+            "prepared_state_propagation_row_replace",
+            "Reduce row growth or raise MEMORY_LIMIT before committing this propagated update.",
+        )?;
+
+        if let Err(err) = self.delete_row_in_prepared_write_set(ws, tx, table, existing.row_id) {
+            self.accountant.release(row_bytes);
+            return Err(err);
+        }
+
+        ws.relational_inserts.push((
+            table.to_string(),
+            VersionedRow {
+                row_id: existing.row_id,
+                values: next_values,
+                created_tx: tx,
+                deleted_tx: None,
+                lsn: ws.commit_lsn.unwrap_or(Lsn(0)),
+                created_at: Some(current_wallclock()),
+            },
+        ));
+        Ok(true)
+    }
+
+    fn delete_row_in_prepared_write_set(
+        &self,
+        ws: &mut WriteSet,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+    ) -> Result<()> {
+        if !self.relational_store.table_meta.read().contains_key(table) {
+            return Err(Error::TableNotFound(table.to_string()));
+        }
+        if self.relational_store().is_immutable(table) {
+            return Err(Error::ImmutableTable(table.to_string()));
+        }
+
+        let mut removed_inserts = Vec::new();
+        let mut pos = 0;
+        while pos < ws.relational_inserts.len() {
+            if ws.relational_inserts[pos].0 == table
+                && ws.relational_inserts[pos].1.row_id == row_id
+            {
+                removed_inserts.push(ws.relational_inserts.remove(pos));
+            } else {
+                pos += 1;
+            }
+        }
+        for (removed_table, row) in removed_inserts {
+            let bytes = self
+                .table_meta(&removed_table)
+                .map(|meta| estimate_row_bytes_for_meta(&row.values, &meta, false))
+                .unwrap_or_else(|| row.estimated_bytes());
+            self.accountant.release(bytes);
+        }
+
+        let committed_row_exists = self
+            .relational_store
+            .row_by_id(table, row_id, SnapshotId::from_raw_wire(u64::MAX))
+            .is_some();
+        if committed_row_exists
+            && !ws
+                .relational_deletes
+                .iter()
+                .any(|(delete_table, deleted_row_id, _)| {
+                    delete_table == table && *deleted_row_id == row_id
+                })
+        {
+            ws.relational_deletes.push((table.to_string(), row_id, tx));
+        }
+
+        Ok(())
+    }
+
+    fn delete_vector_in_prepared_write_set(
+        &self,
+        ws: &mut WriteSet,
+        tx: TxId,
+        index: VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        self.vector_store.state(&index)?;
+        let Some(row) = self.row_by_id_in_prepared_write_set(ws, &index.table, row_id, snapshot)?
+        else {
+            return Err(Error::NotFound(format!(
+                "row {row_id} in table {}",
+                index.table
+            )));
+        };
+        self.assert_row_write_allowed(&index.table, row.row_id, &row.values, snapshot)?;
+        let existing_live = self
+            .vector_store
+            .live_entry_for_row(&index, row_id, snapshot)
+            .is_some();
+        let mut canceled_inserts = Vec::new();
+        let mut pos = 0;
+        while pos < ws.vector_inserts.len() {
+            if ws.vector_inserts[pos].index == index && ws.vector_inserts[pos].row_id == row_id {
+                canceled_inserts.push(ws.vector_inserts.remove(pos));
+            } else {
+                pos += 1;
+            }
+        }
+
+        let mut moved_sources = Vec::new();
+        let mut pos = 0;
+        while pos < ws.vector_moves.len() {
+            let (move_index, old_row_id, new_row_id, _) = &ws.vector_moves[pos];
+            if *move_index == index && *new_row_id == row_id {
+                moved_sources.push(*old_row_id);
+                ws.vector_moves.remove(pos);
+            } else {
+                pos += 1;
+            }
+        }
+        let pending_move_from_row = ws
+            .vector_moves
+            .iter()
+            .any(|(move_index, old_row_id, _, _)| *move_index == index && *old_row_id == row_id);
+        let canceled_move_to_row = !moved_sources.is_empty();
+        for old_row_id in moved_sources {
+            if !ws
+                .vector_deletes
+                .iter()
+                .any(|(pending_index, pending_row_id, _)| {
+                    *pending_index == index && *pending_row_id == old_row_id
+                })
+            {
+                ws.vector_deletes.push((index.clone(), old_row_id, tx));
+            }
+        }
+
+        let already_deleted = ws
+            .vector_deletes
+            .iter()
+            .any(|(pending_index, pending_row_id, _)| {
+                *pending_index == index && *pending_row_id == row_id
+            });
+        if !pending_move_from_row
+            && ((canceled_inserts.is_empty() && !canceled_move_to_row) || existing_live)
+            && !already_deleted
+        {
+            ws.vector_deletes.push((index.clone(), row_id, tx));
+        }
+        for entry in canceled_inserts {
+            self.accountant
+                .release(self.vector_insert_accounted_bytes(&entry.index, entry.vector.len()));
+        }
         Ok(())
     }
 
@@ -3057,6 +4740,31 @@ impl Database {
     ) -> Result<Option<VersionedRow>> {
         self.relational
             .point_lookup_with_tx(Some(tx), table, col, value, snapshot)
+    }
+
+    pub(crate) fn conflict_lookup_in_tx(
+        &self,
+        tx: TxId,
+        table: &str,
+        columns: &[ColName],
+        values: &[Value],
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        if columns.is_empty() || columns.len() != values.len() {
+            return Err(Error::Other(
+                "ON CONFLICT target must include matching columns and values".to_string(),
+            ));
+        }
+        if let ([column], [value]) = (columns, values) {
+            return self.point_lookup_in_tx(tx, table, column, value, snapshot);
+        }
+        let rows = self.scan_in_tx_raw(tx, table, snapshot)?;
+        Ok(rows.into_iter().find(|row| {
+            columns
+                .iter()
+                .zip(values.iter())
+                .all(|(column, value)| row.values.get(column) == Some(value))
+        }))
     }
 
     pub(crate) fn logical_row_ids_for_uuid(
@@ -4421,6 +6129,7 @@ impl Database {
                 self.release_insert_allocations(&ws);
             }
             self.pending_event_bus_ddl.lock().remove(&tx);
+            self.pending_commit_metadata.lock().remove(&tx);
             let _ = self.tx_mgr.rollback(tx);
         }
         self.stop_cron_tickler();
@@ -4705,6 +6414,61 @@ impl Database {
                 ws.vector_moves.len(),
             )
         })
+    }
+
+    pub(crate) fn write_set_counts(&self, tx: TxId) -> Result<WriteSetCounts> {
+        self.tx_mgr
+            .with_write_set(tx, |ws| current_write_set_counts(ws))
+    }
+
+    pub(crate) fn record_conditional_update_guard(
+        &self,
+        tx: TxId,
+        table: TableName,
+        row_id: RowId,
+        predicates: Vec<(ColName, Value)>,
+        before: WriteSetCounts,
+        after: WriteSetCounts,
+    ) -> Result<()> {
+        self.tx_mgr.with_write_set(tx, |_| ())?;
+        self.pending_commit_metadata
+            .lock()
+            .entry(tx)
+            .or_default()
+            .conditional_update_guards
+            .push(PendingConditionalUpdateGuard {
+                table,
+                row_id,
+                predicates,
+                before,
+                after,
+            });
+        Ok(())
+    }
+
+    pub(crate) fn record_upsert_intent(
+        &self,
+        tx: TxId,
+        table: TableName,
+        row_id: RowId,
+        details: UpsertIntentDetails,
+    ) -> Result<()> {
+        self.tx_mgr.with_write_set(tx, |_| ())?;
+        self.pending_commit_metadata
+            .lock()
+            .entry(tx)
+            .or_default()
+            .upsert_intents
+            .push(PendingUpsertIntent {
+                table,
+                row_id,
+                active_tx: tx,
+                insert_values: details.insert_values,
+                conflict_columns: details.conflict_columns,
+                update_columns: details.update_columns,
+                params: details.params,
+            });
+        Ok(())
     }
 
     pub(crate) fn restore_write_set_checkpoint(
@@ -7038,6 +8802,67 @@ fn strip_internal_row_id(mut qr: QueryResult) -> QueryResult {
         }
     }
     qr
+}
+
+fn current_write_set_counts(ws: &WriteSet) -> WriteSetCounts {
+    WriteSetCounts {
+        relational_inserts: ws.relational_inserts.len(),
+        relational_deletes: ws.relational_deletes.len(),
+        adj_inserts: ws.adj_inserts.len(),
+        adj_deletes: ws.adj_deletes.len(),
+        vector_inserts: ws.vector_inserts.len(),
+        vector_deletes: ws.vector_deletes.len(),
+        vector_moves: ws.vector_moves.len(),
+    }
+}
+
+fn current_wallclock() -> Wallclock {
+    Wallclock(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    )
+}
+
+fn remove_write_set_slice(ws: &mut WriteSet, before: WriteSetCounts, after: WriteSetCounts) {
+    fn drain_range<T>(items: &mut Vec<T>, start: usize, end: usize) {
+        if start >= items.len() {
+            return;
+        }
+        let end = end.min(items.len());
+        if start < end {
+            items.drain(start..end);
+        }
+    }
+
+    drain_range(
+        &mut ws.relational_inserts,
+        before.relational_inserts,
+        after.relational_inserts,
+    );
+    drain_range(
+        &mut ws.relational_deletes,
+        before.relational_deletes,
+        after.relational_deletes,
+    );
+    drain_range(&mut ws.adj_inserts, before.adj_inserts, after.adj_inserts);
+    drain_range(&mut ws.adj_deletes, before.adj_deletes, after.adj_deletes);
+    drain_range(
+        &mut ws.vector_inserts,
+        before.vector_inserts,
+        after.vector_inserts,
+    );
+    drain_range(
+        &mut ws.vector_deletes,
+        before.vector_deletes,
+        after.vector_deletes,
+    );
+    drain_range(
+        &mut ws.vector_moves,
+        before.vector_moves,
+        after.vector_moves,
+    );
 }
 
 fn cached_table_meta(

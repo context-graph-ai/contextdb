@@ -304,3 +304,54 @@ fn t18_05_cron_callback_stamped_txid_matches_commit_event_lsn_resolution() {
     );
     assert_eq!(TxId(db.snapshot_at(event.lsn).0), stamped[0]);
 }
+
+#[test]
+fn t18_06_commit_time_upsert_rewrites_txid_post_image_to_canonical() {
+    // REGRESSION GUARD. A deferred UPSERT may evaluate DO UPDATE expressions
+    // after the initial active-TxId rewrite. TXID values introduced by that
+    // rewrite must still be canonicalized to the commit-order TxId.
+    let (_dir, db) = open_db();
+    let db = &db;
+    db.execute(
+        "CREATE TABLE audit_log (id UUID PRIMARY KEY, natural_key TEXT NOT NULL UNIQUE, recorded_at TXID NOT NULL)",
+        &empty(),
+    )
+    .unwrap();
+    let receiver = db.subscribe();
+
+    let deferred_update_tx = db.begin();
+    let first_commit_tx = db.begin();
+    for tx in [deferred_update_tx, first_commit_tx] {
+        db.execute_in_tx(
+            tx,
+            "INSERT INTO audit_log (id, natural_key, recorded_at) VALUES ($id, 'same-key', $recorded_at) ON CONFLICT (natural_key) DO UPDATE SET recorded_at = $recorded_at",
+            &[
+                ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+                ("recorded_at".to_string(), Value::TxId(tx)),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+    }
+
+    db.commit(first_commit_tx).unwrap();
+    let _first_event = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first commit event");
+    db.commit(deferred_update_tx).unwrap();
+    let update_event = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("deferred UPSERT commit event");
+    let expected = TxId(db.snapshot_at(update_event.lsn).0);
+
+    let rows = db
+        .execute("SELECT recorded_at FROM audit_log", &empty())
+        .unwrap()
+        .rows;
+    assert_eq!(rows, vec![vec![Value::TxId(expected)]]);
+    assert_ne!(
+        expected, deferred_update_tx,
+        "test setup must begin and commit in different orders"
+    );
+}

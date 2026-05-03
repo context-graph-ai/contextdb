@@ -270,3 +270,57 @@ fn t16_06_non_overlapping_conditional_updates_both_commit() {
         assert_eq!(affected.iter().sum::<u64>(), 2);
     });
 }
+
+#[test]
+fn t16_07_non_pk_conditional_update_revalidates_expected_value() {
+    // REGRESSION GUARD. Conditional conflict serialization is tied to the
+    // frozen expected-value predicate, not to the presence of an id equality.
+    let (_dir, db) = open_db();
+    let db = &db;
+    db.execute(
+        "CREATE TABLE counters (id UUID PRIMARY KEY, value INTEGER NOT NULL)",
+        &empty(),
+    )
+    .unwrap();
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO counters (id, value) VALUES ($id, $value)",
+        &[
+            ("id".to_string(), Value::Uuid(id)),
+            ("value".to_string(), Value::Int64(0)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+
+    let tx_one = db.begin();
+    let tx_two = db.begin();
+    for (tx, new_value) in [(tx_one, 1), (tx_two, 2)] {
+        let staged = db
+            .execute_in_tx(
+                tx,
+                "UPDATE counters SET value = $new WHERE value = $expected",
+                &[
+                    ("new".to_string(), Value::Int64(new_value)),
+                    ("expected".to_string(), Value::Int64(0)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        assert_eq!(staged.rows_affected, 1);
+    }
+
+    db.commit(tx_one).expect("first conditional update commits");
+    db.commit(tx_two)
+        .expect("second conditional update commits as commit-time no-op");
+    let rows = db
+        .execute(
+            "SELECT value FROM counters WHERE id = $id",
+            &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(rows[0][0], Value::Int64(1));
+}

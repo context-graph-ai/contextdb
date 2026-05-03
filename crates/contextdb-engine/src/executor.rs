@@ -1,4 +1,6 @@
-use crate::database::{Database, InsertRowResult, QueryResult, QueryTrace, rank_index_name};
+use crate::database::{
+    Database, InsertRowResult, QueryResult, QueryTrace, UpsertIntentDetails, rank_index_name,
+};
 use crate::rank_formula::RankFormula;
 use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
@@ -1564,16 +1566,44 @@ fn exec_insert(
         let vector_values = vector_values_for_table(db, &p.table, &values);
 
         let row_id = if let Some(on_conflict) = &p.on_conflict {
-            let conflict_col = &on_conflict.columns[0];
-            let conflict_value = values
-                .get(conflict_col)
-                .ok_or_else(|| Error::Other("conflict column not in values".to_string()))?;
-            let existing =
-                db.point_lookup(&p.table, conflict_col, conflict_value, db.snapshot())?;
-            let existing_row_id = existing.as_ref().map(|row| row.row_id);
-            let existing_has_vector = existing
-                .as_ref()
-                .is_some_and(|row| db.has_live_vector(row.row_id, db.snapshot()));
+            if on_conflict.columns.is_empty() {
+                db.accountant().release(row_bytes);
+                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                return Err(Error::Other(
+                    "ON CONFLICT target must include at least one column".to_string(),
+                ));
+            }
+            let conflict_values = match on_conflict
+                .columns
+                .iter()
+                .map(|column| {
+                    values.get(column).cloned().ok_or_else(|| {
+                        Error::Other(format!("conflict column {column} not in values"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(values) => values,
+                Err(err) => {
+                    db.accountant().release(row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            };
+            let existing = match db.conflict_lookup_in_tx(
+                txid,
+                &p.table,
+                &on_conflict.columns,
+                &conflict_values,
+                db.snapshot(),
+            ) {
+                Ok(existing) => existing,
+                Err(err) => {
+                    db.accountant().release(row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            };
             let upsert_values = if let Some(existing_row) = existing.as_ref() {
                 match apply_on_conflict_updates(
                     db,
@@ -1594,55 +1624,110 @@ fn exec_insert(
             } else {
                 values.clone()
             };
-
-            match db.upsert_row(txid, &p.table, conflict_col, upsert_values) {
-                Ok(UpsertResult::Inserted) => {
-                    db.point_lookup_in_tx(
-                        txid,
-                        &p.table,
-                        conflict_col,
-                        conflict_value,
-                        db.snapshot(),
-                    )?
-                    .ok_or_else(|| {
-                        Error::Other("inserted upsert row not visible in tx".to_string())
-                    })?
-                    .row_id
-                }
-                Ok(UpsertResult::Updated) => {
-                    if existing_has_vector && let Some(existing_row_id) = existing_row_id {
-                        for index in vector_indexes_for_table(db, &p.table) {
-                            if db
-                                .vector_store_live_entry_for_row(
-                                    &index,
-                                    existing_row_id,
-                                    db.snapshot(),
-                                )
-                                .is_some()
-                            {
-                                db.delete_vector(txid, index, existing_row_id)?;
+            match existing {
+                None => {
+                    let intent_insert_values = upsert_values.clone();
+                    match db.insert_row(txid, &p.table, upsert_values) {
+                        Ok(row_id) => {
+                            if let Err(err) = db.record_upsert_intent(
+                                txid,
+                                p.table.clone(),
+                                row_id,
+                                UpsertIntentDetails {
+                                    insert_values: intent_insert_values,
+                                    conflict_columns: on_conflict.columns.clone(),
+                                    update_columns: on_conflict.update_columns.clone(),
+                                    params: params.clone(),
+                                },
+                            ) {
+                                db.accountant().release(row_bytes);
+                                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                                return Err(err);
                             }
+                            row_id
+                        }
+                        Err(err) => {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
                         }
                     }
-                    db.point_lookup_in_tx(
-                        txid,
-                        &p.table,
-                        conflict_col,
-                        conflict_value,
-                        db.snapshot(),
-                    )?
-                    .ok_or_else(|| {
-                        Error::Other("updated upsert row not visible in tx".to_string())
-                    })?
-                    .row_id
                 }
-                Ok(UpsertResult::NoOp) => {
-                    db.accountant().release(row_bytes);
-                    RowId(0)
-                }
-                Err(err) => {
-                    db.accountant().release(row_bytes);
-                    return Err(err);
+                Some(existing_row) => {
+                    let changed = upsert_values
+                        .iter()
+                        .any(|(k, v)| existing_row.values.get(k) != Some(v));
+                    if !changed {
+                        db.accountant().release(row_bytes);
+                        RowId(0)
+                    } else {
+                        if let Err(err) = validate_update_state_transition(
+                            db,
+                            &p.table,
+                            &existing_row,
+                            &upsert_values,
+                        ) {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
+                        }
+                        if db.has_live_vector(existing_row.row_id, db.snapshot()) {
+                            for index in vector_indexes_for_table(db, &p.table) {
+                                if db
+                                    .vector_store_live_entry_for_row(
+                                        &index,
+                                        existing_row.row_id,
+                                        db.snapshot(),
+                                    )
+                                    .is_some()
+                                    && let Err(err) =
+                                        db.delete_vector(txid, index, existing_row.row_id)
+                                {
+                                    db.accountant().release(row_bytes);
+                                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        if let Err(err) = db.delete_row(txid, &p.table, existing_row.row_id) {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
+                        }
+                        let row_uuid = upsert_values.get("id").and_then(Value::as_uuid).copied();
+                        let new_state = db
+                            .table_meta(&p.table)
+                            .and_then(|meta| meta.state_machine)
+                            .and_then(|sm| upsert_values.get(&sm.column))
+                            .and_then(Value::as_text)
+                            .map(std::borrow::ToOwned::to_owned);
+                        let row_id = match db.insert_row_replacing(
+                            txid,
+                            &p.table,
+                            upsert_values,
+                            existing_row.row_id,
+                        ) {
+                            Ok(row_id) => row_id,
+                            Err(err) => {
+                                db.accountant().release(row_bytes);
+                                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                                return Err(err);
+                            }
+                        };
+                        if let (Some(uuid), Some(state)) = (row_uuid, new_state.as_deref())
+                            && let Err(err) = db.propagate_state_change_if_needed(
+                                txid,
+                                &p.table,
+                                Some(uuid),
+                                Some(state),
+                            )
+                        {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
+                        }
+                        row_id
+                    }
                 }
             }
         } else {
@@ -1738,6 +1823,54 @@ fn exec_delete(
     Ok(QueryResult::empty_with_affected(matched.len() as u64))
 }
 
+fn collect_conditional_update_predicates(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+) -> Result<Option<Vec<(String, Value)>>> {
+    fn collect_into(
+        expr: &Expr,
+        params: &HashMap<String, Value>,
+        out: &mut Vec<(String, Value)>,
+    ) -> Result<bool> {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => Ok(collect_into(left, params, out)? && collect_into(right, params, out)?),
+            Expr::BinaryOp {
+                left,
+                op: BinOp::Eq,
+                right,
+            } => {
+                if let Expr::Column(column) = left.as_ref()
+                    && matches!(right.as_ref(), Expr::Literal(_) | Expr::Parameter(_))
+                {
+                    out.push((column.column.clone(), resolve_expr(right, params)?));
+                    return Ok(true);
+                }
+                if let Expr::Column(column) = right.as_ref()
+                    && matches!(left.as_ref(), Expr::Literal(_) | Expr::Parameter(_))
+                {
+                    out.push((column.column.clone(), resolve_expr(left, params)?));
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    let mut predicates = Vec::new();
+    if collect_into(expr, params, &mut predicates)?
+        && predicates.iter().any(|(column, _)| column != "id")
+    {
+        Ok(Some(predicates))
+    } else {
+        Ok(None)
+    }
+}
+
 fn exec_update(
     db: &Database,
     p: &UpdatePlan,
@@ -1747,14 +1880,57 @@ fn exec_update(
     db.check_disk_budget("UPDATE")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for update".to_string()))?;
     let snapshot = db.snapshot();
-    // Use in-tx scan so prior statements in a BEGIN/COMMIT block are visible:
-    // the old row must not shadow a previously-updated in-tx row.
-    let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
-    let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
     let resolved_where = p
         .where_clause
         .as_ref()
         .map(|expr| resolve_in_subqueries(db, expr, params, tx))
+        .transpose()?;
+    // Use the same IndexScan candidate selection as SELECT when the UPDATE
+    // predicate can narrow by an indexed first column. The residual WHERE is
+    // still evaluated below, so this only reduces the candidate set.
+    let rows = if let Some(where_clause) = resolved_where.as_ref() {
+        let indexed_rows = db
+            .table_meta(&p.table)
+            .and_then(|meta| analyze_filter_for_index(where_clause, &meta.indexes, params).pick)
+            .map(|pick| execute_index_scan(db, &p.table, &pick, snapshot, Some(txid)))
+            .transpose()?;
+        if let Some((rows, examined)) = indexed_rows {
+            db.__bump_rows_examined(examined);
+            rows
+        } else {
+            // Use in-tx scan so prior statements in a BEGIN/COMMIT block are
+            // visible: the old row must not shadow a previously-updated row.
+            let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
+            db.filter_rows_for_read(&p.table, rows, snapshot)?
+        }
+    } else {
+        let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
+        db.filter_rows_for_read(&p.table, rows, snapshot)?
+    };
+    let current_tx_max = Some(db.committed_watermark());
+    let conditional_predicates = resolved_where
+        .as_ref()
+        .map(|expr| collect_conditional_update_predicates(expr, params))
+        .transpose()?
+        .flatten()
+        .map(|predicates| {
+            predicates
+                .into_iter()
+                .map(|(column, value)| {
+                    Ok((
+                        column.clone(),
+                        coerce_value_for_column(
+                            db,
+                            &p.table,
+                            &column,
+                            value,
+                            current_tx_max,
+                            Some(txid),
+                        )?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
         .transpose()?;
     let matched: Vec<_> = rows
         .into_iter()
@@ -1765,8 +1941,6 @@ fn exec_update(
         })
         .collect();
 
-    let current_tx_max = Some(db.committed_watermark());
-
     struct PlannedUpdate {
         row: VersionedRow,
         values: HashMap<String, Value>,
@@ -1774,6 +1948,7 @@ fn exec_update(
         new_state: Option<String>,
         assigned_vector_values: Vec<(String, Vec<f32>)>,
         assigned_vector_columns: HashSet<String>,
+        conditional_predicates: Option<Vec<(String, Value)>>,
     }
 
     let mut planned = Vec::with_capacity(matched.len());
@@ -1787,7 +1962,13 @@ fn exec_update(
                 coerce_value_for_column(db, &p.table, k, value, current_tx_max, Some(txid))?,
             );
         }
-        validate_update_state_transition(db, &p.table, row, &values)?;
+        let state_column_assigned = db
+            .table_meta(&p.table)
+            .and_then(|meta| meta.state_machine)
+            .is_some_and(|sm| p.assignments.iter().any(|(column, _)| column == &sm.column));
+        if state_column_assigned {
+            validate_update_state_transition(db, &p.table, row, &values)?;
+        }
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
         let new_state = db
             .table_meta(&p.table)
@@ -1818,6 +1999,7 @@ fn exec_update(
             new_state,
             assigned_vector_values,
             assigned_vector_columns,
+            conditional_predicates: conditional_predicates.clone(),
         });
     }
 
@@ -1828,6 +2010,7 @@ fn exec_update(
         let new_state = plan.new_state;
         let assigned_vector_values = plan.assigned_vector_values;
         let assigned_vector_columns = plan.assigned_vector_columns;
+        let conditional_predicates = plan.conditional_predicates;
         let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
         db.accountant().try_allocate_for(
             new_row_bytes,
@@ -1836,6 +2019,7 @@ fn exec_update(
             "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
         )?;
         let checkpoint = db.write_set_checkpoint(txid)?;
+        let before_counts = db.write_set_counts(txid)?;
         let mut vector_allocations = Vec::new();
 
         for column in &assigned_vector_columns {
@@ -1890,6 +2074,17 @@ fn exec_update(
             release_accounted_bytes(db, &vector_allocations);
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
             return Err(err);
+        }
+        if let Some(predicates) = conditional_predicates {
+            let after_counts = db.write_set_counts(txid)?;
+            db.record_conditional_update_guard(
+                txid,
+                p.table.clone(),
+                row.row_id,
+                predicates,
+                before_counts,
+                after_counts,
+            )?;
         }
     }
 
@@ -2752,26 +2947,25 @@ fn execute_index_scan(
     // already enumerates postings in index sort order; rows[] preserve it.
     drop(indexes);
     let row_ids: Vec<RowId> = postings.iter().map(|p| p.row_id).collect();
-    if row_ids.is_empty() {
-        return Ok((Vec::new(), rows_examined));
-    }
     let mut out: Vec<VersionedRow> = Vec::with_capacity(row_ids.len());
-    let tables = db.relational_store().tables.read();
-    if let Some(rows) = tables.get(table) {
-        let visible_by_id: HashMap<RowId, &VersionedRow> = rows
-            .iter()
-            .filter(|row| row.visible_at(snapshot))
-            .map(|row| (row.row_id, row))
-            .collect();
-        for rid in &row_ids {
-            if let Some(r) = visible_by_id.get(rid) {
-                out.push((**r).clone());
+    if !row_ids.is_empty() {
+        let tables = db.relational_store().tables.read();
+        if let Some(rows) = tables.get(table) {
+            let visible_by_id: HashMap<RowId, &VersionedRow> = rows
+                .iter()
+                .filter(|row| row.visible_at(snapshot))
+                .map(|row| (row.row_id, row))
+                .collect();
+            for rid in &row_ids {
+                if let Some(r) = visible_by_id.get(rid) {
+                    out.push((**r).clone());
+                }
             }
         }
+        drop(tables);
     }
     // Layer tx-scoped inserts / deletes on top, matching the semantics of
     // scan_with_tx.
-    drop(tables);
     if let Some(tx_id) = tx {
         let overlay = db.index_scan_tx_overlay(tx_id, table, &pick.pushed_column, &pick.shape)?;
         let deleted_row_ids = overlay.deleted_row_ids;
@@ -3068,14 +3262,12 @@ fn validate_update_state_transition(
         return Ok(());
     };
 
-    if old_state == new_state
-        || db.relational_store().validate_state_transition(
-            table,
-            &state_machine.column,
-            old_state,
-            new_state,
-        )
-    {
+    if db.relational_store().validate_state_transition(
+        table,
+        &state_machine.column,
+        old_state,
+        new_state,
+    ) {
         return Ok(());
     }
 
@@ -3702,7 +3894,7 @@ fn eval_assignment_expr(
     }
 }
 
-fn apply_on_conflict_updates(
+pub(crate) fn apply_on_conflict_updates(
     db: &Database,
     table: &str,
     mut insert_values: HashMap<String, Value>,
@@ -3713,6 +3905,10 @@ fn apply_on_conflict_updates(
 ) -> Result<HashMap<String, Value>> {
     if on_conflict.update_columns.is_empty() {
         return Ok(insert_values);
+    }
+
+    if db.table_meta(table).is_some_and(|meta| meta.immutable) {
+        return Err(Error::ImmutableTable(table.to_string()));
     }
 
     // Reject column-level IMMUTABLE updates at the ON CONFLICT DO UPDATE merge

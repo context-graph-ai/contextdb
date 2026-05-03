@@ -105,6 +105,19 @@ impl<S: WriteSetApplicator> TxManager<S> {
         F: FnOnce(Lsn) -> Result<()>,
         G: FnOnce(&WriteSet) -> Result<()>,
     {
+        self.commit_with_reserved_lsn_callback_mut(tx, before_commit, |ws| prepare(ws))
+    }
+
+    pub fn commit_with_reserved_lsn_callback_mut<F, G>(
+        &self,
+        tx: TxId,
+        before_commit: F,
+        prepare: G,
+    ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
+    where
+        F: FnOnce(Lsn) -> Result<()>,
+        G: FnOnce(&mut WriteSet) -> Result<()>,
+    {
         let _lock = self.commit_mutex.lock();
         let reserved_lsn = self.next_lsn.load(Ordering::SeqCst);
         if let Err(error) = before_commit(reserved_lsn) {
@@ -130,7 +143,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         debug_assert_eq!(lsn, reserved_lsn);
         ws.stamp_lsn(lsn);
-        if let Err(error) = prepare(&ws) {
+        if let Err(error) = prepare(&mut ws) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
                 error,
@@ -174,6 +187,19 @@ impl<S: WriteSetApplicator> TxManager<S> {
         F: FnOnce(&WriteSet) -> Result<()>,
         G: FnOnce(Lsn, &WriteSet),
     {
+        self.commit_with_lsn_prepared_and_applied_mut(tx, |ws| prepare(ws), after_apply)
+    }
+
+    pub fn commit_with_lsn_prepared_and_applied_mut<F, G>(
+        &self,
+        tx: TxId,
+        prepare: F,
+        after_apply: G,
+    ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
+    where
+        F: FnOnce(&mut WriteSet) -> Result<()>,
+        G: FnOnce(Lsn, &WriteSet),
+    {
         let _lock = self.commit_mutex.lock();
         let mut ws = {
             let mut active = self.active_txs.lock();
@@ -190,7 +216,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
         ws.reassign_tx(tx, visibility_tx);
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         ws.stamp_lsn(lsn);
-        if let Err(error) = prepare(&ws) {
+        if let Err(error) = prepare(&mut ws) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             return Err(CommitFailure {
                 error,

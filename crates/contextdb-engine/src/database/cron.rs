@@ -463,7 +463,7 @@ impl Database {
         let _callback_thread = self.cron.enter_callback_thread_scope();
         let tx = self.begin();
         let mut pending_sink_events = Vec::new();
-        let result = self.tx_mgr.commit_with_reserved_lsn_callback(
+        let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
             tx,
             |reserved_lsn| {
                 let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
@@ -489,7 +489,8 @@ impl Database {
             },
             |ws| {
                 if !ws.is_empty() {
-                    self.validate_foreign_keys_in_write_set(ws)?;
+                    self.rewrite_txid_placeholders(tx, ws)?;
+                    let _validation = self.commit_validate(tx, ws)?;
                     self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
                     pending_sink_events = self.prepare_sink_events_for_write_set(ws)?;
                     if self.persistence.is_some()
@@ -505,6 +506,7 @@ impl Database {
 
         match result {
             Ok((lsn, ws)) => {
+                self.pending_commit_metadata.lock().remove(&tx);
                 if !ws.is_empty() {
                     self.release_delete_allocations(&ws);
                     self.plugin.post_commit(&ws, CommitSource::AutoCommit);
@@ -514,6 +516,7 @@ impl Database {
                 Ok(lsn)
             }
             Err(failure) => {
+                self.pending_commit_metadata.lock().remove(&tx);
                 if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
                     self.event_bus.take_staged_sink_events_for_persistence(lsn);
                 }
@@ -604,6 +607,7 @@ impl Database {
             cron: self.cron.clone(),
             event_bus: self.event_bus.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
+            pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
             disk_limit_startup_ceiling: AtomicU64::new(
                 self.disk_limit_startup_ceiling.load(Ordering::SeqCst),
