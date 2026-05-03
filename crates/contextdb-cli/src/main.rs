@@ -186,6 +186,10 @@ fn main() {
     // Graceful shutdown: stop background notifications, wait for any in-flight
     // auto-sync work to finish, then do one final flush before closing the DB.
     if let Some((rt, client)) = rt_and_client {
+        if let Err(err) = db.execute("ROLLBACK", &std::collections::HashMap::new()) {
+            eprintln!("Final transaction rollback failed: {err}");
+            all_ok = false;
+        }
         if let Some(ref plugin) = sync_plugin_arc {
             plugin.shutdown();
         }
