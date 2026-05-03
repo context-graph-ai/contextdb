@@ -1175,7 +1175,7 @@ fn p19_data_integrity_at_scale() {
         for i in 0..100 {
             let seq = batch * 100 + i;
             let id = Uuid::new_v4();
-            let row_id = db
+            let _row_id = db
                 .insert_row(
                     tx,
                     "rows_t",
@@ -1200,20 +1200,21 @@ fn p19_data_integrity_at_scale() {
                     .unwrap();
                 }
                 let angle = seq as f32 * 0.01;
-                db.insert_row(
-                    tx,
-                    "vec_t",
-                    values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
-                )
-                .unwrap();
+                let vector_row_id = db
+                    .insert_row(
+                        tx,
+                        "vec_t",
+                        values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                    )
+                    .unwrap();
                 db.insert_vector(
                     tx,
                     contextdb_core::VectorIndexRef::new("vec_t", "embedding"),
-                    row_id,
+                    vector_row_id,
                     vec![angle.cos(), angle.sin(), 0.0],
                 )
                 .unwrap();
-                vector_row_ids.push(row_id);
+                vector_row_ids.push(vector_row_id);
             }
         }
         db.commit(tx).unwrap();

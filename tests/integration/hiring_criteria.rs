@@ -143,6 +143,8 @@ async fn hc_t02_restart_preserves_committed_sync_visibility() {
     assert_eq!(initial_pull.skipped_rows, 0);
 
     handle.abort();
+    let _ = handle.await;
+    drop(server);
     drop(client);
     drop(edge_db);
     drop(server_db);
@@ -191,6 +193,8 @@ async fn hc_t02_restart_preserves_committed_sync_visibility() {
     );
 
     restarted_handle.abort();
+    let _ = restarted_handle.await;
+    drop(restarted_server);
 }
 
 #[test]

@@ -69,6 +69,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         batches += 1;
     }
 
+    db.close()?;
     let reopened = Database::open(&db_path)?;
     let snapshot = reopened.snapshot();
     let rows = reopened.scan("rss_items", snapshot)?;
