@@ -132,3 +132,18 @@ path = "../../benches/tier1_scope_label_overhead.rs"
 name = "tier1_acl_overhead"
 harness = false
 path = "../../benches/tier1_acl_overhead.rs"
+
+[[bench]]
+name = "tier2_commit_validate_overhead"
+harness = false
+path = "../../benches/tier2_commit_validate_overhead.rs"
+
+[[bench]]
+name = "tier2_fk_revalidation_overhead"
+harness = false
+path = "../../benches/tier2_fk_revalidation_overhead.rs"
+
+[[bench]]
+name = "tier2_state_machine_overhead"
+harness = false
+path = "../../benches/tier2_state_machine_overhead.rs"
