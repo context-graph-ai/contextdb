@@ -1350,7 +1350,7 @@ fn f113c_sq4_cross_batch_recall_stability() {
         crossbatch_row[bytes_idx]
     );
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let footprint_batch: Vec<(Uuid, Vec<f32>)> = (0..512)
+    let footprint_batch: Vec<(Uuid, Vec<f32>)> = (0..5000)
         .map(|i| {
             let range = if i < 256 {
                 (-1.0_f32, 1.0_f32)
