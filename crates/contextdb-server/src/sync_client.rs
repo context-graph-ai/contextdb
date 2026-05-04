@@ -616,6 +616,11 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
     precise_split_changeset(changeset)
 }
 
+#[doc(hidden)]
+pub fn split_changeset_for_test(changeset: ChangeSet) -> Vec<ChangeSet> {
+    split_changeset(changeset)
+}
+
 fn batch_wire_size(changeset: &ChangeSet) -> usize {
     rmp_serde::to_vec(&WireChangeSet::from(changeset.clone()))
         .map(|v| v.len())

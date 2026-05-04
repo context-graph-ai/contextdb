@@ -50,6 +50,8 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::drop_index_stmt => Statement::DropIndex(build_drop_index(inner)?),
         Rule::create_schedule_stmt => build_create_schedule(inner)?,
         Rule::drop_schedule_stmt => build_drop_schedule(inner)?,
+        Rule::create_trigger_stmt => build_create_trigger(inner)?,
+        Rule::drop_trigger_stmt => build_drop_trigger(inner)?,
         Rule::create_event_type_stmt => build_create_event_type(inner)?,
         Rule::create_sink_stmt => build_create_sink(inner)?,
         Rule::create_route_stmt => build_create_route(inner)?,
@@ -2044,6 +2046,44 @@ fn build_drop_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
         .map(|p| parse_identifier(p.as_str()))
         .ok_or_else(|| Error::ParseError("DROP SCHEDULE missing name".to_string()))?;
     Ok(Statement::DropSchedule { name })
+}
+
+fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let mut name = None;
+    let mut table = None;
+    let mut event = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::identifier if table.is_none() => table = Some(parse_identifier(p.as_str())),
+            Rule::event_trigger => {
+                event = Some(match p.as_str().to_ascii_uppercase().as_str() {
+                    "INSERT" => TriggerEvent::Insert,
+                    "UPDATE" => TriggerEvent::Update,
+                    "DELETE" => TriggerEvent::Delete,
+                    _ => return Err(Error::ParseError("invalid trigger event".to_string())),
+                });
+            }
+            other => return Err(unexpected_rule(other, "build_create_trigger")),
+        }
+    }
+    Ok(Statement::CreateTrigger {
+        name: name.ok_or_else(|| Error::ParseError("CREATE TRIGGER missing name".to_string()))?,
+        table: table
+            .ok_or_else(|| Error::ParseError("CREATE TRIGGER missing table".to_string()))?,
+        on_events: vec![
+            event.ok_or_else(|| Error::ParseError("CREATE TRIGGER missing event".to_string()))?,
+        ],
+    })
+}
+
+fn build_drop_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let name = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("DROP TRIGGER missing name".to_string()))?;
+    Ok(Statement::DropTrigger { name })
 }
 
 fn build_create_event_type(pair: Pair<'_, Rule>) -> Result<Statement> {

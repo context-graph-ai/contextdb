@@ -235,6 +235,25 @@ pub enum Error {
     },
     #[error("missed cron ticks exceeded policy: {ticks} ticks missed under '{policy}'")]
     MissedTicksExceeded { ticks: u32, policy: String },
+    #[error("database is not initialized: trigger callbacks must be registered before {operation}")]
+    EngineNotInitialized { operation: String },
+    #[error("trigger callback missing: {trigger_name}")]
+    TriggerCallbackMissing { trigger_name: String },
+    #[error("trigger not declared: {trigger_name}")]
+    TriggerNotDeclared { trigger_name: String },
+    #[error("trigger callback already registered: {trigger_name}")]
+    TriggerAlreadyRegistered { trigger_name: String },
+    #[error("trigger cascade depth exceeded for {trigger_name}: depth {depth}")]
+    TriggerCascadeDepthExceeded { trigger_name: String, depth: u32 },
+    #[error("trigger event is not supported: {event}")]
+    TriggerEventUnsupported { event: String },
+    #[error("trigger callback failed for {trigger_name}: {reason}")]
+    TriggerCallbackFailed {
+        trigger_name: String,
+        reason: String,
+    },
+    #[error("trigger operation requires an admin database handle: {operation}")]
+    TriggerRequiresAdmin { operation: String },
     #[error("schema invalid: {reason}")]
     SchemaInvalid { reason: String },
     #[error("{0}")]

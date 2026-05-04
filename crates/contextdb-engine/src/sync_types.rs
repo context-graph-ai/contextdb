@@ -67,6 +67,8 @@ impl ChangeSet {
                     DdlChange::AlterTable { name, .. } => include_dir(name),
                     DdlChange::CreateIndex { table, .. } => include_dir(table),
                     DdlChange::DropIndex { table, .. } => include_dir(table),
+                    DdlChange::CreateTrigger { table, .. } => include_dir(table),
+                    DdlChange::DropTrigger { .. } => true,
                     DdlChange::CreateEventType { table, .. } => include_event_table(table),
                     DdlChange::CreateSink { name, .. } => {
                         directions.is_empty() || included_route_sinks.contains(name)
@@ -128,6 +130,14 @@ pub enum DdlChange {
     },
     DropIndex {
         table: String,
+        name: String,
+    },
+    CreateTrigger {
+        name: String,
+        table: String,
+        on_events: Vec<String>,
+    },
+    DropTrigger {
         name: String,
     },
     CreateEventType {

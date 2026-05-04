@@ -70,6 +70,8 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
         Statement::CreateSchedule { .. }
         | Statement::DropSchedule { .. }
+        | Statement::CreateTrigger { .. }
+        | Statement::DropTrigger { .. }
         | Statement::CreateEventType { .. }
         | Statement::CreateSink { .. }
         | Statement::CreateRoute { .. }

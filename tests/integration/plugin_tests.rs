@@ -387,6 +387,8 @@ impl DatabasePlugin for DdlVetoPlugin {
             DdlChange::AlterTable { .. } => "AlterTable",
             DdlChange::CreateIndex { .. } => "CreateIndex",
             DdlChange::DropIndex { .. } => "DropIndex",
+            DdlChange::CreateTrigger { .. } => "CreateTrigger",
+            DdlChange::DropTrigger { .. } => "DropTrigger",
             DdlChange::CreateEventType { .. } => "CreateEventType",
             DdlChange::CreateSink { .. } => "CreateSink",
             DdlChange::CreateRoute { .. } => "CreateRoute",

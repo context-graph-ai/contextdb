@@ -50,6 +50,9 @@ fn ddl_sql_from_change(change: &DdlChange) -> String {
             panic!("unexpected CREATE INDEX in DDL round-trip helper")
         }
         DdlChange::DropIndex { .. } => panic!("unexpected DROP INDEX in DDL round-trip helper"),
+        DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. } => {
+            panic!("unexpected trigger DDL in DDL round-trip helper")
+        }
         DdlChange::CreateEventType { .. }
         | DdlChange::CreateSink { .. }
         | DdlChange::CreateRoute { .. }

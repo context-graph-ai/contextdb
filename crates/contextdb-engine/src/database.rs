@@ -146,6 +146,59 @@ pub enum CronAuditKind {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerDeclaration {
+    pub name: String,
+    pub table: String,
+    pub on_events: Vec<TriggerEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerContext {
+    pub trigger_name: String,
+    pub table: String,
+    pub event: TriggerEvent,
+    pub tx: TxId,
+    pub depth: u32,
+    pub row_values: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerAuditEntry {
+    pub trigger_name: String,
+    pub firing_tx: TxId,
+    pub firing_lsn: Lsn,
+    pub depth: u32,
+    pub cascade_row_count: u32,
+    pub status: TriggerAuditStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerAuditStatus {
+    Fired,
+    RolledBack { reason: String },
+    DepthExceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerAuditStatusFilter {
+    Fired,
+    RolledBack,
+    DepthExceeded,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TriggerAuditFilter {
+    pub trigger_name: Option<String>,
+    pub status: Option<TriggerAuditStatusFilter>,
+}
+
 pub struct CronPauseGuard {
     cron: Arc<CronState>,
 }
@@ -1158,6 +1211,9 @@ impl Database {
                 self.drop_cron_schedule(name)?;
                 return Ok(QueryResult::empty());
             }
+            Statement::CreateTrigger { .. } | Statement::DropTrigger { .. } => {
+                return Ok(QueryResult::empty());
+            }
             _ => {}
         }
 
@@ -1282,6 +1338,8 @@ impl Database {
                 | Statement::DropIndex(_)
                 | Statement::CreateSchedule { .. }
                 | Statement::DropSchedule { .. }
+                | Statement::CreateTrigger { .. }
+                | Statement::DropTrigger { .. }
                 | Statement::CreateEventType { .. }
                 | Statement::CreateSink { .. }
                 | Statement::CreateRoute { .. }
@@ -1852,6 +1910,24 @@ impl Database {
                 .to_string(),
                 table: table.clone(),
             }),
+            Statement::CreateTrigger {
+                name,
+                table,
+                on_events,
+            } => Some(DdlChange::CreateTrigger {
+                name: name.clone(),
+                table: table.clone(),
+                on_events: on_events
+                    .iter()
+                    .map(|event| match event {
+                        contextdb_parser::ast::TriggerEvent::Insert => "INSERT",
+                        contextdb_parser::ast::TriggerEvent::Update => "UPDATE",
+                        contextdb_parser::ast::TriggerEvent::Delete => "DELETE",
+                    })
+                    .map(str::to_string)
+                    .collect(),
+            }),
+            Statement::DropTrigger { name } => Some(DdlChange::DropTrigger { name: name.clone() }),
             Statement::CreateSink {
                 name,
                 sink_type,
@@ -7290,6 +7366,8 @@ impl Database {
                     }
                 }
                 DdlChange::CreateEventType { .. }
+                | DdlChange::CreateTrigger { .. }
+                | DdlChange::DropTrigger { .. }
                 | DdlChange::CreateSink { .. }
                 | DdlChange::CreateRoute { .. }
                 | DdlChange::DropRoute { .. } => {}
@@ -7360,6 +7438,8 @@ impl Database {
                     }
                 }
                 DdlChange::CreateEventType { .. }
+                | DdlChange::CreateTrigger { .. }
+                | DdlChange::DropTrigger { .. }
                 | DdlChange::CreateSink { .. }
                 | DdlChange::CreateRoute { .. }
                 | DdlChange::DropRoute { .. } => {}
@@ -7410,6 +7490,8 @@ impl Database {
                 }
                 DdlChange::CreateIndex { .. }
                 | DdlChange::DropIndex { .. }
+                | DdlChange::CreateTrigger { .. }
+                | DdlChange::DropTrigger { .. }
                 | DdlChange::CreateEventType { .. }
                 | DdlChange::CreateSink { .. }
                 | DdlChange::CreateRoute { .. }
@@ -7453,6 +7535,8 @@ impl Database {
                 DdlChange::DropTable { .. }
                 | DdlChange::CreateIndex { .. }
                 | DdlChange::DropIndex { .. }
+                | DdlChange::CreateTrigger { .. }
+                | DdlChange::DropTrigger { .. }
                 | DdlChange::CreateEventType { .. }
                 | DdlChange::CreateSink { .. }
                 | DdlChange::CreateRoute { .. }
@@ -7826,6 +7910,52 @@ impl Database {
         }
     }
 
+    pub fn complete_initialization(&self) -> Result<()> {
+        let _operation = self.open_operation()?;
+        Ok(())
+    }
+
+    pub fn register_trigger_callback<F>(&self, _name: &str, _callback: F) -> Result<()>
+    where
+        F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static,
+    {
+        let _operation = self.open_operation()?;
+        Ok(())
+    }
+
+    pub fn list_triggers(&self) -> Vec<TriggerDeclaration> {
+        let _operation = self.assert_open_operation();
+        Vec::new()
+    }
+
+    pub fn registered_trigger_callbacks(&self) -> Vec<String> {
+        let _operation = self.assert_open_operation();
+        Vec::new()
+    }
+
+    pub fn trigger_cascade_depth_cap(&self) -> u32 {
+        let _operation = self.assert_open_operation();
+        0
+    }
+
+    pub fn trigger_audit_ring_capacity(&self) -> usize {
+        let _operation = self.assert_open_operation();
+        0
+    }
+
+    pub fn trigger_audit_log(&self) -> Vec<TriggerAuditEntry> {
+        let _operation = self.assert_open_operation();
+        Vec::new()
+    }
+
+    pub fn trigger_audit_history(
+        &self,
+        _filter: TriggerAuditFilter,
+    ) -> Result<Vec<TriggerAuditEntry>> {
+        let _operation = self.open_operation()?;
+        Ok(Vec::new())
+    }
+
     /// Applies a ChangeSet to this database with the given conflict policies.
     pub fn apply_changes(
         &self,
@@ -8097,6 +8227,7 @@ impl Database {
                         }
                         table_meta_cache.remove(&table);
                     }
+                    DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. } => {}
                     event_ddl @ (DdlChange::CreateEventType { .. }
                     | DdlChange::CreateSink { .. }
                     | DdlChange::CreateRoute { .. }

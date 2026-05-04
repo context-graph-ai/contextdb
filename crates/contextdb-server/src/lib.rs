@@ -7,5 +7,7 @@ pub mod sync_plugin;
 pub mod sync_server;
 
 pub use sync_client::SyncClient;
+#[doc(hidden)]
+pub use sync_client::split_changeset_for_test;
 pub use sync_plugin::SyncPlugin;
 pub use sync_server::SyncServer;

@@ -130,6 +130,8 @@ fn ds02_ddl_in_changeset_after_reopen() {
         DdlChange::AlterTable { .. } => unreachable!(),
         DdlChange::CreateIndex { .. }
         | DdlChange::DropIndex { .. }
+        | DdlChange::CreateTrigger { .. }
+        | DdlChange::DropTrigger { .. }
         | DdlChange::CreateEventType { .. }
         | DdlChange::CreateSink { .. }
         | DdlChange::CreateRoute { .. }
@@ -159,6 +161,8 @@ fn ds02_ddl_in_changeset_after_reopen() {
         DdlChange::AlterTable { .. } => unreachable!(),
         DdlChange::CreateIndex { .. }
         | DdlChange::DropIndex { .. }
+        | DdlChange::CreateTrigger { .. }
+        | DdlChange::DropTrigger { .. }
         | DdlChange::CreateEventType { .. }
         | DdlChange::CreateSink { .. }
         | DdlChange::CreateRoute { .. }

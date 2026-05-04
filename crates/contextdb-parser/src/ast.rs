@@ -29,6 +29,14 @@ pub enum Statement {
     DropSchedule {
         name: String,
     },
+    CreateTrigger {
+        name: String,
+        table: String,
+        on_events: Vec<TriggerEvent>,
+    },
+    DropTrigger {
+        name: String,
+    },
     CreateEventType {
         name: String,
         when: EventTypeTrigger,
@@ -52,6 +60,13 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventTypeTrigger {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TriggerEvent {
     Insert,
     Update,
     Delete,

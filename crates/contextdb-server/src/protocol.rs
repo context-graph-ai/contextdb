@@ -174,6 +174,14 @@ pub enum WireDdlChange {
         table: String,
         name: String,
     },
+    CreateTrigger {
+        name: String,
+        table: String,
+        on_events: Vec<String>,
+    },
+    DropTrigger {
+        name: String,
+    },
     CreateEventType {
         name: String,
         trigger: String,
@@ -387,6 +395,16 @@ impl From<DdlChange> for WireDdlChange {
                 }
             }
             DdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
+            DdlChange::CreateTrigger {
+                name,
+                table,
+                on_events,
+            } => Self::CreateTrigger {
+                name,
+                table,
+                on_events,
+            },
+            DdlChange::DropTrigger { name } => Self::DropTrigger { name },
             DdlChange::CreateEventType {
                 name,
                 trigger,
@@ -468,6 +486,16 @@ impl From<WireDdlChange> for DdlChange {
                 }
             }
             WireDdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
+            WireDdlChange::CreateTrigger {
+                name,
+                table,
+                on_events,
+            } => Self::CreateTrigger {
+                name,
+                table,
+                on_events,
+            },
+            WireDdlChange::DropTrigger { name } => Self::DropTrigger { name },
             WireDdlChange::CreateEventType {
                 name,
                 trigger,

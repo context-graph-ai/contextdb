@@ -16,6 +16,8 @@ stmt = _{
     | drop_index_stmt
     | create_schedule_stmt
     | drop_schedule_stmt
+    | create_trigger_stmt
+    | drop_trigger_stmt
     | create_event_type_stmt
     | create_sink_stmt
     | create_route_stmt
@@ -304,6 +306,13 @@ missed_tick_clause = {
     ~ (^"WITHIN" ~ integer ~ ^"SECONDS")?
 }
 drop_schedule_stmt = { ^"DROP" ~ ^"SCHEDULE" ~ identifier }
+
+create_trigger_stmt = {
+    ^"CREATE" ~ ^"TRIGGER" ~ identifier
+    ~ ^"ON" ~ identifier
+    ~ ^"WHEN" ~ event_trigger
+}
+drop_trigger_stmt = { ^"DROP" ~ ^"TRIGGER" ~ identifier }
 
 create_event_type_stmt = {
     ^"CREATE" ~ ^"EVENT" ~ ^"TYPE" ~ identifier

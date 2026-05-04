@@ -50,6 +50,8 @@ mod memory_accounting;
 mod multi_edge;
 #[path = "acceptance/multi_table_atomic_visibility.rs"]
 mod multi_table_atomic_visibility;
+#[path = "acceptance/observation_trigger.rs"]
+mod observation_trigger;
 #[path = "acceptance/persistence.rs"]
 mod persistence;
 #[path = "acceptance/precommit_context_guard.rs"]

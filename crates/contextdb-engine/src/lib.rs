@@ -12,7 +12,8 @@ pub mod sync_types;
 
 pub use database::{
     ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, SinkError, SinkEvent,
-    SinkMetrics,
+    SinkMetrics, TriggerAuditEntry, TriggerAuditFilter, TriggerAuditStatus,
+    TriggerAuditStatusFilter, TriggerContext, TriggerDeclaration, TriggerEvent,
 };
 pub use database::{CascadeReport, Database, IndexCandidate, QueryResult, QueryTrace};
 pub use database::{SearchResult, SemanticQuery};
