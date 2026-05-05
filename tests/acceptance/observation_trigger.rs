@@ -1,7 +1,7 @@
 use super::common::{count_rows, empty_params, start_nats, wait_for_sync_server_ready};
 use contextdb_core::{
-    ContextId, Error, Lsn, Principal, Result, RowId, ScopeLabel, TxId, Value, VectorIndexRef,
-    VersionedRow,
+    ContextId, Error, Lsn, Principal, Result, RowId, ScopeLabel, SortDirection, TxId, UpsertResult,
+    Value, VectorIndexRef, VersionedRow,
 };
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
@@ -13,7 +13,7 @@ use contextdb_engine::{
 use contextdb_server::{SyncClient, SyncServer, protocol::WireChangeSet};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -53,6 +53,22 @@ fn setup_host_tables(db: &Database) {
         &empty(),
     )
     .unwrap();
+}
+
+fn setup_ready_host_write_trigger(db: &Database) {
+    db.execute(
+        "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER host_write_trigger ON host_writes WHEN INSERT",
+        &empty(),
+    )
+    .unwrap();
+    db.register_trigger_callback("host_write_trigger", |_, _| Ok(()))
+        .unwrap();
+    db.complete_initialization().unwrap();
 }
 
 fn register_audit_callback(db: &Database, fire_count: Arc<AtomicUsize>) {
@@ -198,7 +214,10 @@ fn reopened_rollback_audit_failure(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HnswBaseline {
-    stats: String,
+    point_count: usize,
+    layer0_points: usize,
+    dimension: usize,
+    has_layer0_edges: bool,
     raw_entry_counts: Vec<(RowId, usize)>,
 }
 
@@ -222,7 +241,10 @@ fn hnsw_baseline_failure(
         return Some(format!("{label} raw HNSW graph is missing for {index:?}"));
     };
     let actual = HnswBaseline {
-        stats: format!("{stats:?}"),
+        point_count: stats.point_count,
+        layer0_points: stats.layer0_points,
+        dimension: stats.dimension,
+        has_layer0_edges: stats.layer0_neighbor_edges > 0,
         raw_entry_counts: expected
             .row_ids()
             .into_iter()
@@ -244,12 +266,8 @@ fn hnsw_baseline_failure(
             .take(8)
             .collect::<Vec<_>>();
         return Some(format!(
-            "{label} raw HNSW baseline changed for {index:?}; warm_empty={}, expected_stats={}, actual_stats={}, expected_raw_rows={}, actual_raw_rows={}, raw_mismatches_sample={raw_mismatches:?}",
-            warm.as_ref().map(|hits| hits.is_empty()).unwrap_or(true),
-            expected.stats,
-            actual.stats,
-            expected.raw_entry_counts.len(),
-            actual.raw_entry_counts.len()
+            "{label} raw HNSW baseline changed for {index:?}; warm_empty={}, expected={expected:?}, actual={actual:?}, raw_mismatches_sample={raw_mismatches:?}",
+            warm.as_ref().map(|hits| hits.is_empty()).unwrap_or(true)
         ));
     }
     None
@@ -368,12 +386,19 @@ fn warm_hnsw_fixture(
         stats.point_count, expected_rows,
         "{label} fixture must exercise raw HNSW, not just MVCC vector entries; stats={stats:?}"
     );
+    assert_eq!(
+        stats.layer0_points, expected_rows,
+        "{label} fixture must put every point into layer 0; stats={stats:?}"
+    );
     assert!(
         stats.layer0_neighbor_edges > 0,
         "{label} fixture must expose real HNSW neighbor edges; stats={stats:?}"
     );
     let baseline = HnswBaseline {
-        stats: format!("{stats:?}"),
+        point_count: stats.point_count,
+        layer0_points: stats.layer0_points,
+        dimension: stats.dimension,
+        has_layer0_edges: true,
         raw_entry_counts: baseline_row_ids
             .into_iter()
             .map(|row_id| {
@@ -560,6 +585,7 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
     let (sibling_hnsw_count, sibling_hnsw_max_row_id, sibling_hnsw_baseline) =
         seed_sibling_hnsw_vectors(&db);
     let sibling_hnsw_index = VectorIndexRef::new("sibling_vectors", "embedding");
+    let cold_remote_vector_row_id = RowId::from_raw_wire(sibling_hnsw_max_row_id + 64);
     db.execute(
         "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
         &empty(),
@@ -619,7 +645,7 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
             }],
             vectors: vec![VectorChange {
                 index: VectorIndexRef::new("sibling_vectors", "embedding"),
-                row_id: RowId::from_raw_wire(0x198),
+                row_id: cold_remote_vector_row_id,
                 vector: vec![0.1, 0.2, 0.3],
                 lsn: Lsn(1),
             }],
@@ -630,7 +656,7 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
     let cold_row_id = row_id_for_column_uuid(&db, "sibling_vectors", "id", uuid(0x198));
     let mut cold_vector_probe_rows = candidate_row_ids_after(sibling_hnsw_max_row_id);
     cold_vector_probe_rows.extend(cold_row_id);
-    cold_vector_probe_rows.push(RowId::from_raw_wire(0x198));
+    cold_vector_probe_rows.push(cold_remote_vector_row_id);
     let cold_vector_leaks = live_vector_rows(&db, cold_vector_probe_rows.iter().copied());
     let cold_hnsw_raw_leaks = hnsw_raw_leaks(
         &db,
@@ -646,7 +672,6 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
     if !matches!(
         sync_gated,
         Err(Error::EngineNotInitialized { ref operation }) if operation.contains("apply_changes")
-            && operation.contains("host_writes")
     ) || count_rows(&db, "sibling_writes") != 1
         || count_rows(&db, "sibling_vectors") != sibling_hnsw_count
         || count_rows(&db, "host_writes") != 0
@@ -667,6 +692,48 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
             db.edge_count(uuid(0x199), "COLD_APPLY_LEAK", db.snapshot())
                 .unwrap(),
             db.changes_since(sync_since)
+        ));
+    }
+
+    let global_apply_since = db.current_lsn();
+    let non_trigger_apply = db.apply_changes(
+        ChangeSet {
+            rows: vec![row_change(
+                "sibling_writes",
+                uuid(0x201),
+                "non-trigger-sync-still-blocked-while-booting",
+                Lsn(2),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let ddl_only_apply = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateTable {
+                name: "cold_sync_ddl".into(),
+                columns: vec![("id".into(), "UUID PRIMARY KEY".into())],
+                constraints: Vec::new(),
+            }],
+            ddl_lsn: vec![Lsn(2)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let leaked_global_apply_changes = db.changes_since(global_apply_since);
+    if !matches!(
+        non_trigger_apply,
+        Err(Error::EngineNotInitialized { ref operation }) if operation.contains("apply_changes")
+    ) || !matches!(
+        ddl_only_apply,
+        Err(Error::EngineNotInitialized { ref operation }) if operation.contains("apply_changes")
+    ) || count_rows(&db, "sibling_writes") != 1
+        || changeset_has_data(&leaked_global_apply_changes)
+        || !leaked_global_apply_changes.ddl.is_empty()
+    {
+        failures.push(format!(
+            "a booting trigger handle must reject sync apply with data or non-tombstone DDL-only batches; non_trigger={non_trigger_apply:?}, ddl_only={ddl_only_apply:?}, sibling_rows={}, leaked_changes={leaked_global_apply_changes:?}",
+            count_rows(&db, "sibling_writes")
         ));
     }
 
@@ -741,6 +808,1823 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
 }
 
 #[test]
+fn t3_sync_apply_requires_complete_initialization_after_callback_registration() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("callback_registered_not_initialized.redb");
+    {
+        let db = Database::open(&path).unwrap();
+        setup_host_tables(&db);
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    db.register_trigger_callback("host_write_trigger", |_, _| Ok(()))
+        .unwrap();
+    let since = db.current_lsn();
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateIndex {
+                table: "host_writes".into(),
+                name: "host_content_idx".into(),
+                columns: vec![("content".into(), SortDirection::Asc)],
+            }],
+            ddl_lsn: vec![Lsn(10)],
+            rows: vec![row_change(
+                "host_writes",
+                uuid(0x203),
+                "registered-callback-is-not-ready",
+                Lsn(10),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let leaked_changes = db.changes_since(since);
+    let has_user_index = db
+        .table_meta("host_writes")
+        .unwrap()
+        .indexes
+        .iter()
+        .any(|index| index.name == "host_content_idx");
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("apply_changes")
+        ) && count_rows(&db, "host_writes") == 0
+            && !has_user_index
+            && leaked_changes.ddl.is_empty()
+            && leaked_changes.rows.is_empty()
+            && leaked_changes.edges.is_empty()
+            && leaked_changes.vectors.is_empty(),
+        "registering callbacks must not bypass explicit complete_initialization for sync apply; result={result:?}, has_user_index={has_user_index}, leaked_changes={leaked_changes:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callbacks() {
+    let tmp = TempDir::new().unwrap();
+
+    let unknown_drop_trigger_path = tmp.path().join("cold_unknown_drop_trigger.redb");
+    {
+        let db = Database::open(&unknown_drop_trigger_path).unwrap();
+        setup_host_tables(&db);
+        db.close().unwrap();
+    }
+    let unknown_drop_trigger_db = Database::open(&unknown_drop_trigger_path).unwrap();
+    let unknown_drop_trigger_since = unknown_drop_trigger_db.current_lsn();
+    let unknown_drop_trigger_result = unknown_drop_trigger_db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropTrigger {
+                name: "unknown_trigger".into(),
+            }],
+            ddl_lsn: vec![Lsn(100)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let unknown_drop_trigger_ddl = unknown_drop_trigger_db
+        .changes_since(unknown_drop_trigger_since)
+        .ddl;
+    assert!(
+        matches!(
+            unknown_drop_trigger_result,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("apply_changes")
+        ) && unknown_drop_trigger_db
+            .list_triggers()
+            .iter()
+            .any(|trigger| trigger.name == "host_write_trigger")
+            && unknown_drop_trigger_ddl.is_empty(),
+        "unknown sync DropTrigger must not bypass the cold durable-trigger callback gate or append tombstones; result={unknown_drop_trigger_result:?}, triggers={:?}, ddl={unknown_drop_trigger_ddl:?}",
+        unknown_drop_trigger_db.list_triggers()
+    );
+    unknown_drop_trigger_db.close().unwrap();
+
+    let data_then_drop_trigger_path = tmp.path().join("cold_data_then_drop_trigger.redb");
+    {
+        let db = Database::open(&data_then_drop_trigger_path).unwrap();
+        setup_host_tables(&db);
+        db.close().unwrap();
+    }
+    let data_then_drop_trigger_db = Database::open(&data_then_drop_trigger_path).unwrap();
+    let data_then_drop_trigger_since = data_then_drop_trigger_db.current_lsn();
+    let data_then_drop_trigger_result = data_then_drop_trigger_db.apply_changes(
+        ChangeSet {
+            rows: vec![row_change(
+                "host_writes",
+                uuid(0x217),
+                "must-not-bypass-cold-gate-before-drop",
+                Lsn(99),
+            )],
+            ddl: vec![DdlChange::DropTrigger {
+                name: "host_write_trigger".into(),
+            }],
+            ddl_lsn: vec![Lsn(100)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let data_then_drop_changes =
+        data_then_drop_trigger_db.changes_since(data_then_drop_trigger_since);
+    assert!(
+        matches!(
+            data_then_drop_trigger_result,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("host_writes")
+                    && operation.contains("host_write_trigger")
+        ) && count_rows(&data_then_drop_trigger_db, "host_writes") == 0
+            && data_then_drop_trigger_db
+                .list_triggers()
+                .iter()
+                .any(|trigger| trigger.name == "host_write_trigger")
+            && data_then_drop_changes.rows.is_empty()
+            && data_then_drop_changes.ddl.is_empty(),
+        "trigger-table data before a same-batch DropTrigger must not bypass a cold persisted trigger gate; result={data_then_drop_trigger_result:?}, triggers={:?}, changes={data_then_drop_changes:?}",
+        data_then_drop_trigger_db.list_triggers()
+    );
+    data_then_drop_trigger_db.close().unwrap();
+
+    let same_lsn_data_drop_trigger_path = tmp.path().join("cold_same_lsn_data_drop_trigger.redb");
+    {
+        let db = Database::open(&same_lsn_data_drop_trigger_path).unwrap();
+        setup_host_tables(&db);
+        db.close().unwrap();
+    }
+    let same_lsn_data_drop_trigger_db = Database::open(&same_lsn_data_drop_trigger_path).unwrap();
+    let same_lsn_data_drop_trigger_since = same_lsn_data_drop_trigger_db.current_lsn();
+    let same_lsn_data_drop_trigger_result = same_lsn_data_drop_trigger_db.apply_changes(
+        ChangeSet {
+            rows: vec![row_change(
+                "host_writes",
+                uuid(0x218),
+                "must-not-bypass-cold-gate-at-drop-lsn",
+                Lsn(100),
+            )],
+            ddl: vec![DdlChange::DropTrigger {
+                name: "host_write_trigger".into(),
+            }],
+            ddl_lsn: vec![Lsn(100)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let same_lsn_data_drop_changes =
+        same_lsn_data_drop_trigger_db.changes_since(same_lsn_data_drop_trigger_since);
+    assert!(
+        matches!(
+            same_lsn_data_drop_trigger_result,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("host_writes")
+                    && operation.contains("host_write_trigger")
+        ) && count_rows(&same_lsn_data_drop_trigger_db, "host_writes") == 0
+            && same_lsn_data_drop_trigger_db
+                .list_triggers()
+                .iter()
+                .any(|trigger| trigger.name == "host_write_trigger")
+            && same_lsn_data_drop_changes.rows.is_empty()
+            && same_lsn_data_drop_changes.ddl.is_empty(),
+        "trigger-table data at the same sender LSN as DropTrigger must not bypass a cold persisted trigger gate; result={same_lsn_data_drop_trigger_result:?}, triggers={:?}, changes={same_lsn_data_drop_changes:?}",
+        same_lsn_data_drop_trigger_db.list_triggers()
+    );
+    same_lsn_data_drop_trigger_db.close().unwrap();
+
+    let partial_drop_trigger_path = tmp.path().join("cold_partial_drop_trigger.redb");
+    {
+        let db = Database::open(&partial_drop_trigger_path).unwrap();
+        setup_host_tables(&db);
+        db.execute(
+            "CREATE TABLE other_writes (id UUID PRIMARY KEY, content TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TRIGGER other_write_trigger ON other_writes WHEN INSERT",
+            &empty(),
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+    let partial_drop_trigger_db = Database::open(&partial_drop_trigger_path).unwrap();
+    let partial_drop_trigger_since = partial_drop_trigger_db.current_lsn();
+    let partial_drop_trigger_result = partial_drop_trigger_db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropTrigger {
+                name: "host_write_trigger".into(),
+            }],
+            ddl_lsn: vec![Lsn(100)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let partial_drop_trigger_ddl = partial_drop_trigger_db
+        .changes_since(partial_drop_trigger_since)
+        .ddl;
+    let partial_triggers = partial_drop_trigger_db.list_triggers();
+    let still_booting = partial_drop_trigger_db.complete_initialization();
+    assert!(
+        partial_drop_trigger_result.is_ok()
+            && partial_triggers
+                .iter()
+                .all(|trigger| trigger.name != "host_write_trigger")
+            && partial_triggers
+                .iter()
+                .any(|trigger| trigger.name == "other_write_trigger")
+            && matches!(
+                still_booting,
+                Err(Error::TriggerCallbackMissing { ref trigger_name })
+                    if trigger_name == "other_write_trigger"
+            )
+            && partial_drop_trigger_ddl.iter().any(
+                |change| matches!(change, DdlChange::DropTrigger { name } if name == "host_write_trigger")
+            ),
+        "known tombstone-only sync cleanup must be allowed to remove one cold trigger while another trigger remains fail-closed; result={partial_drop_trigger_result:?}, triggers={partial_triggers:?}, init={still_booting:?}, ddl={partial_drop_trigger_ddl:?}"
+    );
+    partial_drop_trigger_db.close().unwrap();
+
+    let registered_partial_drop_path = tmp.path().join("cold_registered_partial_drop_trigger.redb");
+    {
+        let db = Database::open(&registered_partial_drop_path).unwrap();
+        setup_host_tables(&db);
+        db.execute(
+            "CREATE TABLE other_writes (id UUID PRIMARY KEY, content TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TRIGGER other_write_trigger ON other_writes WHEN INSERT",
+            &empty(),
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+    let registered_partial_drop_db = Database::open(&registered_partial_drop_path).unwrap();
+    registered_partial_drop_db
+        .register_trigger_callback("other_write_trigger", |_, _| Ok(()))
+        .unwrap();
+    let registered_partial_drop_result = registered_partial_drop_db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropTrigger {
+                name: "host_write_trigger".into(),
+            }],
+            ddl_lsn: vec![Lsn(100)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let still_requires_explicit_init = registered_partial_drop_db.apply_changes(
+        ChangeSet {
+            rows: vec![row_change(
+                "other_writes",
+                uuid(0x219),
+                "must-not-bypass-explicit-initialization",
+                Lsn(101),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    assert!(
+        registered_partial_drop_result.is_ok()
+            && matches!(
+                still_requires_explicit_init,
+                Err(Error::EngineNotInitialized { ref operation })
+                    if operation.contains("apply_changes")
+            )
+            && count_rows(&registered_partial_drop_db, "other_writes") == 0
+            && registered_partial_drop_db.complete_initialization().is_ok(),
+        "tombstone cleanup must not infer readiness for a cold handle that has registered remaining callbacks but has not explicitly completed initialization; cleanup={registered_partial_drop_result:?}, write={still_requires_explicit_init:?}, triggers={:?}",
+        registered_partial_drop_db.list_triggers()
+    );
+    registered_partial_drop_db.close().unwrap();
+
+    let drop_trigger_path = tmp.path().join("cold_drop_trigger.redb");
+    {
+        let db = Database::open(&drop_trigger_path).unwrap();
+        setup_host_tables(&db);
+        db.close().unwrap();
+    }
+    let drop_trigger_db = Database::open(&drop_trigger_path).unwrap();
+    let drop_trigger_since = drop_trigger_db.current_lsn();
+    let drop_trigger_result = drop_trigger_db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropTrigger {
+                name: "host_write_trigger".into(),
+            }],
+            ddl_lsn: vec![Lsn(100)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let drop_trigger_ddl = drop_trigger_db.changes_since(drop_trigger_since).ddl;
+    assert!(
+        drop_trigger_result.is_ok()
+            && drop_trigger_db.list_triggers().is_empty()
+            && drop_trigger_db.complete_initialization().is_ok()
+            && drop_trigger_ddl.iter().any(
+                |change| matches!(change, DdlChange::DropTrigger { name } if name == "host_write_trigger")
+            ),
+        "cold reopened trigger handle must accept a sync DropTrigger tombstone without requiring the deleted callback; result={drop_trigger_result:?}, triggers={:?}, ddl={drop_trigger_ddl:?}",
+        drop_trigger_db.list_triggers()
+    );
+    drop_trigger_db.close().unwrap();
+
+    let drop_table_path = tmp.path().join("cold_drop_table.redb");
+    {
+        let db = Database::open(&drop_table_path).unwrap();
+        setup_host_tables(&db);
+        db.close().unwrap();
+    }
+    let drop_table_db = Database::open(&drop_table_path).unwrap();
+    let drop_table_since = drop_table_db.current_lsn();
+    let drop_table_result = drop_table_db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropTable {
+                name: "host_writes".into(),
+            }],
+            ddl_lsn: vec![Lsn(100)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let drop_table_ddl = drop_table_db.changes_since(drop_table_since).ddl;
+    assert!(
+        drop_table_result.is_ok()
+            && drop_table_db.table_meta("host_writes").is_none()
+            && drop_table_db.list_triggers().is_empty()
+            && drop_table_db.complete_initialization().is_ok()
+            && drop_table_ddl
+                .iter()
+                .any(|change| matches!(change, DdlChange::DropTable { name } if name == "host_writes"))
+            && drop_table_ddl.iter().any(
+                |change| matches!(change, DdlChange::DropTrigger { name } if name == "host_write_trigger")
+            ),
+        "cold reopened trigger handle must accept a sync DropTable tombstone and emit the implicit DropTrigger without requiring the deleted callback; result={drop_table_result:?}, triggers={:?}, ddl={drop_table_ddl:?}",
+        drop_table_db.list_triggers()
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_rejects_invalid_event_bus_batch_without_trigger_leak() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "trigger_before_bad_event_route".into(),
+                    table: "host_writes".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::CreateSink {
+                    name: "partial".into(),
+                    sink_type: "CALLBACK".into(),
+                    url: None,
+                },
+                DdlChange::CreateRoute {
+                    name: "bad_route".into(),
+                    event_type: "missing_event".into(),
+                    sink: "partial".into(),
+                    table: "host_writes".into(),
+                    where_in: None,
+                },
+            ],
+            ddl_lsn: vec![Lsn(7), Lsn(7), Lsn(7)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(result.is_err(), "invalid mixed DDL batch must fail");
+    assert!(
+        db.list_triggers()
+            .iter()
+            .all(|trigger| trigger.name != "trigger_before_bad_event_route"),
+        "failed sync batch must not persist trigger declarations"
+    );
+    assert!(
+        db.changes_since(since).ddl.iter().all(|ddl| {
+            !matches!(
+                ddl,
+                DdlChange::CreateTrigger { name, .. }
+                    if name == "trigger_before_bad_event_route"
+            )
+        }),
+        "failed sync batch must not append trigger DDL history"
+    );
+    assert!(
+        db.register_sink("partial", None, |_| Ok(())).is_err(),
+        "failed sync batch must not leave an EventBus sink behind"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_with_same_batch_rows_fails_closed_until_callback_ready() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateTrigger {
+                name: "synced_trigger".into(),
+                table: "host_writes".into(),
+                on_events: vec!["INSERT".into()],
+            }],
+            ddl_lsn: vec![Lsn(7)],
+            rows: vec![row_change(
+                "host_writes",
+                uuid(0x7001),
+                "must-not-ingest-before-callback",
+                Lsn(7),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("host_writes")
+                    && operation.contains("synced_trigger")
+        ),
+        "sync must fail closed before ingesting rows for trigger-attached tables without callbacks; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "failed mixed sync batch must not persist trigger declarations"
+    );
+    assert_eq!(
+        count_rows(&db, "host_writes"),
+        0,
+        "failed mixed sync batch must not ingest trigger-attached rows"
+    );
+    assert!(
+        db.changes_since(since).ddl.iter().all(|ddl| {
+            !matches!(
+                ddl,
+                DdlChange::CreateTrigger { name, .. } if name == "synced_trigger"
+            )
+        }),
+        "failed mixed sync batch must not append trigger DDL history"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_with_same_batch_unrelated_data_fails_closed_until_callback_ready() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE plain_rows (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateTrigger {
+                name: "synced_trigger".into(),
+                table: "host_writes".into(),
+                on_events: vec!["INSERT".into()],
+            }],
+            ddl_lsn: vec![Lsn(7)],
+            rows: vec![row_change(
+                "plain_rows",
+                uuid(0x7002),
+                "must-not-ingest-unrelated-data-before-callback",
+                Lsn(7),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("host_writes")
+                    && operation.contains("synced_trigger")
+                    && operation.contains("apply_changes")
+        ),
+        "sync must fail closed for any same-batch data once trigger DDL would require callbacks; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "failed mixed sync batch must not persist trigger declarations"
+    );
+    assert_eq!(
+        count_rows(&db, "plain_rows"),
+        0,
+        "failed mixed sync batch must not ingest unrelated data while the handle would become booting"
+    );
+    assert!(
+        !changeset_has_data(&db.changes_since(since))
+            && db.changes_since(since).ddl.iter().all(|ddl| {
+                !matches!(
+                    ddl,
+                    DdlChange::CreateTrigger { name, .. } if name == "synced_trigger"
+                )
+            }),
+        "failed mixed sync batch must not append data or trigger DDL history"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_with_same_batch_vector_data_fails_before_trigger_leak() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE host_vectors (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateTrigger {
+                name: "vector_trigger".into(),
+                table: "host_vectors".into(),
+                on_events: vec!["INSERT".into()],
+            }],
+            ddl_lsn: vec![Lsn(7)],
+            vectors: vec![VectorChange {
+                index: VectorIndexRef::new("host_vectors", "embedding"),
+                row_id: RowId(7003),
+                vector: vec![1.0, 0.0, 0.0],
+                lsn: Lsn(7),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("host_vectors")
+                    && operation.contains("vector_trigger")
+                    && operation.contains("apply_changes")
+        ),
+        "sync must reject vector-only data before durable trigger DDL side effects; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "failed vector-only mixed sync batch must not persist trigger declarations"
+    );
+    assert!(
+        !changeset_has_data(&db.changes_since(since))
+            && db.changes_since(since).ddl.iter().all(|ddl| {
+                !matches!(
+                    ddl,
+                    DdlChange::CreateTrigger { name, .. } if name == "vector_trigger"
+                )
+            }),
+        "failed vector-only mixed sync batch must not append data or trigger DDL history"
+    );
+}
+
+#[test]
+fn t3_sync_mixed_ddl_preflight_uses_sender_lsn_order_before_trigger_side_effects() {
+    let db = Database::open_memory();
+    setup_ready_host_write_trigger(&db);
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::DropTrigger {
+                    name: "host_write_trigger".into(),
+                },
+                DdlChange::CreateTable {
+                    name: "future_rows".into(),
+                    columns: vec![
+                        ("id".into(), "UUID PRIMARY KEY".into()),
+                        ("content".into(), "TEXT".into()),
+                    ],
+                    constraints: Vec::new(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(30)],
+            rows: vec![row_change(
+                "future_rows",
+                uuid(0x7004),
+                "row-before-its-schema-must-not-leak-earlier-ddl",
+                Lsn(20),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(
+        matches!(result, Err(Error::TableNotFound(ref table)) if table == "future_rows"),
+        "preflight must reject rows against the schema visible at their sender LSN; got {result:?}"
+    );
+    assert!(
+        db.list_triggers()
+            .iter()
+            .any(|trigger| trigger.name == "host_write_trigger"),
+        "earlier trigger DDL must not leak when a later sender-LSN row is invalid"
+    );
+    let leaked_changes = db.changes_since(since);
+    assert!(
+        leaked_changes.ddl.is_empty()
+            && leaked_changes.rows.is_empty()
+            && leaked_changes.edges.is_empty()
+            && leaked_changes.vectors.is_empty(),
+        "chronological preflight rejection must leave no durable sync side effects; got {leaked_changes:?}"
+    );
+}
+
+#[test]
+fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
+    let invalid_type_db = Database::open_memory();
+    let invalid_type_since = invalid_type_db.current_lsn();
+    let invalid_type_result = invalid_type_db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: "leaked_bad_type_prefix".into(),
+                    columns: vec![("id".into(), "UUID PRIMARY KEY".into())],
+                    constraints: Vec::new(),
+                },
+                DdlChange::CreateTable {
+                    name: "bad_type_table".into(),
+                    columns: vec![("id".into(), "NOT_A_TYPE".into())],
+                    constraints: Vec::new(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(5), Lsn(5)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+    let invalid_type_leaked_changes = invalid_type_db.changes_since(invalid_type_since);
+    assert!(
+        matches!(
+            invalid_type_result,
+            Err(Error::ParseError(ref message)) if message.contains("NOT_A_TYPE")
+        ) && invalid_type_db
+            .table_meta("leaked_bad_type_prefix")
+            .is_none()
+            && invalid_type_db.table_meta("bad_type_table").is_none()
+            && invalid_type_leaked_changes.ddl.is_empty()
+            && invalid_type_leaked_changes.rows.is_empty()
+            && invalid_type_leaked_changes.edges.is_empty()
+            && invalid_type_leaked_changes.vectors.is_empty(),
+        "sync DDL preflight must reject invalid CreateTable type before applying earlier same-LSN DDL; result={invalid_type_result:?}, leaked_changes={invalid_type_leaked_changes:?}"
+    );
+
+    let db = Database::open_memory();
+    let create_since = db.current_lsn();
+    let create_result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: "leaked_sync_ddl".into(),
+                    columns: vec![
+                        ("id".into(), "UUID PRIMARY KEY".into()),
+                        ("content".into(), "TEXT".into()),
+                    ],
+                    constraints: Vec::new(),
+                },
+                DdlChange::CreateIndex {
+                    table: "missing_index_table".into(),
+                    name: "missing_content_idx".into(),
+                    columns: vec![("content".into(), SortDirection::Asc)],
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(10)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(
+        matches!(create_result, Err(Error::TableNotFound(ref table)) if table == "missing_index_table"),
+        "sync DDL preflight must reject CreateIndex for a missing projected table before applying earlier same-LSN DDL; got {create_result:?}"
+    );
+    let create_leaked_changes = db.changes_since(create_since);
+    assert!(
+        db.table_meta("leaked_sync_ddl").is_none()
+            && create_leaked_changes.ddl.is_empty()
+            && create_leaked_changes.rows.is_empty()
+            && create_leaked_changes.edges.is_empty()
+            && create_leaked_changes.vectors.is_empty(),
+        "invalid same-LSN sync DDL must leave no durable create-table side effects; got {create_leaked_changes:?}"
+    );
+
+    db.execute(
+        "CREATE TABLE doomed_writes (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let drop_since = db.current_lsn();
+    let drop_result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::DropTable {
+                    name: "doomed_writes".into(),
+                },
+                DdlChange::CreateIndex {
+                    table: "doomed_writes".into(),
+                    name: "doomed_content_idx".into(),
+                    columns: vec![("content".into(), SortDirection::Asc)],
+                },
+            ],
+            ddl_lsn: vec![Lsn(20), Lsn(20)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(
+        matches!(drop_result, Err(Error::TableNotFound(ref table)) if table == "doomed_writes"),
+        "sync DDL preflight must reject CreateIndex after a same-LSN DropTable before dropping the local table; got {drop_result:?}"
+    );
+    let drop_leaked_changes = db.changes_since(drop_since);
+    assert!(
+        db.table_meta("doomed_writes").is_some()
+            && drop_leaked_changes.ddl.is_empty()
+            && drop_leaked_changes.rows.is_empty()
+            && drop_leaked_changes.edges.is_empty()
+            && drop_leaked_changes.vectors.is_empty(),
+        "invalid same-LSN sync DDL must leave no durable drop-table side effects; got {drop_leaked_changes:?}"
+    );
+
+    let bad_row_db = Database::open_memory();
+    bad_row_db
+        .execute(
+            "CREATE TABLE type_checked_writes (id UUID PRIMARY KEY, content TEXT)",
+            &empty(),
+        )
+        .unwrap();
+    let bad_row_since = bad_row_db.current_lsn();
+    let bad_row_result = bad_row_db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateTrigger {
+                name: "bad_row_trigger".into(),
+                table: "type_checked_writes".into(),
+                on_events: vec!["INSERT".into()],
+            }],
+            ddl_lsn: vec![Lsn(30)],
+            rows: vec![RowChange {
+                table: "type_checked_writes".into(),
+                natural_key: NaturalKey {
+                    column: "id".into(),
+                    value: Value::Uuid(uuid(0x1530)),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(uuid(0x1530))),
+                    ("content".to_string(), Value::TxId(TxId(30))),
+                ]),
+                deleted: false,
+                lsn: Lsn(30),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let bad_row_leaked_changes = bad_row_db.changes_since(bad_row_since);
+    assert!(
+        matches!(
+            bad_row_result,
+            Err(Error::ColumnTypeMismatch {
+                ref table,
+                ref column,
+                ..
+            }) if table == "type_checked_writes" && column == "content"
+        ) && bad_row_db
+            .list_triggers()
+            .iter()
+            .all(|trigger| trigger.name != "bad_row_trigger")
+            && count_rows(&bad_row_db, "type_checked_writes") == 0
+            && bad_row_leaked_changes.ddl.is_empty()
+            && bad_row_leaked_changes.rows.is_empty()
+            && bad_row_leaked_changes.edges.is_empty()
+            && bad_row_leaked_changes.vectors.is_empty(),
+        "mixed sync DDL/data preflight must reject invalid row values before trigger DDL or row side effects; result={bad_row_result:?}, leaked={bad_row_leaked_changes:?}, triggers={:?}",
+        bad_row_db.list_triggers()
+    );
+}
+
+#[test]
+fn t3_sync_mixed_ddl_preflight_rejects_noncanonical_natural_key_envelopes_without_trigger_leak() {
+    let cases = [
+        (
+            "column mismatch",
+            RowChange {
+                table: "host_writes".into(),
+                natural_key: NaturalKey {
+                    column: "content".into(),
+                    value: Value::Text("content-as-key".into()),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(uuid(0x7005))),
+                    ("content".to_string(), Value::Text("content-as-key".into())),
+                ]),
+                deleted: false,
+                lsn: Lsn(20),
+            },
+        ),
+        (
+            "value mismatch",
+            RowChange {
+                table: "host_writes".into(),
+                natural_key: NaturalKey {
+                    column: "id".into(),
+                    value: Value::Uuid(uuid(0x7006)),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(uuid(0x7007))),
+                    ("content".to_string(), Value::Text("wrong-envelope".into())),
+                ]),
+                deleted: false,
+                lsn: Lsn(20),
+            },
+        ),
+    ];
+
+    for (expected_message, row) in cases {
+        let db = Database::open_memory();
+        setup_ready_host_write_trigger(&db);
+        let since = db.current_lsn();
+
+        let result = db.apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::DropTrigger {
+                    name: "host_write_trigger".into(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+                rows: vec![row],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        );
+
+        let Err(Error::SyncError(message)) = result else {
+            panic!(
+                "malformed sync natural key envelope must fail before DDL apply; got {result:?}"
+            );
+        };
+        assert!(
+            message.contains("natural key") && message.contains(expected_message),
+            "natural key rejection should explain {expected_message}; got {message}"
+        );
+        assert!(
+            db.list_triggers()
+                .iter()
+                .any(|trigger| trigger.name == "host_write_trigger"),
+            "trigger drop must not leak for malformed natural-key envelope"
+        );
+        assert_eq!(
+            count_rows(&db, "host_writes"),
+            0,
+            "malformed natural-key envelope must not ingest host rows"
+        );
+        let leaked_changes = db.changes_since(since);
+        assert!(
+            leaked_changes.ddl.is_empty()
+                && leaked_changes.rows.is_empty()
+                && leaked_changes.edges.is_empty()
+                && leaked_changes.vectors.is_empty(),
+            "malformed natural-key rejection must leave no durable sync side effects; got {leaked_changes:?}"
+        );
+    }
+}
+
+#[test]
+fn t3_drop_table_removes_attached_triggers_and_persists_tombstones() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("drop_table_trigger_cleanup.redb");
+    let db = Database::open(&path).unwrap();
+    setup_host_tables(&db);
+    let since = db.current_lsn();
+
+    db.execute("DROP TABLE host_writes", &empty()).unwrap();
+
+    assert!(
+        db.list_triggers().is_empty(),
+        "dropping a trigger-attached table must detach its trigger declarations"
+    );
+    let ddl = db.changes_since(since).ddl;
+    assert!(
+        ddl.iter()
+            .any(|change| matches!(change, DdlChange::DropTable { name } if name == "host_writes"))
+            && ddl.iter().any(
+                |change| matches!(change, DdlChange::DropTrigger { name } if name == "host_write_trigger")
+            ),
+        "DROP TABLE must emit both the table tombstone and implicit trigger tombstone; got {ddl:?}"
+    );
+    db.close().unwrap();
+
+    let reopened = Database::open(&path).unwrap();
+    assert!(
+        reopened.list_triggers().is_empty() && reopened.complete_initialization().is_ok(),
+        "implicit trigger cleanup must survive reopen without cold-starting dead schema; triggers={:?}",
+        reopened.list_triggers()
+    );
+    let reopened_ddl = reopened.changes_since(Lsn(0)).ddl;
+    assert!(
+        reopened_ddl.iter().any(
+            |change| matches!(change, DdlChange::DropTrigger { name } if name == "host_write_trigger")
+        ),
+        "implicit trigger tombstone must be durable for downstream sync; got {reopened_ddl:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_preflight_rejects_fk_invalid_data_before_any_trigger_ddl_leaks() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child_rows (id UUID PRIMARY KEY, parent_id UUID REFERENCES parent_rows(id), content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+    let child_id = uuid(0x7008);
+    let missing_parent = uuid(0x7009);
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "child_trigger".into(),
+                    table: "child_rows".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTrigger {
+                    name: "child_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(30)],
+            rows: vec![RowChange {
+                table: "child_rows".into(),
+                natural_key: NaturalKey {
+                    column: "id".into(),
+                    value: Value::Uuid(child_id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(child_id)),
+                    ("parent_id".to_string(), Value::Uuid(missing_parent)),
+                    ("content".to_string(), Value::Text("bad-fk".into())),
+                ]),
+                deleted: false,
+                lsn: Lsn(20),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::ForeignKeyViolation {
+                ref table,
+                ref column,
+                ref_table: _
+            }) if table == "child_rows" && column == "parent_id"
+        ),
+        "FK-invalid sync data must fail during preflight before trigger DDL is applied; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "preflight rejection must not leave a trigger declaration behind"
+    );
+    let leaked_changes = db.changes_since(since);
+    assert!(
+        leaked_changes.ddl.is_empty()
+            && leaked_changes.rows.is_empty()
+            && leaked_changes.edges.is_empty()
+            && leaked_changes.vectors.is_empty(),
+        "FK preflight rejection must leave no durable DDL/data side effects; got {leaked_changes:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_fk_preflight_respects_sender_lsn_order() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child_rows (id UUID PRIMARY KEY, parent_id UUID REFERENCES parent_rows(id), content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+    let child_id = uuid(0x7010);
+    let parent_id = uuid(0x7011);
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "child_trigger".into(),
+                    table: "child_rows".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTrigger {
+                    name: "child_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(40)],
+            rows: vec![
+                RowChange {
+                    table: "child_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(child_id),
+                    },
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(child_id)),
+                        ("parent_id".to_string(), Value::Uuid(parent_id)),
+                        ("content".to_string(), Value::Text("bad-order".into())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(20),
+                },
+                RowChange {
+                    table: "parent_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(parent_id),
+                    },
+                    values: HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
+                    deleted: false,
+                    lsn: Lsn(30),
+                },
+            ],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::ForeignKeyViolation {
+                ref table,
+                ref column,
+                ref_table: _
+            }) if table == "child_rows" && column == "parent_id"
+        ),
+        "a later sender-LSN parent must not validate an earlier child row; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "chronological FK preflight rejection must not leave a trigger declaration behind"
+    );
+    let leaked_changes = db.changes_since(since);
+    assert!(
+        leaked_changes.ddl.is_empty()
+            && leaked_changes.rows.is_empty()
+            && leaked_changes.edges.is_empty()
+            && leaked_changes.vectors.is_empty(),
+        "chronological FK preflight rejection must leave no durable side effects; got {leaked_changes:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_fk_preflight_rejects_parent_delete_before_trigger_leak() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child_rows (id UUID PRIMARY KEY, parent_id UUID REFERENCES parent_rows(id), content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let parent_id = uuid(0x7012);
+    let child_id = uuid(0x7013);
+    db.execute(
+        "INSERT INTO parent_rows (id) VALUES ($id)",
+        &HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO child_rows (id, parent_id, content) VALUES ($id, $parent_id, $content)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(child_id)),
+            ("parent_id".to_string(), Value::Uuid(parent_id)),
+            (
+                "content".to_string(),
+                Value::Text("still-live-child".into()),
+            ),
+        ]),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "child_trigger".into(),
+                    table: "child_rows".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTrigger {
+                    name: "child_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(30)],
+            rows: vec![RowChange {
+                table: "parent_rows".into(),
+                natural_key: NaturalKey {
+                    column: "id".into(),
+                    value: Value::Uuid(parent_id),
+                },
+                values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
+                deleted: true,
+                lsn: Lsn(20),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::ForeignKeyViolation {
+                ref table,
+                ref column,
+                ref_table: _
+            }) if table == "child_rows" && column == "parent_id"
+        ),
+        "FK-invalid parent delete must fail during preflight before trigger DDL is applied; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "reverse-FK preflight rejection must not leave a trigger declaration behind"
+    );
+    assert_eq!(
+        count_rows(&db, "parent_rows"),
+        1,
+        "rejected parent delete must not mutate committed parent rows"
+    );
+    let leaked_changes = db.changes_since(since);
+    assert!(
+        leaked_changes.ddl.is_empty()
+            && leaked_changes.rows.is_empty()
+            && leaked_changes.edges.is_empty()
+            && leaked_changes.vectors.is_empty(),
+        "reverse-FK preflight rejection must leave no durable side effects; got {leaked_changes:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_fk_preflight_rejects_stale_parent_prefix_after_update() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE parent_rows (id UUID PRIMARY KEY, ref_id UUID UNIQUE)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE child_rows (id UUID PRIMARY KEY, parent_ref UUID REFERENCES parent_rows(ref_id), content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let parent_id = uuid(0x7014);
+    let old_ref = uuid(0x7015);
+    let new_ref = uuid(0x7016);
+    let child_id = uuid(0x7017);
+    db.execute(
+        "INSERT INTO parent_rows (id, ref_id) VALUES ($id, $ref_id)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(parent_id)),
+            ("ref_id".to_string(), Value::Uuid(old_ref)),
+        ]),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "child_trigger".into(),
+                    table: "child_rows".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTrigger {
+                    name: "child_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(40)],
+            rows: vec![
+                RowChange {
+                    table: "parent_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(parent_id),
+                    },
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(parent_id)),
+                        ("ref_id".to_string(), Value::Uuid(new_ref)),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(20),
+                },
+                RowChange {
+                    table: "child_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(child_id),
+                    },
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(child_id)),
+                        ("parent_ref".to_string(), Value::Uuid(old_ref)),
+                        (
+                            "content".to_string(),
+                            Value::Text("stale-parent-ref".into()),
+                        ),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(30),
+                },
+            ],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::ForeignKeyViolation {
+                ref table,
+                ref column,
+                ref_table: _
+            }) if table == "child_rows" && column == "parent_ref"
+        ),
+        "FK preflight must treat parent updates as replacing the old referenced value; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "stale-prefix FK rejection must not leave a trigger declaration behind"
+    );
+    assert_eq!(
+        count_rows(&db, "child_rows"),
+        0,
+        "stale-prefix rejection must not insert the invalid child row"
+    );
+    let parent = row_for_column_uuid(&db, "parent_rows", "id", parent_id)
+        .expect("parent row must remain at its committed pre-sync value");
+    assert!(
+        matches!(parent.values.get("ref_id"), Some(Value::Uuid(value)) if *value == old_ref),
+        "stale-prefix rejection must not update the committed parent row; got {parent:?}"
+    );
+    let leaked_changes = db.changes_since(since);
+    assert!(
+        leaked_changes.ddl.is_empty()
+            && leaked_changes.rows.is_empty()
+            && leaked_changes.edges.is_empty()
+            && leaked_changes.vectors.is_empty(),
+        "stale-prefix FK preflight rejection must leave no durable side effects; got {leaked_changes:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_fk_preflight_accepts_child_update_before_parent_delete() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child_rows (id UUID PRIMARY KEY, parent_id UUID REFERENCES parent_rows(id), content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let parent_id = uuid(0x7018);
+    let child_id = uuid(0x7019);
+    db.execute(
+        "INSERT INTO parent_rows (id) VALUES ($id)",
+        &HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO child_rows (id, parent_id, content) VALUES ($id, $parent_id, $content)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(child_id)),
+            ("parent_id".to_string(), Value::Uuid(parent_id)),
+            ("content".to_string(), Value::Text("attached".into())),
+        ]),
+    )
+    .unwrap();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "child_trigger".into(),
+                    table: "child_rows".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTrigger {
+                    name: "child_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(40)],
+            rows: vec![
+                RowChange {
+                    table: "child_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(child_id),
+                    },
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(child_id)),
+                        ("parent_id".to_string(), Value::Null),
+                        ("content".to_string(), Value::Text("detached".into())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(20),
+                },
+                RowChange {
+                    table: "parent_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(parent_id),
+                    },
+                    values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
+                    deleted: true,
+                    lsn: Lsn(30),
+                },
+            ],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+
+    assert!(
+        result.is_ok(),
+        "reverse-FK preflight must honor earlier child updates that remove a reference; got {result:?}"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "create/drop trigger sync should leave no live trigger after successful apply"
+    );
+    assert_eq!(
+        count_rows(&db, "parent_rows"),
+        0,
+        "parent delete should commit after the child no longer references it"
+    );
+    let child = row_for_column_uuid(&db, "child_rows", "id", child_id)
+        .expect("child row should survive as detached");
+    assert!(
+        matches!(child.values.get("parent_id"), Some(Value::Null)),
+        "child update should leave a durable NULL parent reference; got {child:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_fk_preflight_rejects_skipped_child_update_before_parent_delete() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child_rows (id UUID PRIMARY KEY, parent_id UUID REFERENCES parent_rows(id), content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER child_trigger ON child_rows WHEN INSERT",
+        &empty(),
+    )
+    .unwrap();
+    db.register_trigger_callback("child_trigger", |_, _| Ok(()))
+        .unwrap();
+    db.complete_initialization().unwrap();
+    let parent_id = uuid(0x701A);
+    let child_id = uuid(0x701B);
+    db.execute(
+        "INSERT INTO parent_rows (id) VALUES ($id)",
+        &HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO child_rows (id, parent_id, content) VALUES ($id, $parent_id, $content)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(child_id)),
+            ("parent_id".to_string(), Value::Uuid(parent_id)),
+            (
+                "content".to_string(),
+                Value::Text("server-owned-child".into()),
+            ),
+        ]),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::DropTrigger {
+                name: "child_trigger".into(),
+            }],
+            ddl_lsn: vec![Lsn(10)],
+            rows: vec![
+                RowChange {
+                    table: "child_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(child_id),
+                    },
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(child_id)),
+                        ("parent_id".to_string(), Value::Null),
+                        ("content".to_string(), Value::Text("skipped-detach".into())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(20),
+                },
+                RowChange {
+                    table: "parent_rows".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Uuid(parent_id),
+                    },
+                    values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
+                    deleted: true,
+                    lsn: Lsn(30),
+                },
+            ],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(Error::ForeignKeyViolation {
+                ref table,
+                ref column,
+                ref_table: _
+            }) if table == "child_rows" && column == "parent_id"
+        ),
+        "reverse-FK preflight must not trust child updates that sync policy will skip; got {result:?}"
+    );
+    assert!(
+        db.list_triggers()
+            .iter()
+            .any(|trigger| trigger.name == "child_trigger"),
+        "skipped-update FK rejection must not leak the earlier trigger drop"
+    );
+    let child = row_for_column_uuid(&db, "child_rows", "id", child_id)
+        .expect("committed child must remain attached");
+    assert!(
+        matches!(child.values.get("parent_id"), Some(Value::Uuid(value)) if *value == parent_id),
+        "skipped child update must not detach the committed child; got {child:?}"
+    );
+    let leaked_changes = db.changes_since(since);
+    assert!(
+        leaked_changes.ddl.is_empty()
+            && leaked_changes.rows.is_empty()
+            && leaked_changes.edges.is_empty()
+            && leaked_changes.vectors.is_empty(),
+        "skipped-update reverse-FK preflight rejection must leave no durable sync side effects; got {leaked_changes:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
+    let db = Database::open_memory();
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: "replay_writes".into(),
+                    columns: vec![
+                        ("id".into(), "UUID PRIMARY KEY".into()),
+                        ("content".into(), "TEXT".into()),
+                    ],
+                    constraints: Vec::new(),
+                },
+                DdlChange::CreateTrigger {
+                    name: "replay_trigger".into(),
+                    table: "replay_writes".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTable {
+                    name: "replay_writes".into(),
+                },
+                DdlChange::DropTrigger {
+                    name: "replay_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(20), Lsn(30), Lsn(30)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+
+    assert!(
+        result.is_ok()
+            && db.table_meta("replay_writes").is_none()
+            && db.list_triggers().is_empty()
+            && db.complete_initialization().is_ok(),
+        "sync must replay create-table/create-trigger/drop-table trigger history chronologically; result={result:?}, tables={:?}, triggers={:?}",
+        db.table_names(),
+        db.list_triggers()
+    );
+    let ddl = db.changes_since(Lsn(0)).ddl;
+    assert!(
+        ddl.iter()
+            .any(|change| matches!(change, DdlChange::CreateTrigger { name, table, .. } if name == "replay_trigger" && table == "replay_writes"))
+            && ddl.iter().any(
+                |change| matches!(change, DdlChange::DropTrigger { name } if name == "replay_trigger")
+            )
+            && ddl
+                .iter()
+                .any(|change| matches!(change, DdlChange::DropTable { name } if name == "replay_writes")),
+        "chronological trigger table replay must preserve downstream-visible trigger/table tombstones; ddl={ddl:?}"
+    );
+
+    let same_lsn_since = db.current_lsn();
+    let same_lsn_result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: "same_lsn_replay_writes".into(),
+                    columns: vec![
+                        ("id".into(), "UUID PRIMARY KEY".into()),
+                        ("content".into(), "TEXT".into()),
+                    ],
+                    constraints: Vec::new(),
+                },
+                DdlChange::CreateTrigger {
+                    name: "same_lsn_replay_trigger".into(),
+                    table: "same_lsn_replay_writes".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTable {
+                    name: "same_lsn_replay_writes".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(40), Lsn(40), Lsn(40)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let same_lsn_ddl = db.changes_since(same_lsn_since).ddl;
+    let same_lsn_create_trigger_pos = same_lsn_ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::CreateTrigger { name, table, .. } if name == "same_lsn_replay_trigger" && table == "same_lsn_replay_writes"));
+    let same_lsn_drop_table_pos = same_lsn_ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::DropTable { name } if name == "same_lsn_replay_writes"));
+    let same_lsn_drop_trigger_pos = same_lsn_ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::DropTrigger { name } if name == "same_lsn_replay_trigger"));
+    assert!(
+        same_lsn_result.is_ok()
+            && db.table_meta("same_lsn_replay_writes").is_none()
+            && db
+                .list_triggers()
+                .iter()
+                .all(|trigger| trigger.name != "same_lsn_replay_trigger")
+            && same_lsn_create_trigger_pos.is_some()
+            && same_lsn_drop_table_pos.is_some()
+            && same_lsn_drop_trigger_pos.is_some()
+            && same_lsn_create_trigger_pos < same_lsn_drop_table_pos,
+        "same-sender-LSN CreateTrigger followed by DropTable must replay atomically and emit the implicit trigger tombstone; result={same_lsn_result:?}, ddl={same_lsn_ddl:?}, triggers={:?}",
+        db.list_triggers()
+    );
+
+    db.execute(
+        "CREATE TABLE same_lsn_marker (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let mixed_lsn_since = db.current_lsn();
+    let mixed_marker_id = uuid(0x7020);
+    let mixed_lsn_result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: "mixed_lsn_replay_writes".into(),
+                    columns: vec![
+                        ("id".into(), "UUID PRIMARY KEY".into()),
+                        ("content".into(), "TEXT".into()),
+                    ],
+                    constraints: Vec::new(),
+                },
+                DdlChange::CreateTrigger {
+                    name: "mixed_lsn_replay_trigger".into(),
+                    table: "mixed_lsn_replay_writes".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTable {
+                    name: "mixed_lsn_replay_writes".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(50), Lsn(50), Lsn(50)],
+            rows: vec![row_change(
+                "same_lsn_marker",
+                mixed_marker_id,
+                "forces-mixed-branch",
+                Lsn(50),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let mixed_lsn_marker_row = row_for_column_uuid(&db, "same_lsn_marker", "id", mixed_marker_id);
+    let mixed_lsn_changes = db.changes_since(mixed_lsn_since);
+    let mixed_lsn_create_trigger_pos = mixed_lsn_changes
+        .ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::CreateTrigger { name, table, .. } if name == "mixed_lsn_replay_trigger" && table == "mixed_lsn_replay_writes"));
+    let mixed_lsn_drop_table_pos = mixed_lsn_changes
+        .ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::DropTable { name } if name == "mixed_lsn_replay_writes"));
+    let mixed_lsn_drop_trigger_pos = mixed_lsn_changes
+        .ddl
+        .iter()
+        .position(|change| matches!(change, DdlChange::DropTrigger { name } if name == "mixed_lsn_replay_trigger"));
+    let mixed_lsn_create_trigger_lsn =
+        mixed_lsn_create_trigger_pos.and_then(|pos| mixed_lsn_changes.ddl_lsn.get(pos).copied());
+    let mixed_lsn_drop_table_lsn =
+        mixed_lsn_drop_table_pos.and_then(|pos| mixed_lsn_changes.ddl_lsn.get(pos).copied());
+    let mixed_lsn_drop_trigger_lsn =
+        mixed_lsn_drop_trigger_pos.and_then(|pos| mixed_lsn_changes.ddl_lsn.get(pos).copied());
+    assert!(
+        mixed_lsn_result.is_ok()
+            && mixed_lsn_marker_row.is_some()
+            && db.table_meta("mixed_lsn_replay_writes").is_none()
+            && db
+                .list_triggers()
+                .iter()
+                .all(|trigger| trigger.name != "mixed_lsn_replay_trigger")
+            && mixed_lsn_create_trigger_pos.is_some()
+            && mixed_lsn_drop_table_pos.is_some()
+            && mixed_lsn_drop_trigger_pos.is_some()
+            && mixed_lsn_create_trigger_pos < mixed_lsn_drop_table_pos
+            && mixed_lsn_create_trigger_lsn == mixed_lsn_drop_table_lsn
+            && mixed_lsn_create_trigger_lsn == mixed_lsn_drop_trigger_lsn,
+        "same-sender-LSN CreateTrigger followed by DropTable must fold queued trigger DDL into the durable table-drop transaction even when the group also has data; result={mixed_lsn_result:?}, marker={mixed_lsn_marker_row:?}, ddl={:?}, ddl_lsn={:?}, triggers={:?}",
+        mixed_lsn_changes.ddl,
+        mixed_lsn_changes.ddl_lsn,
+        db.list_triggers()
+    );
+}
+
+#[test]
+fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE host_vectors (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let since = db.current_lsn();
+    let vector_id = uuid(0x7005);
+
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "vector_history_trigger".into(),
+                    table: "host_vectors".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTrigger {
+                    name: "vector_history_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(10), Lsn(30)],
+            rows: vec![RowChange {
+                table: "host_vectors".into(),
+                natural_key: NaturalKey {
+                    column: "id".into(),
+                    value: Value::Uuid(vector_id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(vector_id)),
+                    ("embedding".to_string(), Value::Vector(vec![1.0, 0.0, 0.0])),
+                ]),
+                deleted: false,
+                lsn: Lsn(20),
+            }],
+            vectors: vec![VectorChange {
+                index: VectorIndexRef::new("host_vectors", "embedding"),
+                row_id: RowId(7005),
+                vector: vec![1.0, 0.0, 0.0],
+                lsn: Lsn(20),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+
+    let row = row_for_column_uuid(&db, "host_vectors", "id", vector_id);
+    let ddl = db.changes_since(since).ddl;
+    let fired = fired_trigger_history(&db, "vector_history_trigger");
+    assert!(
+        result.is_ok()
+            && row.is_some()
+            && live_vector_count(&db, "host_vectors") == 1
+            && db.list_triggers().is_empty()
+            && db.complete_initialization().is_ok()
+            && fired.len() == 1
+            && ddl.iter().any(
+                |change| matches!(change, DdlChange::CreateTrigger { name, table, .. } if name == "vector_history_trigger" && table == "host_vectors")
+            )
+            && ddl.iter().any(
+                |change| matches!(change, DdlChange::DropTrigger { name } if name == "vector_history_trigger")
+            ),
+        "sync must replay CreateTrigger -> vector data -> DropTrigger history without host callbacks or partial cold-gate leakage; result={result:?}, row={row:?}, live_vectors={}, triggers={:?}, fired={fired:?}, ddl={ddl:?}",
+        live_vector_count(&db, "host_vectors"),
+        db.list_triggers()
+    );
+
+    let same_lsn_id = uuid(0x7006);
+    let same_lsn_since = db.current_lsn();
+    let same_lsn_result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "same_lsn_vector_history_trigger".into(),
+                    table: "host_vectors".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::DropTrigger {
+                    name: "same_lsn_vector_history_trigger".into(),
+                },
+            ],
+            ddl_lsn: vec![Lsn(40), Lsn(40)],
+            rows: vec![RowChange {
+                table: "host_vectors".into(),
+                natural_key: NaturalKey {
+                    column: "id".into(),
+                    value: Value::Uuid(same_lsn_id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(same_lsn_id)),
+                    ("embedding".to_string(), Value::Vector(vec![0.0, 1.0, 0.0])),
+                ]),
+                deleted: false,
+                lsn: Lsn(40),
+            }],
+            vectors: vec![VectorChange {
+                index: VectorIndexRef::new("host_vectors", "embedding"),
+                row_id: RowId(7006),
+                vector: vec![0.0, 1.0, 0.0],
+                lsn: Lsn(40),
+            }],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let same_lsn_row = row_for_column_uuid(&db, "host_vectors", "id", same_lsn_id);
+    let same_lsn_ddl = db.changes_since(same_lsn_since).ddl;
+    let same_lsn_fired = fired_trigger_history(&db, "same_lsn_vector_history_trigger");
+    assert!(
+        same_lsn_result.is_ok()
+            && same_lsn_row.is_some()
+            && db
+                .list_triggers()
+                .iter()
+                .all(|trigger| trigger.name != "same_lsn_vector_history_trigger")
+            && same_lsn_fired.len() == 1
+            && same_lsn_ddl.iter().any(
+                |change| matches!(change, DdlChange::CreateTrigger { name, table, .. } if name == "same_lsn_vector_history_trigger" && table == "host_vectors")
+            )
+            && same_lsn_ddl.iter().any(
+                |change| matches!(change, DdlChange::DropTrigger { name } if name == "same_lsn_vector_history_trigger")
+            ),
+        "same-sender-LSN CreateTrigger -> data -> DropTrigger replay must preserve committed data, tombstone final state, and fired audit without callbacks; result={same_lsn_result:?}, row={same_lsn_row:?}, fired={same_lsn_fired:?}, ddl={same_lsn_ddl:?}, triggers={:?}",
+        db.list_triggers()
+    );
+}
+
+#[test]
 fn t3_reg_introspection_and_delete_event_rejection() {
     let db = Database::open_memory();
     db.execute(
@@ -765,6 +2649,72 @@ fn t3_reg_introspection_and_delete_event_rejection() {
     .unwrap();
 
     let mut failures = Vec::new();
+    let race_tmp = TempDir::new().unwrap();
+    let race_path = race_tmp.path().join("concurrent_trigger_ddl.redb");
+    let race_db = Arc::new(Database::open(&race_path).unwrap());
+    race_db
+        .execute(
+            "CREATE TABLE race_writes (id UUID PRIMARY KEY, content TEXT)",
+            &empty(),
+        )
+        .unwrap();
+    let race_barrier = Arc::new(Barrier::new(3));
+    let mut race_joins = Vec::new();
+    for (name, event) in [
+        ("race_insert_trigger".to_string(), "INSERT".to_string()),
+        ("race_update_trigger".to_string(), "UPDATE".to_string()),
+    ] {
+        let db = race_db.clone();
+        let barrier = race_barrier.clone();
+        race_joins.push(std::thread::spawn(move || {
+            barrier.wait();
+            db.execute(
+                &format!("CREATE TRIGGER {name} ON race_writes WHEN {event}"),
+                &HashMap::new(),
+            )
+        }));
+    }
+    race_barrier.wait();
+    let race_results = race_joins
+        .into_iter()
+        .map(|join| join.join().expect("concurrent trigger DDL thread panicked"))
+        .collect::<Vec<_>>();
+    let race_trigger_names = race_db
+        .list_triggers()
+        .into_iter()
+        .map(|trigger| trigger.name)
+        .collect::<BTreeSet<_>>();
+    let race_ddl_names = race_db
+        .changes_since(Lsn(0))
+        .ddl
+        .into_iter()
+        .filter_map(|change| match change {
+            DdlChange::CreateTrigger { name, .. } => Some(name),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    race_db.close().unwrap();
+    let reopened_race_db = Database::open(&race_path).unwrap();
+    let reopened_race_trigger_names = reopened_race_db
+        .list_triggers()
+        .into_iter()
+        .map(|trigger| trigger.name)
+        .collect::<BTreeSet<_>>();
+    let expected_race_triggers = BTreeSet::from([
+        "race_insert_trigger".to_string(),
+        "race_update_trigger".to_string(),
+    ]);
+    if race_results.iter().any(|result| result.is_err())
+        || race_trigger_names != expected_race_triggers
+        || race_ddl_names != expected_race_triggers
+        || reopened_race_trigger_names != expected_race_triggers
+    {
+        failures.push(format!(
+            "concurrent CREATE TRIGGER commits must merge durable declaration state and DDL history without losing either trigger; results={race_results:?}, triggers={race_trigger_names:?}, ddl={race_ddl_names:?}, reopened={reopened_race_trigger_names:?}"
+        ));
+    }
+    reopened_race_db.close().unwrap();
+
     let unknown = db.register_trigger_callback("missing_trigger", |_, _| Ok(()));
     if !matches!(
         unknown,
@@ -814,6 +2764,8 @@ fn t3_reg_introspection_and_delete_event_rejection() {
 
     let insert_fires = Arc::new(AtomicUsize::new(0));
     let captured_insert_fires = insert_fires.clone();
+    let insert_contexts = Arc::new(Mutex::new(Vec::new()));
+    let captured_insert_contexts = insert_contexts.clone();
     db.register_trigger_callback("host_write_trigger", move |_, ctx| {
         if ctx.trigger_name != "host_write_trigger"
             || ctx.table != "host_writes"
@@ -823,6 +2775,11 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                 "unexpected INSERT trigger context identity: {ctx:?}"
             )));
         }
+        captured_insert_contexts.lock().unwrap().push((
+            ctx.event,
+            ctx.row_values.get("id").cloned(),
+            ctx.row_values.get("content").cloned(),
+        ));
         captured_insert_fires.fetch_add(1, Ordering::SeqCst);
         Ok(())
     })
@@ -910,6 +2867,18 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             update_contexts.lock().unwrap()
         ));
     }
+    if insert_contexts.lock().unwrap().last()
+        != Some(&(
+            TriggerEvent::Insert,
+            Some(Value::Uuid(uuid(0x310))),
+            Some(Value::Text("before-update".into())),
+        ))
+    {
+        failures.push(format!(
+            "WHEN INSERT callback must see post-image row values; got {:?}",
+            insert_contexts.lock().unwrap()
+        ));
+    }
     p.insert("content".into(), Value::Text("after-update".into()));
     let update_since = db.current_lsn();
     let update_rx = db.subscribe();
@@ -974,6 +2943,42 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                 "WHEN UPDATE callback must write cascade data inside the same firing tx; host_lsns={update_host_lsns:?}, audit_lsns={update_audit_lsns:?}, event={update_event:?}, host_row={update_host_row:?}, audit_row={update_audit_row:?}, changes={update_changes:?}"
             ));
         }
+    }
+
+    let insert_then_update_insert_count_before = insert_fires.load(Ordering::SeqCst);
+    let insert_then_update_context_count_before = insert_contexts.lock().unwrap().len();
+    let insert_then_update_update_count_before = update_contexts.lock().unwrap().len();
+    let insert_then_update_begin = db.execute("BEGIN", &empty());
+    let mut insert_then_update_params = insert_host_params(uuid(0x313), "insert-then-update-draft");
+    let insert_then_update_insert = db.execute(host_insert_sql(), &insert_then_update_params);
+    insert_then_update_params.insert(
+        "content".into(),
+        Value::Text("insert-then-update-final".into()),
+    );
+    let insert_then_update_update = db.execute(
+        "UPDATE host_writes SET content = $content WHERE id = $id",
+        &insert_then_update_params,
+    );
+    let insert_then_update_commit = db.execute("COMMIT", &empty());
+    let insert_then_update_contexts = insert_contexts.lock().unwrap().clone();
+    let insert_then_update_updates = update_contexts.lock().unwrap().clone();
+    if insert_then_update_begin.is_err()
+        || insert_then_update_insert.is_err()
+        || insert_then_update_update.is_err()
+        || insert_then_update_commit.is_err()
+        || insert_fires.load(Ordering::SeqCst) != insert_then_update_insert_count_before + 1
+        || insert_then_update_contexts.len() != insert_then_update_context_count_before + 1
+        || insert_then_update_updates.len() != insert_then_update_update_count_before
+        || !matches!(
+            insert_then_update_contexts.last(),
+            Some((TriggerEvent::Insert, Some(Value::Uuid(id)), Some(Value::Text(content))))
+                if *id == uuid(0x313) && content == "insert-then-update-final"
+        )
+    {
+        failures.push(format!(
+            "insert then update of a new row in one tx must fire the INSERT trigger once on the final post-image and must not misroute to UPDATE; begin={insert_then_update_begin:?}, insert={insert_then_update_insert:?}, update={insert_then_update_update:?}, commit={insert_then_update_commit:?}, insert_fires_before={insert_then_update_insert_count_before}, insert_fires_after={}, insert_contexts_before={insert_then_update_context_count_before}, insert_contexts={insert_then_update_contexts:?}, update_count_before={insert_then_update_update_count_before}, updates={insert_then_update_updates:?}",
+            insert_fires.load(Ordering::SeqCst)
+        ));
     }
 
     let drop_trigger = db.execute("DROP TRIGGER host_write_trigger", &empty());
@@ -1082,6 +3087,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                 table: "sync_writes".into(),
                 on_events: vec!["DELETE".into()],
             }],
+            ddl_lsn: vec![Lsn(31)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -1093,6 +3099,44 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                 table: "sync_writes".into(),
                 on_events: vec!["INSERT".into(), "DELETE".into()],
             }],
+            ddl_lsn: vec![Lsn(32)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let sync_partial_batch = sync_admin.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTrigger {
+                    name: "sync_partial_valid_trigger".into(),
+                    table: "sync_writes".into(),
+                    on_events: vec!["INSERT".into()],
+                },
+                DdlChange::CreateTrigger {
+                    name: "sync_partial_delete_trigger".into(),
+                    table: "sync_writes".into(),
+                    on_events: vec!["DELETE".into()],
+                },
+            ],
+            ddl_lsn: vec![Lsn(33), Lsn(33)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let sync_mixed_bad_row = sync_admin.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateTrigger {
+                name: "sync_bad_row_trigger".into(),
+                table: "sync_writes".into(),
+                on_events: vec!["INSERT".into()],
+            }],
+            rows: vec![row_change(
+                "missing_sync_rows",
+                uuid(0x325),
+                "must-not-persist-trigger",
+                Lsn(41),
+            )],
+            ddl_lsn: vec![Lsn(41)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -1104,6 +3148,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                 table: "sync_writes".into(),
                 on_events: vec!["INSERT".into(), "UPDATE".into()],
             }],
+            ddl_lsn: vec![Lsn(34)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -1132,6 +3177,62 @@ fn t3_reg_introspection_and_delete_event_rejection() {
     });
     let sync_ready = sync_admin.complete_initialization();
     let sync_triggers_after_create = sync_admin.list_triggers();
+    let sync_pull_callbacks_before = sync_contexts_for_callback.lock().unwrap().clone();
+    let sync_pull_audits_before = sync_admin
+        .trigger_audit_history(TriggerAuditFilter {
+            trigger_name: Some("sync_trigger".into()),
+            status: Some(TriggerAuditStatusFilter::Fired),
+        })
+        .unwrap();
+    let sync_pull_insert = sync_admin.apply_changes(
+        ChangeSet {
+            rows: vec![row_change(
+                "sync_writes",
+                uuid(0x322),
+                "remote-insert",
+                Lsn(50),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let sync_pull_update = sync_admin.apply_changes(
+        ChangeSet {
+            rows: vec![row_change(
+                "sync_writes",
+                uuid(0x322),
+                "remote-update",
+                Lsn(51),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let sync_pull_stale = sync_admin.apply_changes(
+        ChangeSet {
+            rows: vec![row_change(
+                "sync_writes",
+                uuid(0x322),
+                "stale-remote",
+                Lsn(1),
+            )],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    let sync_pull_callbacks_after = sync_contexts_for_callback.lock().unwrap().clone();
+    let sync_pull_remote_row = row_for_column_uuid(&sync_admin, "sync_writes", "id", uuid(0x322));
+    let sync_pull_audits_after = sync_admin
+        .trigger_audit_history(TriggerAuditFilter {
+            trigger_name: Some("sync_trigger".into()),
+            status: Some(TriggerAuditStatusFilter::Fired),
+        })
+        .unwrap();
+    let sync_pull_new_audits = sync_pull_audits_after
+        .iter()
+        .skip(sync_pull_audits_before.len())
+        .cloned()
+        .collect::<Vec<_>>();
     let sync_insert_before_drop = sync_admin.execute(
         "INSERT INTO sync_writes (id, content) VALUES ('00000000-0000-0000-0000-000000000320', 'before-drop')",
         &empty_params(),
@@ -1145,6 +3246,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             ddl: vec![DdlChange::DropTrigger {
                 name: "sync_trigger".into(),
             }],
+            ddl_lsn: vec![Lsn(35)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -1159,15 +3261,47 @@ fn t3_reg_introspection_and_delete_event_rejection() {
     );
     let sync_contexts_snapshot = sync_contexts_for_callback.lock().unwrap().clone();
     let sync_ddl_history = sync_admin.changes_since(sync_since).ddl;
+    let sync_fired_history = sync_admin
+        .trigger_audit_history(TriggerAuditFilter {
+            trigger_name: Some("sync_trigger".into()),
+            status: Some(TriggerAuditStatusFilter::Fired),
+        })
+        .unwrap();
     if sync_create.is_err()
         || sync_register.is_err()
         || sync_ready.is_err()
+        || !matches!(
+            &sync_partial_batch,
+            Err(Error::TriggerEventUnsupported { event }) if event == "DELETE"
+        )
+        || !matches!(
+            &sync_mixed_bad_row,
+            Err(Error::TableNotFound(table)) if table == "missing_sync_rows"
+        )
         || !matches!(
             sync_triggers_after_create.as_slice(),
             [trigger]
                 if trigger.name == "sync_trigger"
                     && trigger.table == "sync_writes"
                     && trigger.on_events == vec![TriggerEvent::Insert, TriggerEvent::Update]
+        )
+        || sync_pull_insert.is_err()
+        || sync_pull_update.is_err()
+        || sync_pull_stale.is_err()
+        || sync_pull_callbacks_after != sync_pull_callbacks_before
+        || sync_pull_new_audits.len() != 2
+        || !sync_pull_new_audits.iter().all(|entry| {
+            entry.trigger_name == "sync_trigger"
+                && entry.status == TriggerAuditStatus::Fired
+                && entry.depth == 1
+                && entry.cascade_row_count == 0
+                && entry.firing_lsn != Lsn(0)
+                && entry.firing_tx != TxId(0)
+        })
+        || !matches!(
+            sync_pull_remote_row,
+            Some(ref row)
+                if row.values.get("content") == Some(&Value::Text("remote-update".into()))
         )
         || sync_insert_before_drop.is_err()
         || sync_update_before_drop.is_err()
@@ -1207,9 +3341,10 @@ fn t3_reg_introspection_and_delete_event_rejection() {
         || sync_admin
             .registered_trigger_callbacks()
             .contains(&"sync_trigger".to_string())
+        || sync_fired_history.len() != 4
     {
         failures.push(format!(
-            "admin apply_changes must preserve INSERT/UPDATE trigger events, reject unsupported DELETE events, emit durable create/drop DDL, and detach dispatch; delete={sync_delete:?}, mixed_delete={sync_mixed_delete:?}, create={sync_create:?}, register={sync_register:?}, ready={sync_ready:?}, triggers_after_create={sync_triggers_after_create:?}, before={sync_insert_before_drop:?}, update_before={sync_update_before_drop:?}, drop={sync_drop:?}, after={sync_insert_after_drop:?}, update_after={sync_update_after_drop:?}, contexts={sync_contexts_snapshot:?}, ddl_history={sync_ddl_history:?}, triggers={:?}, callbacks={:?}",
+            "admin apply_changes must preserve INSERT/UPDATE trigger events, reject unsupported DELETE and invalid mixed DDL/data batches atomically, emit durable create/drop DDL, suppress SyncPull callbacks while auditing committed receiver writes, and detach dispatch; delete={sync_delete:?}, mixed_delete={sync_mixed_delete:?}, partial_batch={sync_partial_batch:?}, mixed_bad_row={sync_mixed_bad_row:?}, create={sync_create:?}, register={sync_register:?}, ready={sync_ready:?}, triggers_after_create={sync_triggers_after_create:?}, sync_pull_insert={sync_pull_insert:?}, sync_pull_update={sync_pull_update:?}, sync_pull_stale={sync_pull_stale:?}, sync_pull_callbacks_before={sync_pull_callbacks_before:?}, sync_pull_callbacks_after={sync_pull_callbacks_after:?}, sync_pull_row={sync_pull_remote_row:?}, sync_pull_new_audits={sync_pull_new_audits:?}, fired_history={sync_fired_history:?}, before={sync_insert_before_drop:?}, update_before={sync_update_before_drop:?}, drop={sync_drop:?}, after={sync_insert_after_drop:?}, update_after={sync_update_after_drop:?}, contexts={sync_contexts_snapshot:?}, ddl_history={sync_ddl_history:?}, triggers={:?}, callbacks={:?}",
             sync_admin.list_triggers(),
             sync_admin.registered_trigger_callbacks()
         ));
@@ -1228,6 +3363,34 @@ fn t3_reg_introspection_and_delete_event_rejection() {
     ) {
         failures.push(format!(
             "sync-applied CREATE TRIGGER with mixed INSERT+DELETE must reject the whole declaration with a typed event error; got {sync_mixed_delete:?}"
+        ));
+    }
+    if !matches!(
+        &sync_partial_batch,
+        Err(Error::TriggerEventUnsupported { event }) if event == "DELETE"
+    ) || sync_admin
+        .changes_since(sync_since)
+        .ddl
+        .iter()
+        .any(|change| {
+            matches!(
+                change,
+                DdlChange::CreateTrigger { name, .. }
+                    if name == "sync_partial_valid_trigger"
+                        || name == "sync_partial_delete_trigger"
+                        || name == "sync_bad_row_trigger"
+            )
+        })
+        || sync_admin.list_triggers().iter().any(|trigger| {
+            trigger.name == "sync_partial_valid_trigger"
+                || trigger.name == "sync_partial_delete_trigger"
+                || trigger.name == "sync_bad_row_trigger"
+        })
+    {
+        failures.push(format!(
+            "sync-applied trigger DDL batch must validate all trigger declarations and mixed DDL/data row schemas before persisting any trigger declaration; partial_batch={sync_partial_batch:?}, mixed_bad_row={sync_mixed_bad_row:?}, ddl={:?}, triggers={:?}",
+            sync_admin.changes_since(sync_since).ddl,
+            sync_admin.list_triggers()
         ));
     }
     sync_admin.close().unwrap();
@@ -1261,18 +3424,29 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             matches!(
                 change,
                 DdlChange::CreateTrigger { name, .. }
-                    if name == "sync_delete_trigger" || name == "sync_mixed_delete_trigger"
+                    if name == "sync_delete_trigger"
+                        || name == "sync_mixed_delete_trigger"
+                        || name == "sync_partial_valid_trigger"
+                        || name == "sync_partial_delete_trigger"
+                        || name == "sync_bad_row_trigger"
             )
         })
         .count();
+    let reopened_sync_fired_history = reopened_sync_admin
+        .trigger_audit_history(TriggerAuditFilter {
+            trigger_name: Some("sync_trigger".into()),
+            status: Some(TriggerAuditStatusFilter::Fired),
+        })
+        .unwrap();
     if reopened_sync_ready.is_err()
         || !reopened_sync_admin.list_triggers().is_empty()
         || reopened_sync_create_triggers != 1
         || reopened_sync_drop_triggers != 1
         || reopened_sync_delete_triggers != 0
+        || reopened_sync_fired_history.len() != 4
     {
         failures.push(format!(
-            "sync-applied trigger DDL create/drop and unsupported DELETE rejection must survive durable reopen; ready={reopened_sync_ready:?}, triggers={:?}, ddl={reopened_sync_ddl:?}",
+            "sync-applied trigger DDL create/drop, fired trigger audit history, and unsupported DELETE rejection must survive durable reopen; ready={reopened_sync_ready:?}, triggers={:?}, ddl={reopened_sync_ddl:?}, fired={reopened_sync_fired_history:?}",
             reopened_sync_admin.list_triggers()
         ));
     }
@@ -1469,6 +3643,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                 table: "scoped_writes".into(),
                 on_events: vec!["INSERT".into()],
             }],
+            ddl_lsn: vec![Lsn(1)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -1487,6 +3662,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             ddl: vec![contextdb_engine::sync_types::DdlChange::DropTrigger {
                 name: "sync_trigger".into(),
             }],
+            ddl_lsn: vec![Lsn(1)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -2012,6 +4188,632 @@ fn t3_reg_introspection_and_delete_event_rejection() {
     acl_admin.close().unwrap();
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE guard_writes (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE guard_audits (id UUID PRIMARY KEY, write_id UUID UNIQUE, note TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER guard_trigger ON guard_writes WHEN INSERT",
+        &empty(),
+    )
+    .unwrap();
+
+    let other_db = Arc::new(Database::open_memory());
+    other_db
+        .execute(
+            "CREATE TABLE escape_writes (id UUID PRIMARY KEY, content TEXT)",
+            &empty(),
+        )
+        .unwrap();
+    let wrong_tx = db.begin();
+    let other_wrong_tx = other_db.begin();
+    other_db
+        .insert_row(
+            other_wrong_tx,
+            "escape_writes",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid(0xE0A))),
+                (
+                    "content".to_string(),
+                    Value::Text("pre-staged-escape".into()),
+                ),
+            ]),
+        )
+        .unwrap();
+    let (third_owner_db, third_owner_wrong_tx) = std::thread::spawn(|| {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE third_owner_escape (id UUID PRIMARY KEY, content TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        let tx = db.begin();
+        db.insert_row(
+            tx,
+            "third_owner_escape",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid(0xE0B))),
+                (
+                    "content".to_string(),
+                    Value::Text("pre-staged-third-owner-escape".into()),
+                ),
+            ]),
+        )
+        .unwrap();
+        (db, tx)
+    })
+    .join()
+    .unwrap();
+    let third_owner_db = Arc::new(third_owner_db);
+    let attempts = Arc::new(Mutex::new(Vec::<(String, bool, String)>::new()));
+    let callback_attempts = attempts.clone();
+    let callback_other_db = other_db.clone();
+    let callback_third_owner_db = third_owner_db.clone();
+    db.register_trigger_callback("guard_trigger", move |db_handle, ctx| {
+        let wrong_direct = db_handle.insert_row(
+            wrong_tx,
+            "guard_audits",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid(0xE01))),
+                (
+                    "write_id".to_string(),
+                    ctx.row_values
+                        .get("id")
+                        .cloned()
+                        .unwrap_or(Value::Uuid(uuid(0xE00))),
+                ),
+                ("note".to_string(), Value::Text("wrong-tx".into())),
+            ]),
+        );
+        callback_attempts.lock().unwrap().push((
+            "same_handle_wrong_tx".to_string(),
+            wrong_direct.is_err(),
+            format!("{wrong_direct:?}"),
+        ));
+        let wrong_execute_in_tx = db_handle.execute_in_tx(
+            wrong_tx,
+            "INSERT INTO guard_audits (id, write_id, note) VALUES ($id, $write_id, 'wrong-execute-in-tx')",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid(0xE05))),
+                (
+                    "write_id".to_string(),
+                    ctx.row_values
+                        .get("id")
+                        .cloned()
+                        .unwrap_or(Value::Uuid(uuid(0xE06))),
+                ),
+            ]),
+        );
+        callback_attempts.lock().unwrap().push((
+            "same_handle_execute_in_tx_wrong_tx".to_string(),
+            wrong_execute_in_tx.is_err(),
+            format!("{wrong_execute_in_tx:?}"),
+        ));
+
+        let other_sql = callback_other_db.execute(
+            "INSERT INTO escape_writes (id, content) VALUES ($id, 'escape')",
+            &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE02)))]),
+        );
+        callback_attempts.lock().unwrap().push((
+            "other_handle_sql".to_string(),
+            other_sql.is_err(),
+            format!("{other_sql:?}"),
+        ));
+
+        let other_apply_changes = callback_other_db.apply_changes(
+            ChangeSet {
+                rows: vec![row_change(
+                    "escape_writes",
+                    uuid(0xE09),
+                    "sync-escape",
+                    Lsn(1),
+                )],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        );
+        callback_attempts.lock().unwrap().push((
+            "other_handle_apply_changes".to_string(),
+            other_apply_changes.is_err(),
+            format!("{other_apply_changes:?}"),
+        ));
+
+        let other_commit = callback_other_db.commit(other_wrong_tx);
+        callback_attempts.lock().unwrap().push((
+            "other_handle_commit_staged_tx".to_string(),
+            other_commit.is_err(),
+            format!("{other_commit:?}"),
+        ));
+
+        let write_id = ctx
+            .row_values
+            .get("id")
+            .cloned()
+            .unwrap_or(Value::Uuid(uuid(0xE06)));
+        let cross_thread_direct = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    db_handle.insert_row(
+                        ctx.tx,
+                        "guard_audits",
+                        HashMap::from([
+                            ("id".to_string(), Value::Uuid(uuid(0xE07))),
+                            ("write_id".to_string(), write_id),
+                            ("note".to_string(), Value::Text("cross-thread".into())),
+                        ]),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        callback_attempts.lock().unwrap().push((
+            "same_handle_cross_thread_ctx_tx".to_string(),
+            cross_thread_direct.is_err(),
+            format!("{cross_thread_direct:?}"),
+        ));
+
+        let other_for_thread = callback_other_db.clone();
+        let cross_thread_other_handle = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    other_for_thread.execute(
+                        "INSERT INTO escape_writes (id, content) VALUES ($id, 'thread-escape')",
+                        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE08)))]),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        callback_attempts.lock().unwrap().push((
+            "other_handle_cross_thread_sql".to_string(),
+            cross_thread_other_handle.is_err(),
+            format!("{cross_thread_other_handle:?}"),
+        ));
+
+        let third_owner_for_thread = callback_third_owner_db.clone();
+        let third_owner_cross_thread_sql = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    third_owner_for_thread.execute(
+                        "INSERT INTO third_owner_escape (id, content) VALUES ($id, 'thread-escape')",
+                        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE0C)))]),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        callback_attempts.lock().unwrap().push((
+            "third_owner_handle_cross_thread_sql".to_string(),
+            third_owner_cross_thread_sql.is_err(),
+            format!("{third_owner_cross_thread_sql:?}"),
+        ));
+
+        let third_owner_for_commit = callback_third_owner_db.clone();
+        let third_owner_cross_thread_commit = std::thread::scope(|scope| {
+            scope
+                .spawn(move || third_owner_for_commit.commit(third_owner_wrong_tx))
+                .join()
+                .unwrap()
+        });
+        callback_attempts.lock().unwrap().push((
+            "third_owner_handle_cross_thread_commit".to_string(),
+            third_owner_cross_thread_commit.is_err(),
+            format!("{third_owner_cross_thread_commit:?}"),
+        ));
+
+        db_handle.insert_row(
+            ctx.tx,
+            "guard_audits",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(uuid(0xE03))),
+                (
+                    "write_id".to_string(),
+                    ctx.row_values
+                        .get("id")
+                        .cloned()
+                        .unwrap_or(Value::Uuid(uuid(0xE04))),
+                ),
+                ("note".to_string(), Value::Text("valid".into())),
+            ]),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+
+    let fire = db.execute(
+        "INSERT INTO guard_writes (id, content) VALUES ($id, 'fire')",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE10)))]),
+    );
+    let rollback_wrong_tx = db.rollback(wrong_tx);
+    let rollback_other_wrong_tx = other_db.rollback(other_wrong_tx);
+    let attempts = attempts.lock().unwrap().clone();
+    assert!(
+        fire.is_ok()
+            && rollback_wrong_tx.is_ok()
+            && rollback_other_wrong_tx.is_ok()
+            && attempts.len() == 9
+            && attempts.iter().all(|(_, rejected, message)| {
+                *rejected
+                    && (message.contains(
+                        "trigger callback writes must use the supplied tx-bound database handle",
+                    ) || message.contains("trigger callback is active")
+                        || message.contains("inside trigger callbacks"))
+            })
+            && count_rows(&db, "guard_audits") == 1
+            && count_rows(&other_db, "escape_writes") == 0
+            && count_rows(&third_owner_db, "third_owner_escape") == 0,
+        "trigger callbacks must not escape the firing tx or supplied handle; fire={fire:?}, rollback={rollback_wrong_tx:?}, rollback_other={rollback_other_wrong_tx:?}, attempts={attempts:?}, guard_audits={}, escape_rows={}, third_owner_escape_rows={}",
+        count_rows(&db, "guard_audits"),
+        count_rows(&other_db, "escape_writes"),
+        count_rows(&third_owner_db, "third_owner_escape")
+    );
+}
+
+#[test]
+fn t3_trigger_dispatch_uses_commit_final_write_set() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE final_writes (id UUID PRIMARY KEY, slug TEXT UNIQUE, status TEXT, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE final_audits (id UUID PRIMARY KEY, slug TEXT, event TEXT, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER final_insert_trigger ON final_writes WHEN INSERT",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER final_update_trigger ON final_writes WHEN UPDATE",
+        &empty(),
+    )
+    .unwrap();
+
+    let events = Arc::new(Mutex::new(Vec::<(TriggerEvent, String, String)>::new()));
+    for (trigger_name, expected_event) in [
+        ("final_insert_trigger", TriggerEvent::Insert),
+        ("final_update_trigger", TriggerEvent::Update),
+    ] {
+        let events = events.clone();
+        db.register_trigger_callback(trigger_name, move |db_handle, ctx| {
+            if ctx.event != expected_event {
+                return Err(Error::Other(format!(
+                    "{trigger_name} saw wrong event {:?}",
+                    ctx.event
+                )));
+            }
+            let slug = ctx
+                .row_values
+                .get("slug")
+                .and_then(Value::as_text)
+                .ok_or_else(|| Error::Other("missing slug".into()))?
+                .to_string();
+            let content = ctx
+                .row_values
+                .get("content")
+                .and_then(Value::as_text)
+                .ok_or_else(|| Error::Other("missing content".into()))?
+                .to_string();
+            events
+                .lock()
+                .unwrap()
+                .push((ctx.event, slug.clone(), content.clone()));
+            db_handle.insert_row(
+                ctx.tx,
+                "final_audits",
+                HashMap::from([
+                    ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+                    ("slug".to_string(), Value::Text(slug)),
+                    (
+                        "event".to_string(),
+                        Value::Text(
+                            match ctx.event {
+                                TriggerEvent::Insert => "INSERT",
+                                TriggerEvent::Update => "UPDATE",
+                            }
+                            .into(),
+                        ),
+                    ),
+                    ("content".to_string(), Value::Text(content)),
+                ]),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    db.complete_initialization().unwrap();
+
+    db.execute(
+        "INSERT INTO final_writes (id, slug, status, content) VALUES ($id, 'stale-key', 'pending', 'base')",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE20)))]),
+    )
+    .unwrap();
+    let stale_tx = db.begin();
+    db.execute_in_tx(
+        stale_tx,
+        "UPDATE final_writes SET status = 'ack', content = 'stale-cascade' WHERE id = $id AND status = 'pending'",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE20)))]),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE final_writes SET status = 'done', content = 'winner' WHERE id = $id AND status = 'pending'",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE20)))]),
+    )
+    .unwrap();
+    let stale_commit = db.commit(stale_tx);
+
+    let upsert_tx = db.begin();
+    db.execute_in_tx(
+        upsert_tx,
+        "INSERT INTO final_writes (id, slug, status, content) VALUES ($id, 'upsert-key', 'open', $content) ON CONFLICT (slug) DO UPDATE SET content = $content",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(uuid(0xE21))),
+            ("content".to_string(), Value::Text("from-upsert".into())),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO final_writes (id, slug, status, content) VALUES ($id, 'upsert-key', 'open', 'committed-before-upsert')",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE22)))]),
+    )
+    .unwrap();
+    let upsert_commit = db.commit(upsert_tx);
+
+    let api_insert_tx = db.begin();
+    let api_insert = db.upsert_row(
+        api_insert_tx,
+        "final_writes",
+        "slug",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(uuid(0xE23))),
+            ("slug".to_string(), Value::Text("api-upsert-key".into())),
+            ("status".to_string(), Value::Text("open".into())),
+            ("content".to_string(), Value::Text("api-insert".into())),
+        ]),
+    );
+    let api_insert_commit = db.commit(api_insert_tx);
+    let api_update_tx = db.begin();
+    let api_update = db.upsert_row(
+        api_update_tx,
+        "final_writes",
+        "slug",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(uuid(0xE23))),
+            ("slug".to_string(), Value::Text("api-upsert-key".into())),
+            ("status".to_string(), Value::Text("open".into())),
+            ("content".to_string(), Value::Text("api-update".into())),
+        ]),
+    );
+    let api_update_commit = db.commit(api_update_tx);
+
+    let events = events.lock().unwrap().clone();
+    let stale_row = row_for_column_uuid(&db, "final_writes", "id", uuid(0xE20))
+        .expect("stale row must still exist");
+    let stale_content = stale_row
+        .values
+        .get("content")
+        .and_then(Value::as_text)
+        .unwrap_or("<missing>");
+    let audit_rows = db.scan("final_audits", db.snapshot()).unwrap();
+    assert!(
+        stale_commit.is_ok()
+            && upsert_commit.is_ok()
+            && matches!(api_insert, Ok(UpsertResult::Inserted))
+            && api_insert_commit.is_ok()
+            && matches!(api_update, Ok(UpsertResult::Updated))
+            && api_update_commit.is_ok()
+            && stale_content == "winner"
+            && events.iter().filter(|(_, slug, _)| slug == "stale-key").count() == 2
+            && !events
+                .iter()
+                .any(|(_, slug, content)| slug == "stale-key" && content == "stale-cascade")
+            && events.iter().any(|(event, slug, content)| {
+                *event == TriggerEvent::Update
+                    && slug == "upsert-key"
+                    && content == "from-upsert"
+            })
+            && events
+                .iter()
+                .filter(|(event, slug, _)| {
+                    *event == TriggerEvent::Insert && slug == "upsert-key"
+                })
+                .count()
+                == 1
+            && events
+                .iter()
+                .filter(|(event, slug, _)| {
+                    *event == TriggerEvent::Insert && slug == "api-upsert-key"
+                })
+                .count()
+                == 1
+            && events.iter().any(|(event, slug, content)| {
+                *event == TriggerEvent::Update
+                    && slug == "api-upsert-key"
+                    && content == "api-update"
+            })
+            && events
+                .iter()
+                .filter(|(event, slug, content)| {
+                    *event == TriggerEvent::Insert
+                        && slug == "api-upsert-key"
+                        && content == "api-update"
+                })
+                .count()
+                == 0
+            && audit_rows
+                .iter()
+                .filter(|row| matches!(row.values.get("slug"), Some(Value::Text(slug)) if slug == "upsert-key"))
+                .count()
+                == 2,
+        "trigger dispatch must use the final commit-normalized write set: stale_commit={stale_commit:?}, upsert_commit={upsert_commit:?}, api_insert={api_insert:?}, api_insert_commit={api_insert_commit:?}, api_update={api_update:?}, api_update_commit={api_update_commit:?}, stale_content={stale_content}, events={events:?}, audits={audit_rows:?}"
+    );
+}
+
+#[test]
+fn t3_sync_trigger_ddl_replay_respects_sender_lsn_order() {
+    let origin = Database::open_memory();
+    setup_host_tables(&origin);
+    register_audit_callback(&origin, Arc::new(AtomicUsize::new(0)));
+    origin.complete_initialization().unwrap();
+    origin
+        .execute(
+            host_insert_sql(),
+            &insert_host_params(uuid(0xE40), "ordered"),
+        )
+        .unwrap();
+    origin
+        .execute("DROP TRIGGER host_write_trigger", &empty())
+        .unwrap();
+
+    let changes = origin.changes_since(Lsn(0));
+    let trigger_create_lsn = changes
+        .ddl
+        .iter()
+        .zip(changes.ddl_lsn.iter())
+        .find_map(|(ddl, lsn)| {
+            matches!(ddl, DdlChange::CreateTrigger { name, .. } if name == "host_write_trigger")
+                .then_some(*lsn)
+        })
+        .expect("origin history must carry trigger create LSN");
+    let trigger_drop_lsn = changes
+        .ddl
+        .iter()
+        .zip(changes.ddl_lsn.iter())
+        .find_map(|(ddl, lsn)| {
+            matches!(ddl, DdlChange::DropTrigger { name } if name == "host_write_trigger")
+                .then_some(*lsn)
+        })
+        .expect("origin history must carry trigger drop LSN");
+    let data_lsn = changes
+        .rows
+        .iter()
+        .find(|row| row.table == "host_writes")
+        .map(|row| row.lsn)
+        .expect("origin history must carry firing data");
+
+    let receiver = Database::open_memory();
+    receiver
+        .apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+    let fired = receiver
+        .trigger_audit_history(TriggerAuditFilter {
+            trigger_name: Some("host_write_trigger".into()),
+            status: Some(TriggerAuditStatusFilter::Fired),
+        })
+        .unwrap();
+    assert!(
+        trigger_create_lsn < data_lsn
+            && data_lsn < trigger_drop_lsn
+            && receiver.list_triggers().is_empty()
+            && fired.len() == 1
+            && fired[0].trigger_name == "host_write_trigger"
+            && fired[0].firing_lsn == data_lsn,
+        "sync replay must apply trigger DDL chronologically so create->data->drop audits historical fires without leaving the trigger active; create_lsn={trigger_create_lsn:?}, data_lsn={data_lsn:?}, drop_lsn={trigger_drop_lsn:?}, triggers={:?}, fired={fired:?}",
+        receiver.list_triggers()
+    );
+}
+
+#[test]
+fn t3_sibling_callback_cascades_validate_after_all_triggers_stage() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE sibling_sources (id UUID PRIMARY KEY, kind TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sibling_parents (id UUID PRIMARY KEY)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sibling_children (id UUID PRIMARY KEY, parent_id UUID REFERENCES sibling_parents(id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER sibling_trigger ON sibling_sources WHEN INSERT",
+        &empty(),
+    )
+    .unwrap();
+    let parent_id = uuid(0xEAA);
+    db.register_trigger_callback("sibling_trigger", move |db_handle, ctx| {
+        let kind = ctx
+            .row_values
+            .get("kind")
+            .and_then(Value::as_text)
+            .ok_or_else(|| Error::Other("missing sibling source kind".into()))?;
+        match kind {
+            "child-first" => {
+                db_handle.execute(
+                    "INSERT INTO sibling_children (id, parent_id) VALUES ($id, $parent_id)",
+                    &HashMap::from([
+                        ("id".to_string(), Value::Uuid(uuid(0xEAB))),
+                        ("parent_id".to_string(), Value::Uuid(parent_id)),
+                    ]),
+                )?;
+            }
+            "parent-second" => {
+                db_handle.execute(
+                    "INSERT INTO sibling_parents (id) VALUES ($id)",
+                    &HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
+                )?;
+            }
+            other => {
+                return Err(Error::Other(format!(
+                    "unexpected sibling source kind {other}"
+                )));
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+
+    let tx = db.begin();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO sibling_sources (id, kind) VALUES ($id, 'child-first')",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xEA1)))]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO sibling_sources (id, kind) VALUES ($id, 'parent-second')",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xEA2)))]),
+    )
+    .unwrap();
+    let commit = db.commit(tx);
+
+    assert!(
+        commit.is_ok()
+            && count_rows(&db, "sibling_sources") == 2
+            && count_rows(&db, "sibling_parents") == 1
+            && count_rows(&db, "sibling_children") == 1,
+        "trigger callback cascades from sibling firing rows must validate after all callbacks stage, not after each callback; commit={commit:?}, counts=({}, {}, {})",
+        count_rows(&db, "sibling_sources"),
+        count_rows(&db, "sibling_parents"),
+        count_rows(&db, "sibling_children")
+    );
 }
 
 #[test]
@@ -2717,9 +5519,9 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
         matches!(
             cold_reopen_apply,
             Err(Error::EngineNotInitialized { ref operation })
-                if operation.contains("apply_changes") && operation.contains("host_writes")
+                if operation.contains("apply_changes")
         ),
-        "reopened handles must reject sync apply into trigger-attached tables until callbacks are ready; got {cold_reopen_apply:?}"
+        "reopened handles must reject sync apply until callbacks are ready; got {cold_reopen_apply:?}"
     );
     let cold_direct_tx = reopened.begin();
     let cold_direct_insert = reopened.insert_row(
@@ -2742,6 +5544,34 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
         "direct Database::insert_row must also enter the persisted-trigger cold gate before callback registration and must not leak staged data; result={cold_direct_insert:?}, host_rows={}, audit_rows={}, leaked_changes={:?}",
         count_rows(&reopened, "host_writes"),
         count_rows(&reopened, "host_audits"),
+        reopened.changes_since(cold_gate_since)
+    );
+    let cold_vector_tx = reopened.begin();
+    let cold_vector_insert = reopened.insert_vector(
+        cold_vector_tx,
+        VectorIndexRef::new("host_writes", "embedding"),
+        RowId(999_001),
+        vec![1.0, 0.0, 0.0],
+    );
+    let cold_vector_delete = reopened.delete_vector(
+        cold_vector_tx,
+        VectorIndexRef::new("host_writes", "embedding"),
+        RowId(999_001),
+    );
+    let _ = reopened.rollback(cold_vector_tx);
+    assert!(
+        matches!(
+            cold_vector_insert,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("host_writes")
+                    && operation.contains("insert_vector")
+        ) && matches!(
+            cold_vector_delete,
+            Err(Error::EngineNotInitialized { ref operation })
+                if operation.contains("host_writes")
+                    && operation.contains("delete_vector")
+        ) && !changeset_has_data(&reopened.changes_since(cold_gate_since)),
+        "direct vector APIs must also fail closed for trigger-attached tables before callback registration; insert={cold_vector_insert:?}, delete={cold_vector_delete:?}, leaked_changes={:?}",
         reopened.changes_since(cold_gate_since)
     );
     let replay_fires = Arc::new(AtomicUsize::new(0));
@@ -3419,13 +6249,15 @@ fn t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure() {
     ];
     let wire_changes = ChangeSet {
         ddl: trigger_ddl.clone(),
+        ddl_lsn: vec![Lsn(5), Lsn(9)],
         ..Default::default()
     };
     let encoded = rmp_serde::to_vec(&WireChangeSet::from(wire_changes))
         .expect("trigger DDL WireChangeSet must encode");
     let decoded_wire: WireChangeSet =
         rmp_serde::from_slice(&encoded).expect("trigger DDL WireChangeSet must decode");
-    let decoded_changes = ChangeSet::from(decoded_wire);
+    let decoded_changes =
+        ChangeSet::try_from(decoded_wire).expect("valid trigger DDL WireChangeSet must convert");
     assert!(
         matches!(
             decoded_changes.ddl.as_slice(),
@@ -3442,6 +6274,11 @@ fn t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure() {
                 && drop_name == "wire_trigger"
         ),
         "trigger CreateTrigger/DropTrigger DDL must survive the actual sync wire round-trip"
+    );
+    assert_eq!(
+        decoded_changes.ddl_lsn,
+        vec![Lsn(5), Lsn(9)],
+        "trigger DDL LSNs must survive the actual sync wire round-trip"
     );
 
     let mut rows = Vec::new();
@@ -3693,6 +6530,95 @@ fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
             event.lsn
         );
     }
+}
+
+#[tokio::test]
+async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() {
+    let nats = start_nats().await;
+    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+    let tenant_id = "t3-trigger-bootstrap-pull";
+
+    let db_tmp = TempDir::new().unwrap();
+    let server_path = db_tmp.path().join("server.redb");
+    let fresh_path = db_tmp.path().join("fresh.redb");
+    let server_seed = Database::open(&server_path).unwrap();
+    let fresh_db = Arc::new(Database::open(&fresh_path).unwrap());
+
+    setup_host_tables(&server_seed);
+    let server_fires = Arc::new(AtomicUsize::new(0));
+    register_audit_callback(&server_seed, server_fires.clone());
+    server_seed.complete_initialization().unwrap();
+
+    let expected_ids = [uuid(0xB001), uuid(0xB002), uuid(0xB003)];
+    for (idx, id) in expected_ids.iter().copied().enumerate() {
+        server_seed
+            .execute(
+                host_insert_sql(),
+                &insert_host_params(id, &format!("bootstrap-history-{idx}")),
+            )
+            .unwrap();
+    }
+    assert_eq!(server_fires.load(Ordering::SeqCst), expected_ids.len());
+    let expected_groups = row_group_signatures(&server_seed, server_seed.changes_since(Lsn(0)));
+    server_seed.close().unwrap();
+    let server_db = Arc::new(Database::open(&server_path).unwrap());
+
+    let server = Arc::new(SyncServer::new(
+        server_db.clone(),
+        &nats.nats_url,
+        tenant_id,
+        policies.clone(),
+    ));
+    let server_task = server.clone();
+    tokio::spawn(async move { server_task.run().await });
+    assert!(
+        wait_for_sync_server_ready(&nats.nats_url, tenant_id, Duration::from_secs(5)).await,
+        "sync server must be ready before fresh trigger bootstrap pull"
+    );
+
+    let fresh = SyncClient::new(fresh_db.clone(), &nats.nats_url, tenant_id);
+    let first_pull = fresh.pull(&policies).await;
+    let missing_callback = fresh_db.complete_initialization();
+    assert!(
+        first_pull.is_ok()
+            && fresh_db
+                .list_triggers()
+                .iter()
+                .any(|trigger| trigger.name == "host_write_trigger"
+                    && trigger.table == "host_writes")
+            && matches!(
+                missing_callback,
+                Err(Error::TriggerCallbackMissing { ref trigger_name })
+                    if trigger_name == "host_write_trigger"
+            )
+            && count_rows(&fresh_db, "host_writes") == 0
+            && count_rows(&fresh_db, "host_audits") == 0,
+        "fresh full-history pull must stop after trigger DDL so callbacks can be registered before data replay; first_pull={first_pull:?}, init={missing_callback:?}, triggers={:?}, counts=({}, {})",
+        fresh_db.list_triggers(),
+        count_rows(&fresh_db, "host_writes"),
+        count_rows(&fresh_db, "host_audits")
+    );
+
+    let fresh_fires = Arc::new(AtomicUsize::new(0));
+    register_audit_callback(&fresh_db, fresh_fires.clone());
+    fresh_db.complete_initialization().unwrap();
+    let fresh_since = fresh_db.current_lsn();
+    let second_pull = fresh.pull(&policies).await;
+
+    assert!(
+        second_pull.is_ok()
+            && fresh_fires.load(Ordering::SeqCst) == 0
+            && count_rows(&fresh_db, "host_writes") == expected_ids.len()
+            && count_rows(&fresh_db, "host_audits") == expected_ids.len()
+            && row_group_signatures(&fresh_db, fresh_db.changes_since(fresh_since))
+                == expected_groups,
+        "fresh full-history pull must replay data only after callback registration and must not re-fire receiver callbacks; second_pull={second_pull:?}, fires={}, groups={:?} expected={:?}, counts=({}, {})",
+        fresh_fires.load(Ordering::SeqCst),
+        row_group_signatures(&fresh_db, fresh_db.changes_since(fresh_since)),
+        expected_groups,
+        count_rows(&fresh_db, "host_writes"),
+        count_rows(&fresh_db, "host_audits")
+    );
 }
 
 #[test]
@@ -4633,6 +7559,21 @@ fn t3_audit_records_panic_rollback_and_engine_survives() {
         .register_trigger_callback("other_trigger", |_, _| Ok(()))
         .unwrap();
     reopened_audit_db.complete_initialization().unwrap();
+    let reopened_ring = reopened_audit_db.trigger_audit_log();
+    assert_eq!(
+        reopened_ring.len(),
+        cap,
+        "file-backed reopen must restore only the bounded hot ring, not mirror all durable audit history into memory"
+    );
+    assert!(
+        !reopened_ring
+            .iter()
+            .any(|entry| entry.firing_lsn == oldest_fired_lsn)
+            && reopened_ring
+                .iter()
+                .any(|entry| entry.firing_lsn == newest_fired_lsn),
+        "file-backed hot ring must preserve eviction state across reopen; ring={reopened_ring:?}"
+    );
     let reopened_fired_history = reopened_audit_db
         .trigger_audit_history(TriggerAuditFilter {
             trigger_name: Some("host_write_trigger".into()),

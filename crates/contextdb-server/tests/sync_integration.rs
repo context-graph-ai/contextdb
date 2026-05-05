@@ -1145,6 +1145,8 @@ async fn a10_vector_mapping_survives_failed_inserts() {
             },
         ],
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     // EdgeWins forces upsert attempt on row B — which fails due to state machine
@@ -1361,6 +1363,8 @@ async fn a13_pull_pagination_fetches_all_pages() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let insert_policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     server_db
@@ -1526,6 +1530,8 @@ fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     // Apply on edge-B — apply_changes is the sync-pull entry point and internally
@@ -1642,6 +1648,8 @@ fn sync_apply_rejects_peer_txid_u64_max() {
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     // Apply must return Err(Error::TxIdOverflow { table: "t", incoming: u64::MAX }).
@@ -1731,6 +1739,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);

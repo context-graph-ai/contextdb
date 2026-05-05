@@ -6,7 +6,7 @@ use contextdb_engine::sync_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -116,6 +116,7 @@ pub struct ChunkAck {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireChangeSet {
     pub ddl: Vec<WireDdlChange>,
+    pub ddl_lsn: Vec<Lsn>,
     pub rows: Vec<WireRowChange>,
     pub edges: Vec<WireEdgeChange>,
     pub vectors: Vec<WireVectorChange>,
@@ -263,6 +264,7 @@ impl From<ChangeSet> for WireChangeSet {
     fn from(value: ChangeSet) -> Self {
         Self {
             ddl: value.ddl.into_iter().map(Into::into).collect(),
+            ddl_lsn: value.ddl_lsn,
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             vectors: value.vectors.into_iter().map(Into::into).collect(),
@@ -270,14 +272,24 @@ impl From<ChangeSet> for WireChangeSet {
     }
 }
 
-impl From<WireChangeSet> for ChangeSet {
-    fn from(value: WireChangeSet) -> Self {
-        Self {
+impl TryFrom<WireChangeSet> for ChangeSet {
+    type Error = SyncError;
+
+    fn try_from(value: WireChangeSet) -> Result<Self, Self::Error> {
+        if value.ddl_lsn.len() != value.ddl.len() {
+            return Err(SyncError::Protocol(format!(
+                "WireChangeSet ddl_lsn length {} does not match ddl length {}",
+                value.ddl_lsn.len(),
+                value.ddl.len()
+            )));
+        }
+        Ok(Self {
             ddl: value.ddl.into_iter().map(Into::into).collect(),
+            ddl_lsn: value.ddl_lsn,
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             vectors: value.vectors.into_iter().map(Into::into).collect(),
-        }
+        })
     }
 }
 

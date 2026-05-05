@@ -80,10 +80,11 @@ pub(crate) struct SinkQueueEntry {
 }
 
 pub(crate) type PreparedSinkEvent = (String, SinkQueueEntry);
+type EncodedConfigValues = Vec<(&'static str, Vec<u8>)>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EventBusPersistenceCommit {
-    pub(crate) config_values: Vec<(&'static str, Vec<u8>)>,
+    pub(crate) config_values: EncodedConfigValues,
     pub(crate) ddl: Vec<DdlChange>,
 }
 
@@ -318,10 +319,21 @@ impl Database {
             .or(Some(String::new()))
     }
 
-    pub(super) fn validate_event_bus_ddl_batch(&self, ddl: &[DdlChange]) -> Result<()> {
+    pub(super) fn validate_event_bus_ddl_batch_with_table_lookup<F>(
+        &self,
+        ddl: &[DdlChange],
+        table_exists: F,
+    ) -> Result<()>
+    where
+        F: Fn(&str) -> bool,
+    {
         let mut projected = self.event_bus.definitions.lock().clone();
         for change in ddl {
-            self.apply_event_bus_ddl_to_definitions(&mut projected, change)?;
+            Self::apply_event_bus_ddl_to_definitions_with_table_lookup(
+                &mut projected,
+                change,
+                &table_exists,
+            )?;
         }
         Ok(())
     }
@@ -427,13 +439,23 @@ impl Database {
         definitions: &mut EventBusDefinitions,
         ddl: &DdlChange,
     ) -> Result<()> {
+        Self::apply_event_bus_ddl_to_definitions_with_table_lookup(definitions, ddl, &|table| {
+            self.table_meta(table).is_some()
+        })
+    }
+
+    fn apply_event_bus_ddl_to_definitions_with_table_lookup(
+        definitions: &mut EventBusDefinitions,
+        ddl: &DdlChange,
+        table_exists: &impl Fn(&str) -> bool,
+    ) -> Result<()> {
         match ddl {
             DdlChange::CreateEventType {
                 name,
                 trigger,
                 table,
             } => {
-                if self.table_meta(table).is_none() {
+                if !table_exists(table) {
                     return Err(Error::TableNotFound(table.clone()));
                 }
                 Self::put_event_type_def(
@@ -575,8 +597,10 @@ impl Database {
         })
     }
 
-    pub(crate) fn remove_event_bus_definitions_for_table(&self, table: &str) -> Result<()> {
-        let mut next = self.event_bus.definitions.lock().clone();
+    fn event_bus_definitions_without_table(
+        mut next: EventBusDefinitions,
+        table: &str,
+    ) -> EventBusDefinitions {
         let removed_event_types = next
             .event_types
             .iter()
@@ -584,13 +608,33 @@ impl Database {
             .map(|(name, _)| name.clone())
             .collect::<HashSet<_>>();
         if removed_event_types.is_empty() {
-            return Ok(());
+            return next;
         }
         next.event_types
             .retain(|name, _| !removed_event_types.contains(name));
         next.routes
             .retain(|_, route| !removed_event_types.contains(&route.event_type));
-        self.commit_event_bus_definitions_without_log(next)
+        next
+    }
+
+    pub(crate) fn event_bus_config_values_without_table(
+        &self,
+        table: &str,
+    ) -> Result<Option<EncodedConfigValues>> {
+        let current = self.event_bus.definitions.lock().clone();
+        let next = Self::event_bus_definitions_without_table(current.clone(), table);
+        if current == next {
+            return Ok(None);
+        }
+        Ok(Some(Self::encoded_event_bus_config_values(&next)?))
+    }
+
+    pub(crate) fn apply_event_bus_definitions_without_table_to_memory(&self, table: &str) {
+        let current = self.event_bus.definitions.lock().clone();
+        let next = Self::event_bus_definitions_without_table(current.clone(), table);
+        if current != next {
+            self.apply_event_bus_definitions_to_memory(next);
+        }
     }
 
     pub fn register_sink<F>(
@@ -963,22 +1007,9 @@ impl Database {
         }
     }
 
-    fn commit_event_bus_definitions_without_log(
-        &self,
-        definitions: EventBusDefinitions,
-    ) -> Result<()> {
-        if let Some(persistence) = &self.persistence {
-            persistence.flush_encoded_config_values(Self::encoded_event_bus_config_values(
-                &definitions,
-            )?)?;
-        }
-        self.apply_event_bus_definitions_to_memory(definitions);
-        Ok(())
-    }
-
     fn encoded_event_bus_config_values(
         definitions: &EventBusDefinitions,
-    ) -> Result<Vec<(&'static str, Vec<u8>)>> {
+    ) -> Result<EncodedConfigValues> {
         let event_types = definitions
             .event_types
             .values()

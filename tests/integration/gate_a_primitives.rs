@@ -242,6 +242,7 @@ fn rt3_database_apply_changes_ddl_round_trip() {
                 constraints: vec!["DAG('CITES')".to_string()],
             },
         ],
+        ddl_lsn: vec![Lsn(1), Lsn(1), Lsn(1)],
         ..Default::default()
     };
     db.apply_changes(

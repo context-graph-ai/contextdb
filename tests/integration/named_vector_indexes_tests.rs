@@ -1740,6 +1740,8 @@ fn nv19b_changeset_ddl_applies_before_vector_changes_for_new_index() {
             columns: vec![("vector_vision".into(), "VECTOR(8)".into())],
             constraints: vec![],
         }],
+
+        ddl_lsn: vec![contextdb_core::Lsn(10)],
     };
     receiver
         .apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))
@@ -2324,6 +2326,8 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
             lsn: Lsn(20),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     receiver
         .apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))
@@ -2941,6 +2945,8 @@ fn nv_subscription_event_includes_table_for_vector_only_change() {
             lsn: Lsn(10),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))
         .expect("apply vector-only");
@@ -3269,7 +3275,7 @@ fn nv17_protocol_version_mismatch_returns_typed_error() {
 fn nv17b_protocol_version_mismatch_rejects_lower_version_envelopes() {
     use contextdb_server::protocol::{Envelope, MessageType, decode};
 
-    // A v2 receiver must also reject a v1 envelope, not just envelopes claiming a higher version.
+    // A v3 receiver must also reject a v1 envelope, not just envelopes claiming a higher version.
     // Without symmetric rejection, the asymmetric-upgrade detection contract (RB17) is unwired.
     let envelope = Envelope {
         version: 1,
@@ -3279,20 +3285,17 @@ fn nv17b_protocol_version_mismatch_rejects_lower_version_envelopes() {
     let bytes = rmp_serde::to_vec(&envelope).expect("encode envelope");
 
     let result = decode(&bytes);
-    // At Step 3 stub time: PROTOCOL_VERSION = 1 and the guard is still `version > PROTOCOL_VERSION`,
-    // so a v1 envelope returns Ok(_) and the matches! arm fails — RED. After Step 5 sub-batch B4,
-    // PROTOCOL_VERSION = 2 and the guard becomes `version != PROTOCOL_VERSION`, returning the typed variant.
     assert!(
         matches!(
             result,
             Err(
                 contextdb_server::error::SyncError::ProtocolVersionMismatch {
                     received: 1,
-                    supported: 2
+                    supported: 3
                 }
             )
         ),
-        "v2 receiver must reject v1 envelope (asymmetric upgrade detection); got {result:?}"
+        "v3 receiver must reject v1 envelope (asymmetric upgrade detection); got {result:?}"
     );
 }
 
@@ -3320,6 +3323,8 @@ fn nv19_unknown_index_apply_returns_typed_error() {
             lsn: contextdb_core::Lsn(1),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let res = receiver.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins));
     assert!(matches!(
@@ -3338,6 +3343,8 @@ fn nv19_unknown_index_apply_returns_typed_error() {
             lsn: contextdb_core::Lsn(2),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let res = receiver.apply_changes(
         existing_table_unknown_column,
@@ -3410,6 +3417,8 @@ fn nv19_unknown_index_apply_returns_typed_error() {
             },
         ],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let mut directions = HashMap::new();
     directions.insert("evidence".to_string(), SyncDirection::Push);

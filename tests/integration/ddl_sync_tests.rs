@@ -1,5 +1,4 @@
-use contextdb_core::Lsn;
-use contextdb_core::Value;
+use contextdb_core::{Error, Lsn, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use std::collections::HashMap;
@@ -559,6 +558,8 @@ fn ds10_schema_divergence_detected() {
             ],
             constraints: vec![],
         }],
+
+        ddl_lsn: vec![Lsn(1)],
     };
 
     server
@@ -596,6 +597,33 @@ fn ds10_schema_divergence_detected() {
         rows.len(),
         1,
         "table must still accept rows after divergent DDL skip"
+    );
+}
+
+#[test]
+fn ds10b_public_apply_changes_rejects_ddl_without_matching_lsn() {
+    let db = Database::open_memory();
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::CreateTable {
+                    name: "missing_lsn".into(),
+                    columns: vec![("id".into(), "UUID PRIMARY KEY".into())],
+                    constraints: Vec::new(),
+                }],
+                ddl_lsn: Vec::new(),
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .expect_err("public apply_changes must reject DDL without a matching ddl_lsn");
+    assert!(
+        matches!(err, Error::SyncError(ref message) if message.contains("ddl_lsn length")),
+        "unexpected missing ddl_lsn error: {err}"
+    );
+    assert!(
+        db.table_meta("missing_lsn").is_none(),
+        "invalid DDL envelope must not apply schema side effects"
     );
 }
 
@@ -958,5 +986,288 @@ fn ds16_deletion_tombstone_sync() {
             .unwrap()
             .is_some(),
         "alice must still exist on server"
+    );
+}
+
+fn assert_delete_tombstone_syncs_for_scalar_id(create_sql: &str, id: Value) {
+    let server = Database::open_memory();
+    let edge = Database::open_memory();
+
+    edge.execute(create_sql, &HashMap::new()).unwrap();
+    let tx = edge.begin();
+    edge.insert_row(
+        tx,
+        "items",
+        vals(vec![
+            ("id", id.clone()),
+            ("name", Value::Text("delete-me".into())),
+        ]),
+    )
+    .unwrap();
+    edge.commit(tx).unwrap();
+
+    let initial = edge.changes_since(Lsn(0));
+    server
+        .apply_changes(
+            initial,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup("items", "id", &id, server.snapshot())
+            .unwrap()
+            .is_some(),
+        "initial sync must create the scalar-id row on the receiver"
+    );
+
+    let lsn_after_sync = edge.current_lsn();
+    let row = edge
+        .point_lookup("items", "id", &id, edge.snapshot())
+        .unwrap()
+        .expect("edge row must exist before delete");
+    let tx = edge.begin();
+    edge.delete_row(tx, "items", row.row_id).unwrap();
+    edge.commit(tx).unwrap();
+
+    let delete_changes = edge.changes_since(lsn_after_sync);
+    assert!(
+        delete_changes.rows.iter().any(|row| {
+            row.deleted && row.natural_key.column == "id" && row.natural_key.value == id
+        }),
+        "delete changeset must carry the actual scalar id value"
+    );
+    server
+        .apply_changes(
+            delete_changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup("items", "id", &id, server.snapshot())
+            .unwrap()
+            .is_none(),
+        "delete tombstone must remove scalar-id row on receiver"
+    );
+}
+
+#[test]
+fn ds17_text_primary_key_delete_tombstone_sync() {
+    assert_delete_tombstone_syncs_for_scalar_id(
+        "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT)",
+        Value::Text("item-1".into()),
+    );
+}
+
+#[test]
+fn ds18_integer_primary_key_delete_tombstone_sync() {
+    assert_delete_tombstone_syncs_for_scalar_id(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+        Value::Int64(42),
+    );
+}
+
+#[test]
+fn ds19_primary_key_wins_over_non_key_id_for_delete_tombstone_sync() {
+    let server = Database::open_memory();
+    let edge = Database::open_memory();
+
+    edge.execute(
+        "CREATE TABLE items (id TEXT, sku TEXT PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let tx = edge.begin();
+    edge.insert_row(
+        tx,
+        "items",
+        vals(vec![
+            ("id", Value::Text("legacy-id".into())),
+            ("sku", Value::Text("sku-1".into())),
+            ("name", Value::Text("delete-me".into())),
+        ]),
+    )
+    .unwrap();
+    edge.commit(tx).unwrap();
+
+    let initial = edge.changes_since(Lsn(0));
+    server
+        .apply_changes(
+            initial,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let lsn_after_sync = edge.current_lsn();
+    let row = edge
+        .point_lookup(
+            "items",
+            "sku",
+            &Value::Text("sku-1".into()),
+            edge.snapshot(),
+        )
+        .unwrap()
+        .expect("edge row must exist before delete");
+    let tx = edge.begin();
+    edge.delete_row(tx, "items", row.row_id).unwrap();
+    edge.commit(tx).unwrap();
+
+    let delete_changes = edge.changes_since(lsn_after_sync);
+    assert!(
+        delete_changes.rows.iter().any(|row| {
+            row.deleted
+                && row.natural_key.column == "sku"
+                && row.natural_key.value == Value::Text("sku-1".into())
+        }),
+        "delete changeset must prefer declared primary key over a non-key id column"
+    );
+    server
+        .apply_changes(
+            delete_changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-1".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_none(),
+        "delete tombstone must remove row by declared primary key on receiver"
+    );
+}
+
+#[test]
+fn ds20_delete_tombstone_uses_latest_primary_key_after_key_update() {
+    let server = Database::open_memory();
+    let edge = Database::open_memory();
+
+    edge.execute(
+        "CREATE TABLE items (sku TEXT PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let tx = edge.begin();
+    edge.insert_row(
+        tx,
+        "items",
+        vals(vec![
+            ("sku", Value::Text("sku-a".into())),
+            ("name", Value::Text("delete-after-key-update".into())),
+        ]),
+    )
+    .unwrap();
+    edge.commit(tx).unwrap();
+
+    server
+        .apply_changes(
+            edge.changes_since(Lsn(0)),
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-a".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_some(),
+        "initial sync must create the original primary-key row"
+    );
+
+    let lsn_after_initial = edge.current_lsn();
+    edge.execute(
+        "UPDATE items SET sku = 'sku-b' WHERE sku = 'sku-a'",
+        &HashMap::new(),
+    )
+    .unwrap();
+    server
+        .apply_changes(
+            edge.changes_since(lsn_after_initial),
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-b".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_some(),
+        "update sync must move the receiver to the new primary key"
+    );
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-a".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_none(),
+        "old primary key must not remain live after update sync"
+    );
+
+    let lsn_after_update = edge.current_lsn();
+    let row = edge
+        .point_lookup(
+            "items",
+            "sku",
+            &Value::Text("sku-b".into()),
+            edge.snapshot(),
+        )
+        .unwrap()
+        .expect("edge row must exist with updated primary key before delete");
+    let tx = edge.begin();
+    edge.delete_row(tx, "items", row.row_id).unwrap();
+    edge.commit(tx).unwrap();
+
+    let delete_changes = edge.changes_since(lsn_after_update);
+    assert!(
+        delete_changes.rows.iter().any(|row| {
+            row.deleted
+                && row.natural_key.column == "sku"
+                && row.natural_key.value == Value::Text("sku-b".into())
+        }),
+        "delete changeset must carry the latest primary-key value after key update"
+    );
+    assert!(
+        !delete_changes.rows.iter().any(|row| {
+            row.deleted
+                && row.natural_key.column == "sku"
+                && row.natural_key.value == Value::Text("sku-a".into())
+        }),
+        "delete changeset must not use the stale primary-key value"
+    );
+
+    server
+        .apply_changes(
+            delete_changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-b".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_none(),
+        "delete tombstone must remove the row at the latest primary key on receiver"
     );
 }

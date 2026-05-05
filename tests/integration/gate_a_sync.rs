@@ -2004,6 +2004,8 @@ fn a9_15_archive_not_delete_status_transition_sync() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let poison_result = server
         .apply_changes(
@@ -4140,6 +4142,8 @@ fn cp06_conflict_policy_wired_to_apply_changes() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
 
     // Test with server_wins — server value must be kept
@@ -4414,6 +4418,8 @@ fn integrity_11_sync_apply_respects_memory_limit() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
 
     let result = db.apply_changes(
@@ -4497,6 +4503,8 @@ fn integrity_12_sync_delete_removes_vectors() {
             lsn: Lsn(10),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
 
     db.apply_changes(
@@ -4584,6 +4592,8 @@ fn integrity_13_sync_upsert_refreshes_vector() {
             lsn: Lsn(10),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
 
     db.apply_changes(

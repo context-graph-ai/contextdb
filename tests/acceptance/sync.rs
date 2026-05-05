@@ -1133,11 +1133,14 @@ fn f111_sync_vector_change_round_trip_preserves_table_column_identity() {
             },
         ],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let wire: WireChangeSet = original.clone().into();
     let bytes = rmp_serde::to_vec(&wire).expect("rmp_serde encode");
     let decoded: WireChangeSet = rmp_serde::from_slice(&bytes).expect("rmp_serde decode");
-    let restored: ChangeSet = decoded.into();
+    let restored =
+        ChangeSet::try_from(decoded).expect("valid WireChangeSet must convert through protocol");
     assert_eq!(
         restored.vectors[0].index,
         VectorIndexRef::new("evidence", "vector_text")

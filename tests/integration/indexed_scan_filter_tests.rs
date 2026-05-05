@@ -2444,6 +2444,7 @@ fn sy01_create_index_replicates_through_sync() {
         .unwrap();
     let cs = ChangeSet {
         ddl: ddl.clone(),
+        ddl_lsn: vec![Lsn(1); ddl.len()],
         ..ChangeSet::default()
     };
     receiver
@@ -2501,6 +2502,7 @@ fn sy02_drop_index_replicates_through_sync() {
         .execute("CREATE INDEX idx ON t (a)", &empty())
         .unwrap();
     let cs = ChangeSet {
+        ddl_lsn: vec![Lsn(1); ddl.len()],
         ddl,
         ..ChangeSet::default()
     };
@@ -2857,6 +2859,7 @@ fn ba01_batch_apply_create_index_before_rows() {
             name: "idx_a".into(),
             columns: vec![("a".into(), SortDirection::Asc)],
         }],
+        ddl_lsn: vec![Lsn(1)],
         ..ChangeSet::default()
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
@@ -3479,6 +3482,7 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
     let edge_b = Database::open_memory();
     // Replicate schema + index + rows to edge B.
     let cs = ChangeSet {
+        ddl_lsn: vec![Lsn(1); ddl.len()],
         ddl,
         rows: rows_changes,
         ..ChangeSet::default()
@@ -3530,6 +3534,7 @@ fn sy04_desc_direction_replicates_through_sync_ddl() {
         .apply_changes(
             ChangeSet {
                 ddl: ddl.clone(),
+                ddl_lsn: vec![Lsn(1); ddl.len()],
                 ..ChangeSet::default()
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -3607,6 +3612,7 @@ fn sy05_mixed_direction_composite_replicates_through_sync_ddl() {
     receiver
         .apply_changes(
             ChangeSet {
+                ddl_lsn: vec![Lsn(1); ddl.len()],
                 ddl,
                 ..ChangeSet::default()
             },
@@ -3971,6 +3977,7 @@ fn sync_createindex_missing_table_returns_tablenotfound() {
             name: "idx".into(),
             columns: vec![("a".into(), SortDirection::Asc)],
         }],
+        ddl_lsn: vec![Lsn(1)],
         ..ChangeSet::default()
     };
     let err = peer
@@ -4355,6 +4362,7 @@ fn sync_ddl_createtable_regenerates_auto_indexes_on_peer() {
     peer.apply_changes(
         ChangeSet {
             ddl: vec![create_ddl],
+            ddl_lsn: vec![Lsn(1)],
             ..ChangeSet::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),

@@ -854,6 +854,8 @@ fn sc03_create_table_ddl_round_trips_immutable_flag_via_apply_changes() {
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: vec![create],
+
+        ddl_lsn: vec![contextdb_core::Lsn(1)],
     };
     let _: ApplyResult = peer
         .apply_changes(
@@ -963,6 +965,8 @@ fn sc04_peer_update_on_flagged_column_rejected_after_replication() {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: vec![create],
+
+            ddl_lsn: vec![contextdb_core::Lsn(1)],
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
@@ -1023,6 +1027,8 @@ fn sa01_apply_changes_rejects_flagged_mutation_on_existing_row() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1080,6 +1086,8 @@ fn sa02_apply_changes_new_row_sets_flagged_column_value() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1127,6 +1135,8 @@ fn sa03_apply_changes_same_value_replay_is_noop() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1170,6 +1180,8 @@ fn sa04_apply_changes_fresh_row_accepted() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1220,6 +1232,8 @@ fn sa05_sync_upsert_flagged_diff_rejected_row_unchanged() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -2154,6 +2168,8 @@ fn ic09_sync_apply_rejection_under_edge_wins() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
@@ -2208,6 +2224,8 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
@@ -2387,6 +2405,8 @@ fn ic12_concurrent_update_and_sync_apply_on_flagged() {
                     edges: Vec::new(),
                     vectors: Vec::new(),
                     ddl: Vec::new(),
+
+                    ddl_lsn: Vec::new(),
                 },
                 &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
             )
@@ -2572,6 +2592,8 @@ fn ic14_cross_variant_coercion_into_flagged_column_rejected() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -2642,6 +2664,8 @@ fn ic14b_sync_apply_fresh_row_correct_variant_accepted() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -2769,6 +2793,8 @@ fn sa06_partial_changeset_rejects_flagged_row_applies_clean_row() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -2855,6 +2881,8 @@ fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: vec![create_ddl],
+
+            ddl_lsn: vec![contextdb_core::Lsn(1)],
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
@@ -2876,12 +2904,15 @@ fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
         !alter_ddl.is_empty(),
         "origin ALTER must emit an AlterTable DDL"
     );
+    let alter_ddl_lsn = vec![contextdb_core::Lsn(1); alter_ddl.len()];
     peer.apply_changes(
         ChangeSet {
             rows: Vec::new(),
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: alter_ddl,
+
+            ddl_lsn: alter_ddl_lsn,
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )

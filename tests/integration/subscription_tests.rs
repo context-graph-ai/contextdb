@@ -128,6 +128,8 @@ fn s04_apply_changes_source_is_sync_pull() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
 
     let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
@@ -732,6 +734,8 @@ fn s20_auto_sync_fires_commit_event() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
     db.apply_changes(changes, &policies).unwrap();

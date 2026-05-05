@@ -175,15 +175,7 @@ pub(crate) fn execute_plan(
                 return Err(block);
             }
             let bytes_to_release = estimate_drop_table_bytes(db, name);
-            db.drop_table_aux_state(name);
-            db.remove_rank_formulas_for_table(name);
-            db.vector_store_deregister_table(name);
-            db.relational_store().drop_table(name);
-            db.remove_persisted_table(name)?;
-            db.persist_vectors()?;
-            db.persist_graph_edges()?;
-            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn))?;
-            db.remove_event_bus_definitions_for_table(name)?;
+            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl_and_remove_triggers(name, lsn))?;
             db.accountant().release(bytes_to_release);
             db.clear_statement_cache();
             Ok(QueryResult::empty_with_affected(0))
@@ -4734,6 +4726,17 @@ pub(crate) fn coerce_into_column(
     active_tx: Option<TxId>,
 ) -> Result<Value> {
     coerce_value_for_column(db, table, col, v, current_tx_max, active_tx)
+}
+
+pub(crate) fn coerce_into_column_with_meta(
+    table: &str,
+    meta: &TableMeta,
+    col: &str,
+    v: Value,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
+    coerce_value_for_column_with_meta(table, meta, col, v, current_tx_max, active_tx)
 }
 
 fn coerce_value_for_column(

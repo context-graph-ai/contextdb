@@ -3,7 +3,7 @@ use crate::protocol::{
 };
 use crate::subjects::{pull_subject, push_subject};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::ConflictPolicies;
+use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -229,10 +229,19 @@ impl SyncServer {
                     let request: PushRequest = rmp_serde::from_slice(&inner_envelope.payload)
                         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
 
-                    match self
-                        .db
-                        .apply_changes(request.changeset.into(), &self.policies)
-                    {
+                    let changeset = match ChangeSet::try_from(request.changeset) {
+                        Ok(changeset) => changeset,
+                        Err(err) => {
+                            let response = PushResponse {
+                                result: None,
+                                error: Some(err.to_string()),
+                            };
+                            return encode(MessageType::PushResponse, &response)
+                                .map_err(|e| contextdb_core::Error::SyncError(e.to_string()));
+                        }
+                    };
+
+                    match self.db.apply_changes(changeset, &self.policies) {
                         Ok(result) => {
                             let response = PushResponse {
                                 result: Some(result.into()),
@@ -274,13 +283,16 @@ impl SyncServer {
                 let request: PushRequest = rmp_serde::from_slice(&envelope.payload)
                     .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
                 maybe_wait_for_test_push_barrier(request.changeset.rows.len()).await;
-                let response = match self
-                    .db
-                    .apply_changes(request.changeset.into(), &self.policies)
-                {
-                    Ok(result) => PushResponse {
-                        result: Some(result.into()),
-                        error: None,
+                let response = match ChangeSet::try_from(request.changeset) {
+                    Ok(changeset) => match self.db.apply_changes(changeset, &self.policies) {
+                        Ok(result) => PushResponse {
+                            result: Some(result.into()),
+                            error: None,
+                        },
+                        Err(err) => PushResponse {
+                            result: None,
+                            error: Some(err.to_string()),
+                        },
                     },
                     Err(err) => PushResponse {
                         result: None,
@@ -329,23 +341,50 @@ impl SyncServer {
         let mut cursor = None;
         if let Some(max_entries) = request.max_entries {
             let max = max_entries as usize;
-            if changes.rows.len() > max {
-                let mut remainder = changes.rows.split_off(max);
-                // Don't split in the middle of a same-LSN group: extend returned set
-                // to include all rows sharing the LSN at the split boundary.
-                if let (Some(last_returned), Some(first_remainder)) =
-                    (changes.rows.last(), remainder.first())
-                    && last_returned.lsn == first_remainder.lsn
-                {
-                    let boundary_lsn = last_returned.lsn;
-                    let split_idx = remainder.partition_point(|r| r.lsn == boundary_lsn);
-                    let moved: Vec<_> = remainder.drain(..split_idx).collect();
-                    changes.rows.extend(moved);
+            let groups = changes
+                .clone()
+                .split_by_data_lsn()
+                .into_iter()
+                .filter(|group| group.data_entry_count() > 0 || !group.ddl.is_empty())
+                .collect::<Vec<_>>();
+
+            if !groups.is_empty()
+                && groups
+                    .iter()
+                    .map(ChangeSet::data_entry_count)
+                    .sum::<usize>()
+                    > max
+            {
+                let mut selected = Vec::new();
+                let mut selected_entries = 0usize;
+                for group in &groups {
+                    let group_entries = group.data_entry_count().max(group.ddl.len()).max(1);
+                    if !selected.is_empty() && selected_entries + group_entries > max {
+                        break;
+                    }
+                    selected_entries = selected_entries.saturating_add(group_entries);
+                    selected.push(group.clone());
+                    if selected_entries >= max {
+                        break;
+                    }
                 }
-                // Cursor = last LSN of returned set (not remainder)
-                cursor = changes.rows.last().map(|r| r.lsn);
-                has_more = !remainder.is_empty();
+                has_more = selected.len() < groups.len();
+                changes = merge_changeset_groups(selected);
             }
+        }
+        let mut bootstrap_batches = changes.clone().split_at_trigger_bootstrap_barriers();
+        if bootstrap_batches.len() > 1 {
+            changes = bootstrap_batches.remove(0);
+            has_more = true;
+        }
+        if request.max_entries.is_some() || has_more {
+            cursor = changes.max_lsn().or_else(|| {
+                if changes.ddl.is_empty() {
+                    None
+                } else {
+                    Some(self.db.current_lsn())
+                }
+            });
         }
 
         let response = PullResponse {
@@ -385,4 +424,16 @@ impl SyncServer {
         }
         Ok(())
     }
+}
+
+fn merge_changeset_groups(groups: Vec<ChangeSet>) -> ChangeSet {
+    let mut merged = ChangeSet::default();
+    for group in groups {
+        merged.rows.extend(group.rows);
+        merged.edges.extend(group.edges);
+        merged.vectors.extend(group.vectors);
+        merged.ddl.extend(group.ddl);
+        merged.ddl_lsn.extend(group.ddl_lsn);
+    }
+    merged
 }

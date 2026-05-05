@@ -556,6 +556,8 @@ fn p05_pre_commit_source_sync_pull() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
         .unwrap();
@@ -1402,6 +1404,8 @@ fn p24_on_sync_pull_rejects_batch() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let result = db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins));
     assert!(result.is_err());
@@ -1456,6 +1460,8 @@ fn p25_on_sync_pull_filters_rows() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
         .unwrap();
@@ -1634,11 +1640,22 @@ fn p34_apply_changes_per_row_sync_pull() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
         .unwrap();
 
     let ev = events.lock().unwrap();
+    let sync_pulls: Vec<_> = ev
+        .iter()
+        .filter(|e| matches!(e, HookEvent::OnSyncPull))
+        .collect();
+    assert_eq!(
+        sync_pulls.len(),
+        1,
+        "apply_changes must run on_sync_pull once for the inbound batch even when sender LSN groups commit separately"
+    );
     let sync_pres: Vec<_> = ev
         .iter()
         .filter(|e| matches!(e, HookEvent::PreCommit(CommitSource::SyncPull, _)))

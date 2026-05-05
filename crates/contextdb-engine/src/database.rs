@@ -10,7 +10,7 @@ use crate::rank_formula::{FormulaEvalError, RankFormula};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
-    NaturalKey, RowChange, VectorChange,
+    NaturalKey, RowChange, VectorChange, natural_key_column_for_meta,
 };
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 type DynStore = Box<dyn WriteSetApplicator>;
 type GatedBfsEntry = (NodeId, u32, Vec<(NodeId, EdgeType)>);
 type GatedGraphNeighbor = (NodeId, EdgeType, HashMap<String, Value>, NodeId, NodeId);
-const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 64;
+const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 1024;
 const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
 const SAME_PROCESS_REOPEN_RETRY: Duration = Duration::from_millis(500);
 // redb may need a small metadata page on the next write, especially for a new
@@ -46,8 +46,10 @@ const MIN_DISK_WRITE_HEADROOM_BYTES: u64 = 1024;
 mod cron;
 pub(crate) mod event_bus;
 pub(crate) mod gate;
+pub(crate) mod trigger;
 use cron::CronState;
 use event_bus::EventBusState;
+use trigger::TriggerState;
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -299,8 +301,26 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static CRON_CALLBACK_ACTIVE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static TRIGGER_CALLBACK_TX: std::cell::Cell<Option<TxId>> =
+        const { std::cell::Cell::new(None) };
+    static TRIGGER_CALLBACK_DB: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static TRIGGER_CALLBACK_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
     static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct SyncApplyTriggerGateGuard;
+
+impl Drop for SyncApplyTriggerGateGuard {
+    fn drop(&mut self) {
+        SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
 }
 
 pub struct Database {
@@ -319,6 +339,7 @@ pub struct Database {
     vector: MemVectorExecutor<DynStore>,
     session_tx: Mutex<Option<TxId>>,
     instance_id: uuid::Uuid,
+    owner_thread: thread::ThreadId,
     plugin: Arc<dyn DatabasePlugin>,
     access: AccessConstraints,
     accountant: Arc<MemoryAccountant>,
@@ -328,6 +349,7 @@ pub struct Database {
     pruning_guard: Arc<Mutex<()>>,
     cron: Arc<CronState>,
     event_bus: Arc<EventBusState>,
+    trigger: Arc<TriggerState>,
     pending_event_bus_ddl: Mutex<HashMap<TxId, Vec<DdlChange>>>,
     pending_commit_metadata: Mutex<HashMap<TxId, PendingCommitMetadata>>,
     disk_limit: AtomicU64,
@@ -375,7 +397,7 @@ pub(crate) struct WriteSetCounts {
     vector_moves: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PendingCommitMetadata {
     conditional_update_guards: Vec<PendingConditionalUpdateGuard>,
     upsert_intents: Vec<PendingUpsertIntent>,
@@ -731,6 +753,7 @@ impl Database {
         disk_limit: Option<u64>,
         disk_limit_startup_ceiling: Option<u64>,
         event_bus: Arc<EventBusState>,
+        trigger: Arc<TriggerState>,
     ) -> Self {
         Self {
             tx_mgr: tx_mgr.clone(),
@@ -753,6 +776,7 @@ impl Database {
             ),
             session_tx: Mutex::new(None),
             instance_id: uuid::Uuid::new_v4(),
+            owner_thread: thread::current().id(),
             plugin,
             access: AccessConstraints::default(),
             accountant,
@@ -762,6 +786,7 @@ impl Database {
             pruning_guard: Arc::new(Mutex::new(())),
             cron: Arc::new(CronState::new()),
             event_bus,
+            trigger,
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
@@ -998,8 +1023,13 @@ impl Database {
             apply_phase_pause.clone(),
         );
         let event_bus = Arc::new(EventBusState::new());
-        let persistent =
-            PersistentCompositeStore::new(composite, persistence.clone(), Some(event_bus.clone()));
+        let trigger = Arc::new(TriggerState::new());
+        let persistent = PersistentCompositeStore::new(
+            composite,
+            persistence.clone(),
+            Some(event_bus.clone()),
+            Some(trigger.clone()),
+        );
         let store: DynStore = Box::new(persistent);
         let tx_mgr = Arc::new(TxManager::new_with_counters_and_commit_index(
             store,
@@ -1025,6 +1055,7 @@ impl Database {
             effective_disk_limit,
             startup_disk_ceiling,
             event_bus,
+            trigger,
         );
 
         for meta in all_meta.values() {
@@ -1038,6 +1069,7 @@ impl Database {
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         db.load_cron_state_from_persistence()?;
         db.load_event_bus_state_from_persistence()?;
+        db.load_trigger_state_from_persistence()?;
 
         Ok(db)
     }
@@ -1053,6 +1085,7 @@ impl Database {
         let change_log = Arc::new(RwLock::new(Vec::new()));
         let ddl_log = Arc::new(RwLock::new(Vec::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
+        let trigger = Arc::new(TriggerState::new());
         let store: DynStore = Box::new(CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
             graph.clone(),
@@ -1081,6 +1114,7 @@ impl Database {
             None,
             None,
             event_bus,
+            trigger,
         );
         maybe_prebuild_hnsw(&db.vector_store, db.accountant());
         Ok(db)
@@ -1091,9 +1125,23 @@ impl Database {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
             panic!("transaction control is not allowed inside cron callbacks");
         }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
+            panic!("transaction control is not allowed inside trigger callbacks");
+        }
+        if self.trigger_active_on_this_handle() {
+            panic!("transaction control is not allowed inside trigger callbacks");
+        }
         if self.cron.callback_active_on_other_thread() {
             panic!(
                 "transaction control is not allowed from another thread while a cron callback is active"
+            );
+        }
+        if self
+            .trigger
+            .callback_active_on_other_thread(self.owner_thread)
+        {
+            panic!(
+                "transaction control is not allowed from another thread while a trigger callback is active"
             );
         }
         self.tx_mgr.begin()
@@ -1106,9 +1154,28 @@ impl Database {
                 "transaction control is not allowed inside cron callbacks".to_string(),
             ));
         }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "transaction control is not allowed inside trigger callbacks".to_string(),
+            ));
+        }
+        if self.trigger_active_on_this_handle() {
+            return Err(Error::Other(
+                "transaction control is not allowed inside trigger callbacks".to_string(),
+            ));
+        }
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::Other(
                 "transaction control is not allowed from another thread while a cron callback is active"
+                    .to_string(),
+            ));
+        }
+        if self
+            .trigger
+            .callback_active_on_other_thread(self.owner_thread)
+        {
+            return Err(Error::Other(
+                "transaction control is not allowed from another thread while a trigger callback is active"
                     .to_string(),
             ));
         }
@@ -1122,9 +1189,28 @@ impl Database {
                 "transaction control is not allowed inside cron callbacks".to_string(),
             ));
         }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "transaction control is not allowed inside trigger callbacks".to_string(),
+            ));
+        }
+        if self.trigger_active_on_this_handle() {
+            return Err(Error::Other(
+                "transaction control is not allowed inside trigger callbacks".to_string(),
+            ));
+        }
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::Other(
                 "transaction control is not allowed from another thread while a cron callback is active"
+                    .to_string(),
+            ));
+        }
+        if self
+            .trigger
+            .callback_active_on_other_thread(self.owner_thread)
+        {
+            return Err(Error::Other(
+                "transaction control is not allowed from another thread while a trigger callback is active"
                     .to_string(),
             ));
         }
@@ -1145,11 +1231,22 @@ impl Database {
         self.tx_mgr.snapshot_at_lsn(lsn)
     }
 
+    fn enter_sync_apply_trigger_gate_bypass(&self) -> SyncApplyTriggerGateGuard {
+        SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_add(1));
+        });
+        SyncApplyTriggerGateGuard
+    }
+
+    fn sync_apply_trigger_gate_bypass_active() -> bool {
+        SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| depth.get() > 0)
+    }
+
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         let _operation = self.open_operation()?;
         if let Some(cached) = self.cached_statement(sql) {
             self.assert_statement_allowed_inside_cron_callback(&cached.stmt)?;
-            self.assert_statement_allowed_during_cross_thread_cron_callback(&cached.stmt)?;
+            self.assert_statement_allowed_during_cross_thread_callback(&cached.stmt)?;
             let active_tx = self.active_session_tx();
             return self.execute_statement_with_plan(
                 &cached.stmt,
@@ -1162,7 +1259,7 @@ impl Database {
 
         let stmt = contextdb_parser::parse(sql)?;
         self.assert_statement_allowed_inside_cron_callback(&stmt)?;
-        self.assert_statement_allowed_during_cross_thread_cron_callback(&stmt)?;
+        self.assert_statement_allowed_during_cross_thread_callback(&stmt)?;
 
         match &stmt {
             Statement::Begin => {
@@ -1212,6 +1309,10 @@ impl Database {
                 return Ok(QueryResult::empty());
             }
             Statement::CreateTrigger { .. } | Statement::DropTrigger { .. } => {
+                let ddl = self
+                    .ddl_change_for_statement(&stmt, self.active_session_tx())
+                    .expect("trigger statement has DDL change");
+                self.apply_trigger_ddl_from_user(ddl)?;
                 return Ok(QueryResult::empty());
             }
             _ => {}
@@ -1227,6 +1328,9 @@ impl Database {
             if CRON_CALLBACK_DB.with(|slot| slot.get()) == Some(this_db) {
                 return CRON_CALLBACK_TX.with(|slot| slot.get());
             }
+        }
+        if let Some(tx) = self.active_trigger_tx_for_this_handle() {
+            return Some(tx);
         }
         *self.session_tx.lock()
     }
@@ -1253,19 +1357,60 @@ impl Database {
                 ));
             }
         }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get())
+            && Self::statement_forbidden_inside_cron_callback(stmt)
+            && !matches!(
+                stmt,
+                Statement::CreateTrigger { .. } | Statement::DropTrigger { .. }
+            )
+        {
+            return Err(Error::Other(
+                "DDL and transaction control are not allowed inside trigger callbacks".to_string(),
+            ));
+        }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get())
+            && Self::statement_requires_cron_bound_handle(stmt)
+        {
+            let active_tx = self.active_session_tx();
+            let trigger_tx = TRIGGER_CALLBACK_TX.with(|slot| slot.get());
+            let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
+            let this_db = self as *const Self as usize;
+            if active_tx.is_none() || active_tx != trigger_tx || trigger_db != Some(this_db) {
+                return Err(Error::Other(
+                    "trigger callback writes must use the supplied tx-bound database handle"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
-    fn assert_statement_allowed_during_cross_thread_cron_callback(
+    fn assert_statement_allowed_during_cross_thread_callback(
         &self,
         stmt: &Statement,
     ) -> Result<()> {
+        let is_trigger_ddl = matches!(
+            stmt,
+            Statement::CreateTrigger { .. } | Statement::DropTrigger { .. }
+        );
         if self.cron.callback_active_on_other_thread()
             && (Self::statement_forbidden_inside_cron_callback(stmt)
                 || Self::statement_requires_cron_bound_handle(stmt))
         {
             return Err(Error::Other(
                 "database writes from other threads are not allowed while a cron callback is active"
+                    .to_string(),
+            ));
+        }
+        if self
+            .trigger
+            .callback_active_on_other_thread(self.owner_thread)
+            && !is_trigger_ddl
+            && (Self::statement_forbidden_inside_cron_callback(stmt)
+                || Self::statement_requires_cron_bound_handle(stmt))
+        {
+            return Err(Error::Other(
+                "database writes from other threads are not allowed while a trigger callback is active"
                     .to_string(),
             ));
         }
@@ -1279,17 +1424,43 @@ impl Database {
                     .to_string(),
             ));
         }
+        if self
+            .trigger
+            .callback_active_on_other_thread(self.owner_thread)
+        {
+            return Err(Error::Other(
+                "database writes from other threads are not allowed while a trigger callback is active"
+                    .to_string(),
+            ));
+        }
         if !CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Ok(());
+            return self.assert_trigger_callback_tx_bound_handle(tx);
         }
         let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
         let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
         let this_db = self as *const Self as usize;
         if cron_tx == Some(tx) && cron_db == Some(this_db) {
-            Ok(())
+            self.assert_trigger_callback_tx_bound_handle(tx)
         } else {
             Err(Error::Other(
                 "cron callback writes must use the supplied tx-bound database handle".to_string(),
+            ))
+        }
+    }
+
+    fn assert_trigger_callback_tx_bound_handle(&self, tx: TxId) -> Result<()> {
+        if !TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Ok(());
+        }
+        let trigger_tx = TRIGGER_CALLBACK_TX.with(|slot| slot.get());
+        let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
+        let this_db = self as *const Self as usize;
+        if trigger_tx == Some(tx) && trigger_db == Some(this_db) {
+            Ok(())
+        } else {
+            Err(Error::Other(
+                "trigger callback writes must use the supplied tx-bound database handle"
+                    .to_string(),
             ))
         }
     }
@@ -1444,7 +1615,9 @@ impl Database {
             ));
         }
         let stmt = contextdb_parser::parse(sql)?;
-        self.assert_statement_allowed_during_cross_thread_cron_callback(&stmt)?;
+        self.assert_statement_allowed_inside_cron_callback(&stmt)?;
+        self.assert_statement_allowed_during_cross_thread_callback(&stmt)?;
+        self.assert_trigger_callback_tx_bound_handle(tx)?;
         self.execute_statement(&stmt, sql, params, Some(tx))
     }
 
@@ -1460,18 +1633,74 @@ impl Database {
         source: CommitSource,
         event_bus_ddl: &[DdlChange],
     ) -> Result<CommitValidationOutcome> {
-        let mut pending_sink_events = Vec::new();
-        let mut validation_outcome = CommitValidationOutcome::default();
-        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_prepared_and_applied_mut(
+        self.commit_with_source_and_sync_ddl(tx, source, event_bus_ddl, &[])
+    }
+
+    fn commit_with_source_and_sync_ddl(
+        &self,
+        tx: TxId,
+        source: CommitSource,
+        event_bus_ddl: &[DdlChange],
+        trigger_ddl: &[DdlChange],
+    ) -> Result<CommitValidationOutcome> {
+        self.commit_with_source_and_sync_ddl_and_trigger_audit_projection(
             tx,
+            source,
+            event_bus_ddl,
+            trigger_ddl,
+            None,
+        )
+    }
+
+    fn commit_with_source_and_sync_ddl_and_trigger_audit_projection(
+        &self,
+        tx: TxId,
+        source: CommitSource,
+        event_bus_ddl: &[DdlChange],
+        trigger_ddl: &[DdlChange],
+        sync_pull_trigger_audit_projection: Option<&BTreeMap<String, TriggerDeclaration>>,
+    ) -> Result<CommitValidationOutcome> {
+        let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+        let mut pending_sink_events = Vec::new();
+        let mut committed_trigger_audit_entries = Vec::new();
+        let validation_noop_count = std::cell::Cell::new(0_u64);
+        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_active_prepare_and_applied_mut(
+            tx,
+            |_| {
+                if source != CommitSource::SyncPull {
+                    let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
+                    validation_noop_count.set(
+                        validation_noop_count
+                            .get()
+                            .saturating_add(outcome.conditional_noop_count),
+                    );
+                    let audits = self
+                        .dispatch_triggers_for_tx(tx)
+                        .map_err(|failure| failure.error)?;
+                    *pending_trigger_audits.borrow_mut() = audits;
+                    let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
+                    validation_noop_count.set(
+                        validation_noop_count
+                            .get()
+                            .saturating_add(outcome.conditional_noop_count),
+                    );
+                }
+                Ok(())
+            },
             |ws| {
                 if !ws.is_empty() {
                     if source != CommitSource::SyncPull {
                         self.rewrite_txid_placeholders(tx, ws)?;
                     }
-                    validation_outcome = self.commit_validate(tx, ws)?;
+                    let final_validation = self.commit_validate(tx, ws)?;
+                    validation_noop_count.set(
+                        validation_noop_count
+                            .get()
+                            .saturating_add(final_validation.conditional_noop_count),
+                    );
                     if let Some(lsn) = ws.commit_lsn {
                         self.stage_event_bus_ddl_for_commit(lsn, event_bus_ddl)?;
+                        self.stage_trigger_ddl_for_commit(lsn, trigger_ddl)?;
                     }
                     self.plugin.pre_commit(ws, source)?;
                     pending_sink_events = self
@@ -1482,12 +1711,33 @@ impl Database {
                         self.event_bus
                             .stage_sink_events_for_persistence(lsn, pending_sink_events.clone());
                     }
+                    if let Some(lsn) = ws.commit_lsn {
+                        committed_trigger_audit_entries = if source == CommitSource::SyncPull {
+                            let projected_declarations =
+                                self.staged_trigger_declarations_for_commit(lsn);
+                            let audit_projection = sync_pull_trigger_audit_projection
+                                .or(projected_declarations.as_ref());
+                            self.committed_sync_pull_trigger_audits_for_write_set(
+                                ws,
+                                lsn,
+                                audit_projection,
+                            )?
+                        } else {
+                            let pending = pending_trigger_audits.borrow();
+                            self.committed_trigger_audits_for_pending(&pending, ws, lsn)
+                        };
+                        self.stage_trigger_audits_for_persistence(
+                            lsn,
+                            &committed_trigger_audit_entries,
+                        );
+                    }
                 }
                 Ok(())
             },
             |lsn, ws| {
                 if !ws.is_empty() {
                     self.publish_staged_event_bus_ddl_commit(lsn);
+                    self.publish_staged_trigger_ddl_commit(lsn);
                 }
             },
         ) {
@@ -1496,9 +1746,19 @@ impl Database {
                 if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
                     self.event_bus.take_staged_sink_events_for_persistence(lsn);
                     self.discard_staged_event_bus_ddl_commit(lsn);
+                    self.discard_staged_trigger_ddl_commit(lsn);
+                    self.discard_staged_trigger_audits_for_persistence(lsn);
                 }
                 if let Some(ws) = &failure.write_set {
                     self.release_insert_allocations(ws);
+                }
+                if let Err(audit_error) = self.append_rolled_back_trigger_audits(
+                    &pending_trigger_audits.borrow(),
+                    tx,
+                    &failure.error.to_string(),
+                ) {
+                    self.pending_commit_metadata.lock().remove(&tx);
+                    return Err(audit_error);
                 }
                 self.pending_commit_metadata.lock().remove(&tx);
                 return Err(failure.error);
@@ -1510,12 +1770,20 @@ impl Database {
             self.release_delete_allocations(&ws);
             self.plugin.post_commit(&ws, source);
             self.publish_prepared_sink_events_to_memory(pending_sink_events);
+            self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
             self.publish_commit_event_if_subscribers(&ws, source, lsn);
-        } else if !event_bus_ddl.is_empty() {
-            self.apply_event_bus_ddl_batch(event_bus_ddl.to_vec())?;
+        } else {
+            if !event_bus_ddl.is_empty() {
+                self.apply_event_bus_ddl_batch(event_bus_ddl.to_vec())?;
+            }
+            if !trigger_ddl.is_empty() {
+                self.apply_trigger_ddl_batch(trigger_ddl.to_vec())?;
+            }
         }
 
-        Ok(validation_outcome)
+        Ok(CommitValidationOutcome {
+            conditional_noop_count: validation_noop_count.get(),
+        })
     }
 
     fn build_commit_event(
@@ -1552,12 +1820,23 @@ impl Database {
             .collect();
         tables_changed.sort();
 
+        let relational_row_count = ws
+            .relational_inserts
+            .iter()
+            .map(|(table, row)| (table.clone(), row.row_id))
+            .chain(
+                ws.relational_deletes
+                    .iter()
+                    .map(|(table, row_id, _)| (table.clone(), *row_id)),
+            )
+            .collect::<HashSet<_>>()
+            .len();
+
         CommitEvent {
             source,
             lsn,
             tables_changed,
-            row_count: ws.relational_inserts.len()
-                + ws.relational_deletes.len()
+            row_count: relational_row_count
                 + ws.adj_inserts.len()
                 + ws.adj_deletes.len()
                 + ws.vector_inserts.len()
@@ -2005,6 +2284,7 @@ impl Database {
     ) -> Result<RowId> {
         let _operation = self.open_operation()?;
         self.assert_cron_callback_tx_bound_handle(tx)?;
+        self.ensure_trigger_table_ready(table, "insert_row")?;
         // Statement-scoped bound: `Value::TxId(n)` must satisfy
         // `n <= max(committed_watermark, tx)` so writes inside an active
         // transaction can reference their own allocated TxId. The error,
@@ -2031,6 +2311,7 @@ impl Database {
         values: HashMap<ColName, Value>,
         old_row_id: RowId,
     ) -> Result<RowId> {
+        self.ensure_trigger_table_ready(table, "insert_row_replacing")?;
         let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
         self.complete_insert_access_values(table, &mut values)?;
@@ -2104,16 +2385,22 @@ impl Database {
         if let Some(existing) = existing_row.as_ref() {
             self.assert_row_write_allowed(table, existing.row_id, &existing.values, snapshot)?;
             self.assert_row_write_allowed(table, existing.row_id, &values, snapshot)?;
-            let result = self
-                .relational
-                .upsert(tx, table, conflict_col, values, snapshot)?;
+            let changed = values
+                .iter()
+                .any(|(column, value)| existing.values.get(column) != Some(value));
+            if !changed {
+                return Ok(UpsertResult::NoOp);
+            }
+            self.validate_commit_time_upsert_state_transition(table, existing, &values)?;
+            self.relational.delete(tx, table, existing.row_id)?;
+            self.relational
+                .insert_with_row_id(tx, table, existing.row_id, values, snapshot)?;
             if let (Some(uuid), Some(state), Some(_meta)) =
                 (row_uuid, new_state.as_deref(), meta.as_ref())
-                && matches!(result, UpsertResult::Updated)
             {
                 self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
             }
-            return Ok(result);
+            return Ok(UpsertResult::Updated);
         }
 
         let row_id = self.relational_store.new_row_id();
@@ -2177,6 +2464,7 @@ impl Database {
         table: &str,
         mut values: HashMap<ColName, Value>,
     ) -> Result<InsertRowResult> {
+        self.ensure_trigger_table_ready(table, "insert_row")?;
         self.complete_insert_access_values(table, &mut values)?;
         let allow_duplicate_unique_noop =
             !self.table_meta(table).is_some_and(|meta| meta.immutable);
@@ -2201,6 +2489,7 @@ impl Database {
     ) -> Result<UpsertResult> {
         let _operation = self.open_operation()?;
         self.assert_cron_callback_tx_bound_handle(tx)?;
+        self.ensure_trigger_table_ready(table, "upsert_row")?;
         self.complete_insert_access_values(table, &mut values)?;
         let snapshot = self.snapshot_for_read();
         let existing_row = values
@@ -2229,10 +2518,7 @@ impl Database {
             }
         }
         self.validate_row_constraints(tx, table, &values, existing_row_id)?;
-        if let Some(existing) = existing_row.as_ref() {
-            self.assert_row_write_allowed(table, existing.row_id, &existing.values, snapshot)?;
-            self.assert_row_write_allowed(table, existing.row_id, &values, snapshot)?;
-        } else {
+        let Some(existing) = existing_row.as_ref() else {
             let row_id = self.relational_store.new_row_id();
             self.assert_row_write_allowed(table, row_id, &values, snapshot)?;
 
@@ -2253,6 +2539,10 @@ impl Database {
                 self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
             }
             return Ok(UpsertResult::Inserted);
+        };
+        {
+            self.assert_row_write_allowed(table, existing.row_id, &existing.values, snapshot)?;
+            self.assert_row_write_allowed(table, existing.row_id, &values, snapshot)?;
         }
 
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
@@ -2264,18 +2554,24 @@ impl Database {
             .and_then(Value::as_text)
             .map(std::borrow::ToOwned::to_owned);
 
-        let result = self
-            .relational
-            .upsert(tx, table, conflict_col, values, snapshot)?;
+        let changed = values
+            .iter()
+            .any(|(column, value)| existing.values.get(column) != Some(value));
+        if !changed {
+            return Ok(UpsertResult::NoOp);
+        }
+        self.validate_commit_time_upsert_state_transition(table, existing, &values)?;
+        self.relational.delete(tx, table, existing.row_id)?;
+        self.relational
+            .insert_with_row_id(tx, table, existing.row_id, values, snapshot)?;
 
         if let (Some(uuid), Some(state), Some(_meta)) =
             (row_uuid, new_state.as_deref(), meta.as_ref())
-            && matches!(result, UpsertResult::Updated)
         {
             self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
         }
 
-        Ok(result)
+        Ok(UpsertResult::Updated)
     }
 
     fn validate_row_constraints(
@@ -2420,6 +2716,7 @@ impl Database {
                 }
             };
             self.merge_unique_conflict(
+                tx,
                 table,
                 &column.name,
                 &matching_row_ids,
@@ -2480,6 +2777,7 @@ impl Database {
             // matching the plan's single-column error convention.
             let column_label = unique_constraint.first().map(|s| s.as_str()).unwrap_or("");
             self.merge_unique_conflict(
+                tx,
                 table,
                 column_label,
                 &matching_row_ids,
@@ -2497,6 +2795,7 @@ impl Database {
 
     fn merge_unique_conflict(
         &self,
+        tx: TxId,
         table: &str,
         column: &str,
         matching_row_ids: &[RowId],
@@ -2515,6 +2814,12 @@ impl Database {
         }
 
         let matched_row_id = matching_row_ids[0];
+        if self.row_id_is_staged_insert(tx, table, matched_row_id)? {
+            return Err(Error::UniqueViolation {
+                table: table.to_string(),
+                column: column.to_string(),
+            });
+        }
 
         if let Some(existing_row_id) = duplicate_unique_row_id {
             if *existing_row_id != matched_row_id {
@@ -2528,6 +2833,16 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    fn row_id_is_staged_insert(&self, tx: TxId, table: &str, row_id: RowId) -> Result<bool> {
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.relational_inserts
+                .iter()
+                .any(|(staged_table, staged_row)| {
+                    staged_table == table && staged_row.row_id == row_id
+                })
+        })
     }
 
     /// Returns true if `table` has any single-column index covering `column`.
@@ -2787,6 +3102,50 @@ impl Database {
         })
     }
 
+    fn take_conditional_update_guards_for_tx(
+        &self,
+        tx: TxId,
+    ) -> Vec<PendingConditionalUpdateGuard> {
+        self.pending_commit_metadata
+            .lock()
+            .get_mut(&tx)
+            .map(|metadata| std::mem::take(&mut metadata.conditional_update_guards))
+            .unwrap_or_default()
+    }
+
+    fn pending_upsert_intents_for_tx(&self, tx: TxId) -> Vec<PendingUpsertIntent> {
+        self.pending_commit_metadata
+            .lock()
+            .get(&tx)
+            .map(|metadata| metadata.upsert_intents.clone())
+            .unwrap_or_default()
+    }
+
+    fn rewrite_commit_time_upserts_for_write_set(
+        &self,
+        ws: &mut WriteSet,
+        snapshot: SnapshotId,
+        upsert_intents: &[PendingUpsertIntent],
+    ) -> Result<()> {
+        let mut index = 0;
+        while index < ws.relational_inserts.len() {
+            let table = ws.relational_inserts[index].0.clone();
+            let skip_deleted = Self::deleted_row_ids_for_table(ws, &table);
+            if self.apply_original_commit_time_upsert_if_needed(
+                ws,
+                index,
+                &skip_deleted,
+                upsert_intents,
+                snapshot,
+            )? {
+                index = 0;
+                continue;
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
     fn deleted_row_ids_for_table(ws: &WriteSet, table: &str) -> HashSet<RowId> {
         ws.relational_deletes
             .iter()
@@ -2990,6 +3349,22 @@ impl Database {
                 !skip_deleted.contains(&row.row_id) && row.values.get(column) == Some(value)
             })?;
         Ok(!rows.is_empty())
+    }
+
+    fn visible_row_by_column(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+        snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>,
+    ) -> Result<Option<VersionedRow>> {
+        let rows = self
+            .relational
+            .scan_filter_with_tx(None, table, snapshot, &|row| {
+                !skip_deleted.contains(&row.row_id) && row.values.get(column) == Some(value)
+            })?;
+        Ok(rows.into_iter().next())
     }
 
     fn apply_commit_time_upsert(
@@ -4714,6 +5089,7 @@ impl Database {
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation()?;
         self.assert_cron_callback_tx_bound_handle(tx)?;
+        self.ensure_trigger_table_ready(table, "delete_row")?;
         self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot())?;
         self.relational.delete(tx, table, row_id)
     }
@@ -5016,6 +5392,7 @@ impl Database {
         vector: Vec<f32>,
     ) -> Result<()> {
         let _operation = self.open_operation()?;
+        self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
         self.assert_cron_callback_tx_bound_handle(tx)?;
         self.vector_store.state(&index)?;
         self.assert_existing_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
@@ -5040,6 +5417,7 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
+        self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
         self.vector_store.validate_vector(&index, vector.len())?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         let bytes = self.vector_insert_accounted_bytes(&index, vector.len());
@@ -5124,6 +5502,7 @@ impl Database {
 
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation()?;
+        self.ensure_trigger_table_ready(&index.table, "delete_vector")?;
         self.assert_cron_callback_tx_bound_handle(tx)?;
         self.vector_store.state(&index)?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
@@ -5199,6 +5578,7 @@ impl Database {
         old_row_id: RowId,
         new_row_id: RowId,
     ) -> Result<()> {
+        self.ensure_trigger_table_ready(&index.table, "move_vector")?;
         self.vector_store.state(&index)?;
         let existing_live = self
             .vector_store
@@ -5880,6 +6260,21 @@ impl Database {
     }
 
     pub(crate) fn drop_table_aux_state(&self, table: &str) {
+        let edges = self.graph_edges_after_table_drop(table);
+        let mut forward_next: HashMap<NodeId, Vec<AdjEntry>> = HashMap::new();
+        let mut reverse_next: HashMap<NodeId, Vec<AdjEntry>> = HashMap::new();
+        for edge in edges {
+            forward_next
+                .entry(edge.source)
+                .or_default()
+                .push(edge.clone());
+            reverse_next.entry(edge.target).or_default().push(edge);
+        }
+        *self.graph_store.forward_adj.write() = forward_next;
+        *self.graph_store.reverse_adj.write() = reverse_next;
+    }
+
+    pub(crate) fn graph_edges_after_table_drop(&self, table: &str) -> Vec<AdjEntry> {
         let snapshot = self.snapshot_for_read();
         let rows = self.scan(table, snapshot).unwrap_or_default();
         let edge_keys: HashSet<(NodeId, EdgeType, NodeId)> = rows
@@ -5898,26 +6293,23 @@ impl Database {
             })
             .collect();
 
-        if !edge_keys.is_empty() {
-            {
-                let mut forward = self.graph_store.forward_adj.write();
-                for entries in forward.values_mut() {
-                    entries.retain(|entry| {
-                        !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
-                    });
-                }
-                forward.retain(|_, entries| !entries.is_empty());
-            }
-            {
-                let mut reverse = self.graph_store.reverse_adj.write();
-                for entries in reverse.values_mut() {
-                    entries.retain(|entry| {
-                        !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
-                    });
-                }
-                reverse.retain(|_, entries| !entries.is_empty());
-            }
-        }
+        self.graph_store
+            .forward_adj
+            .read()
+            .values()
+            .flat_map(|entries| entries.iter().cloned())
+            .filter(|entry| {
+                !edge_keys.contains(&(entry.source, entry.edge_type.clone(), entry.target))
+            })
+            .collect()
+    }
+
+    pub(crate) fn vector_entries_after_table_drop(&self, table: &str) -> Vec<VectorEntry> {
+        self.vector_store
+            .all_entries()
+            .into_iter()
+            .filter(|entry| entry.index.table != table)
+            .collect()
     }
 
     pub fn table_names(&self) -> Vec<String> {
@@ -5980,18 +6372,10 @@ impl Database {
                     else {
                         continue;
                     };
-                    let natural_key = row
-                        .values
-                        .get("id")
-                        .cloned()
-                        .map(|value| NaturalKey {
-                            column: "id".to_string(),
-                            value,
-                        })
-                        .unwrap_or_else(|| NaturalKey {
-                            column: "id".to_string(),
-                            value: Value::Int64(row_id.0 as i64),
-                        });
+                    let Some((natural_key, _)) = self.row_change_values_from_row(&table, row)
+                    else {
+                        continue;
+                    };
                     out.push(RowChange {
                         table,
                         natural_key,
@@ -6192,6 +6576,15 @@ impl Database {
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::Other(
                 "cannot close database from another thread while a cron callback is active"
+                    .to_string(),
+            ));
+        }
+        if self
+            .trigger
+            .callback_active_on_other_thread(self.owner_thread)
+        {
+            return Err(Error::Other(
+                "cannot close database from another thread while a trigger callback is active"
                     .to_string(),
             ));
         }
@@ -6622,6 +7015,13 @@ impl Database {
         self.tx_mgr.allocate_ddl_lsn(f)
     }
 
+    pub(crate) fn allocate_ddl_lsn_maybe<F, R>(&self, f: F) -> Result<Option<R>>
+    where
+        F: FnOnce(Lsn) -> Result<Option<R>>,
+    {
+        self.tx_mgr.allocate_ddl_lsn_maybe(f)
+    }
+
     pub(crate) fn with_commit_lock<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -6636,17 +7036,6 @@ impl Database {
         lsn: Lsn,
     ) -> Result<()> {
         let change = ddl_change_from_meta(name, meta);
-        if let Some(persistence) = &self.persistence {
-            persistence.append_ddl_log(lsn, &change)?;
-        }
-        self.ddl_log.write().push((lsn, change));
-        Ok(())
-    }
-
-    pub(crate) fn log_drop_table_ddl(&self, name: &str, lsn: Lsn) -> Result<()> {
-        let change = DdlChange::DropTable {
-            name: name.to_string(),
-        };
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
         }
@@ -6860,28 +7249,6 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn persist_graph_edges(&self) -> Result<()> {
-        if let Some(persistence) = &self.persistence {
-            let edges = self
-                .graph_store
-                .forward_adj
-                .read()
-                .values()
-                .flat_map(|entries| entries.iter().cloned())
-                .collect::<Vec<_>>();
-            persistence.rewrite_graph_edges(&edges)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn remove_persisted_table(&self, name: &str) -> Result<()> {
-        if let Some(persistence) = &self.persistence {
-            persistence.remove_table_meta(name)?;
-            persistence.remove_table_data(name)?;
-        }
-        Ok(())
-    }
-
     pub fn change_log_since(&self, since_lsn: Lsn) -> Vec<ChangeLogEntry> {
         let _operation = self.assert_open_operation();
         if !self.access_is_admin() {
@@ -6965,9 +7332,21 @@ impl Database {
     }
 
     fn ddl_log_since_unlocked(&self, since_lsn: Lsn) -> Vec<DdlChange> {
+        self.ddl_log_entries_since_unlocked(since_lsn)
+            .into_iter()
+            .map(|(_, change)| change)
+            .collect()
+    }
+
+    fn ddl_log_entries_since_unlocked(&self, since_lsn: Lsn) -> Vec<(Lsn, DdlChange)> {
         let ddl = self.ddl_log.read();
-        let start = ddl.partition_point(|(lsn, _)| *lsn <= since_lsn);
-        ddl[start..].iter().map(|(_, c)| c.clone()).collect()
+        let mut entries = ddl
+            .iter()
+            .filter(|(lsn, _)| *lsn > since_lsn)
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(lsn, _)| *lsn);
+        entries
     }
 
     /// Builds a complete snapshot of all live data as a ChangeSet.
@@ -6988,6 +7367,7 @@ impl Database {
         if self.access_is_admin() {
             ddl.extend(full_snapshot_ddl(&meta_guard));
             let live_tables = meta_guard.keys().cloned().collect::<HashSet<_>>();
+            ddl.extend(self.trigger_snapshot_ddl_for_tables(&live_tables));
             ddl.extend(self.event_bus_snapshot_ddl_for_tables(&live_tables));
         }
 
@@ -6998,27 +7378,7 @@ impl Database {
                 Some(m) => m,
                 None => continue,
             };
-            let key_col = meta
-                .natural_key_column
-                .clone()
-                .or_else(|| {
-                    if meta
-                        .columns
-                        .iter()
-                        .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
-                    {
-                        Some("id".to_string())
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    meta.columns
-                        .iter()
-                        .find(|c| c.primary_key && c.column_type == ColumnType::Uuid)
-                        .map(|c| c.name.clone())
-                })
-                .unwrap_or_default();
+            let key_col = natural_key_column_for_meta(meta).unwrap_or_default();
             if key_col.is_empty() {
                 continue;
             }
@@ -7088,11 +7448,26 @@ impl Database {
             });
         }
 
+        let first_data_lsn = rows
+            .iter()
+            .map(|row| row.lsn)
+            .chain(edges.iter().map(|edge| edge.lsn))
+            .chain(vectors.iter().map(|vector| vector.lsn))
+            .min()
+            .unwrap_or_else(|| self.current_lsn());
+        let snapshot_schema_lsn = if rows.is_empty() && edges.is_empty() && vectors.is_empty() {
+            self.current_lsn()
+        } else {
+            Lsn(first_data_lsn.0.saturating_sub(1))
+        };
+        let ddl_lsn = vec![snapshot_schema_lsn; ddl.len()];
+
         ChangeSet {
             rows,
             edges,
             vectors,
             ddl,
+            ddl_lsn,
         }
     }
 
@@ -7115,27 +7490,7 @@ impl Database {
                 Some(meta) => meta,
                 None => continue,
             };
-            let key_col = meta
-                .natural_key_column
-                .clone()
-                .or_else(|| {
-                    if meta
-                        .columns
-                        .iter()
-                        .any(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
-                    {
-                        Some("id".to_string())
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    meta.columns
-                        .iter()
-                        .find(|c| c.primary_key && c.column_type == ColumnType::Uuid)
-                        .map(|c| c.name.clone())
-                })
-                .unwrap_or_default();
+            let key_col = natural_key_column_for_meta(meta).unwrap_or_default();
             if key_col.is_empty() {
                 continue;
             }
@@ -7213,6 +7568,7 @@ impl Database {
             edges,
             vectors,
             ddl,
+            ddl_lsn: Vec::new(),
         }
     }
 
@@ -7318,63 +7674,70 @@ impl Database {
         let mut projected = self.relational_store.table_meta.read().clone();
 
         for change in ddl {
-            match change {
-                DdlChange::CreateTable {
-                    name,
-                    columns,
-                    constraints,
-                } => {
-                    projected
-                        .entry(name.clone())
-                        .or_insert_with(|| rough_sync_table_meta(columns, constraints));
-                }
-                DdlChange::AlterTable { name, columns, .. } => {
-                    if let Some(meta) = projected.get_mut(name) {
-                        let mut existing = meta
-                            .columns
-                            .iter()
-                            .map(|column| column.name.clone())
-                            .collect::<HashSet<_>>();
-                        for (column, ty) in columns {
-                            if existing.insert(column.clone()) {
-                                meta.columns.push(rough_sync_column_def(column, ty));
-                            }
-                        }
-                    }
-                }
-                DdlChange::DropTable { name } => {
-                    projected.remove(name);
-                }
-                DdlChange::CreateIndex {
-                    table,
-                    name,
-                    columns,
-                } => {
-                    if let Some(meta) = projected.get_mut(table)
-                        && !meta.indexes.iter().any(|index| index.name == *name)
-                    {
-                        meta.indexes.push(IndexDecl {
-                            name: name.clone(),
-                            columns: columns.clone(),
-                            kind: IndexKind::UserDeclared,
-                        });
-                    }
-                }
-                DdlChange::DropIndex { table, name } => {
-                    if let Some(meta) = projected.get_mut(table) {
-                        meta.indexes.retain(|index| index.name != *name);
-                    }
-                }
-                DdlChange::CreateEventType { .. }
-                | DdlChange::CreateTrigger { .. }
-                | DdlChange::DropTrigger { .. }
-                | DdlChange::CreateSink { .. }
-                | DdlChange::CreateRoute { .. }
-                | DdlChange::DropRoute { .. } => {}
-            }
+            Self::apply_sync_table_ddl_to_projected_meta(&mut projected, change);
         }
 
         projected
+    }
+
+    fn apply_sync_table_ddl_to_projected_meta(
+        projected: &mut HashMap<String, TableMeta>,
+        change: &DdlChange,
+    ) {
+        match change {
+            DdlChange::CreateTable {
+                name,
+                columns,
+                constraints,
+            } => {
+                projected
+                    .entry(name.clone())
+                    .or_insert_with(|| rough_sync_table_meta(columns, constraints));
+            }
+            DdlChange::AlterTable { name, columns, .. } => {
+                if let Some(meta) = projected.get_mut(name) {
+                    let mut existing = meta
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect::<HashSet<_>>();
+                    for (column, ty) in columns {
+                        if existing.insert(column.clone()) {
+                            meta.columns.push(rough_sync_column_def(column, ty));
+                        }
+                    }
+                }
+            }
+            DdlChange::DropTable { name } => {
+                projected.remove(name);
+            }
+            DdlChange::CreateIndex {
+                table,
+                name,
+                columns,
+            } => {
+                if let Some(meta) = projected.get_mut(table)
+                    && !meta.indexes.iter().any(|index| index.name == *name)
+                {
+                    meta.indexes.push(IndexDecl {
+                        name: name.clone(),
+                        columns: columns.clone(),
+                        kind: IndexKind::UserDeclared,
+                    });
+                }
+            }
+            DdlChange::DropIndex { table, name } => {
+                if let Some(meta) = projected.get_mut(table) {
+                    meta.indexes.retain(|index| index.name != *name);
+                }
+            }
+            DdlChange::CreateEventType { .. }
+            | DdlChange::CreateTrigger { .. }
+            | DdlChange::DropTrigger { .. }
+            | DdlChange::CreateSink { .. }
+            | DdlChange::CreateRoute { .. }
+            | DdlChange::DropRoute { .. } => {}
+        }
     }
 
     fn projected_sync_ddl_metadata_bytes(&self, ddl: &[DdlChange]) -> usize {
@@ -7449,58 +7812,298 @@ impl Database {
         required
     }
 
-    fn preflight_sync_ddl_mixed_apply(&self, changes: &ChangeSet) -> Result<()> {
+    fn preflight_sync_ddl_mixed_apply(
+        &self,
+        changes: &ChangeSet,
+        policies: &ConflictPolicies,
+    ) -> Result<()> {
         if changes.ddl.is_empty() {
             return Ok(());
+        }
+
+        let callback_required_triggers = self.preflight_sync_trigger_callback_required(changes)?;
+        let mut ddl_prefix = Vec::new();
+        let mut event_bus_ddl_prefix = Vec::new();
+        let mut incoming_fk_values = HashMap::<String, Vec<HashMap<String, Value>>>::new();
+        let mut deleted_committed_fk_row_ids = HashMap::<String, HashSet<RowId>>::new();
+        let mut projected_table_meta = self.relational_store.table_meta.read().clone();
+        let mut projected_trigger_declarations = self.trigger.declarations.lock().clone();
+        let snapshot = self.snapshot();
+        for group in changes.clone().split_by_data_lsn() {
+            self.preflight_sync_trigger_data_gate(
+                &group.rows,
+                &group.edges,
+                &group.vectors,
+                &projected_trigger_declarations,
+                &callback_required_triggers,
+            )?;
+            ddl_prefix.extend(group.ddl.iter().cloned());
+            event_bus_ddl_prefix.extend(group.ddl.iter().filter_map(|ddl| match ddl {
+                DdlChange::CreateEventType { .. }
+                | DdlChange::CreateSink { .. }
+                | DdlChange::CreateRoute { .. }
+                | DdlChange::DropRoute { .. } => Some(ddl.clone()),
+                _ => None,
+            }));
+            for ddl in &group.ddl {
+                Self::validate_sync_table_ddl_against_projected_meta(&projected_table_meta, ddl)?;
+                Self::apply_sync_table_ddl_to_projected_meta(&mut projected_table_meta, ddl);
+                self.apply_sync_trigger_ddl_to_projection(
+                    &mut projected_trigger_declarations,
+                    ddl,
+                    &projected_table_meta,
+                )?;
+            }
+
+            self.preflight_sync_rows_against_projected_schema(&group.rows, &projected_table_meta)?;
+            self.preflight_sync_vectors_against_projected_schema(
+                &group.vectors,
+                &projected_table_meta,
+            )?;
+            self.preflight_sync_foreign_keys_against_lsn_prefix(
+                &group.rows,
+                &projected_table_meta,
+                snapshot,
+                &mut incoming_fk_values,
+                &mut deleted_committed_fk_row_ids,
+                policies,
+            )?;
+
+            self.preflight_sync_trigger_data_gate(
+                &group.rows,
+                &group.edges,
+                &group.vectors,
+                &projected_trigger_declarations,
+                &callback_required_triggers,
+            )?;
+
+            let dropped_tables = Self::sync_dropped_tables(&ddl_prefix);
+            let projected_event_bus_ddl = event_bus_ddl_prefix
+                .iter()
+                .filter(|ddl| {
+                    !Self::skip_event_bus_ddl_for_dropped_table(ddl, &dropped_tables, |table| {
+                        projected_table_meta.contains_key(table)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            self.validate_event_bus_ddl_batch_with_table_lookup(
+                &projected_event_bus_ddl,
+                |table| projected_table_meta.contains_key(table),
+            )?;
         }
 
         let projected_dag_edge_types = self.projected_sync_dag_edge_types(&changes.ddl);
         self.preflight_sync_edge_cycles(changes, &projected_dag_edge_types)?;
 
-        let mut vector_dims = HashMap::new();
-        {
-            let meta = self.relational_store.table_meta.read();
-            for (table, table_meta) in meta.iter() {
+        Ok(())
+    }
+
+    fn preflight_sync_trigger_callback_required(
+        &self,
+        changes: &ChangeSet,
+    ) -> Result<HashSet<String>> {
+        let projected_trigger_declarations = self.preflight_sync_trigger_projection(changes)?;
+        Ok(self.sync_triggers_requiring_ready_gate(&projected_trigger_declarations))
+    }
+
+    fn preflight_sync_trigger_projection(
+        &self,
+        changes: &ChangeSet,
+    ) -> Result<BTreeMap<String, TriggerDeclaration>> {
+        let mut projected_table_meta = self.relational_store.table_meta.read().clone();
+        let mut projected_trigger_declarations = self.trigger.declarations.lock().clone();
+        for group in changes.clone().split_by_data_lsn() {
+            for ddl in &group.ddl {
+                Self::validate_sync_table_ddl_against_projected_meta(&projected_table_meta, ddl)?;
+                Self::apply_sync_table_ddl_to_projected_meta(&mut projected_table_meta, ddl);
+                self.apply_sync_trigger_ddl_to_projection(
+                    &mut projected_trigger_declarations,
+                    ddl,
+                    &projected_table_meta,
+                )?;
+            }
+        }
+        Ok(projected_trigger_declarations)
+    }
+
+    fn validate_sync_table_ddl_against_projected_meta(
+        projected: &HashMap<String, TableMeta>,
+        change: &DdlChange,
+    ) -> Result<()> {
+        match change {
+            DdlChange::CreateTable {
+                name,
+                columns,
+                constraints,
+            } => Self::validate_sync_table_shape_ddl(name, columns, constraints),
+            DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+            } => Self::validate_sync_table_shape_ddl(name, columns, constraints),
+            DdlChange::CreateIndex {
+                table,
+                name,
+                columns,
+            } => {
+                let Some(meta) = projected.get(table) else {
+                    return Err(Error::TableNotFound(table.clone()));
+                };
+                for prefix in ["__pk_", "__unique_"] {
+                    if name.starts_with(prefix) {
+                        return Err(Error::ReservedIndexName {
+                            table: table.clone(),
+                            name: name.clone(),
+                            prefix: prefix.to_string(),
+                        });
+                    }
+                }
+                for (column, _) in columns {
+                    if !meta
+                        .columns
+                        .iter()
+                        .any(|candidate| candidate.name == *column)
+                    {
+                        return Err(Error::ColumnNotFound {
+                            table: table.clone(),
+                            column: column.clone(),
+                        });
+                    }
+                }
+                for (column, _) in columns {
+                    let column_meta = meta
+                        .columns
+                        .iter()
+                        .find(|candidate| candidate.name == *column)
+                        .expect("column existence verified above");
+                    if matches!(
+                        column_meta.column_type,
+                        ColumnType::Json | ColumnType::Vector(_)
+                    ) {
+                        return Err(Error::ColumnNotIndexable {
+                            table: table.clone(),
+                            column: column.clone(),
+                            column_type: column_meta.column_type.clone(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_sync_table_shape_ddl(
+        name: &str,
+        columns: &[(String, String)],
+        constraints: &[String],
+    ) -> Result<()> {
+        let sql = sync_create_table_sql(name, columns, constraints);
+        let stmt = contextdb_parser::parse(&sql)?;
+        let _ = contextdb_planner::plan(&stmt)?;
+        Ok(())
+    }
+
+    fn preflight_sync_rows_against_projected_schema(
+        &self,
+        rows: &[RowChange],
+        projected_table_meta: &HashMap<String, TableMeta>,
+    ) -> Result<()> {
+        for row in rows {
+            if row.values.is_empty() {
+                continue;
+            }
+            let table_meta = projected_table_meta
+                .get(&row.table)
+                .ok_or_else(|| Error::TableNotFound(row.table.clone()))?;
+            let expected_natural_key = natural_key_column_for_meta(table_meta)
+                .ok_or_else(|| Error::NotSyncEligible(row.table.clone()))?;
+            if row.natural_key.column != expected_natural_key {
+                let column_exists = table_meta
+                    .columns
+                    .iter()
+                    .any(|column| column.name == row.natural_key.column);
+                if column_exists {
+                    return Err(Error::SyncError(format!(
+                        "sync row natural key column mismatch for {}: got {}, expected {}",
+                        row.table, row.natural_key.column, expected_natural_key
+                    )));
+                }
+                return Err(Error::ColumnNotFound {
+                    table: row.table.clone(),
+                    column: row.natural_key.column.clone(),
+                });
+            }
+            if !row.deleted {
+                match row.values.get(&expected_natural_key) {
+                    Some(value) if value == &row.natural_key.value => {}
+                    _ => {
+                        return Err(Error::SyncError(format!(
+                            "sync row natural key value mismatch for {}.{}",
+                            row.table, expected_natural_key
+                        )));
+                    }
+                }
+                for (column, value) in &row.values {
+                    let is_vector_bypass = matches!(value, Value::Vector(_))
+                        && table_meta
+                            .columns
+                            .iter()
+                            .find(|candidate| candidate.name == *column)
+                            .map(|candidate| matches!(candidate.column_type, ColumnType::Vector(_)))
+                            .unwrap_or(false);
+                    if !is_vector_bypass {
+                        crate::executor::coerce_into_column_with_meta(
+                            &row.table,
+                            table_meta,
+                            column,
+                            value.clone(),
+                            None,
+                            None,
+                        )?;
+                    }
+                }
                 for column in &table_meta.columns {
-                    if let ColumnType::Vector(dimension) = column.column_type {
-                        vector_dims.insert(
-                            VectorIndexRef::new(table.clone(), column.name.clone()),
-                            dimension,
-                        );
+                    if column.nullable || column.primary_key || column.default.is_some() {
+                        continue;
                     }
-                }
-            }
-        }
-
-        for ddl in &changes.ddl {
-            match ddl {
-                DdlChange::CreateTable { name, columns, .. }
-                | DdlChange::AlterTable { name, columns, .. } => {
-                    for (column, ty) in columns {
-                        if let Some(dimension) = ddl_vector_dimension(ty) {
-                            vector_dims.insert(
-                                VectorIndexRef::new(name.clone(), column.clone()),
-                                dimension,
-                            );
+                    match row.values.get(&column.name) {
+                        None | Some(Value::Null) => {
+                            return Err(Error::ColumnNotNullable {
+                                table: row.table.clone(),
+                                column: column.name.clone(),
+                            });
                         }
+                        _ => {}
                     }
                 }
-                DdlChange::DropTable { name } => {
-                    vector_dims.retain(|index, _| index.table != *name);
-                }
-                DdlChange::CreateIndex { .. }
-                | DdlChange::DropIndex { .. }
-                | DdlChange::CreateTrigger { .. }
-                | DdlChange::DropTrigger { .. }
-                | DdlChange::CreateEventType { .. }
-                | DdlChange::CreateSink { .. }
-                | DdlChange::CreateRoute { .. }
-                | DdlChange::DropRoute { .. } => {}
             }
         }
+        Ok(())
+    }
 
-        for vector in &changes.vectors {
-            let Some(expected) = vector_dims.get(&vector.index).copied() else {
+    fn preflight_sync_vectors_against_projected_schema(
+        &self,
+        vectors: &[VectorChange],
+        projected_table_meta: &HashMap<String, TableMeta>,
+    ) -> Result<()> {
+        for vector in vectors {
+            let Some(table_meta) = projected_table_meta.get(&vector.index.table) else {
+                return Err(Error::UnknownVectorIndex {
+                    index: vector.index.clone(),
+                });
+            };
+            let Some(column) = table_meta
+                .columns
+                .iter()
+                .find(|column| column.name == vector.index.column)
+            else {
+                return Err(Error::UnknownVectorIndex {
+                    index: vector.index.clone(),
+                });
+            };
+            let ColumnType::Vector(expected) = column.column_type else {
                 return Err(Error::UnknownVectorIndex {
                     index: vector.index.clone(),
                 });
@@ -7513,8 +8116,283 @@ impl Database {
                 });
             }
         }
-
         Ok(())
+    }
+
+    fn preflight_sync_foreign_keys_against_lsn_prefix(
+        &self,
+        rows: &[RowChange],
+        projected_table_meta: &HashMap<String, TableMeta>,
+        snapshot: SnapshotId,
+        incoming_values: &mut HashMap<String, Vec<HashMap<String, Value>>>,
+        deleted_committed_row_ids: &mut HashMap<String, HashSet<RowId>>,
+        policies: &ConflictPolicies,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut deleted_projected_rows = Vec::<(String, HashMap<String, Value>)>::new();
+        let mut current_deleted_committed_row_ids = Vec::<(String, RowId)>::new();
+        let mut applying_rows = Vec::<&RowChange>::new();
+        for row in rows.iter().filter(|row| row.deleted) {
+            let empty_deleted = HashSet::new();
+            let skip_deleted = deleted_committed_row_ids
+                .get(&row.table)
+                .unwrap_or(&empty_deleted);
+            if self.table_meta(&row.table).is_some()
+                && let Some(committed) = self.visible_row_by_column(
+                    &row.table,
+                    &row.natural_key.column,
+                    &row.natural_key.value,
+                    snapshot,
+                    skip_deleted,
+                )?
+            {
+                current_deleted_committed_row_ids.push((row.table.clone(), committed.row_id));
+                deleted_projected_rows.push((row.table.clone(), committed.values));
+                continue;
+            }
+            if let Some(incoming) = incoming_values.get(&row.table).and_then(|table_values| {
+                table_values.iter().find(|values| {
+                    values.get(&row.natural_key.column) == Some(&row.natural_key.value)
+                })
+            }) {
+                deleted_projected_rows.push((row.table.clone(), incoming.clone()));
+            }
+        }
+
+        let mut post_incoming_values = incoming_values.clone();
+        for row in rows.iter().filter(|row| row.deleted) {
+            if let Some(table_values) = post_incoming_values.get_mut(&row.table) {
+                table_values.retain(|values| {
+                    values.get(&row.natural_key.column) != Some(&row.natural_key.value)
+                });
+            }
+        }
+        let mut post_deleted_committed_row_ids = deleted_committed_row_ids.clone();
+        for (table, row_id) in current_deleted_committed_row_ids {
+            post_deleted_committed_row_ids
+                .entry(table)
+                .or_default()
+                .insert(row_id);
+        }
+        for row in rows {
+            if row.deleted || row.values.is_empty() {
+                continue;
+            }
+            let policy = Self::sync_conflict_policy_for_table(policies, &row.table);
+            let mut replaces_incoming_prefix = false;
+            if let Some(table_values) = post_incoming_values.get_mut(&row.table) {
+                let mut retained = Vec::with_capacity(table_values.len());
+                for values in table_values.drain(..) {
+                    if values.get(&row.natural_key.column) == Some(&row.natural_key.value) {
+                        replaces_incoming_prefix = true;
+                        deleted_projected_rows.push((row.table.clone(), values));
+                    } else {
+                        retained.push(values);
+                    }
+                }
+                *table_values = retained;
+            }
+            let empty_deleted = HashSet::new();
+            let skip_deleted = post_deleted_committed_row_ids
+                .get(&row.table)
+                .unwrap_or(&empty_deleted);
+            if self.table_meta(&row.table).is_some()
+                && let Some(committed) = self.visible_row_by_column(
+                    &row.table,
+                    &row.natural_key.column,
+                    &row.natural_key.value,
+                    snapshot,
+                    skip_deleted,
+                )?
+            {
+                if !replaces_incoming_prefix
+                    && !Self::sync_row_applies_over_committed(row, &committed, policy)
+                {
+                    continue;
+                }
+                post_deleted_committed_row_ids
+                    .entry(row.table.clone())
+                    .or_default()
+                    .insert(committed.row_id);
+                deleted_projected_rows.push((row.table.clone(), committed.values));
+            }
+            post_incoming_values
+                .entry(row.table.clone())
+                .or_default()
+                .push(row.values.clone());
+            applying_rows.push(row);
+        }
+
+        for row in applying_rows {
+            let table_meta = projected_table_meta
+                .get(&row.table)
+                .ok_or_else(|| Error::TableNotFound(row.table.clone()))?;
+            for column in &table_meta.columns {
+                let Some(reference) = &column.references else {
+                    continue;
+                };
+                let Some(value) = row.values.get(&column.name) else {
+                    continue;
+                };
+                if *value == Value::Null {
+                    continue;
+                }
+                if !projected_table_meta.contains_key(&reference.table) {
+                    return Err(Error::ForeignKeyViolation {
+                        table: row.table.clone(),
+                        column: column.name.clone(),
+                        ref_table: reference.table.clone(),
+                    });
+                }
+                let incoming_match =
+                    post_incoming_values
+                        .get(&reference.table)
+                        .is_some_and(|rows| {
+                            rows.iter()
+                                .any(|values| values.get(&reference.column) == Some(value))
+                        });
+                if incoming_match {
+                    continue;
+                }
+                let empty_deleted = HashSet::new();
+                let deleted_parent_row_ids = post_deleted_committed_row_ids
+                    .get(&reference.table)
+                    .unwrap_or(&empty_deleted);
+                let committed_match = if self.table_meta(&reference.table).is_some() {
+                    self.visible_row_exists_by_column(
+                        &reference.table,
+                        &reference.column,
+                        value,
+                        snapshot,
+                        deleted_parent_row_ids,
+                    )?
+                } else {
+                    false
+                };
+                if !committed_match {
+                    return Err(Error::ForeignKeyViolation {
+                        table: row.table.clone(),
+                        column: column.name.clone(),
+                        ref_table: reference.table.clone(),
+                    });
+                }
+            }
+        }
+        let reverse_refs = projected_table_meta
+            .iter()
+            .flat_map(|(child_table, meta)| {
+                meta.columns.iter().filter_map(|column| {
+                    column.references.as_ref().map(|reference| {
+                        (
+                            reference.table.clone(),
+                            reference.column.clone(),
+                            child_table.clone(),
+                            column.name.clone(),
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for (parent_table, parent_values) in &deleted_projected_rows {
+            for (ref_table, ref_column, child_table, child_column) in &reverse_refs {
+                if ref_table != parent_table {
+                    continue;
+                }
+                let Some(parent_value) = parent_values.get(ref_column) else {
+                    continue;
+                };
+                let parent_replaced_with_same_key = post_incoming_values
+                    .get(parent_table)
+                    .is_some_and(|table_values| {
+                        table_values
+                            .iter()
+                            .any(|values| values.get(ref_column) == Some(parent_value))
+                    });
+                if parent_replaced_with_same_key {
+                    continue;
+                }
+                let incoming_child_match =
+                    post_incoming_values
+                        .get(child_table)
+                        .is_some_and(|table_values| {
+                            table_values
+                                .iter()
+                                .any(|values| values.get(child_column) == Some(parent_value))
+                        });
+                if incoming_child_match {
+                    return Err(Error::ForeignKeyViolation {
+                        table: child_table.clone(),
+                        column: child_column.clone(),
+                        ref_table: parent_table.clone(),
+                    });
+                }
+                let empty_deleted = HashSet::new();
+                let deleted_child_row_ids = post_deleted_committed_row_ids
+                    .get(child_table)
+                    .unwrap_or(&empty_deleted);
+                if self.table_meta(child_table).is_some()
+                    && self.visible_row_exists_by_column(
+                        child_table,
+                        child_column,
+                        parent_value,
+                        snapshot,
+                        deleted_child_row_ids,
+                    )?
+                {
+                    return Err(Error::ForeignKeyViolation {
+                        table: child_table.clone(),
+                        column: child_column.clone(),
+                        ref_table: parent_table.clone(),
+                    });
+                }
+            }
+        }
+
+        *incoming_values = post_incoming_values;
+        *deleted_committed_row_ids = post_deleted_committed_row_ids;
+        Ok(())
+    }
+
+    fn sync_conflict_policy_for_table(policies: &ConflictPolicies, table: &str) -> ConflictPolicy {
+        policies
+            .per_table
+            .get(table)
+            .copied()
+            .unwrap_or(policies.default)
+    }
+
+    fn sync_row_applies_over_committed(
+        row: &RowChange,
+        committed: &VersionedRow,
+        policy: ConflictPolicy,
+    ) -> bool {
+        match policy {
+            ConflictPolicy::InsertIfNotExists | ConflictPolicy::ServerWins => false,
+            ConflictPolicy::EdgeWins => true,
+            ConflictPolicy::LatestWins => Self::sync_latest_wins_incoming(row, committed),
+        }
+    }
+
+    fn sync_latest_wins_incoming(row: &RowChange, committed: &VersionedRow) -> bool {
+        if row.lsn != committed.lsn {
+            return row.lsn > committed.lsn;
+        }
+        for (col, incoming_val) in &row.values {
+            if let (Value::TxId(incoming_tx), Some(Value::TxId(local_tx))) =
+                (incoming_val, committed.values.get(col))
+            {
+                if incoming_tx.0 > local_tx.0 {
+                    return true;
+                }
+                if incoming_tx.0 < local_tx.0 {
+                    return false;
+                }
+            }
+        }
+        false
     }
 
     fn projected_sync_dag_edge_types(&self, ddl: &[DdlChange]) -> HashSet<EdgeType> {
@@ -7545,6 +8423,30 @@ impl Database {
         }
 
         edge_types
+    }
+
+    fn sync_dropped_tables(ddl: &[DdlChange]) -> HashSet<String> {
+        ddl.iter()
+            .filter_map(|change| match change {
+                DdlChange::DropTable { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn skip_event_bus_ddl_for_dropped_table(
+        ddl: &DdlChange,
+        dropped_tables: &HashSet<String>,
+        table_exists_after_apply: impl Fn(&str) -> bool,
+    ) -> bool {
+        match ddl {
+            DdlChange::CreateEventType { table, .. } | DdlChange::CreateRoute { table, .. } => {
+                !table.is_empty()
+                    && !table_exists_after_apply(table)
+                    && dropped_tables.contains(table)
+            }
+            _ => false,
+        }
     }
 
     fn preflight_sync_edge_cycles(
@@ -7663,14 +8565,15 @@ impl Database {
             return self.persisted_state_since(since_lsn);
         }
 
-        let (mut ddl, change_entries) = self.with_commit_lock(|| {
-            let ddl = self.ddl_log_since_unlocked(since_lsn);
+        let (mut ddl_entries, change_entries) = self.with_commit_lock(|| {
+            let ddl = self.ddl_log_entries_since_unlocked(since_lsn);
             let changes = self.change_log_since_unlocked(since_lsn);
             (ddl, changes)
         });
         if !self.access_is_admin() {
-            ddl.clear();
+            ddl_entries.clear();
         }
+        let (ddl_lsn, ddl): (Vec<_>, Vec<_>) = ddl_entries.into_iter().unzip();
 
         let mut rows = Vec::new();
         let mut edges = Vec::new();
@@ -7853,6 +8756,7 @@ impl Database {
             edges,
             vectors,
             ddl,
+            ddl_lsn,
         }
     }
 
@@ -7912,48 +8816,94 @@ impl Database {
 
     pub fn complete_initialization(&self) -> Result<()> {
         let _operation = self.open_operation()?;
+        let declarations = self.trigger.declarations.lock();
+        let callbacks = self.trigger.callbacks.read();
+        for name in declarations.keys() {
+            if !callbacks.contains_key(name) {
+                return Err(Error::TriggerCallbackMissing {
+                    trigger_name: name.clone(),
+                });
+            }
+        }
+        self.trigger.ready.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    pub fn register_trigger_callback<F>(&self, _name: &str, _callback: F) -> Result<()>
+    pub fn register_trigger_callback<F>(&self, name: &str, callback: F) -> Result<()>
     where
         F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static,
     {
         let _operation = self.open_operation()?;
+        if !self.trigger.declarations.lock().contains_key(name) {
+            return Err(Error::TriggerNotDeclared {
+                trigger_name: name.to_string(),
+            });
+        }
+        let mut callbacks = self.trigger.callbacks.write();
+        if callbacks.contains_key(name) {
+            return Err(Error::TriggerAlreadyRegistered {
+                trigger_name: name.to_string(),
+            });
+        }
+        callbacks.insert(name.to_string(), Arc::new(callback));
         Ok(())
     }
 
     pub fn list_triggers(&self) -> Vec<TriggerDeclaration> {
         let _operation = self.assert_open_operation();
-        Vec::new()
+        self.persisted_trigger_declarations()
     }
 
     pub fn registered_trigger_callbacks(&self) -> Vec<String> {
         let _operation = self.assert_open_operation();
-        Vec::new()
+        let mut names = self
+            .trigger
+            .callbacks
+            .read()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     pub fn trigger_cascade_depth_cap(&self) -> u32 {
         let _operation = self.assert_open_operation();
-        0
+        trigger::TRIGGER_CASCADE_DEPTH_CAP
     }
 
     pub fn trigger_audit_ring_capacity(&self) -> usize {
         let _operation = self.assert_open_operation();
-        0
+        trigger::TRIGGER_AUDIT_RING_CAPACITY
     }
 
     pub fn trigger_audit_log(&self) -> Vec<TriggerAuditEntry> {
         let _operation = self.assert_open_operation();
-        Vec::new()
+        self.trigger.audit_ring.lock().iter().cloned().collect()
     }
 
     pub fn trigger_audit_history(
         &self,
-        _filter: TriggerAuditFilter,
+        filter: TriggerAuditFilter,
     ) -> Result<Vec<TriggerAuditEntry>> {
         let _operation = self.open_operation()?;
-        Ok(Vec::new())
+        let history = if let Some(persistence) = &self.persistence {
+            persistence.load_trigger_audit_history()?
+        } else {
+            self.trigger.volatile_audit_history.lock().clone()
+        };
+        Ok(history
+            .into_iter()
+            .filter(|entry| {
+                filter
+                    .trigger_name
+                    .as_ref()
+                    .is_none_or(|name| entry.trigger_name == *name)
+                    && filter
+                        .status
+                        .is_none_or(|status| entry.status.matches_filter(status))
+            })
+            .collect())
     }
 
     /// Applies a ChangeSet to this database with the given conflict policies.
@@ -7968,9 +8918,23 @@ impl Database {
                 "apply_changes is not allowed inside cron callbacks".to_string(),
             ));
         }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "apply_changes is not allowed inside trigger callbacks".to_string(),
+            ));
+        }
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::Other(
                 "apply_changes is not allowed from another thread while a cron callback is active"
+                    .to_string(),
+            ));
+        }
+        if self
+            .trigger
+            .callback_active_on_other_thread(self.owner_thread)
+        {
+            return Err(Error::Other(
+                "apply_changes is not allowed from another thread while a trigger callback is active"
                     .to_string(),
             ));
         }
@@ -7979,8 +8943,25 @@ impl Database {
         // runs inside the tx manager's commit_mutex, so no second write
         // acquisition happens for the scope of this call.
         self.relational_store.bump_index_write_lock_count();
+        Self::validate_public_changeset_ddl_lsn(&changes)?;
         self.plugin.on_sync_pull(&mut changes)?;
+        Self::validate_public_changeset_ddl_lsn(&changes)?;
         if !self.access_is_admin() && !changes.ddl.is_empty() {
+            if let Some(trigger_ddl) = changes.ddl.iter().find(|ddl| {
+                matches!(
+                    ddl,
+                    DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. }
+                )
+            }) {
+                let operation = match trigger_ddl {
+                    DdlChange::CreateTrigger { .. } => "apply_changes CREATE TRIGGER",
+                    DdlChange::DropTrigger { .. } => "apply_changes DROP TRIGGER",
+                    _ => "apply_changes trigger DDL",
+                };
+                return Err(Error::TriggerRequiresAdmin {
+                    operation: operation.to_string(),
+                });
+            }
             return Err(Error::Other(
                 "sync DDL apply requires an admin database handle".to_string(),
             ));
@@ -8001,27 +8982,70 @@ impl Database {
                 }
             }
         }
-        self.preflight_sync_ddl_mixed_apply(&changes)?;
+        self.preflight_sync_ddl_mixed_apply(&changes, policies)?;
+        self.preflight_sync_apply_trigger_ready(&changes)?;
+        let _sync_trigger_gate = self.enter_sync_apply_trigger_gate_bypass();
 
-        let atomic_mixed_apply = !changes.edges.is_empty() || !changes.vectors.is_empty();
-        let has_event_bus_ddl = changes.ddl.iter().any(|ddl| {
-            matches!(
-                ddl,
-                DdlChange::CreateEventType { .. }
-                    | DdlChange::CreateSink { .. }
-                    | DdlChange::CreateRoute { .. }
-                    | DdlChange::DropRoute { .. }
-            )
-        });
+        let lsn_groups = changes.split_by_data_lsn();
+        if lsn_groups.len() > 1 {
+            let mut total = ApplyResult {
+                applied_rows: 0,
+                skipped_rows: 0,
+                conflicts: Vec::new(),
+                new_lsn: self.current_lsn(),
+            };
+            for group in lsn_groups {
+                let result = self.apply_changes_single_lsn_group(group, policies)?;
+                total.applied_rows += result.applied_rows;
+                total.skipped_rows += result.skipped_rows;
+                total.conflicts.extend(result.conflicts);
+                total.new_lsn = result.new_lsn;
+            }
+            return Ok(total);
+        }
+
+        self.apply_changes_single_lsn_group(
+            lsn_groups
+                .into_iter()
+                .next()
+                .expect("split_by_data_lsn always returns at least one group"),
+            policies,
+        )
+    }
+
+    fn validate_public_changeset_ddl_lsn(changes: &ChangeSet) -> Result<()> {
+        changes
+            .validate_ddl_lsn_cardinality()
+            .map_err(Error::SyncError)
+    }
+
+    fn preflight_sync_apply_trigger_ready(&self, changes: &ChangeSet) -> Result<()> {
+        if self.trigger.ready.load(Ordering::SeqCst) || changes.is_empty() {
+            return Ok(());
+        }
+
+        if self.sync_changeset_is_trigger_tombstone_only(changes) {
+            return Ok(());
+        }
+
+        if !changes.ddl.is_empty() {
+            let projected_triggers = self.preflight_sync_trigger_projection(changes)?;
+            if projected_triggers.is_empty() {
+                return Ok(());
+            }
+        }
+
+        self.ensure_sync_apply_ready()
+    }
+
+    fn apply_changes_single_lsn_group(
+        &self,
+        changes: ChangeSet,
+        policies: &ConflictPolicies,
+    ) -> Result<ApplyResult> {
         let mut tx = self.begin();
-        let commit_each_row = self.access_is_admin()
-            && !atomic_mixed_apply
-            && !has_event_bus_ddl
-            && changes.rows.len() <= 128;
-        let batch_row_commits = self.access_is_admin()
-            && !atomic_mixed_apply
-            && !has_event_bus_ddl
-            && changes.rows.len() > 128;
+        let commit_each_row = false;
+        let batch_row_commits = false;
         let mut result = ApplyResult {
             applied_rows: 0,
             skipped_rows: 0,
@@ -8035,6 +9059,10 @@ impl Database {
         let mut table_meta_cache: HashMap<String, Option<TableMeta>> = HashMap::new();
         let mut visible_rows_cache: HashMap<String, Vec<VersionedRow>> = HashMap::new();
         let mut event_bus_ddl = Vec::new();
+        let mut trigger_ddl = Vec::new();
+        let mut sync_trigger_projection = self.trigger.declarations.lock().clone();
+        let group_has_data = changes.data_entry_count() != 0;
+        let dropped_tables = Self::sync_dropped_tables(&changes.ddl);
 
         let ddl_result = (|| -> Result<()> {
             for ddl in changes.ddl.clone() {
@@ -8085,25 +9113,48 @@ impl Database {
                             }
                             continue;
                         }
-                        let mut sql = format!(
-                            "CREATE TABLE {} ({})",
-                            name,
-                            columns
-                                .iter()
-                                .map(|(col, ty)| format!("{col} {ty}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                        if !constraints.is_empty() {
-                            sql.push(' ');
-                            sql.push_str(&constraints.join(" "));
-                        }
+                        let sql = sync_create_table_sql(&name, &columns, &constraints);
                         self.execute_in_tx(tx, &sql, &HashMap::new())?;
                         self.clear_statement_cache();
                         table_meta_cache.remove(&name);
                         visible_rows_cache.remove(&name);
                     }
                     DdlChange::DropTable { name } => {
+                        let projected_table_triggers = sync_trigger_projection
+                            .values()
+                            .filter(|declaration| declaration.table == name)
+                            .map(|declaration| declaration.name.clone())
+                            .collect::<Vec<_>>();
+                        if !projected_table_triggers.is_empty() {
+                            let current_trigger_names = self
+                                .trigger
+                                .declarations
+                                .lock()
+                                .keys()
+                                .cloned()
+                                .collect::<HashSet<_>>();
+                            for trigger_name in &projected_table_triggers {
+                                let already_queued_drop = trigger_ddl.iter().any(|change| {
+                                    matches!(change, DdlChange::DropTrigger { name } if name == trigger_name)
+                                });
+                                if !current_trigger_names.contains(trigger_name)
+                                    && !already_queued_drop
+                                {
+                                    trigger_ddl.push(DdlChange::DropTrigger {
+                                        name: trigger_name.clone(),
+                                    });
+                                }
+                            }
+                            for trigger_name in projected_table_triggers {
+                                sync_trigger_projection.remove(&trigger_name);
+                            }
+                        }
+                        let table_had_triggers = self
+                            .trigger
+                            .declarations
+                            .lock()
+                            .values()
+                            .any(|declaration| declaration.table == name);
                         if self.table_meta(&name).is_some() {
                             if let Some(block) =
                                 crate::executor::rank_policy_drop_table_blocker(self, &name)
@@ -8112,17 +9163,28 @@ impl Database {
                             }
                             let bytes_to_release =
                                 crate::executor::estimate_drop_table_bytes(self, &name);
-                            self.drop_table_aux_state(&name);
-                            self.remove_rank_formulas_for_table(&name);
-                            self.vector_store_deregister_table(&name);
-                            self.relational_store().drop_table(&name);
-                            self.remove_persisted_table(&name)?;
-                            self.persist_vectors()?;
-                            self.persist_graph_edges()?;
-                            self.allocate_ddl_lsn(|lsn| self.log_drop_table_ddl(&name, lsn))?;
-                            self.remove_event_bus_definitions_for_table(&name)?;
+                            let prefix_trigger_ddl = std::mem::take(&mut trigger_ddl);
+                            self.allocate_ddl_lsn(|lsn| {
+                                self.log_drop_table_ddl_and_remove_triggers_with_prefix(
+                                    &name,
+                                    lsn,
+                                    &prefix_trigger_ddl,
+                                )
+                            })?;
                             self.accountant().release(bytes_to_release);
                             self.clear_statement_cache();
+                        } else if table_had_triggers {
+                            let prefix_trigger_ddl = std::mem::take(&mut trigger_ddl);
+                            self.allocate_ddl_lsn(|lsn| {
+                                self.log_drop_table_ddl_and_remove_triggers_with_prefix(
+                                    &name,
+                                    lsn,
+                                    &prefix_trigger_ddl,
+                                )
+                            })?;
+                            self.clear_statement_cache();
+                        } else if !group_has_data && !trigger_ddl.is_empty() {
+                            self.apply_trigger_ddl_batch(std::mem::take(&mut trigger_ddl))?;
                         }
                         table_meta_cache.remove(&name);
                         visible_rows_cache.remove(&name);
@@ -8227,7 +9289,30 @@ impl Database {
                         }
                         table_meta_cache.remove(&table);
                     }
-                    DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. } => {}
+                    trigger_change @ (DdlChange::CreateTrigger { .. }
+                    | DdlChange::DropTrigger { .. }) => {
+                        let trigger_table = match &trigger_change {
+                            DdlChange::CreateTrigger { table, .. } => Some(table.clone()),
+                            DdlChange::DropTrigger { .. } => None,
+                            _ => None,
+                        };
+                        self.require_admin_trigger_ddl(match &trigger_change {
+                            DdlChange::CreateTrigger { .. } => "apply_changes CREATE TRIGGER",
+                            DdlChange::DropTrigger { .. } => "apply_changes DROP TRIGGER",
+                            _ => "apply_changes trigger DDL",
+                        })?;
+                        let projected_table_meta = self.relational_store.table_meta.read().clone();
+                        self.apply_sync_trigger_ddl_to_projection(
+                            &mut sync_trigger_projection,
+                            &trigger_change,
+                            &projected_table_meta,
+                        )?;
+                        trigger_ddl.push(trigger_change);
+                        if let Some(table) = trigger_table {
+                            table_meta_cache.remove(&table);
+                            visible_rows_cache.remove(&table);
+                        }
+                    }
                     event_ddl @ (DdlChange::CreateEventType { .. }
                     | DdlChange::CreateSink { .. }
                     | DdlChange::CreateRoute { .. }
@@ -8236,20 +9321,17 @@ impl Database {
                     }
                 }
             }
-            event_bus_ddl.retain(|ddl| match ddl {
-                DdlChange::CreateEventType { table, .. } | DdlChange::CreateRoute { table, .. } => {
-                    table.is_empty() || self.table_meta(table).is_some()
-                }
-                _ => true,
+            event_bus_ddl.retain(|ddl| {
+                !Self::skip_event_bus_ddl_for_dropped_table(ddl, &dropped_tables, |table| {
+                    self.table_meta(table).is_some()
+                })
             });
-            self.validate_event_bus_ddl_batch(&event_bus_ddl)?;
             Ok(())
         })();
         if let Err(err) = ddl_result {
             let _ = self.rollback(tx);
             return Err(err);
         }
-
         for row in changes.rows {
             if row.values.is_empty() {
                 result.skipped_rows += 1;
@@ -8764,8 +9846,21 @@ impl Database {
             }
         }
 
-        self.commit_with_source_and_event_bus_ddl(tx, CommitSource::SyncPull, &event_bus_ddl)?;
-        result.new_lsn = self.current_lsn();
+        let sync_pull_trigger_audit_projection = if trigger_ddl.is_empty() {
+            None
+        } else {
+            Some(self.sync_pull_trigger_audit_projection(&trigger_ddl)?)
+        };
+
+        self.commit_with_source_and_sync_ddl_and_trigger_audit_projection(
+            tx,
+            CommitSource::SyncPull,
+            &event_bus_ddl,
+            &trigger_ddl,
+            sync_pull_trigger_audit_projection.as_ref(),
+        )?;
+        let committed_lsn = self.current_lsn();
+        result.new_lsn = committed_lsn;
         Ok(result)
     }
 
@@ -8803,25 +9898,7 @@ impl Database {
         row: &VersionedRow,
     ) -> Option<(NaturalKey, HashMap<String, Value>)> {
         let meta = self.relational_store.table_meta.read();
-        let key_col = meta
-            .get(table)
-            .and_then(|m| m.natural_key_column.clone())
-            .or_else(|| {
-                meta.get(table).and_then(|m| {
-                    m.columns
-                        .iter()
-                        .find(|c| c.name == "id" && c.column_type == ColumnType::Uuid)
-                        .map(|_| "id".to_string())
-                })
-            })
-            .or_else(|| {
-                meta.get(table).and_then(|m| {
-                    m.columns
-                        .iter()
-                        .find(|c| c.primary_key && c.column_type == ColumnType::Uuid)
-                        .map(|c| c.name.clone())
-                })
-            })?;
+        let key_col = meta.get(table).and_then(natural_key_column_for_meta)?;
 
         let key_val = row.values.get(&key_col)?.clone();
         let values = row
@@ -10034,6 +11111,27 @@ fn sql_quote(value: &str) -> String {
 
 fn normalize_schema_type(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sync_create_table_sql(
+    name: &str,
+    columns: &[(String, String)],
+    constraints: &[String],
+) -> String {
+    let mut sql = format!(
+        "CREATE TABLE {} ({})",
+        name,
+        columns
+            .iter()
+            .map(|(column, ty)| format!("{column} {ty}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if !constraints.is_empty() {
+        sql.push(' ');
+        sql.push_str(&constraints.join(" "));
+    }
+    sql
 }
 
 fn ddl_vector_dimension(value: &str) -> Option<usize> {

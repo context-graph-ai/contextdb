@@ -1,6 +1,6 @@
 use crate::protocol::{
     ChunkAck, MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireChangeSet,
-    WireRowChange, decode, encode,
+    decode, encode,
 };
 use crate::subjects::{pull_subject, push_subject};
 use contextdb_core::{AtomicLsn, Error, Lsn};
@@ -158,16 +158,17 @@ impl SyncClient {
         };
 
         let mut last_successful_lsn = since;
-        for batch in split_changeset(changeset) {
-            let batch_max_lsn = [
-                batch.rows.last().map(|r| r.lsn),
-                batch.edges.last().map(|e| e.lsn),
-                batch.vectors.last().map(|v| v.lsn),
-            ]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(since);
+        let mut batches = split_changeset(changeset).into_iter().peekable();
+        while let Some(batch) = batches.next() {
+            let batch_max_lsn = batch.max_lsn().unwrap_or_else(|| {
+                if batch.ddl.is_empty() {
+                    since
+                } else {
+                    self.db.current_lsn()
+                }
+            });
+            let stop_for_trigger_bootstrap =
+                batch.has_create_trigger_ddl() && batches.peek().is_some();
 
             let request = PushRequest {
                 changeset: batch.clone().into(),
@@ -339,6 +340,9 @@ impl SyncClient {
             total.skipped_rows += result.skipped_rows;
             total.conflicts.extend(result.conflicts);
             total.new_lsn = result.new_lsn;
+            if stop_for_trigger_bootstrap {
+                break;
+            }
         }
 
         self.push_watermark
@@ -487,26 +491,17 @@ impl SyncClient {
 
                 let response: PullResponse = rmp_serde::from_slice(&response_envelope.payload)
                     .map_err(|e| Error::SyncError(e.to_string()))?;
-                (
-                    ChangeSet::from(response.changeset),
-                    response.has_more,
-                    response.cursor,
-                )
+                let changes = ChangeSet::try_from(response.changeset)
+                    .map_err(|e| Error::SyncError(e.to_string()))?;
+                (changes, response.has_more, response.cursor)
             };
 
             // Extract server-side max LSN BEFORE filtering/applying
-            let server_lsn = [
-                changes.rows.last().map(|r| r.lsn),
-                changes.edges.last().map(|e| e.lsn),
-                changes.vectors.last().map(|v| v.lsn),
-            ]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(since_lsn);
+            let server_lsn = cursor.or_else(|| changes.max_lsn()).unwrap_or(since_lsn);
 
             let filtered = changes
                 .filter_by_direction(&directions, &[SyncDirection::Pull, SyncDirection::Both]);
+            let stop_for_trigger_bootstrap = filtered.has_create_trigger_ddl() && has_more;
             let result = self
                 .db
                 .apply_changes(filtered, &remap_pull_policies(policies))?;
@@ -517,6 +512,9 @@ impl SyncClient {
             last_server_lsn = server_lsn;
 
             if !has_more {
+                break;
+            }
+            if stop_for_trigger_bootstrap {
                 break;
             }
             since_lsn = cursor.unwrap_or(since_lsn);
@@ -599,6 +597,17 @@ impl SyncClient {
 }
 
 pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
+    let bootstrap_batches = changeset.split_at_trigger_bootstrap_barriers();
+    if bootstrap_batches.len() > 1 {
+        return bootstrap_batches
+            .into_iter()
+            .flat_map(split_changeset_by_size)
+            .collect();
+    }
+    split_changeset_by_size(bootstrap_batches.into_iter().next().unwrap_or_default())
+}
+
+fn split_changeset_by_size(changeset: ChangeSet) -> Vec<ChangeSet> {
     let wire = WireChangeSet::from(changeset.clone());
     let estimated = rmp_serde::to_vec(&wire).map(|v| v.len()).unwrap_or(0);
     if estimated <= MAX_BATCH_BYTES {
@@ -628,235 +637,47 @@ fn batch_wire_size(changeset: &ChangeSet) -> usize {
 }
 
 fn fast_split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
-    let row_sizes: Vec<usize> = changeset
-        .rows
-        .iter()
-        .map(|r| {
-            let wire_row = WireRowChange::from(r.clone());
-            rmp_serde::to_vec(&wire_row).map(|v| v.len()).unwrap_or(128)
-        })
-        .collect();
-    let vector_sizes: Vec<usize> = changeset
-        .vectors
-        .iter()
-        .map(|v| {
-            let wire_vec = crate::protocol::WireVectorChange::from(v.clone());
-            rmp_serde::to_vec(&wire_vec).map(|v| v.len()).unwrap_or(64)
-        })
-        .collect();
-
-    let mut batches = Vec::new();
-    let mut batch_rows = Vec::new();
-    let mut batch_vectors = Vec::new();
-    let mut batch_size = 0usize;
-    let changeset_edges = changeset.edges;
-    let changeset_vectors = changeset.vectors;
-    let changeset_ddl = changeset.ddl;
-
-    let edges_size: usize = {
-        let edges_wire: Vec<crate::protocol::WireEdgeChange> =
-            changeset_edges.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&edges_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let ddl_size: usize = {
-        let ddl_wire: Vec<crate::protocol::WireDdlChange> =
-            changeset_ddl.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&ddl_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let first_batch_overhead = edges_size + ddl_size;
-
-    for (i, row) in changeset.rows.into_iter().enumerate() {
-        let row_size = row_sizes.get(i).copied().unwrap_or(128);
-        let vec_size_for_i = vector_sizes.get(i).copied().unwrap_or(64);
-        let item_size = row_size + vec_size_for_i;
-        let first_item_overhead = if batch_rows.is_empty() && batches.is_empty() {
-            first_batch_overhead
-        } else {
-            0
-        };
-
-        if !batch_rows.is_empty() && batch_size + item_size > TARGET_BATCH_BYTES {
-            batches.push(ChangeSet {
-                rows: std::mem::take(&mut batch_rows),
-                edges: if batches.is_empty() {
-                    changeset_edges.clone()
-                } else {
-                    Vec::new()
-                },
-                vectors: std::mem::take(&mut batch_vectors),
-                ddl: if batches.is_empty() {
-                    changeset_ddl.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-            batch_size = 0;
-        }
-
-        if i < changeset_vectors.len() {
-            batch_vectors.push(changeset_vectors[i].clone());
-            batch_size += vec_size_for_i;
-        }
-        batch_rows.push(row);
-        batch_size += row_size + first_item_overhead;
-    }
-
-    if !batch_rows.is_empty() {
-        batches.push(ChangeSet {
-            rows: batch_rows,
-            edges: if batches.is_empty() {
-                changeset_edges
-            } else {
-                Vec::new()
-            },
-            vectors: batch_vectors,
-            ddl: if batches.is_empty() {
-                changeset_ddl
-            } else {
-                Vec::new()
-            },
-        });
-    } else if batches.is_empty() {
-        batches.push(ChangeSet {
-            rows: Vec::new(),
-            edges: changeset_edges,
-            vectors: Vec::new(),
-            ddl: changeset_ddl,
-        });
-    }
-
-    batches
+    split_complete_lsn_groups(changeset, TARGET_BATCH_BYTES, false)
 }
 
 fn precise_split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
-    // Estimate per-row sizes by serializing each WireRowChange individually
-    let row_sizes: Vec<usize> = changeset
-        .rows
-        .iter()
-        .map(|r| {
-            let wire_row = WireRowChange::from(r.clone());
-            rmp_serde::to_vec(&wire_row).map(|v| v.len()).unwrap_or(128)
-        })
-        .collect();
-    let vector_sizes: Vec<usize> = changeset
-        .vectors
-        .iter()
-        .map(|v| {
-            let wire_vec = crate::protocol::WireVectorChange::from(v.clone());
-            rmp_serde::to_vec(&wire_vec).map(|v| v.len()).unwrap_or(64)
-        })
-        .collect();
+    split_complete_lsn_groups(changeset, MAX_BATCH_BYTES, true)
+}
 
+fn split_complete_lsn_groups(
+    changeset: ChangeSet,
+    target_bytes: usize,
+    precise: bool,
+) -> Vec<ChangeSet> {
+    let groups = changeset.split_by_data_lsn();
     let mut batches = Vec::new();
-    let mut batch_rows = Vec::new();
-    let mut batch_vectors = Vec::new();
-    let mut batch_size = 0usize;
-    // Extract edges, vectors, and ddl BEFORE consuming rows via into_iter()
-    let changeset_edges = changeset.edges;
-    let changeset_vectors = changeset.vectors;
-    let changeset_ddl = changeset.ddl;
+    let mut current = ChangeSet::default();
 
-    // Overhead for edges + DDL in first batch
-    let edges_size: usize = {
-        let edges_wire: Vec<crate::protocol::WireEdgeChange> =
-            changeset_edges.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&edges_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let ddl_size: usize = {
-        let ddl_wire: Vec<crate::protocol::WireDdlChange> =
-            changeset_ddl.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&ddl_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let first_batch_overhead = edges_size + ddl_size;
-
-    for (i, row) in changeset.rows.into_iter().enumerate() {
-        let row_size = row_sizes.get(i).copied().unwrap_or(128);
-        let vec_size_for_i = vector_sizes.get(i).copied().unwrap_or(64);
-        let overhead = if batches.is_empty() {
-            first_batch_overhead
+    for group in groups {
+        let mut trial = current.clone();
+        trial.rows.extend(group.rows.clone());
+        trial.edges.extend(group.edges.clone());
+        trial.vectors.extend(group.vectors.clone());
+        trial.ddl.extend(group.ddl.clone());
+        trial.ddl_lsn.extend(group.ddl_lsn.clone());
+        let trial_size = if precise {
+            batch_wire_size(&trial)
         } else {
-            0
+            batch_wire_size(&current).saturating_add(batch_wire_size(&group))
         };
 
-        let should_flush = if batch_rows.is_empty() {
-            false
-        } else {
-            let mut trial_rows = batch_rows.clone();
-            trial_rows.push(row.clone());
-            let mut trial_vectors = batch_vectors.clone();
-            if i < changeset_vectors.len() {
-                trial_vectors.push(changeset_vectors[i].clone());
-            }
-            let trial = ChangeSet {
-                rows: trial_rows.clone(),
-                edges: if batches.is_empty() {
-                    changeset_edges.clone()
-                } else {
-                    Vec::new()
-                },
-                vectors: trial_vectors,
-                ddl: if batches.is_empty() {
-                    changeset_ddl.clone()
-                } else {
-                    Vec::new()
-                },
-            };
-            let actual_size = rmp_serde::to_vec(&WireChangeSet::from(trial))
-                .map(|v| v.len())
-                .unwrap_or(usize::MAX);
-            batch_size + row_size + vec_size_for_i + overhead > MAX_BATCH_BYTES
-                || actual_size > MAX_BATCH_BYTES
-        };
-
-        if should_flush {
-            batches.push(ChangeSet {
-                rows: std::mem::take(&mut batch_rows),
-                edges: if batches.is_empty() {
-                    changeset_edges.clone()
-                } else {
-                    Vec::new()
-                },
-                vectors: std::mem::take(&mut batch_vectors),
-                ddl: if batches.is_empty() {
-                    changeset_ddl.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-            batch_size = 0;
+        if current.data_entry_count() > 0 && trial_size > target_bytes {
+            batches.push(std::mem::take(&mut current));
         }
-
-        // Pair with vector at same index if available
-        if i < changeset_vectors.len() {
-            batch_vectors.push(changeset_vectors[i].clone());
-            batch_size += vector_sizes.get(i).copied().unwrap_or(64);
-        }
-        batch_rows.push(row);
-        batch_size += row_size;
+        current.rows.extend(group.rows);
+        current.edges.extend(group.edges);
+        current.vectors.extend(group.vectors);
+        current.ddl.extend(group.ddl);
+        current.ddl_lsn.extend(group.ddl_lsn);
     }
 
-    if !batch_rows.is_empty() {
-        batches.push(ChangeSet {
-            rows: batch_rows,
-            edges: if batches.is_empty() {
-                changeset_edges
-            } else {
-                Vec::new()
-            },
-            vectors: batch_vectors,
-            ddl: if batches.is_empty() {
-                changeset_ddl
-            } else {
-                Vec::new()
-            },
-        });
-    } else if batches.is_empty() && (!changeset_edges.is_empty() || !changeset_ddl.is_empty()) {
-        batches.push(ChangeSet {
-            rows: Vec::new(),
-            edges: changeset_edges,
-            vectors: Vec::new(),
-            ddl: changeset_ddl,
-        });
+    if current.data_entry_count() > 0 || !current.ddl.is_empty() {
+        batches.push(current);
     }
 
     batches
@@ -884,7 +705,7 @@ mod tests {
     use super::*;
     use contextdb_core::{RowId, Value};
     use contextdb_engine::Database;
-    use contextdb_engine::sync_types::{NaturalKey, RowChange, VectorChange};
+    use contextdb_engine::sync_types::{DdlChange, NaturalKey, RowChange, VectorChange};
     use std::sync::Arc;
     use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
     use testcontainers::runners::AsyncRunner;
@@ -980,7 +801,7 @@ mod tests {
         // Build a changeset with 10 rows, each ~100KB of data (total ~1MB)
         let large_text = "x".repeat(100 * 1024); // ~100KB per row
         let mut rows = Vec::new();
-        for _ in 0..10 {
+        for i in 0..10 {
             let id = Uuid::new_v4();
             let mut values = HashMap::new();
             values.insert("id".to_string(), Value::Uuid(id));
@@ -993,7 +814,7 @@ mod tests {
                 },
                 values,
                 deleted: false,
-                lsn: Lsn(1),
+                lsn: Lsn(i + 1),
             });
         }
 
@@ -1009,11 +830,14 @@ mod tests {
                 ],
                 constraints: vec!["PRIMARY KEY (id)".to_string()],
             }],
+
+            ddl_lsn: vec![Lsn(1)],
         };
 
         let batches = split_changeset(changeset);
 
         // Must split into 2+ batches (10 rows * ~100KB > 800KB)
+        // because each row is from a distinct sender LSN and can be split.
         assert!(
             batches.len() >= 2,
             "10 rows of ~100KB each (~1MB total) must split into at least 2 batches, got {}",
@@ -1101,6 +925,8 @@ mod tests {
                 ],
                 constraints: Vec::new(),
             }],
+
+            ddl_lsn: vec![Lsn(1)],
         };
 
         let batches = split_changeset(changeset);
@@ -1189,7 +1015,7 @@ mod tests {
     fn a14b_batch_splitting_accounts_for_vector_sizes() {
         let mut rows = Vec::new();
         let mut vectors = Vec::new();
-        for _ in 0..200 {
+        for i in 0..200 {
             let id = Uuid::new_v4();
             let mut values = HashMap::new();
             values.insert("id".to_string(), Value::Uuid(id));
@@ -1202,13 +1028,13 @@ mod tests {
                 },
                 values,
                 deleted: false,
-                lsn: Lsn(1),
+                lsn: Lsn(i as u64 + 1),
             });
             vectors.push(VectorChange {
                 index: contextdb_core::VectorIndexRef::default(),
                 row_id: RowId(0),
                 vector: (0..384).map(|j| j as f32).collect(),
-                lsn: Lsn(1),
+                lsn: Lsn(i as u64 + 1),
             });
         }
         let changeset = ChangeSet {
@@ -1216,6 +1042,8 @@ mod tests {
             edges: Vec::new(),
             vectors,
             ddl: vec![],
+
+            ddl_lsn: Vec::new(),
         };
         let batches = split_changeset(changeset);
         assert!(
@@ -1260,6 +1088,8 @@ mod tests {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1311,6 +1141,8 @@ mod tests {
             edges: Vec::new(),
             vectors,
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1354,6 +1186,8 @@ mod tests {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1390,6 +1224,8 @@ mod tests {
             edges,
             vectors: Vec::new(),
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1428,6 +1264,8 @@ mod tests {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl,
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1442,6 +1280,120 @@ mod tests {
             total_ddl, 20,
             "all 20 DDL entries must be present across batches, got {}",
             total_ddl
+        );
+    }
+
+    #[test]
+    fn a20_split_changeset_emits_trigger_bootstrap_barrier_even_when_small() {
+        let id = Uuid::new_v4();
+        let changeset = ChangeSet {
+            rows: vec![RowChange {
+                table: "host_writes".to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    (
+                        "content".to_string(),
+                        Value::Text("after-trigger".to_string()),
+                    ),
+                ]),
+                deleted: false,
+                lsn: Lsn(3),
+            }],
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: "host_writes".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("content".to_string(), "TEXT".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                },
+                DdlChange::CreateTrigger {
+                    name: "host_write_trigger".to_string(),
+                    table: "host_writes".to_string(),
+                    on_events: vec!["INSERT".to_string()],
+                },
+            ],
+            ddl_lsn: vec![Lsn(2), Lsn(2)],
+        };
+
+        let batches = split_changeset(changeset);
+        assert!(
+            batches.len() >= 2
+                && batches
+                    .iter()
+                    .any(|batch| batch.has_create_trigger_ddl() && batch.data_entry_count() == 0)
+                && batches.iter().position(ChangeSet::has_create_trigger_ddl)
+                    < batches.iter().position(|batch| !batch.rows.is_empty()),
+            "small full-history batches must surface CREATE TRIGGER before any data so receivers can register callbacks; batches={batches:?}"
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .find(|batch| batch.has_create_trigger_ddl())
+                .and_then(ChangeSet::max_lsn),
+            Some(Lsn(2)),
+            "trigger bootstrap batch cursor must advance through schema without skipping first data LSN; batches={batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .filter(|batch| !batch.rows.is_empty())
+                .all(|batch| batch.ddl.is_empty() && batch.max_lsn() == Some(Lsn(3))),
+            "data after trigger bootstrap must remain available at its sender LSN without duplicated DDL; batches={batches:?}"
+        );
+    }
+
+    #[test]
+    fn a21_split_changeset_does_not_fabricate_cursor_for_same_lsn_trigger_data() {
+        let id = Uuid::new_v4();
+        let changeset = ChangeSet {
+            rows: vec![RowChange {
+                table: "host_writes".to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    (
+                        "content".to_string(),
+                        Value::Text("same-lsn-trigger-data".to_string()),
+                    ),
+                ]),
+                deleted: false,
+                lsn: Lsn(3),
+            }],
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![DdlChange::CreateTrigger {
+                name: "host_write_trigger".to_string(),
+                table: "host_writes".to_string(),
+                on_events: vec!["INSERT".to_string()],
+            }],
+            ddl_lsn: vec![Lsn(3)],
+        };
+
+        let batches = split_changeset(changeset);
+        assert_eq!(
+            batches.len(),
+            1,
+            "a same-LSN trigger DDL/data group cannot be split safely with an exclusive LSN cursor; batches={batches:?}"
+        );
+        assert_eq!(
+            batches[0].max_lsn(),
+            Some(Lsn(3)),
+            "splitter must preserve the real sender LSN instead of fabricating LSN-1 progress"
+        );
+        assert!(
+            batches[0].has_create_trigger_ddl() && batches[0].data_entry_count() == 1,
+            "same-LSN trigger DDL/data remains atomic and will fail closed at apply if callbacks are missing; batches={batches:?}"
         );
     }
 }

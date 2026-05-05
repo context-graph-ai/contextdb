@@ -1,5 +1,7 @@
 use crate::composite_store::ChangeLogEntry;
+use crate::database::TriggerAuditEntry;
 use crate::database::event_bus::{EventBusPersistenceCommit, PreparedSinkEvent, SinkQueueEntry};
+use crate::database::trigger::TriggerPersistenceCommit;
 use crate::sync_types::DdlChange;
 use contextdb_core::{
     AdjEntry, ColumnType, Error, Lsn, Result, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
@@ -8,7 +10,7 @@ use contextdb_core::{
 use contextdb_tx::WriteSet;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
@@ -24,16 +26,24 @@ const CHANGE_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cha
 const DDL_LOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ddl_log");
 const COMMIT_INDEX_TABLE: TableDefinition<u64, u64> = TableDefinition::new("commit_index");
 const SINK_AUDIT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("__sink_audit");
+const TRIGGER_AUDIT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("__trigger_audit");
 const GRAPH_FWD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_fwd");
 const GRAPH_REV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("graph_rev");
 const VECTORS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_entries");
 const FORMAT_VERSION_KEY: &str = "format_version";
 const CURRENT_FORMAT_VERSION: &str = "1.0.0";
+const TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY: &str = "__trigger_audit_next_index";
+const TRIGGER_AUDIT_RING_CONFIG_KEY: &str = "__trigger_audit_ring";
 
 pub struct RedbPersistence {
     path: std::path::PathBuf,
     lock_file: Mutex<Option<File>>,
     db: Mutex<Option<redb::Database>>,
+}
+
+pub(crate) struct SchemaDdlPersistence<'a> {
+    pub(crate) event_bus: Option<&'a EventBusPersistenceCommit>,
+    pub(crate) trigger: Option<&'a TriggerPersistenceCommit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,7 +413,17 @@ impl RedbPersistence {
     }
 
     pub fn flush_data_with_logs(&self, ws: &WriteSet, change_log: &[ChangeLogEntry]) -> Result<()> {
-        self.flush_data_with_logs_and_sink_events(ws, change_log, &[], None, usize::MAX)
+        self.flush_data_with_logs_and_sink_events(
+            ws,
+            change_log,
+            &[],
+            &[],
+            SchemaDdlPersistence {
+                event_bus: None,
+                trigger: None,
+            },
+            usize::MAX,
+        )
     }
 
     pub(crate) fn flush_data_with_logs_and_sink_events(
@@ -411,7 +431,8 @@ impl RedbPersistence {
         ws: &WriteSet,
         change_log: &[ChangeLogEntry],
         sink_events: &[PreparedSinkEvent],
-        event_bus_ddl: Option<&EventBusPersistenceCommit>,
+        trigger_audits: &[(u64, TriggerAuditEntry)],
+        schema_ddl: SchemaDdlPersistence<'_>,
         max_sink_queue_depth: usize,
     ) -> Result<()> {
         let table_meta = self.load_all_table_meta()?;
@@ -679,24 +700,100 @@ impl RedbPersistence {
                 }
             }
 
-            if let Some(event_bus_ddl) = event_bus_ddl {
+            if !trigger_audits.is_empty() {
+                {
+                    let mut audit_table = write_txn
+                        .open_table(TRIGGER_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (index, entry) in trigger_audits {
+                        let key = Self::trigger_audit_key(*index, &entry.trigger_name);
+                        let encoded = Self::encode(entry)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
                 {
                     let mut config_table = write_txn
                         .open_table(CONFIG_TABLE)
                         .map_err(Self::storage_error)?;
-                    for (key, encoded) in &event_bus_ddl.config_values {
-                        config_table
-                            .insert(*key, encoded.as_slice())
-                            .map_err(Self::storage_error)?;
+                    let mut ring: Vec<TriggerAuditEntry> = config_table
+                        .get(TRIGGER_AUDIT_RING_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode(value.value()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    ring.extend(trigger_audits.iter().map(|(_, entry)| entry.clone()));
+                    let overflow = ring
+                        .len()
+                        .saturating_sub(crate::database::trigger::TRIGGER_AUDIT_RING_CAPACITY);
+                    if overflow > 0 {
+                        ring.drain(0..overflow);
+                    }
+                    let current_next_index = config_table
+                        .get(TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode::<u64>(value.value()))
+                        .transpose()?
+                        .unwrap_or(0);
+                    let next_index = trigger_audits
+                        .iter()
+                        .map(|(index, _)| index.saturating_add(1))
+                        .max()
+                        .unwrap_or(0)
+                        .max(current_next_index);
+                    let encoded_ring = Self::encode(&ring)?;
+                    config_table
+                        .insert(TRIGGER_AUDIT_RING_CONFIG_KEY, encoded_ring.as_slice())
+                        .map_err(Self::storage_error)?;
+                    let encoded_next_index = Self::encode(&next_index)?;
+                    config_table
+                        .insert(
+                            TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY,
+                            encoded_next_index.as_slice(),
+                        )
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            if schema_ddl.event_bus.is_some() || schema_ddl.trigger.is_some() {
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    if let Some(event_bus_ddl) = schema_ddl.event_bus {
+                        for (key, encoded) in &event_bus_ddl.config_values {
+                            config_table
+                                .insert(*key, encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                        }
+                    }
+                    if let Some(trigger_ddl) = schema_ddl.trigger {
+                        for (key, encoded) in &trigger_ddl.config_values {
+                            config_table
+                                .insert(*key, encoded.as_slice())
+                                .map_err(Self::storage_error)?;
+                        }
                     }
                 }
-                if !event_bus_ddl.ddl.is_empty() {
+                let ddl_entries = schema_ddl
+                    .event_bus
+                    .into_iter()
+                    .flat_map(|commit| commit.ddl.iter())
+                    .chain(
+                        schema_ddl
+                            .trigger
+                            .into_iter()
+                            .flat_map(|commit| commit.ddl.iter()),
+                    )
+                    .collect::<Vec<_>>();
+                if !ddl_entries.is_empty() {
                     let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
                     let mut ddl_table = write_txn
                         .open_table(DDL_LOG_TABLE)
                         .map_err(Self::storage_error)?;
-                    for (index, change) in event_bus_ddl.ddl.iter().enumerate() {
-                        let key = Self::ddl_log_key_for_index(lsn, index, event_bus_ddl.ddl.len());
+                    for (index, change) in ddl_entries.iter().enumerate() {
+                        let key = Self::ddl_log_key_for_index(lsn, index, ddl_entries.len());
                         let encoded = Self::encode(change)?;
                         ddl_table
                             .insert(key.as_str(), encoded.as_slice())
@@ -947,6 +1044,60 @@ impl RedbPersistence {
         })
     }
 
+    pub fn append_trigger_audit(&self, index: u64, entry: &TriggerAuditEntry) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut table = write_txn
+                    .open_table(TRIGGER_AUDIT_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::trigger_audit_key(index, &entry.trigger_name);
+                let encoded = Self::encode(entry)?;
+                table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut ring: Vec<TriggerAuditEntry> = config_table
+                    .get(TRIGGER_AUDIT_RING_CONFIG_KEY)
+                    .map_err(Self::storage_error)?
+                    .map(|value| Self::decode(value.value()))
+                    .transpose()?
+                    .unwrap_or_default();
+                ring.push(entry.clone());
+                let overflow = ring
+                    .len()
+                    .saturating_sub(crate::database::trigger::TRIGGER_AUDIT_RING_CAPACITY);
+                if overflow > 0 {
+                    ring.drain(0..overflow);
+                }
+                let current_next_index = config_table
+                    .get(TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY)
+                    .map_err(Self::storage_error)?
+                    .map(|value| Self::decode::<u64>(value.value()))
+                    .transpose()?
+                    .unwrap_or(0);
+                let next_index = index.saturating_add(1).max(current_next_index);
+                let encoded_ring = Self::encode(&ring)?;
+                config_table
+                    .insert(TRIGGER_AUDIT_RING_CONFIG_KEY, encoded_ring.as_slice())
+                    .map_err(Self::storage_error)?;
+                let encoded_next_index = Self::encode(&next_index)?;
+                config_table
+                    .insert(
+                        TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY,
+                        encoded_next_index.as_slice(),
+                    )
+                    .map_err(Self::storage_error)?;
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
     pub fn remove_table_data(&self, name: &str) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
@@ -964,6 +1115,172 @@ impl RedbPersistence {
                 Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(redb::TableError::TableTypeMismatch { .. }) => {}
                 Err(err) => return Err(Self::storage_error(err)),
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_table_with_config_values_and_ddl_log(
+        &self,
+        name: &str,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+    ) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::meta_key(name);
+                meta_table
+                    .remove(key.as_str())
+                    .map_err(Self::storage_error)?;
+            }
+            let table_name = Self::rel_table_name(name);
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            let legacy_table_def: TableDefinition<u64, &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(legacy_table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            if !config_values.is_empty() {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            if !ddl.is_empty() {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_table_rewrite_aux_with_config_values_and_ddl_log(
+        &self,
+        name: &str,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        graph_edges: &[AdjEntry],
+        vectors: &[VectorEntry],
+    ) -> Result<()> {
+        let mut table_meta = self.load_all_table_meta()?;
+        table_meta.remove(name);
+        let vector_quantization = Self::vector_quantization_map(&table_meta);
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::meta_key(name);
+                meta_table
+                    .remove(key.as_str())
+                    .map_err(Self::storage_error)?;
+            }
+            let table_name = Self::rel_table_name(name);
+            let table_def: TableDefinition<&[u8], &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            let legacy_table_def: TableDefinition<u64, &[u8]> =
+                TableDefinition::new(table_name.as_str());
+            match write_txn.delete_table(legacy_table_def) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+
+            let _ = write_txn.delete_table(GRAPH_FWD_TABLE);
+            let _ = write_txn.delete_table(GRAPH_REV_TABLE);
+            {
+                let mut fwd_table = write_txn
+                    .open_table(GRAPH_FWD_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rev_table = write_txn
+                    .open_table(GRAPH_REV_TABLE)
+                    .map_err(Self::storage_error)?;
+                for entry in graph_edges {
+                    let encoded = Self::encode(entry)?;
+                    let fwd_key = Self::graph_fwd_key(entry);
+                    let rev_key = Self::graph_rev_key(entry);
+                    fwd_table
+                        .insert(fwd_key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    rev_table
+                        .insert(rev_key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            let _ = write_txn.delete_table(VECTORS_TABLE);
+            {
+                let mut table = write_txn
+                    .open_table(VECTORS_TABLE)
+                    .map_err(Self::storage_error)?;
+                for entry in vectors {
+                    let quantization = vector_quantization
+                        .get(&entry.index)
+                        .copied()
+                        .unwrap_or_default();
+                    let encoded = Self::encode_vector_entry(entry, quantization)?;
+                    let key = Self::vector_key(entry);
+                    table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            if !config_values.is_empty() {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            if !ddl.is_empty() {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
             }
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -1220,6 +1537,77 @@ impl RedbPersistence {
         })
     }
 
+    pub fn load_trigger_audit_state(
+        &self,
+        ring_capacity: usize,
+    ) -> Result<(Vec<TriggerAuditEntry>, u64)> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            if let Ok(config_table) = read_txn.open_table(CONFIG_TABLE) {
+                let ring = config_table
+                    .get(TRIGGER_AUDIT_RING_CONFIG_KEY)
+                    .map_err(Self::storage_error)?
+                    .map(|value| Self::decode::<Vec<TriggerAuditEntry>>(value.value()))
+                    .transpose()?;
+                let next_index = config_table
+                    .get(TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY)
+                    .map_err(Self::storage_error)?
+                    .map(|value| Self::decode::<u64>(value.value()))
+                    .transpose()?;
+                if let (Some(mut ring), Some(next_index)) = (ring, next_index) {
+                    let overflow = ring.len().saturating_sub(ring_capacity);
+                    if overflow > 0 {
+                        ring.drain(0..overflow);
+                    }
+                    return Ok((ring, next_index));
+                }
+            }
+
+            let table = match read_txn.open_table(TRIGGER_AUDIT_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0)),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+
+            let mut ring = VecDeque::new();
+            let mut next_index = 0;
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                if let Some(index) = key
+                    .value()
+                    .split(':')
+                    .next()
+                    .and_then(|raw| raw.parse::<u64>().ok())
+                {
+                    next_index = next_index.max(index.saturating_add(1));
+                }
+                ring.push_back(Self::decode(value.value())?);
+                if ring.len() > ring_capacity {
+                    ring.pop_front();
+                }
+            }
+            Ok((ring.into_iter().collect(), next_index))
+        })
+    }
+
+    pub fn load_trigger_audit_history(&self) -> Result<Vec<TriggerAuditEntry>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read_txn.open_table(TRIGGER_AUDIT_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+
+            let mut entries = Vec::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (_, value) = entry.map_err(Self::storage_error)?;
+                entries.push(Self::decode(value.value())?);
+            }
+            Ok(entries)
+        })
+    }
+
     pub fn load_commit_index(&self) -> Result<BTreeMap<Lsn, TxId>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -1460,6 +1848,10 @@ impl RedbPersistence {
 
     fn sink_audit_key(lsn: Lsn, index: usize, sink: &str) -> String {
         format!("{:020}:{index:06}:{sink}", lsn.0)
+    }
+
+    fn trigger_audit_key(index: u64, trigger: &str) -> String {
+        format!("{index:020}:{trigger}")
     }
 
     fn rel_row_key(row: &VersionedRow) -> Vec<u8> {

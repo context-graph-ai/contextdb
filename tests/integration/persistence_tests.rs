@@ -2280,6 +2280,8 @@ fn p36_noop_sync_commit_does_not_reuse_lsn_after_reopen() {
                 edges: vec![],
                 vectors: vec![],
                 ddl: vec![],
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )

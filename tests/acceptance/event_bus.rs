@@ -1433,6 +1433,7 @@ fn t5_20_failed_sync_event_bus_ddl_does_not_persist_partial_sink() {
                 where_in: None,
             },
         ],
+        ddl_lsn: vec![Lsn(1), Lsn(1)],
         ..Default::default()
     };
     assert!(
@@ -1446,6 +1447,47 @@ fn t5_20_failed_sync_event_bus_ddl_does_not_persist_partial_sink() {
     assert!(
         db.register_sink("partial", None, |_| Ok(())).is_err(),
         "failed sync batch must not leave behind a durable or in-memory sink"
+    );
+}
+
+#[test]
+fn t5_20b_failed_sync_event_bus_ddl_missing_table_does_not_persist_partial_sink() {
+    let db = Database::open_memory();
+    let changes = contextdb_engine::sync_types::ChangeSet {
+        ddl: vec![
+            DdlChange::CreateSink {
+                name: "partial_missing_table".into(),
+                sink_type: "CALLBACK".into(),
+                url: None,
+            },
+            DdlChange::CreateEventType {
+                name: "missing_event".into(),
+                trigger: "INSERT".into(),
+                table: "missing_table".into(),
+            },
+            DdlChange::CreateRoute {
+                name: "bad_missing_table_route".into(),
+                event_type: "missing_event".into(),
+                sink: "partial_missing_table".into(),
+                table: "missing_table".into(),
+                where_in: None,
+            },
+        ],
+        ddl_lsn: vec![Lsn(1), Lsn(1), Lsn(1)],
+        ..Default::default()
+    };
+    assert!(
+        db.apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins)
+        )
+        .is_err(),
+        "EventBus DDL that references a missing table must reject the whole sync batch"
+    );
+    assert!(
+        db.register_sink("partial_missing_table", None, |_| Ok(()))
+            .is_err(),
+        "failed sync batch must not leave behind the sink that preceded invalid table DDL"
     );
 }
 
@@ -1533,6 +1575,7 @@ fn t5_23_idempotent_event_bus_sync_ddl_does_not_echo_log() {
                     where_in: None,
                 },
             ],
+            ddl_lsn: vec![Lsn(1), Lsn(1), Lsn(1)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
@@ -1572,6 +1615,7 @@ fn t5_24_failed_sync_event_bus_ddl_rolls_back_rows_in_same_changeset() {
                 where_in: None,
             },
         ],
+        ddl_lsn: vec![Lsn(42), Lsn(42)],
         rows: vec![RowChange {
             table: "existing".into(),
             natural_key: NaturalKey {

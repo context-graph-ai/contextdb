@@ -463,6 +463,8 @@ impl Database {
         let _callback_thread = self.cron.enter_callback_thread_scope();
         let tx = self.begin();
         let mut pending_sink_events = Vec::new();
+        let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+        let mut committed_trigger_audit_entries = Vec::new();
         let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
             tx,
             |reserved_lsn| {
@@ -472,7 +474,25 @@ impl Database {
                     let this_db = self as *const Self as usize;
                     let prior_db = CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
                     let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
-                    let result = catch_unwind(AssertUnwindSafe(|| callback(self)));
+                    let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)));
+                    if let Ok(Ok(())) = &result
+                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
+                    {
+                        result = Ok(Err(error));
+                    }
+                    if let Ok(Ok(())) = &result {
+                        match self.dispatch_triggers_for_tx(tx) {
+                            Ok(audits) => *pending_trigger_audits.borrow_mut() = audits,
+                            Err(failure) => {
+                                result = Ok(Err(failure.error));
+                            }
+                        }
+                    }
+                    if let Ok(Ok(())) = &result
+                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
+                    {
+                        result = Ok(Err(error));
+                    }
                     CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
                     CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
                     CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
@@ -499,6 +519,15 @@ impl Database {
                         self.event_bus
                             .stage_sink_events_for_persistence(lsn, pending_sink_events.clone());
                     }
+                    if let Some(lsn) = ws.commit_lsn {
+                        let pending = pending_trigger_audits.borrow();
+                        committed_trigger_audit_entries =
+                            self.committed_trigger_audits_for_pending(&pending, ws, lsn);
+                        self.stage_trigger_audits_for_persistence(
+                            lsn,
+                            &committed_trigger_audit_entries,
+                        );
+                    }
                 }
                 Ok(())
             },
@@ -511,6 +540,7 @@ impl Database {
                     self.release_delete_allocations(&ws);
                     self.plugin.post_commit(&ws, CommitSource::AutoCommit);
                     self.publish_prepared_sink_events_to_memory(pending_sink_events);
+                    self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
                     self.publish_commit_event_if_subscribers(&ws, CommitSource::AutoCommit, lsn);
                 }
                 Ok(lsn)
@@ -519,12 +549,15 @@ impl Database {
                 self.pending_commit_metadata.lock().remove(&tx);
                 if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
                     self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                    self.discard_staged_trigger_audits_for_persistence(lsn);
                 }
                 if let Some(ws) = failure.write_set {
                     self.release_insert_allocations(&ws);
                 } else {
                     let _ = self.rollback(tx);
                 }
+                let pending = pending_trigger_audits.borrow();
+                self.append_rolled_back_trigger_audits(&pending, tx, &failure.error.to_string())?;
                 Err(failure.error)
             }
         }
@@ -597,6 +630,7 @@ impl Database {
             ),
             session_tx: Mutex::new(None),
             instance_id: self.instance_id,
+            owner_thread: self.owner_thread,
             plugin: self.plugin.clone(),
             access: AccessConstraints::default(),
             accountant: self.accountant.clone(),
@@ -606,6 +640,7 @@ impl Database {
             pruning_guard: self.pruning_guard.clone(),
             cron: self.cron.clone(),
             event_bus: self.event_bus.clone(),
+            trigger: self.trigger.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),

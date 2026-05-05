@@ -69,9 +69,8 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
     // ---- Envelope ----
     // Envelope has explicit fields `version: u8`, `message_type: MessageType`,
     // `payload: Vec<u8>`. Build via `default_pull_request()` which selects the
-    // `MessageType::PullRequest` flavor — stub returns WRONG `version = 2`, so
-    // TU7 goes RED; T7b only asserts round-trip identity, so it passes regardless
-    // of what `version` value the stub picks (identity equality is version-agnostic).
+    // `MessageType::PullRequest` flavor. T7b asserts round-trip identity; TU7
+    // below asserts the concrete protocol version.
     use contextdb_server::protocol::MessageType;
     let original = Envelope::default_pull_request();
     let bytes = rmp_serde::to_vec(&original).expect("Envelope encode");
@@ -101,7 +100,7 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
 // ======== TU7 ========
 
 #[test]
-fn protocol_version_stays_at_two_for_named_vector_indexes() {
+fn protocol_version_stays_at_three_for_trigger_ddl_lsn_wire_ordering() {
     use contextdb_server::protocol::{Envelope, PROTOCOL_VERSION};
 
     // Construct the default envelope used by the pull path.
@@ -130,4 +129,77 @@ fn protocol_version_stays_at_two_for_named_vector_indexes() {
         "serialized Envelope must contain PROTOCOL_VERSION={PROTOCOL_VERSION}; bytes = {:?}",
         bytes
     );
+}
+
+#[test]
+fn wire_changeset_requires_ddl_lsn_field_for_protocol_v3() {
+    use contextdb_server::protocol::{
+        WireChangeSet, WireDdlChange, WireEdgeChange, WireRowChange, WireVectorChange,
+    };
+
+    #[derive(serde::Serialize)]
+    struct LegacyWireChangeSetV2 {
+        ddl: Vec<WireDdlChange>,
+        rows: Vec<WireRowChange>,
+        edges: Vec<WireEdgeChange>,
+        vectors: Vec<WireVectorChange>,
+    }
+
+    let legacy = LegacyWireChangeSetV2 {
+        ddl: vec![WireDdlChange::CreateTrigger {
+            name: "legacy_trigger".into(),
+            table: "observations".into(),
+            on_events: vec!["INSERT".into()],
+        }],
+        rows: Vec::new(),
+        edges: Vec::new(),
+        vectors: Vec::new(),
+    };
+    let bytes = rmp_serde::to_vec(&legacy).expect("legacy WireChangeSet encodes");
+    let decoded = rmp_serde::from_slice::<WireChangeSet>(&bytes);
+    assert!(
+        decoded.is_err(),
+        "protocol v3 WireChangeSet must reject payloads that omit ddl_lsn; got {decoded:?}"
+    );
+}
+
+#[test]
+fn wire_changeset_rejects_mismatched_ddl_lsn_lengths_for_protocol_v3() {
+    use contextdb_core::Lsn;
+    use contextdb_engine::sync_types::ChangeSet;
+    use contextdb_server::protocol::{WireChangeSet, WireDdlChange};
+
+    fn trigger_ddl(name: &str) -> WireDdlChange {
+        WireDdlChange::CreateTrigger {
+            name: name.into(),
+            table: "observations".into(),
+            on_events: vec!["INSERT".into()],
+        }
+    }
+
+    let cases = [
+        WireChangeSet {
+            ddl: vec![trigger_ddl("missing_lsn")],
+            ddl_lsn: Vec::new(),
+            ..WireChangeSet::default()
+        },
+        WireChangeSet {
+            ddl: vec![trigger_ddl("short_lsn_a"), trigger_ddl("short_lsn_b")],
+            ddl_lsn: vec![Lsn(1)],
+            ..WireChangeSet::default()
+        },
+        WireChangeSet {
+            ddl: vec![trigger_ddl("extra_lsn")],
+            ddl_lsn: vec![Lsn(1), Lsn(2)],
+            ..WireChangeSet::default()
+        },
+    ];
+
+    for wire in cases {
+        let err = ChangeSet::try_from(wire).expect_err("mismatched ddl_lsn length must fail");
+        assert!(
+            err.to_string().contains("ddl_lsn length"),
+            "error should name ddl_lsn length mismatch, got {err}"
+        );
+    }
 }

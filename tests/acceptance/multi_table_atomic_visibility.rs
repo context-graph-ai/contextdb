@@ -230,6 +230,8 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
             lsn: Lsn(10),
         }],
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
     let sync_pause = sync_db.pause_after_relational_apply_for_test();
     let mut sync_writer = Some({
@@ -1318,6 +1320,8 @@ fn t21_14_mixed_sync_edge_error_rolls_back_rows() {
         }],
         vectors: Vec::new(),
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     let err = db
@@ -1370,6 +1374,8 @@ fn t21_16_mixed_sync_vector_error_rolls_back_rows() {
             lsn: contextdb_core::Lsn(1),
         }],
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     let err = db
@@ -1612,6 +1618,8 @@ fn t21_18_mixed_sync_ddl_vector_error_does_not_apply_ddl() {
                     columns: vec![("vector_vision".to_string(), "VECTOR(8)".to_string())],
                     constraints: vec![],
                 }],
+
+                ddl_lsn: vec![contextdb_core::Lsn(10)],
             },
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
@@ -1660,6 +1668,8 @@ fn t21_19_mixed_sync_ddl_edge_error_does_not_apply_ddl() {
                     ],
                     constraints: vec!["DAG('DEPENDS')".to_string()],
                 }],
+
+                ddl_lsn: vec![contextdb_core::Lsn(10)],
             },
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
@@ -1738,6 +1748,8 @@ fn t21_20_sync_drop_table_removes_vector_state_and_persists() {
                         name: "edges".to_string(),
                     },
                 ],
+
+                ddl_lsn: vec![contextdb_core::Lsn(10), contextdb_core::Lsn(10)],
             },
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )
@@ -1799,6 +1811,8 @@ fn t21_21_mixed_sync_ddl_vector_memory_error_does_not_apply_ddl() {
                     ],
                     constraints: vec![],
                 }],
+
+                ddl_lsn: vec![contextdb_core::Lsn(1)],
             },
             &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
         )

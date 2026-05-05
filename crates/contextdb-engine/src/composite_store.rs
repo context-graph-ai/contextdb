@@ -1,4 +1,4 @@
-use crate::sync_types::{DdlChange, NaturalKey};
+use crate::sync_types::{DdlChange, NaturalKey, natural_key_column_for_meta};
 use contextdb_core::{EdgeType, Lsn, NodeId, Result, RowId, TableName, Value, VectorIndexRef};
 use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
@@ -193,22 +193,7 @@ impl CompositeStore {
         }
 
         for (table, row_id, _) in &ws.relational_deletes {
-            let natural_key = self
-                .relational
-                .tables
-                .read()
-                .get(table)
-                .and_then(|rows| rows.iter().find(|r| r.row_id == *row_id))
-                .and_then(|row| {
-                    row.values.get("id").cloned().map(|value| NaturalKey {
-                        column: "id".to_string(),
-                        value,
-                    })
-                })
-                .unwrap_or_else(|| NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Int64(row_id.0 as i64),
-                });
+            let natural_key = self.natural_key_for_row_delete(table, *row_id);
 
             log_entries.push(ChangeLogEntry::RowDelete {
                 table: table.clone(),
@@ -253,6 +238,34 @@ impl CompositeStore {
         }
 
         log_entries
+    }
+
+    fn natural_key_for_row_delete(&self, table: &str, row_id: RowId) -> NaturalKey {
+        let meta = self.relational.table_meta.read().get(table).cloned();
+        let key_col = meta.as_ref().and_then(natural_key_column_for_meta);
+        let row_values = self
+            .relational
+            .tables
+            .read()
+            .get(table)
+            .and_then(|rows| {
+                rows.iter()
+                    .rev()
+                    .find(|row| row.row_id == row_id && row.deleted_tx.is_none())
+                    .cloned()
+            })
+            .map(|row| row.values);
+
+        if let (Some(column), Some(values)) = (key_col, row_values)
+            && let Some(value) = values.get(&column).cloned()
+        {
+            return NaturalKey { column, value };
+        }
+
+        NaturalKey {
+            column: "id".to_string(),
+            value: Value::Int64(row_id.0 as i64),
+        }
     }
 
     pub(crate) fn apply_exact(&self, ws: WriteSet) -> Result<()> {

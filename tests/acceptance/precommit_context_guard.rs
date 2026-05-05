@@ -1150,6 +1150,7 @@ fn t4_18_scoped_apply_changes_rejects_ddl() {
                 ddl: vec![DdlChange::DropTable {
                     name: "memos".into(),
                 }],
+                ddl_lsn: vec![Lsn(1)],
                 ..ChangeSet::default()
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),

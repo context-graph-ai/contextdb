@@ -2005,6 +2005,7 @@ fn sy04_sync_drop_table_respects_rank_policy_restrict() {
             ddl: vec![DdlChange::DropTable {
                 name: "outcomes".into(),
             }],
+            ddl_lsn: vec![Lsn(1)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -2037,6 +2038,7 @@ fn sy05_sync_drop_index_respects_rank_policy_restrict() {
                 table: "outcomes".into(),
                 name: "outcomes_decision_id_idx".into(),
             }],
+            ddl_lsn: vec![Lsn(1)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
