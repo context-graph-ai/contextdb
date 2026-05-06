@@ -362,6 +362,8 @@ pub struct Database {
     acl_grant_cache: RwLock<HashMap<AclGrantCacheKey, Arc<HashSet<uuid::Uuid>>>>,
     rank_policy_eval_count: AtomicU64,
     rank_policy_formula_parse_count: AtomicU64,
+    fk_indexed_tuple_probes: AtomicU64,
+    fk_full_scan_fallbacks: AtomicU64,
     corrupt_joined_values: RwLock<HashSet<(String, RowId, String)>>,
     resource_owner: bool,
 }
@@ -812,6 +814,8 @@ impl Database {
             acl_grant_cache: RwLock::new(HashMap::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
+            fk_indexed_tuple_probes: AtomicU64::new(0),
+            fk_full_scan_fallbacks: AtomicU64::new(0),
             corrupt_joined_values: RwLock::new(HashSet::new()),
             resource_owner: true,
         }
@@ -2190,9 +2194,9 @@ impl Database {
                         })
                         .collect(),
                     constraints: create_table_constraints_from_meta(&meta),
-                    foreign_keys: Vec::new(),
-                    composite_foreign_keys: Vec::new(),
-                    composite_unique: Vec::new(),
+                    foreign_keys: single_column_foreign_keys_from_meta(&meta, &HashSet::new()),
+                    composite_foreign_keys: meta.composite_foreign_keys.clone(),
+                    composite_unique: meta.unique_constraints.clone(),
                 })
             }
             Statement::CreateEventType { name, when, table } => Some(DdlChange::CreateEventType {
@@ -3384,6 +3388,76 @@ impl Database {
         Ok(rows.into_iter().next())
     }
 
+    fn indexed_visible_row_exists_by_columns(
+        &self,
+        table: &str,
+        columns: &[String],
+        values: &[Value],
+        snapshot: SnapshotId,
+        skip_deleted: &HashSet<RowId>,
+    ) -> Result<bool> {
+        if columns.is_empty() || columns.len() != values.len() {
+            return Ok(false);
+        }
+
+        fn visible_posting(
+            entries: &[contextdb_relational::IndexEntry],
+            snapshot: SnapshotId,
+            skip_deleted: &HashSet<RowId>,
+        ) -> Option<RowId> {
+            entries
+                .iter()
+                .find(|entry| !skip_deleted.contains(&entry.row_id) && entry.visible_at(snapshot))
+                .map(|entry| entry.row_id)
+        }
+
+        let row_id = {
+            let indexes = self.relational_store.indexes.read();
+            let Some(storage) = indexes.iter().find_map(|((indexed_table, _), storage)| {
+                if indexed_table == table
+                    && storage.columns.len() >= columns.len()
+                    && storage
+                        .columns
+                        .iter()
+                        .zip(columns.iter())
+                        .all(|((indexed_column, _), wanted)| indexed_column == wanted)
+                {
+                    Some(storage)
+                } else {
+                    None
+                }
+            }) else {
+                self.fk_full_scan_fallbacks.fetch_add(1, Ordering::SeqCst);
+                return Err(Error::Other(format!(
+                    "composite foreign key probe on {table}({}) has no covering index",
+                    columns.join(", ")
+                )));
+            };
+
+            self.fk_indexed_tuple_probes.fetch_add(1, Ordering::SeqCst);
+            let prefix = index_key_from_values(&storage.columns[..columns.len()], values);
+            if storage.columns.len() == columns.len() {
+                storage
+                    .tree
+                    .get(&prefix)
+                    .and_then(|entries| visible_posting(entries, snapshot, skip_deleted))
+            } else {
+                storage
+                    .tree
+                    .range(prefix.clone()..)
+                    .take_while(|(key, _)| {
+                        key.len() >= prefix.len() && key[..prefix.len()] == prefix[..]
+                    })
+                    .find_map(|(_, entries)| visible_posting(entries, snapshot, skip_deleted))
+            }
+        };
+        Ok(row_id.is_some_and(|row_id| {
+            self.relational_store
+                .row_by_id(table, row_id, snapshot)
+                .is_some()
+        }))
+    }
+
     fn apply_commit_time_upsert(
         &self,
         ws: &mut WriteSet,
@@ -4085,9 +4159,102 @@ impl Database {
 
     fn validate_composite_foreign_keys_in_write_set(
         &self,
-        _ws: &WriteSet,
-        _snapshot: SnapshotId,
+        ws: &WriteSet,
+        snapshot: SnapshotId,
     ) -> Result<()> {
+        for (table, row) in &ws.relational_inserts {
+            let meta = self
+                .table_meta(table)
+                .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+            for fk in &meta.composite_foreign_keys {
+                let Some(values) = tuple_values_for_row(row, &fk.child_columns) else {
+                    continue;
+                };
+                let parent_deletes = Self::deleted_row_ids_for_table(ws, &fk.parent_table);
+                let staged_match =
+                    staged_tuple_exists(ws, &fk.parent_table, &fk.parent_columns, &values);
+                let committed_match = self.indexed_visible_row_exists_by_columns(
+                    &fk.parent_table,
+                    &fk.parent_columns,
+                    &values,
+                    snapshot,
+                    &parent_deletes,
+                )?;
+                if !staged_match && !committed_match {
+                    return Err(Error::ForeignKeyViolation {
+                        child_table: table.clone(),
+                        child_columns: fk.child_columns.clone(),
+                        parent_table: fk.parent_table.clone(),
+                        parent_columns: fk.parent_columns.clone(),
+                    });
+                }
+            }
+        }
+
+        let reverse_refs = {
+            let metas = self.relational_store.table_meta.read();
+            metas
+                .iter()
+                .flat_map(|(child_table, meta)| {
+                    meta.composite_foreign_keys.iter().map(|fk| {
+                        (
+                            fk.parent_table.clone(),
+                            fk.parent_columns.clone(),
+                            child_table.clone(),
+                            fk.child_columns.clone(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (parent_table, parent_row_id, _) in &ws.relational_deletes {
+            let Some(parent_row) =
+                self.relational_store
+                    .row_by_id(parent_table, *parent_row_id, snapshot)
+            else {
+                continue;
+            };
+            for (ref_table, ref_columns, child_table, child_columns) in &reverse_refs {
+                if ref_table != parent_table {
+                    continue;
+                }
+                let Some(parent_values) = tuple_values_for_row(&parent_row, ref_columns) else {
+                    continue;
+                };
+                let parent_replaced_with_same_key =
+                    staged_tuple_exists(ws, parent_table, ref_columns, &parent_values);
+                if parent_replaced_with_same_key {
+                    continue;
+                }
+
+                if staged_tuple_exists(ws, child_table, child_columns, &parent_values) {
+                    return Err(Error::ForeignKeyViolation {
+                        child_table: child_table.clone(),
+                        child_columns: child_columns.clone(),
+                        parent_table: parent_table.clone(),
+                        parent_columns: ref_columns.clone(),
+                    });
+                }
+
+                let child_deletes = Self::deleted_row_ids_for_table(ws, child_table);
+                if self.indexed_visible_row_exists_by_columns(
+                    child_table,
+                    child_columns,
+                    &parent_values,
+                    snapshot,
+                    &child_deletes,
+                )? {
+                    return Err(Error::ForeignKeyViolation {
+                        child_table: child_table.clone(),
+                        child_columns: child_columns.clone(),
+                        parent_table: parent_table.clone(),
+                        parent_columns: ref_columns.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -6534,11 +6701,16 @@ impl Database {
     }
 
     pub fn __fk_probe_stats(&self) -> FkProbeStats {
-        FkProbeStats::default()
+        FkProbeStats {
+            indexed_tuple_probes: self.fk_indexed_tuple_probes.load(Ordering::SeqCst),
+            full_scan_fallbacks: self.fk_full_scan_fallbacks.load(Ordering::SeqCst),
+        }
     }
 
     pub fn __reset_fk_probe_stats(&self) {
         let _operation = self.assert_open_operation();
+        self.fk_indexed_tuple_probes.store(0, Ordering::SeqCst);
+        self.fk_full_scan_fallbacks.store(0, Ordering::SeqCst);
     }
 
     /// Set the pruning loop interval. Test-only API.
@@ -7104,9 +7276,9 @@ impl Database {
                 })
                 .collect(),
             constraints: create_table_constraints_from_meta(meta),
-            foreign_keys: Vec::new(),
-            composite_foreign_keys: Vec::new(),
-            composite_unique: Vec::new(),
+            foreign_keys: single_column_foreign_keys_from_meta(meta, &HashSet::new()),
+            composite_foreign_keys: meta.composite_foreign_keys.clone(),
+            composite_unique: meta.unique_constraints.clone(),
         };
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
@@ -7397,6 +7569,83 @@ impl Database {
             .collect::<Vec<_>>();
         entries.sort_by_key(|(lsn, _)| *lsn);
         entries
+            .into_iter()
+            .map(|(lsn, change)| (lsn, self.enrich_table_ddl_from_current_meta(change)))
+            .collect()
+    }
+
+    fn enrich_table_ddl_from_current_meta(&self, change: DdlChange) -> DdlChange {
+        match change {
+            DdlChange::CreateTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            } => {
+                // Sequence-form bincode table DDL is legacy-shaped after
+                // deserialization. Current TableMeta is the durable authority
+                // for structured constraints, so use it to serve complete sync
+                // payloads after reopen.
+                if foreign_keys.is_empty()
+                    && composite_foreign_keys.is_empty()
+                    && composite_unique.is_empty()
+                    && let Some(meta) = self.table_meta(&name)
+                {
+                    return DdlChange::CreateTable {
+                        name,
+                        columns,
+                        constraints,
+                        foreign_keys: single_column_foreign_keys_from_meta(&meta, &HashSet::new()),
+                        composite_foreign_keys: meta.composite_foreign_keys,
+                        composite_unique: meta.unique_constraints,
+                    };
+                }
+                DdlChange::CreateTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                }
+            }
+            DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            } => {
+                // See CreateTable arm: enrich legacy-shaped decoded DDL from
+                // the current table metadata before exposing it to sync.
+                if foreign_keys.is_empty()
+                    && composite_foreign_keys.is_empty()
+                    && composite_unique.is_empty()
+                    && let Some(meta) = self.table_meta(&name)
+                {
+                    return DdlChange::AlterTable {
+                        name,
+                        columns,
+                        constraints,
+                        foreign_keys: single_column_foreign_keys_from_meta(&meta, &HashSet::new()),
+                        composite_foreign_keys: meta.composite_foreign_keys,
+                        composite_unique: meta.unique_constraints,
+                    };
+                }
+                DdlChange::AlterTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                }
+            }
+            other => other,
+        }
     }
 
     /// Builds a complete snapshot of all live data as a ChangeSet.
@@ -7739,24 +7988,66 @@ impl Database {
                 name,
                 columns,
                 constraints,
-                ..
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             } => {
-                projected
-                    .entry(name.clone())
-                    .or_insert_with(|| rough_sync_table_meta(columns, constraints));
+                projected.entry(name.clone()).or_insert_with(|| {
+                    rough_sync_table_meta(
+                        columns,
+                        constraints,
+                        foreign_keys,
+                        composite_foreign_keys,
+                        composite_unique,
+                    )
+                });
             }
-            DdlChange::AlterTable { name, columns, .. } => {
+            DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            } => {
                 if let Some(meta) = projected.get_mut(name) {
+                    let incoming = rough_sync_table_meta(
+                        columns,
+                        constraints,
+                        foreign_keys,
+                        composite_foreign_keys,
+                        composite_unique,
+                    );
                     let mut existing = meta
                         .columns
                         .iter()
                         .map(|column| column.name.clone())
                         .collect::<HashSet<_>>();
-                    for (column, ty) in columns {
-                        if existing.insert(column.clone()) {
-                            meta.columns.push(rough_sync_column_def(column, ty));
+                    for column in incoming.columns {
+                        if existing.insert(column.name.clone()) {
+                            meta.columns.push(column);
+                        } else if let Some(current) = meta
+                            .columns
+                            .iter_mut()
+                            .find(|current| current.name == column.name)
+                        {
+                            current.references = column.references;
                         }
                     }
+                    if !incoming.unique_constraints.is_empty() {
+                        meta.unique_constraints = incoming.unique_constraints;
+                    }
+                    if !incoming.composite_foreign_keys.is_empty() {
+                        meta.composite_foreign_keys = incoming.composite_foreign_keys;
+                    }
+                    let user_indexes = meta
+                        .indexes
+                        .iter()
+                        .filter(|index| index.kind == IndexKind::UserDeclared)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    meta.indexes = crate::executor::auto_indexes_for_table_meta(meta);
+                    meta.indexes.extend(user_indexes);
                 }
             }
             DdlChange::DropTable { name } => {
@@ -7801,27 +8092,69 @@ impl Database {
                     name,
                     columns,
                     constraints,
-                    ..
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
                 } => {
                     if !projected.contains_key(name) {
-                        let meta = rough_sync_table_meta(columns, constraints);
+                        let meta = rough_sync_table_meta(
+                            columns,
+                            constraints,
+                            foreign_keys,
+                            composite_foreign_keys,
+                            composite_unique,
+                        );
                         required = required.saturating_add(meta.estimated_bytes());
                         projected.insert(name.clone(), meta);
                     }
                 }
-                DdlChange::AlterTable { name, columns, .. } => {
+                DdlChange::AlterTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                } => {
                     if let Some(meta) = projected.get_mut(name) {
                         let before = meta.estimated_bytes();
+                        let incoming = rough_sync_table_meta(
+                            columns,
+                            constraints,
+                            foreign_keys,
+                            composite_foreign_keys,
+                            composite_unique,
+                        );
                         let mut existing = meta
                             .columns
                             .iter()
                             .map(|column| column.name.clone())
                             .collect::<HashSet<_>>();
-                        for (column, ty) in columns {
-                            if existing.insert(column.clone()) {
-                                meta.columns.push(rough_sync_column_def(column, ty));
+                        for column in incoming.columns {
+                            if existing.insert(column.name.clone()) {
+                                meta.columns.push(column);
+                            } else if let Some(current) = meta
+                                .columns
+                                .iter_mut()
+                                .find(|current| current.name == column.name)
+                            {
+                                current.references = column.references;
                             }
                         }
+                        if !incoming.unique_constraints.is_empty() {
+                            meta.unique_constraints = incoming.unique_constraints;
+                        }
+                        if !incoming.composite_foreign_keys.is_empty() {
+                            meta.composite_foreign_keys = incoming.composite_foreign_keys;
+                        }
+                        let user_indexes = meta
+                            .indexes
+                            .iter()
+                            .filter(|index| index.kind == IndexKind::UserDeclared)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        meta.indexes = crate::executor::auto_indexes_for_table_meta(meta);
+                        meta.indexes.extend(user_indexes);
                         required =
                             required.saturating_add(meta.estimated_bytes().saturating_sub(before));
                     }
@@ -7988,14 +8321,34 @@ impl Database {
                 name,
                 columns,
                 constraints,
-                ..
-            } => Self::validate_sync_table_shape_ddl(name, columns, constraints),
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            } => Self::validate_sync_table_shape_ddl(
+                projected,
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            ),
             DdlChange::AlterTable {
                 name,
                 columns,
                 constraints,
-                ..
-            } => Self::validate_sync_table_shape_ddl(name, columns, constraints),
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            } => Self::validate_sync_table_shape_ddl(
+                projected,
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            ),
             DdlChange::CreateIndex {
                 table,
                 name,
@@ -8004,7 +8357,7 @@ impl Database {
                 let Some(meta) = projected.get(table) else {
                     return Err(Error::TableNotFound(table.clone()));
                 };
-                for prefix in ["__pk_", "__unique_"] {
+                for prefix in ["__pk_", "__unique_", "__fk_"] {
                     if name.starts_with(prefix) {
                         return Err(Error::ReservedIndexName {
                             table: table.clone(),
@@ -8049,13 +8402,39 @@ impl Database {
     }
 
     fn validate_sync_table_shape_ddl(
+        projected: &HashMap<String, TableMeta>,
         name: &str,
         columns: &[(String, String)],
         constraints: &[String],
+        foreign_keys: &[SingleColumnForeignKey],
+        composite_foreign_keys: &[CompositeForeignKey],
+        composite_unique: &[Vec<String>],
     ) -> Result<()> {
-        let sql = sync_create_table_sql(name, columns, constraints);
+        let sql = sync_create_table_sql(
+            name,
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        );
         let stmt = contextdb_parser::parse(&sql)?;
         let _ = contextdb_planner::plan(&stmt)?;
+        let candidate = rough_sync_table_meta(
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        );
+        let candidate_lookup = candidate.clone();
+        crate::executor::validate_composite_foreign_keys_for_meta(name, &candidate, |parent| {
+            if parent == name {
+                Some(candidate_lookup.clone())
+            } else {
+                projected.get(parent).cloned()
+            }
+        })?;
         Ok(())
     }
 
@@ -8414,6 +8793,81 @@ impl Database {
         Ok(())
     }
 
+    fn sync_composite_fk_violation_for_values(
+        &self,
+        tx: TxId,
+        child_table: &str,
+        child_meta: &TableMeta,
+        values: &HashMap<String, Value>,
+        incoming_batch_values: &HashMap<String, Vec<HashMap<String, Value>>>,
+        projected_deleted_committed_row_ids: &HashMap<String, HashSet<RowId>>,
+    ) -> Result<Option<Error>> {
+        for fk in &child_meta.composite_foreign_keys {
+            let mut tuple = Vec::with_capacity(fk.child_columns.len());
+            let mut has_null = false;
+            for column in &fk.child_columns {
+                match values.get(column) {
+                    Some(Value::Null) | None => {
+                        has_null = true;
+                        break;
+                    }
+                    Some(value) => tuple.push(value.clone()),
+                }
+            }
+            if has_null {
+                continue;
+            }
+
+            let incoming_match =
+                incoming_batch_values
+                    .get(&fk.parent_table)
+                    .is_some_and(|table_values| {
+                        table_values.iter().any(|row_values| {
+                            fk.parent_columns
+                                .iter()
+                                .zip(tuple.iter())
+                                .all(|(column, value)| row_values.get(column) == Some(value))
+                        })
+                    });
+            if incoming_match {
+                continue;
+            }
+
+            let staged_match = self.tx_mgr.with_write_set(tx, |ws| {
+                staged_tuple_exists(ws, &fk.parent_table, &fk.parent_columns, &tuple)
+            })?;
+            if staged_match {
+                continue;
+            }
+
+            let mut parent_deletes = projected_deleted_committed_row_ids
+                .get(&fk.parent_table)
+                .cloned()
+                .unwrap_or_default();
+            let staged_parent_deletes = self.tx_mgr.with_write_set(tx, |ws| {
+                Self::deleted_row_ids_for_table(ws, &fk.parent_table)
+            })?;
+            parent_deletes.extend(staged_parent_deletes);
+            let committed_match = self.indexed_visible_row_exists_by_columns(
+                &fk.parent_table,
+                &fk.parent_columns,
+                &tuple,
+                self.snapshot(),
+                &parent_deletes,
+            )?;
+            if !committed_match {
+                return Ok(Some(Error::ForeignKeyViolation {
+                    child_table: child_table.to_string(),
+                    child_columns: fk.child_columns.clone(),
+                    parent_table: fk.parent_table.clone(),
+                    parent_columns: fk.parent_columns.clone(),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn sync_conflict_policy_for_table(policies: &ConflictPolicies, table: &str) -> ConflictPolicy {
         policies
             .per_table
@@ -8451,6 +8905,315 @@ impl Database {
             }
         }
         false
+    }
+
+    fn projected_sync_incoming_values_for_applied_rows(
+        &self,
+        rows: &[RowChange],
+        policies: &ConflictPolicies,
+    ) -> Result<ProjectedSyncApply> {
+        let mut projected_rows = Vec::<ProjectedSyncRow>::new();
+        let mut visible_rows_cache = HashMap::new();
+        let mut deleted_committed_row_ids = HashMap::<String, HashSet<RowId>>::new();
+        let mut synthetic_row_ids = HashSet::<RowId>::new();
+        let mut next_synthetic_row_id = u64::MAX;
+
+        for row in rows {
+            if row.values.is_empty() {
+                continue;
+            }
+
+            let existing = cached_point_lookup(
+                self,
+                &mut visible_rows_cache,
+                &row.table,
+                &row.natural_key.column,
+                &row.natural_key.value,
+            )?;
+
+            if row.deleted {
+                if let Some(local) = existing {
+                    remove_cached_row(&mut visible_rows_cache, &row.table, local.row_id);
+                    if !synthetic_row_ids.remove(&local.row_id) {
+                        deleted_committed_row_ids
+                            .entry(row.table.clone())
+                            .or_default()
+                            .insert(local.row_id);
+                    }
+                    projected_rows.retain(|projected| {
+                        projected.table != row.table || projected.natural_key != row.natural_key
+                    });
+                }
+                continue;
+            }
+
+            let mut values = row.values.clone();
+            values.remove("__deleted");
+            let policy = Self::sync_conflict_policy_for_table(policies, &row.table);
+            let applies = match existing.as_ref() {
+                None => self
+                    .sync_insert_constraint_error_for_values(
+                        &row.table,
+                        &values,
+                        &mut visible_rows_cache,
+                    )?
+                    .is_none(),
+                Some(local) => {
+                    Self::sync_row_applies_over_committed(row, local, policy)
+                        && self
+                            .sync_upsert_constraint_error_for_values(
+                                &row.table,
+                                &values,
+                                local,
+                                &mut visible_rows_cache,
+                            )?
+                            .is_none()
+                }
+            };
+            if !applies {
+                continue;
+            }
+
+            if let Some(local) = existing.as_ref()
+                && !synthetic_row_ids.contains(&local.row_id)
+            {
+                deleted_committed_row_ids
+                    .entry(row.table.clone())
+                    .or_default()
+                    .insert(local.row_id);
+            }
+            projected_rows.retain(|projected| {
+                projected.table != row.table || projected.natural_key != row.natural_key
+            });
+            let row_id = existing.as_ref().map(|row| row.row_id).unwrap_or_else(|| {
+                let row_id = RowId(next_synthetic_row_id);
+                synthetic_row_ids.insert(row_id);
+                next_synthetic_row_id = next_synthetic_row_id.saturating_sub(1);
+                row_id
+            });
+            upsert_cached_projection(
+                &mut visible_rows_cache,
+                &row.table,
+                row_id,
+                values.clone(),
+                row.lsn,
+            );
+            projected_rows.push(ProjectedSyncRow {
+                table: row.table.clone(),
+                natural_key: row.natural_key.clone(),
+                values,
+            });
+        }
+
+        self.retain_projected_rows_with_valid_composite_fks(
+            &mut projected_rows,
+            &deleted_committed_row_ids,
+        )?;
+        Ok(ProjectedSyncApply {
+            incoming_values: projected_sync_rows_by_table(&projected_rows),
+            deleted_committed_row_ids,
+        })
+    }
+
+    fn sync_insert_constraint_error_for_values(
+        &self,
+        table: &str,
+        values: &HashMap<String, Value>,
+        visible_rows_cache: &mut HashMap<String, Vec<VersionedRow>>,
+    ) -> Result<Option<String>> {
+        self.sync_projected_row_constraint_error_for_values(table, values, visible_rows_cache, None)
+    }
+
+    fn sync_projected_row_constraint_error_for_values(
+        &self,
+        table: &str,
+        values: &HashMap<String, Value>,
+        visible_rows_cache: &mut HashMap<String, Vec<VersionedRow>>,
+        skip_row_id: Option<RowId>,
+    ) -> Result<Option<String>> {
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+
+        for col_def in &meta.columns {
+            if !col_def.nullable && !col_def.primary_key && col_def.default.is_none() {
+                match values.get(&col_def.name) {
+                    None | Some(Value::Null) => {
+                        return Ok(Some(format!(
+                            "NOT NULL constraint violated: {}.{}",
+                            table, col_def.name
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let visible_rows = cached_visible_rows(self, visible_rows_cache, table)?;
+        for col_def in &meta.columns {
+            if (col_def.primary_key || col_def.unique)
+                && let Some(new_value) = values.get(&col_def.name)
+                && *new_value != Value::Null
+                && visible_rows.iter().any(|row| {
+                    skip_row_id != Some(row.row_id)
+                        && row.values.get(&col_def.name) == Some(new_value)
+                })
+            {
+                return Ok(Some(format!(
+                    "UNIQUE constraint violated: {}.{}",
+                    table, col_def.name
+                )));
+            }
+        }
+
+        for unique_columns in &meta.unique_constraints {
+            let Some(tuple) = tuple_values_from_map(values, unique_columns) else {
+                continue;
+            };
+            if visible_rows.iter().any(|row| {
+                skip_row_id != Some(row.row_id)
+                    && tuple_values_for_row(row, unique_columns).as_ref() == Some(&tuple)
+            }) {
+                return Ok(Some(format!(
+                    "UNIQUE constraint violated: {}({})",
+                    table,
+                    unique_columns.join(", ")
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn sync_upsert_constraint_error_for_values(
+        &self,
+        table: &str,
+        values: &HashMap<String, Value>,
+        existing: &VersionedRow,
+        visible_rows_cache: &mut HashMap<String, Vec<VersionedRow>>,
+    ) -> Result<Option<String>> {
+        let values = match self.coerce_row_for_insert(table, values.clone(), None, None) {
+            Ok(values) => values,
+            Err(err) if is_fatal_sync_apply_error(&err) => return Err(err),
+            Err(err) => return Ok(Some(format!("{err}"))),
+        };
+
+        if let Some(meta) = self.table_meta(table) {
+            for col_def in meta.columns.iter().filter(|column| column.immutable) {
+                let Some(incoming) = values.get(&col_def.name) else {
+                    continue;
+                };
+                if existing.values.get(&col_def.name) != Some(incoming) {
+                    return Ok(Some(format!(
+                        "{}",
+                        Error::ImmutableColumn {
+                            table: table.to_string(),
+                            column: col_def.name.clone(),
+                        }
+                    )));
+                }
+            }
+        }
+
+        if let Some(err) = self.sync_projected_row_constraint_error_for_values(
+            table,
+            &values,
+            visible_rows_cache,
+            Some(existing.row_id),
+        )? {
+            return Ok(Some(err));
+        }
+
+        let snapshot = self.snapshot_for_read();
+        for check in [
+            self.assert_row_write_allowed(table, existing.row_id, &existing.values, snapshot),
+            self.assert_row_write_allowed(table, existing.row_id, &values, snapshot),
+            self.validate_commit_time_upsert_state_transition(table, existing, &values),
+        ] {
+            if let Err(err) = check {
+                if is_fatal_sync_apply_error(&err) {
+                    return Err(err);
+                }
+                return Ok(Some(format!("{err}")));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn retain_projected_rows_with_valid_composite_fks(
+        &self,
+        projected_rows: &mut Vec<ProjectedSyncRow>,
+        deleted_committed_row_ids: &HashMap<String, HashSet<RowId>>,
+    ) -> Result<()> {
+        loop {
+            let incoming_values = projected_sync_rows_by_table(projected_rows);
+            let mut remove_indexes = Vec::new();
+            for (idx, row) in projected_rows.iter().enumerate() {
+                let meta = self
+                    .table_meta(&row.table)
+                    .ok_or_else(|| Error::TableNotFound(row.table.clone()))?;
+                if self.projected_composite_fk_violation_for_values(
+                    &meta,
+                    &row.values,
+                    &incoming_values,
+                    deleted_committed_row_ids,
+                )? {
+                    remove_indexes.push(idx);
+                }
+            }
+            if remove_indexes.is_empty() {
+                return Ok(());
+            }
+            for idx in remove_indexes.into_iter().rev() {
+                projected_rows.remove(idx);
+            }
+        }
+    }
+
+    fn projected_composite_fk_violation_for_values(
+        &self,
+        child_meta: &TableMeta,
+        values: &HashMap<String, Value>,
+        incoming_values: &HashMap<String, Vec<HashMap<String, Value>>>,
+        deleted_committed_row_ids: &HashMap<String, HashSet<RowId>>,
+    ) -> Result<bool> {
+        for fk in &child_meta.composite_foreign_keys {
+            let Some(tuple) = tuple_values_from_map(values, &fk.child_columns) else {
+                continue;
+            };
+            let incoming_match =
+                incoming_values
+                    .get(&fk.parent_table)
+                    .is_some_and(|table_values| {
+                        table_values.iter().any(|row_values| {
+                            fk.parent_columns
+                                .iter()
+                                .zip(tuple.iter())
+                                .all(|(column, value)| row_values.get(column) == Some(value))
+                        })
+                    });
+            if incoming_match {
+                continue;
+            }
+
+            let empty_deleted = HashSet::new();
+            let deleted_parent_row_ids = deleted_committed_row_ids
+                .get(&fk.parent_table)
+                .unwrap_or(&empty_deleted);
+            let committed_match = self.indexed_visible_row_exists_by_columns(
+                &fk.parent_table,
+                &fk.parent_columns,
+                &tuple,
+                self.snapshot(),
+                deleted_parent_row_ids,
+            )?;
+            if !committed_match {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     fn projected_sync_dag_edge_types(&self, ddl: &[DdlChange]) -> HashSet<EdgeType> {
@@ -9121,7 +9884,6 @@ impl Database {
         let mut sync_trigger_projection = self.trigger.declarations.lock().clone();
         let group_has_data = changes.data_entry_count() != 0;
         let dropped_tables = Self::sync_dropped_tables(&changes.ddl);
-
         let ddl_result = (|| -> Result<()> {
             for ddl in changes.ddl.clone() {
                 match ddl {
@@ -9129,10 +9891,26 @@ impl Database {
                         name,
                         columns,
                         constraints,
-                        ..
+                        foreign_keys,
+                        composite_foreign_keys,
+                        composite_unique,
                     } => {
                         if self.table_meta(&name).is_some() {
                             if let Some(local_meta) = self.table_meta(&name) {
+                                if !sync_table_shape_matches(
+                                    &local_meta,
+                                    &columns,
+                                    &constraints,
+                                    &foreign_keys,
+                                    &composite_foreign_keys,
+                                    &composite_unique,
+                                ) {
+                                    return Err(Error::SchemaInvalid {
+                                        reason: format!(
+                                            "schema mismatch for table {name}: structured constraints differ"
+                                        ),
+                                    });
+                                }
                                 let local_cols: Vec<(String, String)> = local_meta
                                     .columns
                                     .iter()
@@ -9172,7 +9950,14 @@ impl Database {
                             }
                             continue;
                         }
-                        let sql = sync_create_table_sql(&name, &columns, &constraints);
+                        let sql = sync_create_table_sql(
+                            &name,
+                            &columns,
+                            &constraints,
+                            &foreign_keys,
+                            &composite_foreign_keys,
+                            &composite_unique,
+                        );
                         self.execute_in_tx(tx, &sql, &HashMap::new())?;
                         self.clear_statement_cache();
                         table_meta_cache.remove(&name);
@@ -9252,7 +10037,9 @@ impl Database {
                         name,
                         columns,
                         constraints,
-                        ..
+                        foreign_keys,
+                        composite_foreign_keys,
+                        composite_unique,
                     } => {
                         if self.table_meta(&name).is_none() {
                             continue;
@@ -9260,14 +10047,67 @@ impl Database {
                         let existing = self.table_meta(&name).unwrap_or_default();
                         let existing_cols: HashSet<String> =
                             existing.columns.iter().map(|c| c.name.clone()).collect();
-                        for (col, ty) in columns {
-                            if existing_cols.contains(&col) {
+                        for (col, ty) in &columns {
+                            if existing_cols.contains(col.as_str()) {
                                 continue;
                             }
-                            let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", name, col, ty);
+                            let sql = format!(
+                                "ALTER TABLE {} ADD COLUMN {} {}",
+                                name,
+                                col,
+                                sync_column_type_with_foreign_key(col, ty, &foreign_keys)
+                            );
                             self.execute_in_tx(tx, &sql, &HashMap::new())?;
                         }
-                        let _ = constraints;
+                        if let Some(mut meta) = self.table_meta(&name) {
+                            let incoming = rough_sync_table_meta(
+                                &columns,
+                                &constraints,
+                                &foreign_keys,
+                                &composite_foreign_keys,
+                                &composite_unique,
+                            );
+                            for incoming_column in incoming.columns {
+                                if let Some(existing_column) = meta
+                                    .columns
+                                    .iter_mut()
+                                    .find(|column| column.name == incoming_column.name)
+                                {
+                                    existing_column.references = incoming_column.references;
+                                }
+                            }
+                            if !incoming.unique_constraints.is_empty() {
+                                meta.unique_constraints = incoming.unique_constraints;
+                            }
+                            if !incoming.composite_foreign_keys.is_empty() {
+                                meta.composite_foreign_keys = incoming.composite_foreign_keys;
+                            }
+                            let user_indexes = meta
+                                .indexes
+                                .iter()
+                                .filter(|index| index.kind == IndexKind::UserDeclared)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            meta.indexes = crate::executor::auto_indexes_for_table_meta(&meta);
+                            meta.indexes.extend(user_indexes);
+                            {
+                                let store = self.relational_store();
+                                store.table_meta.write().insert(name.clone(), meta.clone());
+                                for index in meta
+                                    .indexes
+                                    .iter()
+                                    .filter(|index| index.kind == IndexKind::Auto)
+                                {
+                                    store.create_index_storage(
+                                        &name,
+                                        &index.name,
+                                        index.columns.clone(),
+                                    );
+                                    store.rebuild_index(&name, &index.name);
+                                }
+                            }
+                            self.persist_table_meta(&name, &meta)?;
+                        }
                         self.clear_statement_cache();
                         table_meta_cache.remove(&name);
                         visible_rows_cache.remove(&name);
@@ -9392,6 +10232,14 @@ impl Database {
             let _ = self.rollback(tx);
             return Err(err);
         }
+        let projected_sync_apply =
+            match self.projected_sync_incoming_values_for_applied_rows(&changes.rows, policies) {
+                Ok(projection) => projection,
+                Err(err) => {
+                    let _ = self.rollback(tx);
+                    return Err(err);
+                }
+            };
         for row in changes.rows {
             if row.values.is_empty() {
                 result.skipped_rows += 1;
@@ -9530,6 +10378,34 @@ impl Database {
                                 natural_key: row.natural_key.clone(),
                                 resolution: policy,
                                 reason: Some(err_msg),
+                            });
+                            if commit_each_row {
+                                self.commit_with_source(tx, CommitSource::SyncPull)?;
+                                tx = self.begin();
+                            }
+                            continue;
+                        }
+
+                        if let Some(err) = self.sync_composite_fk_violation_for_values(
+                            tx,
+                            &row.table,
+                            &meta,
+                            &values,
+                            &projected_sync_apply.incoming_values,
+                            &projected_sync_apply.deleted_committed_row_ids,
+                        )? {
+                            result.skipped_rows += 1;
+                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                consume_failed_vector_row_group(
+                                    &vector_row_ids,
+                                    &mut vector_row_idx,
+                                    &mut failed_row_ids,
+                                );
+                            }
+                            result.conflicts.push(Conflict {
+                                natural_key: row.natural_key.clone(),
+                                resolution: policy,
+                                reason: Some(format!("{err}")),
                             });
                             if commit_each_row {
                                 self.commit_with_source(tx, CommitSource::SyncPull)?;
@@ -10255,6 +11131,43 @@ fn record_cached_insert(
     }
 }
 
+fn upsert_cached_projection(
+    cache: &mut HashMap<String, Vec<VersionedRow>>,
+    table: &str,
+    row_id: RowId,
+    values: HashMap<String, Value>,
+    lsn: Lsn,
+) {
+    if let Some(rows) = cache.get_mut(table) {
+        if let Some(row) = rows.iter_mut().find(|row| row.row_id == row_id) {
+            row.values = values;
+            row.lsn = lsn;
+        } else {
+            rows.push(VersionedRow {
+                row_id,
+                values,
+                created_tx: TxId(0),
+                deleted_tx: None,
+                lsn,
+                created_at: None,
+            });
+        }
+    }
+}
+
+fn projected_sync_rows_by_table(
+    rows: &[ProjectedSyncRow],
+) -> HashMap<String, Vec<HashMap<String, Value>>> {
+    let mut by_table = HashMap::<String, Vec<HashMap<String, Value>>>::new();
+    for row in rows {
+        by_table
+            .entry(row.table.clone())
+            .or_default()
+            .push(row.values.clone());
+    }
+    by_table
+}
+
 fn consume_vector_row_group(
     remote_row_ids: &[RowId],
     cursor: &mut usize,
@@ -10420,6 +11333,62 @@ fn sleep_with_shutdown(shutdown: &AtomicBool, interval: Duration) {
     }
 }
 
+fn tuple_values_from_map(
+    values_by_column: &HashMap<String, Value>,
+    columns: &[String],
+) -> Option<Vec<Value>> {
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        match values_by_column.get(column) {
+            Some(Value::Null) | None => return None,
+            Some(value) => values.push(value.clone()),
+        }
+    }
+    Some(values)
+}
+
+fn tuple_values_for_row(row: &VersionedRow, columns: &[String]) -> Option<Vec<Value>> {
+    tuple_values_from_map(&row.values, columns)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetentionRowKey {
+    table: String,
+    row_id: RowId,
+}
+
+impl RetentionRowKey {
+    fn new(table: &str, row_id: RowId) -> Self {
+        Self {
+            table: table.to_string(),
+            row_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedSyncRow {
+    table: String,
+    natural_key: NaturalKey,
+    values: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedSyncApply {
+    incoming_values: HashMap<String, Vec<HashMap<String, Value>>>,
+    deleted_committed_row_ids: HashMap<String, HashSet<RowId>>,
+}
+
+fn staged_tuple_exists(ws: &WriteSet, table: &str, columns: &[String], values: &[Value]) -> bool {
+    ws.relational_inserts.iter().any(|(insert_table, row)| {
+        insert_table == table
+            && columns
+                .iter()
+                .zip(values.iter())
+                .all(|(column, value)| row.values.get(column) == Some(value))
+    })
+}
+
 fn prune_expired_rows(
     relational_store: &Arc<RelationalStore>,
     graph_store: &Arc<GraphStore>,
@@ -10427,15 +11396,21 @@ fn prune_expired_rows(
     accountant: &MemoryAccountant,
     persistence: Option<&Arc<RedbPersistence>>,
     sync_watermark: Lsn,
-) -> u64 {
+) -> PruningReport {
     let now = Wallclock::now();
     let metas = relational_store.table_meta.read().clone();
     let mut pruned_by_table: HashMap<String, Vec<RowId>> = HashMap::new();
     let mut pruned_node_ids = HashSet::new();
     let mut released_row_bytes = 0usize;
+    let mut blocked = Vec::new();
 
     {
         let mut tables = relational_store.tables.write();
+        let table_snapshot = tables.clone();
+        let prune_candidates =
+            retention_prune_candidates(&metas, &table_snapshot, now, sync_watermark);
+        let protected_prune_candidates =
+            fk_protected_prune_candidates(&metas, &table_snapshot, &prune_candidates);
         for (table_name, rows) in tables.iter_mut() {
             let Some(meta) = metas.get(table_name) else {
                 continue;
@@ -10445,7 +11420,19 @@ fn prune_expired_rows(
             }
 
             rows.retain(|row| {
-                if !row_is_prunable(row, meta, now, sync_watermark) {
+                let row_key = RetentionRowKey::new(table_name, row.row_id);
+                if !prune_candidates.contains(&row_key) {
+                    return true;
+                }
+                if let Some(reason) = prune_blocker_for_referenced_parent(
+                    table_name,
+                    row,
+                    &metas,
+                    &table_snapshot,
+                    &prune_candidates,
+                    &protected_prune_candidates,
+                ) {
+                    blocked.push(reason);
                     return true;
                 }
 
@@ -10468,7 +11455,19 @@ fn prune_expired_rows(
         .flat_map(|rows| rows.iter().copied())
         .collect();
     if pruned_row_ids.is_empty() {
-        return 0;
+        return PruningReport {
+            pruned_rows: 0,
+            blocked_count: blocked.len() as u64,
+            blocked,
+        };
+    }
+
+    for table_name in pruned_by_table.keys() {
+        if let Some(meta) = metas.get(table_name) {
+            for index in &meta.indexes {
+                relational_store.rebuild_index(table_name, &index.name);
+            }
+        }
     }
 
     let released_vector_bytes = vector_store.prune_row_ids(&pruned_row_ids, accountant);
@@ -10529,7 +11528,11 @@ fn prune_expired_rows(
             .saturating_add(released_edge_bytes),
     );
 
-    pruned_row_ids.len() as u64
+    PruningReport {
+        pruned_rows: pruned_row_ids.len() as u64,
+        blocked_count: blocked.len() as u64,
+        blocked,
+    }
 }
 
 fn checked_prune_expired_rows(
@@ -10540,17 +11543,164 @@ fn checked_prune_expired_rows(
     persistence: Option<&Arc<RedbPersistence>>,
     sync_watermark: Lsn,
 ) -> Result<PruningReport> {
-    Ok(PruningReport {
-        pruned_rows: prune_expired_rows(
-            relational_store,
-            graph_store,
-            vector_store,
-            accountant,
-            persistence,
-            sync_watermark,
-        ),
-        blocked_count: 0,
-        blocked: Vec::new(),
+    Ok(prune_expired_rows(
+        relational_store,
+        graph_store,
+        vector_store,
+        accountant,
+        persistence,
+        sync_watermark,
+    ))
+}
+
+fn retention_prune_candidates(
+    metas: &HashMap<String, TableMeta>,
+    tables: &HashMap<String, Vec<VersionedRow>>,
+    now: Wallclock,
+    sync_watermark: Lsn,
+) -> HashSet<RetentionRowKey> {
+    let mut candidates = HashSet::new();
+    for (table_name, rows) in tables {
+        let Some(meta) = metas.get(table_name) else {
+            continue;
+        };
+        if meta.default_ttl_seconds.is_none() {
+            continue;
+        }
+        for row in rows {
+            if row_is_prunable(row, meta, now, sync_watermark) {
+                candidates.insert(RetentionRowKey::new(table_name, row.row_id));
+            }
+        }
+    }
+    candidates
+}
+
+fn fk_protected_prune_candidates(
+    metas: &HashMap<String, TableMeta>,
+    tables: &HashMap<String, Vec<VersionedRow>>,
+    prune_candidates: &HashSet<RetentionRowKey>,
+) -> HashSet<RetentionRowKey> {
+    let mut protected = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (parent_table, rows) in tables {
+            for parent_row in rows {
+                let parent_key = RetentionRowKey::new(parent_table, parent_row.row_id);
+                if !prune_candidates.contains(&parent_key) || parent_row.deleted_tx.is_some() {
+                    continue;
+                }
+                if prune_blocker_for_referenced_parent(
+                    parent_table,
+                    parent_row,
+                    metas,
+                    tables,
+                    prune_candidates,
+                    &protected,
+                )
+                .is_some()
+                {
+                    changed |= protected.insert(parent_key);
+                }
+            }
+        }
+        if !changed {
+            return protected;
+        }
+    }
+}
+
+fn prune_blocker_for_referenced_parent(
+    parent_table: &str,
+    parent_row: &VersionedRow,
+    metas: &HashMap<String, TableMeta>,
+    tables: &HashMap<String, Vec<VersionedRow>>,
+    prune_candidates: &HashSet<RetentionRowKey>,
+    protected_prune_candidates: &HashSet<RetentionRowKey>,
+) -> Option<String> {
+    if parent_row.deleted_tx.is_some() {
+        return None;
+    }
+
+    for (child_table, child_meta) in metas {
+        for column in &child_meta.columns {
+            let Some(reference) = &column.references else {
+                continue;
+            };
+            if reference.table != parent_table {
+                continue;
+            }
+            let Some(parent_value) = parent_row.values.get(&reference.column) else {
+                continue;
+            };
+            if *parent_value == Value::Null {
+                continue;
+            }
+            if child_rows_contain_live_reference(
+                child_table,
+                tables,
+                std::slice::from_ref(&column.name),
+                std::slice::from_ref(parent_value),
+                prune_candidates,
+                protected_prune_candidates,
+            ) {
+                return Some(format!(
+                    "blocked pruning {}({}) because live {}({}) references it",
+                    parent_table, reference.column, child_table, column.name
+                ));
+            }
+        }
+
+        for fk in &child_meta.composite_foreign_keys {
+            if fk.parent_table != parent_table {
+                continue;
+            }
+            let Some(parent_values) = tuple_values_for_row(parent_row, &fk.parent_columns) else {
+                continue;
+            };
+            if child_rows_contain_live_reference(
+                child_table,
+                tables,
+                &fk.child_columns,
+                &parent_values,
+                prune_candidates,
+                protected_prune_candidates,
+            ) {
+                return Some(format!(
+                    "blocked pruning {}({}) because live {}({}) references it",
+                    parent_table,
+                    fk.parent_columns.join(", "),
+                    child_table,
+                    fk.child_columns.join(", ")
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+fn child_rows_contain_live_reference(
+    child_table: &str,
+    tables: &HashMap<String, Vec<VersionedRow>>,
+    child_columns: &[String],
+    parent_values: &[Value],
+    prune_candidates: &HashSet<RetentionRowKey>,
+    protected_prune_candidates: &HashSet<RetentionRowKey>,
+) -> bool {
+    tables.get(child_table).is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row.deleted_tx.is_none()
+                && child_columns
+                    .iter()
+                    .zip(parent_values.iter())
+                    .all(|(column, value)| row.values.get(column) == Some(value))
+                && {
+                    let child_key = RetentionRowKey::new(child_table, row.row_id);
+                    !prune_candidates.contains(&child_key)
+                        || protected_prune_candidates.contains(&child_key)
+                }
+        })
     })
 }
 
@@ -10889,9 +12039,17 @@ fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {
             })
             .collect(),
         constraints: create_table_constraints_from_ast(ct),
-        foreign_keys: Vec::new(),
-        composite_foreign_keys: Vec::new(),
-        composite_unique: Vec::new(),
+        foreign_keys: single_column_foreign_keys_from_ast(ct),
+        composite_foreign_keys: ct
+            .composite_foreign_keys
+            .iter()
+            .map(|fk| CompositeForeignKey {
+                child_columns: fk.child_columns.clone(),
+                parent_table: fk.parent_table.clone(),
+                parent_columns: fk.parent_columns.clone(),
+            })
+            .collect(),
+        composite_unique: ct.unique_constraints.clone(),
     }
 }
 
@@ -10918,10 +12076,64 @@ fn ddl_change_from_meta_excluding(
             })
             .collect(),
         constraints: create_table_constraints_from_meta(meta),
-        foreign_keys: Vec::new(),
-        composite_foreign_keys: Vec::new(),
-        composite_unique: Vec::new(),
+        foreign_keys: single_column_foreign_keys_from_meta(meta, excluded_columns),
+        composite_foreign_keys: meta
+            .composite_foreign_keys
+            .iter()
+            .filter(|fk| {
+                fk.child_columns
+                    .iter()
+                    .all(|column| !excluded_columns.contains(column))
+            })
+            .cloned()
+            .collect(),
+        composite_unique: meta
+            .unique_constraints
+            .iter()
+            .filter(|columns| {
+                columns
+                    .iter()
+                    .all(|column| !excluded_columns.contains(column))
+            })
+            .cloned()
+            .collect(),
     }
+}
+
+fn single_column_foreign_keys_from_ast(ct: &CreateTable) -> Vec<SingleColumnForeignKey> {
+    ct.columns
+        .iter()
+        .filter_map(|column| {
+            column
+                .references
+                .as_ref()
+                .map(|reference| SingleColumnForeignKey {
+                    child_column: column.name.clone(),
+                    parent_table: reference.table.clone(),
+                    parent_column: reference.column.clone(),
+                })
+        })
+        .collect()
+}
+
+fn single_column_foreign_keys_from_meta(
+    meta: &TableMeta,
+    excluded_columns: &HashSet<String>,
+) -> Vec<SingleColumnForeignKey> {
+    meta.columns
+        .iter()
+        .filter(|column| !excluded_columns.contains(&column.name))
+        .filter_map(|column| {
+            column
+                .references
+                .as_ref()
+                .map(|reference| SingleColumnForeignKey {
+                    child_column: column.name.clone(),
+                    parent_table: reference.table.clone(),
+                    parent_column: reference.column.clone(),
+                })
+        })
+        .collect()
 }
 
 fn full_snapshot_ddl(metas: &HashMap<String, TableMeta>) -> Vec<DdlChange> {
@@ -10947,6 +12159,18 @@ fn full_snapshot_ddl(metas: &HashMap<String, TableMeta>) -> Vec<DdlChange> {
                     policy.joined_table == *name
                         || !metas.contains_key(&policy.joined_table)
                         || emitted.contains(&policy.joined_table)
+                })
+                && meta.columns.iter().all(|column| {
+                    column.references.as_ref().is_none_or(|reference| {
+                        reference.table == *name
+                            || !metas.contains_key(&reference.table)
+                            || emitted.contains(&reference.table)
+                    })
+                })
+                && meta.composite_foreign_keys.iter().all(|fk| {
+                    fk.parent_table == *name
+                        || !metas.contains_key(&fk.parent_table)
+                        || emitted.contains(&fk.parent_table)
                 });
             if deps_ready {
                 push_snapshot_table_ddl(&mut ddl, name, meta);
@@ -11007,9 +12231,9 @@ fn push_snapshot_table_ddl(ddl: &mut Vec<DdlChange>, name: &str, meta: &TableMet
                 })
                 .collect(),
             constraints: create_table_constraints_from_meta(meta),
-            foreign_keys: Vec::new(),
-            composite_foreign_keys: Vec::new(),
-            composite_unique: Vec::new(),
+            foreign_keys: single_column_foreign_keys_from_meta(meta, &HashSet::new()),
+            composite_foreign_keys: meta.composite_foreign_keys.clone(),
+            composite_unique: meta.unique_constraints.clone(),
         });
     }
 }
@@ -11208,21 +12432,91 @@ fn sync_create_table_sql(
     name: &str,
     columns: &[(String, String)],
     constraints: &[String],
+    foreign_keys: &[SingleColumnForeignKey],
+    composite_foreign_keys: &[CompositeForeignKey],
+    composite_unique: &[Vec<String>],
 ) -> String {
-    let mut sql = format!(
-        "CREATE TABLE {} ({})",
-        name,
-        columns
-            .iter()
-            .map(|(column, ty)| format!("{column} {ty}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    if !constraints.is_empty() {
+    let mut table_elements = columns
+        .iter()
+        .map(|(column, ty)| {
+            format!(
+                "{column} {}",
+                sync_column_type_with_foreign_key(column, ty, foreign_keys)
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut table_options = Vec::new();
+    let mut seen_table_elements = table_elements
+        .iter()
+        .map(|element| schema_clause_key(element))
+        .collect::<HashSet<_>>();
+
+    for unique in composite_unique {
+        let element = format!("UNIQUE ({})", unique.join(", "));
+        if seen_table_elements.insert(schema_clause_key(&element)) {
+            table_elements.push(element);
+        }
+    }
+    for fk in composite_foreign_keys {
+        let element = format!(
+            "FOREIGN KEY ({}) REFERENCES {}({})",
+            fk.child_columns.join(", "),
+            fk.parent_table,
+            fk.parent_columns.join(", ")
+        );
+        if seen_table_elements.insert(schema_clause_key(&element)) {
+            table_elements.push(element);
+        }
+    }
+    for constraint in constraints {
+        if sync_constraint_is_table_element(constraint) {
+            if seen_table_elements.insert(schema_clause_key(constraint)) {
+                table_elements.push(constraint.clone());
+            }
+        } else {
+            table_options.push(constraint.clone());
+        }
+    }
+
+    let mut sql = format!("CREATE TABLE {} ({})", name, table_elements.join(", "));
+    if !table_options.is_empty() {
         sql.push(' ');
-        sql.push_str(&constraints.join(" "));
+        sql.push_str(&table_options.join(" "));
     }
     sql
+}
+
+fn sync_column_type_with_foreign_key(
+    column: &str,
+    ty: &str,
+    foreign_keys: &[SingleColumnForeignKey],
+) -> String {
+    if normalize_schema_type(ty)
+        .to_ascii_uppercase()
+        .contains(" REFERENCES ")
+    {
+        return ty.to_string();
+    }
+    let Some(fk) = foreign_keys.iter().find(|fk| fk.child_column == column) else {
+        return ty.to_string();
+    };
+    format!(
+        "{} REFERENCES {}({})",
+        ty, fk.parent_table, fk.parent_column
+    )
+}
+
+fn sync_constraint_is_table_element(constraint: &str) -> bool {
+    let upper = normalize_schema_type(constraint).to_ascii_uppercase();
+    upper.starts_with("UNIQUE") || upper.starts_with("FOREIGN KEY")
+}
+
+fn schema_clause_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_uppercase())
+        .collect()
 }
 
 fn ddl_vector_dimension(value: &str) -> Option<usize> {
@@ -11260,44 +12554,130 @@ fn ddl_dag_edge_types(constraints: &[String]) -> Vec<EdgeType> {
     edge_types
 }
 
-fn rough_sync_table_meta(columns: &[(String, String)], constraints: &[String]) -> TableMeta {
-    let column_defs = columns
+fn ddl_unique_constraints(constraints: &[String]) -> Vec<Vec<String>> {
+    constraints
+        .iter()
+        .filter_map(|constraint| {
+            let upper = normalize_schema_type(constraint).to_ascii_uppercase();
+            if !upper.starts_with("UNIQUE") {
+                return None;
+            }
+            let start = constraint.find('(')? + 1;
+            let end = constraint[start..].find(')')? + start;
+            let columns = constraint[start..end]
+                .split(',')
+                .map(|column| column.trim().to_string())
+                .filter(|column| !column.is_empty())
+                .collect::<Vec<_>>();
+            (!columns.is_empty()).then_some(columns)
+        })
+        .collect()
+}
+
+fn ddl_column_reference(ty: &str) -> Option<ForeignKeyReference> {
+    let normalized = normalize_schema_type(ty);
+    let upper = normalized.to_ascii_uppercase();
+    let reference_start = upper.find("REFERENCES ")? + "REFERENCES ".len();
+    let rest = normalized[reference_start..].trim();
+    let paren = rest.find('(')?;
+    let close = rest[paren + 1..].find(')')? + paren + 1;
+    let table = rest[..paren].trim();
+    let column = rest[paren + 1..close].trim();
+    if table.is_empty() || column.is_empty() {
+        return None;
+    }
+    Some(ForeignKeyReference {
+        table: table.to_string(),
+        column: column.to_string(),
+    })
+}
+
+fn sync_table_shape_matches(
+    local_meta: &TableMeta,
+    remote_columns: &[(String, String)],
+    remote_constraints: &[String],
+    remote_foreign_keys: &[SingleColumnForeignKey],
+    remote_composite_foreign_keys: &[CompositeForeignKey],
+    remote_composite_unique: &[Vec<String>],
+) -> bool {
+    let remote_meta = rough_sync_table_meta(
+        remote_columns,
+        remote_constraints,
+        remote_foreign_keys,
+        remote_composite_foreign_keys,
+        remote_composite_unique,
+    );
+
+    descriptor_multiset(single_column_foreign_keys_from_meta(
+        local_meta,
+        &HashSet::new(),
+    )) == descriptor_multiset(single_column_foreign_keys_from_meta(
+        &remote_meta,
+        &HashSet::new(),
+    )) && descriptor_multiset(local_meta.composite_foreign_keys.clone())
+        == descriptor_multiset(remote_meta.composite_foreign_keys)
+        && descriptor_multiset(local_meta.unique_constraints.clone())
+            == descriptor_multiset(remote_meta.unique_constraints)
+}
+
+fn descriptor_multiset<T>(mut values: Vec<T>) -> Vec<T>
+where
+    T: Ord,
+{
+    values.sort();
+    values
+}
+
+fn rough_sync_table_meta(
+    columns: &[(String, String)],
+    constraints: &[String],
+    foreign_keys: &[SingleColumnForeignKey],
+    composite_foreign_keys: &[CompositeForeignKey],
+    composite_unique: &[Vec<String>],
+) -> TableMeta {
+    let mut column_defs = columns
         .iter()
         .map(|(name, ty)| rough_sync_column_def(name, ty))
         .collect::<Vec<_>>();
-    let indexes = column_defs
-        .iter()
-        .filter(|column| {
-            (column.primary_key || column.unique)
-                && !matches!(column.column_type, ColumnType::Json | ColumnType::Vector(_))
-        })
-        .map(|column| IndexDecl {
-            name: if column.primary_key {
-                format!("__pk_{}", column.name)
-            } else {
-                format!("__unique_{}", column.name)
-            },
-            columns: vec![(column.name.clone(), SortDirection::Asc)],
-            kind: IndexKind::Auto,
-        })
-        .collect();
+    for fk in foreign_keys {
+        if let Some(column) = column_defs
+            .iter_mut()
+            .find(|column| column.name == fk.child_column)
+        {
+            column.references = Some(ForeignKeyReference {
+                table: fk.parent_table.clone(),
+                column: fk.parent_column.clone(),
+            });
+        }
+    }
+    let mut unique_constraints = ddl_unique_constraints(constraints);
+    for unique in composite_unique {
+        if !unique_constraints
+            .iter()
+            .any(|candidate| candidate == unique)
+        {
+            unique_constraints.push(unique.clone());
+        }
+    }
 
-    TableMeta {
+    let mut meta = TableMeta {
         columns: column_defs,
         immutable: constraints
             .iter()
             .any(|constraint| constraint.eq_ignore_ascii_case("IMMUTABLE")),
         state_machine: None,
         dag_edge_types: ddl_dag_edge_types(constraints),
-        unique_constraints: Vec::new(),
+        unique_constraints,
         natural_key_column: None,
         propagation_rules: Vec::new(),
         default_ttl_seconds: None,
         sync_safe: false,
         expires_column: None,
-        indexes,
-        composite_foreign_keys: Vec::new(),
-    }
+        indexes: Vec::new(),
+        composite_foreign_keys: composite_foreign_keys.to_vec(),
+    };
+    meta.indexes = crate::executor::auto_indexes_for_table_meta(&meta);
+    meta
 }
 
 fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
@@ -11343,7 +12723,7 @@ fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
         primary_key,
         unique,
         default: None,
-        references: None,
+        references: ddl_column_reference(ty),
         expires,
         immutable,
         quantization,
@@ -11420,6 +12800,15 @@ fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
         constraints.push(format!("UNIQUE ({})", unique_constraint.join(", ")));
     }
 
+    for fk in &ct.composite_foreign_keys {
+        constraints.push(format!(
+            "FOREIGN KEY ({}) REFERENCES {}({})",
+            fk.child_columns.join(", "),
+            fk.parent_table,
+            fk.parent_columns.join(", ")
+        ));
+    }
+
     for rule in &ct.propagation_rules {
         match rule {
             contextdb_parser::ast::AstPropagationRule::EdgeState {
@@ -11492,6 +12881,15 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
 
     for unique_constraint in &meta.unique_constraints {
         constraints.push(format!("UNIQUE ({})", unique_constraint.join(", ")));
+    }
+
+    for fk in &meta.composite_foreign_keys {
+        constraints.push(format!(
+            "FOREIGN KEY ({}) REFERENCES {}({})",
+            fk.child_columns.join(", "),
+            fk.parent_table,
+            fk.parent_columns.join(", ")
+        ));
     }
 
     for rule in &meta.propagation_rules {

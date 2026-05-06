@@ -6,6 +6,7 @@
 use contextdb_core::{
     CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, TableMeta, Value, VectorIndexRef,
 };
+use serde::de::VariantAccess;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
@@ -238,17 +239,14 @@ pub struct VectorChange {
     pub lsn: Lsn,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum DdlChange {
     CreateTable {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
-        #[serde(default)]
         foreign_keys: Vec<SingleColumnForeignKey>,
-        #[serde(default)]
         composite_foreign_keys: Vec<CompositeForeignKey>,
-        #[serde(default)]
         composite_unique: Vec<Vec<String>>,
     },
     DropTable {
@@ -258,11 +256,8 @@ pub enum DdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
-        #[serde(default)]
         foreign_keys: Vec<SingleColumnForeignKey>,
-        #[serde(default)]
         composite_foreign_keys: Vec<CompositeForeignKey>,
-        #[serde(default)]
         composite_unique: Vec<Vec<String>>,
     },
     CreateIndex {
@@ -296,15 +291,320 @@ pub enum DdlChange {
         name: String,
         event_type: String,
         sink: String,
-        #[serde(default)]
         table: String,
         where_in: Option<(String, Vec<String>)>,
     },
     DropRoute {
         name: String,
-        #[serde(default)]
         table: String,
     },
+}
+
+impl<'de> Deserialize<'de> for DdlChange {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum Variant {
+            CreateTable,
+            DropTable,
+            AlterTable,
+            CreateIndex,
+            DropIndex,
+            CreateTrigger,
+            DropTrigger,
+            CreateEventType,
+            CreateSink,
+            CreateRoute,
+            DropRoute,
+        }
+
+        struct DdlChangeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DdlChangeVisitor {
+            type Value = DdlChange;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a DdlChange")
+            }
+
+            fn visit_enum<A>(self, data: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::EnumAccess<'de>,
+            {
+                let (variant, access) = data.variant::<Variant>()?;
+                match variant {
+                    Variant::CreateTable => {
+                        let fields = access.newtype_variant::<TableDdlFields>()?;
+                        Ok(DdlChange::CreateTable {
+                            name: fields.name,
+                            columns: fields.columns,
+                            constraints: fields.constraints,
+                            foreign_keys: fields.foreign_keys,
+                            composite_foreign_keys: fields.composite_foreign_keys,
+                            composite_unique: fields.composite_unique,
+                        })
+                    }
+                    Variant::DropTable => {
+                        let fields = access.newtype_variant::<DropTableFields>()?;
+                        Ok(DdlChange::DropTable { name: fields.name })
+                    }
+                    Variant::AlterTable => {
+                        let fields = access.newtype_variant::<TableDdlFields>()?;
+                        Ok(DdlChange::AlterTable {
+                            name: fields.name,
+                            columns: fields.columns,
+                            constraints: fields.constraints,
+                            foreign_keys: fields.foreign_keys,
+                            composite_foreign_keys: fields.composite_foreign_keys,
+                            composite_unique: fields.composite_unique,
+                        })
+                    }
+                    Variant::CreateIndex => {
+                        let fields = access.newtype_variant::<CreateIndexFields>()?;
+                        Ok(DdlChange::CreateIndex {
+                            table: fields.table,
+                            name: fields.name,
+                            columns: fields.columns,
+                        })
+                    }
+                    Variant::DropIndex => {
+                        let fields = access.newtype_variant::<DropIndexFields>()?;
+                        Ok(DdlChange::DropIndex {
+                            table: fields.table,
+                            name: fields.name,
+                        })
+                    }
+                    Variant::CreateTrigger => {
+                        let fields = access.newtype_variant::<CreateTriggerFields>()?;
+                        Ok(DdlChange::CreateTrigger {
+                            name: fields.name,
+                            table: fields.table,
+                            on_events: fields.on_events,
+                        })
+                    }
+                    Variant::DropTrigger => {
+                        let fields = access.newtype_variant::<DropTriggerFields>()?;
+                        Ok(DdlChange::DropTrigger { name: fields.name })
+                    }
+                    Variant::CreateEventType => {
+                        let fields = access.newtype_variant::<CreateEventTypeFields>()?;
+                        Ok(DdlChange::CreateEventType {
+                            name: fields.name,
+                            trigger: fields.trigger,
+                            table: fields.table,
+                        })
+                    }
+                    Variant::CreateSink => {
+                        let fields = access.newtype_variant::<CreateSinkFields>()?;
+                        Ok(DdlChange::CreateSink {
+                            name: fields.name,
+                            sink_type: fields.sink_type,
+                            url: fields.url,
+                        })
+                    }
+                    Variant::CreateRoute => {
+                        let fields = access.newtype_variant::<CreateRouteFields>()?;
+                        Ok(DdlChange::CreateRoute {
+                            name: fields.name,
+                            event_type: fields.event_type,
+                            sink: fields.sink,
+                            table: fields.table,
+                            where_in: fields.where_in,
+                        })
+                    }
+                    Variant::DropRoute => {
+                        let fields = access.newtype_variant::<DropRouteFields>()?;
+                        Ok(DdlChange::DropRoute {
+                            name: fields.name,
+                            table: fields.table,
+                        })
+                    }
+                }
+            }
+        }
+
+        const VARIANTS: &[&str] = &[
+            "CreateTable",
+            "DropTable",
+            "AlterTable",
+            "CreateIndex",
+            "DropIndex",
+            "CreateTrigger",
+            "DropTrigger",
+            "CreateEventType",
+            "CreateSink",
+            "CreateRoute",
+            "DropRoute",
+        ];
+        deserializer.deserialize_enum("DdlChange", VARIANTS, DdlChangeVisitor)
+    }
+}
+
+#[derive(Debug)]
+struct TableDdlFields {
+    name: String,
+    columns: Vec<(String, String)>,
+    constraints: Vec<String>,
+    foreign_keys: Vec<SingleColumnForeignKey>,
+    composite_foreign_keys: Vec<CompositeForeignKey>,
+    composite_unique: Vec<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for TableDdlFields {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TableDdlFieldsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TableDdlFieldsVisitor {
+            type Value = TableDdlFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("table DDL fields")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let name = seq
+                    .next_element::<String>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let columns = seq
+                    .next_element::<Vec<(String, String)>>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let constraints = seq
+                    .next_element::<Vec<String>>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                // Bincode's serde representation for struct variants is not
+                // self-describing, so old three-field table DDL records cannot
+                // be distinguished from new records with trailing fields
+                // without risking an EOF error. Treat sequence-form records as
+                // legacy and let the engine enrich structured fields from
+                // current TableMeta when serving DDL logs.
+                Ok(TableDdlFields {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut name = None;
+                let mut columns = None;
+                let mut constraints = None;
+                let mut foreign_keys = None;
+                let mut composite_foreign_keys = None;
+                let mut composite_unique = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => name = Some(map.next_value()?),
+                        "columns" => columns = Some(map.next_value()?),
+                        "constraints" => constraints = Some(map.next_value()?),
+                        "foreign_keys" => foreign_keys = Some(map.next_value()?),
+                        "composite_foreign_keys" => {
+                            composite_foreign_keys = Some(map.next_value()?)
+                        }
+                        "composite_unique" => composite_unique = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                Ok(TableDdlFields {
+                    name: name.ok_or_else(|| serde::de::Error::missing_field("name"))?,
+                    columns: columns.ok_or_else(|| serde::de::Error::missing_field("columns"))?,
+                    constraints: constraints
+                        .ok_or_else(|| serde::de::Error::missing_field("constraints"))?,
+                    foreign_keys: foreign_keys.unwrap_or_default(),
+                    composite_foreign_keys: composite_foreign_keys.unwrap_or_default(),
+                    composite_unique: composite_unique.unwrap_or_default(),
+                })
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "name",
+            "columns",
+            "constraints",
+            "foreign_keys",
+            "composite_foreign_keys",
+            "composite_unique",
+        ];
+        deserializer.deserialize_struct("TableDdlFields", FIELDS, TableDdlFieldsVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct DropTableFields {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct CreateIndexFields {
+    table: String,
+    name: String,
+    columns: Vec<(String, contextdb_core::SortDirection)>,
+}
+
+#[derive(Deserialize)]
+struct DropIndexFields {
+    table: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct CreateTriggerFields {
+    name: String,
+    table: String,
+    on_events: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct DropTriggerFields {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct CreateEventTypeFields {
+    name: String,
+    trigger: String,
+    table: String,
+}
+
+#[derive(Deserialize)]
+struct CreateSinkFields {
+    name: String,
+    sink_type: String,
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateRouteFields {
+    name: String,
+    event_type: String,
+    sink: String,
+    #[serde(default)]
+    table: String,
+    where_in: Option<(String, Vec<String>)>,
+}
+
+#[derive(Deserialize)]
+struct DropRouteFields {
+    name: String,
+    #[serde(default)]
+    table: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

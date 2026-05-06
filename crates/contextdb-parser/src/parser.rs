@@ -1051,7 +1051,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                         unique_constraints.push(build_unique_table_constraint(element)?);
                     }
                     Rule::foreign_key_table_constraint => {
-                        let _ = build_composite_foreign_key(element)?;
+                        composite_foreign_keys.push(build_composite_foreign_key(element)?);
                     }
                     other => {
                         return Err(unexpected_rule(other, "build_create_table.table_element"));
@@ -1559,11 +1559,35 @@ fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(columns)
 }
 
-fn build_composite_foreign_key(_pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
+fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
+    let mut identifiers = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .collect::<Vec<_>>();
+    if identifiers.len() < 3 {
+        return Err(Error::ParseError(
+            "FOREIGN KEY constraint requires child columns, parent table, and parent columns"
+                .to_string(),
+        ));
+    }
+
+    let child_count = identifiers.len().saturating_sub(1) / 2;
+    if identifiers.len() != child_count.saturating_mul(2).saturating_add(1) {
+        return Err(Error::ParseError(
+            "FOREIGN KEY constraint has mismatched child and parent columns".to_string(),
+        ));
+    }
+    let parent_columns = identifiers.split_off(child_count + 1);
+    let parent_table = identifiers
+        .pop()
+        .ok_or_else(|| Error::ParseError("FOREIGN KEY missing parent table".to_string()))?;
+    let child_columns = identifiers;
+
     Ok(CompositeForeignKey {
-        child_columns: Vec::new(),
-        parent_table: String::new(),
-        parent_columns: Vec::new(),
+        child_columns,
+        parent_table,
+        parent_columns,
     })
 }
 

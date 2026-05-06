@@ -97,6 +97,16 @@ pub(crate) fn execute_plan(
                     kind: contextdb_core::IndexKind::Auto,
                 });
             }
+            let composite_foreign_keys = p
+                .composite_foreign_keys
+                .iter()
+                .map(|fk| contextdb_core::CompositeForeignKey {
+                    child_columns: fk.child_columns.clone(),
+                    parent_table: fk.parent_table.clone(),
+                    parent_columns: fk.parent_columns.clone(),
+                })
+                .collect::<Vec<_>>();
+
             let mut resolved_policies = HashMap::<String, ResolvedRankPolicy>::new();
             for column in &p.columns {
                 if let Some(resolved) =
@@ -105,7 +115,7 @@ pub(crate) fn execute_plan(
                     resolved_policies.insert(column.name.clone(), resolved);
                 }
             }
-            let meta = TableMeta {
+            let mut meta = TableMeta {
                 columns: p
                     .columns
                     .iter()
@@ -141,8 +151,18 @@ pub(crate) fn execute_plan(
                 // keeps them in `EXPLAIN <query>` so agents can assert
                 // routing programmatically.
                 indexes: auto_indexes.clone(),
-                composite_foreign_keys: Vec::new(),
+                composite_foreign_keys,
             };
+            let candidate_meta = meta.clone();
+            validate_composite_foreign_keys_for_meta(&p.name, &meta, |parent| {
+                if parent == p.name {
+                    Some(candidate_meta.clone())
+                } else {
+                    db.table_meta(parent)
+                }
+            })?;
+            append_composite_fk_auto_indexes(&mut meta);
+            auto_indexes = meta.indexes.clone();
             let metadata_bytes = meta.estimated_bytes();
             db.accountant().try_allocate_for(
                 metadata_bytes,
@@ -2090,7 +2110,7 @@ fn exec_create_index(
 ) -> Result<QueryResult> {
     // Reserved-prefix guard: user-declared indexes must not collide with the
     // auto-index namespace used for PRIMARY KEY / UNIQUE backing indexes.
-    for prefix in ["__pk_", "__unique_"] {
+    for prefix in ["__pk_", "__unique_", "__fk_"] {
         if plan.name.starts_with(prefix) {
             return Err(Error::ReservedIndexName {
                 table: plan.table.clone(),
@@ -5206,6 +5226,202 @@ fn expires_column_name(columns: &[contextdb_parser::ast::ColumnDef]) -> Result<O
         }
     }
     Ok(expires_column)
+}
+
+fn btree_indexable(column_type: &ColumnType) -> bool {
+    !matches!(column_type, ColumnType::Json | ColumnType::Vector(_))
+}
+
+pub(crate) fn auto_indexes_for_table_meta(meta: &TableMeta) -> Vec<contextdb_core::IndexDecl> {
+    let mut indexes = Vec::new();
+    for column in &meta.columns {
+        if column.primary_key && btree_indexable(&column.column_type) {
+            indexes.push(contextdb_core::IndexDecl {
+                name: format!("__pk_{}", column.name),
+                columns: vec![(column.name.clone(), contextdb_core::SortDirection::Asc)],
+                kind: contextdb_core::IndexKind::Auto,
+            });
+        }
+        if column.unique && !column.primary_key && btree_indexable(&column.column_type) {
+            indexes.push(contextdb_core::IndexDecl {
+                name: format!("__unique_{}", column.name),
+                columns: vec![(column.name.clone(), contextdb_core::SortDirection::Asc)],
+                kind: contextdb_core::IndexKind::Auto,
+            });
+        }
+    }
+    for unique_constraint in &meta.unique_constraints {
+        if unique_constraint.is_empty()
+            || !unique_constraint.iter().all(|column_name| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == *column_name)
+                    .is_some_and(|column| btree_indexable(&column.column_type))
+            })
+        {
+            continue;
+        }
+        indexes.push(contextdb_core::IndexDecl {
+            name: format!("__unique_{}", unique_constraint.join("_")),
+            columns: unique_constraint
+                .iter()
+                .map(|column| (column.clone(), contextdb_core::SortDirection::Asc))
+                .collect(),
+            kind: contextdb_core::IndexKind::Auto,
+        });
+    }
+    let mut meta_with_indexes = meta.clone();
+    meta_with_indexes.indexes = indexes;
+    append_composite_fk_auto_indexes(&mut meta_with_indexes);
+    meta_with_indexes.indexes
+}
+
+pub(crate) fn append_composite_fk_auto_indexes(meta: &mut TableMeta) {
+    for fk in &meta.composite_foreign_keys {
+        if fk.child_columns.is_empty()
+            || !fk.child_columns.iter().all(|column_name| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == *column_name)
+                    .is_some_and(|column| btree_indexable(&column.column_type))
+            })
+        {
+            continue;
+        }
+        let name = composite_fk_auto_index_name(fk);
+        if meta.indexes.iter().any(|index| index.name == name) {
+            continue;
+        }
+        meta.indexes.push(contextdb_core::IndexDecl {
+            name,
+            columns: fk
+                .child_columns
+                .iter()
+                .map(|column| (column.clone(), contextdb_core::SortDirection::Asc))
+                .collect(),
+            kind: contextdb_core::IndexKind::Auto,
+        });
+    }
+}
+
+fn composite_fk_auto_index_name(fk: &contextdb_core::CompositeForeignKey) -> String {
+    format!(
+        "__fk_{}_to_{}_{}",
+        fk.child_columns.join("_"),
+        fk.parent_table,
+        fk.parent_columns.join("_")
+    )
+}
+
+pub(crate) fn validate_composite_foreign_keys_for_meta<F>(
+    table: &str,
+    meta: &TableMeta,
+    mut parent_lookup: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Option<TableMeta>,
+{
+    let child_columns = meta
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect::<HashMap<_, _>>();
+
+    for fk in &meta.composite_foreign_keys {
+        if fk.child_columns.is_empty()
+            || fk.child_columns.len() != fk.parent_columns.len()
+            || fk.parent_table.is_empty()
+        {
+            return Err(Error::SchemaInvalid {
+                reason: format!(
+                    "composite foreign key on {table} must have matching non-empty child and parent columns"
+                ),
+            });
+        }
+        reject_duplicate_columns(table, &fk.child_columns, "FOREIGN KEY child columns")?;
+        reject_duplicate_columns(
+            &fk.parent_table,
+            &fk.parent_columns,
+            "FOREIGN KEY parent columns",
+        )?;
+
+        for column in &fk.child_columns {
+            let Some(column_meta) = child_columns.get(column.as_str()) else {
+                return Err(Error::ColumnNotFound {
+                    table: table.to_string(),
+                    column: column.clone(),
+                });
+            };
+            if !btree_indexable(&column_meta.column_type) {
+                return Err(Error::ColumnNotIndexable {
+                    table: table.to_string(),
+                    column: column.clone(),
+                    column_type: column_meta.column_type.clone(),
+                });
+            }
+        }
+
+        let Some(parent_meta) = parent_lookup(&fk.parent_table) else {
+            return Err(Error::TableNotFound(fk.parent_table.clone()));
+        };
+        for column in &fk.parent_columns {
+            let Some(parent_column) = parent_meta.columns.iter().find(|c| c.name == *column) else {
+                return Err(Error::ColumnNotFound {
+                    table: fk.parent_table.clone(),
+                    column: column.clone(),
+                });
+            };
+            if !btree_indexable(&parent_column.column_type) {
+                return Err(Error::ColumnNotIndexable {
+                    table: fk.parent_table.clone(),
+                    column: column.clone(),
+                    column_type: parent_column.column_type.clone(),
+                });
+            }
+        }
+        if !parent_tuple_is_key_covered(&parent_meta, &fk.parent_columns) {
+            return Err(Error::SchemaInvalid {
+                reason: format!(
+                    "composite foreign key on {table} references {}({}) without an ordered PRIMARY KEY or UNIQUE constraint",
+                    fk.parent_table,
+                    fk.parent_columns.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_duplicate_columns(table: &str, columns: &[String], label: &str) -> Result<()> {
+    let mut seen = HashSet::new();
+    for column in columns {
+        if !seen.insert(column) {
+            return Err(Error::SchemaInvalid {
+                reason: format!("{label} on {table} contain duplicate column '{column}'"),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parent_tuple_is_key_covered(
+    parent_meta: &TableMeta,
+    parent_columns: &[String],
+) -> bool {
+    if parent_columns.len() == 1
+        && parent_meta
+            .columns
+            .iter()
+            .any(|column| column.name == parent_columns[0] && (column.primary_key || column.unique))
+    {
+        return true;
+    }
+
+    parent_meta
+        .unique_constraints
+        .iter()
+        .any(|unique| unique == parent_columns)
 }
 
 pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {

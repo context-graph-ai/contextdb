@@ -110,7 +110,10 @@ pub enum Error {
     TxNotFound(TxId),
     #[error("unique constraint violation: {table}.{column}")]
     UniqueViolation { table: String, column: String },
-    #[error("foreign key violation: {child_table} references {parent_table}")]
+    #[error(
+        "{}",
+        foreign_key_violation_display(child_table, child_columns, parent_table, parent_columns)
+    )]
     ForeignKeyViolation {
         child_table: String,
         child_columns: Vec<String>,
@@ -281,6 +284,21 @@ fn drop_blocked_rank_policy_display(
     }
     format!(
         "cannot drop table `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+    )
+}
+
+fn foreign_key_violation_display(
+    child_table: &str,
+    child_columns: &[String],
+    parent_table: &str,
+    parent_columns: &[String],
+) -> String {
+    format!(
+        "foreign key violation: {}({}) references {}({})",
+        child_table,
+        child_columns.join(", "),
+        parent_table,
+        parent_columns.join(", ")
     )
 }
 

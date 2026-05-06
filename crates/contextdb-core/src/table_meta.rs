@@ -2,14 +2,14 @@ use crate::Direction;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CompositeForeignKey {
     pub child_columns: Vec<String>,
     pub parent_table: String,
     pub parent_columns: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SingleColumnForeignKey {
     pub child_column: String,
     pub parent_table: String,
@@ -553,6 +553,10 @@ impl TableMeta {
             .indexes
             .iter()
             .fold(0usize, |acc, i| acc.saturating_add(i.estimated_bytes()));
+        let composite_foreign_key_bytes = self
+            .composite_foreign_keys
+            .iter()
+            .fold(0usize, |acc, fk| acc.saturating_add(fk.estimated_bytes()));
 
         16 + columns_bytes
             + state_machine_bytes
@@ -562,8 +566,21 @@ impl TableMeta {
             + propagation_bytes
             + expires_bytes
             + indexes_bytes
+            + composite_foreign_key_bytes
             + self.default_ttl_seconds.map(|_| 8).unwrap_or(0)
             + 8
+    }
+}
+
+impl CompositeForeignKey {
+    fn estimated_bytes(&self) -> usize {
+        40 + self.parent_table.len() * 16
+            + self.child_columns.iter().fold(0usize, |acc, column| {
+                acc.saturating_add(16 + column.len() * 16)
+            })
+            + self.parent_columns.iter().fold(0usize, |acc, column| {
+                acc.saturating_add(16 + column.len() * 16)
+            })
     }
 }
 

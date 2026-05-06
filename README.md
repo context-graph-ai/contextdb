@@ -203,7 +203,7 @@ recreate the schema and reimport the data.
 
 **Unified transactions** — One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. MVCC with consistent snapshots — readers never block writers.
 
-**Enforceable policy constraints** — `IMMUTABLE` tables, `STATE MACHINE` column transitions, `DAG` cycle prevention, `RETAIN` with TTL expiry, `PROPAGATE` for cascading state changes along edges and foreign keys. Enforced by the database — no application code can bypass them.
+**Enforceable policy constraints** — `IMMUTABLE` tables, `STATE MACHINE` column transitions, `DAG` cycle prevention, single-column and composite foreign keys, `RETAIN` with TTL expiry, `PROPAGATE` for cascading state changes along edges and foreign keys. Enforced by the database — no application code can bypass them.
 
 **Collaborative sync** — Every contextdb instance is a full read-write database. Each runs a SyncClient that syncs bidirectionally with a central SyncServer over NATS (WebSocket for clients behind NAT, native protocol for server-to-server). Offline-first: each database works independently, syncing changesets when connected. Per-table conflict resolution (LatestWins, ServerWins, EdgeWins) and per-table sync direction (Push, Pull, Both, None) give you fine-grained control over what flows where. The server runs the same contextdb engine — self-host it, or point your databases at a hosted server.
 

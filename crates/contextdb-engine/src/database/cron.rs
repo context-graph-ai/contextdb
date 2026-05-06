@@ -655,6 +655,8 @@ impl Database {
             acl_grant_cache: RwLock::new(HashMap::new()),
             rank_policy_eval_count: AtomicU64::new(0),
             rank_policy_formula_parse_count: AtomicU64::new(0),
+            fk_indexed_tuple_probes: AtomicU64::new(0),
+            fk_full_scan_fallbacks: AtomicU64::new(0),
             corrupt_joined_values: RwLock::new(self.corrupt_joined_values.read().clone()),
             resource_owner: false,
         }

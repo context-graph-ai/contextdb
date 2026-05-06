@@ -317,13 +317,26 @@ CREATE TABLE decisions (
 )
 ```
 
+Table-level composite foreign keys are supported when the referenced parent
+tuple is covered by an ordered `PRIMARY KEY` or `UNIQUE` constraint:
+
+```sql
+CREATE TABLE parent (tenant INTEGER, number INTEGER, UNIQUE(tenant, number));
+CREATE TABLE child (
+  id INTEGER PRIMARY KEY,
+  tenant INTEGER,
+  number INTEGER,
+  FOREIGN KEY (tenant, number) REFERENCES parent(tenant, number)
+);
+```
+
 | Constraint | Description |
 |------------|-------------|
 | `PRIMARY KEY` | Unique row identifier |
 | `NOT NULL` | Value required |
 | `UNIQUE` | No duplicate values (single column). A duplicate INSERT on a `UNIQUE` column is a silent no-op (returns `Ok(rows_affected=0)`), matching the composite-uniqueness contract. |
 | `DEFAULT expr` | Default value for inserts |
-| `REFERENCES table(col)` | Foreign key — writes are rejected if the referenced row does not exist; in explicit transactions the error may surface at `COMMIT` |
+| `REFERENCES table(col)` / `FOREIGN KEY (...) REFERENCES ...` | Foreign key — writes are rejected if the referenced row or tuple does not exist; in explicit transactions the error may surface at `COMMIT` |
 | `IMMUTABLE` | Column is audit-frozen — INSERT sets the value once; `UPDATE`, `ON CONFLICT DO UPDATE`, sync-apply mutations, and schema-altering DDL against the column are rejected with `Error::ImmutableColumn` |
 
 ### Audit-Frozen Columns
@@ -819,13 +832,15 @@ named `__pk_<col>` for `PRIMARY KEY`, `__unique_<col>` for a single-column
 `UNIQUE (col1, col2, ...)` constraint. These indexes exist so PK / UNIQUE
 constraint probes run in O(log n) and so `SELECT ... WHERE pk_col = $v`
 queries pick an `IndexScan` without requiring a user `CREATE INDEX`.
+Composite foreign keys also create child-side `__fk_...` auto-indexes so
+parent deletes and tuple validation do not rely on table scans.
 
 Auto-indexes are elided from `.schema` output to keep schema printouts
 focused on user-authored DDL. They remain visible in `EXPLAIN <query>`
 output as index candidates so agents can programmatically confirm that
 a query routed through the auto-index rather than a table scan.
 
-User-declared index names must not begin with `__pk_` or `__unique_`.
+User-declared index names must not begin with `__pk_`, `__unique_`, or `__fk_`.
 `CREATE INDEX __pk_id ON t (id)` returns
 `ReservedIndexName { table, name, prefix }`.
 
@@ -838,4 +853,4 @@ User-declared index names must not begin with `__pk_` or `__unique_`.
 | `ColumnNotIndexable { table, column, column_type }` | `CREATE INDEX` on a `JSON` or `VECTOR` column |
 | `ColumnInIndex { table, column, index }` | `ALTER TABLE ... DROP COLUMN c RESTRICT` on a column referenced by an index |
 | `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table |
-| `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_` or `__unique_` (reserved for auto-indexes) |
+| `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_`, `__unique_`, or `__fk_` (reserved for auto-indexes) |

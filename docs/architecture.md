@@ -259,7 +259,7 @@ NATS with automatic chunking for payloads exceeding the 1MB NATS message limit. 
 
 ### DDL Sync
 
-Schema changes (CREATE TABLE, ALTER TABLE, DROP TABLE) are synced alongside data. Constraints (PRIMARY KEY, NOT NULL, UNIQUE, STATE MACHINE, DAG) are preserved across sync.
+Schema changes (CREATE TABLE, ALTER TABLE, DROP TABLE) are synced alongside data. Constraints (PRIMARY KEY, NOT NULL, UNIQUE, single-column and composite FOREIGN KEY, STATE MACHINE, DAG) are preserved across sync.
 
 ---
 

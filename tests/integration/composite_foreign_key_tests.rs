@@ -1078,6 +1078,515 @@ fn ddl_sync_apply_ok_when_receiver_has_parent() {
 }
 
 #[test]
+fn ddl_sync_skipped_parent_row_does_not_satisfy_composite_fk_child() {
+    let receiver = db();
+    receiver
+        .execute(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE(a, b))",
+            &p(),
+        )
+        .unwrap();
+    receiver
+        .execute("CREATE TABLE child (id INTEGER PRIMARY KEY, c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b))", &p())
+        .unwrap();
+    receiver
+        .execute("INSERT INTO parent (id, a, b) VALUES (1, 1, 1)", &p())
+        .unwrap();
+
+    let child = RowChange {
+        table: "child".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(2),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(2)),
+            ("c1".into(), Value::Int64(9)),
+            ("c2".into(), Value::Int64(9)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+    let skipped_parent = RowChange {
+        table: "parent".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("a".into(), Value::Int64(9)),
+            ("b".into(), Value::Int64(9)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+
+    let result = receiver
+        .apply_changes(
+            ChangeSet {
+                rows: vec![child, skipped_parent],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        row_count(&receiver, "child"),
+        0,
+        "child must be a bounded FK conflict, not committed against a skipped parent"
+    );
+    assert_eq!(
+        receiver
+            .execute("SELECT a, b FROM parent WHERE id = 1", &p())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(1), Value::Int64(1)]],
+        "server_wins parent conflict must leave the local parent unchanged"
+    );
+    assert!(
+        result
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.reason.as_deref().is_some_and(|reason| {
+                reason.contains("child(c1, c2)") && reason.contains("parent(a, b)")
+            })),
+        "missing bounded child FK conflict: {result:?}"
+    );
+}
+
+#[test]
+fn ddl_sync_child_before_parent_same_batch_uses_applied_parent_projection() {
+    let receiver = db();
+    receiver
+        .execute(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE(a, b))",
+            &p(),
+        )
+        .unwrap();
+    receiver
+        .execute("CREATE TABLE child (id INTEGER PRIMARY KEY, c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b))", &p())
+        .unwrap();
+
+    let child = RowChange {
+        table: "child".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("c1".into(), Value::Int64(1)),
+            ("c2".into(), Value::Int64(2)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+    let parent = RowChange {
+        table: "parent".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("a".into(), Value::Int64(1)),
+            ("b".into(), Value::Int64(2)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+
+    let result = receiver
+        .apply_changes(
+            ChangeSet {
+                rows: vec![child, parent],
+                ..Default::default()
+            },
+            &apply_policy(),
+        )
+        .unwrap();
+
+    assert!(
+        result.conflicts.is_empty(),
+        "same-batch parent projected to apply must satisfy child FK: {result:?}"
+    );
+    assert_eq!(row_count(&receiver, "parent"), 1);
+    assert_eq!(row_count(&receiver, "child"), 1);
+}
+
+#[test]
+fn ddl_sync_future_parent_delete_does_not_satisfy_composite_fk_child() {
+    let receiver = db();
+    receiver
+        .execute(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE(a, b))",
+            &p(),
+        )
+        .unwrap();
+    receiver
+        .execute("CREATE TABLE child (id INTEGER PRIMARY KEY, c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b))", &p())
+        .unwrap();
+    receiver
+        .execute("INSERT INTO parent (id, a, b) VALUES (1, 1, 2)", &p())
+        .unwrap();
+
+    let child = RowChange {
+        table: "child".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("c1".into(), Value::Int64(1)),
+            ("c2".into(), Value::Int64(2)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+    let delete_parent = RowChange {
+        table: "parent".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("a".into(), Value::Int64(1)),
+            ("b".into(), Value::Int64(2)),
+        ]),
+        deleted: true,
+        lsn: Lsn(10),
+    };
+
+    let result = receiver
+        .apply_changes(
+            ChangeSet {
+                rows: vec![child, delete_parent],
+                ..Default::default()
+            },
+            &apply_policy(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        row_count(&receiver, "child"),
+        0,
+        "child must not be inserted against a parent projected to delete in the same batch"
+    );
+    assert_eq!(
+        row_count(&receiver, "parent"),
+        0,
+        "parent delete should still apply once the child is bounded as a conflict"
+    );
+    assert!(
+        result
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.reason.as_deref().is_some_and(|reason| {
+                reason.contains("child(c1, c2)") && reason.contains("parent(a, b)")
+            })),
+        "missing bounded child FK conflict: {result:?}"
+    );
+}
+
+#[test]
+fn ddl_sync_future_parent_update_away_does_not_satisfy_composite_fk_child() {
+    let receiver = db();
+    receiver
+        .execute(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE(a, b))",
+            &p(),
+        )
+        .unwrap();
+    receiver
+        .execute("CREATE TABLE child (id INTEGER PRIMARY KEY, c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b))", &p())
+        .unwrap();
+    receiver
+        .execute("INSERT INTO parent (id, a, b) VALUES (1, 1, 2)", &p())
+        .unwrap();
+
+    let child = RowChange {
+        table: "child".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("c1".into(), Value::Int64(1)),
+            ("c2".into(), Value::Int64(2)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+    let parent_update = RowChange {
+        table: "parent".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("a".into(), Value::Int64(9)),
+            ("b".into(), Value::Int64(9)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+
+    let result = receiver
+        .apply_changes(
+            ChangeSet {
+                rows: vec![child, parent_update],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        row_count(&receiver, "child"),
+        0,
+        "child must not be inserted against a parent tuple projected to move away"
+    );
+    assert_eq!(
+        receiver
+            .execute("SELECT a, b FROM parent WHERE id = 1", &p())
+            .unwrap()
+            .rows,
+        vec![vec![Value::Int64(9), Value::Int64(9)]],
+        "parent update should still apply after child is bounded as a conflict"
+    );
+    assert!(
+        result
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.reason.as_deref().is_some_and(|reason| {
+                reason.contains("child(c1, c2)") && reason.contains("parent(a, b)")
+            })),
+        "missing bounded child FK conflict: {result:?}"
+    );
+}
+
+#[test]
+fn ddl_sync_parent_update_rejected_by_immutable_does_not_satisfy_composite_fk_child() {
+    let receiver = db();
+    receiver
+        .execute(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, frozen TEXT IMMUTABLE, UNIQUE(a, b))",
+            &p(),
+        )
+        .unwrap();
+    receiver
+        .execute("CREATE TABLE child (id INTEGER PRIMARY KEY, c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b))", &p())
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO parent (id, a, b, frozen) VALUES (1, 1, 2, 'x')",
+            &p(),
+        )
+        .unwrap();
+
+    let child = RowChange {
+        table: "child".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("c1".into(), Value::Int64(9)),
+            ("c2".into(), Value::Int64(9)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+    let rejected_parent_update = RowChange {
+        table: "parent".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("a".into(), Value::Int64(9)),
+            ("b".into(), Value::Int64(9)),
+            ("frozen".into(), Value::Text("y".into())),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+
+    let result = receiver
+        .apply_changes(
+            ChangeSet {
+                rows: vec![child, rejected_parent_update],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        row_count(&receiver, "child"),
+        0,
+        "child must not be inserted against a parent update rejected by immutable constraints"
+    );
+    assert_eq!(
+        receiver
+            .execute("SELECT a, b, frozen FROM parent WHERE id = 1", &p())
+            .unwrap()
+            .rows,
+        vec![vec![
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Text("x".into())
+        ]],
+        "immutable parent update must remain a bounded conflict"
+    );
+    assert!(
+        result
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.reason.as_deref().is_some_and(|reason| {
+                reason.contains("child(c1, c2)") && reason.contains("parent(a, b)")
+            })),
+        "missing bounded child FK conflict: {result:?}"
+    );
+    assert!(
+        result.conflicts.iter().any(|conflict| conflict
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("immutable"))),
+        "missing immutable parent conflict: {result:?}"
+    );
+}
+
+#[test]
+fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composite_fk_child() {
+    let receiver = db();
+    receiver
+        .execute(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, u TEXT UNIQUE, UNIQUE(a, b))",
+            &p(),
+        )
+        .unwrap();
+    receiver
+        .execute("CREATE TABLE child (id INTEGER PRIMARY KEY, c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b))", &p())
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO parent (id, a, b, u) VALUES (1, 1, 2, 'old')",
+            &p(),
+        )
+        .unwrap();
+
+    let child = RowChange {
+        table: "child".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("c1".into(), Value::Int64(9)),
+            ("c2".into(), Value::Int64(9)),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+    let projected_unique_holder = RowChange {
+        table: "parent".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(2),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(2)),
+            ("a".into(), Value::Int64(5)),
+            ("b".into(), Value::Int64(5)),
+            ("u".into(), Value::Text("taken".into())),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+    let rejected_parent_update = RowChange {
+        table: "parent".into(),
+        natural_key: NaturalKey {
+            column: "id".into(),
+            value: Value::Int64(1),
+        },
+        values: HashMap::from([
+            ("id".into(), Value::Int64(1)),
+            ("a".into(), Value::Int64(9)),
+            ("b".into(), Value::Int64(9)),
+            ("u".into(), Value::Text("taken".into())),
+        ]),
+        deleted: false,
+        lsn: Lsn(10),
+    };
+
+    let result = receiver
+        .apply_changes(
+            ChangeSet {
+                rows: vec![child, projected_unique_holder, rejected_parent_update],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        row_count(&receiver, "child"),
+        0,
+        "child must not be inserted against a parent update rejected by projected unique state"
+    );
+    assert_eq!(
+        receiver
+            .execute("SELECT a, b, u FROM parent WHERE id = 1", &p())
+            .unwrap()
+            .rows,
+        vec![vec![
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Text("old".into())
+        ]],
+        "unique-rejected parent update must remain a bounded conflict"
+    );
+    assert_eq!(
+        receiver
+            .execute("SELECT a, b, u FROM parent WHERE id = 2", &p())
+            .unwrap()
+            .rows,
+        vec![vec![
+            Value::Int64(5),
+            Value::Int64(5),
+            Value::Text("taken".into())
+        ]],
+        "earlier projected unique holder should still apply"
+    );
+    assert!(
+        result
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.reason.as_deref().is_some_and(|reason| {
+                reason.contains("child(c1, c2)") && reason.contains("parent(a, b)")
+            })),
+        "missing bounded child FK conflict: {result:?}"
+    );
+    assert!(
+        result.conflicts.iter().any(|conflict| conflict
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.to_ascii_lowercase().contains("unique"))),
+        "missing unique parent conflict: {result:?}"
+    );
+}
+
+#[test]
 fn ddl_sync_ddl_apply_rejects_when_receiver_index_missing() {
     let receiver = db();
     receiver
@@ -1482,6 +1991,60 @@ fn cfk_retention_eviction_of_parent_with_children_rejects() {
     legacy.close().unwrap();
     assert_eq!(persisted_row_count(&legacy_path, "parent"), 1);
     assert_eq!(persisted_row_count(&legacy_path, "child"), 1);
+}
+
+#[test]
+fn cfk_retention_keeps_transitively_referenced_expired_parent_chain() {
+    let (_tmp, _path, db) = file_db("retention-transitive-chain.db");
+    db.execute(
+        "CREATE TABLE grandparent (a INTEGER, b INTEGER, UNIQUE(a, b)) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE parent (a INTEGER, b INTEGER, ga INTEGER, gb INTEGER, UNIQUE(a, b), FOREIGN KEY (ga, gb) REFERENCES grandparent(a, b)) RETAIN 1 SECONDS",
+        &p(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER, FOREIGN KEY (pa, pb) REFERENCES parent(a, b))",
+        &p(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO grandparent (a, b) VALUES (1, 2)", &p())
+        .unwrap();
+    db.execute(
+        "INSERT INTO parent (a, b, ga, gb) VALUES (10, 20, 1, 2)",
+        &p(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO child (id, pa, pb) VALUES (1, 10, 20)", &p())
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let report = db.run_pruning_cycle_checked().unwrap();
+
+    assert_eq!(
+        report.pruned_rows, 0,
+        "retention must not prune any row in an FK chain pinned by a live leaf"
+    );
+    assert_eq!(row_count(&db, "grandparent"), 1);
+    assert_eq!(row_count(&db, "parent"), 1);
+    assert_eq!(row_count(&db, "child"), 1);
+    assert!(
+        report
+            .blocked
+            .iter()
+            .any(|b| b.contains("grandparent(a, b)") && b.contains("parent(ga, gb)")),
+        "missing grandparent blocker reason: {report:?}"
+    );
+    assert!(
+        report
+            .blocked
+            .iter()
+            .any(|b| b.contains("parent(a, b)") && b.contains("child(pa, pb)")),
+        "missing parent blocker reason: {report:?}"
+    );
 }
 
 #[test]
