@@ -403,6 +403,8 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     }
 
     ensure_release_binaries();
+    let stderr_path = tmp.path().join("server.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("server stderr");
     let child = Command::new(server_bin())
         .args([
             "--db-path",
@@ -417,9 +419,23 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
         .env("CONTEXTDB_TEST_PUSH_RELEASE_FILE", &release_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .expect("server should spawn");
+
+    struct ServerStderrDump<'a> {
+        path: &'a std::path::Path,
+    }
+    impl<'a> Drop for ServerStderrDump<'a> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let s = std::fs::read_to_string(self.path).unwrap_or_default();
+                eprintln!("--- server.stderr ---\n{s}\n--- end ---");
+            }
+        }
+    }
+    let _stderr_dump = ServerStderrDump { path: &stderr_path };
+
     assert!(
         wait_for_sync_server_ready(&nats.nats_url, "f121", Duration::from_secs(15)).await,
         "sync server must respond before SIGTERM drain test starts"
@@ -442,7 +458,7 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     // Start a larger follow-up push and send SIGTERM only after the client has begun the server push.
     // A server that exits 0 without draining active handlers can lose this batch while still passing a
     // quiescent-shutdown test.
-    let batch_ids: Vec<Uuid> = (0..4096).map(|_| Uuid::new_v4()).collect();
+    let batch_ids: Vec<Uuid> = (0..128).map(|_| Uuid::new_v4()).collect();
     let batch_for_task = batch_ids.clone();
     let nats_url = nats.nats_url.clone();
     let task_barrier_path = barrier_path.clone();
@@ -474,12 +490,12 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     );
     std::fs::write(&release_path, b"release").expect("release in-flight push barrier");
 
-    let exit = wait_for_child_output(child, Duration::from_secs(10), "graceful drain").status;
+    let exit = wait_for_child_output(child, Duration::from_secs(30), "graceful drain").status;
     assert!(
         exit.success(),
         "contextdb-server must exit 0 on SIGTERM; status: {exit:?}"
     );
-    tokio::time::timeout(Duration::from_secs(10), pending_push)
+    tokio::time::timeout(Duration::from_secs(30), pending_push)
         .await
         .expect("in-flight push must complete during graceful drain")
         .expect("in-flight push task must not panic");

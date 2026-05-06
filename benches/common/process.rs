@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Once;
+use std::thread;
+use std::time::{Duration, Instant};
 
 static BUILD_RELEASE_BINARIES: Once = Once::new();
 
@@ -94,4 +96,53 @@ pub fn spawn_server(db_path: &Path, tenant_id: &str, nats_url: &str) -> Child {
 pub fn stop_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_server_with_barrier(
+    db_path: &Path,
+    tenant_id: &str,
+    nats_url: &str,
+    barrier_path: &Path,
+    release_path: &Path,
+    min_rows: usize,
+    stderr_path: &Path,
+) -> Child {
+    ensure_release_binaries();
+    let stderr_file = std::fs::File::create(stderr_path).expect("server stderr");
+    Command::new(server_bin())
+        .args([
+            "--db-path",
+            db_path.to_str().expect("utf-8 path"),
+            "--tenant-id",
+            tenant_id,
+            "--nats-url",
+            nats_url,
+        ])
+        .env("CONTEXTDB_TEST_PUSH_BARRIER_MIN_ROWS", min_rows.to_string())
+        .env("CONTEXTDB_TEST_PUSH_BARRIER_FILE", barrier_path)
+        .env("CONTEXTDB_TEST_PUSH_RELEASE_FILE", release_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .expect("server should spawn")
+}
+
+pub fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
+    let start = Instant::now();
+    loop {
+        match child.try_wait().expect("child status poll") {
+            Some(_) => return child.wait_with_output().expect(context),
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    return child
+                        .wait_with_output()
+                        .expect("child should finish after timeout kill");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }

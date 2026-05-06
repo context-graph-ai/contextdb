@@ -147,3 +147,8 @@ path = "../../benches/tier2_fk_revalidation_overhead.rs"
 name = "tier2_state_machine_overhead"
 harness = false
 path = "../../benches/tier2_state_machine_overhead.rs"
+
+[[bench]]
+name = "sigterm_drain_in_flight_persistence"
+harness = false
+path = "../../benches/sigterm_drain_in_flight_persistence.rs"

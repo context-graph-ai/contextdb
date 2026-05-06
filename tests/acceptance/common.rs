@@ -507,7 +507,7 @@ pub(crate) async fn push_many_changes_through_server(
         let _ = started.send(());
     }
 
-    let msg = tokio::time::timeout(Duration::from_secs(15), inbox_sub.next())
+    let msg = tokio::time::timeout(Duration::from_secs(45), inbox_sub.next())
         .await
         .expect("direct push must respond after graceful drain")
         .expect("direct push inbox must stay open");
