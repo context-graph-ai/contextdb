@@ -1,12 +1,14 @@
 use crate::error::SyncError;
-use contextdb_core::{Lsn, RowId, Value, VectorIndexRef};
+use contextdb_core::{
+    CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
+};
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, VectorChange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -155,6 +157,12 @@ pub enum WireDdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+        #[serde(default)]
+        foreign_keys: Vec<SingleColumnForeignKey>,
+        #[serde(default)]
+        composite_foreign_keys: Vec<CompositeForeignKey>,
+        #[serde(default)]
+        composite_unique: Vec<Vec<String>>,
     },
     DropTable {
         name: String,
@@ -163,6 +171,12 @@ pub enum WireDdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+        #[serde(default)]
+        foreign_keys: Vec<SingleColumnForeignKey>,
+        #[serde(default)]
+        composite_foreign_keys: Vec<CompositeForeignKey>,
+        #[serde(default)]
+        composite_unique: Vec<Vec<String>>,
     },
     // Direction is encoded as a string ("ASC" / "DESC") on the wire so the
     // server does not depend on contextdb-core's SortDirection type shape.
@@ -370,20 +384,32 @@ impl From<DdlChange> for WireDdlChange {
                 name,
                 columns,
                 constraints,
+                foreign_keys: _,
+                composite_foreign_keys: _,
+                composite_unique: _,
             } => Self::CreateTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             },
             DdlChange::DropTable { name } => Self::DropTable { name },
             DdlChange::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys: _,
+                composite_foreign_keys: _,
+                composite_unique: _,
             } => Self::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             },
             DdlChange::CreateIndex {
                 table,
@@ -460,20 +486,32 @@ impl From<WireDdlChange> for DdlChange {
                 name,
                 columns,
                 constraints,
+                foreign_keys: _,
+                composite_foreign_keys: _,
+                composite_unique: _,
             } => Self::CreateTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             },
             WireDdlChange::DropTable { name } => Self::DropTable { name },
             WireDdlChange::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys: _,
+                composite_foreign_keys: _,
+                composite_unique: _,
             } => Self::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             },
             WireDdlChange::CreateIndex {
                 table,

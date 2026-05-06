@@ -100,7 +100,7 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
 // ======== TU7 ========
 
 #[test]
-fn protocol_version_stays_at_three_for_trigger_ddl_lsn_wire_ordering() {
+fn protocol_version_uses_current_constant_for_structured_constraint_wire() {
     use contextdb_server::protocol::{Envelope, PROTOCOL_VERSION};
 
     // Construct the default envelope used by the pull path.
@@ -132,7 +132,7 @@ fn protocol_version_stays_at_three_for_trigger_ddl_lsn_wire_ordering() {
 }
 
 #[test]
-fn wire_changeset_requires_ddl_lsn_field_for_protocol_v3() {
+fn wire_changeset_requires_ddl_lsn_field_for_current_protocol() {
     use contextdb_server::protocol::{
         WireChangeSet, WireDdlChange, WireEdgeChange, WireRowChange, WireVectorChange,
     };
@@ -159,12 +159,12 @@ fn wire_changeset_requires_ddl_lsn_field_for_protocol_v3() {
     let decoded = rmp_serde::from_slice::<WireChangeSet>(&bytes);
     assert!(
         decoded.is_err(),
-        "protocol v3 WireChangeSet must reject payloads that omit ddl_lsn; got {decoded:?}"
+        "current WireChangeSet protocol must reject payloads that omit ddl_lsn; got {decoded:?}"
     );
 }
 
 #[test]
-fn wire_changeset_rejects_mismatched_ddl_lsn_lengths_for_protocol_v3() {
+fn wire_changeset_rejects_mismatched_ddl_lsn_lengths_for_current_protocol() {
     use contextdb_core::Lsn;
     use contextdb_engine::sync_types::ChangeSet;
     use contextdb_server::protocol::{WireChangeSet, WireDdlChange};

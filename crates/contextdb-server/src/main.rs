@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Parser)]
 #[command(
     name = "contextdb-server",
-    version = concat!(env!("CARGO_PKG_VERSION"), " protocol_version=3")
+    version = concat!(env!("CARGO_PKG_VERSION"), " protocol_version=4")
 )]
 struct Args {
     /// Database path (:memory: for in-memory)

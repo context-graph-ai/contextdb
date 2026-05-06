@@ -318,12 +318,20 @@ pub struct CreateTable {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub unique_constraints: Vec<Vec<String>>,
+    pub composite_foreign_keys: Vec<CompositeForeignKey>,
     pub if_not_exists: bool,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
     pub propagation_rules: Vec<AstPropagationRule>,
     pub retain: Option<RetainOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeForeignKey {
+    pub child_columns: Vec<String>,
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

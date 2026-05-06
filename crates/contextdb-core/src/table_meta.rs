@@ -2,6 +2,20 @@ use crate::Direction;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositeForeignKey {
+    pub child_columns: Vec<String>,
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SingleColumnForeignKey {
+    pub child_column: String,
+    pub parent_table: String,
+    pub parent_column: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
@@ -22,6 +36,8 @@ pub struct TableMeta {
     pub expires_column: Option<String>,
     #[serde(default)]
     pub indexes: Vec<IndexDecl>,
+    #[serde(default)]
+    pub composite_foreign_keys: Vec<CompositeForeignKey>,
 }
 
 // Custom `Deserialize` that tolerates prior on-disk `TableMeta` encoded
@@ -72,6 +88,9 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 // default.
                 let expires_column = seq.next_element::<Option<String>>()?.unwrap_or_default();
                 let indexes = seq.next_element::<Vec<IndexDecl>>()?.unwrap_or_default();
+                let composite_foreign_keys = seq
+                    .next_element::<Vec<CompositeForeignKey>>()?
+                    .unwrap_or_default();
                 Ok(TableMeta {
                     columns,
                     immutable,
@@ -84,6 +103,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     sync_safe,
                     expires_column,
                     indexes,
+                    composite_foreign_keys,
                 })
             }
 
@@ -102,6 +122,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let mut sync_safe: Option<bool> = None;
                 let mut expires_column: Option<Option<String>> = None;
                 let mut indexes: Option<Vec<IndexDecl>> = None;
+                let mut composite_foreign_keys: Option<Vec<CompositeForeignKey>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -116,6 +137,9 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                         "sync_safe" => sync_safe = Some(map.next_value()?),
                         "expires_column" => expires_column = Some(map.next_value()?),
                         "indexes" => indexes = Some(map.next_value()?),
+                        "composite_foreign_keys" => {
+                            composite_foreign_keys = Some(map.next_value()?)
+                        }
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -135,6 +159,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     sync_safe: sync_safe.unwrap_or_default(),
                     expires_column: expires_column.unwrap_or_default(),
                     indexes: indexes.unwrap_or_default(),
+                    composite_foreign_keys: composite_foreign_keys.unwrap_or_default(),
                 })
             }
         }
@@ -151,6 +176,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
             "sync_safe",
             "expires_column",
             "indexes",
+            "composite_foreign_keys",
         ];
         deserializer.deserialize_struct("TableMeta", FIELDS, TableMetaVisitor)
     }

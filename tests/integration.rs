@@ -8,6 +8,8 @@ mod anti_tests;
 mod boundary_conditions;
 #[path = "integration/column_level_immutable_tests.rs"]
 mod column_level_immutable_tests;
+#[path = "integration/composite_foreign_key_tests.rs"]
+mod composite_foreign_key_tests;
 #[path = "integration/ddl_sync_tests.rs"]
 mod ddl_sync_tests;
 #[path = "integration/gate_a_primitives.rs"]

@@ -6,6 +6,8 @@ mod auto_stamped_txid;
 mod cli_ux;
 #[path = "acceptance/common.rs"]
 mod common;
+#[path = "acceptance/composite_foreign_key.rs"]
+mod composite_foreign_key;
 #[path = "acceptance/composite_unique_concurrent_update.rs"]
 mod composite_unique_concurrent_update;
 #[path = "acceptance/concurrent_unique_revalidation.rs"]

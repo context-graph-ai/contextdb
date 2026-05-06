@@ -553,12 +553,12 @@ fn f120_contextdb_server_version_prints_binary_and_protocol_version() {
         semver_present,
         "stdout must include a SemVer-shaped version token; got: {stdout}"
     );
-    // Protocol version is operator-discoverable; require the literal numeric `3` adjacent to the protocol token.
+    // Protocol version is operator-discoverable; require the literal numeric `4` adjacent to the protocol token.
     assert!(
-        stdout.contains("protocol_version=3")
-            || stdout.contains("protocol_version 3")
-            || stdout.contains("PROTOCOL_VERSION 3"),
-        "stdout must include `protocol_version=3` (or equivalent) so operators can detect asymmetric upgrades; got: {stdout}"
+        stdout.contains("protocol_version=4")
+            || stdout.contains("protocol_version 4")
+            || stdout.contains("PROTOCOL_VERSION 4"),
+        "stdout must include `protocol_version=4` (or equivalent) so operators can detect asymmetric upgrades; got: {stdout}"
     );
 }
 /// I ran the README's two-vector walkthrough through contextdb-cli scripted mode. SHOW VECTOR_INDEXES rendered

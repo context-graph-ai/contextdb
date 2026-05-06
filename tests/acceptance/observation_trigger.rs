@@ -714,6 +714,9 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
                 name: "cold_sync_ddl".into(),
                 columns: vec![("id".into(), "UUID PRIMARY KEY".into())],
                 constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             }],
             ddl_lsn: vec![Lsn(2)],
             ..Default::default()
@@ -1422,6 +1425,9 @@ fn t3_sync_mixed_ddl_preflight_uses_sender_lsn_order_before_trigger_side_effects
                         ("content".into(), "TEXT".into()),
                     ],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
             ],
             ddl_lsn: vec![Lsn(10), Lsn(30)],
@@ -1467,11 +1473,17 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
                     name: "leaked_bad_type_prefix".into(),
                     columns: vec![("id".into(), "UUID PRIMARY KEY".into())],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
                 DdlChange::CreateTable {
                     name: "bad_type_table".into(),
                     columns: vec![("id".into(), "NOT_A_TYPE".into())],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
             ],
             ddl_lsn: vec![Lsn(5), Lsn(5)],
@@ -1507,6 +1519,9 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
                         ("content".into(), "TEXT".into()),
                     ],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
                 DdlChange::CreateIndex {
                     table: "missing_index_table".into(),
@@ -1803,10 +1818,10 @@ fn t3_sync_trigger_ddl_preflight_rejects_fk_invalid_data_before_any_trigger_ddl_
         matches!(
             result,
             Err(Error::ForeignKeyViolation {
-                ref table,
-                ref column,
-                ref_table: _
-            }) if table == "child_rows" && column == "parent_id"
+                ref child_table,
+                ref child_columns,
+                ..
+            }) if child_table == "child_rows" && child_columns == &vec!["parent_id".to_string()]
         ),
         "FK-invalid sync data must fail during preflight before trigger DDL is applied; got {result:?}"
     );
@@ -1886,10 +1901,10 @@ fn t3_sync_trigger_ddl_fk_preflight_respects_sender_lsn_order() {
         matches!(
             result,
             Err(Error::ForeignKeyViolation {
-                ref table,
-                ref column,
-                ref_table: _
-            }) if table == "child_rows" && column == "parent_id"
+                ref child_table,
+                ref child_columns,
+                ..
+            }) if child_table == "child_rows" && child_columns == &vec!["parent_id".to_string()]
         ),
         "a later sender-LSN parent must not validate an earlier child row; got {result:?}"
     );
@@ -1970,10 +1985,10 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_parent_delete_before_trigger_leak() 
         matches!(
             result,
             Err(Error::ForeignKeyViolation {
-                ref table,
-                ref column,
-                ref_table: _
-            }) if table == "child_rows" && column == "parent_id"
+                ref child_table,
+                ref child_columns,
+                ..
+            }) if child_table == "child_rows" && child_columns == &vec!["parent_id".to_string()]
         ),
         "FK-invalid parent delete must fail during preflight before trigger DDL is applied; got {result:?}"
     );
@@ -2077,10 +2092,10 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_stale_parent_prefix_after_update() {
         matches!(
             result,
             Err(Error::ForeignKeyViolation {
-                ref table,
-                ref column,
-                ref_table: _
-            }) if table == "child_rows" && column == "parent_ref"
+                ref child_table,
+                ref child_columns,
+                ..
+            }) if child_table == "child_rows" && child_columns == &vec!["parent_ref".to_string()]
         ),
         "FK preflight must treat parent updates as replacing the old referenced value; got {result:?}"
     );
@@ -2281,10 +2296,10 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_skipped_child_update_before_parent_d
         matches!(
             result,
             Err(Error::ForeignKeyViolation {
-                ref table,
-                ref column,
-                ref_table: _
-            }) if table == "child_rows" && column == "parent_id"
+                ref child_table,
+                ref child_columns,
+                ..
+            }) if child_table == "child_rows" && child_columns == &vec!["parent_id".to_string()]
         ),
         "reverse-FK preflight must not trust child updates that sync policy will skip; got {result:?}"
     );
@@ -2324,6 +2339,9 @@ fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
                         ("content".into(), "TEXT".into()),
                     ],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
                 DdlChange::CreateTrigger {
                     name: "replay_trigger".into(),
@@ -2376,6 +2394,9 @@ fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
                         ("content".into(), "TEXT".into()),
                     ],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
                 DdlChange::CreateTrigger {
                     name: "same_lsn_replay_trigger".into(),
@@ -2433,6 +2454,9 @@ fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
                         ("content".into(), "TEXT".into()),
                     ],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
                 DdlChange::CreateTrigger {
                     name: "mixed_lsn_replay_trigger".into(),
@@ -5301,8 +5325,9 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
         let leaked_changes = db.changes_since(since);
         if !matches!(
             result,
-            Err(Error::ForeignKeyViolation { ref table, ref column, .. })
-                if table == "cascade_children" && column == "parent_id"
+            Err(Error::ForeignKeyViolation { ref child_table, ref child_columns, .. })
+                if child_table == "cascade_children"
+                    && child_columns == &vec!["parent_id".to_string()]
         ) || count_rows(&db, "host_writes") != 0
             || count_rows(&db, "cascade_children") != 0
             || changeset_has_data(&leaked_changes)

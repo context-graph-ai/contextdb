@@ -110,11 +110,12 @@ pub enum Error {
     TxNotFound(TxId),
     #[error("unique constraint violation: {table}.{column}")]
     UniqueViolation { table: String, column: String },
-    #[error("foreign key violation: {table}.{column} references {ref_table}")]
+    #[error("foreign key violation: {child_table} references {parent_table}")]
     ForeignKeyViolation {
-        table: String,
-        column: String,
-        ref_table: String,
+        child_table: String,
+        child_columns: Vec<String>,
+        parent_table: String,
+        parent_columns: Vec<String>,
     },
     #[error("recursive CTEs are not supported")]
     RecursiveCteNotSupported,

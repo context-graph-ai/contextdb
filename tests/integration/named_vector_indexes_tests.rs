@@ -1739,6 +1739,9 @@ fn nv19b_changeset_ddl_applies_before_vector_changes_for_new_index() {
             name: "evidence".into(),
             columns: vec![("vector_vision".into(), "VECTOR(8)".into())],
             constraints: vec![],
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
         }],
 
         ddl_lsn: vec![contextdb_core::Lsn(10)],
@@ -3273,9 +3276,9 @@ fn nv17_protocol_version_mismatch_returns_typed_error() {
 
 #[test]
 fn nv17b_protocol_version_mismatch_rejects_lower_version_envelopes() {
-    use contextdb_server::protocol::{Envelope, MessageType, decode};
+    use contextdb_server::protocol::{Envelope, MessageType, PROTOCOL_VERSION, decode};
 
-    // A v3 receiver must also reject a v1 envelope, not just envelopes claiming a higher version.
+    // The current receiver must also reject a v1 envelope, not just envelopes claiming a higher version.
     // Without symmetric rejection, the asymmetric-upgrade detection contract (RB17) is unwired.
     let envelope = Envelope {
         version: 1,
@@ -3291,11 +3294,11 @@ fn nv17b_protocol_version_mismatch_rejects_lower_version_envelopes() {
             Err(
                 contextdb_server::error::SyncError::ProtocolVersionMismatch {
                     received: 1,
-                    supported: 3
+                    supported: PROTOCOL_VERSION
                 }
             )
         ),
-        "v3 receiver must reject v1 envelope (asymmetric upgrade detection); got {result:?}"
+        "current receiver must reject v1 envelope (asymmetric upgrade detection); got {result:?}"
     );
 }
 

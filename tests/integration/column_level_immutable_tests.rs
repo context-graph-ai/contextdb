@@ -885,6 +885,7 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
             name,
             columns,
             constraints,
+            ..
         } = change
         {
             if name == table {

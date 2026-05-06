@@ -829,6 +829,9 @@ mod tests {
                     ("data".to_string(), "TEXT".to_string()),
                 ],
                 constraints: vec!["PRIMARY KEY (id)".to_string()],
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             }],
 
             ddl_lsn: vec![Lsn(1)],
@@ -924,6 +927,9 @@ mod tests {
                     (vector_column.to_string(), "VECTOR(4)".to_string()),
                 ],
                 constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             }],
 
             ddl_lsn: vec![Lsn(1)],
@@ -1257,6 +1263,9 @@ mod tests {
                     .map(|j| (format!("col_{}_{}", j, "x".repeat(500)), "TEXT".to_string()))
                     .collect(),
                 constraints: vec![format!("PRIMARY KEY (col_{})", "x".repeat(500))],
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             });
         }
         let changeset = ChangeSet {
@@ -1313,6 +1322,9 @@ mod tests {
                         ("content".to_string(), "TEXT".to_string()),
                     ],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 },
                 DdlChange::CreateTrigger {
                     name: "host_write_trigger".to_string(),

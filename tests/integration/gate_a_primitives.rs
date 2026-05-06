@@ -28,6 +28,7 @@ fn ddl_sql_from_change(change: &DdlChange) -> String {
             name,
             columns,
             constraints,
+            ..
         } => {
             let mut sql = format!(
                 "CREATE TABLE {} ({})",
@@ -188,6 +189,7 @@ fn rt1_composite_store_ddl_round_trip_parse() {
             name,
             columns,
             constraints,
+            ..
         } = change
         else {
             panic!("expected CREATE TABLE");
@@ -222,6 +224,9 @@ fn rt3_database_apply_changes_ddl_round_trip() {
                     ("name".to_string(), "TEXT".to_string()),
                 ],
                 constraints: vec!["IMMUTABLE".to_string()],
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             },
             DdlChange::CreateTable {
                 name: "rt3_state_machine".to_string(),
@@ -230,6 +235,9 @@ fn rt3_database_apply_changes_ddl_round_trip() {
                     ("status".to_string(), "TEXT".to_string()),
                 ],
                 constraints: vec!["STATE MACHINE (status: pending -> [done])".to_string()],
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             },
             DdlChange::CreateTable {
                 name: "rt3_dag".to_string(),
@@ -240,6 +248,9 @@ fn rt3_database_apply_changes_ddl_round_trip() {
                     ("edge_type".to_string(), "TEXT".to_string()),
                 ],
                 constraints: vec!["DAG('CITES')".to_string()],
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             },
         ],
         ddl_lsn: vec![Lsn(1), Lsn(1), Lsn(1)],

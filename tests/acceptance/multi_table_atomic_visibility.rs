@@ -1617,6 +1617,9 @@ fn t21_18_mixed_sync_ddl_vector_error_does_not_apply_ddl() {
                     name: "evidence".to_string(),
                     columns: vec![("vector_vision".to_string(), "VECTOR(8)".to_string())],
                     constraints: vec![],
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 }],
 
                 ddl_lsn: vec![contextdb_core::Lsn(10)],
@@ -1667,6 +1670,9 @@ fn t21_19_mixed_sync_ddl_edge_error_does_not_apply_ddl() {
                         ("edge_type".to_string(), "TEXT".to_string()),
                     ],
                     constraints: vec!["DAG('DEPENDS')".to_string()],
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 }],
 
                 ddl_lsn: vec![contextdb_core::Lsn(10)],
@@ -1810,6 +1816,9 @@ fn t21_21_mixed_sync_ddl_vector_memory_error_does_not_apply_ddl() {
                         ("embedding".to_string(), "VECTOR(256)".to_string()),
                     ],
                     constraints: vec![],
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 }],
 
                 ddl_lsn: vec![contextdb_core::Lsn(1)],

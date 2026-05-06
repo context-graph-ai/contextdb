@@ -16,6 +16,7 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             name: ct.name.clone(),
             columns: ct.columns.clone(),
             unique_constraints: ct.unique_constraints.clone(),
+            composite_foreign_keys: ct.composite_foreign_keys.clone(),
             immutable: ct.immutable,
             state_machine: ct.state_machine.clone(),
             dag_edge_types: ct.dag_edge_types.clone(),

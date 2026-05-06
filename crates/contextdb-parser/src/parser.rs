@@ -1010,6 +1010,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut if_not_exists = false;
     let mut columns = Vec::new();
     let mut unique_constraints = Vec::new();
+    let mut composite_foreign_keys = Vec::new();
     let mut immutable = false;
     let mut state_machine = None;
     let mut dag_edge_types = Vec::new();
@@ -1048,6 +1049,9 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                     }
                     Rule::unique_table_constraint => {
                         unique_constraints.push(build_unique_table_constraint(element)?);
+                    }
+                    Rule::foreign_key_table_constraint => {
+                        let _ = build_composite_foreign_key(element)?;
                     }
                     other => {
                         return Err(unexpected_rule(other, "build_create_table.table_element"));
@@ -1186,6 +1190,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         name: name.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
         columns,
         unique_constraints,
+        composite_foreign_keys: std::mem::take(&mut composite_foreign_keys),
         if_not_exists,
         immutable,
         state_machine,
@@ -1552,6 +1557,14 @@ fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     }
 
     Ok(columns)
+}
+
+fn build_composite_foreign_key(_pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
+    Ok(CompositeForeignKey {
+        child_columns: Vec::new(),
+        parent_table: String::new(),
+        parent_columns: Vec::new(),
+    })
 }
 
 fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {

@@ -1,7 +1,7 @@
 use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
-    AlterAction, ColumnDef, Expr, OnConflict, RetainOption, SetDiskLimitValue, SetMemoryLimitValue,
-    SortDirection, StateMachineDef,
+    AlterAction, ColumnDef, CompositeForeignKey, Expr, OnConflict, RetainOption, SetDiskLimitValue,
+    SetMemoryLimitValue, SortDirection, StateMachineDef,
 };
 
 #[derive(Debug, Clone)]
@@ -150,6 +150,7 @@ pub struct CreateTablePlan {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub unique_constraints: Vec<Vec<String>>,
+    pub composite_foreign_keys: Vec<CompositeForeignKey>,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,

@@ -3,7 +3,9 @@
 //! These types define the public API for sync operations and the durable wire
 //! shape used by file-backed history, full snapshots, and server replication.
 
-use contextdb_core::{Lsn, RowId, TableMeta, Value, VectorIndexRef};
+use contextdb_core::{
+    CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, TableMeta, Value, VectorIndexRef,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
@@ -236,12 +238,18 @@ pub struct VectorChange {
     pub lsn: Lsn,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DdlChange {
     CreateTable {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+        #[serde(default)]
+        foreign_keys: Vec<SingleColumnForeignKey>,
+        #[serde(default)]
+        composite_foreign_keys: Vec<CompositeForeignKey>,
+        #[serde(default)]
+        composite_unique: Vec<Vec<String>>,
     },
     DropTable {
         name: String,
@@ -250,6 +258,12 @@ pub enum DdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+        #[serde(default)]
+        foreign_keys: Vec<SingleColumnForeignKey>,
+        #[serde(default)]
+        composite_foreign_keys: Vec<CompositeForeignKey>,
+        #[serde(default)]
+        composite_unique: Vec<Vec<String>>,
     },
     CreateIndex {
         table: String,

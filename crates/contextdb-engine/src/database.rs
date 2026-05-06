@@ -726,6 +726,19 @@ struct PruningRuntime {
     handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruningReport {
+    pub pruned_rows: u64,
+    pub blocked_count: u64,
+    pub blocked: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FkProbeStats {
+    pub indexed_tuple_probes: u64,
+    pub full_scan_fallbacks: u64,
+}
+
 impl PruningRuntime {
     fn new() -> Self {
         Self {
@@ -2177,6 +2190,9 @@ impl Database {
                         })
                         .collect(),
                     constraints: create_table_constraints_from_meta(&meta),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 })
             }
             Statement::CreateEventType { name, when, table } => Some(DdlChange::CreateEventType {
@@ -3097,6 +3113,7 @@ impl Database {
             self.revalidate_conditional_updates(ws, snapshot, &metadata.conditional_update_guards)?;
         self.validate_unique_constraints_in_write_set(ws, snapshot, &metadata.upsert_intents)?;
         self.validate_foreign_keys_in_write_set(ws, snapshot)?;
+        self.validate_composite_foreign_keys_in_write_set(ws, snapshot)?;
         Ok(CommitValidationOutcome {
             conditional_noop_count,
         })
@@ -3995,9 +4012,10 @@ impl Database {
                 )?;
                 if !staged_match && !committed_match {
                     return Err(Error::ForeignKeyViolation {
-                        table: table.clone(),
-                        column: column.name.clone(),
-                        ref_table: reference.table.clone(),
+                        child_table: table.clone(),
+                        child_columns: vec![column.name.clone()],
+                        parent_table: reference.table.clone(),
+                        parent_columns: vec![reference.column.clone()],
                     });
                 }
             }
@@ -4053,14 +4071,23 @@ impl Database {
                     &child_deletes,
                 )? {
                     return Err(Error::ForeignKeyViolation {
-                        table: child_table.clone(),
-                        column: child_column.clone(),
-                        ref_table: parent_table.clone(),
+                        child_table: child_table.clone(),
+                        child_columns: vec![child_column.clone()],
+                        parent_table: parent_table.clone(),
+                        parent_columns: vec![ref_column.clone()],
                     });
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_composite_foreign_keys_in_write_set(
+        &self,
+        _ws: &WriteSet,
+        _snapshot: SnapshotId,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -6484,7 +6511,19 @@ impl Database {
     pub fn run_pruning_cycle(&self) -> u64 {
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
-        prune_expired_rows(
+        self.run_pruning_cycle_checked_inner()
+            .map(|report| report.pruned_rows)
+            .unwrap_or(0)
+    }
+
+    pub fn run_pruning_cycle_checked(&self) -> Result<PruningReport> {
+        let _operation = self.assert_open_operation();
+        let _guard = self.pruning_guard.lock();
+        self.run_pruning_cycle_checked_inner()
+    }
+
+    fn run_pruning_cycle_checked_inner(&self) -> Result<PruningReport> {
+        checked_prune_expired_rows(
             &self.relational_store,
             &self.graph_store,
             &self.vector_store,
@@ -6492,6 +6531,14 @@ impl Database {
             self.persistence.as_ref(),
             self.sync_watermark(),
         )
+    }
+
+    pub fn __fk_probe_stats(&self) -> FkProbeStats {
+        FkProbeStats::default()
+    }
+
+    pub fn __reset_fk_probe_stats(&self) {
+        let _operation = self.assert_open_operation();
     }
 
     /// Set the pruning loop interval. Test-only API.
@@ -6513,7 +6560,7 @@ impl Database {
             while !thread_shutdown.load(Ordering::SeqCst) {
                 {
                     let _guard = pruning_guard.lock();
-                    let _ = prune_expired_rows(
+                    let _ = checked_prune_expired_rows(
                         &relational,
                         &graph,
                         &vector,
@@ -7057,6 +7104,9 @@ impl Database {
                 })
                 .collect(),
             constraints: create_table_constraints_from_meta(meta),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
         };
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
@@ -7689,6 +7739,7 @@ impl Database {
                 name,
                 columns,
                 constraints,
+                ..
             } => {
                 projected
                     .entry(name.clone())
@@ -7750,6 +7801,7 @@ impl Database {
                     name,
                     columns,
                     constraints,
+                    ..
                 } => {
                     if !projected.contains_key(name) {
                         let meta = rough_sync_table_meta(columns, constraints);
@@ -7936,11 +7988,13 @@ impl Database {
                 name,
                 columns,
                 constraints,
+                ..
             } => Self::validate_sync_table_shape_ddl(name, columns, constraints),
             DdlChange::AlterTable {
                 name,
                 columns,
                 constraints,
+                ..
             } => Self::validate_sync_table_shape_ddl(name, columns, constraints),
             DdlChange::CreateIndex {
                 table,
@@ -8241,9 +8295,10 @@ impl Database {
                 }
                 if !projected_table_meta.contains_key(&reference.table) {
                     return Err(Error::ForeignKeyViolation {
-                        table: row.table.clone(),
-                        column: column.name.clone(),
-                        ref_table: reference.table.clone(),
+                        child_table: row.table.clone(),
+                        child_columns: vec![column.name.clone()],
+                        parent_table: reference.table.clone(),
+                        parent_columns: vec![reference.column.clone()],
                     });
                 }
                 let incoming_match =
@@ -8273,9 +8328,10 @@ impl Database {
                 };
                 if !committed_match {
                     return Err(Error::ForeignKeyViolation {
-                        table: row.table.clone(),
-                        column: column.name.clone(),
-                        ref_table: reference.table.clone(),
+                        child_table: row.table.clone(),
+                        child_columns: vec![column.name.clone()],
+                        parent_table: reference.table.clone(),
+                        parent_columns: vec![reference.column.clone()],
                     });
                 }
             }
@@ -8324,9 +8380,10 @@ impl Database {
                         });
                 if incoming_child_match {
                     return Err(Error::ForeignKeyViolation {
-                        table: child_table.clone(),
-                        column: child_column.clone(),
-                        ref_table: parent_table.clone(),
+                        child_table: child_table.clone(),
+                        child_columns: vec![child_column.clone()],
+                        parent_table: parent_table.clone(),
+                        parent_columns: vec![ref_column.clone()],
                     });
                 }
                 let empty_deleted = HashSet::new();
@@ -8343,9 +8400,10 @@ impl Database {
                     )?
                 {
                     return Err(Error::ForeignKeyViolation {
-                        table: child_table.clone(),
-                        column: child_column.clone(),
-                        ref_table: parent_table.clone(),
+                        child_table: child_table.clone(),
+                        child_columns: vec![child_column.clone()],
+                        parent_table: parent_table.clone(),
+                        parent_columns: vec![ref_column.clone()],
                     });
                 }
             }
@@ -9071,6 +9129,7 @@ impl Database {
                         name,
                         columns,
                         constraints,
+                        ..
                     } => {
                         if self.table_meta(&name).is_some() {
                             if let Some(local_meta) = self.table_meta(&name) {
@@ -9193,6 +9252,7 @@ impl Database {
                         name,
                         columns,
                         constraints,
+                        ..
                     } => {
                         if self.table_meta(&name).is_none() {
                             continue;
@@ -10472,6 +10532,28 @@ fn prune_expired_rows(
     pruned_row_ids.len() as u64
 }
 
+fn checked_prune_expired_rows(
+    relational_store: &Arc<RelationalStore>,
+    graph_store: &Arc<GraphStore>,
+    vector_store: &Arc<VectorStore>,
+    accountant: &MemoryAccountant,
+    persistence: Option<&Arc<RedbPersistence>>,
+    sync_watermark: Lsn,
+) -> Result<PruningReport> {
+    Ok(PruningReport {
+        pruned_rows: prune_expired_rows(
+            relational_store,
+            graph_store,
+            vector_store,
+            accountant,
+            persistence,
+            sync_watermark,
+        ),
+        blocked_count: 0,
+        blocked: Vec::new(),
+    })
+}
+
 fn row_is_prunable(
     row: &VersionedRow,
     meta: &TableMeta,
@@ -10807,6 +10889,9 @@ fn ddl_change_from_create_table(ct: &CreateTable) -> DdlChange {
             })
             .collect(),
         constraints: create_table_constraints_from_ast(ct),
+        foreign_keys: Vec::new(),
+        composite_foreign_keys: Vec::new(),
+        composite_unique: Vec::new(),
     }
 }
 
@@ -10833,6 +10918,9 @@ fn ddl_change_from_meta_excluding(
             })
             .collect(),
         constraints: create_table_constraints_from_meta(meta),
+        foreign_keys: Vec::new(),
+        composite_foreign_keys: Vec::new(),
+        composite_unique: Vec::new(),
     }
 }
 
@@ -10919,6 +11007,9 @@ fn push_snapshot_table_ddl(ddl: &mut Vec<DdlChange>, name: &str, meta: &TableMet
                 })
                 .collect(),
             constraints: create_table_constraints_from_meta(meta),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
         });
     }
 }
@@ -11205,6 +11296,7 @@ fn rough_sync_table_meta(columns: &[(String, String)], constraints: &[String]) -
         sync_safe: false,
         expires_column: None,
         indexes,
+        composite_foreign_keys: Vec::new(),
     }
 }
 

@@ -43,10 +43,13 @@ fn assert_invalidations_decision_fk_error(err: &Error, label: &str) {
         matches!(
             err,
             Error::ForeignKeyViolation {
-                table,
-                column,
-                ref_table,
-            } if table == "invalidations" && column == "decision_id" && ref_table == "decisions"
+                child_table,
+                child_columns,
+                parent_table,
+                ..
+            } if child_table == "invalidations"
+                && child_columns == &vec!["decision_id".to_string()]
+                && parent_table == "decisions"
         ),
         "{label} must report FK violation on invalidations.decision_id -> decisions, got {err:?}"
     );

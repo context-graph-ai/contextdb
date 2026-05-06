@@ -141,6 +141,7 @@ pub(crate) fn execute_plan(
                 // keeps them in `EXPLAIN <query>` so agents can assert
                 // routing programmatically.
                 indexes: auto_indexes.clone(),
+                composite_foreign_keys: Vec::new(),
             };
             let metadata_bytes = meta.estimated_bytes();
             db.accountant().try_allocate_for(

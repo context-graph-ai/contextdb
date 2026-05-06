@@ -557,6 +557,9 @@ fn ds10_schema_divergence_detected() {
                 ("unit".into(), "TEXT".into()),
             ],
             constraints: vec![],
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
         }],
 
         ddl_lsn: vec![Lsn(1)],
@@ -610,6 +613,9 @@ fn ds10b_public_apply_changes_rejects_ddl_without_matching_lsn() {
                     name: "missing_lsn".into(),
                     columns: vec![("id".into(), "UUID PRIMARY KEY".into())],
                     constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
                 }],
                 ddl_lsn: Vec::new(),
                 ..Default::default()
