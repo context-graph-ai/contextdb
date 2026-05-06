@@ -6678,9 +6678,13 @@ impl Database {
     pub fn run_pruning_cycle(&self) -> u64 {
         let _operation = self.assert_open_operation();
         let _guard = self.pruning_guard.lock();
-        self.run_pruning_cycle_checked_inner()
-            .map(|report| report.pruned_rows)
-            .unwrap_or(0)
+        match self.run_pruning_cycle_checked_inner() {
+            Ok(report) => report.pruned_rows,
+            Err(err) => {
+                log_pruning_error(&err);
+                0
+            }
+        }
     }
 
     pub fn run_pruning_cycle_checked(&self) -> Result<PruningReport> {
@@ -6690,14 +6694,16 @@ impl Database {
     }
 
     fn run_pruning_cycle_checked_inner(&self) -> Result<PruningReport> {
-        checked_prune_expired_rows(
-            &self.relational_store,
-            &self.graph_store,
-            &self.vector_store,
-            self.accountant(),
-            self.persistence.as_ref(),
-            self.sync_watermark(),
-        )
+        self.with_commit_lock(|| {
+            checked_prune_expired_rows(
+                &self.relational_store,
+                &self.graph_store,
+                &self.vector_store,
+                self.accountant(),
+                self.persistence.as_ref(),
+                self.sync_watermark(),
+            )
+        })
     }
 
     pub fn __fk_probe_stats(&self) -> FkProbeStats {
@@ -6725,6 +6731,7 @@ impl Database {
         let accountant = self.accountant.clone();
         let persistence = self.persistence.clone();
         let sync_watermark = self.sync_watermark.clone();
+        let tx_mgr = self.tx_mgr.clone();
         let pruning_guard = self.pruning_guard.clone();
         let thread_shutdown = shutdown.clone();
 
@@ -6732,14 +6739,18 @@ impl Database {
             while !thread_shutdown.load(Ordering::SeqCst) {
                 {
                     let _guard = pruning_guard.lock();
-                    let _ = checked_prune_expired_rows(
-                        &relational,
-                        &graph,
-                        &vector,
-                        accountant.as_ref(),
-                        persistence.as_ref(),
-                        sync_watermark.load(Ordering::SeqCst),
-                    );
+                    if let Err(err) = tx_mgr.with_commit_lock(|| {
+                        checked_prune_expired_rows(
+                            &relational,
+                            &graph,
+                            &vector,
+                            accountant.as_ref(),
+                            persistence.as_ref(),
+                            sync_watermark.load(Ordering::SeqCst),
+                        )
+                    }) {
+                        log_pruning_error(&err);
+                    }
                 }
                 sleep_with_shutdown(&thread_shutdown, interval);
             }
@@ -11396,7 +11407,7 @@ fn prune_expired_rows(
     accountant: &MemoryAccountant,
     persistence: Option<&Arc<RedbPersistence>>,
     sync_watermark: Lsn,
-) -> PruningReport {
+) -> Result<PruningReport> {
     let now = Wallclock::now();
     let metas = relational_store.table_meta.read().clone();
     let mut pruned_by_table: HashMap<String, Vec<RowId>> = HashMap::new();
@@ -11404,49 +11415,47 @@ fn prune_expired_rows(
     let mut released_row_bytes = 0usize;
     let mut blocked = Vec::new();
 
-    {
-        let mut tables = relational_store.tables.write();
-        let table_snapshot = tables.clone();
-        let prune_candidates =
-            retention_prune_candidates(&metas, &table_snapshot, now, sync_watermark);
-        let protected_prune_candidates =
-            fk_protected_prune_candidates(&metas, &table_snapshot, &prune_candidates);
-        for (table_name, rows) in tables.iter_mut() {
-            let Some(meta) = metas.get(table_name) else {
+    let table_snapshot = relational_store.tables.read().clone();
+    let prune_candidates = retention_prune_candidates(&metas, &table_snapshot, now, sync_watermark);
+    let protected_prune_candidates =
+        fk_protected_prune_candidates(&metas, &table_snapshot, &prune_candidates);
+    for (table_name, rows) in &table_snapshot {
+        let Some(meta) = metas.get(table_name) else {
+            continue;
+        };
+        if meta.default_ttl_seconds.is_none() {
+            continue;
+        }
+
+        for row in rows {
+            let row_key = RetentionRowKey::new(table_name, row.row_id);
+            if !prune_candidates.contains(&row_key) {
                 continue;
-            };
-            if meta.default_ttl_seconds.is_none() {
+            }
+            if let Some(reason) = prune_blocker_for_referenced_parent(
+                table_name,
+                row,
+                &metas,
+                &table_snapshot,
+                &prune_candidates,
+                &protected_prune_candidates,
+            ) {
+                blocked.push(reason);
                 continue;
             }
 
-            rows.retain(|row| {
-                let row_key = RetentionRowKey::new(table_name, row.row_id);
-                if !prune_candidates.contains(&row_key) {
-                    return true;
-                }
-                if let Some(reason) = prune_blocker_for_referenced_parent(
-                    table_name,
-                    row,
-                    &metas,
-                    &table_snapshot,
-                    &prune_candidates,
-                    &protected_prune_candidates,
-                ) {
-                    blocked.push(reason);
-                    return true;
-                }
-
-                pruned_by_table
-                    .entry(table_name.clone())
-                    .or_default()
-                    .push(row.row_id);
-                released_row_bytes = released_row_bytes
-                    .saturating_add(estimate_row_bytes_for_meta(&row.values, meta, false));
-                if let Some(Value::Uuid(id)) = row.values.get("id") {
-                    pruned_node_ids.insert(*id);
-                }
-                false
-            });
+            pruned_by_table
+                .entry(table_name.clone())
+                .or_default()
+                .push(row.row_id);
+            released_row_bytes = released_row_bytes.saturating_add(estimate_row_bytes_for_meta(
+                &row.values,
+                meta,
+                false,
+            ));
+            if let Some(Value::Uuid(id)) = row.values.get("id") {
+                pruned_node_ids.insert(*id);
+            }
         }
     }
 
@@ -11455,11 +11464,65 @@ fn prune_expired_rows(
         .flat_map(|rows| rows.iter().copied())
         .collect();
     if pruned_row_ids.is_empty() {
-        return PruningReport {
+        return Ok(PruningReport {
             pruned_rows: 0,
             blocked_count: blocked.len() as u64,
             blocked,
-        };
+        });
+    }
+
+    let pruned_by_table_sets = pruned_by_table
+        .iter()
+        .map(|(table, row_ids)| {
+            (
+                table.clone(),
+                row_ids.iter().copied().collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let post_prune_table_rows = pruned_by_table_sets
+        .iter()
+        .map(|(table_name, row_ids)| {
+            let rows = table_snapshot
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| !row_ids.contains(&row.row_id))
+                .collect::<Vec<_>>();
+            (table_name.clone(), rows)
+        })
+        .collect::<HashMap<_, _>>();
+    let post_prune_vectors = vector_store
+        .all_entries()
+        .into_iter()
+        .filter(|entry| !pruned_row_ids.contains(&entry.row_id))
+        .collect::<Vec<_>>();
+    let post_prune_edges = graph_store
+        .forward_adj
+        .read()
+        .values()
+        .flat_map(|entries| entries.iter().cloned())
+        .filter(|entry| {
+            !pruned_node_ids.contains(&entry.source) && !pruned_node_ids.contains(&entry.target)
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(persistence) = persistence {
+        persistence.rewrite_pruned_state(
+            &post_prune_table_rows,
+            &post_prune_vectors,
+            &post_prune_edges,
+        )?;
+    }
+
+    {
+        let mut tables = relational_store.tables.write();
+        for (table_name, row_ids) in &pruned_by_table_sets {
+            if let Some(rows) = tables.get_mut(table_name) {
+                rows.retain(|row| !row_ids.contains(&row.row_id));
+            }
+        }
     }
 
     for table_name in pruned_by_table.keys() {
@@ -11500,39 +11563,17 @@ fn prune_expired_rows(
         reverse.retain(|_, entries| !entries.is_empty());
     }
 
-    if let Some(persistence) = persistence {
-        for table_name in pruned_by_table.keys() {
-            let rows = relational_store
-                .tables
-                .read()
-                .get(table_name)
-                .cloned()
-                .unwrap_or_default();
-            let _ = persistence.rewrite_table_rows(table_name, &rows);
-        }
-
-        let vectors = vector_store.all_entries();
-        let edges = graph_store
-            .forward_adj
-            .read()
-            .values()
-            .flat_map(|entries| entries.iter().cloned())
-            .collect::<Vec<_>>();
-        let _ = persistence.rewrite_vectors(&vectors);
-        let _ = persistence.rewrite_graph_edges(&edges);
-    }
-
     accountant.release(
         released_row_bytes
             .saturating_add(released_vector_bytes)
             .saturating_add(released_edge_bytes),
     );
 
-    PruningReport {
+    Ok(PruningReport {
         pruned_rows: pruned_row_ids.len() as u64,
         blocked_count: blocked.len() as u64,
         blocked,
-    }
+    })
 }
 
 fn checked_prune_expired_rows(
@@ -11543,14 +11584,23 @@ fn checked_prune_expired_rows(
     persistence: Option<&Arc<RedbPersistence>>,
     sync_watermark: Lsn,
 ) -> Result<PruningReport> {
-    Ok(prune_expired_rows(
+    prune_expired_rows(
         relational_store,
         graph_store,
         vector_store,
         accountant,
         persistence,
         sync_watermark,
-    ))
+    )
+}
+
+fn log_pruning_error(err: &Error) {
+    tracing::warn!(
+        name: "retention_pruning_error",
+        target: "retention_pruning",
+        error = %err,
+        "retention_pruning_error"
+    );
 }
 
 fn retention_prune_candidates(
@@ -12941,5 +12991,73 @@ fn ttl_seconds_to_sql(seconds: u64) -> String {
         format!("{} MINUTES", seconds / 60)
     } else {
         format!("{seconds} SECONDS")
+    }
+}
+
+#[cfg(test)]
+mod retention_prune_persistence_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn params() -> HashMap<String, Value> {
+        HashMap::new()
+    }
+
+    fn visible_rows(db: &Database, table: &str) -> usize {
+        db.execute(&format!("SELECT * FROM {table}"), &params())
+            .unwrap()
+            .rows
+            .len()
+    }
+
+    fn db_with_expired_row() -> Database {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.keep().join("retention-persist-failure.db");
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE obs (id INTEGER PRIMARY KEY, note TEXT) RETAIN 1 SECONDS",
+            &params(),
+        )
+        .unwrap();
+        db.execute("INSERT INTO obs (id, note) VALUES (1, 'old')", &params())
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        db
+    }
+
+    #[test]
+    fn checked_prune_reports_persistence_failure_without_mutating_memory() {
+        let db = db_with_expired_row();
+
+        db.persistence.as_ref().unwrap().close();
+        let err = db.run_pruning_cycle_checked().unwrap_err();
+
+        assert!(
+            err.to_string().contains("database persistence is closed"),
+            "checked pruning must surface persistence rewrite failure; got {err:?}"
+        );
+        assert_eq!(
+            visible_rows(&db, "obs"),
+            1,
+            "failed persistence must leave in-memory rows unchanged for retry"
+        );
+    }
+
+    #[test]
+    fn compatibility_prune_keeps_memory_when_persistence_fails() {
+        let db = db_with_expired_row();
+
+        db.persistence.as_ref().unwrap().close();
+        let pruned = db.run_pruning_cycle();
+
+        assert_eq!(
+            pruned, 0,
+            "compatibility pruning cannot surface errors and must report no durable prune"
+        );
+        assert_eq!(
+            visible_rows(&db, "obs"),
+            1,
+            "failed persistence must leave in-memory rows unchanged for retry"
+        );
     }
 }

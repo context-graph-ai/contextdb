@@ -1645,6 +1645,100 @@ impl RedbPersistence {
         })
     }
 
+    pub fn rewrite_pruned_state(
+        &self,
+        table_rows: &HashMap<String, Vec<VersionedRow>>,
+        vectors: &[VectorEntry],
+        edges: &[AdjEntry],
+    ) -> Result<()> {
+        let table_meta = self.load_all_table_meta()?;
+        let vector_quantization = Self::vector_quantization_map(&table_meta);
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+
+            for (name, rows) in table_rows {
+                let table_name = Self::rel_table_name(name);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                match write_txn.delete_table(table_def) {
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                    Err(err) => return Err(Self::storage_error(err)),
+                }
+                let legacy_table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                match write_txn.delete_table(legacy_table_def) {
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                    Err(err) => return Err(Self::storage_error(err)),
+                }
+                let mut redb_table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+                for row in rows {
+                    let encoded = Self::encode_versioned_row(row, table_meta.get(name))?;
+                    let key = Self::rel_row_key(row);
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            match write_txn.delete_table(VECTORS_TABLE) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            {
+                let mut table = write_txn
+                    .open_table(VECTORS_TABLE)
+                    .map_err(Self::storage_error)?;
+                for entry in vectors {
+                    let quantization = vector_quantization
+                        .get(&entry.index)
+                        .copied()
+                        .unwrap_or_default();
+                    let encoded = Self::encode_vector_entry(entry, quantization)?;
+                    let key = Self::vector_key(entry);
+                    table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            match write_txn.delete_table(GRAPH_FWD_TABLE) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            match write_txn.delete_table(GRAPH_REV_TABLE) {
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            {
+                let mut fwd_table = write_txn
+                    .open_table(GRAPH_FWD_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rev_table = write_txn
+                    .open_table(GRAPH_REV_TABLE)
+                    .map_err(Self::storage_error)?;
+
+                for entry in edges {
+                    let encoded = Self::encode(entry)?;
+                    let fwd_key = Self::graph_fwd_key(entry);
+                    let rev_key = Self::graph_rev_key(entry);
+                    fwd_table
+                        .insert(fwd_key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    rev_table
+                        .insert(rev_key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
     pub fn rewrite_commit_index(&self, entries: &BTreeMap<Lsn, TxId>) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
