@@ -1,6 +1,7 @@
 use super::common::*;
 use contextdb_core::Value;
 use contextdb_engine::Database;
+use std::io::Read;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -47,6 +48,10 @@ async fn f06a_data_written_on_edge_appears_on_server_automatically() {
     let (_tmp, edge_path, server_path, nats_url, ws_url, _nats) = setup_sync_env("f06a").await;
     let tenant = "f06a";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
+    assert!(
+        wait_for_sync_server_ready(&nats_url, tenant, Duration::from_secs(15)).await,
+        "sync server should be ready before f06a writer runs"
+    );
     let edge = run_cli_script(
         &edge_path,
         &["--tenant-id", tenant, "--nats-url", &ws_url],
@@ -65,19 +70,33 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000010', '
 .quit\n",
     );
     assert!(edge.status.success());
-    let synced = wait_until(Duration::from_secs(5), || {
-        stop_child(&mut server);
-        let count = count_rows_from_file(&server_path, "sensors");
-        if count == 10 {
-            true
-        } else {
-            server = spawn_server(&server_path, tenant, &nats_url);
-            false
-        }
+
+    // Observe via a non-destructive checker edge: bootstrap schema once, then poll
+    // by issuing `.sync pull` + `SELECT count(*)` against the live server. Pull replays
+    // inserts/deletes, not DDL, so the checker DB needs the table created before the loop.
+    let checker_path = edge_path.with_file_name("f06a-checker.db");
+    let checker_setup = run_cli_script(
+        &checker_path,
+        &["--tenant-id", tenant, "--nats-url", &ws_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+    );
+    assert!(
+        checker_setup.status.success(),
+        "checker edge setup must succeed"
+    );
+
+    let synced = wait_until(Duration::from_secs(30), || {
+        let check = run_cli_script(
+            &checker_path,
+            &["--tenant-id", tenant, "--nats-url", &ws_url],
+            ".sync pull\n\
+             SELECT count(*) FROM sensors\n\
+             .quit\n",
+        );
+        output_string(&check.stdout).contains("| 10")
     });
-    if server.try_wait().expect("server status").is_none() {
-        stop_child(&mut server);
-    }
+
+    stop_child(&mut server);
     assert!(synced, "server should receive rows without manual push");
 }
 
@@ -683,7 +702,9 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
 
     let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
 
-    // Create table, insert, enable auto-sync, then UPDATE
+    // Create table, insert, enable auto-sync, then UPDATE.
+    // Stdin is held open below — closing it would trigger `.quit` and silently degrade
+    // this test into f12e's quit-time-flush contract.
     write_child_stdin(
         &mut child,
         "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
@@ -693,47 +714,85 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
          UPDATE sensors SET name = 'updated' WHERE id = '00000000-0000-0000-0000-000000000001'\n",
     );
 
-    // Wait for UPDATE to appear on the server while the writer CLI is still running.
-    // Inspect the server DB file directly between short server restarts so this test stays
-    // focused on edge->server auto-push rather than pull-side conflict resolution on a checker edge.
-    let mut last_server_name = None;
+    // Bootstrap the checker DB schema BEFORE wait_until: pull replays inserts/deletes,
+    // not DDL, so without the table the in-loop SELECT would fail for the full budget.
+    let checker_path = edge_path.with_file_name("f12b-checker.db");
+    let checker_setup = run_cli_script(
+        &checker_path,
+        &["--tenant-id", tenant, "--nats-url", ws_url],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+    );
+    assert!(
+        checker_setup.status.success(),
+        "checker edge setup must succeed"
+    );
+
+    // Wait for the UPDATE to be visible on the server via a pull-based checker edge,
+    // while the writing CLI is still running. The predicate is value-based
+    // (`| updated`); a row-count predicate (`| 1`) cannot distinguish UPDATE-applied
+    // from initial-INSERT-only state.
     let found = wait_until(Duration::from_secs(30), || {
-        stop_child(&mut server);
-        let db = Database::open(&server_path).expect("server db");
-        let row = db.point_lookup(
-            "sensors",
-            "id",
-            &Value::Uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
-            db.snapshot(),
-        );
-        last_server_name = match row {
-            Ok(found) => found
-                .as_ref()
-                .and_then(|r| r.values.get("name"))
-                .and_then(Value::as_text)
-                .map(ToOwned::to_owned),
-            Err(contextdb_core::Error::TableNotFound(_)) => None,
-            Err(err) => panic!("server lookup: {err}"),
-        };
-        db.close().expect("server db close");
-        if last_server_name.as_deref() == Some("updated") {
-            true
-        } else {
-            server = spawn_server(&server_path, tenant, nats_url);
-            false
+        // If the writer has exited prematurely, surface the failure with full child
+        // output so triage doesn't have to guess. We can't call `wait_with_output`
+        // here — the closure is `FnMut` and cannot consume `child`; the happy-path
+        // `.quit` + `wait_with_output` lives below, outside the loop.
+        if let Some(status) = child.try_wait().expect("writer status poll") {
+            let mut stdout_buf = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_string(&mut stdout_buf);
+            }
+            let mut stderr_buf = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_buf);
+            }
+            panic!(
+                "f12b writer exited prematurely with {status:?}; stdout={stdout_buf}; stderr={stderr_buf}"
+            );
         }
+
+        let check = run_cli_script(
+            &checker_path,
+            &["--tenant-id", tenant, "--nats-url", ws_url],
+            ".sync pull\n\
+             SELECT name FROM sensors WHERE id = '00000000-0000-0000-0000-000000000001'\n\
+             .quit\n",
+        );
+        output_string(&check.stdout).contains("| updated")
     });
 
     write_child_stdin(&mut child, ".quit\n");
     let output = child.wait_with_output().expect("collect f12b child output");
-    stop_child(&mut server);
 
     assert!(
         found,
-        "UPDATE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}; last server name={last_server_name:?}",
+        "UPDATE must auto-sync to server while CLI is still running; child stdout={}; child stderr={}",
         output_string(&output.stdout),
         output_string(&output.stderr),
     );
+
+    // Disk-parity step: pull proved "visible to peers while writer is live"; the
+    // post-shutdown disk read proves "durably committed to server bytes." Both must hold.
+    stop_child(&mut server);
+    let db = Database::open(&server_path).expect("server db");
+    let row = db
+        .point_lookup(
+            "sensors",
+            "id",
+            &Value::Uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
+            db.snapshot(),
+        )
+        .expect("server point_lookup");
+    let server_name = row
+        .as_ref()
+        .and_then(|r| r.values.get("name"))
+        .and_then(Value::as_text)
+        .map(ToOwned::to_owned);
+    assert_eq!(
+        server_name.as_deref(),
+        Some("updated"),
+        "post-shutdown server DB must reflect the UPDATE; got {server_name:?}"
+    );
+    db.close().expect("server db close");
 }
 
 /// I deleted a row with .sync auto enabled, and the deletion appeared on the server before I quit.
