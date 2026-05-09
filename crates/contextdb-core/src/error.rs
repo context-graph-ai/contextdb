@@ -14,13 +14,10 @@ pub enum CallbackKind {
 
 impl std::fmt::Display for CallbackKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
+        f.write_str(match self {
             CallbackKind::Trigger => "trigger",
             CallbackKind::Cron => "cron",
-        };
-        let mut stub_label = String::with_capacity(label.len());
-        stub_label.push_str(label);
-        f.write_str(&stub_label)
+        })
     }
 }
 

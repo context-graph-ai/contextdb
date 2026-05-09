@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -203,6 +203,7 @@ pub struct TriggerAuditFilter {
 
 pub struct CronPauseGuard {
     cron: Arc<CronState>,
+    tickler_owner: Option<Database>,
 }
 
 impl std::fmt::Debug for CronPauseGuard {
@@ -213,7 +214,12 @@ impl std::fmt::Debug for CronPauseGuard {
 
 impl Drop for CronPauseGuard {
     fn drop(&mut self) {
-        self.cron.resume_tickler();
+        if self.cron.resume_tickler()
+            && Arc::strong_count(&self.cron) > 2
+            && let Some(db) = self.tickler_owner.take()
+        {
+            db.ensure_cron_tickler_running_after_pause_for_test();
+        }
     }
 }
 
@@ -307,6 +313,12 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static TRIGGER_CALLBACK_ACTIVE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static TRIGGER_CALLBACK_NAME: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static USER_COMMIT_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static USER_COMMIT_TRIGGER_REENTRY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
     static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
@@ -321,6 +333,23 @@ impl Drop for SyncApplyTriggerGateGuard {
             depth.set(depth.get().saturating_sub(1));
         });
     }
+}
+
+struct UserCommitCallbackGuard {
+    prior_active: bool,
+    prior_reentry: bool,
+}
+
+impl Drop for UserCommitCallbackGuard {
+    fn drop(&mut self) {
+        USER_COMMIT_TRIGGER_REENTRY.with(|slot| slot.set(self.prior_reentry));
+        USER_COMMIT_ACTIVE.with(|slot| slot.set(self.prior_active));
+    }
+}
+
+fn global_callback_active_count() -> &'static AtomicUsize {
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    &ACTIVE
 }
 
 pub struct Database {
@@ -356,6 +385,7 @@ pub struct Database {
     disk_limit_startup_ceiling: AtomicU64,
     sync_watermark: Arc<AtomicLsn>,
     closed: AtomicBool,
+    resource_closed: Arc<AtomicBool>,
     rows_examined: AtomicU64,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
     rank_formula_cache: RwLock<HashMap<(String, String), Arc<RankFormula>>>,
@@ -808,6 +838,7 @@ impl Database {
             disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
             sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
             closed: AtomicBool::new(false),
+            resource_closed: Arc::new(AtomicBool::new(false)),
             rows_examined: AtomicU64::new(0),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: RwLock::new(HashMap::new()),
@@ -1139,35 +1170,86 @@ impl Database {
 
     pub fn begin(&self) -> Result<TxId> {
         let _operation = self.open_operation()?;
+        self.assert_public_tx_control_callbacks_allowed()?;
+        Ok(self.tx_mgr.begin())
+    }
+
+    fn callback_active_process_wide() -> bool {
+        global_callback_active_count().load(Ordering::SeqCst) > 0
+    }
+
+    fn assert_public_tx_control_callbacks_allowed(&self) -> Result<()> {
+        if !Self::callback_active_process_wide() {
+            return Ok(());
+        }
+        self.assert_callback_reentry_allowed()?;
+        self.assert_public_tx_control_cross_thread_allowed()
+    }
+
+    fn assert_internal_write_callbacks_allowed(&self) -> Result<()> {
+        if !Self::callback_active_process_wide() {
+            return Ok(());
+        }
+        self.assert_callback_reentry_allowed()?;
+        self.assert_internal_write_cross_thread_allowed()
+    }
+
+    fn assert_callback_reentry_allowed(&self) -> Result<()> {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "stub: typed variant not yet implemented (begin × A1)".to_string(),
-            ));
+            return Err(Error::CallbackReentry {
+                kind: CallbackKind::Cron,
+            });
         }
         if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "stub: typed variant not yet implemented (begin × A2)".to_string(),
-            ));
+            self.record_user_commit_trigger_reentry();
+            return Err(Error::CallbackReentry {
+                kind: CallbackKind::Trigger,
+            });
         }
-        if self.trigger_active_on_this_handle() {
-            return Err(Error::Other(
-                "stub: typed variant not yet implemented (begin × dead-code-A3)".to_string(),
-            ));
-        }
+        Ok(())
+    }
+
+    fn assert_public_tx_control_cross_thread_allowed(&self) -> Result<()> {
         if self.cron.callback_active_on_other_thread() {
-            return Err(Error::Other(
-                "stub: typed variant not yet implemented (begin × B1)".to_string(),
-            ));
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Cron,
+            });
+        }
+        if self.trigger.callback_active_on_other_thread_for_tx_control(
+            self.owner_thread,
+            self.cron.has_schedules(),
+        ) {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            });
+        }
+        Ok(())
+    }
+
+    // Internal engine-managed writes still need callback-active gates, but they
+    // keep trigger contention scoped to this database. Public tx-control
+    // surfaces use the stricter process-wide tx-control helper above.
+    fn begin_for_internal_write(&self) -> Result<TxId> {
+        let _operation = self.open_operation()?;
+        self.assert_internal_write_callbacks_allowed()?;
+        Ok(self.tx_mgr.begin())
+    }
+
+    fn assert_internal_write_cross_thread_allowed(&self) -> Result<()> {
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Cron,
+            });
         }
         if self
             .trigger
             .callback_active_on_other_thread(self.owner_thread)
         {
-            return Err(Error::Other(
-                "stub: typed variant not yet implemented (begin × B2)".to_string(),
-            ));
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            });
         }
-        Ok(self.tx_mgr.begin())
+        Ok(())
     }
 
     /// Test/example helper. Production code MUST use `?` propagation against
@@ -1175,76 +1257,19 @@ impl Database {
     /// `CallbackActiveCrossThread` / `CallbackReentry` variants as panics; not
     /// appropriate for code that may run alongside trigger or cron callbacks.
     pub fn begin_or_panic(&self) -> TxId {
-        self.begin().expect("begin failed in test/example helper")
+        self.begin().unwrap_or_else(|err| panic!("{err}"))
     }
 
     pub fn commit(&self, tx: TxId) -> Result<()> {
         let _operation = self.open_operation()?;
-        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "transaction control is not allowed inside cron callbacks".to_string(),
-            ));
-        }
-        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "transaction control is not allowed inside trigger callbacks".to_string(),
-            ));
-        }
-        if self.trigger_active_on_this_handle() {
-            return Err(Error::Other(
-                "transaction control is not allowed inside trigger callbacks".to_string(),
-            ));
-        }
-        if self.cron.callback_active_on_other_thread() {
-            return Err(Error::Other(
-                "transaction control is not allowed from another thread while a cron callback is active"
-                    .to_string(),
-            ));
-        }
-        if self
-            .trigger
-            .callback_active_on_other_thread(self.owner_thread)
-        {
-            return Err(Error::Other(
-                "transaction control is not allowed from another thread while a trigger callback is active"
-                    .to_string(),
-            ));
-        }
+        self.assert_public_tx_control_callbacks_allowed()?;
+        let _user_commit = self.enter_user_commit_callback_scope();
         self.commit_with_source(tx, CommitSource::User)
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
         let _operation = self.open_operation()?;
-        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "transaction control is not allowed inside cron callbacks".to_string(),
-            ));
-        }
-        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "transaction control is not allowed inside trigger callbacks".to_string(),
-            ));
-        }
-        if self.trigger_active_on_this_handle() {
-            return Err(Error::Other(
-                "transaction control is not allowed inside trigger callbacks".to_string(),
-            ));
-        }
-        if self.cron.callback_active_on_other_thread() {
-            return Err(Error::Other(
-                "transaction control is not allowed from another thread while a cron callback is active"
-                    .to_string(),
-            ));
-        }
-        if self
-            .trigger
-            .callback_active_on_other_thread(self.owner_thread)
-        {
-            return Err(Error::Other(
-                "transaction control is not allowed from another thread while a trigger callback is active"
-                    .to_string(),
-            ));
-        }
+        self.assert_public_tx_control_callbacks_allowed()?;
         let ws = self.tx_mgr.rollback_write_set(tx)?;
         self.pending_event_bus_ddl.lock().remove(&tx);
         self.pending_commit_metadata.lock().remove(&tx);
@@ -1273,11 +1298,29 @@ impl Database {
         SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| depth.get() > 0)
     }
 
+    fn enter_user_commit_callback_scope(&self) -> UserCommitCallbackGuard {
+        let prior_active = USER_COMMIT_ACTIVE.with(|slot| slot.replace(true));
+        let prior_reentry = USER_COMMIT_TRIGGER_REENTRY.with(|slot| slot.replace(false));
+        UserCommitCallbackGuard {
+            prior_active,
+            prior_reentry,
+        }
+    }
+
+    fn record_user_commit_trigger_reentry(&self) {
+        if self.access_is_admin() && USER_COMMIT_ACTIVE.with(|slot| slot.get()) {
+            USER_COMMIT_TRIGGER_REENTRY.with(|slot| slot.set(true));
+        }
+    }
+
+    fn take_user_commit_trigger_reentry(&self) -> bool {
+        USER_COMMIT_TRIGGER_REENTRY.with(|slot| slot.replace(false))
+    }
+
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         let _operation = self.open_operation()?;
         if let Some(cached) = self.cached_statement(sql) {
-            self.assert_statement_allowed_inside_cron_callback(&cached.stmt)?;
-            self.assert_statement_allowed_during_cross_thread_callback(&cached.stmt)?;
+            self.assert_statement_allowed_for_callbacks(&cached.stmt)?;
             let active_tx = self.active_session_tx();
             return self.execute_statement_with_plan(
                 &cached.stmt,
@@ -1289,8 +1332,7 @@ impl Database {
         }
 
         let stmt = contextdb_parser::parse(sql)?;
-        self.assert_statement_allowed_inside_cron_callback(&stmt)?;
-        self.assert_statement_allowed_during_cross_thread_callback(&stmt)?;
+        self.assert_statement_allowed_for_callbacks(&stmt)?;
 
         match &stmt {
             Statement::Begin => {
@@ -1301,9 +1343,25 @@ impl Database {
                 return Ok(QueryResult::empty());
             }
             Statement::Commit => {
-                let mut session = self.session_tx.lock();
-                if let Some(tx) = session.take() {
-                    self.commit_with_source(tx, CommitSource::User)?;
+                let tx = *self.session_tx.lock();
+                if let Some(tx) = tx {
+                    match self.commit(tx) {
+                        Ok(()) => {
+                            let mut session = self.session_tx.lock();
+                            if *session == Some(tx) {
+                                *session = None;
+                            }
+                        }
+                        Err(err) => {
+                            if self.tx_mgr.cloned_write_set(tx).is_err() {
+                                let mut session = self.session_tx.lock();
+                                if *session == Some(tx) {
+                                    *session = None;
+                                }
+                            }
+                            return Err(err);
+                        }
+                    }
                 }
                 return Ok(QueryResult::empty());
             }
@@ -1366,17 +1424,18 @@ impl Database {
         *self.session_tx.lock()
     }
 
-    fn assert_statement_allowed_inside_cron_callback(&self, stmt: &Statement) -> Result<()> {
-        if CRON_CALLBACK_ACTIVE.with(|active| active.get())
-            && Self::statement_forbidden_inside_cron_callback(stmt)
-        {
-            return Err(Error::Other(
-                "DDL and transaction control are not allowed inside cron callbacks".to_string(),
-            ));
+    fn assert_statement_allowed_inside_cron_callback(
+        &self,
+        stmt: &Statement,
+        forbidden_in_callback: bool,
+        requires_callback_tx: bool,
+    ) -> Result<()> {
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) && forbidden_in_callback {
+            return Err(Error::CallbackReentry {
+                kind: CallbackKind::Cron,
+            });
         }
-        if CRON_CALLBACK_ACTIVE.with(|active| active.get())
-            && Self::statement_requires_cron_bound_handle(stmt)
-        {
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) && requires_callback_tx {
             let active_tx = self.active_session_tx();
             let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
             let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
@@ -1388,20 +1447,26 @@ impl Database {
                 ));
             }
         }
-        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get())
-            && Self::statement_forbidden_inside_cron_callback(stmt)
-            && !matches!(
-                stmt,
-                Statement::CreateTrigger { .. } | Statement::DropTrigger { .. }
-            )
-        {
-            return Err(Error::Other(
-                "DDL and transaction control are not allowed inside trigger callbacks".to_string(),
-            ));
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) && forbidden_in_callback {
+            // Self-drop of the currently firing trigger has a long-standing
+            // admin-error contract: block the DDL locally, preserve the active
+            // trigger, and let the firing cascade continue if the callback
+            // handles the error.
+            if let Statement::DropTrigger { name } = stmt {
+                let drops_active_trigger = TRIGGER_CALLBACK_NAME
+                    .with(|active_name| active_name.borrow().as_deref() == Some(name));
+                let drops_from_active_trigger_handle = TRIGGER_CALLBACK_DB
+                    .with(|active_db| active_db.get() == Some(self as *const Self as usize));
+                if drops_active_trigger && drops_from_active_trigger_handle {
+                    return Ok(());
+                }
+            }
+            self.record_user_commit_trigger_reentry();
+            return Err(Error::CallbackReentry {
+                kind: CallbackKind::Trigger,
+            });
         }
-        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get())
-            && Self::statement_requires_cron_bound_handle(stmt)
-        {
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) && requires_callback_tx {
             let active_tx = self.active_session_tx();
             let trigger_tx = TRIGGER_CALLBACK_TX.with(|slot| slot.get());
             let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
@@ -1418,51 +1483,73 @@ impl Database {
 
     fn assert_statement_allowed_during_cross_thread_callback(
         &self,
-        stmt: &Statement,
+        forbidden_in_callback: bool,
+        requires_callback_tx: bool,
     ) -> Result<()> {
-        let is_trigger_ddl = matches!(
-            stmt,
-            Statement::CreateTrigger { .. } | Statement::DropTrigger { .. }
-        );
-        if self.cron.callback_active_on_other_thread()
-            && (Self::statement_forbidden_inside_cron_callback(stmt)
-                || Self::statement_requires_cron_bound_handle(stmt))
-        {
-            return Err(Error::Other(
-                "database writes from other threads are not allowed while a cron callback is active"
-                    .to_string(),
-            ));
+        if !forbidden_in_callback && !requires_callback_tx {
+            return Ok(());
+        }
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Cron,
+            });
         }
         if self
             .trigger
             .callback_active_on_other_thread(self.owner_thread)
-            && !is_trigger_ddl
-            && (Self::statement_forbidden_inside_cron_callback(stmt)
-                || Self::statement_requires_cron_bound_handle(stmt))
         {
-            return Err(Error::Other(
-                "database writes from other threads are not allowed while a trigger callback is active"
-                    .to_string(),
-            ));
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            });
+        }
+        if requires_callback_tx
+            && self
+                .trigger
+                .callback_active_on_other_thread_for_tx_control(self.owner_thread, false)
+        {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            });
         }
         Ok(())
     }
 
-    fn assert_cron_callback_tx_bound_handle(&self, tx: TxId) -> Result<()> {
-        if self.cron.callback_active_on_other_thread() {
-            return Err(Error::Other(
-                "database writes from other threads are not allowed while a cron callback is active"
-                    .to_string(),
-            ));
+    fn assert_statement_allowed_for_callbacks(&self, stmt: &Statement) -> Result<()> {
+        let forbidden_in_callback = Self::statement_forbidden_inside_cron_callback(stmt);
+        let requires_callback_tx = Self::statement_requires_cron_bound_handle(stmt);
+        if !forbidden_in_callback && !requires_callback_tx {
+            return Ok(());
         }
-        if self
-            .trigger
-            .callback_active_on_other_thread(self.owner_thread)
-        {
-            return Err(Error::Other(
-                "database writes from other threads are not allowed while a trigger callback is active"
-                    .to_string(),
-            ));
+        if !Self::callback_active_process_wide() {
+            return Ok(());
+        }
+        self.assert_statement_allowed_inside_cron_callback(
+            stmt,
+            forbidden_in_callback,
+            requires_callback_tx,
+        )?;
+        self.assert_statement_allowed_during_cross_thread_callback(
+            forbidden_in_callback,
+            requires_callback_tx,
+        )
+    }
+
+    fn assert_cron_callback_tx_bound_handle(&self, tx: TxId) -> Result<()> {
+        if !Self::callback_active_process_wide() {
+            return Ok(());
+        }
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Cron,
+            });
+        }
+        if self.trigger.callback_active_on_other_thread_for_tx_control(
+            self.owner_thread,
+            self.cron.has_schedules(),
+        ) {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            });
         }
         if !CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
             return self.assert_trigger_callback_tx_bound_handle(tx);
@@ -1580,7 +1667,7 @@ impl Database {
         self.__reset_rows_examined();
         match plan {
             PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_) => {
-                let tx = self.begin()?;
+                let tx = self.begin_for_internal_write()?;
                 let result = execute_plan(self, plan, params, Some(tx));
                 match result {
                     Ok(mut qr) => {
@@ -1641,13 +1728,12 @@ impl Database {
     ) -> Result<QueryResult> {
         let _operation = self.open_operation()?;
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "execute_in_tx is not allowed inside cron callbacks".to_string(),
-            ));
+            return Err(Error::CallbackReentry {
+                kind: CallbackKind::Cron,
+            });
         }
         let stmt = contextdb_parser::parse(sql)?;
-        self.assert_statement_allowed_inside_cron_callback(&stmt)?;
-        self.assert_statement_allowed_during_cross_thread_callback(&stmt)?;
+        self.assert_statement_allowed_for_callbacks(&stmt)?;
         self.assert_trigger_callback_tx_bound_handle(tx)?;
         self.execute_statement(&stmt, sql, params, Some(tx))
     }
@@ -2057,7 +2143,7 @@ impl Database {
         let auto_commit = tx.is_none();
         let tx = match tx {
             Some(tx) => tx,
-            None => self.begin()?,
+            None => self.begin_for_internal_write()?,
         };
         let mut count = 0u64;
         for row_exprs in &ins.values {
@@ -6810,39 +6896,21 @@ impl Database {
 
     pub fn close(&self) -> Result<()> {
         let db_id = self as *const Self as usize;
-        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "cannot close database from inside a cron callback".to_string(),
-            ));
-        }
-        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "stub: typed variant not yet implemented (close × A2)".to_string(),
-            ));
+        if Self::callback_active_process_wide() {
+            self.assert_callback_reentry_allowed()?;
         }
         if DB_OPERATION_STACK.with(|stack| stack.borrow().contains(&db_id)) {
             return Err(Error::Other(
                 "cannot close database from inside an active operation".to_string(),
             ));
         }
-        if self.cron.callback_active_on_other_thread() {
-            return Err(Error::Other(
-                "cannot close database from another thread while a cron callback is active"
-                    .to_string(),
-            ));
-        }
-        if self
-            .trigger
-            .callback_active_on_other_thread(self.owner_thread)
-        {
-            return Err(Error::Other(
-                "cannot close database from another thread while a trigger callback is active"
-                    .to_string(),
-            ));
-        }
+        self.assert_public_tx_control_cross_thread_allowed()?;
         let _operation_barrier = self.operation_gate.write();
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
+        }
+        if self.resource_owner {
+            self.resource_closed.store(true, Ordering::SeqCst);
         }
         let tx = self.session_tx.lock().take();
         if let Some(tx) = tx {
@@ -9767,31 +9835,7 @@ impl Database {
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
         let _operation = self.open_operation()?;
-        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "apply_changes is not allowed inside cron callbacks".to_string(),
-            ));
-        }
-        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::Other(
-                "apply_changes is not allowed inside trigger callbacks".to_string(),
-            ));
-        }
-        if self.cron.callback_active_on_other_thread() {
-            return Err(Error::Other(
-                "apply_changes is not allowed from another thread while a cron callback is active"
-                    .to_string(),
-            ));
-        }
-        if self
-            .trigger
-            .callback_active_on_other_thread(self.owner_thread)
-        {
-            return Err(Error::Other(
-                "apply_changes is not allowed from another thread while a trigger callback is active"
-                    .to_string(),
-            ));
-        }
+        self.assert_public_tx_control_callbacks_allowed()?;
         // Per I14: the whole batch takes the index-maintenance lock once.
         // Per-row commits reuse the same guard via the per-row apply that
         // runs inside the tx manager's commit_mutex, so no second write
@@ -11336,6 +11380,9 @@ impl Drop for Database {
         let _operation_barrier = self.operation_gate.write();
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
+        }
+        if self.resource_owner {
+            self.resource_closed.store(true, Ordering::SeqCst);
         }
         self.stop_cron_tickler();
         self.stop_event_bus_threads();

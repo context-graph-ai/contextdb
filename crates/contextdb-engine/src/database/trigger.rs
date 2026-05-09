@@ -20,6 +20,7 @@ pub(crate) struct TriggerState {
     staged_persistence_audits: Mutex<HashMap<Lsn, Vec<(u64, TriggerAuditEntry)>>>,
     staged_ddl_for_persistence: Mutex<HashMap<Lsn, StagedTriggerDdlCommit>>,
     callback_owner_threads: Mutex<HashMap<thread::ThreadId, usize>>,
+    callback_active_count: AtomicUsize,
     pub(super) next_audit_index: AtomicU64,
     pub(super) ready: AtomicBool,
 }
@@ -68,6 +69,11 @@ fn global_trigger_callback_owner_threads() -> &'static Mutex<HashMap<thread::Thr
     OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(super) fn global_trigger_callback_active_count() -> &'static AtomicUsize {
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    &ACTIVE
+}
+
 impl TriggerState {
     pub(super) fn new() -> Self {
         Self {
@@ -78,22 +84,54 @@ impl TriggerState {
             staged_persistence_audits: Mutex::new(HashMap::new()),
             staged_ddl_for_persistence: Mutex::new(HashMap::new()),
             callback_owner_threads: Mutex::new(HashMap::new()),
+            callback_active_count: AtomicUsize::new(0),
             next_audit_index: AtomicU64::new(0),
             ready: AtomicBool::new(true),
         }
     }
 
-    pub(super) fn callback_active_on_other_thread(&self, target_owner: thread::ThreadId) -> bool {
+    pub(super) fn callback_active_on_other_thread(&self, _target_owner: thread::ThreadId) -> bool {
+        // Local SQL/write-helper gates are scoped to this TriggerState. The
+        // process-wide owner map is handled by explicit tx-control and DML
+        // gates, so unrelated database instances can still run DDL while
+        // another database has a trigger callback parked.
+        if self.callback_active_count.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
         let current = thread::current().id();
         let owners = self.callback_owner_threads.lock();
-        if !owners.is_empty() && !owners.contains_key(&current) {
-            return true;
+        !owners.is_empty() && !owners.contains_key(&current)
+    }
+
+    pub(super) fn callback_active_on_other_thread_for_tx_control(
+        &self,
+        target_owner: thread::ThreadId,
+        include_owner_thread_global: bool,
+    ) -> bool {
+        // Public tx-control must reject same-database trigger contention, which
+        // is tracked by the local owner map below. The process-wide owner map
+        // catches non-owner callers sharing handles across threads, while the
+        // owner-thread exception keeps unrelated database instances independent.
+        // Cron-scheduled databases can opt into owner-thread global checks so
+        // retry loops still observe trigger contention after B1 cron contention
+        // clears.
+        let mut current = None;
+        if self.callback_active_count.load(Ordering::SeqCst) > 0 {
+            let current_id = thread::current().id();
+            current = Some(current_id);
+            let owners = self.callback_owner_threads.lock();
+            if !owners.is_empty() && !owners.contains_key(&current_id) {
+                return true;
+            }
         }
-        drop(owners);
+        if global_trigger_callback_active_count().load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let current = current.unwrap_or_else(|| thread::current().id());
         let global_owners = global_trigger_callback_owner_threads().lock();
         !global_owners.is_empty()
             && !global_owners.contains_key(&current)
-            && current != target_owner
+            && (include_owner_thread_global || current != target_owner)
     }
 
     fn enter_callback_thread_scope(&self) -> TriggerCallbackThreadGuard<'_> {
@@ -103,6 +141,9 @@ impl TriggerState {
             .entry(owner)
             .or_default() += 1;
         *self.callback_owner_threads.lock().entry(owner).or_default() += 1;
+        global_callback_active_count().fetch_add(1, Ordering::SeqCst);
+        global_trigger_callback_active_count().fetch_add(1, Ordering::SeqCst);
+        self.callback_active_count.fetch_add(1, Ordering::SeqCst);
         TriggerCallbackThreadGuard {
             trigger: self,
             owner,
@@ -179,6 +220,11 @@ impl Drop for TriggerCallbackThreadGuard<'_> {
             }
             None => {}
         }
+        self.trigger
+            .callback_active_count
+            .fetch_sub(1, Ordering::SeqCst);
+        global_trigger_callback_active_count().fetch_sub(1, Ordering::SeqCst);
+        global_callback_active_count().fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -892,15 +938,22 @@ impl Database {
             let prior_tx = tx_slot.replace(Some(tx));
             let prior_db = TRIGGER_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
             let prior_active = TRIGGER_CALLBACK_ACTIVE.with(|active| active.replace(true));
+            let prior_name =
+                TRIGGER_CALLBACK_NAME.with(|name| name.replace(Some(ctx.trigger_name.clone())));
             let result = catch_unwind(AssertUnwindSafe(|| callback(self, ctx)));
+            let user_commit_reentry = self.take_user_commit_trigger_reentry();
             TRIGGER_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
+            TRIGGER_CALLBACK_NAME.with(|name| name.replace(prior_name));
             TRIGGER_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
             tx_slot.set(prior_tx);
-            result
+            (result, user_commit_reentry)
         });
         match result {
-            Ok(result) => result,
-            Err(payload) => Err(Error::TriggerCallbackFailed {
+            (Ok(Ok(())), true) => Err(Error::CallbackReentry {
+                kind: CallbackKind::Trigger,
+            }),
+            (Ok(result), _) => result,
+            (Err(payload), _) => Err(Error::TriggerCallbackFailed {
                 trigger_name: ctx.trigger_name.clone(),
                 reason: format!("panic: {}", panic_payload_to_string(payload)),
             }),
@@ -1274,12 +1327,6 @@ impl Database {
                 self.trigger.volatile_audit_history.lock().push(entry);
             }
         }
-    }
-
-    pub(super) fn trigger_active_on_this_handle(&self) -> bool {
-        let this_db = self as *const Self as usize;
-        TRIGGER_CALLBACK_ACTIVE.with(|active| active.get())
-            && TRIGGER_CALLBACK_DB.with(|db| db.get()) == Some(this_db)
     }
 
     pub(super) fn active_trigger_tx_for_this_handle(&self) -> Option<TxId> {

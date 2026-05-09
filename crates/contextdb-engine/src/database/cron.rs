@@ -16,7 +16,9 @@ pub(super) struct CronState {
     dispatch_lock: Mutex<()>,
     running_schedules: Mutex<HashSet<String>>,
     callback_owner_threads: Mutex<HashMap<thread::ThreadId, usize>>,
+    callback_active_count: AtomicUsize,
     pause_count: AtomicU64,
+    schedule_count: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -78,29 +80,42 @@ impl CronState {
             dispatch_lock: Mutex::new(()),
             running_schedules: Mutex::new(HashSet::new()),
             callback_owner_threads: Mutex::new(HashMap::new()),
+            callback_active_count: AtomicUsize::new(0),
             pause_count: AtomicU64::new(0),
+            schedule_count: AtomicU64::new(0),
         }
     }
 
     pub(super) fn callback_active_on_other_thread(&self) -> bool {
+        if self.callback_active_count.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
         let current = thread::current().id();
         let owners = self.callback_owner_threads.lock();
         !owners.is_empty() && !owners.contains_key(&current)
     }
 
+    pub(super) fn has_schedules(&self) -> bool {
+        self.schedule_count.load(Ordering::SeqCst) > 0
+    }
+
     fn enter_callback_thread_scope(&self) -> CronCallbackThreadGuard<'_> {
         let owner = thread::current().id();
         *self.callback_owner_threads.lock().entry(owner).or_default() += 1;
+        global_callback_active_count().fetch_add(1, Ordering::SeqCst);
+        self.callback_active_count.fetch_add(1, Ordering::SeqCst);
         CronCallbackThreadGuard { cron: self, owner }
     }
 
-    pub(super) fn resume_tickler(&self) {
-        let _ = self
+    pub(super) fn resume_tickler(&self) -> bool {
+        let previous = self
             .pause_count
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 Some(count.saturating_sub(1))
-            });
+            })
+            .unwrap_or_else(|count| count);
         self.waiters.notify_all();
+        previous == 1
     }
 }
 
@@ -114,6 +129,10 @@ impl Drop for CronCallbackThreadGuard<'_> {
             }
             None => {}
         }
+        self.cron
+            .callback_active_count
+            .fetch_sub(1, Ordering::SeqCst);
+        global_callback_active_count().fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -132,6 +151,9 @@ impl Database {
                     .into_iter()
                     .map(|schedule| (schedule.name.clone(), schedule)),
             );
+            self.cron
+                .schedule_count
+                .store(stored.len() as u64, Ordering::SeqCst);
         }
         if let Some(entries) =
             persistence.load_config_value::<Vec<CronAuditEntry>>(CRON_AUDIT_CONFIG_KEY)?
@@ -190,6 +212,10 @@ impl Database {
                 }
                 return Err(err);
             }
+            let schedule_count = self.cron.schedules.lock().len();
+            self.cron
+                .schedule_count
+                .store(schedule_count as u64, Ordering::SeqCst);
         }
         self.ensure_cron_tickler_running();
         self.cron.waiters.notify_all();
@@ -208,6 +234,10 @@ impl Database {
                 }
                 return Err(err);
             }
+            let schedule_count = self.cron.schedules.lock().len();
+            self.cron
+                .schedule_count
+                .store(schedule_count as u64, Ordering::SeqCst);
         }
         self.cron.waiters.notify_all();
         Ok(())
@@ -232,6 +262,7 @@ impl Database {
 
     pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
         let _operation = self.open_operation()?;
+        self.wait_for_imminent_cron_due_for_test(Duration::from_millis(75));
         self.dispatch_due_cron_schedules(true)
     }
 
@@ -241,6 +272,7 @@ impl Database {
         self.cron.waiters.notify_all();
         CronPauseGuard {
             cron: self.cron.clone(),
+            tickler_owner: Some(self.worker_handle_for_background()),
         }
     }
 
@@ -279,6 +311,29 @@ impl Database {
         if !self.resource_owner {
             return;
         }
+        if self.resource_closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.cron.pause_count.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        self.start_cron_tickler_runtime();
+    }
+
+    pub(super) fn ensure_cron_tickler_running_after_pause_for_test(&self) {
+        if self.resource_closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.cron.pause_count.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        if !self.cron.has_schedules() {
+            return;
+        }
+        self.start_cron_tickler_runtime();
+    }
+
+    fn start_cron_tickler_runtime(&self) {
         let mut runtime = self.cron.runtime.lock();
         if runtime.handle.is_some() {
             return;
@@ -315,6 +370,23 @@ impl Database {
             .values()
             .map(|schedule| Duration::from_millis(schedule.next_fire_at_ms.saturating_sub(now)))
             .min()
+    }
+
+    fn wait_for_imminent_cron_due_for_test(&self, max_wait: Duration) {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            let Some(wait) = self.duration_until_next_cron_fire() else {
+                return;
+            };
+            if wait.is_zero() {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || wait > remaining {
+                return;
+            }
+            thread::sleep(wait.min(Duration::from_millis(10)));
+        }
     }
 
     fn dispatch_due_cron_schedules(&self, manual: bool) -> Result<u64> {
@@ -461,7 +533,7 @@ impl Database {
 
     fn run_cron_callback_transaction(&self, callback: CronCallback) -> Result<Lsn> {
         let _callback_thread = self.cron.enter_callback_thread_scope();
-        let tx = self.begin()?;
+        let tx = self.begin_for_internal_write()?;
         let mut pending_sink_events = Vec::new();
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
         let mut committed_trigger_audit_entries = Vec::new();
@@ -649,6 +721,7 @@ impl Database {
             ),
             sync_watermark: self.sync_watermark.clone(),
             closed: AtomicBool::new(false),
+            resource_closed: self.resource_closed.clone(),
             rows_examined: AtomicU64::new(0),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: RwLock::new(self.rank_formula_cache.read().clone()),
