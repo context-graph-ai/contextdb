@@ -45,6 +45,30 @@ ALTER TABLE t DROP SYNC_CONFLICT_POLICY
 DROP TABLE t
 ```
 
+### CREATE TRIGGER
+
+```sql
+CREATE TRIGGER observation_seen ON observations WHEN INSERT
+CREATE TRIGGER entity_changed ON entities WHEN UPDATE
+DROP TRIGGER observation_seen
+```
+
+`CREATE TRIGGER` declares a host-callback ObservationTrigger. The callback is
+registered through the Rust API with `Database::register_trigger_callback` and
+activated by `Database::complete_initialization`. ObservationTriggers are for
+transactional observation and cascade writes; they are not validation triggers.
+Use `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` for engine-enforced
+invariants.
+
+Concurrency: the callback runs inside the firing transaction. Same-DB
+cross-thread writers wait-and-proceed, unrelated databases proceed
+independently, callback-thread reentry receives `CallbackReentry`, callback
+tx-bound handles stay isolated to the runner thread, cron same-DB contention
+remains immediate, and the bounded deadlock guard emits a structured
+`tracing::warn!` with `trigger_name`, `waited_ms`, and `surface`.
+See [Architecture](architecture.md#trigger-concurrency) for the operator
+runbook.
+
 ### CREATE INDEX
 
 ```sql

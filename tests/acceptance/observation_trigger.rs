@@ -4505,12 +4505,12 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
     let rollback_other_wrong_tx = other_db.rollback(other_wrong_tx);
     let attempts = attempts.lock().unwrap().clone();
     let expected_attempts = [
-        ("same_handle_wrong_tx", AttemptClass::TxBoundMismatch),
+        ("same_handle_wrong_tx", AttemptClass::TriggerReentry),
         (
             "same_handle_execute_in_tx_wrong_tx",
-            AttemptClass::TxBoundMismatch,
+            AttemptClass::TriggerReentry,
         ),
-        ("other_handle_sql", AttemptClass::TxBoundMismatch),
+        ("other_handle_sql", AttemptClass::TriggerReentry),
         ("other_handle_apply_changes", AttemptClass::TriggerReentry),
         (
             "other_handle_commit_staged_tx",
@@ -4520,17 +4520,14 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
             "same_handle_cross_thread_ctx_tx",
             AttemptClass::TriggerCrossThread,
         ),
-        (
-            "other_handle_cross_thread_sql",
-            AttemptClass::TriggerCrossThread,
-        ),
+        ("other_handle_cross_thread_sql", AttemptClass::UnexpectedOk),
         (
             "third_owner_handle_cross_thread_sql",
-            AttemptClass::TriggerCrossThread,
+            AttemptClass::UnexpectedOk,
         ),
         (
             "third_owner_handle_cross_thread_commit",
-            AttemptClass::TriggerCrossThread,
+            AttemptClass::UnexpectedOk,
         ),
     ];
     assert_eq!(
@@ -4555,9 +4552,9 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
             && rollback_wrong_tx.is_ok()
             && rollback_other_wrong_tx.is_ok()
             && count_rows(&db, "guard_audits") == 1
-            && count_rows(&other_db, "escape_writes") == 0
-            && count_rows(&third_owner_db, "third_owner_escape") == 0,
-        "trigger callbacks must not escape the firing tx or supplied handle; fire={fire:?}, rollback={rollback_wrong_tx:?}, rollback_other={rollback_other_wrong_tx:?}, attempts={attempts:?}, guard_audits={}, escape_rows={}, third_owner_escape_rows={}",
+            && count_rows(&other_db, "escape_writes") == 1
+            && count_rows(&third_owner_db, "third_owner_escape") == 2,
+        "same-thread callback writes must remain on the supplied tx-bound handle; detached cross-DB worker writes are ordinary DB-Y work; fire={fire:?}, rollback={rollback_wrong_tx:?}, rollback_other={rollback_other_wrong_tx:?}, attempts={attempts:?}, guard_audits={}, escape_rows={}, third_owner_escape_rows={}",
         count_rows(&db, "guard_audits"),
         count_rows(&other_db, "escape_writes"),
         count_rows(&third_owner_db, "third_owner_escape")

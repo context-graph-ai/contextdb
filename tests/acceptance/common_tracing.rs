@@ -4,7 +4,7 @@
 //! - §30 (`trigger_same_db_progress.rs`): t30_17 asserts exactly one warn on
 //!   deadlock-guard timeout; t30_18 asserts zero warns on healthy contention.
 //! - §29 (`trigger_concurrency_panic_freedom.rs`): t37_* siblings assert zero
-//!   warns on healthy and cross-DB B2 typed-Err paths; one warn on the
+//!   deadlock-guard warns on healthy and cross-DB paths; one warn on the
 //!   deadlock-guard sibling.
 //!
 //! Both suites consumed `set_global_default` via separate `OnceLock`-gated
@@ -41,15 +41,31 @@ pub fn install_global_subscriber() {
             ) {
                 if T30_COUNT_ENABLED.load(AtomicOrdering::SeqCst)
                     && *event.metadata().level() == tracing::Level::WARN
+                    && event.metadata().target().starts_with("contextdb_engine")
                 {
-                    T30_WARN_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
                     let mut visitor = StringFieldVisitor(String::new());
                     event.record(&mut visitor);
-                    let cell = T30_LAST_WARN_FIELDS.get_or_init(|| Mutex::new(None));
-                    *cell.lock().unwrap() = Some(visitor.0);
+                    if visitor
+                        .0
+                        .contains("trigger callback wait exceeded deadlock guard")
+                    {
+                        T30_WARN_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+                        let cell = T30_LAST_WARN_FIELDS.get_or_init(|| Mutex::new(None));
+                        *cell.lock().unwrap() = Some(visitor.0);
+                    }
                 }
-                if T37_COUNT_ENABLED.load(AtomicOrdering::SeqCst) {
-                    T37_TRACING_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+                if T37_COUNT_ENABLED.load(AtomicOrdering::SeqCst)
+                    && *event.metadata().level() == tracing::Level::WARN
+                    && event.metadata().target().starts_with("contextdb_engine")
+                {
+                    let mut visitor = StringFieldVisitor(String::new());
+                    event.record(&mut visitor);
+                    if visitor
+                        .0
+                        .contains("trigger callback wait exceeded deadlock guard")
+                    {
+                        T37_TRACING_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+                    }
                 }
             }
         }

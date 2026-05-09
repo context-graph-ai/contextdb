@@ -342,6 +342,18 @@ impl<S: WriteSetApplicator> TxManager<S> {
         active.remove(&tx).ok_or(Error::TxNotFound(tx))
     }
 
+    pub fn rollback_empty_without_commit_lock(&self, tx: TxId) -> Result<()> {
+        let mut active = self.active_txs.lock();
+        let ws = active.get(&tx).ok_or(Error::TxNotFound(tx))?;
+        if !ws.is_empty() {
+            return Err(Error::Other(
+                "cannot rollback non-empty transaction without commit lock".to_string(),
+            ));
+        }
+        active.remove(&tx);
+        Ok(())
+    }
+
     fn visibility_tx_for_commit(&self, tx: TxId, floor: Option<TxId>) -> TxId {
         let committed = self.committed_watermark.load(Ordering::SeqCst);
         let desired = floor.unwrap_or(tx).max(tx);

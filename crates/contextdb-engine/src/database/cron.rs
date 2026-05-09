@@ -243,6 +243,14 @@ impl Database {
         Ok(())
     }
 
+    /// Registers a host callback for a cron schedule.
+    ///
+    /// Cron callbacks use the same Class A reentry rules as trigger callbacks:
+    /// tx-control from inside the callback returns [`Error::CallbackReentry`],
+    /// and writes are allowed only through the supplied tx-bound handle. Cron
+    /// same-DB Class B contention returns [`Error::CallbackActiveCrossThread`]
+    /// immediately; trigger same-DB Class B uses the wait-and-proceed contract
+    /// documented on [`Error::CallbackActiveCrossThread`].
     pub fn register_cron_callback<F>(&self, name: &str, callback: F) -> Result<()>
     where
         F: Fn(&Database) -> Result<()> + Send + Sync + 'static,
@@ -542,6 +550,8 @@ impl Database {
         let tx = self.begin_for_internal_write()?;
         let mut pending_sink_events = Vec::new();
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+        let pending_trigger_active_guards =
+            std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
         let mut committed_trigger_audit_entries = Vec::new();
         let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
             tx,
@@ -560,8 +570,17 @@ impl Database {
                     }
                     if let Ok(Ok(())) = &result {
                         match self.dispatch_triggers_for_tx(tx) {
-                            Ok(audits) => *pending_trigger_audits.borrow_mut() = audits,
+                            Ok(outcome) => {
+                                *pending_trigger_audits.borrow_mut() = outcome.pending;
+                                pending_trigger_active_guards
+                                    .borrow_mut()
+                                    .extend(outcome.active_guards);
+                            }
                             Err(failure) => {
+                                let failure = *failure;
+                                pending_trigger_active_guards
+                                    .borrow_mut()
+                                    .extend(failure.active_guards);
                                 result = Ok(Err(failure.error));
                             }
                         }
@@ -632,7 +651,7 @@ impl Database {
                 if let Some(ws) = failure.write_set {
                     self.release_insert_allocations(&ws);
                 } else {
-                    let _ = self.rollback(tx);
+                    let _ = self.rollback_without_callback_tx_control(tx);
                 }
                 let pending = pending_trigger_audits.borrow();
                 self.append_rolled_back_trigger_audits(&pending, tx, &failure.error.to_string())?;

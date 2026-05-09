@@ -281,13 +281,20 @@ pub enum Error {
     TriggerRequiresAdmin { operation: String },
     #[error("schema invalid: {reason}")]
     SchemaInvalid { reason: String },
-    /// Cross-thread retry-safe contention. A callback body is executing on another
-    /// thread; the caller may retry once it completes.
+    /// Cross-thread retry-safe contention. Post-TriggerActiveSameDBProgress,
+    /// ordinary same-DB cross-thread trigger contention waits inside the engine
+    /// and proceeds as `Ok`; unrelated cross-DB writers proceed independently.
+    /// This typed error remains for cron same-DB contention, callback tx-bound
+    /// handles used from the wrong thread, and bounded trigger deadlock-guard
+    /// timeouts.
     ///
-    /// Retrying callers MUST use exponential backoff (start >=1ms, cap ~50ms).
-    /// Spin-retry pins the CPU and starves the active callback's runner thread on
-    /// edge hardware (<=4 cores) -- the callback cannot complete and the retry loop
-    /// never exits.
+    /// Canonical callback contract: same-DB trigger Class B waits and
+    /// proceeds; unrelated DBs are independent; Class A callback-thread reentry
+    /// returns [`Error::CallbackReentry`]; cron same-DB Class B returns this
+    /// typed error immediately; if a same-DB trigger wait exceeds
+    /// `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` (default 60 seconds, no enforced
+    /// minimum), the engine returns this typed error and emits exactly one
+    /// `tracing::warn!` with `trigger_name`, `waited_ms`, and `surface`.
     ///
     /// Greppable cross-process substring (sync-wire, log scrapers): the Display
     /// string contains `"callback active on another thread"` for both kinds.
@@ -299,12 +306,13 @@ pub enum Error {
     #[error("{kind} callback active on another thread; retry once the callback completes")]
     CallbackActiveCrossThread { kind: CallbackKind },
 
-    /// API misuse. The caller is inside their own callback body and tx-control
-    /// from any `Database` handle is forbidden -- a fresh `begin()` cannot
-    /// recover. Inside a trigger callback the runner is given a tx-bound
-    /// `&Database` argument that supports writes against the firing tx; calls
-    /// to `begin()` / `commit()` / `rollback()` on any `Database` handle (the
-    /// argument or any other) are misuse.
+    /// API misuse. The caller is inside its own callback body. Tx-control from
+    /// any `Database` handle is forbidden, and write-control is allowed only
+    /// through the supplied tx-bound callback handle. Retrying cannot recover.
+    /// See [`Error::CallbackActiveCrossThread`] for the complementary Class B
+    /// contract: same-DB trigger contention waits, unrelated DBs proceed
+    /// independently, cron B1 remains immediate, and timeouts emit an operator
+    /// `tracing::warn!`.
     ///
     /// Greppable substring: the Display string contains `"operation not allowed inside"`
     /// for both kinds.

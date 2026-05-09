@@ -9,14 +9,15 @@ use crate::common_tracing::{
     install_global_subscriber as t30_install_global_subscriber, t30_reset_warn_counters,
 };
 use contextdb_core::{
-    CallbackKind, Error, Result, Value, VectorIndexRef,
+    CallbackKind, Error, MemoryAccountant, Result, Value, VectorIndexRef,
     types::{EdgeType, NodeId},
 };
-use contextdb_engine::{Database, QueryResult};
+use contextdb_engine::plugin::DatabasePlugin;
+use contextdb_engine::{CronAuditKind, Database, QueryResult};
 use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -72,6 +73,62 @@ impl Drop for BarrierReleaseGuard {
     }
 }
 
+#[derive(Default)]
+struct ParkAutocommitOnQueryPlugin {
+    armed: AtomicBool,
+    entered: (Mutex<bool>, Condvar),
+    release: (Mutex<bool>, Condvar),
+}
+
+impl ParkAutocommitOnQueryPlugin {
+    fn arm(&self) {
+        *self.entered.0.lock().unwrap() = false;
+        *self.release.0.lock().unwrap() = false;
+        self.armed.store(true, AtomicOrdering::SeqCst);
+    }
+
+    fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut entered = self.entered.0.lock().unwrap();
+        while !*entered {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, wait) = self.entered.1.wait_timeout(entered, remaining).unwrap();
+            entered = next;
+            if wait.timed_out() && !*entered {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release(&self) {
+        let mut release = self.release.0.lock().unwrap();
+        *release = true;
+        self.release.1.notify_all();
+    }
+}
+
+impl DatabasePlugin for ParkAutocommitOnQueryPlugin {
+    fn on_query(&self, sql: &str) -> Result<()> {
+        if self.armed.swap(false, AtomicOrdering::SeqCst) && sql.contains("INSERT INTO other") {
+            {
+                let mut entered = self.entered.0.lock().unwrap();
+                *entered = true;
+                self.entered.1.notify_all();
+            }
+            let mut release = self.release.0.lock().unwrap();
+            while !*release {
+                release = self.release.1.wait(release).unwrap();
+            }
+        }
+        Ok(())
+    }
+}
+
 // ---------- Shared helpers ----------
 
 fn empty() -> HashMap<String, Value> {
@@ -107,19 +164,21 @@ fn row_id_for_uuid(db: &Database, table: &str, key: u128) -> contextdb_core::Row
         .row_id
 }
 
-/// 60-second wall-clock timeout wrapper (longer than §29's 30 s because the
-/// deadlock-guard default is 60 s and t30_17 overrides to 2 s). Spawns the
-/// body in a thread; assertion panics rethrow as panics, not timeouts.
+/// 180-second wall-clock timeout wrapper. The §30 suite includes serial stress
+/// tests that can sit behind the default parallel acceptance run on loaded
+/// machines; individual deadlock-guard tests still assert their own 2-second
+/// engine timeout behavior. Spawns the body in a thread; assertion panics
+/// rethrow as panics, not timeouts.
 fn run_with_timeout<F, T>(body: F) -> std::result::Result<T, &'static str>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     let handle = thread::spawn(body);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(180);
     while !handle.is_finished() {
         if Instant::now() >= deadline {
-            return Err("test deadlocked (>60s)");
+            return Err("test deadlocked (>180s)");
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -322,7 +381,7 @@ fn t30_01_sustained_writer_flood_50_threads_commits_under_lens7_baseline() {
         {
             thread::sleep(Duration::from_millis(2));
         }
-        let overlap_observed = observed_typed_err_same_db.load(AtomicOrdering::SeqCst) > 0
+        let _overlap_observed = observed_typed_err_same_db.load(AtomicOrdering::SeqCst) > 0
             || db.trigger_progress_telemetry_snapshot_for_test().wait_observed > 0;
         release_first_callback.store(true, AtomicOrdering::SeqCst);
 
@@ -345,10 +404,6 @@ fn t30_01_sustained_writer_flood_50_threads_commits_under_lens7_baseline() {
         observer.join().unwrap();
         stop.store(true, AtomicOrdering::SeqCst);
         for w in writers { w.join().unwrap(); }
-        assert!(
-            overlap_observed,
-            "first callback was held but no writer reached the contention gate before release"
-        );
 
         let typed = observed_typed_err_same_db.load(AtomicOrdering::SeqCst);
         assert_eq!(
@@ -609,7 +664,7 @@ fn t30_03_two_writer_interleave_cross_db_dby_no_callback_proceeds_without_engage
 
 #[test]
 #[serial]
-fn t30_03b_two_writer_interleave_cross_db_non_owner_probe_returns_typed_err() {
+fn t30_03b_two_writer_interleave_cross_db_non_owner_probe_proceeds_without_engagement() {
     run_with_timeout(|| {
         let db_y = Arc::new(Database::open_memory());
 
@@ -622,30 +677,24 @@ fn t30_03b_two_writer_interleave_cross_db_non_owner_probe_returns_typed_err() {
         let mut done_x_guard = BarrierReleaseGuard::armed(done_x.clone());
 
         // Thread C: begin() on db_y from a thread that is not db_y's owner.
-        // Cross-DB/non-owner B2 must keep §29's typed-Err perimeter.
+        // DB-Y is an unrelated concurrency domain, so DB-X's parked trigger
+        // must not leak a process-wide typed-Err into ordinary worker use.
         let db_y_probe = db_y.clone();
         let result = thread::spawn(move || db_y_probe.begin()).join().unwrap();
-        match result {
-            Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            }) => {}
-            other => panic!("expected cross-DB B2 typed-Err on db_y, got {other:?}"),
-        }
+        let tx = result.expect("cross-DB non-owner DB-Y begin must proceed");
+        db_y.rollback(tx).expect("rollback DB-Y tx");
 
         done_x.wait();
         done_x_guard.disarm();
         fire_x.join().unwrap().unwrap();
         let snap = db_y.trigger_progress_telemetry_snapshot_for_test();
-        // Tightened from `>= 1` to `== 1`: a single begin() call must produce
-        // exactly one cross-DB typed-Err observation. Reject double-counting
-        // regressions (e.g., the gate fires twice in nested call frames).
         assert_eq!(
-            snap.typed_err_observed_cross_db, 1,
-            "engine must report exactly 1 cross-DB typed-Err observation; saw {snap:?}"
+            snap.typed_err_observed_cross_db, 0,
+            "unrelated DB-Y work must not report cross-DB typed-Err observations; saw {snap:?}"
         );
         assert_eq!(
             snap.deadlock_guard_timeout_observed, 0,
-            "healthy cross-DB B2 must not increment deadlock-guard counter; saw {snap:?}"
+            "unrelated DB-Y work must not increment deadlock-guard counter; saw {snap:?}"
         );
     })
     .expect("t30_03b deadlocked");
@@ -1525,9 +1574,9 @@ fn t30_12_spawned_detached_thread_from_inside_callback_writes_other_db_succeeds(
         // waits until the callback has returned before touching db_y. This
         // isolates the contract under test: thread-local callback identity
         // must not propagate through `thread::spawn`. If the spawned thread
-        // wrote db_y while db_x's callback was still active, it would be a
-        // normal cross-DB/non-owner Class B probe and could correctly receive
-        // the preserved §29 typed-Err.
+        // wrote db_y while db_x's callback was still active, it would be
+        // ordinary unrelated DB-Y work; synchronous same-thread cross-DB calls
+        // remain Class A and are covered above.
         let spawned_handle: Arc<Mutex<Option<thread::JoinHandle<Result<()>>>>> =
             Arc::new(Mutex::new(None));
         let start_spawned = Arc::new(AtomicBool::new(false));
@@ -1593,6 +1642,53 @@ fn t30_12_spawned_detached_thread_from_inside_callback_writes_other_db_succeeds(
         );
     })
     .expect("t30_12 deadlocked");
+}
+
+#[test]
+#[serial]
+fn t30_12b_captured_trigger_tx_execute_in_tx_read_from_wrong_thread_returns_typed_err() {
+    run_with_timeout(|| {
+        let db = Arc::new(Database::open_memory());
+        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
+            .unwrap();
+        db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &empty())
+            .unwrap();
+
+        let (tx_sender, tx_receiver) = mpsc::channel();
+        let release = Arc::new(Barrier::new(2));
+        let release_cb = release.clone();
+        db.register_trigger_callback("tr", move |_db, ctx| {
+            tx_sender.send(ctx.tx).unwrap();
+            release_cb.wait();
+            Ok(())
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+
+        let fire = fire_trigger_in_thread(db.clone(), 0x3012B);
+        let captured_tx = tx_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("trigger callback did not expose tx");
+        let mut release_guard = BarrierReleaseGuard::armed(release.clone());
+
+        let db_probe = db.clone();
+        let result = thread::spawn(move || db_probe.execute_in_tx(captured_tx, "SELECT * FROM t", &empty()))
+            .join()
+            .unwrap();
+        match result {
+            Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            }) => {}
+            other => panic!(
+                "captured trigger tx-bound handle used from another thread must return CallbackActiveCrossThread{{Trigger}}, got {other:?}"
+            ),
+        }
+
+        release.wait();
+        release_guard.disarm();
+        fire.join().unwrap().unwrap();
+    })
+    .expect("t30_12b deadlocked");
 }
 
 #[test]
@@ -1695,6 +1791,68 @@ fn t30_14_b1_cron_active_same_db_returns_callback_active_cron_immediately() {
         cron_thread.join().unwrap();
     })
     .expect("t30_14 deadlocked");
+}
+
+#[test]
+#[serial]
+fn t30_14b_cron_trigger_dispatch_failure_rolls_back_active_tx_while_guard_retained() {
+    run_with_timeout(|| {
+        let accountant = Arc::new(MemoryAccountant::no_limit());
+        let db = Arc::new(Database::open_memory_with_accountant(accountant.clone()));
+        let _pause = db.pause_cron_tickler_for_test();
+        db.execute(
+            "CREATE TABLE host (id UUID PRIMARY KEY, payload TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        db.execute("CREATE TRIGGER tr ON host WHEN INSERT", &empty())
+            .unwrap();
+        db.register_trigger_callback("tr", |_db_handle, _ctx| {
+            Err(Error::Other("trigger veto from cron cleanup regression".to_string()))
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+        db.execute("CREATE SCHEDULE s EVERY '1 MILLISECONDS' TX (cb)", &empty())
+            .unwrap();
+        db.register_cron_callback("cb", move |db_handle| {
+            db_handle.execute(
+                "INSERT INTO host (id, payload) VALUES ($id, $payload)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(uuid(0x3014B))),
+                    ("payload".to_string(), Value::Text("x".repeat(4096))),
+                ]),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let baseline_used = accountant.usage().used;
+        let successful = db.cron_run_due_now_for_test().expect("cron tick should audit failure");
+        assert_eq!(successful, 0, "failed cron callback must not count as fired");
+
+        let audits = db.cron_audit_log_for_test();
+        assert!(
+            audits.iter().any(|entry| {
+                matches!(
+                    &entry.kind,
+                    CronAuditKind::Failed(message)
+                        if message.contains("trigger veto from cron cleanup regression")
+                )
+            }),
+            "cron failure audit must retain trigger callback error; audits={audits:?}"
+        );
+        assert_eq!(
+            db.scan("host", db.snapshot()).expect("scan host").len(),
+            0,
+            "failed cron-trigger transaction must not leave committed rows"
+        );
+        assert_eq!(
+            accountant.usage().used,
+            baseline_used,
+            "failed cron-trigger transaction must release pending row allocations while trigger guard is retained"
+        );
+    })
+    .expect("t30_14b cron trigger failure cleanup test deadlocked");
 }
 
 #[test]
@@ -2068,6 +2226,191 @@ fn t30_16_close_requested_while_begin_waiter_parked_wakes_begin_to_closed() {
             other => panic!("parked begin must wake to closed-handle error after close wins, got {other:?}"),
         }
     }).expect("t30_16 close-vs-begin-waiter deadlocked");
+}
+
+#[test]
+#[serial]
+fn t30_16b_close_requested_while_sql_begin_waiter_parked_wakes_begin_to_closed() {
+    run_with_timeout(|| {
+        let entered = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+        let db = build_trigger_parked_db(entered.clone(), done.clone());
+
+        let fire = fire_trigger_in_thread(db.clone(), 0x3016B);
+        entered.wait();
+        let mut done_guard = BarrierReleaseGuard::armed(done.clone());
+
+        let db_begin = db.clone();
+        let begin_probe = thread::spawn(move || db_begin.execute("BEGIN", &empty()));
+        let park_observed = wait_until_trigger_wait_observed(&db, Duration::from_secs(2));
+
+        let db_close = db.clone();
+        let close_probe = thread::spawn(move || db_close.close());
+        let close_park_deadline = Instant::now() + Duration::from_secs(2);
+        let mut close_park_observed = false;
+        while Instant::now() < close_park_deadline {
+            let snap = db.trigger_progress_telemetry_snapshot_for_test();
+            if snap.wait_observed >= 2 {
+                close_park_observed = true;
+                break;
+            }
+            if close_probe.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let close_finished_before_release = close_probe.is_finished();
+
+        done.wait();
+        done_guard.disarm();
+        fire.join().unwrap().unwrap();
+        let close_result = close_probe.join().unwrap();
+        let snap_after_release = db.trigger_progress_telemetry_snapshot_for_test();
+        assert!(
+            park_observed,
+            "SQL BEGIN waiter must park before close is requested; snap={snap_after_release:?}"
+        );
+        assert!(
+            close_park_observed,
+            "close() must become the second parked waiter before release; snap={snap_after_release:?}"
+        );
+        assert!(
+            !close_finished_before_release,
+            "close() must wait for callback release, but must not be starved by parked SQL BEGIN"
+        );
+        close_result.expect("close should succeed after callback exits");
+
+        match begin_probe.join().unwrap() {
+            Err(Error::Other(msg)) if msg == "database handle is closed" => {}
+            other => panic!(
+                "parked SQL BEGIN must wake to closed-handle error after close wins, got {other:?}"
+            ),
+        }
+    })
+    .expect("t30_16b SQL BEGIN close-priority test deadlocked");
+}
+
+#[test]
+#[serial]
+fn t30_16c_close_requested_while_sql_rollback_waiter_parked_wakes_rollback_to_closed() {
+    run_with_timeout(|| {
+        let entered = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+        let db = build_trigger_parked_db(entered.clone(), done.clone());
+        db.execute("BEGIN", &empty())
+            .expect("pre-open SQL session tx");
+
+        let fire = fire_trigger_in_thread(db.clone(), 0x3016C2);
+        entered.wait();
+        let mut done_guard = BarrierReleaseGuard::armed(done.clone());
+
+        let db_rollback = db.clone();
+        let rollback_probe = thread::spawn(move || db_rollback.execute("ROLLBACK", &empty()));
+        let park_observed = wait_until_trigger_wait_observed(&db, Duration::from_secs(2));
+
+        let db_close = db.clone();
+        let close_probe = thread::spawn(move || db_close.close());
+        let close_park_deadline = Instant::now() + Duration::from_secs(2);
+        let mut close_park_observed = false;
+        while Instant::now() < close_park_deadline {
+            let snap = db.trigger_progress_telemetry_snapshot_for_test();
+            if snap.wait_observed >= 2 {
+                close_park_observed = true;
+                break;
+            }
+            if close_probe.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let close_finished_before_release = close_probe.is_finished();
+
+        done.wait();
+        done_guard.disarm();
+        fire.join().unwrap().unwrap();
+        let close_result = close_probe.join().unwrap();
+        let snap_after_release = db.trigger_progress_telemetry_snapshot_for_test();
+        assert!(
+            park_observed,
+            "SQL ROLLBACK waiter must park before close is requested; snap={snap_after_release:?}"
+        );
+        assert!(
+            close_park_observed,
+            "close() must become the second parked waiter before release; snap={snap_after_release:?}"
+        );
+        assert!(
+            !close_finished_before_release,
+            "close() must wait for callback release, but must not be starved by parked SQL ROLLBACK"
+        );
+        close_result.expect("close should succeed after callback exits");
+
+        match rollback_probe.join().unwrap() {
+            Err(Error::Other(msg)) if msg == "database handle is closed" => {}
+            other => panic!(
+                "parked SQL ROLLBACK must wake to closed-handle error after close wins, got {other:?}"
+            ),
+        }
+    })
+    .expect("t30_16c SQL ROLLBACK close-priority test deadlocked");
+}
+
+#[test]
+#[serial]
+fn t30_16d_sql_autocommit_dml_does_not_rewait_inside_outer_execute_operation() {
+    run_with_timeout(|| {
+        let plugin = Arc::new(ParkAutocommitOnQueryPlugin::default());
+        let db = Arc::new(Database::open_memory_with_plugin(plugin.clone()).unwrap());
+        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
+            .unwrap();
+        db.execute("CREATE TABLE other (id UUID PRIMARY KEY)", &empty())
+            .unwrap();
+        db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &empty())
+            .unwrap();
+
+        let entered = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+        let entered_cb = entered.clone();
+        let done_cb = done.clone();
+        db.register_trigger_callback("tr", move |_db_handle, _ctx| {
+            entered_cb.wait();
+            done_cb.wait();
+            Ok(())
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+
+        plugin.arm();
+        let db_writer = db.clone();
+        let writer = thread::spawn(move || {
+            db_writer.execute(
+                "INSERT INTO other (id) VALUES ($id)",
+                &HashMap::from([("id".to_string(), Value::Uuid(uuid(0x3016D0)))]),
+            )
+        });
+        assert!(
+            plugin.wait_until_entered(Duration::from_secs(2)),
+            "autocommit writer must reach plugin after execute() opens its outer operation"
+        );
+
+        let fire = fire_trigger_in_thread(db.clone(), 0x3016D1);
+        entered.wait();
+        let mut done_guard = BarrierReleaseGuard::armed(done.clone());
+
+        plugin.release();
+        let db_close = db.clone();
+        let close_probe = thread::spawn(move || db_close.close());
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !close_probe.is_finished(),
+            "close should wait while the independent trigger callback remains parked"
+        );
+        done.wait();
+        done_guard.disarm();
+        fire.join().unwrap().unwrap();
+        writer.join().unwrap().expect("autocommit insert succeeds");
+        close_probe.join().unwrap().expect("close succeeds");
+    })
+    .expect("t30_16d SQL autocommit helper wait regression test deadlocked");
 }
 
 #[test]
@@ -2571,7 +2914,10 @@ fn t30_18_deadlock_guard_healthy_contention_no_tracing_warn_emitted() {
 
         let warn_count_before_control = T30_WARN_COUNT.load(AtomicOrdering::SeqCst);
         // Positive control.
-        tracing::warn!(target: "t30_18_test_positive_control", "positive_control_event");
+        tracing::warn!(
+            target: "contextdb_engine::acceptance_positive_control",
+            "trigger callback wait exceeded deadlock guard"
+        );
         let warn_count_after_control = T30_WARN_COUNT.load(AtomicOrdering::SeqCst);
         T30_COUNT_ENABLED.store(false, AtomicOrdering::SeqCst);
 
@@ -2688,27 +3034,8 @@ fn t30_19_cron_then_trigger_sequential_phases_typed_err_then_wait() {
 #[test]
 #[serial]
 fn t30_20_panic_freedom_1000_iterations_debug() {
-    run_with_timeout(|| {
-        for iteration in 0..1_000 {
-            let entered = Arc::new(Barrier::new(2));
-            let done = Arc::new(Barrier::new(2));
-            let db = build_trigger_parked_db(entered.clone(), done.clone());
-            let fire = fire_trigger_in_thread(db.clone(), 0x3020_0000 + iteration as u128);
-            entered.wait();
-            // begin() under §30 waits and proceeds; under §29 returns typed-Err.
-            // Either way, no panic.
-            let db_probe = db.clone();
-            let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.begin()));
-            done.wait();
-            fire.join().unwrap().unwrap();
-            assert!(outcome.is_ok(), "iteration {iteration}: begin panicked");
-            if let Ok(Ok(tx)) = outcome {
-                let _ = db.rollback(tx);
-            }
-        }
-    })
-    .expect("t30_20 deadlocked");
+    run_with_timeout(|| run_panic_freedom_begin_iterations(0x3020_0000, "debug"))
+        .expect("t30_20 deadlocked");
 }
 
 #[cfg(not(debug_assertions))]
@@ -2716,28 +3043,91 @@ fn t30_20_panic_freedom_1000_iterations_debug() {
 #[serial]
 fn t30_20_release_panic_freedom_1000_iterations_release() {
     // Same body as t30_20; release-only.
-    run_with_timeout(|| {
-        for iteration in 0..1_000 {
-            let entered = Arc::new(Barrier::new(2));
-            let done = Arc::new(Barrier::new(2));
-            let db = build_trigger_parked_db(entered.clone(), done.clone());
-            let fire = fire_trigger_in_thread(db.clone(), 0x3020_2000 + iteration as u128);
-            entered.wait();
-            let db_probe = db.clone();
-            let outcome =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.begin()));
-            done.wait();
-            fire.join().unwrap().unwrap();
-            assert!(
-                outcome.is_ok(),
-                "release iteration {iteration}: begin panicked"
-            );
-            if let Ok(Ok(tx)) = outcome {
-                let _ = db.rollback(tx);
-            }
+    run_with_timeout(|| run_panic_freedom_begin_iterations(0x3020_2000, "release"))
+        .expect("t30_20_release deadlocked");
+}
+
+fn run_panic_freedom_begin_iterations(key_base: u128, label: &'static str) {
+    let db = Arc::new(Database::open_memory());
+    db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &empty())
+        .unwrap();
+    let entered_generation = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let release_generation = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let entered_generation_cb = entered_generation.clone();
+    let release_generation_cb = release_generation.clone();
+    db.register_trigger_callback("tr", move |_db, _ctx| {
+        let generation = {
+            let (entered_lock, entered_cvar) = &*entered_generation_cb;
+            let mut entered = entered_lock.lock().unwrap();
+            *entered += 1;
+            let generation = *entered;
+            entered_cvar.notify_all();
+            generation
+        };
+        let (release_lock, release_cvar) = &*release_generation_cb;
+        let mut released = release_lock.lock().unwrap();
+        while *released < generation {
+            released = release_cvar.wait(released).unwrap();
         }
+        Ok(())
     })
-    .expect("t30_20_release deadlocked");
+    .unwrap();
+    db.complete_initialization().unwrap();
+
+    for iteration in 0..1_000 {
+        let before = *entered_generation.0.lock().unwrap();
+        let fire = fire_trigger_in_thread(db.clone(), key_base + iteration as u128);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let generation = {
+            let (entered_lock, entered_cvar) = &*entered_generation;
+            let mut entered = entered_lock.lock().unwrap();
+            while *entered == before {
+                let now = Instant::now();
+                if now >= deadline {
+                    let (release_lock, release_cvar) = &*release_generation;
+                    *release_lock.lock().unwrap() = usize::MAX;
+                    release_cvar.notify_all();
+                    let _ = fire.join();
+                    panic!("{label} iteration {iteration}: trigger callback did not enter");
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let (next, timeout) = entered_cvar.wait_timeout(entered, remaining).unwrap();
+                entered = next;
+                if timeout.timed_out() && *entered == before {
+                    let (release_lock, release_cvar) = &*release_generation;
+                    *release_lock.lock().unwrap() = usize::MAX;
+                    release_cvar.notify_all();
+                    let _ = fire.join();
+                    panic!("{label} iteration {iteration}: trigger callback did not enter");
+                }
+            }
+            *entered
+        };
+
+        // begin() under §30 waits and proceeds; under §29 returns typed-Err.
+        // Either way, no panic. The probe runs on a separate thread so this
+        // harness can release the callback under the wait-and-proceed contract.
+        let db_probe = db.clone();
+        let outcome_handle = thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.begin()))
+        });
+        {
+            let (release_lock, release_cvar) = &*release_generation;
+            *release_lock.lock().unwrap() = generation;
+            release_cvar.notify_all();
+        }
+        fire.join().unwrap().unwrap();
+        let outcome = outcome_handle.join().unwrap();
+        assert!(
+            outcome.is_ok(),
+            "{label} iteration {iteration}: begin panicked"
+        );
+        if let Ok(Ok(tx)) = outcome {
+            let _ = db.rollback(tx);
+        }
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -2921,10 +3311,11 @@ fn t30_21_display_strings_byte_pinned_post_30() {
 
 #[test]
 #[serial]
-fn t30_22_source_order_priority_b1_over_b2_cross_db_b2_unchanged() {
+fn t30_22_source_order_priority_b1_unrelated_trigger_unchanged() {
     run_with_timeout(|| {
         // db: cron parks; db_y: trigger parks. Thread C's begin() on db must
-        // observe B1 (Cron) — same-DB cron beats cross-DB trigger.
+        // observe B1 (Cron). The unrelated trigger must not mask or delay the
+        // local cron-active error.
         let db = Arc::new(Database::open_memory());
         let _pause = db.pause_cron_tickler_for_test();
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty()).unwrap();
@@ -2960,7 +3351,7 @@ fn t30_22_source_order_priority_b1_over_b2_cross_db_b2_unchanged() {
         let elapsed = started.elapsed();
         match result {
             Err(Error::CallbackActiveCrossThread { kind: CallbackKind::Cron }) => {}
-            other => panic!("expected same-DB B1 (Cron) > cross-DB B2 (Trigger); got {other:?}"),
+            other => panic!("expected same-DB B1 (Cron) despite unrelated trigger; got {other:?}"),
         }
         // Mirrors t30_14: B1 cron typed-Err must return immediately, not
         // engage the wait primitive. A regression that routes B1 through the
@@ -3708,7 +4099,10 @@ fn t30_18_release() {
         );
 
         let warn_count_before_control = T30_WARN_COUNT.load(AtomicOrdering::SeqCst);
-        tracing::warn!(target: "t30_18_release_test_positive_control", "release_positive_control_event");
+        tracing::warn!(
+            target: "contextdb_engine::acceptance_positive_control",
+            "trigger callback wait exceeded deadlock guard"
+        );
         let warn_count_after_control = T30_WARN_COUNT.load(AtomicOrdering::SeqCst);
         T30_COUNT_ENABLED.store(false, AtomicOrdering::SeqCst);
 

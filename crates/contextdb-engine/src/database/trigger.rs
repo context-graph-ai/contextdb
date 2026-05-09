@@ -20,6 +20,11 @@ pub(crate) struct TriggerState {
     staged_persistence_audits: Mutex<HashMap<Lsn, Vec<(u64, TriggerAuditEntry)>>>,
     staged_ddl_for_persistence: Mutex<HashMap<Lsn, StagedTriggerDdlCommit>>,
     callback_owner_threads: Mutex<HashMap<thread::ThreadId, usize>>,
+    callback_active_txs: Mutex<HashMap<TxId, usize>>,
+    active_trigger_names: Mutex<Vec<String>>,
+    pub(super) wait_lock: Mutex<()>,
+    pub(super) waiters: Condvar,
+    pub(super) close_waiter_count: AtomicUsize,
     callback_active_count: AtomicUsize,
     pub(super) next_audit_index: AtomicU64,
     pub(super) ready: AtomicBool,
@@ -27,6 +32,12 @@ pub(crate) struct TriggerState {
     pub(super) typed_err_observed_same_db_count: AtomicU64,
     pub(super) typed_err_observed_cross_db_count: AtomicU64,
     pub(super) deadlock_guard_timeout_observed_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TriggerContention {
+    None,
+    SameDb,
 }
 
 #[derive(Debug, Clone)]
@@ -48,14 +59,20 @@ pub(super) struct PendingTriggerAudit {
     pub cascade_row_count: u32,
 }
 
-#[derive(Debug)]
 pub(super) struct TriggerDispatchFailure {
     pub error: Error,
+    pub(super) active_guards: Vec<TriggerCallbackThreadGuard>,
+}
+
+pub(super) struct TriggerDispatchOutcome {
+    pub(super) pending: Vec<PendingTriggerAudit>,
+    pub(super) active_guards: Vec<TriggerCallbackThreadGuard>,
 }
 
 struct TriggerDispatchRun {
     processed: HashSet<(String, RowId, String)>,
     pending: Vec<PendingTriggerAudit>,
+    active_guards: Vec<TriggerCallbackThreadGuard>,
 }
 
 struct TriggerFiring {
@@ -63,9 +80,11 @@ struct TriggerFiring {
     row: VersionedRow,
 }
 
-struct TriggerCallbackThreadGuard<'a> {
-    trigger: &'a TriggerState,
+pub(super) struct TriggerCallbackThreadGuard {
+    trigger: Arc<TriggerState>,
     owner: thread::ThreadId,
+    tx: TxId,
+    trigger_name: String,
 }
 
 fn global_trigger_callback_owner_threads() -> &'static Mutex<HashMap<thread::ThreadId, usize>> {
@@ -88,6 +107,11 @@ impl TriggerState {
             staged_persistence_audits: Mutex::new(HashMap::new()),
             staged_ddl_for_persistence: Mutex::new(HashMap::new()),
             callback_owner_threads: Mutex::new(HashMap::new()),
+            callback_active_txs: Mutex::new(HashMap::new()),
+            active_trigger_names: Mutex::new(Vec::new()),
+            wait_lock: Mutex::new(()),
+            waiters: Condvar::new(),
+            close_waiter_count: AtomicUsize::new(0),
             callback_active_count: AtomicUsize::new(0),
             next_audit_index: AtomicU64::new(0),
             ready: AtomicBool::new(true),
@@ -111,50 +135,66 @@ impl TriggerState {
         !owners.is_empty() && !owners.contains_key(&current)
     }
 
-    pub(super) fn callback_active_on_other_thread_for_tx_control(
+    pub(super) fn callback_contention_for_tx_control(
         &self,
         target_owner: thread::ThreadId,
         include_owner_thread_global: bool,
-    ) -> bool {
-        // Public tx-control must reject same-database trigger contention, which
-        // is tracked by the local owner map below. The process-wide owner map
-        // catches non-owner callers sharing handles across threads, while the
-        // owner-thread exception keeps unrelated database instances independent.
-        // Cron-scheduled databases can opt into owner-thread global checks so
-        // retry loops still observe trigger contention after B1 cron contention
-        // clears.
-        let mut current = None;
+    ) -> TriggerContention {
+        // Trigger Class B contention is scoped to this TriggerState. A process
+        // can embed multiple independent databases; a parked trigger on DB-X
+        // must not make ordinary worker-thread writes on DB-Y fail just because
+        // both handles live in the same process.
+        let _ = (target_owner, include_owner_thread_global);
         if self.callback_active_count.load(Ordering::SeqCst) > 0 {
             let current_id = thread::current().id();
-            current = Some(current_id);
             let owners = self.callback_owner_threads.lock();
             if !owners.is_empty() && !owners.contains_key(&current_id) {
-                return true;
+                return TriggerContention::SameDb;
             }
         }
-        if global_trigger_callback_active_count().load(Ordering::SeqCst) == 0 {
-            return false;
-        }
-        let current = current.unwrap_or_else(|| thread::current().id());
-        let global_owners = global_trigger_callback_owner_threads().lock();
-        !global_owners.is_empty()
-            && !global_owners.contains_key(&current)
-            && (include_owner_thread_global || current != target_owner)
+        TriggerContention::None
     }
 
-    fn enter_callback_thread_scope(&self) -> TriggerCallbackThreadGuard<'_> {
+    pub(super) fn active_trigger_name_for_wait(&self) -> String {
+        self.active_trigger_names
+            .lock()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<unknown trigger>".to_string())
+    }
+
+    pub(super) fn callback_tx_active(&self, tx: TxId) -> bool {
+        self.callback_active_txs.lock().contains_key(&tx)
+    }
+
+    fn enter_callback_thread_scope(
+        trigger: &Arc<Self>,
+        trigger_name: &str,
+        tx: TxId,
+    ) -> TriggerCallbackThreadGuard {
         let owner = thread::current().id();
         *global_trigger_callback_owner_threads()
             .lock()
             .entry(owner)
             .or_default() += 1;
-        *self.callback_owner_threads.lock().entry(owner).or_default() += 1;
+        *trigger
+            .callback_owner_threads
+            .lock()
+            .entry(owner)
+            .or_default() += 1;
+        *trigger.callback_active_txs.lock().entry(tx).or_default() += 1;
+        trigger
+            .active_trigger_names
+            .lock()
+            .push(trigger_name.to_string());
         global_callback_active_count().fetch_add(1, Ordering::SeqCst);
         global_trigger_callback_active_count().fetch_add(1, Ordering::SeqCst);
-        self.callback_active_count.fetch_add(1, Ordering::SeqCst);
+        trigger.callback_active_count.fetch_add(1, Ordering::SeqCst);
         TriggerCallbackThreadGuard {
-            trigger: self,
+            trigger: trigger.clone(),
             owner,
+            tx,
+            trigger_name: trigger_name.to_string(),
         }
     }
 
@@ -210,8 +250,9 @@ impl TriggerState {
     }
 }
 
-impl Drop for TriggerCallbackThreadGuard<'_> {
+impl Drop for TriggerCallbackThreadGuard {
     fn drop(&mut self) {
+        let _wait_guard = self.trigger.wait_lock.lock();
         let mut owners = self.trigger.callback_owner_threads.lock();
         match owners.get_mut(&self.owner) {
             Some(count) if *count > 1 => *count -= 1,
@@ -228,11 +269,26 @@ impl Drop for TriggerCallbackThreadGuard<'_> {
             }
             None => {}
         }
+        let mut active_txs = self.trigger.callback_active_txs.lock();
+        match active_txs.get_mut(&self.tx) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                active_txs.remove(&self.tx);
+            }
+            None => {}
+        }
+        drop(active_txs);
         self.trigger
             .callback_active_count
             .fetch_sub(1, Ordering::SeqCst);
         global_trigger_callback_active_count().fetch_sub(1, Ordering::SeqCst);
         global_callback_active_count().fetch_sub(1, Ordering::SeqCst);
+        let mut names = self.trigger.active_trigger_names.lock();
+        if let Some(pos) = names.iter().rposition(|name| name == &self.trigger_name) {
+            names.remove(pos);
+        }
+        drop(names);
+        self.trigger.waiters.notify_all();
     }
 }
 
@@ -708,28 +764,46 @@ impl Database {
     pub(super) fn dispatch_triggers_for_tx(
         &self,
         tx: TxId,
-    ) -> std::result::Result<Vec<PendingTriggerAudit>, TriggerDispatchFailure> {
+    ) -> std::result::Result<TriggerDispatchOutcome, Box<TriggerDispatchFailure>> {
         if self.trigger.declarations.lock().is_empty() {
-            return Ok(Vec::new());
+            return Ok(TriggerDispatchOutcome {
+                pending: Vec::new(),
+                active_guards: Vec::new(),
+            });
         }
         let mut run = TriggerDispatchRun {
             processed: HashSet::new(),
             pending: Vec::new(),
+            active_guards: Vec::new(),
         };
         let initial_len = self
             .tx_mgr
             .with_write_set(tx, |ws| ws.relational_inserts.len())
-            .map_err(|error| TriggerDispatchFailure { error })?;
+            .map_err(|error| {
+                Box::new(TriggerDispatchFailure {
+                    error,
+                    active_guards: Vec::new(),
+                })
+            })?;
         if let Err(error) = self.dispatch_trigger_range(tx, 0, initial_len, 1, &mut run) {
             let reason = error.to_string();
             if let Err(audit_error) =
                 self.append_rolled_back_trigger_audits(&run.pending, tx, &reason)
             {
-                return Err(TriggerDispatchFailure { error: audit_error });
+                return Err(Box::new(TriggerDispatchFailure {
+                    error: audit_error,
+                    active_guards: run.active_guards,
+                }));
             }
-            return Err(TriggerDispatchFailure { error });
+            return Err(Box::new(TriggerDispatchFailure {
+                error,
+                active_guards: run.active_guards,
+            }));
         }
-        Ok(run.pending)
+        Ok(TriggerDispatchOutcome {
+            pending: run.pending,
+            active_guards: run.active_guards,
+        })
     }
 
     pub(super) fn prepare_active_trigger_write_set_for_dispatch(
@@ -884,6 +958,9 @@ impl Database {
             depth,
             row_values: firing.row.values.clone(),
         };
+        let callback_thread =
+            TriggerState::enter_callback_thread_scope(&self.trigger, &ctx.trigger_name, tx);
+        run.active_guards.push(callback_thread);
         let callback_result = self.run_trigger_callback(tx, &ctx, callback);
         if let Err(error) = callback_result {
             let entry = TriggerAuditEntry {
@@ -940,7 +1017,6 @@ impl Database {
         ctx: &TriggerContext,
         callback: TriggerCallback,
     ) -> Result<()> {
-        let _callback_thread = self.trigger.enter_callback_thread_scope();
         let this_db = self as *const Self as usize;
         let result = TRIGGER_CALLBACK_TX.with(|tx_slot| {
             let prior_tx = tx_slot.replace(Some(tx));

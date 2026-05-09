@@ -38,6 +38,7 @@ type GatedGraphNeighbor = (NodeId, EdgeType, HashMap<String, Value>, NodeId, Nod
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 1024;
 const MAX_STATEMENT_CACHE_ENTRIES: usize = 1024;
 const SAME_PROCESS_REOPEN_RETRY: Duration = Duration::from_millis(500);
+const DEFAULT_TRIGGER_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(60);
 // redb may need a small metadata page on the next write, especially for a new
 // file with the format metadata table. Keep the disk-limit error deterministic
 // instead of starting a write that cannot commit cleanly.
@@ -49,7 +50,7 @@ pub(crate) mod gate;
 pub(crate) mod trigger;
 use cron::CronState;
 use event_bus::EventBusState;
-use trigger::TriggerState;
+use trigger::{TriggerCallbackThreadGuard, TriggerContention, TriggerState};
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -321,16 +322,36 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
+    static SQL_WRITE_CONTROL_BYPASS_STACK: std::cell::RefCell<Vec<(usize, TxId)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 struct SyncApplyTriggerGateGuard;
 
+struct SqlWriteControlBypassGuard {
+    db_id: usize,
+    tx: TxId,
+}
+
 impl Drop for SyncApplyTriggerGateGuard {
     fn drop(&mut self) {
         SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| {
             depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+impl Drop for SqlWriteControlBypassGuard {
+    fn drop(&mut self) {
+        SQL_WRITE_CONTROL_BYPASS_STACK.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(
+                popped,
+                Some((self.db_id, self.tx)),
+                "SQL write-control bypass stack mismatch"
+            );
         });
     }
 }
@@ -352,6 +373,23 @@ fn global_callback_active_count() -> &'static AtomicUsize {
     &ACTIVE
 }
 
+/// Embedded contextdb database handle.
+///
+/// Trigger concurrency follows the canonical callback contract documented on
+/// [`Error::CallbackActiveCrossThread`]: same-DB cross-thread trigger
+/// contention waits and proceeds inside the engine, unrelated databases proceed
+/// independently, same-thread callback reentry returns
+/// [`Error::CallbackReentry`], callback tx-bound handles are isolated to the
+/// runner thread, and cron same-DB contention still returns the typed cron
+/// callback-active error immediately.
+///
+/// # Drop semantics
+///
+/// Trigger waiters do not park while holding the public-operation read guard,
+/// so `close()` can win the closed-handle transition after an active callback
+/// exits. Production callers should call [`Database::close`] explicitly before
+/// dropping the last handle when deterministic shutdown matters; a waiter that
+/// wakes after close observes the normal closed-handle error.
 pub struct Database {
     tx_mgr: Arc<TxManager<DynStore>>,
     relational_store: Arc<RelationalStore>,
@@ -590,6 +628,10 @@ struct DatabaseOperationGuard<'a> {
     _lock: Option<parking_lot::RwLockReadGuard<'a, ()>>,
 }
 
+struct TriggerCloseWaiterGuard<'a> {
+    trigger: &'a TriggerState,
+}
+
 impl Drop for DatabaseOperationGuard<'_> {
     fn drop(&mut self) {
         DB_OPERATION_STACK.with(|stack| {
@@ -600,6 +642,22 @@ impl Drop for DatabaseOperationGuard<'_> {
                 "database operation stack mismatch"
             );
         });
+    }
+}
+
+impl<'a> TriggerCloseWaiterGuard<'a> {
+    fn new(trigger: &'a TriggerState) -> Self {
+        trigger.close_waiter_count.fetch_add(1, Ordering::SeqCst);
+        Self { trigger }
+    }
+}
+
+impl Drop for TriggerCloseWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.trigger
+            .close_waiter_count
+            .fetch_sub(1, Ordering::SeqCst);
+        self.trigger.waiters.notify_all();
     }
 }
 
@@ -1187,8 +1245,7 @@ impl Database {
     }
 
     pub fn begin(&self) -> Result<TxId> {
-        let _operation = self.open_operation()?;
-        self.assert_public_tx_control_callbacks_allowed()?;
+        let _operation = self.open_operation_after_public_tx_control_wait("begin")?;
         Ok(self.tx_mgr.begin())
     }
 
@@ -1196,20 +1253,37 @@ impl Database {
         global_callback_active_count().load(Ordering::SeqCst) > 0
     }
 
-    fn assert_public_tx_control_callbacks_allowed(&self) -> Result<()> {
-        if !Self::callback_active_process_wide() {
-            return Ok(());
-        }
-        self.assert_callback_reentry_allowed()?;
-        self.assert_public_tx_control_cross_thread_allowed()
+    fn trigger_deadlock_timeout() -> Duration {
+        std::env::var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_TRIGGER_DEADLOCK_TIMEOUT)
     }
 
-    fn assert_internal_write_callbacks_allowed(&self) -> Result<()> {
+    fn open_operation_after_public_tx_control_wait(
+        &self,
+        surface: &'static str,
+    ) -> Result<DatabaseOperationGuard<'_>> {
+        self.open_operation_after_public_tx_control_wait_for_tx(surface, None)
+    }
+
+    fn open_operation_after_public_tx_control_wait_for_tx(
+        &self,
+        surface: &'static str,
+        tx: Option<TxId>,
+    ) -> Result<DatabaseOperationGuard<'_>> {
+        let operation = self.open_operation()?;
         if !Self::callback_active_process_wide() {
-            return Ok(());
+            return Ok(operation);
         }
+        drop(operation);
         self.assert_callback_reentry_allowed()?;
-        self.assert_internal_write_cross_thread_allowed()
+        if let Some(tx) = tx {
+            self.assert_trigger_callback_tx_not_captured_cross_thread(tx)?;
+        }
+        self.assert_public_tx_control_cross_thread_allowed_for_surface(surface)?;
+        self.open_operation()
     }
 
     fn assert_callback_reentry_allowed(&self) -> Result<()> {
@@ -1227,33 +1301,132 @@ impl Database {
         Ok(())
     }
 
-    fn assert_public_tx_control_cross_thread_allowed(&self) -> Result<()> {
+    fn assert_public_tx_control_cross_thread_allowed_for_surface(
+        &self,
+        surface: &'static str,
+    ) -> Result<()> {
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::CallbackActiveCrossThread {
                 kind: CallbackKind::Cron,
             });
         }
-        if self.trigger.callback_active_on_other_thread_for_tx_control(
-            self.owner_thread,
-            self.cron.has_schedules(),
-        ) {
-            return Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            });
+        match self
+            .trigger
+            .callback_contention_for_tx_control(self.owner_thread, self.cron.has_schedules())
+        {
+            TriggerContention::None => Ok(()),
+            TriggerContention::SameDb => self.wait_for_same_db_trigger_callback_idle(surface),
         }
-        Ok(())
     }
 
-    // Internal engine-managed writes still need callback-active gates, but they
-    // keep trigger contention scoped to this database. Public tx-control
-    // surfaces use the stricter process-wide tx-control helper above.
+    fn wait_for_same_db_trigger_callback_idle(&self, surface: &'static str) -> Result<()> {
+        let timeout = Self::trigger_deadlock_timeout();
+        let started = Instant::now();
+        let mut observed_wait = false;
+        let mut guard = self.trigger.wait_lock.lock();
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(closed_database_error());
+            }
+            self.assert_callback_reentry_allowed()?;
+            match self
+                .trigger
+                .callback_contention_for_tx_control(self.owner_thread, self.cron.has_schedules())
+            {
+                TriggerContention::None => {
+                    if surface != "close"
+                        && self.trigger.close_waiter_count.load(Ordering::SeqCst) > 0
+                    {
+                        let _ = self
+                            .trigger
+                            .waiters
+                            .wait_for(&mut guard, Duration::from_millis(1));
+                        continue;
+                    }
+                    return Ok(());
+                }
+                TriggerContention::SameDb => {
+                    if !observed_wait {
+                        self.trigger
+                            .wait_observed_count
+                            .fetch_add(1, Ordering::SeqCst);
+                        observed_wait = true;
+                    }
+                }
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(self.trigger_same_db_deadlock_timeout_error(surface, elapsed));
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            self.trigger.waiters.wait_for(&mut guard, remaining);
+        }
+    }
+
+    fn trigger_same_db_deadlock_timeout_error(
+        &self,
+        surface: &'static str,
+        waited: Duration,
+    ) -> Error {
+        self.trigger
+            .deadlock_guard_timeout_observed_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.trigger
+            .typed_err_observed_same_db_count
+            .fetch_add(1, Ordering::SeqCst);
+        let trigger_name = self.trigger.active_trigger_name_for_wait();
+        let waited_ms = waited.as_millis() as u64;
+        tracing::warn!(
+            trigger = %trigger_name,
+            trigger_name = %trigger_name,
+            waited_ms = waited_ms,
+            surface = surface,
+            "trigger callback wait exceeded deadlock guard"
+        );
+        Error::CallbackActiveCrossThread {
+            kind: CallbackKind::Trigger,
+        }
+    }
+
+    // Internal engine-managed writes still need callback-active gates, and
+    // trigger contention stays scoped to this database so independent embedded
+    // handles do not poison each other through process-wide state.
     fn begin_for_internal_write(&self) -> Result<TxId> {
         let _operation = self.open_operation()?;
         self.assert_internal_write_callbacks_allowed()?;
         Ok(self.tx_mgr.begin())
     }
 
-    fn assert_internal_write_cross_thread_allowed(&self) -> Result<()> {
+    fn begin_for_public_autocommit_write(&self) -> Result<TxId> {
+        let _operation = self.open_operation_after_internal_write_wait("execute")?;
+        Ok(self.tx_mgr.begin())
+    }
+
+    fn rollback_preopened_autocommit_tx(&self, tx: Option<TxId>) {
+        if let Some(tx) = tx {
+            let _ = self.tx_mgr.rollback_empty_without_commit_lock(tx);
+        }
+    }
+
+    fn enter_sql_write_control_bypass(&self, tx: TxId) -> SqlWriteControlBypassGuard {
+        let db_id = self as *const Self as usize;
+        SQL_WRITE_CONTROL_BYPASS_STACK.with(|stack| {
+            stack.borrow_mut().push((db_id, tx));
+        });
+        SqlWriteControlBypassGuard { db_id, tx }
+    }
+
+    fn sql_write_control_bypass_active(&self, tx: TxId) -> bool {
+        let db_id = self as *const Self as usize;
+        SQL_WRITE_CONTROL_BYPASS_STACK.with(|stack| stack.borrow().contains(&(db_id, tx)))
+    }
+
+    fn assert_internal_write_callbacks_allowed(&self) -> Result<()> {
+        if !Self::callback_active_process_wide() {
+            return Ok(());
+        }
+        self.assert_callback_reentry_allowed()?;
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::CallbackActiveCrossThread {
                 kind: CallbackKind::Cron,
@@ -1270,6 +1443,130 @@ impl Database {
         Ok(())
     }
 
+    fn open_operation_after_internal_write_wait(
+        &self,
+        surface: &'static str,
+    ) -> Result<DatabaseOperationGuard<'_>> {
+        let operation = self.open_operation()?;
+        if !Self::callback_active_process_wide() {
+            return Ok(operation);
+        }
+        drop(operation);
+        self.assert_callback_reentry_allowed()?;
+        self.assert_internal_write_cross_thread_allowed(surface)?;
+        self.open_operation()
+    }
+
+    fn cron_callback_tx_bound_matches(&self, tx: TxId) -> bool {
+        let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
+        let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
+        cron_tx == Some(tx) && cron_db == Some(self as *const Self as usize)
+    }
+
+    fn trigger_callback_tx_bound_matches(&self, tx: TxId) -> bool {
+        let trigger_tx = TRIGGER_CALLBACK_TX.with(|slot| slot.get());
+        let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
+        trigger_tx == Some(tx) && trigger_db == Some(self as *const Self as usize)
+    }
+
+    fn callback_tx_bound_matches(&self, tx: TxId) -> bool {
+        self.cron_callback_tx_bound_matches(tx) || self.trigger_callback_tx_bound_matches(tx)
+    }
+
+    fn assert_callback_tx_bound_write_allowed(&self, tx: TxId) -> Result<()> {
+        if CRON_CALLBACK_ACTIVE.with(|active| active.get())
+            && !self.cron_callback_tx_bound_matches(tx)
+        {
+            return Err(Error::CallbackReentry {
+                kind: CallbackKind::Cron,
+            });
+        }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get())
+            && !self.trigger_callback_tx_bound_matches(tx)
+        {
+            self.record_user_commit_trigger_reentry();
+            return Err(Error::CallbackReentry {
+                kind: CallbackKind::Trigger,
+            });
+        }
+        Ok(())
+    }
+
+    fn assert_trigger_callback_tx_not_captured_cross_thread(&self, tx: TxId) -> Result<()> {
+        if self.trigger.callback_tx_active(tx) && !self.trigger_callback_tx_bound_matches(tx) {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            });
+        }
+        Ok(())
+    }
+
+    fn open_operation_after_write_control_wait(
+        &self,
+        tx: TxId,
+        surface: &'static str,
+    ) -> Result<DatabaseOperationGuard<'_>> {
+        let operation = self.open_operation()?;
+        if self.sql_write_control_bypass_active(tx)
+            || !Self::callback_active_process_wide()
+            || self.callback_tx_bound_matches(tx)
+        {
+            return Ok(operation);
+        }
+        drop(operation);
+        self.assert_callback_tx_bound_write_allowed(tx)?;
+        self.assert_trigger_callback_tx_not_captured_cross_thread(tx)?;
+        self.assert_write_control_cross_thread_allowed_for_surface(surface)?;
+        self.open_operation()
+    }
+
+    fn open_operation_after_statement_callback_wait(
+        &self,
+        stmt: &Statement,
+        surface: &'static str,
+    ) -> Result<DatabaseOperationGuard<'_>> {
+        let operation = self.open_operation()?;
+        if !Self::callback_active_process_wide() {
+            return Ok(operation);
+        }
+        drop(operation);
+        self.assert_statement_allowed_for_callbacks_for_surface(stmt, surface)?;
+        self.open_operation()
+    }
+
+    fn assert_write_control_cross_thread_allowed_for_surface(
+        &self,
+        surface: &'static str,
+    ) -> Result<()> {
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Cron,
+            });
+        }
+        match self
+            .trigger
+            .callback_contention_for_tx_control(self.owner_thread, self.cron.has_schedules())
+        {
+            TriggerContention::None => Ok(()),
+            TriggerContention::SameDb => self.wait_for_same_db_trigger_callback_idle(surface),
+        }
+    }
+
+    fn assert_internal_write_cross_thread_allowed(&self, surface: &'static str) -> Result<()> {
+        if self.cron.callback_active_on_other_thread() {
+            return Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Cron,
+            });
+        }
+        match self
+            .trigger
+            .callback_contention_for_tx_control(self.owner_thread, self.cron.has_schedules())
+        {
+            TriggerContention::None => Ok(()),
+            TriggerContention::SameDb => self.wait_for_same_db_trigger_callback_idle(surface),
+        }
+    }
+
     /// Test/example helper. Production code MUST use `?` propagation against
     /// the typed callback-active errors. Unwraps the engine's
     /// `CallbackActiveCrossThread` / `CallbackReentry` variants as panics; not
@@ -1279,15 +1576,19 @@ impl Database {
     }
 
     pub fn commit(&self, tx: TxId) -> Result<()> {
-        let _operation = self.open_operation()?;
-        self.assert_public_tx_control_callbacks_allowed()?;
+        let _operation =
+            self.open_operation_after_public_tx_control_wait_for_tx("commit", Some(tx))?;
         let _user_commit = self.enter_user_commit_callback_scope();
         self.commit_with_source(tx, CommitSource::User)
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
-        let _operation = self.open_operation()?;
-        self.assert_public_tx_control_callbacks_allowed()?;
+        let _operation =
+            self.open_operation_after_public_tx_control_wait_for_tx("rollback", Some(tx))?;
+        self.rollback_without_callback_tx_control(tx)
+    }
+
+    fn rollback_without_callback_tx_control(&self, tx: TxId) -> Result<()> {
         let ws = self.tx_mgr.rollback_write_set(tx)?;
         self.pending_event_bus_ddl.lock().remove(&tx);
         self.pending_commit_metadata.lock().remove(&tx);
@@ -1336,27 +1637,30 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
-        let _operation = self.open_operation()?;
-        if let Some(cached) = self.cached_statement(sql) {
-            self.assert_statement_allowed_for_callbacks(&cached.stmt)?;
-            let active_tx = self.active_session_tx();
-            return self.execute_statement_with_plan(
-                &cached.stmt,
-                sql,
-                params,
-                active_tx,
-                Some(&cached.plan),
-            );
+        let cached = self.cached_statement(sql);
+        let parsed_stmt;
+        let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
+            (&cached.stmt, Some(&cached.plan))
+        } else {
+            parsed_stmt = contextdb_parser::parse(sql)?;
+            (&parsed_stmt, None)
+        };
+        if Self::callback_active_process_wide() {
+            self.assert_statement_allowed_for_callbacks_for_surface(stmt, "execute")?;
         }
 
-        let stmt = contextdb_parser::parse(sql)?;
-        self.assert_statement_allowed_for_callbacks(&stmt)?;
-
-        match &stmt {
+        match stmt {
             Statement::Begin => {
-                let mut session = self.session_tx.lock();
-                if session.is_none() {
-                    *session = Some(self.begin()?);
+                if self.session_tx.lock().is_none() {
+                    if Self::callback_active_process_wide() {
+                        self.assert_callback_reentry_allowed()?;
+                        self.assert_public_tx_control_cross_thread_allowed_for_surface("begin")?;
+                    }
+                    let _operation = self.open_operation()?;
+                    let mut session = self.session_tx.lock();
+                    if session.is_none() {
+                        *session = Some(self.tx_mgr.begin());
+                    }
                 }
                 return Ok(QueryResult::empty());
             }
@@ -1384,17 +1688,41 @@ impl Database {
                 return Ok(QueryResult::empty());
             }
             Statement::Rollback => {
-                let mut session = self.session_tx.lock();
-                if let Some(tx) = *session {
+                let tx = *self.session_tx.lock();
+                if let Some(tx) = tx {
                     self.rollback(tx)?;
-                    *session = None;
+                    let mut session = self.session_tx.lock();
+                    if *session == Some(tx) {
+                        *session = None;
+                    }
                 }
                 return Ok(QueryResult::empty());
             }
             _ => {}
         }
 
-        match &stmt {
+        let active_tx = self.active_session_tx();
+        let preopened_autocommit_tx =
+            if active_tx.is_none() && Self::statement_uses_public_autocommit_write(stmt) {
+                Some(self.begin_for_public_autocommit_write()?)
+            } else {
+                None
+            };
+
+        let operation_result = if preopened_autocommit_tx.is_some() {
+            self.open_operation()
+        } else {
+            self.open_operation_after_statement_callback_wait(stmt, "execute")
+        };
+        let _operation = match operation_result {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.rollback_preopened_autocommit_tx(preopened_autocommit_tx);
+                return Err(error);
+            }
+        };
+
+        match stmt {
             Statement::CreateSchedule {
                 name,
                 every,
@@ -1417,7 +1745,7 @@ impl Database {
             }
             Statement::CreateTrigger { .. } | Statement::DropTrigger { .. } => {
                 let ddl = self
-                    .ddl_change_for_statement(&stmt, self.active_session_tx())
+                    .ddl_change_for_statement(stmt, self.active_session_tx())
                     .expect("trigger statement has DDL change");
                 self.apply_trigger_ddl_from_user(ddl)?;
                 return Ok(QueryResult::empty());
@@ -1425,8 +1753,14 @@ impl Database {
             _ => {}
         }
 
-        let active_tx = self.active_session_tx();
-        self.execute_statement(&stmt, sql, params, active_tx)
+        self.execute_statement_with_plan(
+            stmt,
+            sql,
+            params,
+            active_tx,
+            cached_plan,
+            preopened_autocommit_tx,
+        )
     }
 
     fn active_session_tx(&self) -> Option<TxId> {
@@ -1459,10 +1793,9 @@ impl Database {
             let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
             let this_db = self as *const Self as usize;
             if active_tx.is_none() || active_tx != cron_tx || cron_db != Some(this_db) {
-                return Err(Error::Other(
-                    "cron callback writes must use the supplied tx-bound database handle"
-                        .to_string(),
-                ));
+                return Err(Error::CallbackReentry {
+                    kind: CallbackKind::Cron,
+                });
             }
         }
         if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) && forbidden_in_callback {
@@ -1490,10 +1823,10 @@ impl Database {
             let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
             let this_db = self as *const Self as usize;
             if active_tx.is_none() || active_tx != trigger_tx || trigger_db != Some(this_db) {
-                return Err(Error::Other(
-                    "trigger callback writes must use the supplied tx-bound database handle"
-                        .to_string(),
-                ));
+                self.record_user_commit_trigger_reentry();
+                return Err(Error::CallbackReentry {
+                    kind: CallbackKind::Trigger,
+                });
             }
         }
         Ok(())
@@ -1503,6 +1836,7 @@ impl Database {
         &self,
         forbidden_in_callback: bool,
         requires_callback_tx: bool,
+        surface: &'static str,
     ) -> Result<()> {
         if !forbidden_in_callback && !requires_callback_tx {
             return Ok(());
@@ -1516,23 +1850,27 @@ impl Database {
             .trigger
             .callback_active_on_other_thread(self.owner_thread)
         {
-            return Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            });
+            return self.wait_for_same_db_trigger_callback_idle(surface);
         }
-        if requires_callback_tx
-            && self
+        if requires_callback_tx {
+            match self
                 .trigger
-                .callback_active_on_other_thread_for_tx_control(self.owner_thread, false)
-        {
-            return Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            });
+                .callback_contention_for_tx_control(self.owner_thread, false)
+            {
+                TriggerContention::None => {}
+                TriggerContention::SameDb => {
+                    return self.wait_for_same_db_trigger_callback_idle(surface);
+                }
+            }
         }
         Ok(())
     }
 
-    fn assert_statement_allowed_for_callbacks(&self, stmt: &Statement) -> Result<()> {
+    fn assert_statement_allowed_for_callbacks_for_surface(
+        &self,
+        stmt: &Statement,
+        surface: &'static str,
+    ) -> Result<()> {
         let forbidden_in_callback = Self::statement_forbidden_inside_cron_callback(stmt);
         let requires_callback_tx = Self::statement_requires_cron_bound_handle(stmt);
         if !forbidden_in_callback && !requires_callback_tx {
@@ -1549,56 +1887,8 @@ impl Database {
         self.assert_statement_allowed_during_cross_thread_callback(
             forbidden_in_callback,
             requires_callback_tx,
+            surface,
         )
-    }
-
-    fn assert_cron_callback_tx_bound_handle(&self, tx: TxId) -> Result<()> {
-        if !Self::callback_active_process_wide() {
-            return Ok(());
-        }
-        if self.cron.callback_active_on_other_thread() {
-            return Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Cron,
-            });
-        }
-        if self.trigger.callback_active_on_other_thread_for_tx_control(
-            self.owner_thread,
-            self.cron.has_schedules(),
-        ) {
-            return Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            });
-        }
-        if !CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return self.assert_trigger_callback_tx_bound_handle(tx);
-        }
-        let cron_tx = CRON_CALLBACK_TX.with(|slot| slot.get());
-        let cron_db = CRON_CALLBACK_DB.with(|slot| slot.get());
-        let this_db = self as *const Self as usize;
-        if cron_tx == Some(tx) && cron_db == Some(this_db) {
-            self.assert_trigger_callback_tx_bound_handle(tx)
-        } else {
-            Err(Error::Other(
-                "cron callback writes must use the supplied tx-bound database handle".to_string(),
-            ))
-        }
-    }
-
-    fn assert_trigger_callback_tx_bound_handle(&self, tx: TxId) -> Result<()> {
-        if !TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Ok(());
-        }
-        let trigger_tx = TRIGGER_CALLBACK_TX.with(|slot| slot.get());
-        let trigger_db = TRIGGER_CALLBACK_DB.with(|slot| slot.get());
-        let this_db = self as *const Self as usize;
-        if trigger_tx == Some(tx) && trigger_db == Some(this_db) {
-            Ok(())
-        } else {
-            Err(Error::Other(
-                "trigger callback writes must use the supplied tx-bound database handle"
-                    .to_string(),
-            ))
-        }
     }
 
     fn cached_statement(&self, sql: &str) -> Option<Arc<CachedStatement>> {
@@ -1664,6 +1954,13 @@ impl Database {
         )
     }
 
+    fn statement_uses_public_autocommit_write(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Delete(_) | Statement::Update(_)
+        )
+    }
+
     pub(crate) fn clear_statement_cache(&self) {
         self.statement_cache.write().clear();
     }
@@ -1678,6 +1975,7 @@ impl Database {
         &self,
         plan: &PhysicalPlan,
         params: &HashMap<String, Value>,
+        preopened_autocommit_tx: Option<TxId>,
     ) -> Result<QueryResult> {
         // Reset per-query rows_examined once at the entry point so every
         // sub-plan (union, CTE, subquery IndexScan) accumulates into the
@@ -1685,8 +1983,14 @@ impl Database {
         self.__reset_rows_examined();
         match plan {
             PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_) => {
-                let tx = self.begin_for_internal_write()?;
-                let result = execute_plan(self, plan, params, Some(tx));
+                let tx = match preopened_autocommit_tx {
+                    Some(tx) => tx,
+                    None => self.begin_for_public_autocommit_write()?,
+                };
+                let result = {
+                    let _write_gate = self.enter_sql_write_control_bypass(tx);
+                    execute_plan(self, plan, params, Some(tx))
+                };
                 match result {
                     Ok(mut qr) => {
                         let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
@@ -1701,12 +2005,21 @@ impl Database {
                         Ok(qr)
                     }
                     Err(e) => {
-                        let _ = self.rollback(tx);
+                        let _ = self.rollback_without_callback_tx_control(tx);
                         Err(e)
                     }
                 }
             }
-            _ => execute_plan(self, plan, params, None),
+            _ => {
+                if preopened_autocommit_tx.is_some() {
+                    self.rollback_preopened_autocommit_tx(preopened_autocommit_tx);
+                    return Err(Error::Other(
+                        "internal autocommit transaction reserved for non-DML statement"
+                            .to_string(),
+                    ));
+                }
+                execute_plan(self, plan, params, None)
+            }
         }
     }
 
@@ -1744,15 +2057,18 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
-        let _operation = self.open_operation()?;
-        if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            return Err(Error::CallbackReentry {
-                kind: CallbackKind::Cron,
-            });
-        }
         let stmt = contextdb_parser::parse(sql)?;
-        self.assert_statement_allowed_for_callbacks(&stmt)?;
-        self.assert_trigger_callback_tx_bound_handle(tx)?;
+        let requires_callback_tx = Self::statement_requires_cron_bound_handle(&stmt);
+        if Self::callback_active_process_wide() {
+            self.assert_callback_tx_bound_write_allowed(tx)?;
+            self.assert_trigger_callback_tx_not_captured_cross_thread(tx)?;
+            self.assert_statement_allowed_for_callbacks_for_surface(&stmt, "execute_in_tx")?;
+        }
+        let _operation = if requires_callback_tx {
+            self.open_operation_after_write_control_wait(tx, "execute_in_tx")?
+        } else {
+            self.open_operation_after_statement_callback_wait(&stmt, "execute_in_tx")?
+        };
         self.execute_statement(&stmt, sql, params, Some(tx))
     }
 
@@ -1796,6 +2112,8 @@ impl Database {
         sync_pull_trigger_audit_projection: Option<&BTreeMap<String, TriggerDeclaration>>,
     ) -> Result<CommitValidationOutcome> {
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+        let pending_trigger_active_guards =
+            std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
         let mut pending_sink_events = Vec::new();
         let mut committed_trigger_audit_entries = Vec::new();
         let validation_noop_count = std::cell::Cell::new(0_u64);
@@ -1809,10 +2127,21 @@ impl Database {
                             .get()
                             .saturating_add(outcome.conditional_noop_count),
                     );
-                    let audits = self
-                        .dispatch_triggers_for_tx(tx)
-                        .map_err(|failure| failure.error)?;
-                    *pending_trigger_audits.borrow_mut() = audits;
+                    match self.dispatch_triggers_for_tx(tx) {
+                        Ok(outcome) => {
+                            *pending_trigger_audits.borrow_mut() = outcome.pending;
+                            pending_trigger_active_guards
+                                .borrow_mut()
+                                .extend(outcome.active_guards);
+                        }
+                        Err(failure) => {
+                            let failure = *failure;
+                            pending_trigger_active_guards
+                                .borrow_mut()
+                                .extend(failure.active_guards);
+                            return Err(failure.error);
+                        }
+                    }
                     let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
                     validation_noop_count.set(
                         validation_noop_count
@@ -2032,7 +2361,7 @@ impl Database {
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
     ) -> Result<QueryResult> {
-        self.execute_statement_with_plan(stmt, sql, params, tx, None)
+        self.execute_statement_with_plan(stmt, sql, params, tx, None, None)
     }
 
     fn execute_statement_with_plan(
@@ -2042,15 +2371,23 @@ impl Database {
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
         cached_plan: Option<&PhysicalPlan>,
+        mut preopened_autocommit_tx: Option<TxId>,
     ) -> Result<QueryResult> {
-        self.plugin.on_query(sql)?;
+        if let Err(error) = self.plugin.on_query(sql) {
+            self.rollback_preopened_autocommit_tx(preopened_autocommit_tx.take());
+            return Err(error);
+        }
 
-        if let Some(change) = self.ddl_change_for_statement(stmt, tx).as_ref() {
-            self.plugin.on_ddl(change)?;
+        if let Some(change) = self.ddl_change_for_statement(stmt, tx).as_ref()
+            && let Err(error) = self.plugin.on_ddl(change)
+        {
+            self.rollback_preopened_autocommit_tx(preopened_autocommit_tx.take());
+            return Err(error);
         }
 
         let started = Instant::now();
         if let Some(result) = self.execute_event_bus_statement(stmt, tx) {
+            self.rollback_preopened_autocommit_tx(preopened_autocommit_tx.take());
             let outcome = query_outcome_from_result(&result);
             self.plugin.post_query(sql, started.elapsed(), &outcome);
             return result;
@@ -2061,12 +2398,18 @@ impl Database {
             && (ins.table.eq_ignore_ascii_case("GRAPH")
                 || ins.table.eq_ignore_ascii_case("__edges"))
         {
-            return self.execute_graph_insert(ins, params, tx);
+            return self.execute_graph_insert(ins, params, tx, preopened_autocommit_tx.take());
         }
 
         let result = (|| {
             if let Some(plan) = cached_plan {
-                return self.run_planned_statement(stmt, plan, params, tx);
+                return self.run_planned_statement(
+                    stmt,
+                    plan,
+                    params,
+                    tx,
+                    preopened_autocommit_tx.take(),
+                );
             }
 
             let (stmt, plan) = {
@@ -2076,8 +2419,11 @@ impl Database {
                 self.cache_statement_if_eligible(sql, &stmt, &plan);
                 (stmt, plan)
             };
-            self.run_planned_statement(&stmt, &plan, params, tx)
+            self.run_planned_statement(&stmt, &plan, params, tx, preopened_autocommit_tx.take())
         })();
+        if result.is_err() {
+            self.rollback_preopened_autocommit_tx(preopened_autocommit_tx.take());
+        }
         let duration = started.elapsed();
         let outcome = query_outcome_from_result(&result);
         self.plugin.post_query(sql, duration, &outcome);
@@ -2117,16 +2463,21 @@ impl Database {
         plan: &PhysicalPlan,
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
+        preopened_autocommit_tx: Option<TxId>,
     ) -> Result<QueryResult> {
-        validate_dml(plan, self, params)?;
+        if let Err(error) = validate_dml(plan, self, params) {
+            self.rollback_preopened_autocommit_tx(preopened_autocommit_tx);
+            return Err(error);
+        }
         let result = match tx {
             Some(tx) => {
                 // Reset rows_examined at the top of an in-tx statement so
                 // sub-plans accumulate rather than overwrite.
                 self.__reset_rows_examined();
+                let _write_gate = self.enter_sql_write_control_bypass(tx);
                 execute_plan(self, plan, params, Some(tx))
             }
-            None => self.execute_autocommit(plan, params),
+            None => self.execute_autocommit(plan, params, preopened_autocommit_tx),
         };
         if result.is_ok()
             && let Statement::CreateTable(ct) = stmt
@@ -2143,6 +2494,7 @@ impl Database {
         ins: &contextdb_parser::ast::Insert,
         params: &HashMap<String, Value>,
         tx: Option<TxId>,
+        preopened_autocommit_tx: Option<TxId>,
     ) -> Result<QueryResult> {
         use crate::executor::resolve_expr;
 
@@ -2161,40 +2513,61 @@ impl Database {
         let auto_commit = tx.is_none();
         let tx = match tx {
             Some(tx) => tx,
-            None => self.begin_for_internal_write()?,
+            None => match preopened_autocommit_tx {
+                Some(tx) => tx,
+                None => self.begin_for_public_autocommit_write()?,
+            },
         };
-        let mut count = 0u64;
-        for row_exprs in &ins.values {
-            let source = resolve_expr(&row_exprs[source_idx], params)?;
-            let target = resolve_expr(&row_exprs[target_idx], params)?;
-            let edge_type = resolve_expr(&row_exprs[edge_type_idx], params)?;
+        let result = {
+            let _write_gate = self.enter_sql_write_control_bypass(tx);
+            (|| {
+                let mut count = 0u64;
+                for row_exprs in &ins.values {
+                    let source = resolve_expr(&row_exprs[source_idx], params)?;
+                    let target = resolve_expr(&row_exprs[target_idx], params)?;
+                    let edge_type = resolve_expr(&row_exprs[edge_type_idx], params)?;
 
-            let source_uuid = match &source {
-                Value::Uuid(u) => *u,
-                Value::Text(t) => uuid::Uuid::parse_str(t)
-                    .map_err(|e| Error::PlanError(format!("invalid source_id uuid: {e}")))?,
-                _ => return Err(Error::PlanError("source_id must be UUID".into())),
-            };
-            let target_uuid = match &target {
-                Value::Uuid(u) => *u,
-                Value::Text(t) => uuid::Uuid::parse_str(t)
-                    .map_err(|e| Error::PlanError(format!("invalid target_id uuid: {e}")))?,
-                _ => return Err(Error::PlanError("target_id must be UUID".into())),
-            };
-            let edge_type_str = match &edge_type {
-                Value::Text(t) => t.clone(),
-                _ => return Err(Error::PlanError("edge_type must be TEXT".into())),
-            };
+                    let source_uuid = match &source {
+                        Value::Uuid(u) => *u,
+                        Value::Text(t) => uuid::Uuid::parse_str(t).map_err(|e| {
+                            Error::PlanError(format!("invalid source_id uuid: {e}"))
+                        })?,
+                        _ => return Err(Error::PlanError("source_id must be UUID".into())),
+                    };
+                    let target_uuid = match &target {
+                        Value::Uuid(u) => *u,
+                        Value::Text(t) => uuid::Uuid::parse_str(t).map_err(|e| {
+                            Error::PlanError(format!("invalid target_id uuid: {e}"))
+                        })?,
+                        _ => return Err(Error::PlanError("target_id must be UUID".into())),
+                    };
+                    let edge_type_str = match &edge_type {
+                        Value::Text(t) => t.clone(),
+                        _ => return Err(Error::PlanError("edge_type must be TEXT".into())),
+                    };
 
-            self.insert_edge(
-                tx,
-                source_uuid,
-                target_uuid,
-                edge_type_str,
-                Default::default(),
-            )?;
-            count += 1;
-        }
+                    self.insert_edge(
+                        tx,
+                        source_uuid,
+                        target_uuid,
+                        edge_type_str,
+                        Default::default(),
+                    )?;
+                    count += 1;
+                }
+                Ok(count)
+            })()
+        };
+
+        let count = match result {
+            Ok(count) => count,
+            Err(error) => {
+                if auto_commit {
+                    let _ = self.rollback_without_callback_tx_control(tx);
+                }
+                return Err(error);
+            }
+        };
 
         if auto_commit {
             self.commit_with_source(tx, CommitSource::AutoCommit)?;
@@ -2423,8 +2796,7 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<RowId> {
-        let _operation = self.open_operation()?;
-        self.assert_cron_callback_tx_bound_handle(tx)?;
+        let _operation = self.open_operation_after_write_control_wait(tx, "insert_row")?;
         self.ensure_trigger_table_ready(table, "insert_row")?;
         // Statement-scoped bound: `Value::TxId(n)` must satisfy
         // `n <= max(committed_watermark, tx)` so writes inside an active
@@ -2628,8 +3000,7 @@ impl Database {
         conflict_col: &str,
         mut values: HashMap<ColName, Value>,
     ) -> Result<UpsertResult> {
-        let _operation = self.open_operation()?;
-        self.assert_cron_callback_tx_bound_handle(tx)?;
+        let _operation = self.open_operation_after_write_control_wait(tx, "upsert_row")?;
         self.ensure_trigger_table_ready(table, "upsert_row")?;
         self.complete_insert_access_values(table, &mut values)?;
         let snapshot = self.snapshot_for_read();
@@ -5402,8 +5773,7 @@ impl Database {
     }
 
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
-        let _operation = self.open_operation()?;
-        self.assert_cron_callback_tx_bound_handle(tx)?;
+        let _operation = self.open_operation_after_write_control_wait(tx, "delete_row")?;
         self.ensure_trigger_table_ready(table, "delete_row")?;
         self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot())?;
         self.relational.delete(tx, table, row_id)
@@ -5569,8 +5939,7 @@ impl Database {
         edge_type: EdgeType,
         properties: HashMap<String, Value>,
     ) -> Result<bool> {
-        let _operation = self.open_operation()?;
-        self.assert_cron_callback_tx_bound_handle(tx)?;
+        let _operation = self.open_operation_after_write_control_wait(tx, "insert_edge")?;
         let snapshot = self.snapshot();
         self.assert_node_write_allowed(source, snapshot)?;
         self.assert_node_write_allowed(target, snapshot)?;
@@ -5607,8 +5976,7 @@ impl Database {
         target: NodeId,
         edge_type: &str,
     ) -> Result<()> {
-        let _operation = self.open_operation()?;
-        self.assert_cron_callback_tx_bound_handle(tx)?;
+        let _operation = self.open_operation_after_write_control_wait(tx, "delete_edge")?;
         let snapshot = self.snapshot();
         self.assert_node_write_allowed(source, snapshot)?;
         self.assert_node_write_allowed(target, snapshot)?;
@@ -5706,9 +6074,8 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
-        let _operation = self.open_operation()?;
+        let _operation = self.open_operation_after_write_control_wait(tx, "insert_vector")?;
         self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
-        self.assert_cron_callback_tx_bound_handle(tx)?;
         self.vector_store.state(&index)?;
         self.assert_existing_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         if let Some(expected) = self.pending_vector_dimension(tx, &index)?
@@ -5816,9 +6183,8 @@ impl Database {
     }
 
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
-        let _operation = self.open_operation()?;
+        let _operation = self.open_operation_after_write_control_wait(tx, "delete_vector")?;
         self.ensure_trigger_table_ready(&index.table, "delete_vector")?;
-        self.assert_cron_callback_tx_bound_handle(tx)?;
         self.vector_store.state(&index)?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
         let existing_live = self
@@ -6935,6 +7301,11 @@ impl Database {
 
     pub fn close(&self) -> Result<()> {
         let db_id = self as *const Self as usize;
+        let _close_waiter = if Self::callback_active_process_wide() {
+            Some(TriggerCloseWaiterGuard::new(&self.trigger))
+        } else {
+            None
+        };
         if Self::callback_active_process_wide() {
             self.assert_callback_reentry_allowed()?;
         }
@@ -6943,7 +7314,7 @@ impl Database {
                 "cannot close database from inside an active operation".to_string(),
             ));
         }
-        self.assert_public_tx_control_cross_thread_allowed()?;
+        self.assert_public_tx_control_cross_thread_allowed_for_surface("close")?;
         let _operation_barrier = self.operation_gate.write();
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -9775,6 +10146,13 @@ impl Database {
         }
     }
 
+    /// Marks trigger registration complete after all declared callbacks have
+    /// been registered.
+    ///
+    /// Trigger callbacks use the canonical callback contract documented on
+    /// [`Error::CallbackActiveCrossThread`]. Same-DB cross-thread writers wait
+    /// and proceed; unrelated cross-DB writers proceed independently;
+    /// same-thread callback reentry returns [`Error::CallbackReentry`].
     pub fn complete_initialization(&self) -> Result<()> {
         let _operation = self.open_operation()?;
         let declarations = self.trigger.declarations.lock();
@@ -9801,9 +10179,12 @@ impl Database {
     /// While the callback is active on Thread A, other threads writing to
     /// the same `Database` (or an internal handle/`Arc` clone that shares
     /// the same trigger state) wait until the callback's transaction
-    /// completes, then proceed as `Ok`. Cross-DB writers and same-thread
-    /// reentrant tx-control return typed `Err` (see
-    /// [`Error::CallbackActiveCrossThread`] and [`Error::CallbackReentry`]).
+    /// completes, then proceed as `Ok`. Unrelated cross-DB writers proceed
+    /// independently; same-thread reentry returns [`Error::CallbackReentry`];
+    /// callback tx-bound handles remain isolated to the runner thread; cron
+    /// same-DB contention remains immediate; and a bounded deadlock-guard
+    /// timeout returns the typed callback-active error plus one
+    /// `tracing::warn!`.
     ///
     /// # Example
     ///
@@ -9847,7 +10228,7 @@ impl Database {
     /// entered.wait();  // callback is now parked
     ///
     /// // Thread B writes against the same DB while A's callback is parked.
-    /// // Under §30 it waits and proceeds.
+    /// // Same-DB contention waits and proceeds.
     /// let db_b = db.clone();
     /// let (started_tx, started_rx) = mpsc::channel();
     /// let writer_b = thread::spawn(move || {
@@ -9883,11 +10264,21 @@ impl Database {
         Ok(())
     }
 
+    /// Lists declared triggers.
+    ///
+    /// See [`Error::CallbackActiveCrossThread`] for the trigger concurrency
+    /// contract that applies once callbacks are registered and initialization
+    /// is complete.
     pub fn list_triggers(&self) -> Vec<TriggerDeclaration> {
         let _operation = self.assert_open_operation();
         self.persisted_trigger_declarations()
     }
 
+    /// Lists registered host callback names.
+    ///
+    /// See [`Error::CallbackActiveCrossThread`] for the same-DB wait,
+    /// unrelated-DB independence, Class A reentry, cron B1, and deadlock-guard
+    /// behavior that applies to active callbacks.
     pub fn registered_trigger_callbacks(&self) -> Vec<String> {
         let _operation = self.assert_open_operation();
         let mut names = self
@@ -9911,11 +10302,20 @@ impl Database {
         trigger::TRIGGER_AUDIT_RING_CAPACITY
     }
 
+    /// Returns the in-memory trigger audit ring.
+    ///
+    /// Deadlock-guard timeouts are operator tracing events, not durable trigger
+    /// audit rows; see [`Error::CallbackActiveCrossThread`] for the timeout
+    /// contract.
     pub fn trigger_audit_log(&self) -> Vec<TriggerAuditEntry> {
         let _operation = self.assert_open_operation();
         self.trigger.audit_ring.lock().iter().cloned().collect()
     }
 
+    /// Returns persisted trigger audit history filtered by trigger name/status.
+    ///
+    /// Deadlock-guard timeout diagnostics are emitted via `tracing::warn!`
+    /// rather than this audit history. See [`Error::CallbackActiveCrossThread`].
     pub fn trigger_audit_history(
         &self,
         filter: TriggerAuditFilter,
@@ -9946,8 +10346,7 @@ impl Database {
         mut changes: ChangeSet,
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
-        let _operation = self.open_operation()?;
-        self.assert_public_tx_control_callbacks_allowed()?;
+        let _operation = self.open_operation_after_public_tx_control_wait("apply_changes")?;
         // Per I14: the whole batch takes the index-maintenance lock once.
         // Per-row commits reuse the same guard via the per-row apply that
         // runs inside the tx manager's commit_mutex, so no second write

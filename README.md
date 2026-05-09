@@ -18,7 +18,9 @@ contextdb> UPDATE decisions SET status = 'draft' WHERE id = '550e8400...';
 Error: invalid state transition: active -> draft
 ```
 
-No triggers. No application-side validation. The database enforces it.
+No PostgreSQL-style validation triggers. No duplicated application-side
+constraint checks. The database enforces policy invariants, while host
+callbacks are reserved for explicit observation/cascade workflows.
 
 **Familiar conventions, nothing new to learn:** PostgreSQL-compatible SQL, [pgvector](https://github.com/pgvector/pgvector) syntax for vector search (`<=>`), and [SQL/PGQ](https://www.iso.org/standard/76120.html)-style `GRAPH_TABLE ... MATCH` for graph queries — the subset that matters for bounded traversal, not the full standard.
 
@@ -34,10 +36,10 @@ See [Why contextdb?](docs/why-contextdb.md) for the full problem statement, or j
 |---|---|---|
 | Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in, auto-HNSW at 1K vectors, pre-filtered search, same MVCC transaction as rows |
 | Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ with bounded BFS, DAG enforcement, typed edges |
-| State machines | CHECK constraints + triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
+| State machines | CHECK constraints + validation triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
 | Atomic cross-model updates | Application-level coordination | Single MVCC transaction across relational + graph + vector |
 | Sync | Build your own | Bidirectional collaborative sync — each database syncs changesets with conflict resolution, not WAL pages |
-| Immutable tables | Not enforceable (triggers are bypassable) | `IMMUTABLE` keyword, enforced by the database engine |
+| Immutable tables | Not enforceable with bypassable validation triggers | `IMMUTABLE` keyword, enforced by the database engine |
 | Cascading invalidation | Application code | `PROPAGATE` in DDL — state changes cascade along edges and FKs |
 
 ## Use It As a Library
@@ -97,6 +99,54 @@ let result = db.execute(
 let rx = db.subscribe();
 // rx is a std::sync::mpsc::Receiver<CommitEvent>
 ```
+
+### Observation Triggers
+
+contextdb rejects PG-style validation triggers as an invariant mechanism:
+constraints such as `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` are
+engine-enforced. It does support host-callback ObservationTriggers for
+transactional observation and cascade writes that belong with the firing
+transaction.
+
+```rust
+use contextdb_core::Value;
+use contextdb_engine::Database;
+use std::collections::HashMap;
+
+let db = Database::open_memory();
+db.execute("CREATE TABLE observation (id UUID PRIMARY KEY)", &HashMap::new())?;
+db.execute(
+    "CREATE TABLE derived (id UUID PRIMARY KEY, observation_id UUID)",
+    &HashMap::new(),
+)?;
+db.execute(
+    "CREATE TRIGGER observation_seen ON observation WHEN INSERT",
+    &HashMap::new(),
+)?;
+
+db.register_trigger_callback("observation_seen", |db, ctx| {
+    db.execute_in_tx(
+        ctx.tx,
+        "INSERT INTO derived (id, observation_id) VALUES ($id, $observation)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(uuid::Uuid::new_v4())),
+            (
+                "observation".to_string(),
+                ctx.row_values.get("id").cloned().unwrap_or(Value::Null),
+            ),
+        ]),
+    )?;
+    Ok(())
+})?;
+db.complete_initialization()?;
+```
+
+The callback runs synchronously inside the firing transaction's commit window.
+Same-DB cross-thread writers wait-and-proceed inside the engine, unrelated
+databases proceed independently, same-thread callback reentry receives
+`CallbackReentry`, callback tx-bound handles stay isolated to the runner
+thread, cron same-DB contention remains immediate, and an unhealthy wait trips
+the bounded deadlock guard with a structured `tracing::warn!`.
 
 ### One Query, Three Subsystems
 

@@ -82,6 +82,60 @@ audio, or policy embeddings with different dimensions and quantization choices.
 
 ---
 
+## Trigger Concurrency
+
+ObservationTriggers are host callbacks declared with `CREATE TRIGGER` and
+registered through `Database::register_trigger_callback`. They are not
+PG-style validation triggers; schema invariants remain engine-enforced through
+DDL. A trigger callback runs synchronously inside the firing transaction's
+commit window, and callback writes use the supplied tx-bound `Database` handle
+so relational rows, graph edges, and vectors commit atomically.
+
+The callback-active contract is deliberately split by concurrency domain:
+
+- same-DB trigger Class B waits-and-proceeds inside the engine, including
+  public tx-control, SQL write paths, direct write helpers, and internal
+  handles that share the same trigger state
+- unrelated cross-DB writers proceed independently; a parked callback on DB-X
+  does not poison ordinary worker-thread writes on DB-Y
+- Class A callback-thread reentry returns `CallbackReentry`; retrying inside
+  the callback body is misuse
+- callback tx-bound handles remain isolated to their runner thread
+- cron same-DB Class B keeps the immediate typed cron callback-active error
+- a same-DB trigger wait that exceeds `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS`
+  returns the typed trigger callback-active error and emits one warning
+
+Waiters do not hold the public-operation read guard while parked. That lets
+`close()` acquire the write barrier after the active callback exits; a parked
+writer then wakes to the ordinary closed-handle error instead of proceeding.
+
+### Operator Runbook
+
+Healthy same-DB trigger contention does not emit tracing events. A warning means
+the bounded deadlock guard fired:
+
+```rust
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+tracing_subscriber::registry()
+    .with(EnvFilter::from_default_env())
+    .with(fmt::layer().json())
+    .init();
+```
+
+The warning carries structured fields:
+
+```text
+trigger_name=<name> waited_ms=<milliseconds> surface=<begin|commit|rollback|apply_changes|close|execute|execute_in_tx|direct helper>
+```
+
+Interpretation: no warning means normal wait-and-proceed contention; a warning
+means the callback did not finish within the guard budget. The default guard is
+60 seconds. Override with `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS`; values below
+5 seconds can false-positive under legitimate deep cascades.
+
+---
+
 ## Storage: `WriteSetApplicator`
 
 The boundary between compute and storage:

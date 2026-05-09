@@ -29,10 +29,10 @@ contextdb replaces all three with one embedded database. One transaction atomica
 |---|---|---|
 | Vector search | sqlite-vec (separate extension, no unified transactions with relational data) | Built-in, auto-HNSW at 1K vectors, pre-filtered search, same MVCC transaction as rows |
 | Graph traversal | Recursive CTEs (unbounded, no cycle detection) | SQL/PGQ-style MATCH with bounded BFS, typed edges |
-| State machines | CHECK constraints + triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
+| State machines | CHECK constraints + validation triggers (bypassable) | `STATE MACHINE` in DDL, enforced by the database engine |
 | Atomic cross-model updates | Application-level coordination | Single MVCC transaction across relational + graph + vector |
 | Sync | Build your own | Built-in local-to-server replication with conflict resolution |
-| Immutable tables | Not enforceable (triggers are bypassable) | `IMMUTABLE` keyword, enforced by the database engine |
+| Immutable tables | Not enforceable with bypassable validation triggers | `IMMUTABLE` keyword, enforced by the database engine |
 | Cascading invalidation | Application code | `PROPAGATE` in DDL — state changes cascade along edges and FKs |
 
 ---
@@ -77,6 +77,15 @@ CREATE TABLE observations (...) IMMUTABLE
 CREATE TABLE scratch (...) RETAIN 24 HOURS
 CREATE TABLE logs (...) RETAIN 90 DAYS SYNC SAFE
 ```
+
+**ObservationTriggers** — Host callbacks for transactional observation and
+cascade writes. These are not validation triggers; engine invariants stay in
+DDL. A declared `CREATE TRIGGER` plus a registered Rust callback runs inside
+the firing transaction. Same-DB cross-thread writers wait-and-proceed,
+unrelated databases proceed independently, callback-thread reentry receives
+`CallbackReentry`, callback tx-bound handles stay isolated to the runner
+thread, cron same-DB contention remains immediate, and deadlock-guard timeouts
+emit a structured `tracing::warn!`.
 
 ---
 
