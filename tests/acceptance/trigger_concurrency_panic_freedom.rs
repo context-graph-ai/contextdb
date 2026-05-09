@@ -1,6 +1,11 @@
 //! Trigger-active tx-control symmetry — typed-variant escape across all
 //! tx-control surfaces under all four distinct callback-active conditions.
 
+use crate::common_tracing::{
+    T37_COUNT_ENABLED, T37_TRACING_COUNT,
+    install_global_subscriber as t37_install_global_subscriber, t37_reset,
+};
+use crate::trigger_same_db_progress::EnvGuard;
 use contextdb_core::{CallbackKind, Error, Lsn, Result, RowId, TxId, Value, VectorIndexRef};
 use contextdb_engine::Database;
 use contextdb_engine::plugin::DatabasePlugin;
@@ -10,7 +15,7 @@ use contextdb_engine::sync_types::{
 use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -97,6 +102,27 @@ where
         Ok(value) => Ok(value),
         Err(payload) => std::panic::resume_unwind(payload),
     }
+}
+
+fn wait_until_trigger_wait_observed(db: &Database, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if db
+            .trigger_progress_telemetry_snapshot_for_test()
+            .wait_observed
+            >= 1
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    false
+}
+
+fn run_cross_db_b2_probe<T: Send + 'static>(probe: impl FnOnce() -> T + Send + 'static) -> T {
+    thread::spawn(probe)
+        .join()
+        .expect("cross-DB B2 probe thread")
 }
 
 /// Non-allocating `core::fmt::Write` adapter. Asserts no allocation by writing
@@ -586,7 +612,7 @@ fn assert_forbidden_statement_family_left_no_side_effects(
     );
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DirectApiSideEffectProbe {
     delete_row_key: u128,
     delete_row_id: RowId,
@@ -1081,20 +1107,22 @@ fn t03_begin_b1_cron_cross_thread() {
 }
 
 // ============================================================================
-// t04_begin_b2_trigger_cross_thread — RED
+// t04_begin_cross_db_b2_trigger_returns_typed_err — REGRESSION GUARD
 // ============================================================================
 #[test]
 #[serial]
-fn t04_begin_b2_trigger_cross_thread() {
+fn t04_begin_cross_db_b2_trigger_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        let fire = fire_trigger_in_thread(db.clone(), 0xB2);
-        entered.wait();
-        let result = db.begin();
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC04);
+        entered_x.wait();
+        let db_y_probe = db_y.clone();
+        let result = run_cross_db_b2_probe(move || db_y_probe.begin());
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 result,
@@ -1102,11 +1130,11 @@ fn t04_begin_b2_trigger_cross_thread() {
                     kind: CallbackKind::Trigger
                 })
             ),
-            "expected Err(CallbackActiveCrossThread {{ kind: Trigger }}), got {:?}",
+            "expected Err(CallbackActiveCrossThread {{ kind: Trigger }}) on cross-DB B2, got {:?}",
             result
         );
     })
-    .expect("t04 deadlocked");
+    .expect("t04 cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -1233,19 +1261,21 @@ fn t07_commit_b1_cron_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
-fn t08_commit_b2_trigger_cross_thread() {
+fn t08_commit_cross_db_b2_trigger_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
         let setup_table = "commit_probe_08";
         let setup_key = 0xC08;
-        let setup_tx = stage_commit_probe_row(&db, setup_table, setup_key);
-        let fire = fire_trigger_in_thread(db.clone(), 0xC8);
-        entered.wait();
-        let result = db.commit(setup_tx);
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let setup_tx = stage_commit_probe_row(&db_y, setup_table, setup_key);
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC8);
+        entered_x.wait();
+        let db_y_probe = db_y.clone();
+        let result = run_cross_db_b2_probe(move || db_y_probe.commit(setup_tx));
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 result,
@@ -1253,12 +1283,12 @@ fn t08_commit_b2_trigger_cross_thread() {
                     kind: CallbackKind::Trigger
                 })
             ),
-            "expected Err(CallbackActiveCrossThread {{ kind: Trigger }}), got {:?}",
+            "expected Err(CallbackActiveCrossThread {{ kind: Trigger }}) on cross-DB B2, got {:?}",
             result
         );
-        assert_commit_probe_survives_typed_err(&db, setup_table, setup_tx, setup_key);
+        assert_commit_probe_survives_typed_err(&db_y, setup_table, setup_tx, setup_key);
     })
-    .expect("t08 deadlocked");
+    .expect("t08 cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -1385,19 +1415,21 @@ fn t11_rollback_b1_cron_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
-fn t12_rollback_b2_trigger_cross_thread() {
+fn t12_rollback_cross_db_b2_trigger_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
         let setup_table = "rollback_probe_12";
         let setup_key = 0xC12;
-        let setup_tx = stage_commit_probe_row(&db, setup_table, setup_key);
-        let fire = fire_trigger_in_thread(db.clone(), 0xC12);
-        entered.wait();
-        let result = db.rollback(setup_tx);
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let setup_tx = stage_commit_probe_row(&db_y, setup_table, setup_key);
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC12);
+        entered_x.wait();
+        let db_y_probe = db_y.clone();
+        let result = run_cross_db_b2_probe(move || db_y_probe.rollback(setup_tx));
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 result,
@@ -1408,9 +1440,9 @@ fn t12_rollback_b2_trigger_cross_thread() {
             "got {:?}",
             result
         );
-        assert_rollback_probe_survives_typed_err(&db, setup_table, setup_tx, setup_key);
+        assert_rollback_probe_survives_typed_err(&db_y, setup_table, setup_tx, setup_key);
     })
-    .expect("t12 deadlocked");
+    .expect("t12 cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -1781,20 +1813,23 @@ fn t15b_apply_changes_non_row_shapes_b1_cron_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
-fn t16_apply_changes_b2_trigger_cross_thread() {
+fn t16_apply_changes_cross_db_b2_trigger_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        // Apply target table — separate from `t` (the trigger's firing table).
-        db.execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        db_y.execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
             .unwrap();
-        let fire = fire_trigger_in_thread(db.clone(), 0xC16);
-        entered.wait();
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC16);
+        entered_x.wait();
         let cs = populated_changeset("applied", 0xC16B);
-        let result = db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins));
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let db_y_probe = db_y.clone();
+        let result = run_cross_db_b2_probe(move || {
+            db_y_probe.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 result,
@@ -1805,14 +1840,14 @@ fn t16_apply_changes_b2_trigger_cross_thread() {
             "got {:?}",
             result
         );
-        let snap = db.snapshot();
+        let snap = db_y.snapshot();
         assert_eq!(
-            db.scan("applied", snap).unwrap().len(),
+            db_y.scan("applied", snap).unwrap().len(),
             0,
-            "apply_changes must trip its callback-active gate BEFORE consuming the changeset"
+            "apply_changes must trip its cross-DB callback-active gate BEFORE consuming the changeset"
         );
     })
-    .expect("t16 deadlocked");
+    .expect("t16 cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -1823,14 +1858,15 @@ fn t16_apply_changes_b2_trigger_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
-fn t16b_apply_changes_non_row_shapes_b2_trigger_cross_thread() {
+fn t16b_apply_changes_non_row_shapes_cross_db_b2_trigger_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        let vector_row_id = prepare_vector_shape_target(&db, 0x16B2_0000);
-        let fire = fire_trigger_in_thread(db.clone(), 0xC16B0);
-        entered.wait();
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        let vector_row_id = prepare_vector_shape_target(&db_y, 0x16B2_0000);
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC16B0);
+        entered_x.wait();
         let shapes = [
             ("empty", ChangeSet::default()),
             ("edge-only", edge_only_changeset(0x16B1)),
@@ -1840,12 +1876,17 @@ fn t16b_apply_changes_non_row_shapes_b2_trigger_cross_thread() {
         ];
         let mut observed = Vec::with_capacity(shapes.len());
         for (name, changes) in shapes {
-            let result =
-                db.apply_changes(changes, &ConflictPolicies::uniform(ConflictPolicy::LatestWins));
+            let db_y_probe = db_y.clone();
+            let result = run_cross_db_b2_probe(move || {
+                db_y_probe.apply_changes(
+                    changes,
+                    &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+                )
+            });
             observed.push((name, result));
         }
-        done.wait();
-        fire.join().unwrap().unwrap();
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         for (name, result) in observed {
             assert!(
                 matches!(
@@ -1854,18 +1895,18 @@ fn t16b_apply_changes_non_row_shapes_b2_trigger_cross_thread() {
                         kind: CallbackKind::Trigger
                     })
                 ),
-                "{name} ChangeSet under B2 must return CallbackActiveCrossThread{{Trigger}}, got {:?}",
+                "{name} ChangeSet under cross-DB B2 must return CallbackActiveCrossThread{{Trigger}}, got {:?}",
                 result
             );
         }
         assert_non_row_apply_shapes_left_no_side_effects(
-            &db,
+            &db_y,
             vector_row_id,
             &[0x16B3, 0x16B4],
-            "B2",
+            "cross-DB B2",
         );
     })
-    .expect("t16b deadlocked");
+    .expect("t16b cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -1983,16 +2024,18 @@ fn t19_close_b1_cron_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
-fn t20_close_b2_trigger_cross_thread() {
+fn t20_close_cross_db_b2_trigger_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        let fire = fire_trigger_in_thread(db.clone(), 0xC20);
-        entered.wait();
-        let result = db.close();
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC20);
+        entered_x.wait();
+        let db_y_probe = db_y.clone();
+        let result = run_cross_db_b2_probe(move || db_y_probe.close());
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 result,
@@ -2003,9 +2046,9 @@ fn t20_close_b2_trigger_cross_thread() {
             "got {:?}",
             result
         );
-        assert_handle_still_open(&db, "close B2");
+        assert_handle_still_open(&db_y, "close cross-DB B2");
     })
-    .expect("t20 deadlocked");
+    .expect("t20 cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -2169,21 +2212,25 @@ fn t23_helper_cross_thread_b1() {
 // ============================================================================
 #[test]
 #[serial]
-fn t24_helper_cross_thread_b2() {
+fn t24_execute_helper_cross_db_b2_trigger_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        db.execute("CREATE TABLE w (id UUID PRIMARY KEY)", &empty())
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        db_y.execute("CREATE TABLE w (id UUID PRIMARY KEY)", &empty())
             .unwrap();
-        let fire = fire_trigger_in_thread(db.clone(), 0xC24);
-        entered.wait();
-        let result = db.execute(
-            "INSERT INTO w (id) VALUES ($id)",
-            &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xC24A)))]),
-        );
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC24);
+        entered_x.wait();
+        let db_y_probe = db_y.clone();
+        let result = run_cross_db_b2_probe(move || {
+            db_y_probe.execute(
+                "INSERT INTO w (id) VALUES ($id)",
+                &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xC24A)))]),
+            )
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 result,
@@ -2195,11 +2242,11 @@ fn t24_helper_cross_thread_b2() {
             result
         );
         assert!(
-            !table_contains_uuid(&db, "w", 0xC24A),
-            "execute() under B2 must return before staging the cross-thread INSERT"
+            !table_contains_uuid(&db_y, "w", 0xC24A),
+            "execute() under cross-DB B2 must return before staging the cross-thread INSERT"
         );
     })
-    .expect("t24 deadlocked");
+    .expect("t24 cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -2345,109 +2392,172 @@ fn t25b_direct_api_tx_bound_b1() {
 }
 
 // ============================================================================
-// t26b_direct_api_tx_bound_b2 — RED
-// Symmetric direct library API coverage for trigger-active cross-thread gating.
-// ============================================================================
+// t26b_direct_api_tx_bound_same_db_b2_waits_and_proceeds — RED
+// Symmetric direct library API coverage for same-DB wait/proceed gating.
 #[test]
 #[serial]
-fn t26b_direct_api_tx_bound_b2() {
+fn t26b_direct_api_tx_bound_same_db_b2_waits_and_proceeds() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        let probe = prepare_direct_api_side_effect_probe(&db, 0xC26B00);
-        let setup_tx = db.begin().expect("setup begin");
-        let fire = fire_trigger_in_thread(db.clone(), 0xC26B);
-        entered.wait();
-        let results = [
-            (
-                "insert_row",
+        fn run_case<F, A>(name: &'static str, key_base: u128, action: F, assert_applied: A)
+        where
+            F: FnOnce(Arc<Database>, TxId, DirectApiSideEffectProbe) -> Result<()> + Send + 'static,
+            A: FnOnce(&Database, &DirectApiSideEffectProbe),
+        {
+            let entered = Arc::new(Barrier::new(2));
+            let done = Arc::new(Barrier::new(2));
+            let db = build_trigger_parked_db(entered.clone(), done.clone());
+            let probe = prepare_direct_api_side_effect_probe(&db, key_base);
+            let setup_tx = db.begin().expect("setup begin");
+            let fire = fire_trigger_in_thread(db.clone(), key_base + 0xFF);
+            entered.wait();
+            let db_probe = db.clone();
+            let probe_clone = probe.clone();
+            let direct = thread::spawn(move || action(db_probe, setup_tx, probe_clone));
+            let wait_observed = wait_until_trigger_wait_observed(&db, Duration::from_secs(2));
+            done.wait();
+            fire.join().unwrap().unwrap();
+            let result = direct.join().expect("direct API probe thread");
+            assert!(
+                wait_observed,
+                "direct {name} same-DB B2 must genuinely park before release"
+            );
+            assert!(
+                result.is_ok(),
+                "direct {name} under same-DB B2 must wait and proceed, got {result:?}"
+            );
+            db.commit(setup_tx)
+                .expect("direct API tx must remain commit-able after wait");
+            assert_applied(&db, &probe);
+        }
+
+        run_case(
+            "insert_row",
+            0xC26B00,
+            |db, tx, p| {
                 db.insert_row(
-                    setup_tx,
+                    tx,
                     "w",
-                    HashMap::from([("id".to_string(), Value::Uuid(uuid(probe.insert_row_key)))]),
+                    HashMap::from([("id".to_string(), Value::Uuid(uuid(p.insert_row_key)))]),
                 )
-                .map(|_| ()),
-            ),
-            (
-                "upsert_row",
+                .map(|_| ())
+            },
+            |db, p| assert!(table_contains_uuid(db, "w", p.insert_row_key)),
+        );
+        run_case(
+            "upsert_row",
+            0xC26C00,
+            |db, tx, p| {
                 db.upsert_row(
-                    setup_tx,
+                    tx,
                     "w",
                     "id",
-                    HashMap::from([("id".to_string(), Value::Uuid(uuid(probe.upsert_row_key)))]),
+                    HashMap::from([("id".to_string(), Value::Uuid(uuid(p.upsert_row_key)))]),
                 )
-                .map(|_| ()),
-            ),
-            (
-                "delete_row",
-                db.delete_row(setup_tx, "w", probe.delete_row_id),
-            ),
-            (
-                "insert_edge",
+                .map(|_| ())
+            },
+            |db, p| assert!(table_contains_uuid(db, "w", p.upsert_row_key)),
+        );
+        run_case(
+            "delete_row",
+            0xC26D00,
+            |db, tx, p| db.delete_row(tx, "w", p.delete_row_id),
+            |db, p| assert!(!table_contains_uuid(db, "w", p.delete_row_key)),
+        );
+        run_case(
+            "insert_edge",
+            0xC26E00,
+            |db, tx, p| {
                 db.insert_edge(
-                    setup_tx,
-                    probe.insert_edge_source,
-                    probe.insert_edge_target,
+                    tx,
+                    p.insert_edge_source,
+                    p.insert_edge_target,
                     "direct".to_string(),
                     HashMap::new(),
                 )
-                .map(|_| ()),
-            ),
-            (
-                "delete_edge",
-                db.delete_edge(
-                    setup_tx,
-                    probe.delete_edge_source,
-                    probe.delete_edge_target,
-                    "direct",
-                ),
-            ),
-            (
-                "insert_vector",
+                .map(|_| ())
+            },
+            |db, p| {
+                assert_eq!(
+                    db.edge_count(p.insert_edge_source, "direct", db.snapshot())
+                        .unwrap(),
+                    1
+                )
+            },
+        );
+        run_case(
+            "delete_edge",
+            0xC26F00,
+            |db, tx, p| db.delete_edge(tx, p.delete_edge_source, p.delete_edge_target, "direct"),
+            |db, p| {
+                assert_eq!(
+                    db.edge_count(p.delete_edge_source, "direct", db.snapshot())
+                        .unwrap(),
+                    0
+                )
+            },
+        );
+        run_case(
+            "insert_vector",
+            0xC27000,
+            |db, tx, p| {
                 db.insert_vector(
-                    setup_tx,
+                    tx,
                     VectorIndexRef::new("v", "embedding"),
-                    probe.insert_vector_row_id,
+                    p.insert_vector_row_id,
                     vec![0.1, 0.2, 0.3],
-                ),
-            ),
-            (
-                "delete_vector",
+                )
+            },
+            |db, p| {
+                let hits = db
+                    .query_vector(
+                        VectorIndexRef::new("v", "embedding"),
+                        &[0.1, 0.2, 0.3],
+                        10,
+                        None,
+                        db.snapshot(),
+                    )
+                    .unwrap();
+                assert!(
+                    hits.iter()
+                        .any(|(row_id, _)| *row_id == p.insert_vector_row_id)
+                );
+            },
+        );
+        run_case(
+            "delete_vector",
+            0xC27100,
+            |db, tx, p| {
                 db.delete_vector(
-                    setup_tx,
+                    tx,
                     VectorIndexRef::new("v", "embedding"),
-                    probe.delete_vector_row_id,
-                ),
-            ),
-        ];
-        done.wait();
-        fire.join().unwrap().unwrap();
-        for (name, result) in results {
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::CallbackActiveCrossThread {
-                        kind: CallbackKind::Trigger
-                    })
-                ),
-                "direct {name} under B2 must return CallbackActiveCrossThread{{Trigger}}, got {:?}",
-                result
-            );
-        }
-        db.commit(setup_tx)
-            .expect("direct API tx must remain commit-able after B2 typed Errs");
-        assert_direct_api_typed_err_left_no_side_effects(&db, &probe, "B2 direct API");
+                    p.delete_vector_row_id,
+                )
+            },
+            |db, p| {
+                let hits = db
+                    .query_vector(
+                        VectorIndexRef::new("v", "embedding"),
+                        &[0.9, 0.0, 0.0],
+                        10,
+                        None,
+                        db.snapshot(),
+                    )
+                    .unwrap();
+                assert!(
+                    hits.iter()
+                        .all(|(row_id, _)| *row_id != p.delete_vector_row_id)
+                );
+            },
+        );
     })
-    .expect("t26b deadlocked");
+    .expect("t26b same-DB wait/proceed deadlocked");
 }
 
 // ============================================================================
-// t26_helper_tx_bound_b2 — RED
-// ============================================================================
+// t26_helper_tx_bound_same_db_b2_waits_and_proceeds — RED
 #[test]
 #[serial]
-fn t26_helper_tx_bound_b2() {
+fn t26_helper_tx_bound_same_db_b2_waits_and_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let done = Arc::new(Barrier::new(2));
@@ -2457,31 +2567,31 @@ fn t26_helper_tx_bound_b2() {
         let setup_tx = db.begin().expect("setup begin");
         let fire = fire_trigger_in_thread(db.clone(), 0xC26);
         entered.wait();
-        let result = db.execute_in_tx(
-            setup_tx,
-            "INSERT INTO w (id) VALUES ($id)",
-            &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xC26A)))]),
-        );
+        let db_probe = db.clone();
+        let probe = thread::spawn(move || {
+            db_probe.execute_in_tx(
+                setup_tx,
+                "INSERT INTO w (id) VALUES ($id)",
+                &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xC26A)))]),
+            )
+        });
+        let wait_observed = wait_until_trigger_wait_observed(&db, Duration::from_secs(2));
         done.wait();
         fire.join().unwrap().unwrap();
+        let result = probe.join().expect("execute_in_tx probe thread");
         assert!(
-            matches!(
-                result,
-                Err(Error::CallbackActiveCrossThread {
-                    kind: CallbackKind::Trigger
-                })
-            ),
-            "got {:?}",
-            result
+            wait_observed,
+            "execute_in_tx same-DB B2 must genuinely park before release"
         );
+        result.expect("execute_in_tx under same-DB B2 must wait and proceed");
         db.commit(setup_tx)
-            .expect("execute_in_tx setup tx must remain commit-able after B2 typed Err");
+            .expect("execute_in_tx setup tx must commit after wait");
         assert!(
-            !table_contains_uuid(&db, "w", 0xC26A),
-            "execute_in_tx under B2 must return before staging the INSERT"
+            table_contains_uuid(&db, "w", 0xC26A),
+            "wait/proceed execute_in_tx must stage the row"
         );
     })
-    .expect("t26 deadlocked");
+    .expect("t26 helper same-DB wait/proceed deadlocked");
 }
 
 // ============================================================================
@@ -2724,177 +2834,85 @@ fn t30_class_distinguishability() {
 
 // ============================================================================
 // t31_retry_backoff_shape — RED
-// ============================================================================
 #[test]
 #[serial]
-fn t31_retry_backoff_shape() {
+fn t31_retry_backoff_shape_cross_db_b2() {
+    // §30: same-DB B2 is now a wait-and-proceed contract; the retry-shape
+    // probe for the typed-Err contract moves to cross-DB/non-owner B2. DB-X
+    // parks a callback; writers race against DB-Y from threads that are not
+    // DB-Y's owner. This preserves §29's cross-DB typed-Err perimeter without
+    // relying on a same-DB retry storm.
     run_with_timeout(|| {
-        // Two-barrier harness: fire thread enters callback (signals `entered`),
-        // then exits when every retrying thread has reported a typed contention
-        // observation (signaled by `done`).
         let entered = Arc::new(Barrier::new(2));
         let done = Arc::new(Barrier::new(2));
-        let entered_cb = entered.clone();
-        let done_cb = done.clone();
-        let db = Arc::new(Database::open_memory());
-        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
-            .unwrap();
-        db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &empty())
-            .unwrap();
-        db.register_trigger_callback("tr", move |_db, _ctx| {
-            entered_cb.wait();              // signal: callback body active, parking
-            done_cb.wait();                  // wait for retry threads to observe contention
-            Ok(())
-        })
-        .unwrap();
-        db.complete_initialization().unwrap();
+        // db_y is the probe target. Writers race begin() on db_y from threads
+        // that are not its owner. The active callback lives on db_x (a
+        // different Database), so this exercises the preserved cross-DB
+        // typed-Err perimeter.
+        let db_y = build_trigger_parked_db(entered.clone(), done.clone());
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
 
-        // Fire the trigger on a dedicated thread.
-        let fire = fire_trigger_in_thread(db.clone(), 0xC31);
-        // Wait until the callback is parked. From this point, every begin()
-        // call observes B2 (cross-thread trigger active).
-        entered.wait();
+        // Park the callback on db_x (cross-DB to db_y from the writers'
+        // perspective). The writers race begin() on db_y; cross-DB-of-db_x's
+        // callback engages db_y writers' assert_public_tx_control_cross_thread_allowed
+        // on the global trigger active count, returning typed-Err.
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0x0C31);
+        entered_x.wait();
 
-        // 8 retrying threads. Each retries on CallbackActiveCrossThread{Trigger}
-        // with exponential backoff (1ms to 50ms cap), counting attempts AND counting
-        // typed-Err observations. Both counters PIN that the contention path was
-        // actually exercised, defeating a no-op `begin() -> Ok(_)` regression.
-        #[derive(Debug)]
-        enum RetryObservation {
-            FirstTypedErr(usize),
-            SucceededBeforeTypedErr { thread: usize, attempts: usize },
-            UnexpectedErr { thread: usize, error: String },
-            RetryLimitExceeded { thread: usize, attempts: usize },
-        }
-
+        let typed_err_seen = Arc::new(AtomicUsize::new(0));
         let n = 8usize;
-        let attempts_per_thread = Arc::new(Mutex::new(vec![0usize; n]));
-        let observed_typed_err_count = Arc::new(AtomicUsize::new(0));
-        let (obs_tx, obs_rx) = mpsc::channel();
         let mut handles = Vec::with_capacity(n);
-        for i in 0..n {
-            let db = db.clone();
-            let attempts_per_thread = attempts_per_thread.clone();
-            let observed_typed_err_count = observed_typed_err_count.clone();
-            let obs_tx = obs_tx.clone();
-            handles.push(thread::spawn(move || -> Result<()> {
+        for _ in 0..n {
+            let db = db_y.clone();
+            let typed_err_seen = typed_err_seen.clone();
+            handles.push(thread::spawn(move || {
                 let mut backoff_ms: u64 = 1;
                 let mut attempts = 0usize;
-                let mut observed_first_typed_err = false;
                 loop {
                     attempts += 1;
                     if attempts > 50 {
-                        attempts_per_thread.lock().unwrap()[i] = attempts;
-                        let _ = obs_tx.send(RetryObservation::RetryLimitExceeded {
-                            thread: i,
-                            attempts,
-                        });
-                        panic!("thread {i} exceeded 50 retries");
+                        panic!("thread exceeded 50 retries");
                     }
                     match db.begin() {
                         Ok(tx) => {
-                            // Drop the tx; we are testing retry shape, not commit.
                             let _ = db.rollback(tx);
-                            attempts_per_thread.lock().unwrap()[i] = attempts;
-                            if !observed_first_typed_err {
-                                let _ = obs_tx.send(RetryObservation::SucceededBeforeTypedErr {
-                                    thread: i,
-                                    attempts,
-                                });
-                            }
-                            return Ok(());
+                            return;
                         }
                         Err(Error::CallbackActiveCrossThread { kind: CallbackKind::Trigger }) => {
-                            observed_typed_err_count.fetch_add(1, AtomicOrdering::SeqCst);
-                            if !observed_first_typed_err {
-                                observed_first_typed_err = true;
-                                obs_tx.send(RetryObservation::FirstTypedErr(i)).unwrap();
-                            }
+                            typed_err_seen.fetch_add(1, AtomicOrdering::SeqCst);
                             thread::sleep(Duration::from_millis(backoff_ms));
-                            backoff_ms = (backoff_ms.saturating_mul(2)).min(50);
+                            backoff_ms = backoff_ms.saturating_mul(2).min(50);
                         }
-                        Err(other) => {
-                            attempts_per_thread.lock().unwrap()[i] = attempts;
-                            let error = format!("{other:?}");
-                            let _ = obs_tx.send(RetryObservation::UnexpectedErr {
-                                thread: i,
-                                error,
-                            });
-                            return Err(other);
-                        }
+                        Err(other) => panic!("unexpected: {other:?}"),
                     }
                 }
             }));
         }
-        drop(obs_tx);
 
-        let mut first_typed_err_by_thread = vec![false; n];
-        while !first_typed_err_by_thread.iter().all(|observed| *observed) {
-            match obs_rx
-                .recv()
-                .expect("retry workers exited before reporting their first observation")
-            {
-                RetryObservation::FirstTypedErr(thread) => {
-                    first_typed_err_by_thread[thread] = true;
-                }
-                RetryObservation::SucceededBeforeTypedErr { thread, attempts } => {
-                    done.wait();
-                    for h in handles {
-                        let _ = h.join();
-                    }
-                    let _ = fire.join();
-                    panic!(
-                        "thread {thread} succeeded after {attempts} attempts before observing CallbackActiveCrossThread{{Trigger}}"
-                    );
-                }
-                RetryObservation::UnexpectedErr { thread, error } => {
-                    done.wait();
-                    for h in handles {
-                        let _ = h.join();
-                    }
-                    let _ = fire.join();
-                    panic!("thread {thread} returned unexpected retry error before typed contention observation: {error}");
-                }
-                RetryObservation::RetryLimitExceeded { thread, attempts } => {
-                    done.wait();
-                    for h in handles {
-                        let _ = h.join();
-                    }
-                    let _ = fire.join();
-                    panic!("thread {thread} ran {attempts} retries before all threads observed typed contention");
-                }
-            }
-        }
-        done.wait();
+        // Release db_x's callback so its firing tx commits and writers
+        // converge.
+        thread::sleep(Duration::from_millis(50));
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
 
         for h in handles {
-            h.join().unwrap().unwrap();
+            h.join().unwrap();
         }
-        fire.join().unwrap().unwrap();
+        // db_y's parked callback was never fired by this test path; release
+        // its barriers so the test exits cleanly. (db_y's callback was never
+        // active; entered/done are unused.)
+        drop(entered);
+        drop(done);
 
-        let attempts = attempts_per_thread.lock().unwrap().clone();
-        for (i, count) in attempts.iter().enumerate() {
-            assert!(*count <= 50, "thread {i} ran {count} retries; cap is 50");
-        }
-        // Contention proof — every thread must have observed contention at
-        // least once. With 8 threads × a single 50ms-parked callback × backoff,
-        // every thread that wins past attempt 1 has seen the typed-Err arm at
-        // least once before that. The stricter "all >= 2" form catches a
-        // partial-no-op regression where one thread happened to win on attempt
-        // 1 (which "any > 1" would silently accept).
+        let total_typed_err = typed_err_seen.load(AtomicOrdering::SeqCst);
         assert!(
-            attempts.iter().all(|c| *c >= 2),
-            "every thread must retry at least once: {:?}",
-            attempts
-        );
-        // Typed-Err proof — the contention path returned the typed variant at
-        // least once. A no-op gate would never produce the typed Err.
-        assert!(
-            observed_typed_err_count.load(AtomicOrdering::SeqCst) >= 1,
-            "no thread observed CallbackActiveCrossThread{{Trigger}} — typed-Err contract not exercised"
+            total_typed_err >= 1,
+            "no thread observed CallbackActiveCrossThread{{Trigger}} on cross-DB B2 — typed-Err contract not exercised; total={total_typed_err}"
         );
     })
-    .expect("t31 deadlocked");
+    .expect("t31 cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -3789,171 +3807,205 @@ fn t36b_reentry_retry_never_helps_inside_trigger_callback() {
     .expect("t36b deadlocked");
 }
 
-// ============================================================================
-// t37_no_engine_logging_on_typed_err_production_path — RED
-// Drives the engine production path that returns the typed Err across all five
-// tx-control surfaces, counts engine-emitted tracing events PROCESS-WIDE, and
-// asserts zero events were produced by the engine. A positive-control event
-// emitted from inside the test (NOT from the engine) proves the subscriber
-// pipeline is live — without it a misconfigured subscriber would let the
-// assertion pass vacuously.
-//
-// Process-wide capture (via `set_global_default`) is required because the
-// retry threads cross thread boundaries and `subscriber::with_default` is
-// thread-local. The global subscriber is installed exactly once for the
-// test-binary lifetime via OnceLock; counting is gated by an AtomicBool so
-// other tests do not contribute events.
-// ============================================================================
-use std::sync::OnceLock;
-
-static T37_TRACING_COUNT: AtomicUsize = AtomicUsize::new(0);
-static T37_COUNT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static T37_SUBSCRIBER_INIT: OnceLock<()> = OnceLock::new();
-
-fn t37_install_global_subscriber() {
-    T37_SUBSCRIBER_INIT.get_or_init(|| {
-        use tracing::subscriber::set_global_default;
-        use tracing_subscriber::Registry;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        struct CountingLayer;
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountingLayer {
-            fn on_event(
-                &self,
-                _event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if T37_COUNT_ENABLED.load(AtomicOrdering::SeqCst) {
-                    T37_TRACING_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
-                }
-            }
-        }
-        let _ = set_global_default(Registry::default().with(CountingLayer));
-    });
-}
-
 #[test]
 #[serial]
-fn t37_no_engine_logging_on_typed_err_production_path() {
+fn t37_healthy_same_db_b2_emits_no_warn() {
+    // §30 contract: same-DB B2 waits and proceeds. Engine emits ZERO
+    // tracing events on the healthy wait path. Pinned post-§30 as a
+    // regression guard against future "warn on every parked waiter" drift.
     t37_install_global_subscriber();
-
+    t37_reset();
     run_with_timeout(|| {
-        // Drive B2 on every tx-control surface. Behavior contract §17 forbids
-        // tracing emission on typed-Err construction for the whole surface
-        // family, not only begin().
         let entered = Arc::new(Barrier::new(2));
         let done = Arc::new(Barrier::new(2));
-        let entered_cb = entered.clone();
-        let done_cb = done.clone();
-        let db = Arc::new(Database::open_memory());
-        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
-            .unwrap();
-        db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &empty())
-            .unwrap();
-        db.register_trigger_callback("tr", move |_db, _ctx| {
-            entered_cb.wait();
-            thread::sleep(Duration::from_millis(50));
-            done_cb.wait();
-            Ok(())
-        })
-        .unwrap();
-        db.complete_initialization().unwrap();
-        let commit_tx = db.begin().expect("setup commit tx");
-        let rollback_tx = db.begin().expect("setup rollback tx");
+        let db = build_trigger_parked_db(entered.clone(), done.clone());
 
-        let fire = fire_trigger_in_thread(db.clone(), 0xC37);
+        let fire = fire_trigger_in_thread(db.clone(), 0x0C37);
         entered.wait();
 
-        // Reset and enable global counting AFTER setup is complete so setup
-        // events (DDL, trigger registration) do not contribute.
         T37_TRACING_COUNT.store(0, AtomicOrdering::SeqCst);
         T37_COUNT_ENABLED.store(true, AtomicOrdering::SeqCst);
 
-        let mut typed_err_seen = 0usize;
-        let mut failures = Vec::new();
-        let mut cleanup_txs = Vec::new();
+        // A second thread calls begin() on the same DB. Under §30 it parks
+        // and proceeds (no typed-Err, no warn).
+        let db_probe = db.clone();
+        let probe = thread::spawn(move || db_probe.begin());
 
-        match db.begin() {
-            Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            }) => typed_err_seen += 1,
-            Ok(tx) => {
-                cleanup_txs.push(tx);
-                failures.push("begin returned Ok under B2".to_string());
+        let park_observed = {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut observed = false;
+            while Instant::now() < deadline {
+                if db
+                    .trigger_progress_telemetry_snapshot_for_test()
+                    .wait_observed
+                    >= 1
+                {
+                    observed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
             }
-            Err(other) => failures.push(format!("begin returned unexpected {other:?}")),
-        }
-        match db.commit(commit_tx) {
-            Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            }) => typed_err_seen += 1,
-            Ok(()) => failures.push("commit returned Ok under B2".to_string()),
-            Err(other) => failures.push(format!("commit returned unexpected {other:?}")),
-        }
-        match db.rollback(rollback_tx) {
-            Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            }) => typed_err_seen += 1,
-            Ok(()) => failures.push("rollback returned Ok under B2".to_string()),
-            Err(other) => failures.push(format!("rollback returned unexpected {other:?}")),
-        }
-        match db.apply_changes(
-            ChangeSet::default(),
-            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-        ) {
-            Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            }) => typed_err_seen += 1,
-            Ok(result) => failures.push(format!("apply_changes returned Ok({result:?}) under B2")),
-            Err(other) => failures.push(format!("apply_changes returned unexpected {other:?}")),
-        }
-        match db.close() {
-            Err(Error::CallbackActiveCrossThread {
-                kind: CallbackKind::Trigger,
-            }) => typed_err_seen += 1,
-            Ok(()) => failures.push("close returned Ok under B2".to_string()),
-            Err(other) => failures.push(format!("close returned unexpected {other:?}")),
-        }
+            observed
+        };
+        done.wait();
+        fire.join().unwrap().unwrap();
+        assert!(
+            park_observed,
+            "same-DB B2 probe did not park before release"
+        );
 
-        // Snapshot the engine-attributed event count BEFORE emitting the
-        // positive-control event so we can attribute the two cleanly.
+        let tx = probe
+            .join()
+            .unwrap()
+            .expect("same-DB B2 must wait and proceed");
+        let _ = db.rollback(tx);
+
         let engine_events = T37_TRACING_COUNT.load(AtomicOrdering::SeqCst);
-
-        // Positive control — proves the global subscriber pipeline is live.
-        // Without this, a misconfigured subscriber would silently let the
-        // engine_events == 0 assertion pass vacuously.
+        // Positive control — proves subscriber pipeline is live.
         tracing::error!("positive_control_event");
         let after_control = T37_TRACING_COUNT.load(AtomicOrdering::SeqCst);
         T37_COUNT_ENABLED.store(false, AtomicOrdering::SeqCst);
 
-        done.wait();
-        fire.join().unwrap().unwrap();
-        for tx in cleanup_txs {
-            let _ = db.rollback(tx);
-        }
-        let _ = db.rollback(commit_tx);
-        let _ = db.rollback(rollback_tx);
-
-        // Must have actually exercised the production typed-Err path.
-        assert!(
-            failures.is_empty(),
-            "typed-Err precondition failed across tx-control surfaces: {failures:?}"
-        );
-        assert_eq!(
-            typed_err_seen, 5,
-            "expected one typed B2 error from each tx-control surface"
-        );
         assert!(
             after_control > engine_events,
-            "positive-control tracing event was not captured — subscriber wiring is misconfigured; the engine_events == 0 assertion below is therefore not load-bearing (engine_events={engine_events}, after_control={after_control})"
+            "positive-control event was not captured; subscriber wiring is misconfigured"
         );
         assert_eq!(
-            engine_events,
-            0,
-            "engine emitted {engine_events} tracing event(s) on the typed-Err production path across begin/commit/rollback/apply_changes/close; behavior contract §17 forbids any engine logging on Error construction. typed_err_seen={typed_err_seen}"
+            engine_events, 0,
+            "engine emitted {engine_events} tracing event(s) on the healthy same-DB B2 wait path"
         );
     })
-    .expect("t37 deadlocked");
+    .expect("t37 healthy deadlocked");
+}
+
+#[test]
+#[serial]
+fn t37_cross_db_b2_emits_no_warn() {
+    // Cross-DB B2 keeps the §29 typed-Err contract. Engine emits ZERO
+    // tracing events on Error construction (the §29 invariant).
+    t37_install_global_subscriber();
+    t37_reset();
+    run_with_timeout(|| {
+        let entered = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+        let db_y = build_trigger_parked_db(entered.clone(), done.clone());
+        // Park a callback on db_x to engage the cross-DB B2 path on db_y.
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0x0C37C);
+        entered_x.wait();
+
+        T37_TRACING_COUNT.store(0, AtomicOrdering::SeqCst);
+        T37_COUNT_ENABLED.store(true, AtomicOrdering::SeqCst);
+
+        // db_y writer hits cross-DB B2 from a non-owner probe thread. Running
+        // on the owner thread would trigger §29's owner-thread exception and
+        // fail to exercise the cross-thread B2 arm.
+        let db_y_probe = db_y.clone();
+        let result = thread::spawn(move || db_y_probe.begin()).join().unwrap();
+        match result {
+            Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            }) => {}
+            other => panic!("expected cross-DB B2 typed-Err, got {other:?}"),
+        }
+
+        let engine_events = T37_TRACING_COUNT.load(AtomicOrdering::SeqCst);
+        tracing::error!("positive_control_event");
+        let after_control = T37_TRACING_COUNT.load(AtomicOrdering::SeqCst);
+        T37_COUNT_ENABLED.store(false, AtomicOrdering::SeqCst);
+
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
+        // db_y was never fired; release its barriers cleanly.
+        drop(entered);
+        drop(done);
+
+        assert!(after_control > engine_events);
+        assert_eq!(
+            engine_events, 0,
+            "engine emitted {engine_events} tracing event(s) on cross-DB B2 typed-Err path"
+        );
+    })
+    .expect("t37 cross-DB deadlocked");
+}
+
+#[test]
+#[serial]
+fn t37_deadlock_guard_emits_one_warn() {
+    // §30 contract: a parked-forever callback triggers the bounded deadlock
+    // guard. begin() returns typed-Err AND engine emits exactly one
+    // tracing::warn! with structured fields naming the trigger and surface.
+    t37_install_global_subscriber();
+    t37_reset();
+    // Override the deadlock-guard timeout to 2 s so the test does not wait 60 s.
+    // Note: env-var sets are process-wide; serial
+    // (the unified key shared across t30 + t37 tracing-sensitive tests) keeps
+    // every test that touches the timeout var or the global subscriber from
+    // racing each other.
+    // SAFETY: env mutation is unsafe in 2024 edition; use the std API.
+    unsafe {
+        std::env::set_var("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS", "2000");
+    }
+    let _env_guard = EnvGuard("CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS");
+    run_with_timeout(|| {
+        let entered = Arc::new(Barrier::new(2));
+        // Parked-forever: never call done.wait().
+        let parked_forever_done = Arc::new(Barrier::new(2));
+        let db = Arc::new(Database::open_memory());
+        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
+            .unwrap();
+        db.execute("CREATE TRIGGER probe_trigger ON t WHEN INSERT", &empty())
+            .unwrap();
+        let entered_cb = entered.clone();
+        let parked_forever_done_cb = parked_forever_done.clone();
+        db.register_trigger_callback("probe_trigger", move |_db, _ctx| {
+            entered_cb.wait();
+            parked_forever_done_cb.wait(); // never released by this test
+            Ok(())
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+
+        let fire = fire_trigger_in_thread(db.clone(), 0x0C37D);
+        entered.wait();
+
+        T37_TRACING_COUNT.store(0, AtomicOrdering::SeqCst);
+        T37_COUNT_ENABLED.store(true, AtomicOrdering::SeqCst);
+
+        let started = Instant::now();
+        let probe_result = db.begin();
+        let elapsed = started.elapsed();
+
+        let engine_events = T37_TRACING_COUNT.load(AtomicOrdering::SeqCst);
+        T37_COUNT_ENABLED.store(false, AtomicOrdering::SeqCst);
+
+        // Release the parked-forever callback so the firing thread can exit.
+        parked_forever_done.wait();
+        fire.join().unwrap().unwrap();
+
+        match probe_result {
+            Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            }) => {}
+            other => panic!("expected deadlock-guard typed-Err, got {other:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(2000),
+            "deadlock-guard fired before the 2-second budget: elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(10_000),
+            "deadlock-guard exceeded a generous 10-second test budget; elapsed={elapsed:?}"
+        );
+        assert_eq!(
+            engine_events, 1,
+            "deadlock-guard must emit exactly one tracing::warn!; saw {engine_events}"
+        );
+    })
+    .expect("t37 deadlock-guard deadlocked");
 }
 
 // ============================================================================
@@ -4437,32 +4489,31 @@ fn t43_surface_string_no_begin_token() {
 // ============================================================================
 #[test]
 #[serial]
-fn t44b_post_stub_begin_returns_typed_err_under_b2_cross_thread_contention() {
+fn t44b_begin_cross_db_b2_no_panic_returns_typed_err() {
     use std::panic::catch_unwind;
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        let fire = fire_trigger_in_thread(db.clone(), 0xC44B);
-        entered.wait();
-        let db_probe = db.clone();
-        let outcome = catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.begin()));
-        done.wait();
-        fire.join().unwrap().unwrap();
-        // Strict: post-stub (and post-Step-5) begin() must NOT panic AND must
-        // return the typed variant. Any Ok(Ok(_)) or Err(_) (panic regression)
-        // fails. At stub time the typed variant is not yet wired (Stub 2
-        // returns Error::Other) so this test is RED until Step 5 lands.
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC44B);
+        entered_x.wait();
+        let db_probe = db_y.clone();
+        let outcome = run_cross_db_b2_probe(move || {
+            catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.begin()))
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 outcome,
                 Ok(Err(Error::CallbackActiveCrossThread { kind: CallbackKind::Trigger }))
             ),
-            "expected Ok(Err(CallbackActiveCrossThread{{Trigger}})) under cross-thread trigger contention; got {:?}",
+            "expected Ok(Err(CallbackActiveCrossThread{{Trigger}})) under cross-DB B2 trigger contention; got {:?}",
             outcome
         );
     })
-    .expect("t44b deadlocked");
+    .expect("t44b begin cross-DB B2 deadlocked");
 }
 
 // ============================================================================
@@ -4473,48 +4524,23 @@ fn t44b_post_stub_begin_returns_typed_err_under_b2_cross_thread_contention() {
 // run_with_timeout deadlock (the spawned thread's panic would prevent the
 // channel send) without these sibling probes — t44b alone covers begin().
 // ============================================================================
-
-/// Helper for the t44b sibling family. Drives a B2 (parked-trigger cross-thread)
-/// scenario, captures the surface call inside `catch_unwind`, and returns the
-/// outcome for the caller to assert on. The parked callback is unblocked after
-/// the surface call records its result. AssertUnwindSafe wraps the inner call
-/// because Database holds interior mutability and is not UnwindSafe.
-fn t44b_capture_under_b2<F, T>(
-    surface: F,
-) -> std::result::Result<Result<T>, Box<dyn std::any::Any + Send>>
-where
-    F: FnOnce(Arc<Database>) -> Result<T>,
-    T: Send + 'static,
-{
-    let entered = Arc::new(Barrier::new(2));
-    let done = Arc::new(Barrier::new(2));
-    let db = build_trigger_parked_db(entered.clone(), done.clone());
-    let fire = fire_trigger_in_thread(db.clone(), 0xC44B5);
-    entered.wait();
-    let db_probe = db.clone();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || surface(db_probe)));
-    done.wait();
-    fire.join().unwrap().unwrap();
-    outcome
-}
-
 #[test]
 #[serial]
-fn t44b_commit_post_stub_returns_typed_err_under_b2_no_panic() {
+fn t44b_commit_cross_db_b2_no_panic_returns_typed_err() {
     run_with_timeout(|| {
-        // Pre-allocate a tx for commit() to operate on. begin() is itself
-        // gated, so do this BEFORE entering the parked-trigger window.
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        let setup_tx = db.begin().expect("setup begin");
-        let fire = fire_trigger_in_thread(db.clone(), 0xC44B6);
-        entered.wait();
-        let db_probe = db.clone();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.commit(setup_tx)));
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        let setup_tx = db_y.begin().expect("setup begin");
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC44B6);
+        entered_x.wait();
+        let db_probe = db_y.clone();
+        let outcome = run_cross_db_b2_probe(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.commit(setup_tx)))
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 outcome,
@@ -4522,28 +4548,31 @@ fn t44b_commit_post_stub_returns_typed_err_under_b2_no_panic() {
                     kind: CallbackKind::Trigger
                 }))
             ),
-            "commit() under B2 must NOT panic AND must return typed Err; got {:?}",
+            "commit() under cross-DB B2 must NOT panic AND must return typed Err; got {:?}",
             outcome
         );
     })
-    .expect("t44b_commit deadlocked");
+    .expect("t44b_commit cross-DB B2 deadlocked");
 }
 
+// ============================================================================
 #[test]
 #[serial]
-fn t44b_rollback_post_stub_returns_typed_err_under_b2_no_panic() {
+fn t44b_rollback_cross_db_b2_no_panic_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        let setup_tx = db.begin().expect("setup begin");
-        let fire = fire_trigger_in_thread(db.clone(), 0xC44B7);
-        entered.wait();
-        let db_probe = db.clone();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.rollback(setup_tx)));
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        let setup_tx = db_y.begin().expect("setup begin");
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC44B7);
+        entered_x.wait();
+        let db_probe = db_y.clone();
+        let outcome = run_cross_db_b2_probe(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.rollback(setup_tx)))
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 outcome,
@@ -4551,34 +4580,37 @@ fn t44b_rollback_post_stub_returns_typed_err_under_b2_no_panic() {
                     kind: CallbackKind::Trigger
                 }))
             ),
-            "rollback() under B2 must NOT panic AND must return typed Err; got {:?}",
+            "rollback() under cross-DB B2 must NOT panic AND must return typed Err; got {:?}",
             outcome
         );
     })
-    .expect("t44b_rollback deadlocked");
+    .expect("t44b_rollback cross-DB B2 deadlocked");
 }
 
+// ============================================================================
 #[test]
 #[serial]
-fn t44b_apply_changes_post_stub_returns_typed_err_under_b2_no_panic() {
+fn t44b_apply_changes_cross_db_b2_no_panic_returns_typed_err() {
     run_with_timeout(|| {
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = build_trigger_parked_db(entered.clone(), done.clone());
-        // apply target — separate from the trigger's firing table `t`.
-        db.execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        db_y.execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
             .unwrap();
-        let fire = fire_trigger_in_thread(db.clone(), 0xC44B8);
-        entered.wait();
-        let db_probe = db.clone();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            db_probe.apply_changes(
-                populated_changeset("applied", 0xC44B_8000),
-                &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-            )
-        }));
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC44B8);
+        entered_x.wait();
+        let db_probe = db_y.clone();
+        let outcome = run_cross_db_b2_probe(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db_probe.apply_changes(
+                    populated_changeset("applied", 0xC44B_8000),
+                    &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+                )
+            }))
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 outcome,
@@ -4586,18 +4618,30 @@ fn t44b_apply_changes_post_stub_returns_typed_err_under_b2_no_panic() {
                     kind: CallbackKind::Trigger
                 }))
             ),
-            "apply_changes() under B2 must NOT panic AND must return typed Err; got {:?}",
+            "apply_changes() under cross-DB B2 must NOT panic AND must return typed Err; got {:?}",
             outcome
         );
     })
-    .expect("t44b_apply_changes deadlocked");
+    .expect("t44b_apply_changes cross-DB B2 deadlocked");
 }
 
+// ============================================================================
 #[test]
 #[serial]
-fn t44b_close_post_stub_returns_typed_err_under_b2_no_panic() {
+fn t44b_close_cross_db_b2_no_panic_returns_typed_err() {
     run_with_timeout(|| {
-        let outcome = t44b_capture_under_b2(|db| db.close());
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
+        let db_y = Arc::new(Database::open_memory());
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC44B9);
+        entered_x.wait();
+        let db_probe = db_y.clone();
+        let outcome = run_cross_db_b2_probe(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db_probe.close()))
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
         assert!(
             matches!(
                 outcome,
@@ -4605,35 +4649,30 @@ fn t44b_close_post_stub_returns_typed_err_under_b2_no_panic() {
                     kind: CallbackKind::Trigger
                 }))
             ),
-            "close() under B2 must NOT panic AND must return typed Err; got {:?}",
+            "close() under cross-DB B2 must NOT panic AND must return typed Err; got {:?}",
             outcome
         );
     })
-    .expect("t44b_close deadlocked");
+    .expect("t44b_close cross-DB B2 deadlocked");
 }
 
 // ============================================================================
-// t45_constrained_handle_classifies_typed_err_identically_to_unconstrained — RED
-// Database opened via Database::open_with_contexts after an admin handle has
-// declared the trigger. Both A2 (same-thread reentry inside the callback) and
-// B2 (cross-thread begin on the constrained handle while its callback is parked)
-// must classify identically (same typed variant, same kind) to the unconstrained
-// handle case.
-// ============================================================================
+// t45_constrained_handle_classifies_reentry_and_same_db_b2_progress — RED
+// Constrained handles still classify Class A as CallbackReentry, while same-DB
+// B2 now waits and proceeds because it shares the parked trigger's state.
 #[test]
 #[serial]
-fn t45_constrained_handle_classifies_typed_err_identically_to_unconstrained() {
+fn t45_constrained_handle_classifies_reentry_and_same_db_b2_progress() {
     use std::collections::BTreeSet;
     run_with_timeout(|| {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join("t45-constrained.db");
-        // ContextId has only `pub fn new(uuid: Uuid) -> Self`; no From<&str> impl.
-        let ctx = contextdb_core::types::ContextId::new(Uuid::from_u128(0x00C0FFEE_0000_4045_A045_000000000045_u128));
+        let ctx = contextdb_core::types::ContextId::new(Uuid::from_u128(
+            0x00C0FFEE_0000_4045_A045_000000000045_u128,
+        ));
         let mut contexts = BTreeSet::new();
         contexts.insert(ctx.clone());
 
-        // Trigger DDL requires an admin handle. Declare schema first, then open
-        // the constrained handle against the same file-backed database.
         let admin = Database::open(&path).expect("open admin");
         admin
             .execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
@@ -4643,25 +4682,18 @@ fn t45_constrained_handle_classifies_typed_err_identically_to_unconstrained() {
             .unwrap();
         admin.close().unwrap();
 
-        let db_a = Arc::new(
-            Database::open_with_contexts(&path, contexts.clone()).expect("open_with_contexts a"),
-        );
-
-        // A2 probe — record the result of begin() called from inside the callback.
-        let observed_a2: Arc<Mutex<Option<Result<contextdb_core::TxId>>>> = Arc::new(Mutex::new(None));
+        let db_a =
+            Arc::new(Database::open_with_contexts(&path, contexts).expect("open_with_contexts a"));
+        let observed_a2: Arc<Mutex<Option<Result<contextdb_core::TxId>>>> =
+            Arc::new(Mutex::new(None));
         let observed_a2_cb = observed_a2.clone();
-        // Two-barrier handshake for the cross-thread B2 probe; the callback
-        // captures the A2 result, signals `entered`, waits at `done` so the
-        // B2 racer thread can run while the callback body is still active.
         let entered = Arc::new(Barrier::new(2));
         let done = Arc::new(Barrier::new(2));
         let entered_cb = entered.clone();
         let done_cb = done.clone();
         let db_a_for_cb = db_a.clone();
         db_a.register_trigger_callback("tr", move |_db_handle, _ctx| {
-            // A2: same-thread, same-handle reentry.
             *observed_a2_cb.lock().unwrap() = Some(db_a_for_cb.begin());
-            // Park so the B2 racer can run.
             entered_cb.wait();
             done_cb.wait();
             Ok(())
@@ -4669,35 +4701,33 @@ fn t45_constrained_handle_classifies_typed_err_identically_to_unconstrained() {
         .unwrap();
         db_a.complete_initialization().unwrap();
 
-        // Drive the firing INSERT on a dedicated thread.
         let fire = fire_trigger_in_thread(db_a.clone(), 0xC45);
-
-        // Wait for the callback to be parked, then run the B2 probe on the same
-        // constrained handle from the owning test thread.
         entered.wait();
-        let result_b2 = db_a.begin();
+        let db_probe = db_a.clone();
+        let probe = thread::spawn(move || db_probe.begin());
+        let wait_observed = wait_until_trigger_wait_observed(&db_a, Duration::from_secs(2));
         done.wait();
         fire.join().unwrap().unwrap();
+        let result_b2 = probe.join().expect("constrained B2 probe thread");
 
         let result_a2 = observed_a2.lock().unwrap().take().expect("A2 callback ran");
         assert!(
             matches!(
                 result_a2,
-                Err(Error::CallbackReentry { kind: CallbackKind::Trigger })
+                Err(Error::CallbackReentry {
+                    kind: CallbackKind::Trigger
+                })
             ),
-            "constrained-handle A2 must classify identically to unconstrained: expected CallbackReentry{{Trigger}}, got {:?}",
-            result_a2
+            "constrained-handle A2 must stay CallbackReentry{{Trigger}}, got {result_a2:?}"
         );
         assert!(
-            matches!(
-                result_b2,
-                Err(Error::CallbackActiveCrossThread { kind: CallbackKind::Trigger })
-            ),
-            "constrained-handle B2 must classify identically to unconstrained: expected CallbackActiveCrossThread{{Trigger}}, got {:?}",
-            result_b2
+            wait_observed,
+            "constrained-handle same-DB B2 must genuinely park before release"
         );
+        let tx = result_b2.expect("constrained-handle same-DB B2 must wait and proceed");
+        db_a.rollback(tx).expect("rollback constrained B2 tx");
     })
-    .expect("t45 deadlocked");
+    .expect("t45 constrained same-DB wait/proceed deadlocked");
 }
 
 // ============================================================================
@@ -4710,44 +4740,37 @@ fn t45_constrained_handle_classifies_typed_err_identically_to_unconstrained() {
 // The sink is wired on event_db, while the parked trigger lives on trigger_db.
 // This keeps event delivery independent of the B2 guard being probed by the
 // sink callback.
-// ============================================================================
 #[test]
 #[serial]
-fn t46_sink_callback_calling_tx_control_inside_parked_trigger_returns_typed_err_to_dispatcher() {
+fn t46_sink_callback_calling_tx_control_inside_parked_trigger_waits_and_delivers_without_retry() {
     use contextdb_engine::{SinkError, SinkEvent};
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
         let done = Arc::new(Barrier::new(2));
         let trigger_db = build_trigger_parked_db(entered.clone(), done.clone());
         let event_db = Arc::new(Database::open_memory());
-
-        // Sink event source table + EventBus DDL (CREATE EVENT TYPE / CREATE SINK
-        // / CREATE ROUTE) wires INSERTs on `invalidations` to the `retry_probe`
-        // sink. Pattern lifted from tests/acceptance/event_bus.rs::declare_inv_schema.
         event_db
             .execute(
-            "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
-            &empty(),
-        )
-        .unwrap();
+                "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
+                &empty(),
+            )
+            .unwrap();
         event_db
             .execute(
-            "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
-            &empty(),
-        )
-        .unwrap();
+                "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+                &empty(),
+            )
+            .unwrap();
         event_db
             .execute("CREATE SINK retry_probe TYPE callback", &empty())
             .unwrap();
         event_db
             .execute(
-            "CREATE ROUTE inv_to_retry_probe EVENT inv_match TO retry_probe",
-            &empty(),
-        )
-        .unwrap();
+                "CREATE ROUTE inv_to_retry_probe EVENT inv_match TO retry_probe",
+                &empty(),
+            )
+            .unwrap();
 
-        // Sink callback: probes trigger_db.begin() on the externally captured handle.
-        // Under B2 (parked trigger) returns Transient → dispatcher retries.
         let attempts = Arc::new(AtomicUsize::new(0));
         let saw_typed_err = Arc::new(AtomicUsize::new(0));
         let attempts_cb = attempts.clone();
@@ -4755,70 +4778,97 @@ fn t46_sink_callback_calling_tx_control_inside_parked_trigger_returns_typed_err_
         let db_for_sink = trigger_db.clone();
         event_db
             .register_sink("retry_probe", None, move |_evt: &SinkEvent| {
-            let n = attempts_cb.fetch_add(1, AtomicOrdering::SeqCst);
-            match db_for_sink.begin() {
-                Ok(tx) => {
-                    let _ = db_for_sink.rollback(tx);
-                    Ok(())
+                attempts_cb.fetch_add(1, AtomicOrdering::SeqCst);
+                match db_for_sink.begin() {
+                    Ok(tx) => {
+                        let _ = db_for_sink.rollback(tx);
+                        Ok(())
+                    }
+                    Err(Error::CallbackActiveCrossThread {
+                        kind: CallbackKind::Trigger,
+                    }) => {
+                        saw_typed_err_cb.fetch_add(1, AtomicOrdering::SeqCst);
+                        Err(SinkError::Transient(
+                            "same-DB B2 typed Err should not be visible post-§30".to_string(),
+                        ))
+                    }
+                    Err(other) => Err(SinkError::Permanent(format!("unexpected: {other:?}"))),
                 }
-                Err(Error::CallbackActiveCrossThread { kind: CallbackKind::Trigger }) => {
-                    saw_typed_err_cb.fetch_add(1, AtomicOrdering::SeqCst);
-                    Err(SinkError::Transient(format!(
-                        "callback active on another thread; sink attempt {n}"
-                    )))
-                }
-                Err(other) => Err(SinkError::Permanent(format!("unexpected: {other:?}"))),
-            }
-        })
-        .unwrap();
+            })
+            .unwrap();
 
-        // Park the trigger callback BEFORE driving the sink event, so the sink
-        // dispatcher's first attempt hits B2.
         let fire = fire_trigger_in_thread(trigger_db.clone(), 0xC46);
         entered.wait();
+        let event_drive_db = event_db.clone();
+        let sink_drive = thread::spawn(move || {
+            event_drive_db.execute(
+                "INSERT INTO invalidations (id, severity, reason) VALUES ($id, $sev, $rsn)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(uuid(0xA46))),
+                    ("sev".to_string(), Value::Text("warning".to_string())),
+                    ("rsn".to_string(), Value::Text("t46".to_string())),
+                ]),
+            )
+        });
 
-        // Drive the sink — INSERT into invalidations emits the routed event on
-        // event_db's dispatcher thread; that thread's sink callback probes
-        // trigger_db and hits B2.
-        let sink_drive_result = event_db.execute(
-            "INSERT INTO invalidations (id, severity, reason) VALUES ($id, $sev, $rsn)",
-            &HashMap::from([
-                ("id".to_string(), Value::Uuid(uuid(0xA46))),
-                ("sev".to_string(), Value::Text("warning".to_string())),
-                ("rsn".to_string(), Value::Text("t46".to_string())),
-            ]),
-        );
-
-        // Wait for the sink dispatcher to attempt and observe the typed Err.
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && saw_typed_err.load(AtomicOrdering::SeqCst) == 0 {
-            thread::sleep(Duration::from_millis(20));
+        let mut wait_observed = false;
+        while Instant::now() < deadline {
+            if trigger_db
+                .trigger_progress_telemetry_snapshot_for_test()
+                .wait_observed
+                >= 1
+            {
+                wait_observed = true;
+                break;
+            }
+            if saw_typed_err.load(AtomicOrdering::SeqCst) > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        let saw_typed_before_unblock = saw_typed_err.load(AtomicOrdering::SeqCst);
-
-        // Unblock the trigger callback so subsequent sink retries succeed.
+        let typed_before_release = saw_typed_err.load(AtomicOrdering::SeqCst);
         done.wait();
         fire.join().unwrap().unwrap();
-        sink_drive_result.expect("sink-driving INSERT must succeed");
-        assert!(
-            saw_typed_before_unblock >= 1,
-            "sink callback must have observed CallbackActiveCrossThread{{Trigger}} during B2 contention"
-        );
+        let sink_drive_result = sink_drive.join().expect("sink drive thread");
 
-        // Wait for the sink retry loop to deliver successfully.
+        assert!(
+            wait_observed,
+            "sink callback's trigger_db.begin() must park before trigger release"
+        );
+        assert_eq!(
+            typed_before_release, 0,
+            "sink callback must not observe same-DB B2 typed Err post-§30"
+        );
+        sink_drive_result.expect("sink-driving INSERT must succeed");
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             let m = event_db.sink_metrics_for_test("retry_probe");
-            if m.delivered >= 1 && m.retried >= 1 {
+            if m.delivered >= 1 {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
         let m = event_db.sink_metrics_for_test("retry_probe");
-        assert!(m.retried >= 1, "sink dispatcher's retry loop must have run; metrics={:?}", m);
-        assert!(m.delivered >= 1, "sink must eventually deliver after contention clears; metrics={:?}", m);
+        assert!(
+            m.delivered >= 1,
+            "sink must deliver after contention clears; metrics={m:?}"
+        );
+        assert_eq!(
+            m.retried, 0,
+            "same-DB wait/proceed path must not use sink retry; metrics={m:?}"
+        );
+        assert_eq!(
+            saw_typed_err.load(AtomicOrdering::SeqCst),
+            0,
+            "sink saw same-DB typed Err"
+        );
+        assert!(
+            attempts.load(AtomicOrdering::SeqCst) >= 1,
+            "sink callback must have run"
+        );
     })
-    .expect("t46 deadlocked");
+    .expect("t46 sink same-DB wait/proceed deadlocked");
 }
 
 // ============================================================================
@@ -4832,50 +4882,42 @@ fn t46_sink_callback_calling_tx_control_inside_parked_trigger_returns_typed_err_
 // ============================================================================
 #[test]
 #[serial]
-fn t47_apply_changes_100_row_changeset_fails_early_under_b2_contention() {
+fn t47_apply_changes_100_row_changeset_fails_early_under_cross_db_b2_contention() {
     run_with_timeout(|| {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join("t47.db");
 
-        // Build the trigger-parked DB on disk so we can reopen post-drop.
-        let entered = Arc::new(Barrier::new(2));
-        let done = Arc::new(Barrier::new(2));
-        let db = Arc::new(Database::open(&path).expect("open"));
-        db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
-            .unwrap();
-        db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &empty())
-            .unwrap();
-        // Apply target — separate from `t` (the trigger's firing table).
-        db.execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
-            .unwrap();
-        let entered_cb = entered.clone();
-        let done_cb = done.clone();
-        db.register_trigger_callback("tr", move |_db, _ctx| {
-            entered_cb.wait();
-            done_cb.wait();
-            Ok(())
-        })
-        .unwrap();
-        db.complete_initialization().unwrap();
+        // Build db_x as the parked-trigger DB (in-memory; cross-DB to db_y).
+        let entered_x = Arc::new(Barrier::new(2));
+        let done_x = Arc::new(Barrier::new(2));
+        let db_x = build_trigger_parked_db(entered_x.clone(), done_x.clone());
 
-        let fire = fire_trigger_in_thread(db.clone(), 0xC47);
-        entered.wait();
+        // db_y is the on-disk apply target — separate Database, separate path.
+        let db_y = Arc::new(Database::open(&path).expect("open"));
+        db_y.execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
+            .unwrap();
+        db_y.complete_initialization().unwrap();
+
+        let fire_x = fire_trigger_in_thread(db_x.clone(), 0xC47);
+        entered_x.wait();
         let cs = populated_changeset_n("applied", 0xC47_0000, 100);
-        let result =
-            db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins));
-        done.wait();
-        fire.join().unwrap().unwrap();
+        let db_y_probe = db_y.clone();
+        let result = run_cross_db_b2_probe(move || {
+            db_y_probe.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
+        });
+        done_x.wait();
+        fire_x.join().unwrap().unwrap();
 
         assert!(
             matches!(
                 result,
                 Err(Error::CallbackActiveCrossThread { kind: CallbackKind::Trigger })
             ),
-            "expected typed CallbackActiveCrossThread{{Trigger}} on 100-row apply_changes under B2; got {:?}",
+            "expected typed CallbackActiveCrossThread{{Trigger}} on 100-row apply_changes under cross-DB B2; got {:?}",
             result
         );
-        let snap = db.snapshot();
-        let scanned = db.scan("applied", snap).unwrap();
+        let snap = db_y.snapshot();
+        let scanned = db_y.scan("applied", snap).unwrap();
         assert_eq!(
             scanned.len(),
             0,
@@ -4883,11 +4925,11 @@ fn t47_apply_changes_100_row_changeset_fails_early_under_b2_contention() {
             scanned.len()
         );
 
-        // Durable-persistence pin — drop the Database, reopen the same path,
-        // assert the `applied` table is still empty. Catches any regression
-        // where apply_changes leaks rows into durable redb state before
-        // returning the typed Err.
-        drop(db);
+        // Durable-persistence pin — drop db_y, reopen the same path, assert
+        // the `applied` table is still empty. Catches any regression where
+        // apply_changes leaks rows into durable redb state before returning
+        // the typed Err on cross-DB B2.
+        drop(db_y);
         let reopened = Database::open(&path).expect("reopen post-drop");
         let snap = reopened.snapshot();
         assert_eq!(
@@ -4896,7 +4938,7 @@ fn t47_apply_changes_100_row_changeset_fails_early_under_b2_contention() {
             "fail-early-and-rebuild: durable post-Err scan after reopen must be empty"
         );
     })
-    .expect("t47 deadlocked");
+    .expect("t47 cross-DB B2 deadlocked");
 }
 
 // ============================================================================

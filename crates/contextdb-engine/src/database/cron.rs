@@ -276,6 +276,12 @@ impl Database {
         }
     }
 
+    #[doc(hidden)]
+    pub fn __trigger_progress_worker_handle_for_test(&self) -> Database {
+        let _operation = self.assert_open_operation();
+        self.worker_handle_for_background()
+    }
+
     pub fn cron_audit_log_for_test(&self) -> Vec<CronAuditEntry> {
         let _operation = self.assert_open_operation();
         self.cron.audit.lock().iter().cloned().collect()

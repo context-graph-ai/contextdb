@@ -153,3 +153,8 @@ path = "../../benches/tier2_state_machine_overhead.rs"
 name = "sigterm_drain_in_flight_persistence"
 harness = false
 path = "../../benches/sigterm_drain_in_flight_persistence.rs"
+
+[[bench]]
+name = "trigger_throughput"
+harness = false
+path = "../../benches/trigger_throughput.rs"

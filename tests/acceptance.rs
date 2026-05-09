@@ -40,6 +40,8 @@ mod auto_stamped_txid;
 mod cli_ux;
 #[path = "acceptance/common.rs"]
 mod common;
+#[path = "acceptance/common_tracing.rs"]
+mod common_tracing;
 #[path = "acceptance/composite_foreign_key.rs"]
 mod composite_foreign_key;
 #[path = "acceptance/composite_unique_concurrent_update.rs"]
@@ -112,6 +114,8 @@ mod sync;
 pub mod test_alloc_counter;
 #[path = "acceptance/trigger_concurrency_panic_freedom.rs"]
 mod trigger_concurrency_panic_freedom;
+#[path = "acceptance/trigger_same_db_progress.rs"]
+mod trigger_same_db_progress;
 #[path = "acceptance/txid_monotonic_concurrent_commits.rs"]
 mod txid_monotonic_concurrent_commits;
 #[path = "acceptance/vector_reindex_ordering.rs"]

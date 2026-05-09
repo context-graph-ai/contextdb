@@ -398,6 +398,24 @@ pub struct Database {
     resource_owner: bool,
 }
 
+/// Steady-state snapshot of trigger-progress telemetry counters. The
+/// accessor is `#[doc(hidden)] pub` so integration tests (which compile
+/// against the released crate signature, not `cfg(test)`) can read it,
+/// while it remains absent from rustdoc and unsupported as a public API.
+/// cg observes throughput via `Store::record_observation`, not via these
+/// counters.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TriggerProgressTelemetrySnapshot {
+    pub wait_observed: u64,
+    /// Engine-internal "retry-eligible refusal" count for same-DB B2. Post-§30
+    /// this stays 0 under healthy contention; it is positive only when the
+    /// deadlock-guard timeout regime surfaces the same-DB typed Err.
+    pub typed_err_observed_same_db: u64,
+    pub typed_err_observed_cross_db: u64,
+    pub deadlock_guard_timeout_observed: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccessConstraints {
     contexts: Option<BTreeSet<ContextId>>,
@@ -6146,6 +6164,27 @@ impl Database {
         self.rank_policy_formula_parse_count.load(Ordering::SeqCst)
     }
 
+    /// Acceptance-test accessor. Reads at steady state (after stop signal
+    /// + writer-threads joined). Snapshots are not atomic across counters.
+    #[doc(hidden)]
+    pub fn trigger_progress_telemetry_snapshot_for_test(&self) -> TriggerProgressTelemetrySnapshot {
+        TriggerProgressTelemetrySnapshot {
+            wait_observed: self.trigger.wait_observed_count.load(Ordering::SeqCst),
+            typed_err_observed_same_db: self
+                .trigger
+                .typed_err_observed_same_db_count
+                .load(Ordering::SeqCst),
+            typed_err_observed_cross_db: self
+                .trigger
+                .typed_err_observed_cross_db_count
+                .load(Ordering::SeqCst),
+            deadlock_guard_timeout_observed: self
+                .trigger
+                .deadlock_guard_timeout_observed_count
+                .load(Ordering::SeqCst),
+        }
+    }
+
     #[doc(hidden)]
     pub fn __inject_raw_joined_row_value_for_test(
         &self,
@@ -9751,6 +9790,79 @@ impl Database {
         Ok(())
     }
 
+    /// Registers a host callback for a previously declared trigger. Every
+    /// write to the trigger's table fires the callback synchronously inside
+    /// the firing transaction's commit window. The callback's tx-bound
+    /// `&Database` argument supports relational, graph, and vector cascade
+    /// writes that commit atomically with the firing tx.
+    ///
+    /// # Concurrency contract
+    ///
+    /// While the callback is active on Thread A, other threads writing to
+    /// the same `Database` (or an internal handle/`Arc` clone that shares
+    /// the same trigger state) wait until the callback's transaction
+    /// completes, then proceed as `Ok`. Cross-DB writers and same-thread
+    /// reentrant tx-control return typed `Err` (see
+    /// [`Error::CallbackActiveCrossThread`] and [`Error::CallbackReentry`]).
+    ///
+    /// # Example
+    ///
+    /// Two writer threads + one parked callback. Both commits land.
+    ///
+    /// ```rust
+    /// use contextdb_core::Value;
+    /// use contextdb_engine::Database;
+    /// use std::collections::HashMap;
+    /// use std::sync::{Arc, Barrier, mpsc};
+    /// use std::thread;
+    /// use std::time::Duration;
+    /// use uuid::Uuid;
+    ///
+    /// let db = Arc::new(Database::open_memory());
+    /// db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new()).unwrap();
+    /// db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &HashMap::new()).unwrap();
+    ///
+    /// let entered = Arc::new(Barrier::new(2));
+    /// let done = Arc::new(Barrier::new(2));
+    /// let entered_cb = entered.clone();
+    /// let done_cb = done.clone();
+    /// db.register_trigger_callback("tr", move |_db, _ctx| {
+    ///     entered_cb.wait();
+    ///     done_cb.wait();
+    ///     Ok(())
+    /// }).unwrap();
+    /// db.complete_initialization().unwrap();
+    ///
+    /// // Thread A fires the trigger (its callback parks at entered.wait()).
+    /// let db_a = db.clone();
+    /// let fire_a = thread::spawn(move || {
+    ///     let tx = db_a.begin().expect("a begin");
+    ///     db_a.execute_in_tx(
+    ///         tx,
+    ///         "INSERT INTO t (id) VALUES ($id)",
+    ///         &HashMap::from([("id".to_string(), Value::Uuid(Uuid::from_u128(1)))]),
+    ///     ).expect("a insert");
+    ///     db_a.commit(tx).expect("a commit")
+    /// });
+    /// entered.wait();  // callback is now parked
+    ///
+    /// // Thread B writes against the same DB while A's callback is parked.
+    /// // Under §30 it waits and proceeds.
+    /// let db_b = db.clone();
+    /// let (started_tx, started_rx) = mpsc::channel();
+    /// let writer_b = thread::spawn(move || {
+    ///     started_tx.send(()).unwrap();
+    ///     let tx = db_b.begin().expect("b begin must wait then succeed");
+    ///     db_b.commit(tx).expect("b commit")
+    /// });
+    /// started_rx.recv().unwrap();
+    /// thread::sleep(Duration::from_millis(50));
+    ///
+    /// // Release A's callback. Both commits land.
+    /// done.wait();
+    /// fire_a.join().unwrap();
+    /// writer_b.join().unwrap();
+    /// ```
     pub fn register_trigger_callback<F>(&self, name: &str, callback: F) -> Result<()>
     where
         F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static,
