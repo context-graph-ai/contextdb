@@ -69,8 +69,8 @@ fn t15_01_concurrent_single_column_unique_insert_keeps_one_winner() {
     )
     .unwrap();
     let hash = "sha256:fixed".to_string();
-    let tx_a = db.begin();
-    let tx_b = db.begin();
+    let tx_a = db.begin_or_panic();
+    let tx_b = db.begin_or_panic();
     for tx in [tx_a, tx_b] {
         let staged = db
             .execute_in_tx(
@@ -308,8 +308,8 @@ fn t15_07_concurrent_upserts_same_natural_key_collapse_to_one_row() {
         &empty(),
     )
     .unwrap();
-    let insert_tx = db.begin();
-    let update_tx = db.begin();
+    let insert_tx = db.begin_or_panic();
+    let update_tx = db.begin_or_panic();
     for (tx, label) in [(insert_tx, "insert-first"), (update_tx, "update-second")] {
         let staged = db
             .execute_in_tx(
@@ -352,8 +352,8 @@ fn t15_12_commit_time_upsert_update_expr_reads_conflict_row() {
         &empty(),
     )
     .unwrap();
-    let insert_tx = db.begin();
-    let update_tx = db.begin();
+    let insert_tx = db.begin_or_panic();
+    let update_tx = db.begin_or_panic();
     for (tx, label) in [(insert_tx, "insert-first"), (update_tx, "update-second")] {
         let staged = db
             .execute_in_tx(
@@ -397,8 +397,8 @@ fn t15_13_commit_time_upsert_rejects_immutable_update_column() {
         &empty(),
     )
     .unwrap();
-    let insert_tx = db.begin();
-    let update_tx = db.begin();
+    let insert_tx = db.begin_or_panic();
+    let update_tx = db.begin_or_panic();
     for (tx, frozen) in [(insert_tx, "insert-first"), (update_tx, "update-second")] {
         let staged = db
             .execute_in_tx(
@@ -445,7 +445,7 @@ fn t15_14_commit_time_upsert_rejects_staged_unique_post_image_collision() {
     )
     .unwrap();
 
-    let upsert_tx = db.begin();
+    let upsert_tx = db.begin_or_panic();
     db.execute_in_tx(
         upsert_tx,
         "INSERT INTO entities (id, name, slug) VALUES ($id, 'other', 'dup')",
@@ -560,8 +560,8 @@ fn t15_16_commit_time_upsert_preserves_later_same_tx_update() {
     )
     .unwrap();
 
-    let winner_tx = db.begin();
-    let upsert_tx = db.begin();
+    let winner_tx = db.begin_or_panic();
+    let upsert_tx = db.begin_or_panic();
     let staged_id = Uuid::new_v4();
     db.execute_in_tx(
         winner_tx,
@@ -625,8 +625,8 @@ fn t15_17_commit_time_upsert_triggers_state_propagation() {
 
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
-    let winner_tx = db.begin();
-    let upsert_tx = db.begin();
+    let winner_tx = db.begin_or_panic();
+    let upsert_tx = db.begin_or_panic();
     db.execute_in_tx(
         upsert_tx,
         "INSERT INTO intentions (id, slug, status) VALUES ($id, 'intent-a', 'archived') ON CONFLICT (slug) DO UPDATE SET status = 'archived'",
@@ -695,7 +695,7 @@ fn t15_18_conditional_vector_noop_keeps_commit_time_upsert_vector() {
     )
     .unwrap();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(
         tx,
         "INSERT INTO docs (id, natural, status, embedding) VALUES ($id, 'upsert-key', 'open', $embedding) ON CONFLICT (natural) DO UPDATE SET embedding = $embedding",
@@ -805,12 +805,12 @@ fn t15_19_commit_time_upsert_rechecks_unique_after_propagation_shifts_inserts() 
             .collect(),
     )
     .unwrap();
-    let edge_tx = db.begin();
+    let edge_tx = db.begin_or_panic();
     db.insert_edge(edge_tx, root_id, target_id, "CITES".into(), HashMap::new())
         .unwrap();
     db.commit(edge_tx).unwrap();
 
-    let upsert_tx = db.begin();
+    let upsert_tx = db.begin_or_panic();
     db.execute_in_tx(
         upsert_tx,
         "UPDATE nodes SET note = 'earlier-staged-update' WHERE id = $id",

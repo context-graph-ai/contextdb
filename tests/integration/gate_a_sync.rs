@@ -176,7 +176,7 @@ fn a9_01_push_returns_rows_since_watermark() {
     let uuid_e = Uuid::new_v4();
 
     // Commit 1: 2 rows
-    let tx1 = edge.begin();
+    let tx1 = edge.begin_or_panic();
     edge.insert_row(
         tx1,
         "observations",
@@ -202,7 +202,7 @@ fn a9_01_push_returns_rows_since_watermark() {
     let lsn_after_commit_1 = edge.current_lsn();
 
     // Commit 2: 3 rows
-    let tx2 = edge.begin();
+    let tx2 = edge.begin_or_panic();
     edge.insert_row(
         tx2,
         "observations",
@@ -362,7 +362,7 @@ fn a9_02_pull_inserts_new_rows() {
     );
 
     // Edge inserts 3 observations
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "observations",
@@ -450,7 +450,7 @@ fn a9_03_pull_conflict_server_wins() {
     let shared_uuid = Uuid::new_v4();
 
     // Edge version
-    let tx_e = edge.begin();
+    let tx_e = edge.begin_or_panic();
     edge.insert_row(
         tx_e,
         "entities",
@@ -463,7 +463,7 @@ fn a9_03_pull_conflict_server_wins() {
     edge.commit(tx_e).unwrap();
 
     // Server version (different data, same UUID)
-    let tx_s = server.begin();
+    let tx_s = server.begin_or_panic();
     server
         .insert_row(
             tx_s,
@@ -539,7 +539,7 @@ fn a9_04_pull_conflict_latest_wins() {
     let uuid_1 = Uuid::new_v4();
 
     // Server inserts first (lower LSN)
-    let tx_s = server1.begin();
+    let tx_s = server1.begin_or_panic();
     server1
         .insert_row(
             tx_s,
@@ -554,7 +554,7 @@ fn a9_04_pull_conflict_latest_wins() {
 
     // Edge inserts later — bump LSN with a padding commit first
     let padding_uuid = Uuid::new_v4();
-    let tx_e1 = edge1.begin();
+    let tx_e1 = edge1.begin_or_panic();
     edge1
         .insert_row(
             tx_e1,
@@ -566,7 +566,7 @@ fn a9_04_pull_conflict_latest_wins() {
         )
         .unwrap();
     edge1.commit(tx_e1).unwrap();
-    let tx_e2 = edge1.begin();
+    let tx_e2 = edge1.begin_or_panic();
     edge1
         .insert_row(
             tx_e2,
@@ -609,7 +609,7 @@ fn a9_04_pull_conflict_latest_wins() {
     let uuid_2 = Uuid::new_v4();
 
     // Edge inserts first (lower LSN)
-    let tx_e = edge2.begin();
+    let tx_e = edge2.begin_or_panic();
     edge2
         .insert_row(
             tx_e,
@@ -624,7 +624,7 @@ fn a9_04_pull_conflict_latest_wins() {
 
     // Server inserts later (higher LSN via extra commits)
     let padding2_uuid = Uuid::new_v4();
-    let tx_s1 = server2.begin();
+    let tx_s1 = server2.begin_or_panic();
     server2
         .insert_row(
             tx_s1,
@@ -636,7 +636,7 @@ fn a9_04_pull_conflict_latest_wins() {
         )
         .unwrap();
     server2.commit(tx_s1).unwrap();
-    let tx_s2 = server2.begin();
+    let tx_s2 = server2.begin_or_panic();
     server2
         .insert_row(
             tx_s2,
@@ -689,7 +689,7 @@ fn a9_05_pull_conflict_edge_wins() {
     let shared_uuid = Uuid::new_v4();
 
     // Server version
-    let tx_s = server.begin();
+    let tx_s = server.begin_or_panic();
     server
         .insert_row(
             tx_s,
@@ -704,7 +704,7 @@ fn a9_05_pull_conflict_edge_wins() {
     server.commit(tx_s).unwrap();
 
     // Edge version
-    let tx_e = edge.begin();
+    let tx_e = edge.begin_or_panic();
     edge.insert_row(
         tx_e,
         "entities",
@@ -789,7 +789,7 @@ fn a9_06_observations_never_conflict() {
     let uuid_e3 = Uuid::new_v4();
 
     // Server has 2 existing observations
-    let tx_s = server.begin();
+    let tx_s = server.begin_or_panic();
     server
         .insert_row(
             tx_s,
@@ -824,7 +824,7 @@ fn a9_06_observations_never_conflict() {
     );
 
     // Edge has 3 different observations
-    let tx_e = edge.begin();
+    let tx_e = edge.begin_or_panic();
     edge.insert_row(
         tx_e,
         "observations",
@@ -921,7 +921,7 @@ fn a9_07_watermark_advances_after_sync() {
     let uuid_a = Uuid::new_v4();
     let uuid_b = Uuid::new_v4();
 
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "entities",
@@ -1012,7 +1012,7 @@ fn a9_08_sync_is_deterministic() {
     let mut changesets = Vec::new();
     for _ in 0..3 {
         let db = setup_sync_db_with_tables(&["observations_simple"]);
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         for &uuid in &uuids {
             db.insert_row(
                 tx,
@@ -1123,7 +1123,7 @@ fn a9_09_memory_to_memory_sync() {
     let obs_id = Uuid::new_v4();
 
     // Edge: insert relational rows, graph edge, and vector
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "entities",
@@ -1275,7 +1275,7 @@ fn a9_11_conflict_resolution_respects_state_machine() {
     let uuid_d = Uuid::new_v4();
 
     // Server: decision is active, then transitions to superseded
-    let tx_s = server.begin();
+    let tx_s = server.begin_or_panic();
     server
         .insert_row(
             tx_s,
@@ -1290,7 +1290,7 @@ fn a9_11_conflict_resolution_respects_state_machine() {
     server.commit(tx_s).unwrap();
 
     // Transition to superseded
-    let tx_s2 = server.begin();
+    let tx_s2 = server.begin_or_panic();
     server
         .upsert_row(
             tx_s2,
@@ -1318,7 +1318,7 @@ fn a9_11_conflict_resolution_respects_state_machine() {
 
     // Edge: same decision still active (stale copy, higher LSN via extra commits)
     let padding_id = Uuid::new_v4();
-    let tx_pad = edge.begin();
+    let tx_pad = edge.begin_or_panic();
     edge.insert_row(
         tx_pad,
         "decisions",
@@ -1330,7 +1330,7 @@ fn a9_11_conflict_resolution_respects_state_machine() {
     )
     .unwrap();
     edge.commit(tx_pad).unwrap();
-    let tx_pad2 = edge.begin();
+    let tx_pad2 = edge.begin_or_panic();
     edge.insert_row(
         tx_pad2,
         "decisions",
@@ -1342,7 +1342,7 @@ fn a9_11_conflict_resolution_respects_state_machine() {
     )
     .unwrap();
     edge.commit(tx_pad2).unwrap();
-    let tx_e = edge.begin();
+    let tx_e = edge.begin_or_panic();
     edge.insert_row(
         tx_e,
         "decisions",
@@ -1426,7 +1426,7 @@ fn a9_12_edge_temporal_validity_syncs() {
     let entity_id = Uuid::new_v4();
 
     // Edge: create decision, entity, and BASED_ON edge
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "decisions",
@@ -1500,7 +1500,7 @@ fn a9_12_edge_temporal_validity_syncs() {
     );
 
     // Delete the BASED_ON edge on the edge side, sync again, assert NOT found
-    let tx2 = edge.begin();
+    let tx2 = edge.begin_or_panic();
     edge.delete_edge(tx2, decision_id, entity_id, "BASED_ON")
         .unwrap();
     edge.commit(tx2).unwrap();
@@ -1567,7 +1567,7 @@ fn a9_13_apply_changes_concurrent_with_local_writes() {
     let uuid_pattern = Uuid::new_v4();
 
     // Edge: insert observation
-    let tx_e = edge.begin();
+    let tx_e = edge.begin_or_panic();
     edge.insert_row(
         tx_e,
         "observations",
@@ -1580,7 +1580,7 @@ fn a9_13_apply_changes_concurrent_with_local_writes() {
     edge.commit(tx_e).unwrap();
 
     // Server: start local write (pattern creation) — DO NOT commit yet
-    let tx_local = server.begin();
+    let tx_local = server.begin_or_panic();
     server
         .insert_row(
             tx_local,
@@ -1683,7 +1683,7 @@ fn a9_14_selective_sync_direction_filtering() {
     directions.insert("scratch".to_string(), SyncDirection::None);
 
     // Edge inserts into all 3 tables
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "observations",
@@ -1760,7 +1760,7 @@ fn a9_14_selective_sync_direction_filtering() {
 
     // Server inserts real patterns
     let uuid_pat_real = Uuid::new_v4();
-    let tx_s = server.begin();
+    let tx_s = server.begin_or_panic();
     server
         .insert_row(
             tx_s,
@@ -1849,7 +1849,7 @@ fn a9_15_archive_not_delete_status_transition_sync() {
     let uuid_d = Uuid::new_v4();
 
     // Edge: insert a decision with status=active
-    let tx1 = edge.begin();
+    let tx1 = edge.begin_or_panic();
     edge.insert_row(
         tx1,
         "decisions",
@@ -1886,7 +1886,7 @@ fn a9_15_archive_not_delete_status_transition_sync() {
     );
 
     // Edge: transition status from active → superseded (archive, not delete)
-    let tx2 = edge.begin();
+    let tx2 = edge.begin_or_panic();
     edge.upsert_row(
         tx2,
         "decisions",
@@ -2056,7 +2056,7 @@ async fn nt_01_push_round_trip_via_nats() {
     let uuid_2 = Uuid::new_v4();
     let uuid_3 = Uuid::new_v4();
 
-    let tx = client_db.begin();
+    let tx = client_db.begin_or_panic();
     // NT-01 edge-case data: Arabic Unicode in data field, f32 precision boundary in embedding
     client_db
         .insert_row(
@@ -2214,7 +2214,7 @@ async fn nt_02_pull_round_trip_via_nats() {
         .unwrap();
 
     let mut pat_uuids = Vec::new();
-    let tx = server_db.begin();
+    let tx = server_db.begin_or_panic();
     for _i in 0..5 {
         let id = Uuid::new_v4();
         server_db
@@ -2303,7 +2303,7 @@ async fn nt_03_bidirectional_sync_via_nats() {
     let uuid_d = Uuid::new_v4();
 
     // Edge has A, B
-    let tx_e = edge_db.begin();
+    let tx_e = edge_db.begin_or_panic();
     edge_db
         .insert_row(
             tx_e,
@@ -2327,7 +2327,7 @@ async fn nt_03_bidirectional_sync_via_nats() {
     edge_db.commit(tx_e).unwrap();
 
     // Server has C, D
-    let tx_s = server_db.begin();
+    let tx_s = server_db.begin_or_panic();
     server_db
         .insert_row(
             tx_s,
@@ -2405,7 +2405,7 @@ async fn nt_04_chunking_large_vector_payload() {
     // Generate a known vector for later search assertion
     let known_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
 
-    let tx = edge_db.begin();
+    let tx = edge_db.begin_or_panic();
     for i in 0..200 {
         let uuid = Uuid::new_v4();
         let vec = if i == 0 {
@@ -2509,7 +2509,7 @@ async fn nt_05_reconnection_after_nats_restart() {
     let uuid_3 = Uuid::new_v4();
 
     // Insert first batch
-    let tx1 = edge_db.begin();
+    let tx1 = edge_db.begin_or_panic();
     edge_db
         .insert_row(
             tx1,
@@ -2558,7 +2558,7 @@ async fn nt_05_reconnection_after_nats_restart() {
     );
 
     // Insert second batch
-    let tx2 = edge_db.begin();
+    let tx2 = edge_db.begin_or_panic();
     edge_db
         .insert_row(
             tx2,
@@ -2618,7 +2618,7 @@ async fn nt_06_initial_sync_empty_edge() {
     let known_entity = Uuid::new_v4();
     let known_decision = Uuid::new_v4();
 
-    let tx = server_db.begin();
+    let tx = server_db.begin_or_panic();
     // Insert entities
     server_db
         .insert_row(
@@ -2848,7 +2848,7 @@ async fn nt_07_offline_accumulate_batch_sync() {
     let mut uuids = Vec::with_capacity(1000);
     for i in 0..1000 {
         let id = Uuid::new_v4();
-        let tx = edge_db.begin();
+        let tx = edge_db.begin_or_panic();
         edge_db
             .insert_row(
                 tx,
@@ -2939,7 +2939,7 @@ async fn nt_08_ddl_sync_with_state_machine() {
         .unwrap();
 
     let uuid_1 = Uuid::new_v4();
-    let tx = server_db.begin();
+    let tx = server_db.begin_or_panic();
     server_db
         .insert_row(
             tx,
@@ -3011,7 +3011,7 @@ async fn nt_08_ddl_sync_with_state_machine() {
     );
 
     // State machine enforced: valid transition (active -> deactivated)
-    let tx2 = edge_db.begin();
+    let tx2 = edge_db.begin_or_panic();
     edge_db
         .upsert_row(
             tx2,
@@ -3027,7 +3027,7 @@ async fn nt_08_ddl_sync_with_state_machine() {
     edge_db.commit(tx2).unwrap();
 
     // State machine enforced: INVALID transition (deactivated -> "bogus")
-    let tx3 = edge_db.begin();
+    let tx3 = edge_db.begin_or_panic();
     let invalid_result = edge_db.upsert_row(
         tx3,
         "configs",
@@ -3091,7 +3091,7 @@ async fn nt_09_cross_edge_embedding_clustering() {
             .unwrap();
 
         let obs_id = Uuid::new_v4();
-        let tx = edge_db.begin();
+        let tx = edge_db.begin_or_panic();
         let row_id = edge_db
             .insert_row(
                 tx,
@@ -3206,7 +3206,7 @@ async fn nt_10_invalidation_sync_round_trip() {
     let inv_id = Uuid::new_v4();
 
     // Edge: create observation, decision, and invalidation with graph edges
-    let tx = edge_db.begin();
+    let tx = edge_db.begin_or_panic();
     edge_db
         .insert_row(
             tx,
@@ -3398,7 +3398,7 @@ async fn nt_10_invalidation_sync_round_trip() {
 
     // Server resolves the invalidation (pending -> acknowledged -> resolved)
     let resolution_id = Uuid::new_v4();
-    let tx_s = server_db.begin();
+    let tx_s = server_db.begin_or_panic();
     server_db
         .upsert_row(
             tx_s,
@@ -3421,7 +3421,7 @@ async fn nt_10_invalidation_sync_round_trip() {
         .unwrap();
     server_db.commit(tx_s).unwrap();
 
-    let tx_s2 = server_db.begin();
+    let tx_s2 = server_db.begin_or_panic();
     server_db
         .upsert_row(
             tx_s2,
@@ -3492,7 +3492,7 @@ async fn nt_11_push_large_mixed_payload_chunked() {
     let known_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
     let mut known_uuid: Option<Uuid> = None;
 
-    let tx = edge_db.begin();
+    let tx = edge_db.begin_or_panic();
     for i in 0..400usize {
         let uuid = Uuid::new_v4();
         if i == 0 {
@@ -3621,7 +3621,7 @@ async fn nt_12_push_single_oversized_text_blob() {
     let blob = "x".repeat(1_126_400);
     let uuid_blob = Uuid::new_v4();
 
-    let tx = edge_db.begin();
+    let tx = edge_db.begin_or_panic();
     edge_db
         .insert_row(
             tx,
@@ -3705,7 +3705,7 @@ async fn nt_13_pull_large_dataset_chunked() {
         .unwrap();
 
     let mut sentinel_uuids: Vec<Uuid> = Vec::new();
-    let tx = server_db.begin();
+    let tx = server_db.begin_or_panic();
     for i in 0..600usize {
         let id = Uuid::new_v4();
         if i % 60 == 0 {
@@ -3815,7 +3815,7 @@ async fn nt_14_large_bidirectional_vector_sync() {
     let mut known_edge_uuid: Option<Uuid> = None;
     let mut known_server_uuid: Option<Uuid> = None;
 
-    let tx_e = edge_db.begin();
+    let tx_e = edge_db.begin_or_panic();
     for i in 0..400usize {
         let uuid = Uuid::new_v4();
         if i == 0 {
@@ -3848,7 +3848,7 @@ async fn nt_14_large_bidirectional_vector_sync() {
     }
     edge_db.commit(tx_e).unwrap();
 
-    let tx_s = server_db.begin();
+    let tx_s = server_db.begin_or_panic();
     for i in 0..400usize {
         let uuid = Uuid::new_v4();
         if i == 0 {
@@ -4447,7 +4447,7 @@ fn integrity_12_sync_delete_removes_vectors() {
     .unwrap();
 
     let filler_id = Uuid::new_v4();
-    let filler_tx = db.begin();
+    let filler_tx = db.begin_or_panic();
     db.insert_row(
         filler_tx,
         "observations",
@@ -4460,7 +4460,7 @@ fn integrity_12_sync_delete_removes_vectors() {
     db.commit(filler_tx).unwrap();
 
     let target_id = Uuid::new_v4();
-    let target_tx = db.begin();
+    let target_tx = db.begin_or_panic();
     let target_row_id = db
         .insert_row(
             target_tx,
@@ -4534,7 +4534,7 @@ fn integrity_13_sync_upsert_refreshes_vector() {
     )
     .unwrap();
 
-    let filler_tx = db.begin();
+    let filler_tx = db.begin_or_panic();
     db.insert_row(
         filler_tx,
         "observations",
@@ -4547,7 +4547,7 @@ fn integrity_13_sync_upsert_refreshes_vector() {
     db.commit(filler_tx).unwrap();
 
     let target_id = Uuid::new_v4();
-    let target_tx = db.begin();
+    let target_tx = db.begin_or_panic();
     let original_row_id = db
         .insert_row(
             target_tx,
@@ -4685,7 +4685,7 @@ fn sync_partition_heal_value_txid_lww_deterministic() {
             let mut row_a = HashMap::new();
             row_a.insert("pk".to_string(), Value::Uuid(pk));
             row_a.insert("x".to_string(), Value::TxId(TxId(100)));
-            let tx_a = edge_a.begin();
+            let tx_a = edge_a.begin_or_panic();
             edge_a
                 .insert_row(tx_a, "t", row_a)
                 .expect("edge_a insert must succeed");
@@ -4695,7 +4695,7 @@ fn sync_partition_heal_value_txid_lww_deterministic() {
             let mut row_b = HashMap::new();
             row_b.insert("pk".to_string(), Value::Uuid(pk));
             row_b.insert("x".to_string(), Value::TxId(TxId(200)));
-            let tx_b = edge_b.begin();
+            let tx_b = edge_b.begin_or_panic();
             edge_b
                 .insert_row(tx_b, "t", row_b)
                 .expect("edge_b insert must succeed");

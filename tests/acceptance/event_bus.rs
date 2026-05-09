@@ -1521,7 +1521,7 @@ fn t5_21_full_snapshot_omits_event_bus_ddl_for_dropped_source_table() {
 fn t5_22_execute_in_tx_event_bus_ddl_is_not_a_noop() {
     let db = Database::open_memory();
     declare_inv_schema(&db);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(tx, "CREATE SINK tx_sink TYPE callback", &empty())
         .unwrap();
     db.commit(tx).unwrap();

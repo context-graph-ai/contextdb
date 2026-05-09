@@ -113,7 +113,7 @@ fn p01_relational_rows_survive_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
     db.insert_row(
@@ -232,7 +232,7 @@ fn p02_ddl_schema_survives_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let uuid1 = Uuid::new_v4();
     db.insert_row(
         tx,
@@ -247,7 +247,7 @@ fn p02_ddl_schema_survives_reopen() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     db2.insert_row(
         tx2,
         "events",
@@ -265,7 +265,7 @@ fn p02_ddl_schema_survives_reopen() {
         &HashMap::from([("id".to_string(), Value::Uuid(uuid1))]),
     );
     assert!(update.is_err());
-    let tx3 = db2.begin();
+    let tx3 = db2.begin_or_panic();
     let uuid3 = Uuid::new_v4();
     db2.insert_row(
         tx3,
@@ -294,7 +294,7 @@ fn p03_graph_edges_with_properties_survive_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let ids = [
         Uuid::new_v4(),
         Uuid::new_v4(),
@@ -366,7 +366,7 @@ fn p04_vectors_survive_reopen_and_ann_works() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let r1 = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
@@ -425,7 +425,7 @@ fn p05_hnsw_recall_stable_across_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..200u64 {
         let rid = db
             .insert_row(
@@ -485,7 +485,7 @@ fn p06_cross_subsystem_atomic_persistence() {
     .unwrap();
     db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let dec_id = Uuid::new_v4();
     let node_id = Uuid::new_v4();
     let r1 = db
@@ -552,7 +552,7 @@ fn p07_counter_reconstruction_no_id_collisions() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     for i in 0..5 {
         db.insert_row(
             tx1,
@@ -572,7 +572,7 @@ fn p07_counter_reconstruction_no_id_collisions() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     let post_row_id = db2
         .insert_row(
             tx2,
@@ -601,7 +601,7 @@ fn p08_multi_commit_accumulation() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let id_a = Uuid::new_v4();
     db.insert_row(
         tx1,
@@ -613,7 +613,7 @@ fn p08_multi_commit_accumulation() {
     )
     .unwrap();
     db.commit(tx1).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let id_b = Uuid::new_v4();
     db.insert_row(
         tx2,
@@ -651,7 +651,7 @@ fn p09_committed_data_survives_ungraceful_shutdown() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id1 = Uuid::new_v4();
     db.insert_row(
         tx,
@@ -683,7 +683,7 @@ fn p10_uncommitted_data_lost_after_crash() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let committed_id = Uuid::new_v4();
     db.insert_row(
         tx1,
@@ -695,7 +695,7 @@ fn p10_uncommitted_data_lost_after_crash() {
     )
     .unwrap();
     db.commit(tx1).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let uncommitted_id = Uuid::new_v4();
     db.insert_row(
         tx2,
@@ -726,7 +726,7 @@ fn p11_change_log_survives_reopen() {
     let db = Database::open(&path).unwrap();
     db.execute("CREATE TABLE items (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "items",
@@ -752,7 +752,7 @@ fn p12_open_memory_still_works() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
     let rid = db
@@ -822,7 +822,7 @@ fn p13_single_file_operation() {
     let db = Database::open(&path).unwrap();
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(tx, "t", values(vec![("id", Value::Uuid(the_uuid))]))
         .unwrap();
     db.commit(tx).unwrap();
@@ -849,7 +849,7 @@ fn p14_hnsw_recall_at_10_meets_threshold() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut vectors = Vec::new();
     for i in 0..1000u64 {
         let rid = db
@@ -898,7 +898,7 @@ fn p15_snapshot_query_sees_only_vectors_committed_before_snapshot() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let r1 = db
         .insert_row(
             tx1,
@@ -944,7 +944,7 @@ fn p15_snapshot_query_sees_only_vectors_committed_before_snapshot() {
     db.commit(tx1).unwrap();
     let old_snap = db.snapshot();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let r4 = db
         .insert_row(
             tx2,
@@ -1019,7 +1019,7 @@ fn p16_state_propagation_survives_restart() {
 
     let intention_id = Uuid::new_v4();
     let decision_id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -1042,7 +1042,7 @@ fn p16_state_propagation_survives_restart() {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -1138,12 +1138,12 @@ fn p18_deleted_rows_stay_deleted_after_restart() {
     let db = Database::open(&path).unwrap();
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, "t", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
     db.commit(tx).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "t", row_id).unwrap();
     db.commit(tx2).unwrap();
     db.close().unwrap();
@@ -1171,7 +1171,7 @@ fn p19_data_integrity_at_scale() {
     let mut edge_nodes = Vec::new();
     let mut vector_row_ids = Vec::new();
     for batch in 0..100 {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         for i in 0..100 {
             let seq = batch * 100 + i;
             let id = Uuid::new_v4();
@@ -1263,7 +1263,7 @@ fn p20_dimension_mismatch_rejected_after_restart() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
@@ -1278,7 +1278,7 @@ fn p20_dimension_mismatch_rejected_after_restart() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     let rid2 = db2
         .insert_row(
             tx2,
@@ -1372,7 +1372,7 @@ fn p24_graph_edges_survive_process_crash_without_close() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("graph-crash.db");
     let db = Database::open(&path).unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
@@ -1402,7 +1402,7 @@ fn p25_vectors_survive_process_crash_without_close() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
@@ -1440,7 +1440,7 @@ fn p26_flush_on_commit_proven_when_drop_is_skipped() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let item_id = Uuid::from_u128(1);
         let node_id = Uuid::from_u128(2);
         let rid = db
@@ -1514,7 +1514,7 @@ fn p27_upsert_result_survives_reopen() {
     )
     .unwrap();
     let id = Uuid::new_v4();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     db.insert_row(
         tx1,
         "t",
@@ -1525,7 +1525,7 @@ fn p27_upsert_result_survives_reopen() {
     )
     .unwrap();
     db.commit(tx1).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "t",
@@ -1557,7 +1557,7 @@ fn p28_dag_modifier_enforced_after_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     db.insert_edge(tx1, a, b, "BASED_ON".to_string(), HashMap::new())
@@ -1566,7 +1566,7 @@ fn p28_dag_modifier_enforced_after_reopen() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     let result = db2.insert_edge(tx2, b, a, "BASED_ON".to_string(), HashMap::new());
     assert!(
         result.is_err(),
@@ -1585,7 +1585,7 @@ fn p29_temporal_query_works_after_reopen() {
     )
     .unwrap();
     let entity_id = Uuid::new_v4();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     db.insert_row(
         tx1,
         "entities",
@@ -1604,7 +1604,7 @@ fn p29_temporal_query_works_after_reopen() {
         .unwrap();
     let rid = row1.row_id;
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "entities", rid).unwrap();
     db.insert_row(
         tx2,
@@ -1623,7 +1623,7 @@ fn p29_temporal_query_works_after_reopen() {
         .unwrap()
         .unwrap()
         .row_id;
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     db.delete_row(tx3, "entities", rid2).unwrap();
     db.insert_row(
         tx3,
@@ -1669,11 +1669,11 @@ fn p30_two_paths_are_independent() {
         .unwrap();
     let id_a = Uuid::new_v4();
     let id_b = Uuid::new_v4();
-    let tx_a = db_a.begin();
+    let tx_a = db_a.begin_or_panic();
     db_a.insert_row(tx_a, "t", values(vec![("id", Value::Uuid(id_a))]))
         .unwrap();
     db_a.commit(tx_a).unwrap();
-    let tx_b = db_b.begin();
+    let tx_b = db_b.begin_or_panic();
     db_b.insert_row(tx_b, "t", values(vec![("id", Value::Uuid(id_b))]))
         .unwrap();
     db_b.commit(tx_b).unwrap();
@@ -1766,7 +1766,7 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
     )
     .unwrap();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row_ids = Vec::new();
     let vectors: Vec<Vec<f32>> = vec![
         vec![1.0, 0.0, 0.0],
@@ -1790,7 +1790,7 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
     }
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "obs", row_ids[0]).unwrap();
     db.delete_vector(
         tx2,

@@ -70,7 +70,7 @@ fn setup_seeded_db() -> (Database, u64) {
     let pre_gate_rows = pre_gate_rows();
     let mut seq = 0_u64;
     while seq < pre_gate_rows {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let end = (seq + SEED_BATCH_ROWS).min(pre_gate_rows);
         while seq < end {
             insert_entity(&db, tx, seq);
@@ -93,7 +93,7 @@ fn run_distinct_unique_commits(db: &Database, next_seq: &mut u64, commits: u64) 
     for _ in 0..commits {
         let seq = *next_seq;
         *next_seq = (*next_seq).saturating_add(1);
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         insert_entity(db, tx, seq);
         let commit_started = Instant::now();
         db.commit(tx).expect("commit distinct unique insert");

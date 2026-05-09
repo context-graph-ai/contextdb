@@ -62,7 +62,7 @@ fn test_cross_subsystem_atomic_commit() {
     let eng = setup_db();
     let entity_id = Uuid::new_v4();
 
-    let tx = eng.begin();
+    let tx = eng.begin_or_panic();
     let _entity_row_id = eng
         .insert_row(
             tx,
@@ -113,7 +113,7 @@ fn test_cross_subsystem_atomic_commit() {
         1
     );
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     eng.insert_row(
         tx2,
         "entities",
@@ -162,7 +162,7 @@ fn test_rollback_across_all_subsystems() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = eng.begin();
+    let tx = eng.begin_or_panic();
     eng.insert_row(
         tx,
         "decisions",
@@ -274,7 +274,7 @@ fn test_mvcc_snapshot_isolation() {
     let eng = setup_db();
     let eid = Uuid::new_v4();
 
-    let tx1 = eng.begin();
+    let tx1 = eng.begin_or_panic();
     let rid1 = eng
         .insert_row(
             tx1,
@@ -286,7 +286,7 @@ fn test_mvcc_snapshot_isolation() {
 
     let snap1 = eng.snapshot();
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     eng.delete_row(tx2, "entities", rid1).unwrap();
     eng.insert_row(
         tx2,
@@ -313,7 +313,7 @@ fn test_bfs_under_mvcc() {
     let c = Uuid::new_v4();
     let d = Uuid::new_v4();
 
-    let tx1 = eng.begin();
+    let tx1 = eng.begin_or_panic();
     eng.insert_edge(tx1, a, b, "EDGE".into(), HashMap::new())
         .unwrap();
     eng.insert_edge(tx1, b, c, "EDGE".into(), HashMap::new())
@@ -322,7 +322,7 @@ fn test_bfs_under_mvcc() {
 
     let snap1 = eng.snapshot();
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     eng.insert_edge(tx2, c, d, "EDGE".into(), HashMap::new())
         .unwrap();
     eng.commit(tx2).unwrap();
@@ -355,7 +355,7 @@ fn test_bfs_cycle_detection() {
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
 
-    let tx = eng.begin();
+    let tx = eng.begin_or_panic();
     eng.insert_edge(tx, a, b, "EDGE".into(), HashMap::new())
         .unwrap();
     eng.insert_edge(tx, b, c, "EDGE".into(), HashMap::new())
@@ -381,7 +381,7 @@ fn test_bfs_depth_bound() {
     let eng = setup_db();
     let nodes: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
 
-    let tx = eng.begin();
+    let tx = eng.begin_or_panic();
     for i in 0..5 {
         eng.insert_edge(tx, nodes[i], nodes[i + 1], "EDGE".into(), HashMap::new())
             .unwrap();
@@ -413,7 +413,7 @@ fn test_bfs_depth_exceeds_max_is_accepted_in_executor() {
 fn test_vector_search_with_prefilter() {
     let eng = setup_db();
 
-    let tx = eng.begin();
+    let tx = eng.begin_or_panic();
     let vectors = [
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
@@ -469,7 +469,7 @@ fn test_unified_pipeline() {
     let neighbor2 = Uuid::new_v4();
     let far = Uuid::new_v4();
 
-    let tx = eng.begin();
+    let tx = eng.begin_or_panic();
     let rid1 = eng
         .insert_row(
             tx,
@@ -573,7 +573,7 @@ fn test_upsert_idempotent() {
     let eng = setup_db();
     let eid = Uuid::new_v4();
 
-    let tx1 = eng.begin();
+    let tx1 = eng.begin_or_panic();
     let r1 = eng
         .upsert_row(
             tx1,
@@ -585,7 +585,7 @@ fn test_upsert_idempotent() {
     eng.commit(tx1).unwrap();
     assert_eq!(r1, UpsertResult::Inserted);
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     let r2 = eng
         .upsert_row(
             tx2,
@@ -597,7 +597,7 @@ fn test_upsert_idempotent() {
     eng.commit(tx2).unwrap();
     assert_eq!(r2, UpsertResult::Updated);
 
-    let tx3 = eng.begin();
+    let tx3 = eng.begin_or_panic();
     let r3 = eng
         .upsert_row(
             tx3,
@@ -614,7 +614,7 @@ fn test_upsert_idempotent() {
 fn test_observation_immutability() {
     let eng = setup_db();
 
-    let tx1 = eng.begin();
+    let tx1 = eng.begin_or_panic();
     let rid = eng
         .insert_row(
             tx1,
@@ -627,7 +627,7 @@ fn test_observation_immutability() {
         .unwrap();
     eng.commit(tx1).unwrap();
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     let result = eng.delete_row(tx2, "observations", rid);
     assert!(matches!(result, Err(Error::ImmutableTable(_))));
     eng.rollback(tx2).unwrap();
@@ -638,7 +638,7 @@ fn test_invalidation_state_machine() {
     let eng = setup_db();
     let inv_id = Uuid::new_v4();
 
-    let tx1 = eng.begin();
+    let tx1 = eng.begin_or_panic();
     eng.insert_row(
         tx1,
         "invalidations",
@@ -650,7 +650,7 @@ fn test_invalidation_state_machine() {
     .unwrap();
     eng.commit(tx1).unwrap();
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     eng.upsert_row(
         tx2,
         "invalidations",
@@ -663,7 +663,7 @@ fn test_invalidation_state_machine() {
     .unwrap();
     eng.commit(tx2).unwrap();
 
-    let tx3 = eng.begin();
+    let tx3 = eng.begin_or_panic();
     let err = eng
         .upsert_row(
             tx3,
@@ -683,7 +683,7 @@ fn test_snapshot_contiguity() {
     let eng = setup_db();
     let eid = Uuid::new_v4();
 
-    let tx1 = eng.begin();
+    let tx1 = eng.begin_or_panic();
     eng.insert_row(
         tx1,
         "entity_snapshots",
@@ -701,7 +701,7 @@ fn test_snapshot_contiguity() {
     let rows = eng.scan("entity_snapshots", snap1).unwrap();
     let old_rid = rows[0].row_id;
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     eng.delete_row(tx2, "entity_snapshots", old_rid).unwrap();
     eng.insert_row(
         tx2,
@@ -752,7 +752,7 @@ fn test_snapshot_contiguity() {
 fn test_vector_snapshot_isolation() {
     let eng = setup_db();
 
-    let tx1 = eng.begin();
+    let tx1 = eng.begin_or_panic();
     let row1 = insert_observation_row(&eng, tx1, "snapshot-1");
     let row2 = insert_observation_row(&eng, tx1, "snapshot-2");
     let row3 = insert_observation_row(&eng, tx1, "snapshot-3");
@@ -781,7 +781,7 @@ fn test_vector_snapshot_isolation() {
 
     let snap1 = eng.snapshot();
 
-    let tx2 = eng.begin();
+    let tx2 = eng.begin_or_panic();
     let row4 = insert_observation_row(&eng, tx2, "snapshot-4");
     let row5 = insert_observation_row(&eng, tx2, "snapshot-5");
     eng.insert_vector(
@@ -860,7 +860,7 @@ fn test_empty_database() {
 #[test]
 fn test_vector_search_requires_limit() {
     let eng = setup_db();
-    let tx = eng.begin();
+    let tx = eng.begin_or_panic();
     let row_id = insert_observation_row(&eng, tx, "limit");
     eng.insert_vector(
         tx,

@@ -190,7 +190,7 @@ fn s06_graph_only_commit_empty_tables_changed() {
 
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "RELATES_TO".to_string(), HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();
@@ -530,7 +530,7 @@ fn s16_row_count_includes_relational_and_graph() {
 
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
 
     // 2 relational inserts
     db.insert_row(

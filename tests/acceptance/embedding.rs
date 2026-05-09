@@ -127,7 +127,7 @@ fn f43c_mvcc_from_concurrent_threads() {
     for worker in 0..10_i64 {
         let db = db.clone();
         handles.push(thread::spawn(move || {
-            let tx = db.begin();
+            let tx = db.begin_or_panic();
             for _ in 0..100 {
                 db.insert_row(
                     tx,

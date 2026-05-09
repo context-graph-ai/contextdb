@@ -115,7 +115,7 @@ fn setup_items_table(db: &Database, dimension: usize) {
 }
 
 fn insert_items(db: &Database, count: u64, start_seed: u64) -> Vec<(RowId, Vec<f32>)> {
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut rows = Vec::with_capacity(count as usize);
     for i in 0..count {
         let rid = db
@@ -191,7 +191,7 @@ fn h03_transition_across_threshold_switches_explain() {
     let explain_before = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain before");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(
             tx,
@@ -257,7 +257,7 @@ fn h06_deleted_vectors_are_excluded_under_hnsw() {
     let all_vectors = insert_items(&db, 1_200, 0);
     let all_rids = all_vectors.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let deleted_rids = all_rids[..100].iter().copied().collect::<HashSet<_>>();
     for rid in &all_rids[..100] {
         db.delete_row(tx, "items", *rid).expect("delete row");
@@ -296,7 +296,7 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
 
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let mut tx1_rids = HashSet::new();
     for i in 0..1_000 {
         let rid = db
@@ -318,7 +318,7 @@ fn h07_snapshot_isolation_uses_only_rows_visible_in_snapshot() {
     db.commit(tx1).expect("commit tx1");
     let snap_after_tx1 = db.snapshot();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     for i in 1_000..1_200 {
         let rid = db
             .insert_row(
@@ -398,7 +398,7 @@ fn h09_hnsw_rebuild_after_reopen_returns_same_results() {
 
     let query = random_unit_vector(DIMENSION, 9_999);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     // 10 vectors CLOSE to query (cosine > 0.99)
     for i in 0..10u64 {
         let rid = db
@@ -475,7 +475,7 @@ fn h10_row_id_continuity_survives_reopen() {
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut pre_rids = HashSet::new();
     for i in 0..1_100 {
         let rid = db
@@ -498,7 +498,7 @@ fn h10_row_id_continuity_survives_reopen() {
     db.close().expect("close");
 
     let db2 = Database::open(&path).expect("reopen");
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     let mut post_rids = HashSet::new();
     for i in 1_100..1_200 {
         let rid = db2
@@ -563,7 +563,7 @@ fn h12_insert_after_hnsw_activation_is_searchable() {
     let explain = db
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let target_vec = random_unit_vector(DIMENSION, 9_999);
     let rid_new = db
         .insert_row(
@@ -619,7 +619,7 @@ fn h14_all_deleted_vectors_return_empty_results() {
     let all_vectors = insert_items(&db, 1_100, 0);
     let all_rids = all_vectors.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for rid in &all_rids {
         db.delete_row(tx, "items", *rid).expect("delete row");
         db.delete_vector(
@@ -654,7 +654,7 @@ fn h15_single_surviving_vector_is_returned() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
 
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let mut all_rids = Vec::with_capacity(1_100);
     let survivor_vec = random_unit_vector(DIMENSION, 999);
     let mut survivor_rid = RowId(0);
@@ -685,7 +685,7 @@ fn h15_single_surviving_vector_is_returned() {
     }
     db.commit(tx1).expect("commit tx1");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     for rid in &all_rids {
         if *rid != survivor_rid {
             db.delete_row(tx2, "items", *rid).expect("delete row");
@@ -722,7 +722,7 @@ fn h16_dimension_mismatch_is_rejected_when_hnsw_would_be_active() {
     let db = Database::open_memory();
     setup_items_table(&db, 3);
 
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     for _ in 0..1_000 {
         let rid = db
             .insert_row(
@@ -741,7 +741,7 @@ fn h16_dimension_mismatch_is_rejected_when_hnsw_would_be_active() {
     }
     db.commit(tx1).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let rid = db
         .insert_row(
             tx2,
@@ -785,7 +785,7 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
     let db = Database::open_memory();
     setup_items_table(&db, DIMENSION);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut item_uuids = Vec::with_capacity(1_000);
     for i in 0..1_000 {
         let uuid = Uuid::new_v4();
@@ -807,7 +807,7 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
         .explain("SELECT * FROM items ORDER BY embedding <=> $q LIMIT 10")
         .expect("explain");
 
-    let tx_commit = db.begin();
+    let tx_commit = db.begin_or_panic();
     let uuid_commit = Uuid::new_v4();
     let rid_commit = db
         .insert_row(
@@ -863,7 +863,7 @@ fn h19_relational_graph_and_vector_atomicity_hold_under_hnsw() {
         .expect("vector query");
     assert_eq!(vec_results[0].0, rid_commit);
 
-    let tx_rb = db.begin();
+    let tx_rb = db.begin_or_panic();
     let uuid_rb = Uuid::new_v4();
     let rid_rb = db
         .insert_row(tx_rb, "items", values(vec![("id", Value::Uuid(uuid_rb))]))
@@ -921,7 +921,7 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
     let db = Database::open(&path).expect("open");
     setup_items_table(&db, DIMENSION);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut all_uuids = Vec::with_capacity(1_100);
     for i in 0..1_100 {
         let uuid = Uuid::new_v4();
@@ -944,7 +944,7 @@ fn h20_hnsw_and_other_data_persist_across_reopen() {
         .expect("explain");
     assert!(explain_pre.contains("HNSWSearch"));
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     for i in 0..10 {
         db.insert_edge(
             tx2,

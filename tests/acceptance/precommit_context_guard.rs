@@ -314,7 +314,7 @@ fn t4_05_graph_traversal_excludes_other_contexts() {
 
     let denied_insert_source = n4;
     let denied_insert_target = n2;
-    let tx = scoped.begin();
+    let tx = scoped.begin_or_panic();
     let err = assert_error(
         scoped.insert_edge(
             tx,
@@ -333,7 +333,7 @@ fn t4_05_graph_traversal_excludes_other_contexts() {
     );
     scoped.commit(tx).unwrap();
 
-    let tx = scoped.begin();
+    let tx = scoped.begin_or_panic();
     let err = assert_error(
         scoped.delete_edge(tx, n1, n2, "LINKS"),
         "direct delete_edge from ctx-a handle touching ctx-b node must be rejected",
@@ -479,7 +479,7 @@ fn t4_06_vector_query_excludes_other_contexts() {
     let denied_delete_row_id = *denied_rows
         .next()
         .expect("ctx-b vector fixture row missing for delete");
-    let tx = scoped.begin();
+    let tx = scoped.begin_or_panic();
     let err = assert_error(
         scoped.insert_vector(
             tx,
@@ -497,7 +497,7 @@ fn t4_06_vector_query_excludes_other_contexts() {
     );
     scoped.commit(tx).unwrap();
 
-    let tx = scoped.begin();
+    let tx = scoped.begin_or_panic();
     let err = assert_error(
         scoped.delete_vector(
             tx,
@@ -1051,7 +1051,7 @@ fn t4_16_graph_edge_metadata_context_gate_hides_visible_endpoint_edge() {
             .is_none(),
         "get_edge_properties must hide metadata-denied edge"
     );
-    let tx = scoped.begin();
+    let tx = scoped.begin_or_panic();
     let err = assert_error(
         scoped.delete_edge(tx, n1, n2, "LINKS"),
         "delete_edge must not delete metadata-denied edge",
@@ -1291,7 +1291,7 @@ fn t4_21_scoped_graph_only_edges_require_relational_metadata() {
                 )
                 .unwrap();
         }
-        let tx = admin.begin();
+        let tx = admin.begin_or_panic();
         admin
             .insert_edge(tx, n1, n2, "LOOSE".into(), HashMap::new())
             .unwrap();
@@ -1323,7 +1323,7 @@ fn t4_21_scoped_graph_only_edges_require_relational_metadata() {
         "scoped edge property lookup must hide graph-only edges with no gated metadata row"
     );
 
-    let tx = scoped.begin();
+    let tx = scoped.begin_or_panic();
     let err = assert_error(
         scoped.insert_edge(tx, n1, n2, "NEW".into(), HashMap::new()),
         "scoped direct graph-only insert must be rejected without relational metadata",

@@ -1137,31 +1137,45 @@ impl Database {
         Ok(db)
     }
 
-    pub fn begin(&self) -> TxId {
-        let _operation = self.assert_open_operation();
+    pub fn begin(&self) -> Result<TxId> {
+        let _operation = self.open_operation()?;
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
-            panic!("transaction control is not allowed inside cron callbacks");
+            return Err(Error::Other(
+                "stub: typed variant not yet implemented (begin × A1)".to_string(),
+            ));
         }
         if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
-            panic!("transaction control is not allowed inside trigger callbacks");
+            return Err(Error::Other(
+                "stub: typed variant not yet implemented (begin × A2)".to_string(),
+            ));
         }
         if self.trigger_active_on_this_handle() {
-            panic!("transaction control is not allowed inside trigger callbacks");
+            return Err(Error::Other(
+                "stub: typed variant not yet implemented (begin × dead-code-A3)".to_string(),
+            ));
         }
         if self.cron.callback_active_on_other_thread() {
-            panic!(
-                "transaction control is not allowed from another thread while a cron callback is active"
-            );
+            return Err(Error::Other(
+                "stub: typed variant not yet implemented (begin × B1)".to_string(),
+            ));
         }
         if self
             .trigger
             .callback_active_on_other_thread(self.owner_thread)
         {
-            panic!(
-                "transaction control is not allowed from another thread while a trigger callback is active"
-            );
+            return Err(Error::Other(
+                "stub: typed variant not yet implemented (begin × B2)".to_string(),
+            ));
         }
-        self.tx_mgr.begin()
+        Ok(self.tx_mgr.begin())
+    }
+
+    /// Test/example helper. Production code MUST use `?` propagation against
+    /// the typed callback-active errors. Unwraps the engine's
+    /// `CallbackActiveCrossThread` / `CallbackReentry` variants as panics; not
+    /// appropriate for code that may run alongside trigger or cron callbacks.
+    pub fn begin_or_panic(&self) -> TxId {
+        self.begin().expect("begin failed in test/example helper")
     }
 
     pub fn commit(&self, tx: TxId) -> Result<()> {
@@ -1282,7 +1296,7 @@ impl Database {
             Statement::Begin => {
                 let mut session = self.session_tx.lock();
                 if session.is_none() {
-                    *session = Some(self.begin());
+                    *session = Some(self.begin()?);
                 }
                 return Ok(QueryResult::empty());
             }
@@ -1566,7 +1580,7 @@ impl Database {
         self.__reset_rows_examined();
         match plan {
             PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_) => {
-                let tx = self.begin();
+                let tx = self.begin()?;
                 let result = execute_plan(self, plan, params, Some(tx));
                 match result {
                     Ok(mut qr) => {
@@ -2041,7 +2055,10 @@ impl Database {
             .ok_or_else(|| Error::PlanError("GRAPH INSERT requires edge_type column".into()))?;
 
         let auto_commit = tx.is_none();
-        let tx = tx.unwrap_or_else(|| self.begin());
+        let tx = match tx {
+            Some(tx) => tx,
+            None => self.begin()?,
+        };
         let mut count = 0u64;
         for row_exprs in &ins.values {
             let source = resolve_expr(&row_exprs[source_idx], params)?;
@@ -6798,6 +6815,11 @@ impl Database {
                 "cannot close database from inside a cron callback".to_string(),
             ));
         }
+        if TRIGGER_CALLBACK_ACTIVE.with(|active| active.get()) {
+            return Err(Error::Other(
+                "stub: typed variant not yet implemented (close × A2)".to_string(),
+            ));
+        }
         if DB_OPERATION_STACK.with(|stack| stack.borrow().contains(&db_id)) {
             return Err(Error::Other(
                 "cannot close database from inside an active operation".to_string(),
@@ -9875,7 +9897,7 @@ impl Database {
         changes: ChangeSet,
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
-        let mut tx = self.begin();
+        let mut tx = self.begin()?;
         let commit_each_row = false;
         let batch_row_commits = false;
         let mut result = ApplyResult {
@@ -10256,7 +10278,7 @@ impl Database {
                 result.skipped_rows += 1;
                 if commit_each_row {
                     self.commit_with_source(tx, CommitSource::SyncPull)?;
-                    tx = self.begin();
+                    tx = self.begin()?;
                 }
                 continue;
             }
@@ -10314,7 +10336,7 @@ impl Database {
                 }
                 if commit_each_row {
                     self.commit_with_source(tx, CommitSource::SyncPull)?;
-                    tx = self.begin();
+                    tx = self.begin()?;
                 }
                 continue;
             }
@@ -10392,7 +10414,7 @@ impl Database {
                             });
                             if commit_each_row {
                                 self.commit_with_source(tx, CommitSource::SyncPull)?;
-                                tx = self.begin();
+                                tx = self.begin()?;
                             }
                             continue;
                         }
@@ -10420,7 +10442,7 @@ impl Database {
                             });
                             if commit_each_row {
                                 self.commit_with_source(tx, CommitSource::SyncPull)?;
-                                tx = self.begin();
+                                tx = self.begin()?;
                             }
                             continue;
                         }
@@ -10594,7 +10616,7 @@ impl Database {
                                     });
                                     if commit_each_row {
                                         self.commit_with_source(tx, CommitSource::SyncPull)?;
-                                        tx = self.begin();
+                                        tx = self.begin()?;
                                     }
                                     continue;
                                 }
@@ -10737,13 +10759,13 @@ impl Database {
 
             if commit_each_row {
                 self.commit_with_source(tx, CommitSource::SyncPull)?;
-                tx = self.begin();
+                tx = self.begin()?;
             }
         }
 
         if batch_row_commits {
             self.commit_with_source(tx, CommitSource::SyncPull)?;
-            tx = self.begin();
+            tx = self.begin()?;
         }
 
         for edge in changes.edges {

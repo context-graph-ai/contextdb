@@ -159,7 +159,7 @@ fn t9_01b_constrained_handle_without_principal_refused_on_acl_table() {
         matches!(err, Error::PrincipalRequired { ref table } if table == "memos"),
         "got: {err}"
     );
-    let tx = h.begin();
+    let tx = h.begin_or_panic();
     let err = assert_error(
         h.insert_edge(
             tx,
@@ -175,7 +175,7 @@ fn t9_01b_constrained_handle_without_principal_refused_on_acl_table() {
         "got: {err}"
     );
     h.commit(tx).unwrap();
-    let tx = h.begin();
+    let tx = h.begin_or_panic();
     let err = assert_error(
         h.delete_edge(tx, Uuid::from_u128(1), Uuid::from_u128(2), "LINKS"),
         "a constrained handle without a principal must not direct-delete graph edges touching ACL-protected endpoints",
@@ -467,7 +467,7 @@ fn t9_05_graph_traversal_excludes_acl_denied_rows() {
 
     let denied_insert_source = a_allowed_neighbor;
     let denied_insert_target = b_row;
-    let tx = h.begin();
+    let tx = h.begin_or_panic();
     let err = assert_error(
         h.insert_edge(
             tx,
@@ -487,7 +487,7 @@ fn t9_05_graph_traversal_excludes_acl_denied_rows() {
     );
     h.commit(tx).unwrap();
 
-    let tx = h.begin();
+    let tx = h.begin_or_panic();
     let err = assert_error(
         h.delete_edge(tx, a_row, b_row, "LINKS"),
         "direct delete_edge by a1 touching ACL-denied node must be rejected",
@@ -643,7 +643,7 @@ fn t9_06_vector_query_excludes_acl_denied_rows() {
     let denied_delete_row_id = *denied_rows
         .next()
         .expect("ACL-denied vector fixture row missing for delete");
-    let tx = h.begin();
+    let tx = h.begin_or_panic();
     let err = assert_error(
         h.insert_vector(
             tx,
@@ -662,7 +662,7 @@ fn t9_06_vector_query_excludes_acl_denied_rows() {
     );
     h.commit(tx).unwrap();
 
-    let tx = h.begin();
+    let tx = h.begin_or_panic();
     let err = assert_error(
         h.delete_vector(
             tx,

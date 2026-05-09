@@ -58,7 +58,7 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
 
     let committed_parent = Uuid::new_v4();
     let committed_child = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let committed_parent_rid = db
         .insert_row(
             tx,
@@ -165,7 +165,7 @@ fn si_01_mixed_recovery_survives_crash_and_hides_uncommitted_work() {
     );
     assert_eq!(reopened.change_log_since(Lsn(0)).len(), 5);
 
-    let tx2 = reopened.begin();
+    let tx2 = reopened.begin_or_panic();
     let ghost = Uuid::new_v4();
     let ghost_rid = reopened
         .insert_row(

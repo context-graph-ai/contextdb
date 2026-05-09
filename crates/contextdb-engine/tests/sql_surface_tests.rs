@@ -1670,7 +1670,7 @@ fn jn_04_cte_graph_join_relational() {
     .unwrap();
 
     // Insert edge via transaction (graph subsystem)
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, eid1, eid2, "DEPENDS_ON".into(), HashMap::new())
         .unwrap();
     // Also insert into edges table for relational consistency
@@ -1777,7 +1777,7 @@ fn jn_06_cte_filtered_vector_ordering_executes() {
         .unwrap();
     }
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for target in [near, far] {
         db.insert_edge(tx, root, target, "RELATES_TO".into(), HashMap::new())
             .unwrap();
@@ -3411,7 +3411,7 @@ fn integrity_04_edge_delete_releases_memory() {
     let target = Uuid::new_v4();
     let baseline = accountant.usage().used;
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     assert!(
         db.insert_edge(tx, source, target, "REL".to_string(), HashMap::new())
             .unwrap()
@@ -3421,7 +3421,7 @@ fn integrity_04_edge_delete_releases_memory() {
     let used_after_insert = accountant.usage().used;
     assert!(used_after_insert > baseline);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.delete_edge(tx, source, target, "REL").unwrap();
     db.commit(tx).unwrap();
 
@@ -3725,7 +3725,7 @@ fn where_txid_bound_int64_returns_rows() {
 
     // Insert the three TxId rows via library API.
     for tx_val in &[TxId(10), TxId(50), TxId(200)] {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut r: HashMap<String, Value> = HashMap::new();
         r.insert("x".to_string(), Value::TxId(*tx_val));
         db.insert_row(tx, "t", r)
@@ -3780,7 +3780,7 @@ fn where_txid_negative_literal_below_all() {
     }
 
     for tx_val in &[TxId(10), TxId(50), TxId(200)] {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut r: HashMap<String, Value> = HashMap::new();
         r.insert("x".to_string(), Value::TxId(*tx_val));
         db.insert_row(tx, "t", r)
@@ -3834,7 +3834,7 @@ fn where_txid_text_literal_returns_no_rows() {
             .unwrap();
     }
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut r: HashMap<String, Value> = HashMap::new();
     r.insert("x".to_string(), Value::TxId(TxId(42)));
     db.insert_row(tx, "t", r)
@@ -3932,7 +3932,7 @@ fn orderby_txid_asc_desc() {
 
     // Insert out of order: 7, 1, 42, 3.
     for tx_val in &[TxId(7), TxId(1), TxId(42), TxId(3)] {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut r: HashMap<String, Value> = HashMap::new();
         r.insert("x".to_string(), Value::TxId(*tx_val));
         db.insert_row(tx, "t", r)

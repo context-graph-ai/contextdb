@@ -71,8 +71,8 @@ fn t22_01_concurrent_delete_parent_and_insert_child_serialize() {
     let parent = Uuid::new_v4();
     setup_parent_child(db, parent);
 
-    let child_tx = db.begin();
-    let delete_tx = db.begin();
+    let child_tx = db.begin_or_panic();
+    let delete_tx = db.begin_or_panic();
     db.execute_in_tx(
         child_tx,
         "INSERT INTO invalidations (id, decision_id) VALUES ($id, $decision_id)",
@@ -102,8 +102,8 @@ fn t22_01_concurrent_delete_parent_and_insert_child_serialize() {
     let parent = Uuid::new_v4();
     setup_parent_child(db, parent);
 
-    let child_tx = db.begin();
-    let delete_tx = db.begin();
+    let child_tx = db.begin_or_panic();
+    let delete_tx = db.begin_or_panic();
     db.execute_in_tx(
         child_tx,
         "INSERT INTO invalidations (id, decision_id) VALUES ($id, $decision_id)",
@@ -136,8 +136,8 @@ fn t22_02_after_concurrent_race_no_dangling_child_via_join() {
     let parent = Uuid::new_v4();
     setup_parent_child(db, parent);
 
-    let child_tx = db.begin();
-    let delete_tx = db.begin();
+    let child_tx = db.begin_or_panic();
+    let delete_tx = db.begin_or_panic();
     db.execute_in_tx(
         child_tx,
         "INSERT INTO invalidations (id, decision_id) VALUES ($id, $decision_id)",
@@ -216,7 +216,7 @@ fn t22_04_single_tx_fk_violation_rolls_back_full_writeset() {
     )
     .unwrap();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(
         tx,
         "INSERT INTO invalidations (id, decision_id) VALUES ($id, $decision_id)",

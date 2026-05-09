@@ -30,7 +30,7 @@ fn seed(path: &std::path::Path, rows: u128) {
         &empty(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..rows {
         let principal = if i % 2 == 0 { "a1" } else { "b1" };
         let acl = row_acl_id(i);

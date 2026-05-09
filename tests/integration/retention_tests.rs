@@ -573,7 +573,7 @@ fn r18_pruning_removes_graph_edges() {
         .unwrap();
 
     // Insert edge between node1 and node2
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, id1, id2, "RELATES_TO".to_string(), HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();
@@ -1172,7 +1172,7 @@ fn mr2_graph_edge_cleanup_after_prune_reopen() {
         db.execute("INSERT INTO nodes (id, name) VALUES ($id, $name)", &params2)
             .unwrap();
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_edge(tx, id1, id2, "LINKS".to_string(), HashMap::new())
             .unwrap();
         db.commit(tx).unwrap();
@@ -1371,7 +1371,7 @@ fn retention_wallclock_now_hoisted_once_per_pass() {
     // Insert 100 rows with created_at well before the mock clock's 10_000_000_000 reading
     // (arbitrary small millis — 1-second TTL is easily exceeded).
     for _ in 0..100 {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut row = std::collections::HashMap::new();
         row.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
         row.insert("created_at".to_string(), Value::Timestamp(1_000));
@@ -1421,7 +1421,7 @@ fn retention_tolerates_ntp_backward_jump() {
     let mut row = std::collections::HashMap::new();
     row.insert("id".to_string(), Value::Uuid(id));
     row.insert("created_at".to_string(), Value::Timestamp(1_000));
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(tx, "t", row).expect("insert must succeed");
     db.commit(tx).expect("commit must succeed");
 

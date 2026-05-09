@@ -1628,7 +1628,7 @@ fn al09_alter_add_column_immutable_succeeds_when_no_propagation_rule_targets_it(
 #[test]
 fn ic03a_insert_row_library_path_sets_flagged_column() {
     let db = db_with_decisions();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id = Uuid::new_v4();
     let mut values: HashMap<String, Value> = HashMap::new();
     values.insert("id".to_string(), Value::Uuid(id));
@@ -1658,7 +1658,7 @@ fn ic03b_upsert_row_library_path_rejects_flagged_mutation() {
     let id = Uuid::new_v4();
     insert_decision(&db, id);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut values: HashMap<String, Value> = HashMap::new();
     values.insert("id".to_string(), Value::Uuid(id));
     values.insert(

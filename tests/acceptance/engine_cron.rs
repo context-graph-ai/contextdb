@@ -903,7 +903,7 @@ fn t27_16_callback_rejects_cross_thread_handle_use() {
     )
     .unwrap();
     let _pause = db.pause_cron_tickler_for_test();
-    let read_tx = db.begin();
+    let read_tx = db.begin_or_panic();
 
     let captured_db = db.clone();
     db.register_cron_callback("cb", move |db_handle| {

@@ -31,7 +31,7 @@ fn t18_01_concurrent_committers_stamp_distinct_txids() {
     )
     .unwrap();
     let receiver = db.subscribe();
-    let txs: Vec<_> = (0..3).map(|_| db.begin()).collect();
+    let txs: Vec<_> = (0..3).map(|_| db.begin_or_panic()).collect();
     for tx in &txs {
         db.execute_in_tx(
             *tx,
@@ -92,8 +92,8 @@ fn t18_02_pagination_cursor_after_concurrent_commits_misses_no_rows() {
 
     // Deterministic interleaving: tx_a begins first but commits after tx_b.
     // Cursor pagination from tx_b's commit must still see tx_a's later commit.
-    let tx_a = db.begin();
-    let tx_b = db.begin();
+    let tx_a = db.begin_or_panic();
+    let tx_b = db.begin_or_panic();
     let row_a = Uuid::new_v4();
     let row_b = Uuid::new_v4();
     for (tx, row_id) in [(tx_a, row_a), (tx_b, row_b)] {
@@ -149,7 +149,7 @@ fn t18_03_auto_stamped_txid_order_matches_commit_lsn_order() {
     .unwrap();
     let receiver = db.subscribe();
 
-    let txs: Vec<_> = (0..6).map(|_| db.begin()).collect();
+    let txs: Vec<_> = (0..6).map(|_| db.begin_or_panic()).collect();
     for tx in &txs {
         db.execute_in_tx(
             *tx,
@@ -319,8 +319,8 @@ fn t18_06_commit_time_upsert_rewrites_txid_post_image_to_canonical() {
     .unwrap();
     let receiver = db.subscribe();
 
-    let deferred_update_tx = db.begin();
-    let first_commit_tx = db.begin();
+    let deferred_update_tx = db.begin_or_panic();
+    let first_commit_tx = db.begin_or_panic();
     for tx in [deferred_update_tx, first_commit_tx] {
         db.execute_in_tx(
             tx,

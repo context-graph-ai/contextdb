@@ -202,7 +202,7 @@ fn hc_t04_bfs_mvcc() {
     let db = setup_ontology_db();
     let a = uuid::Uuid::new_v4();
     let b = uuid::Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "R".to_string(), std::collections::HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();

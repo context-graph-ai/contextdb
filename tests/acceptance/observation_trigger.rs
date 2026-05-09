@@ -1,7 +1,7 @@
 use super::common::{count_rows, empty_params, start_nats, wait_for_sync_server_ready};
 use contextdb_core::{
-    ContextId, Error, Lsn, Principal, Result, RowId, ScopeLabel, SortDirection, TxId, UpsertResult,
-    Value, VectorIndexRef, VersionedRow,
+    CallbackKind, ContextId, Error, Lsn, Principal, Result, RowId, ScopeLabel, SortDirection, TxId,
+    UpsertResult, Value, VectorIndexRef, VersionedRow,
 };
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
@@ -4240,8 +4240,8 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
             &empty(),
         )
         .unwrap();
-    let wrong_tx = db.begin();
-    let other_wrong_tx = other_db.begin();
+    let wrong_tx = db.begin_or_panic();
+    let other_wrong_tx = other_db.begin_or_panic();
     other_db
         .insert_row(
             other_wrong_tx,
@@ -4262,7 +4262,7 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
             &empty(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "third_owner_escape",
@@ -4280,7 +4280,39 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
     .join()
     .unwrap();
     let third_owner_db = Arc::new(third_owner_db);
-    let attempts = Arc::new(Mutex::new(Vec::<(String, bool, String)>::new()));
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AttemptClass {
+        TxBoundMismatch,
+        TriggerReentry,
+        TriggerCrossThread,
+        UnexpectedOk,
+        UnexpectedErr,
+    }
+
+    fn classify_attempt<T: std::fmt::Debug>(result: &Result<T>) -> (AttemptClass, String) {
+        let detail = format!("{result:?}");
+        let class = match result {
+            Ok(_) => AttemptClass::UnexpectedOk,
+            Err(Error::Other(message))
+                if message.contains(
+                    "trigger callback writes must use the supplied tx-bound database handle",
+                ) =>
+            {
+                AttemptClass::TxBoundMismatch
+            }
+            Err(Error::CallbackReentry {
+                kind: CallbackKind::Trigger,
+            }) => AttemptClass::TriggerReentry,
+            Err(Error::CallbackActiveCrossThread {
+                kind: CallbackKind::Trigger,
+            }) => AttemptClass::TriggerCrossThread,
+            Err(_) => AttemptClass::UnexpectedErr,
+        };
+        (class, detail)
+    }
+
+    let attempts = Arc::new(Mutex::new(Vec::<(String, AttemptClass, String)>::new()));
     let callback_attempts = attempts.clone();
     let callback_other_db = other_db.clone();
     let callback_third_owner_db = third_owner_db.clone();
@@ -4300,10 +4332,11 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
                 ("note".to_string(), Value::Text("wrong-tx".into())),
             ]),
         );
+        let (class, detail) = classify_attempt(&wrong_direct);
         callback_attempts.lock().unwrap().push((
             "same_handle_wrong_tx".to_string(),
-            wrong_direct.is_err(),
-            format!("{wrong_direct:?}"),
+            class,
+            detail,
         ));
         let wrong_execute_in_tx = db_handle.execute_in_tx(
             wrong_tx,
@@ -4319,20 +4352,22 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
                 ),
             ]),
         );
+        let (class, detail) = classify_attempt(&wrong_execute_in_tx);
         callback_attempts.lock().unwrap().push((
             "same_handle_execute_in_tx_wrong_tx".to_string(),
-            wrong_execute_in_tx.is_err(),
-            format!("{wrong_execute_in_tx:?}"),
+            class,
+            detail,
         ));
 
         let other_sql = callback_other_db.execute(
             "INSERT INTO escape_writes (id, content) VALUES ($id, 'escape')",
             &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE02)))]),
         );
+        let (class, detail) = classify_attempt(&other_sql);
         callback_attempts.lock().unwrap().push((
             "other_handle_sql".to_string(),
-            other_sql.is_err(),
-            format!("{other_sql:?}"),
+            class,
+            detail,
         ));
 
         let other_apply_changes = callback_other_db.apply_changes(
@@ -4347,17 +4382,19 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         );
+        let (class, detail) = classify_attempt(&other_apply_changes);
         callback_attempts.lock().unwrap().push((
             "other_handle_apply_changes".to_string(),
-            other_apply_changes.is_err(),
-            format!("{other_apply_changes:?}"),
+            class,
+            detail,
         ));
 
         let other_commit = callback_other_db.commit(other_wrong_tx);
+        let (class, detail) = classify_attempt(&other_commit);
         callback_attempts.lock().unwrap().push((
             "other_handle_commit_staged_tx".to_string(),
-            other_commit.is_err(),
-            format!("{other_commit:?}"),
+            class,
+            detail,
         ));
 
         let write_id = ctx
@@ -4381,10 +4418,11 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
                 .join()
                 .unwrap()
         });
+        let (class, detail) = classify_attempt(&cross_thread_direct);
         callback_attempts.lock().unwrap().push((
             "same_handle_cross_thread_ctx_tx".to_string(),
-            cross_thread_direct.is_err(),
-            format!("{cross_thread_direct:?}"),
+            class,
+            detail,
         ));
 
         let other_for_thread = callback_other_db.clone();
@@ -4399,10 +4437,11 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
                 .join()
                 .unwrap()
         });
+        let (class, detail) = classify_attempt(&cross_thread_other_handle);
         callback_attempts.lock().unwrap().push((
             "other_handle_cross_thread_sql".to_string(),
-            cross_thread_other_handle.is_err(),
-            format!("{cross_thread_other_handle:?}"),
+            class,
+            detail,
         ));
 
         let third_owner_for_thread = callback_third_owner_db.clone();
@@ -4417,10 +4456,11 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
                 .join()
                 .unwrap()
         });
+        let (class, detail) = classify_attempt(&third_owner_cross_thread_sql);
         callback_attempts.lock().unwrap().push((
             "third_owner_handle_cross_thread_sql".to_string(),
-            third_owner_cross_thread_sql.is_err(),
-            format!("{third_owner_cross_thread_sql:?}"),
+            class,
+            detail,
         ));
 
         let third_owner_for_commit = callback_third_owner_db.clone();
@@ -4430,10 +4470,11 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
                 .join()
                 .unwrap()
         });
+        let (class, detail) = classify_attempt(&third_owner_cross_thread_commit);
         callback_attempts.lock().unwrap().push((
             "third_owner_handle_cross_thread_commit".to_string(),
-            third_owner_cross_thread_commit.is_err(),
-            format!("{third_owner_cross_thread_commit:?}"),
+            class,
+            detail,
         ));
 
         db_handle.insert_row(
@@ -4463,18 +4504,56 @@ fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
     let rollback_wrong_tx = db.rollback(wrong_tx);
     let rollback_other_wrong_tx = other_db.rollback(other_wrong_tx);
     let attempts = attempts.lock().unwrap().clone();
+    let expected_attempts = [
+        ("same_handle_wrong_tx", AttemptClass::TxBoundMismatch),
+        (
+            "same_handle_execute_in_tx_wrong_tx",
+            AttemptClass::TxBoundMismatch,
+        ),
+        ("other_handle_sql", AttemptClass::TxBoundMismatch),
+        ("other_handle_apply_changes", AttemptClass::TriggerReentry),
+        (
+            "other_handle_commit_staged_tx",
+            AttemptClass::TriggerReentry,
+        ),
+        (
+            "same_handle_cross_thread_ctx_tx",
+            AttemptClass::TriggerCrossThread,
+        ),
+        (
+            "other_handle_cross_thread_sql",
+            AttemptClass::TriggerCrossThread,
+        ),
+        (
+            "third_owner_handle_cross_thread_sql",
+            AttemptClass::TriggerCrossThread,
+        ),
+        (
+            "third_owner_handle_cross_thread_commit",
+            AttemptClass::TriggerCrossThread,
+        ),
+    ];
+    assert_eq!(
+        attempts.len(),
+        expected_attempts.len(),
+        "unexpected trigger escape attempt count: attempts={attempts:?}"
+    );
+    for ((name, class, detail), (expected_name, expected_class)) in
+        attempts.iter().zip(expected_attempts.iter())
+    {
+        assert_eq!(
+            name, expected_name,
+            "trigger escape attempts ran in unexpected order: attempts={attempts:?}"
+        );
+        assert_eq!(
+            class, expected_class,
+            "attempt {name} classified incorrectly; detail={detail}"
+        );
+    }
     assert!(
         fire.is_ok()
             && rollback_wrong_tx.is_ok()
             && rollback_other_wrong_tx.is_ok()
-            && attempts.len() == 9
-            && attempts.iter().all(|(_, rejected, message)| {
-                *rejected
-                    && (message.contains(
-                        "trigger callback writes must use the supplied tx-bound database handle",
-                    ) || message.contains("trigger callback is active")
-                        || message.contains("inside trigger callbacks"))
-            })
             && count_rows(&db, "guard_audits") == 1
             && count_rows(&other_db, "escape_writes") == 0
             && count_rows(&third_owner_db, "third_owner_escape") == 0,
@@ -4568,7 +4647,7 @@ fn t3_trigger_dispatch_uses_commit_final_write_set() {
         &HashMap::from([("id".to_string(), Value::Uuid(uuid(0xE20)))]),
     )
     .unwrap();
-    let stale_tx = db.begin();
+    let stale_tx = db.begin_or_panic();
     db.execute_in_tx(
         stale_tx,
         "UPDATE final_writes SET status = 'ack', content = 'stale-cascade' WHERE id = $id AND status = 'pending'",
@@ -4582,7 +4661,7 @@ fn t3_trigger_dispatch_uses_commit_final_write_set() {
     .unwrap();
     let stale_commit = db.commit(stale_tx);
 
-    let upsert_tx = db.begin();
+    let upsert_tx = db.begin_or_panic();
     db.execute_in_tx(
         upsert_tx,
         "INSERT INTO final_writes (id, slug, status, content) VALUES ($id, 'upsert-key', 'open', $content) ON CONFLICT (slug) DO UPDATE SET content = $content",
@@ -4599,7 +4678,7 @@ fn t3_trigger_dispatch_uses_commit_final_write_set() {
     .unwrap();
     let upsert_commit = db.commit(upsert_tx);
 
-    let api_insert_tx = db.begin();
+    let api_insert_tx = db.begin_or_panic();
     let api_insert = db.upsert_row(
         api_insert_tx,
         "final_writes",
@@ -4612,7 +4691,7 @@ fn t3_trigger_dispatch_uses_commit_final_write_set() {
         ]),
     );
     let api_insert_commit = db.commit(api_insert_tx);
-    let api_update_tx = db.begin();
+    let api_update_tx = db.begin_or_panic();
     let api_update = db.upsert_row(
         api_update_tx,
         "final_writes",
@@ -4813,7 +4892,7 @@ fn t3_sibling_callback_cascades_validate_after_all_triggers_stage() {
     .unwrap();
     db.complete_initialization().unwrap();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(
         tx,
         "INSERT INTO sibling_sources (id, kind) VALUES ($id, 'child-first')",
@@ -4986,7 +5065,7 @@ fn t3_atomicity_cascade_rows_share_lsn_and_event() {
     api_db.complete_initialization().unwrap();
     let api_since = api_db.current_lsn();
     let api_rx = api_db.subscribe();
-    let api_tx = api_db.begin();
+    let api_tx = api_db.begin_or_panic();
     api_db
         .insert_row(
             api_tx,
@@ -5548,7 +5627,7 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
         ),
         "reopened handles must reject sync apply until callbacks are ready; got {cold_reopen_apply:?}"
     );
-    let cold_direct_tx = reopened.begin();
+    let cold_direct_tx = reopened.begin_or_panic();
     let cold_direct_insert = reopened.insert_row(
         cold_direct_tx,
         "host_writes",
@@ -5571,7 +5650,7 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
         count_rows(&reopened, "host_audits"),
         reopened.changes_since(cold_gate_since)
     );
-    let cold_vector_tx = reopened.begin();
+    let cold_vector_tx = reopened.begin_or_panic();
     let cold_vector_insert = reopened.insert_vector(
         cold_vector_tx,
         VectorIndexRef::new("host_writes", "embedding"),
@@ -6393,7 +6472,7 @@ fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
     let origin_since = origin.current_lsn();
     let sender_groups = [3usize, 129usize, 257usize];
     for (group_idx, count) in sender_groups.iter().copied().enumerate() {
-        let tx = origin.begin();
+        let tx = origin.begin_or_panic();
         for n in 0..count {
             let write_id = uuid(0x900_u128 + group_idx as u128 * 10_000 + n as u128);
             let audit_id = uuid(0xA00_u128 + group_idx as u128 * 10_000 + n as u128);
@@ -7195,11 +7274,12 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
             .push(format!("{apply_result:?}"));
         if !matches!(
             &apply_result,
-            Err(Error::Other(reason))
-                if reason.contains("cron callbacks") && !reason.contains("trigger")
+            Err(Error::CallbackReentry {
+                kind: CallbackKind::Cron
+            })
         ) {
             return Err(Error::Other(format!(
-                "apply_changes inside cron-trigger callback must be rejected for the cron-active reason only; got {apply_result:?}"
+                "apply_changes inside cron-trigger callback must be rejected with CallbackReentry{{Cron}}; got {apply_result:?}"
             )));
         }
         let write_id = ctx
@@ -7235,11 +7315,12 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
         );
         if !matches!(
             &apply_result,
-            Err(Error::Other(reason))
-                if reason.contains("cron callbacks") && !reason.contains("trigger")
+            Err(Error::CallbackReentry {
+                kind: CallbackKind::Cron
+            })
         ) {
             return Err(Error::Other(format!(
-                "apply_changes after cron-fired trigger returns must still be rejected for the cron-active reason only; got {apply_result:?}"
+                "apply_changes after cron-fired trigger returns must still be rejected with CallbackReentry{{Cron}}; got {apply_result:?}"
             )));
         }
         Ok(())

@@ -188,8 +188,8 @@ fn t16_05_conditional_update_non_state_machine_column_one_winner() {
     )
     .unwrap();
 
-    let tx_one = db.begin();
-    let tx_two = db.begin();
+    let tx_one = db.begin_or_panic();
+    let tx_two = db.begin_or_panic();
     for (tx, new_value) in [(tx_one, 1), (tx_two, 2)] {
         let staged = db
             .execute_in_tx(
@@ -294,8 +294,8 @@ fn t16_07_non_pk_conditional_update_revalidates_expected_value() {
     )
     .unwrap();
 
-    let tx_one = db.begin();
-    let tx_two = db.begin();
+    let tx_one = db.begin_or_panic();
+    let tx_two = db.begin_or_panic();
     for (tx, new_value) in [(tx_one, 1), (tx_two, 2)] {
         let staged = db
             .execute_in_tx(

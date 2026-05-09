@@ -1241,7 +1241,7 @@ fn nv14_snapshot_isolation_across_two_indexes() {
     let writer_db = Arc::clone(&db);
     let id = Uuid::new_v4();
     let writer = thread::spawn(move || -> Result<RowId, Error> {
-        let tx = writer_db.begin();
+        let tx = writer_db.begin_or_panic();
         let row_id = writer_db.insert_row(tx, "evidence", values(vec![("id", Value::Uuid(id))]))?;
         writer_db.insert_vector(
             tx,
@@ -1355,7 +1355,7 @@ fn nv14b_three_way_unified_transaction_atomicity() {
     // writes — that's what makes this a "unified-tx" test.
     let entity_id = Uuid::new_v4();
     let evidence_id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let _entity_row = db
         .insert_row(tx, "entities", values(vec![("id", Value::Uuid(entity_id))]))
         .expect("insert entity");
@@ -2760,7 +2760,7 @@ fn nv14c_record_observation_fanout_unified_tx_atomicity() {
     let ev2 = Uuid::new_v4();
     let ev3 = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(tx, "entities", values(vec![("id", Value::Uuid(entity_id))]))
         .expect("insert entity");
     db.insert_row(
@@ -2930,7 +2930,7 @@ fn nv_subscription_event_includes_table_for_vector_only_change() {
 
     // Seed and commit the relational row first. The observed commit below must be vector-only.
     let id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, "evidence", values(vec![("id", Value::Uuid(id))]))
         .expect("seed row");
@@ -3378,7 +3378,7 @@ fn nv19_unknown_index_apply_returns_typed_error() {
         "raw Rust API query_vector must reject undeclared indexes, not silently search/create an ad-hoc slot; got {raw_query:?}"
     );
 
-    let tx = receiver.begin();
+    let tx = receiver.begin_or_panic();
     let raw_row_id = receiver
         .insert_row(
             tx,
@@ -3443,7 +3443,7 @@ fn nv19_unknown_index_apply_returns_typed_error() {
 #[test]
 fn nv19c_insert_vector_against_undeclared_index_fails() {
     let db = Database::open_memory();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let result = db.insert_vector(
         tx,
         VectorIndexRef::new("nonexistent", "vector_x"),

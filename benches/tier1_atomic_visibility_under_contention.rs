@@ -49,7 +49,7 @@ fn setup_db() -> Arc<Database> {
 
 fn write_three_paradigm_commit(db: &Database, seq: u128) {
     let id = Uuid::from_u128(seq + 1);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(
             tx,

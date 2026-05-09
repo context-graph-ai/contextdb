@@ -39,7 +39,7 @@ fn job_02_impact_analysis_explain_and_result() {
 #[test]
 fn job_03_vector_search_with_explain() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row = db
         .insert_row(
             tx,
@@ -79,7 +79,7 @@ fn job_04_cross_subsystem_tx() {
     let source = uuid::Uuid::new_v4();
     let target = uuid::Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(
             tx,

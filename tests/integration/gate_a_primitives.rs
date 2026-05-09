@@ -128,7 +128,7 @@ fn a1_03_create_table_with_state_machine_constraint() {
 #[test]
 fn a1_04_drop_table_removes_schema_and_data() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "patterns",
@@ -284,7 +284,7 @@ fn a2_01_insert_and_scan() {
         (Uuid::new_v4(), "gamma", "database"),
     ];
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (id, name, entity_type) in rows {
         db.insert_row(
             tx,
@@ -319,7 +319,7 @@ fn a2_02_point_lookup_by_column() {
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -371,7 +371,7 @@ fn a2_03_insert_via_sql() {
 #[test]
 fn a2_04_select_with_where_clause() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (name, entity_type) in [
         ("web-1", "server"),
         ("web-2", "server"),
@@ -409,7 +409,7 @@ fn a2_04_select_with_where_clause() {
 fn a2_05_delete_removes_from_scan() {
     let db = setup_ontology_db();
     let id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let _row_id = db
         .insert_row(
             tx,
@@ -426,7 +426,7 @@ fn a2_05_delete_removes_from_scan() {
     // Capture snapshot before deletion to prove deleted_tx mechanism via MVCC.
     let snap_before_delete = db.snapshot();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "entities", _row_id).expect("delete row");
     db.commit(tx2).expect("commit delete");
 
@@ -486,7 +486,7 @@ fn a2_07_upsert_insert_when_new() {
     let db = setup_ontology_db();
     let id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let result = db
         .upsert_row(
             tx,
@@ -510,7 +510,7 @@ fn a2_08_upsert_update_when_conflict() {
     let db = setup_ontology_db();
     let id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -523,7 +523,7 @@ fn a2_08_upsert_update_when_conflict() {
     .expect("insert");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let result = db
         .upsert_row(
             tx2,
@@ -551,7 +551,7 @@ fn a2_09_upsert_noop_when_same_values() {
     let db = setup_ontology_db();
     let id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -564,7 +564,7 @@ fn a2_09_upsert_noop_when_same_values() {
     .expect("insert");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let result = db
         .upsert_row(
             tx2,
@@ -611,7 +611,7 @@ fn a2_11_select_with_join_direct_api() {
     let entity_id = Uuid::new_v4();
     let decision_id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -678,7 +678,7 @@ fn a2_12_select_with_cte_direct_api() {
 
     let ctx_target = Uuid::new_v4();
     let ctx_other = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "contexts",
@@ -737,7 +737,7 @@ fn a2_12_select_with_cte_direct_api() {
 #[test]
 fn a2_13_count_aggregate_via_scan_len() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for idx in 0..5 {
         db.insert_row(
             tx,
@@ -756,7 +756,7 @@ fn a2_13_count_aggregate_via_scan_len() {
 }
 
 fn insert_chain(db: &contextdb_engine::Database, nodes: &[Uuid], edge_type: &str) {
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for idx in 0..(nodes.len() - 1) {
         db.insert_edge(
             tx,
@@ -775,7 +775,7 @@ fn a3_01_bfs_single_hop() {
     let db = setup_ontology_db();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "BASED_ON".to_string(), HashMap::new())
         .expect("insert");
     db.commit(tx).expect("commit");
@@ -851,7 +851,7 @@ fn a3_04_bfs_cycle_detection() {
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (s, t) in [(a, b), (b, c), (c, a)] {
         db.insert_edge(tx, s, t, "BASED_ON".to_string(), HashMap::new())
             .expect("insert");
@@ -874,7 +874,7 @@ fn a3_05_bfs_reverse_direction() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, d, e, "BASED_ON".to_string(), HashMap::new())
         .expect("insert");
     db.commit(tx).expect("commit");
@@ -898,7 +898,7 @@ fn a3_06_bfs_bidirectional() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "EDGE".to_string(), HashMap::new())
         .expect("insert");
     db.insert_edge(tx, c, b, "EDGE".to_string(), HashMap::new())
@@ -920,7 +920,7 @@ fn a3_07_bfs_edge_type_filter() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "BASED_ON".to_string(), HashMap::new())
         .expect("insert");
     db.insert_edge(tx, a, c, "CITES".to_string(), HashMap::new())
@@ -954,7 +954,7 @@ fn a3_09_bfs_fan_out() {
     let db = setup_ontology_db();
     let a = Uuid::new_v4();
     let neighbors: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for n in &neighbors {
         db.insert_edge(tx, a, *n, "EDGE".to_string(), HashMap::new())
             .expect("insert");
@@ -986,7 +986,7 @@ fn a3_10_bfs_via_match_sql_explain_only() {
 fn a3_11_bfs_max_visited_limit() {
     let db = setup_ontology_db();
     let start = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for _ in 0..100_001 {
         db.insert_edge(
             tx,
@@ -1009,7 +1009,7 @@ fn a3_12_edge_deletion_reflected_in_bfs() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "BASED_ON".to_string(), HashMap::new())
         .expect("insert edge");
     db.commit(tx).expect("commit");
@@ -1024,7 +1024,7 @@ fn a3_12_edge_deletion_reflected_in_bfs() {
         "guard: edge must exist before deletion"
     );
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_edge(tx2, a, b, "BASED_ON").expect("delete edge");
     db.commit(tx2).expect("commit");
 
@@ -1052,7 +1052,7 @@ fn a3_13_bfs_over_adjacency_not_recursive_cte() {
 #[test]
 fn a4_01_insert_and_search_basic() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let r1 = db
         .insert_row(
             tx,
@@ -1126,7 +1126,7 @@ fn a4_01_insert_and_search_basic() {
 #[test]
 fn a4_02_search_respects_k_limit() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for idx in 0..10 {
         let rid = db
             .insert_row(
@@ -1165,7 +1165,7 @@ fn a4_02_search_respects_k_limit() {
 fn a4_03_search_with_candidate_prefilter() {
     let db = setup_ontology_db();
     let mut row_ids = Vec::new();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for idx in 0..10 {
         let rid = db
             .insert_row(
@@ -1223,7 +1223,7 @@ fn a4_04_search_empty_store() {
 #[test]
 fn a4_05_dimension_mismatch_error() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(
             tx,
@@ -1290,7 +1290,7 @@ fn a4_05_dimension_mismatch_error() {
 #[test]
 fn a4_06_vector_deletion() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(
             tx,
@@ -1311,7 +1311,7 @@ fn a4_06_vector_deletion() {
     .expect("insert vector");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_vector(
         tx2,
         contextdb_core::VectorIndexRef::new("observations", "embedding"),
@@ -1336,7 +1336,7 @@ fn a4_06_vector_deletion() {
 #[test]
 fn a4_07_cosine_similarity_ordering() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut ids = Vec::new();
     for vector in [
         embedding384(&[1.0, 0.0]),
@@ -1443,7 +1443,7 @@ fn a4_10_float32_precision_roundtrip() {
     let obs_id = Uuid::new_v4();
 
     // Store embedding in the row's values map so we can retrieve it via point_lookup.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(
             tx,
@@ -1511,7 +1511,7 @@ fn a4_11_hnsw_recall_threshold() {
     .expect("create table");
 
     // Insert enough vectors to trigger HNSW (threshold = 1000).
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut all_vectors = Vec::with_capacity(n as usize);
     for i in 0..n {
         let rid = db
@@ -1607,7 +1607,7 @@ fn a4_12_hnsw_with_mvcc_visibility() {
     .expect("create table");
 
     // Phase 1: insert 1000 vectors and commit.
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let mut phase1_rids = HashSet::new();
     for i in 0..1_000u64 {
         let rid = db
@@ -1641,7 +1641,7 @@ fn a4_12_hnsw_with_mvcc_visibility() {
     let snap_after_phase1 = db.snapshot();
 
     // Phase 2: insert 200 more vectors and commit.
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     for i in 1_000..1_200u64 {
         let rid = db
             .insert_row(
@@ -1758,7 +1758,7 @@ fn a5_01_commit_makes_all_visible() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(
             tx,
@@ -1809,7 +1809,7 @@ fn a5_02_rollback_makes_none_visible() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(
             tx,
@@ -1857,7 +1857,7 @@ fn a5_03_snapshot_isolation_read_old() {
     let db = setup_ontology_db();
     let id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -1900,7 +1900,7 @@ fn a5_04_snapshot_isolation_edge_not_visible() {
     let b = Uuid::new_v4();
     let s1 = db.snapshot();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "EDGE".to_string(), HashMap::new())
         .expect("insert edge");
     db.commit(tx).expect("commit");
@@ -1973,7 +1973,7 @@ fn a5_07_multiple_sequential_transactions() {
     let id_a = Uuid::new_v4();
     let id_b = Uuid::new_v4();
 
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let row_a = db
         .insert_row(
             tx1,
@@ -1990,7 +1990,7 @@ fn a5_07_multiple_sequential_transactions() {
         .expect("insert A");
     db.commit(tx1).expect("commit tx1");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.insert_row(
         tx2,
         "entities",
@@ -2009,7 +2009,7 @@ fn a5_07_multiple_sequential_transactions() {
     // Snapshot after tx2 but before the delete — row A should be visible here.
     let snap_before_delete = db.snapshot();
 
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     db.delete_row(tx3, "entities", row_a).expect("delete A");
     db.commit(tx3).expect("commit tx3");
 
@@ -2041,7 +2041,7 @@ fn a5_08_cross_subsystem_atomicity_no_partial_commit() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(
             tx,
@@ -2334,7 +2334,7 @@ fn a6_10_acyclic_rejects_direct_cycle() {
     let db = setup_ontology_db_with_dag();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
         .expect("insert a->b");
 
@@ -2379,7 +2379,7 @@ fn a6_11_acyclic_rejects_transitive_cycle() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
         .expect("insert a->b");
     db.insert_edge(tx, b, c, "CITES".to_string(), HashMap::new())
@@ -2416,7 +2416,7 @@ fn a6_12_acyclic_allows_diamond() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
         .expect("insert a->b");
 
@@ -2444,7 +2444,7 @@ fn a6_13_non_acyclic_type_allows_cycles() {
     let db = setup_ontology_db_with_dag();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "SERVES".to_string(), HashMap::new())
         .expect("insert a->b");
 
@@ -2482,7 +2482,7 @@ fn a6_14_acyclic_same_tx_write_set_visibility() {
     let db = setup_ontology_db_with_dag();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
 
     let result1 = db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new());
     let result2 = db.insert_edge(tx, b, a, "CITES".to_string(), HashMap::new());
@@ -2515,7 +2515,7 @@ fn a6_15_duplicate_edge_stored_once() {
     let db = setup_ontology_db();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
         .expect("insert #1");
     db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
@@ -2542,16 +2542,16 @@ fn a6_16_reinsert_after_delete_creates_edge() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     db.insert_edge(tx1, a, b, "CITES".to_string(), HashMap::new())
         .expect("insert");
     db.commit(tx1).expect("commit tx1");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_edge(tx2, a, b, "CITES").expect("delete");
     db.commit(tx2).expect("commit tx2");
 
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     let result = db.insert_edge(tx3, a, b, "CITES".to_string(), HashMap::new());
     db.commit(tx3).expect("commit tx3");
 
@@ -2574,7 +2574,7 @@ fn a6_17_different_edge_types_not_duplicates() {
     let db = setup_ontology_db();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "CITES".to_string(), HashMap::new())
         .expect("insert cites");
     db.insert_edge(tx, a, b, "SERVES".to_string(), HashMap::new())
@@ -2618,12 +2618,12 @@ fn a6_18_cross_tx_duplicate_stored_once() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     db.insert_edge(tx1, a, b, "BASED_ON".to_string(), HashMap::new())
         .expect("insert tx1");
     db.commit(tx1).expect("commit tx1");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let result = db.insert_edge(tx2, a, b, "BASED_ON".to_string(), HashMap::new());
     db.commit(tx2).expect("commit tx2");
 
@@ -2757,7 +2757,7 @@ fn a7_10_graph_table_cte_chain_with_later_match_stays_graph_query() {
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new())
         .expect("insert edge a->b");
     db.insert_edge(tx, b, c, "LINKS".to_string(), HashMap::new())
@@ -2889,7 +2889,7 @@ fn a10_04_bfs_aborts_on_frontier_overflow() {
         );
     }
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let _ = db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new());
     let _ = db.commit(tx);
 

@@ -83,7 +83,7 @@ fn insert_on_conflict_do_update() {
 #[test]
 fn vector_search_and_explain() {
     let db = setup_sql_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let r1 = db
         .insert_row(
             tx,
@@ -794,7 +794,7 @@ fn test_insert_value_txid_within_watermark_succeeds() {
         .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
 
     // Insert Value::TxId(TxId(2)) — strictly below the watermark — via library API.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut values: HashMap<String, Value> = HashMap::new();
     values.insert("x".to_string(), Value::TxId(TxId(2)));
     let insert_result = db.insert_row(tx, "t", values);
@@ -845,7 +845,7 @@ fn test_insert_value_txid_beyond_watermark_rejected() {
     // Impl must: positive-accept value <= current_tx_max; reject value > current_tx_max
     //           with TxIdOutOfRange { table, column, value, max } populated from the
     //           threaded statement-scoped snapshot.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row = std::collections::HashMap::new();
     row.insert("x".to_string(), Value::TxId(TxId(u64::MAX)));
     let err = db
@@ -905,7 +905,7 @@ fn test_insert_wrong_variant_into_txid_column_rejected() {
     ];
 
     for (value, expected_actual) in fixtures {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut row: HashMap<String, Value> = HashMap::new();
         row.insert("x".to_string(), value.clone());
         let err = db.insert_row(tx, "t", row).expect_err(&format!(
@@ -949,7 +949,7 @@ fn test_insert_null_respects_txid_nullability() {
     // Case (a): TXID NULL accepts Value::Null, stores it back.
     db.execute("CREATE TABLE t_null (x TXID NULL)", &empty)
         .expect("CREATE TABLE t_null (x TXID NULL) must parse");
-    let tx_a = db.begin();
+    let tx_a = db.begin_or_panic();
     let mut row_a: HashMap<String, Value> = HashMap::new();
     row_a.insert("x".to_string(), Value::Null);
     db.insert_row(tx_a, "t_null", row_a)
@@ -978,7 +978,7 @@ fn test_insert_null_respects_txid_nullability() {
     // Case (b): TXID NOT NULL rejects Value::Null with ColumnNotNullable, not ColumnTypeMismatch.
     db.execute("CREATE TABLE t_nn (x TXID NOT NULL)", &empty)
         .expect("CREATE TABLE t_nn (x TXID NOT NULL) must parse");
-    let tx_b = db.begin();
+    let tx_b = db.begin_or_panic();
     let mut row_b: HashMap<String, Value> = HashMap::new();
     row_b.insert("x".to_string(), Value::Null);
     let err = db
@@ -1024,7 +1024,7 @@ fn test_insert_value_txid_into_non_txid_columns_rejected() {
         db.execute(&create, &empty)
             .unwrap_or_else(|e| panic!("CREATE TABLE {table} ({col_type_ddl}) must parse: {e:?}"));
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut row: HashMap<String, Value> = HashMap::new();
         row.insert("x".to_string(), Value::TxId(TxId(42)));
         let err = db.insert_row(tx, table, row).expect_err(&format!(
@@ -1131,7 +1131,7 @@ fn coerce_value_for_column_exhaustive_no_catch_all() {
 
     let mut row = std::collections::HashMap::new();
     row.insert("e".to_string(), Value::Text("x".to_string()));
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let result = db.insert_row(tx, "v", row);
     let _ = db.rollback(tx);
     assert!(

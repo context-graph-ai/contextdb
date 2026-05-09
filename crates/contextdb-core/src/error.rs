@@ -1,5 +1,29 @@
 use crate::types::{Principal, RowId, TxId, VectorIndexRef};
 
+/// Distinguishes which callback context produced a callback-active error.
+///
+/// Contract: final `Display` for callback-active errors must be alloc-free
+/// (inline `&'static str` templates, never `kind.to_string()`). The RED stub
+/// commit intentionally allocates in this `Display` impl so the allocator probe
+/// fails until the implementation commit replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackKind {
+    Trigger,
+    Cron,
+}
+
+impl std::fmt::Display for CallbackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            CallbackKind::Trigger => "trigger",
+            CallbackKind::Cron => "cron",
+        };
+        let mut stub_label = String::with_capacity(label.len());
+        stub_label.push_str(label);
+        f.write_str(&stub_label)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("table not found: {0}")]
@@ -260,6 +284,38 @@ pub enum Error {
     TriggerRequiresAdmin { operation: String },
     #[error("schema invalid: {reason}")]
     SchemaInvalid { reason: String },
+    /// Cross-thread retry-safe contention. A callback body is executing on another
+    /// thread; the caller may retry once it completes.
+    ///
+    /// Retrying callers MUST use exponential backoff (start >=1ms, cap ~50ms).
+    /// Spin-retry pins the CPU and starves the active callback's runner thread on
+    /// edge hardware (<=4 cores) -- the callback cannot complete and the retry loop
+    /// never exits.
+    ///
+    /// Greppable cross-process substring (sync-wire, log scrapers): the Display
+    /// string contains `"callback active on another thread"` for both kinds.
+    // MAINTAINER: there are no em-dashes in the CallbackActiveCrossThread template,
+    // but see the CallbackReentry template below -- the em-dash character `—` is
+    // U+2014 (NOT ASCII hyphen `-`). The public-API string contract pins exact
+    // bytes (cross-process consumers may grep for these strings); preserve every
+    // em-dash on any future edit and never substitute `--` or `-`.
+    #[error("{kind} callback active on another thread; retry once the callback completes")]
+    CallbackActiveCrossThread { kind: CallbackKind },
+
+    /// API misuse. The caller is inside their own callback body and tx-control
+    /// from any `Database` handle is forbidden -- a fresh `begin()` cannot
+    /// recover. Inside a trigger callback the runner is given a tx-bound
+    /// `&Database` argument that supports writes against the firing tx; calls
+    /// to `begin()` / `commit()` / `rollback()` on any `Database` handle (the
+    /// argument or any other) are misuse.
+    ///
+    /// Greppable substring: the Display string contains `"operation not allowed inside"`
+    /// for both kinds.
+    // MAINTAINER: the em-dash character `—` below is U+2014 (NOT ASCII hyphen `-`).
+    // Public-API string contract pins exact bytes -- preserve the em-dash on any
+    // future edit and never substitute `--` or `-`.
+    #[error("operation not allowed inside a {kind} callback (API misuse — fix the call site)")]
+    CallbackReentry { kind: CallbackKind },
     #[error("{0}")]
     Other(String),
 }

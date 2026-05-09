@@ -87,7 +87,7 @@ fn setup_seeded_db() -> (Database, Vec<Uuid>) {
     let mut parents = Vec::with_capacity(pre_gate_rows);
     let mut seq = 0_usize;
     while seq < pre_gate_rows {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let end = (seq + SEED_BATCH_ROWS).min(pre_gate_rows);
         while seq < end {
             let parent = Uuid::new_v4();
@@ -121,18 +121,18 @@ fn run_fk_commits(db: &Database, parents: &[Uuid]) -> FkReport {
     for offset in 0..TIMED_COMMITS {
         if offset.is_multiple_of(2) {
             let parent = parents[offset % parents.len()];
-            let tx = db.begin();
+            let tx = db.begin_or_panic();
             insert_child(db, tx, Uuid::new_v4(), parent);
             let commit_started = Instant::now();
             db.commit(tx).expect("commit child insert with live parent");
             commit_latencies.push(commit_started.elapsed());
         } else {
             let parent = Uuid::new_v4();
-            let setup_tx = db.begin();
+            let setup_tx = db.begin_or_panic();
             let parent_row_id = insert_parent(db, setup_tx, parent);
             db.commit(setup_tx).expect("commit childless parent setup");
 
-            let tx = db.begin();
+            let tx = db.begin_or_panic();
             db.delete_row(tx, "decisions", parent_row_id)
                 .expect("stage childless parent delete");
             let commit_started = Instant::now();

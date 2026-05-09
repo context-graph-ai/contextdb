@@ -461,7 +461,7 @@ impl Database {
 
     fn run_cron_callback_transaction(&self, callback: CronCallback) -> Result<Lsn> {
         let _callback_thread = self.cron.enter_callback_thread_scope();
-        let tx = self.begin();
+        let tx = self.begin()?;
         let mut pending_sink_events = Vec::new();
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
         let mut committed_trigger_audit_entries = Vec::new();

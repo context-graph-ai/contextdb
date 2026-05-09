@@ -465,7 +465,7 @@ fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
     setup_graph_entities(&db, &[a, b, c]);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "CITES".into(), Default::default())
         .expect("edge a->b");
     db.insert_edge(tx, b, c, "CITES".into(), Default::default())
@@ -474,7 +474,7 @@ fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
     db.close().expect("close db");
 
     let reopened = Database::open(&db_path).expect("reopen db");
-    let tx = reopened.begin();
+    let tx = reopened.begin_or_panic();
     let result = reopened.insert_edge(tx, c, a, "CITES".into(), Default::default());
     assert!(result.is_err());
 }
@@ -528,7 +528,7 @@ fn f05l_vector_index_correct_after_reopen_update_embedding() {
 
     let id_a = Uuid::new_v4();
     let id_b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     // A starts near [1,0,0], B is also near [1,0,0] but slightly off
     let row_a = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(id_a))]))
@@ -620,7 +620,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
 
     for _ in 0..sequence.len() {
         // `begin()` returns a bare TxId (not a guard); `commit(tx)` finalizes.
-        let txid: TxId = db.begin();
+        let txid: TxId = db.begin_or_panic();
         let id = uuid::Uuid::new_v4();
         let mut row = std::collections::HashMap::new();
         row.insert("id".to_string(), Value::Uuid(id));

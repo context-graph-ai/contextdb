@@ -172,7 +172,7 @@ pub async fn push_change_through_server(
     )
     .expect("create edge schema");
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
         .expect("insert edge row");
@@ -207,7 +207,7 @@ pub async fn push_many_changes_through_server(
     )
     .expect("create edge schema");
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (offset, id) in ids.into_iter().enumerate() {
         let row_id = db
             .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))

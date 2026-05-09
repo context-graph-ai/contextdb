@@ -224,7 +224,7 @@ pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
     let decision1_id = Uuid::new_v4();
     let decision2_id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",

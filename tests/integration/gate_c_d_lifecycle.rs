@@ -44,7 +44,7 @@ fn insert_entity(db: &contextdb_engine::Database, tx: u64, id: Uuid, props: &str
 fn c1_01_pattern_stored_and_queryable() {
     let db = setup_ontology_db();
     let p = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "patterns",
@@ -91,7 +91,7 @@ fn c1_01_pattern_stored_and_queryable() {
 fn c1_02_pattern_match_criteria() {
     let db = setup_ontology_db();
     let entity = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx.0, entity, "");
     for _ in 0..3 {
         db.insert_row(
@@ -126,7 +126,7 @@ fn c1_02_pattern_match_criteria() {
 fn c1_03_pattern_scope_labels_filter() {
     let db = setup_ontology_db();
     let p = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "patterns",
@@ -170,7 +170,7 @@ fn c1_03_pattern_scope_labels_filter() {
 #[test]
 fn c1_04_common_attributes_across_decisions() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for idx in 0..5 {
         db.insert_row(
             tx,
@@ -224,7 +224,7 @@ fn c2_01_entity_context_retrieval() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx.0, e, "state=v1");
     db.insert_row(
         tx,
@@ -273,7 +273,7 @@ fn c2_01_entity_context_retrieval() {
 fn c2_02_entity_context_empty() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx.0, e, "state=empty");
     db.commit(tx).expect("commit");
 
@@ -299,7 +299,7 @@ fn c2_03_subscribe_new_decision() {
 
     let entity_id = Uuid::new_v4();
     let decision_id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -402,7 +402,7 @@ fn c2_05_subscribe_conflict_detected() {
 
     // Multiple commits to exercise the path
     for i in 0..5 {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "entities",
@@ -431,7 +431,7 @@ fn c2_05_subscribe_conflict_detected() {
 
     // Now verify a subscriber can still receive
     let rx2 = db.subscribe();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -460,7 +460,7 @@ fn c2_06_callback_exception_isolated() {
     let rx = db.subscribe();
 
     // First commit
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -480,7 +480,7 @@ fn c2_06_callback_exception_isolated() {
     drop(rx);
 
     // Second commit must succeed without error
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -511,7 +511,7 @@ fn c2_06_callback_exception_isolated() {
 
     // Subscribe again after the dropped receiver — must still work
     let rx2 = db.subscribe();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -536,7 +536,7 @@ fn c2_06_callback_exception_isolated() {
 #[test]
 fn c3_01_cross_context_observation_query() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for ctx in ["c1", "c2"] {
         db.insert_row(
             tx,
@@ -576,7 +576,7 @@ fn c3_01_cross_context_observation_query() {
 #[test]
 fn c3_02_cross_context_no_match() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (ctx, attr) in [("c1", "attr=a"), ("c2", "attr=b")] {
         db.insert_row(
             tx,
@@ -603,7 +603,7 @@ fn c3_02_cross_context_no_match() {
 #[test]
 fn c3_03_cross_context_time_window() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for ts in [1_i64, 100_i64] {
         db.insert_row(
             tx,
@@ -636,7 +636,7 @@ fn c3_03_cross_context_time_window() {
 fn c3_04_same_entity_not_self_correlated() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for data in ["attr=a", "attr=b"] {
         db.insert_row(
             tx,
@@ -672,7 +672,7 @@ fn c4_01_pattern_generates_system_intention() {
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx.0, e, "state=match");
     db.insert_row(
         tx,
@@ -749,7 +749,7 @@ fn c4_01_pattern_generates_system_intention() {
 fn c4_03_precedent_match_on_event() {
     let db = setup_ontology_db();
     let precedent = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "decisions",
@@ -798,7 +798,7 @@ fn d1_01_observation_to_new_decision() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let inv = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "contexts",
@@ -1056,7 +1056,7 @@ fn d1_02_unwatched_field_unknown_unknown() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx.0, e, "cpu=4cores,region=us-east-1");
     db.insert_row(
         tx,
@@ -1106,7 +1106,7 @@ fn d1_03_cascade_invalidation_full_chain() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx.0, e, "state=v1");
     db.insert_row(
         tx,
@@ -1203,7 +1203,7 @@ fn d3_04_local_pattern_match_generates_intent() {
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx.0, e, "person_detected=true");
     db.insert_row(
         tx,
@@ -1288,7 +1288,7 @@ fn d3_05_pattern_confidence_updated_by_outcomes() {
     let base_confidence = 0.5_f64;
 
     // Insert pattern and two decisions linked to pattern
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "patterns",
@@ -1318,7 +1318,7 @@ fn d3_05_pattern_confidence_updated_by_outcomes() {
     db.commit(tx).expect("commit");
 
     // Step 1: Record success outcome for D1
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.insert_row(
         tx2,
         "outcomes",
@@ -1360,7 +1360,7 @@ fn d3_05_pattern_confidence_updated_by_outcomes() {
     let new_confidence = base_confidence * (1.0 + success_rate) / 2.0; // 0.5 * 2.0 / 2.0 = 0.5 -> higher
 
     // Step 3: Update pattern P confidence via upsert
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     db.upsert_row(
         tx3,
         "patterns",
@@ -1385,7 +1385,7 @@ fn d3_05_pattern_confidence_updated_by_outcomes() {
     );
 
     // Step 5: Record failure outcome for D2
-    let tx4 = db.begin();
+    let tx4 = db.begin_or_panic();
     db.insert_row(
         tx4,
         "outcomes",
@@ -1417,7 +1417,7 @@ fn d3_05_pattern_confidence_updated_by_outcomes() {
     let total2 = pattern_outcomes2.len();
     let success_rate2 = successes2 as f64 / total2 as f64; // 0.5
     let final_confidence = base_confidence * (1.0 + success_rate2) / 2.0;
-    let tx5 = db.begin();
+    let tx5 = db.begin_or_panic();
     db.upsert_row(
         tx5,
         "patterns",
@@ -1451,7 +1451,7 @@ fn d4_01_vigil_camera_observation_loop() {
     let d = Uuid::new_v4();
 
     // Setup: context, intention, entity, decision, edges
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "contexts",
@@ -1509,7 +1509,7 @@ fn d4_01_vigil_camera_observation_loop() {
     db.commit(tx).expect("commit setup");
 
     // tx1: First observation — Kumar detected (expected person), no invalidation
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     db.insert_row(
         tx1,
         "observations",
@@ -1538,7 +1538,7 @@ fn d4_01_vigil_camera_observation_loop() {
     );
 
     // tx2: Unknown person detected — triggers invalidation
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.insert_row(
         tx2,
         "observations",

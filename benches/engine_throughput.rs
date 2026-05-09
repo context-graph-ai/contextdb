@@ -85,7 +85,7 @@ fn insert_vectors_direct(
     count: usize,
     seed_offset: u64,
 ) {
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..count {
         let row_id = db
             .insert_row(
@@ -293,7 +293,7 @@ fn vector_insert_and_search(c: &mut Criterion) {
                 &HashMap::new(),
             )
             .unwrap();
-            let tx = db.begin();
+            let tx = db.begin_or_panic();
             for i in 0..500 {
                 let angle = i as f32 * 0.01;
                 let rid = db
@@ -325,7 +325,7 @@ fn vector_insert_and_search(c: &mut Criterion) {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         for i in 0..1_000 {
             let angle = i as f32 * 0.01;
             let rid = db
@@ -368,7 +368,7 @@ fn graph_bfs_throughput(c: &mut Criterion) {
 
     group.bench_function("bfs_1000_node_chain", |b| {
         let db = Database::open_memory();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut nodes = Vec::new();
         for _ in 0..1_000 {
             nodes.push(Uuid::new_v4());
@@ -412,7 +412,7 @@ fn persist_and_reopen_smoke(c: &mut Criterion) {
             )
             .unwrap();
             for batch in 0..10 {
-                let tx = db.begin();
+                let tx = db.begin_or_panic();
                 for i in 0..100 {
                     db.insert_row(
                         tx,

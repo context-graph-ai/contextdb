@@ -73,7 +73,7 @@ fn b1_01_observation_triggers_invalidation() {
     let o = Uuid::new_v4();
     let inv = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "rate", "rate_limit=100");
     insert_decision(&db, tx, d, "decision", "active", 0.9);
     add_edge(&db, tx, d, e, "BASED_ON");
@@ -145,7 +145,7 @@ fn b1_02_cascade_through_cites() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "svc", "x=1");
     insert_decision(&db, tx, d1, "d1", "active", 0.9);
     insert_decision(&db, tx, d2, "d2", "active", 0.7);
@@ -185,7 +185,7 @@ fn b1_03_no_material_change_no_invalidation() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "svc", "status=active");
     insert_decision(&db, tx, d, "d", "active", 0.8);
     add_edge(&db, tx, d, e, "BASED_ON");
@@ -220,7 +220,7 @@ fn b1_04_unwatched_field_still_triggers() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "svc", "cpu=4,memory=8");
     insert_decision(&db, tx, d, "reasoning:cpu", "active", 0.9);
     add_edge(&db, tx, d, e, "BASED_ON");
@@ -256,7 +256,7 @@ fn b1_05_new_property_triggers_invalidation() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "svc", "cpu=4");
     insert_decision(&db, tx, d, "d", "active", 0.8);
     add_edge(&db, tx, d, e, "BASED_ON");
@@ -293,7 +293,7 @@ fn b1_06_severity_computation() {
     let e = Uuid::new_v4();
     let d_high = Uuid::new_v4();
     let d_low = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "svc", "v=1");
     insert_decision(&db, tx, d_high, "d_high", "active", 0.9);
     insert_decision(&db, tx, d_low, "d_low", "active", 0.3);
@@ -354,7 +354,7 @@ fn b1_07_impact_analysis_atomic() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "svc", "v=1");
     insert_decision(&db, tx, d, "d", "active", 0.8);
     db.insert_row(
@@ -389,7 +389,7 @@ fn b1_07_impact_analysis_atomic() {
         1
     );
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.insert_row(
         tx2,
         "observations",
@@ -413,7 +413,7 @@ fn b2_01_replay_shows_input_diffs() {
     let e1 = Uuid::new_v4();
     let e2 = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e1, "infra", "cpu=4,region=us");
     insert_entity(&db, tx, e2, "config", "max=10");
     insert_decision(&db, tx, d, "autoscale", "active", 0.8);
@@ -448,7 +448,7 @@ fn b2_01_replay_shows_input_diffs() {
     .expect("snap2");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "entities", entity_row(&db, e1).row_id)
         .expect("delete old");
     insert_entity(&db, tx2, e1, "infra", "cpu=8,region=eu");
@@ -522,7 +522,7 @@ fn b2_02_replay_no_changes() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "x", "stable=1");
     insert_decision(&db, tx, d, "d", "active", 0.5);
     add_edge(&db, tx, d, e, "BASED_ON");
@@ -552,7 +552,7 @@ fn b3_01_full_provenance_includes_snapshots() {
     let p1 = Uuid::new_v4();
     let e1 = Uuid::new_v4();
     let e2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e1, "db", "v=14");
     insert_entity(&db, tx, e2, "api", "throughput=1000");
     insert_decision(&db, tx, p1, "precedent", "active", 0.8);
@@ -652,7 +652,7 @@ fn b3_02_provenance_nonexistent_decision() {
 fn b3_03_provenance_no_inputs() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "no input", "active", 0.7);
     db.insert_row(
         tx,
@@ -692,7 +692,7 @@ fn b3_03_provenance_no_inputs() {
 fn b3_04_provenance_no_precedents() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "no cites", "active", 0.9);
     db.commit(tx).expect("commit");
     assert!(
@@ -719,7 +719,7 @@ fn b4_01_traverse_entity_graph() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (id, name) in [(a, "A"), (b, "B"), (c, "C")] {
         insert_entity(&db, tx, id, name, "");
     }
@@ -746,7 +746,7 @@ fn b4_02_traverse_with_type_filter() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     add_edge(&db, tx, a, b, "RELATES_TO");
     add_edge(&db, tx, a, c, "BASED_ON");
     db.commit(tx).expect("commit");
@@ -767,7 +767,7 @@ fn b4_02_traverse_with_type_filter() {
 fn b4_03_traverse_cycle_detection() {
     let db = setup_ontology_db();
     let nodes: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     add_edge(&db, tx, nodes[0], nodes[1], "RELATES_TO");
     add_edge(&db, tx, nodes[1], nodes[2], "RELATES_TO");
     add_edge(&db, tx, nodes[2], nodes[0], "RELATES_TO");
@@ -789,7 +789,7 @@ fn b4_03_traverse_cycle_detection() {
 fn b4_04_traverse_max_depth_10() {
     let db = setup_ontology_db();
     let nodes: Vec<Uuid> = (0..12).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..11 {
         add_edge(&db, tx, nodes[i], nodes[i + 1], "RELATES_TO");
     }
@@ -834,7 +834,7 @@ fn b4_05_precedent_chain() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for d in [d1, d2, d3] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
     }
@@ -860,7 +860,7 @@ fn b4_06_precedent_chain_cycle() {
     let db = setup_ontology_db();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d1, "d1", "active", 0.8);
     insert_decision(&db, tx, d2, "d2", "active", 0.8);
     add_edge(&db, tx, d1, d2, "CITES");
@@ -883,7 +883,7 @@ fn b4_06_precedent_chain_cycle() {
 fn b4_07_precedent_chain_max_depth() {
     let db = setup_ontology_db();
     let chain: Vec<Uuid> = (0..12).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for id in &chain {
         insert_decision(&db, tx, *id, "d", "active", 0.8);
     }
@@ -911,7 +911,7 @@ fn b4_08_subgraph_decisions() {
     let e2 = Uuid::new_v4();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for e in [e0, e1, e2] {
         insert_entity(&db, tx, e, "e", "");
     }
@@ -963,7 +963,7 @@ fn b4_09_subgraph_depth_zero() {
     let e = Uuid::new_v4();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "e", "");
     insert_decision(&db, tx, d1, "d1", "active", 0.8);
     insert_decision(&db, tx, d2, "d2", "active", 0.8);
@@ -996,7 +996,7 @@ fn b4_10_relationship_idempotent() {
     let db = setup_ontology_db();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     add_edge(&db, tx, a, b, "RELATES_TO");
     add_edge(&db, tx, a, b, "RELATES_TO");
     db.commit(tx).expect("commit");
@@ -1025,7 +1025,7 @@ fn b4_11_entity_neighborhood() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let i1 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for ent in [e, e1, e2, e3] {
         insert_entity(&db, tx, ent, "e", "");
     }
@@ -1099,7 +1099,7 @@ fn b4_12_intention_tree() {
     let d3 = Uuid::new_v4();
     let e1 = Uuid::new_v4();
     let e2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -1204,7 +1204,7 @@ fn b4_13_delete_decision_removes_from_precedent_chain() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for d in [d1, d2, d3] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
     }
@@ -1212,7 +1212,7 @@ fn b4_13_delete_decision_removes_from_precedent_chain() {
     add_edge(&db, tx, d2, d1, "CITES");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let d2_row = db
         .point_lookup("decisions", "id", &Value::Uuid(d2), db.snapshot())
         .expect("lookup")
@@ -1249,7 +1249,7 @@ fn b4_13_delete_decision_removes_from_precedent_chain() {
 #[test]
 fn b5_01_find_similar_decisions() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row_ids = Vec::new();
     for i in 0..5 {
         let d = Uuid::new_v4();
@@ -1275,7 +1275,7 @@ fn b5_01_find_similar_decisions() {
         let id = row.row_id;
         row_ids.push(id);
     }
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     for (idx, rid) in row_ids.iter().enumerate() {
         db.insert_vector(
             tx2,
@@ -1303,7 +1303,7 @@ fn b5_01_find_similar_decisions() {
 #[test]
 fn b5_02_similarity_with_type_filter() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row_ids = Vec::new();
     let mut decision_types = Vec::new();
     for (idx, ty) in ["security", "security", "ops"].iter().enumerate() {
@@ -1375,14 +1375,14 @@ fn b5_02_similarity_with_type_filter() {
 #[test]
 fn b5_03_similarity_threshold() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for conf in [0.9, 0.6, 0.3] {
         insert_decision(&db, tx, Uuid::new_v4(), "d", "active", conf);
     }
     db.commit(tx).expect("commit");
 
     let rows = decision_rows(&db);
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     for (i, r) in rows.iter().enumerate() {
         db.insert_vector(
             tx2,
@@ -1431,7 +1431,7 @@ fn b5_05_compound_search_time_vector_confidence() {
     let d_high = Uuid::new_v4();
     let d_low = Uuid::new_v4();
     let d_old = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut decision_row_ids: Vec<(Uuid, u64)> = Vec::new();
     for (d, desc, conf, success, day, vec) in [
         (d_high, "D_high", 0.9, true, 5_i64, vec![1.0, 0.0]),
@@ -1555,7 +1555,7 @@ fn b5_05_compound_search_time_vector_confidence() {
 #[test]
 fn b5_06_cross_context_semantic_search() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row_ids_ctx: Vec<(u64, String)> = Vec::new();
     for (idx, ctx) in ["c1", "c1", "c2", "c2"].iter().enumerate() {
         let rid = db
@@ -1636,7 +1636,7 @@ fn b5_06_cross_context_semantic_search() {
 fn b6_01_entity_snapshot_at_past_timestamp() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "ent", "v=1");
     for (from, to, state) in [(1, 2, "v=1"), (2, 3, "v=2"), (3, 4, "v=3")] {
         db.insert_row(
@@ -1686,7 +1686,7 @@ fn b6_02_snapshot_before_entity_existed() {
 fn b6_03_entity_history() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (from, to) in [(1, 2), (2, 3), (3, 4)] {
         db.insert_row(
             tx,
@@ -1722,7 +1722,7 @@ fn b6_03_entity_history() {
 fn b6_04_temporal_diff() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (from, state) in [(1, "cpu=4,region=us"), (2, "cpu=8,region=eu")] {
         db.insert_row(
             tx,
@@ -1792,7 +1792,7 @@ fn b6_04_temporal_diff() {
 fn b6_05_temporal_diff_no_changes() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for from in [1, 2] {
         db.insert_row(
             tx,
@@ -1820,7 +1820,7 @@ fn b6_05_temporal_diff_no_changes() {
 fn b6_06_rapid_snapshot_contiguity() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..100_i64 {
         db.insert_row(
             tx,
@@ -1883,7 +1883,7 @@ fn b6_06_rapid_snapshot_contiguity() {
 #[test]
 fn b6_07_list_entities() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (name, ty) in [("a", "SERVICE"), ("b", "DATABASE"), ("c", "SERVICE")] {
         db.insert_row(
             tx,
@@ -1909,7 +1909,7 @@ fn b6_07_list_entities() {
 fn b6_08_delete_entity() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "x", "");
     db.insert_row(
         tx,
@@ -1928,7 +1928,7 @@ fn b6_08_delete_entity() {
     .expect("snap");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let row = entity_row(&db, e);
     db.delete_row(tx2, "entities", row.row_id).expect("delete");
     db.commit(tx2).expect("commit");
@@ -1975,7 +1975,7 @@ fn b6_10_null_valid_to_means_current() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let snap_id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "camera", "pos=north");
     // Insert snapshot with valid_from=100 and NO valid_to (NULL → still current)
     db.insert_row(
@@ -2043,7 +2043,7 @@ fn b7_01_record_decision_with_reasoning() {
     let d = Uuid::new_v4();
     let i = Uuid::new_v4();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -2136,7 +2136,7 @@ fn b7_01_record_decision_with_reasoning() {
 fn b7_02_record_decision_minimal() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "decisions",
@@ -2165,7 +2165,7 @@ fn b7_02_record_decision_minimal() {
 #[test]
 fn b7_03_decision_tags_searchable() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let d = Uuid::new_v4();
     db.insert_row(
         tx,
@@ -2202,7 +2202,7 @@ fn b7_04_list_decisions_by_entity() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for e in [e1, e2] {
         insert_entity(&db, tx, e, "e", "");
     }
@@ -2252,11 +2252,11 @@ fn b7_05_get_decision_not_found() {
 fn b7_06_delete_decision() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "to-delete", "active", 0.8);
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let row = db
         .point_lookup("decisions", "id", &Value::Uuid(d), db.snapshot())
         .expect("lookup")
@@ -2276,14 +2276,14 @@ fn b7_07_supersede_decision() {
     let db = setup_ontology_db();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d1, "d1", "active", 0.8);
     insert_decision(&db, tx, d2, "d2", "active", 0.8);
     add_edge(&db, tx, d2, d1, "SUPERSEDES");
     db.commit(tx).expect("commit");
 
     // Use direct API: delete old row, insert new version with status="superseded"
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let old_row = db
         .point_lookup("decisions", "id", &Value::Uuid(d1), db.snapshot())
         .expect("lookup")
@@ -2328,7 +2328,7 @@ fn b7_07_supersede_decision() {
 fn b7_08_decision_properties_stored() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "decisions",
@@ -2358,7 +2358,7 @@ fn b8_01_invalidation_state_forward_only() {
     let db = setup_ontology_db();
     let i = Uuid::new_v4();
     // Insert initial pending invalidation via direct API
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "invalidations",
@@ -2372,7 +2372,7 @@ fn b8_01_invalidation_state_forward_only() {
     db.commit(tx).expect("commit");
 
     // Transition pending -> acknowledged via upsert
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "invalidations",
@@ -2390,7 +2390,7 @@ fn b8_01_invalidation_state_forward_only() {
     db.commit(tx2).expect("commit");
 
     // Transition acknowledged -> resolved via upsert
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     db.upsert_row(
         tx3,
         "invalidations",
@@ -2405,7 +2405,7 @@ fn b8_01_invalidation_state_forward_only() {
     db.commit(tx3).expect("commit");
 
     // Invalid transition: resolved -> pending should fail
-    let tx4 = db.begin();
+    let tx4 = db.begin_or_panic();
     let err = db.upsert_row(
         tx4,
         "invalidations",
@@ -2425,7 +2425,7 @@ fn b8_02_dismiss_invalidation() {
     let db = setup_ontology_db();
     let i = Uuid::new_v4();
     // Insert initial pending invalidation via direct API
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "invalidations",
@@ -2439,7 +2439,7 @@ fn b8_02_dismiss_invalidation() {
     db.commit(tx).expect("commit");
 
     // Transition pending -> dismissed via upsert
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "invalidations",
@@ -2454,7 +2454,7 @@ fn b8_02_dismiss_invalidation() {
     db.commit(tx2).expect("commit");
 
     // Invalid transition: dismissed -> acknowledged should fail
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     let err = db.upsert_row(
         tx3,
         "invalidations",
@@ -2478,7 +2478,7 @@ fn b8_03_resolve_with_new_decision() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let i = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d1, "d1", "active", 0.8);
     insert_decision(&db, tx, d2, "d2", "active", 0.8);
     db.insert_row(
@@ -2515,7 +2515,7 @@ fn b8_03_resolve_with_new_decision() {
 fn b9_01_record_outcome_and_retrieve() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "d", "active", 0.8);
     db.insert_row(
         tx,
@@ -2543,7 +2543,7 @@ fn b9_01_record_outcome_and_retrieve() {
 fn b9_02_outcome_replaces_previous() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "d", "active", 0.8);
     db.insert_row(
         tx,
@@ -2557,7 +2557,7 @@ fn b9_02_outcome_replaces_previous() {
     .expect("o1");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let old = db
         .scan_filter("outcomes", db.snapshot(), &|r| {
             r.values.get("decision_id") == Some(&Value::Uuid(d))
@@ -2591,7 +2591,7 @@ fn b9_03_effective_confidence() {
     let db = setup_ontology_db();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d1, "d1", "active", 0.9);
     insert_decision(&db, tx, d2, "d2", "active", 0.9);
     db.insert_row(
@@ -2665,7 +2665,7 @@ fn b9_04_citation_stats() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for d in [d1, d2, d3] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
     }
@@ -2733,7 +2733,7 @@ fn b9_05_outcome_nonexistent_decision() {
     // Capture (not ignore) the result of inserting an outcome for a nonexistent decision_id.
     // contextDB does not enforce foreign key constraints on insert_row, so the insert succeeds.
     // This is a data integrity concern handled at the application level.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let insert_result = db.insert_row(
         tx,
         "outcomes",
@@ -2766,7 +2766,7 @@ fn b9_05_outcome_nonexistent_decision() {
 fn b9_06_no_outcome_no_penalty() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "d", "active", 0.8);
     db.commit(tx).expect("commit");
     let row = db
@@ -2781,7 +2781,7 @@ fn b9_06_no_outcome_no_penalty() {
 fn b10_01_add_approval_to_decision() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "d", "active", 0.8);
     db.insert_row(
         tx,
@@ -2814,7 +2814,7 @@ fn b10_01_add_approval_to_decision() {
 fn b10_02_multiple_approvals() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d, "d", "active", 0.8);
     for approver in ["a1", "a2"] {
         db.insert_row(
@@ -2842,7 +2842,7 @@ fn b10_02_multiple_approvals() {
 #[test]
 fn b10_03_query_by_approver() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     insert_decision(&db, tx, d1, "d1", "active", 0.8);
@@ -2872,7 +2872,7 @@ fn b10_03_query_by_approver() {
 #[test]
 fn b10_04_audit_query_filters() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (ty, days, tags) in [
         ("security", 5_i64, "auth"),
         ("security", 50_i64, "auth"),
@@ -2925,7 +2925,7 @@ fn b10_05_approval_nonexistent_decision() {
     // Capture (not ignore) the result of inserting an approval for a nonexistent decision.
     // contextDB does not enforce foreign key constraints on insert_row, so the insert succeeds.
     // This is a data integrity concern handled at the application level.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let insert_result = db.insert_row(
         tx,
         "approvals",
@@ -2957,7 +2957,7 @@ fn b10_05_approval_nonexistent_decision() {
 fn b11_01_decisions_visible_across_contexts() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "decisions",
@@ -2985,7 +2985,7 @@ fn b11_01_decisions_visible_across_contexts() {
 #[test]
 fn b11_02_filter_by_agent_id() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for agent in ["A", "B", "A"] {
         db.insert_row(
             tx,
@@ -3013,7 +3013,7 @@ fn b11_02_filter_by_agent_id() {
 fn b11_03_agent_handoff() {
     let db = setup_ontology_db();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "decisions",
@@ -3035,7 +3035,7 @@ fn b11_03_agent_handoff() {
     .expect("insert");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let row = db
         .point_lookup("decisions", "id", &Value::Uuid(d), db.snapshot())
         .expect("lookup")
@@ -3089,7 +3089,7 @@ fn b11_04_decision_superseded_by_better_option() {
     let d_new = Uuid::new_v4();
 
     // Create intention and an initial active decision serving it.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -3123,7 +3123,7 @@ fn b11_04_decision_superseded_by_better_option() {
 
     // Application-level supersession: delete old decision, insert it as superseded,
     // then insert a new better decision. This is explicit application workflow.
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let old_row = db
         .point_lookup("decisions", "id", &Value::Uuid(d_old), db.snapshot())
         .expect("lookup")
@@ -3191,7 +3191,7 @@ fn b11_04_decision_superseded_by_better_option() {
 fn b12_01_create_intention() {
     let db = setup_ontology_db();
     let i = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -3223,7 +3223,7 @@ fn b12_02_archive_intention_with_active_decisions() {
     let d2 = Uuid::new_v4();
 
     // Create an intention with two active decisions that reference it via FK.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -3273,7 +3273,7 @@ fn b12_02_archive_intention_with_active_decisions() {
 
     // Archive the intention using upsert_row (state machine transition: active -> archived).
     // FK propagation rule should automatically invalidate both decisions.
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -3316,7 +3316,7 @@ fn b12_03_archive_intention_no_active_decisions() {
     let db = setup_ontology_db();
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -3332,7 +3332,7 @@ fn b12_03_archive_intention_no_active_decisions() {
     db.commit(tx).expect("commit");
 
     // Archive via direct API: delete + insert with new status
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let old_intention = db
         .point_lookup("intentions", "id", &Value::Uuid(i), db.snapshot())
         .expect("lookup")
@@ -3364,7 +3364,7 @@ fn b12_04_intention_tree() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -3434,7 +3434,7 @@ fn b13_01_context_scoped_queries() {
     let db = setup_ontology_db();
     let e1 = Uuid::new_v4();
     let e2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (e, ctx) in [(e1, "c1"), (e2, "c2")] {
         db.insert_row(
             tx,
@@ -3480,7 +3480,7 @@ fn b13_01_context_scoped_queries() {
 #[test]
 fn b13_02_cross_context_requires_explicit_opt_in() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for ctx in ["c1", "c2"] {
         db.insert_row(
             tx,
@@ -3523,7 +3523,7 @@ fn b14_01_conflicting_decisions_detected() {
     let e = Uuid::new_v4();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "ent", "");
     for (d, outcome) in [(d1, true), (d2, false)] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
@@ -3595,7 +3595,7 @@ fn b14_02_conflicts_bidirectional() {
     let e = Uuid::new_v4();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "ent", "");
     for d in [d1, d2] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
@@ -3652,7 +3652,7 @@ fn b14_03_no_conflict_different_entity() {
     let e2 = Uuid::new_v4();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for e in [e1, e2] {
         insert_entity(&db, tx, e, "e", "");
     }
@@ -3688,7 +3688,7 @@ fn b14_04_no_conflict_same_outcome() {
     let db = setup_ontology_db();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for d in [d1, d2] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
         db.insert_row(
@@ -3715,7 +3715,7 @@ fn b14_04_no_conflict_same_outcome() {
 #[test]
 fn b15_01_time_window_with_precedent_ranking() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (conf, success, cites, days) in [
         (0.9, true, 3_i64, 5_i64),
         (0.9, false, 0_i64, 2_i64),
@@ -3812,7 +3812,7 @@ fn b15_02_stale_decision_cascade() {
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
     let d4 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "file", "path=/etc/nginx.conf,checksum=abc123");
     for d in [d1, d2, d3, d4] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
@@ -3858,7 +3858,7 @@ fn b15_03_transitive_effective_confidence() {
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
     let d3 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_decision(&db, tx, d1, "d1", "active", 0.9);
     insert_decision(&db, tx, d2, "d2", "active", 0.85);
     insert_decision(&db, tx, d3, "d3", "active", 0.7);
@@ -3926,7 +3926,7 @@ fn b16_01_graph_to_relational_to_vector() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let neighbors: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "root", "");
     for n in &neighbors {
         insert_entity(&db, tx, *n, "n", "");
@@ -3974,7 +3974,7 @@ fn b16_01_graph_to_relational_to_vector() {
     }
 
     // Insert vectors for the observations so query_vector has data
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     for (idx, r) in candidate_obs.iter().enumerate() {
         db.insert_vector(
             tx2,
@@ -4011,7 +4011,7 @@ fn b16_01_graph_to_relational_to_vector() {
 fn b17_01_bfs_output_shape() {
     let db = setup_ontology_db();
     let nodes: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..4 {
         add_edge(&db, tx, nodes[i], nodes[i + 1], "BASED_ON");
     }
@@ -4033,7 +4033,7 @@ fn b17_01_bfs_output_shape() {
 #[test]
 fn b17_02_ann_output_shape() {
     let db = setup_ontology_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for vec in [
         embedding384(&[1.0, 0.0, 0.0, 0.0]),
         embedding384(&[0.95, 0.05, 0.0, 0.0]),
@@ -4077,7 +4077,7 @@ fn b17_02_ann_output_shape() {
 fn b17_03_upsert_output_shape() {
     let db = setup_ontology_db();
     let id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let inserted = db
         .upsert_row(
             tx,
@@ -4108,7 +4108,7 @@ fn b17_03_upsert_output_shape() {
     .expect("seed");
     db.commit(tx).expect("commit");
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let updated = db
         .upsert_row(
             tx2,
@@ -4126,7 +4126,7 @@ fn b17_03_upsert_output_shape() {
         .expect("updated");
     db.commit(tx2).expect("commit");
 
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     let noop = db
         .upsert_row(
             tx3,
@@ -4159,7 +4159,7 @@ fn b17_04_impact_analysis_output_shape() {
     let o = Uuid::new_v4();
     let inv_id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "svc", "cpu=4");
     insert_decision(&db, tx, d, "scale-up", "active", 0.9);
     add_edge(&db, tx, d, e, "BASED_ON");
@@ -4216,7 +4216,7 @@ fn b17_05_provenance_output_shape() {
     let d = Uuid::new_v4();
     let e = Uuid::new_v4();
     let p = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "api", "latency=10ms");
     insert_decision(&db, tx, p, "precedent", "active", 0.8);
     insert_decision(&db, tx, d, "main-decision", "active", 0.9);
@@ -4319,7 +4319,7 @@ fn b17_06_replay_output_shape() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "infra", "cpu=4,region=us");
     insert_decision(&db, tx, d, "autoscale", "active", 0.8);
     add_edge(&db, tx, d, e, "BASED_ON");
@@ -4341,7 +4341,7 @@ fn b17_06_replay_output_shape() {
     db.commit(tx).expect("commit");
 
     // Update entity
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let old = entity_row(&db, e);
     db.delete_row(tx2, "entities", old.row_id).expect("delete");
     insert_entity(&db, tx2, e, "infra", "cpu=8,region=eu");
@@ -4369,7 +4369,7 @@ fn b18_01_multi_observation_independent_impact() {
     let db = setup_ontology_db();
     let d1 = Uuid::new_v4();
     let d2 = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for d in [d1, d2] {
         insert_decision(&db, tx, d, "d", "active", 0.8);
     }
@@ -4412,7 +4412,7 @@ fn b18_01_multi_observation_independent_impact() {
 fn b18_02_concurrent_impact_analysis() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e, "e", "");
     for _ in 0..10 {
         let d = Uuid::new_v4();
@@ -4462,7 +4462,7 @@ fn b18_02_concurrent_impact_analysis() {
 fn b18_03_observation_immutability_under_read() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for _ in 0..100 {
         db.insert_row(
             tx,
@@ -4489,7 +4489,7 @@ fn b18_03_observation_immutability_under_read() {
 fn b18_04_high_frequency_write_throughput() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row_ids = Vec::new();
     for i in 0..1000 {
         let rid = db
@@ -4540,7 +4540,7 @@ fn b18_06_person_reidentification_via_embedding() {
     let e1 = Uuid::new_v4();
     let e2 = Uuid::new_v4();
     let decision = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     insert_entity(&db, tx, e1, "known_visitor", "last_seen=2024-01-01");
     insert_entity(&db, tx, e2, "regular_worker", "last_seen=2024-01-01");
     insert_decision(&db, tx, decision, "trust E1", "active", 0.8);
@@ -4595,7 +4595,7 @@ fn b18_06_person_reidentification_via_embedding() {
     assert_eq!(top.len(), 1);
     assert_eq!(top[0].0, r1);
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let old = entity_row(&db, e1);
     db.delete_row(tx2, "entities", old.row_id)
         .expect("delete old e1");
@@ -4649,7 +4649,7 @@ fn b18_07_decision_supersession_chain() {
     let d3 = Uuid::new_v4();
     let d4 = Uuid::new_v4();
     let e = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",

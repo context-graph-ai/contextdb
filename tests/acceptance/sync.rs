@@ -1114,7 +1114,7 @@ async fn sync_e2e_value_txid_round_trip() {
 
     // Begin a real transaction on edge-A; capture its TxId; insert via library API.
     // `begin()` returns TxId; `commit(tx)` finalizes.
-    let tx_id_used: TxId = edge_a_db.begin();
+    let tx_id_used: TxId = edge_a_db.begin_or_panic();
     assert!(
         tx_id_used.0 > 0,
         "precondition: allocated TxId must be > 0, got {:?}",

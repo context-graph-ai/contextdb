@@ -415,7 +415,7 @@ fn t6_04_edge_graph_traversal_excludes_server_only_rows() {
 
     let denied_insert_source = n_edge_allowed_neighbor;
     let denied_insert_target = n_server;
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     let err = assert_error(
         edge.insert_edge(
             tx,
@@ -434,7 +434,7 @@ fn t6_04_edge_graph_traversal_excludes_server_only_rows() {
     );
     edge.commit(tx).unwrap();
 
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     let err = assert_error(
         edge.delete_edge(tx, n_edge, n_server, "LINKS"),
         "direct delete_edge from edge handle touching server-scoped node must be rejected",
@@ -577,7 +577,7 @@ fn t6_05_edge_vector_query_excludes_server_only_rows() {
     let denied_delete_row_id = *denied_rows
         .next()
         .expect("server vector fixture row missing for delete");
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     let err = assert_error(
         edge.insert_vector(
             tx,
@@ -595,7 +595,7 @@ fn t6_05_edge_vector_query_excludes_server_only_rows() {
     );
     edge.commit(tx).unwrap();
 
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     let err = assert_error(
         edge.delete_vector(
             tx,

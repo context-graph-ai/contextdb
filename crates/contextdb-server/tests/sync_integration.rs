@@ -1567,7 +1567,7 @@ fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
     // A subsequent local transaction on edge-B must allocate a TxId >= 101 —
     // proving the allocator did not silently reuse an id. begin() returns a bare
     // TxId; rollback releases it.
-    let probe_tx = edge_b.begin();
+    let probe_tx = edge_b.begin_or_panic();
     assert!(
         probe_tx.0 >= 101,
         "new transaction on edge_b must issue TxId >= 101 after allocator advance; got {:?}",

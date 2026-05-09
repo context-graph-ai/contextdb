@@ -426,7 +426,7 @@ pub(crate) async fn push_change_through_server(
     )
     .expect("create edge schema");
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
         .expect("insert edge row");
@@ -461,7 +461,7 @@ pub(crate) async fn push_many_changes_through_server(
     )
     .expect("create edge schema");
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (offset, id) in ids.into_iter().enumerate() {
         let row_id = db
             .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
@@ -612,7 +612,7 @@ pub(crate) fn setup_graph_entities(db: &Database, ids: &[Uuid]) {
         &empty_params(),
     )
     .expect("create entities table");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (index, id) in ids.iter().enumerate() {
         db.insert_row(
             tx,
@@ -636,7 +636,7 @@ pub(crate) fn setup_vector_table(db: &Database, dimension: usize) {
 }
 
 pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64 {
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, "embeddings", values(vec![("id", Value::Uuid(id))]))
         .expect("insert embedding row");

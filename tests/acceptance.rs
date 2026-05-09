@@ -1,5 +1,39 @@
 #![allow(clippy::assertions_on_constants)]
 
+// Allocator counter wrapper -- installed binary-wide so t29_display_impl_does_not_allocate
+// can measure allocator activity directly. Counting is gated by a thread-local
+// flag, which the Display probes flip on around measured writes only; unrelated
+// test threads cannot contaminate the delta.
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+pub static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    pub static COUNT_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub struct AllocCounter;
+
+unsafe impl GlobalAlloc for AllocCounter {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if COUNT_ENABLED
+            .try_with(|enabled| enabled.get())
+            .unwrap_or(false)
+        {
+            ALLOC_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+    }
+}
+
+#[global_allocator]
+static GLOBAL: AllocCounter = AllocCounter;
+
 #[path = "acceptance/auto_stamped_txid.rs"]
 mod auto_stamped_txid;
 #[path = "acceptance/cli_ux.rs"]
@@ -74,6 +108,10 @@ mod state_machine_concurrent_legal_transition;
 mod state_machine_self_edge_check;
 #[path = "acceptance/sync.rs"]
 mod sync;
+#[path = "acceptance/test_alloc_counter.rs"]
+pub mod test_alloc_counter;
+#[path = "acceptance/trigger_concurrency_panic_freedom.rs"]
+mod trigger_concurrency_panic_freedom;
 #[path = "acceptance/txid_monotonic_concurrent_commits.rs"]
 mod txid_monotonic_concurrent_commits;
 #[path = "acceptance/vector_reindex_ordering.rs"]

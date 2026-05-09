@@ -89,7 +89,7 @@ fn setup_seeded_db() -> (Database, Vec<Uuid>, Uuid) {
     let mut ids = Vec::with_capacity(pre_gate_rows);
     let mut seq = 0_usize;
     while seq < pre_gate_rows {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let end = (seq + SEED_BATCH_ROWS).min(pre_gate_rows);
         while seq < end {
             let id = Uuid::new_v4();
@@ -100,7 +100,7 @@ fn setup_seeded_db() -> (Database, Vec<Uuid>, Uuid) {
         db.commit(tx).expect("commit state-machine seed batch");
     }
     let strict_id = Uuid::new_v4();
-    let strict_tx = db.begin();
+    let strict_tx = db.begin_or_panic();
     insert_job(&db, strict_tx, "strict_jobs", strict_id);
     db.commit(strict_tx).expect("commit strict job");
     assert_eq!(

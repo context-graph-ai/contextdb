@@ -186,8 +186,8 @@ fn t24_03_concurrent_updates_moving_composite_key_columns_one_winner() {
         .unwrap();
     }
 
-    let alice_tx = db.begin();
-    let bob_tx = db.begin();
+    let alice_tx = db.begin_or_panic();
+    let bob_tx = db.begin_or_panic();
     for (tx, principal) in [(alice_tx, "alice"), (bob_tx, "bob")] {
         let staged = db
             .execute_in_tx(

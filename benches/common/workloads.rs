@@ -25,7 +25,7 @@ pub fn setup_graph_relational_vector_db() -> (Database, Uuid) {
 
     let root = Uuid::new_v4();
     let neighbors: Vec<Uuid> = (0..32).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",

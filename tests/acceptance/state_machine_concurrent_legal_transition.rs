@@ -101,8 +101,8 @@ fn t23_02_post_race_row_is_in_one_terminal_state() {
     let (_dir, db) = open_db();
     let db = &db;
     let id = setup_acknowledged(db);
-    let resolved_tx = db.begin();
-    let dismissed_tx = db.begin();
+    let resolved_tx = db.begin_or_panic();
+    let dismissed_tx = db.begin_or_panic();
     for (tx, terminal) in [(resolved_tx, "resolved"), (dismissed_tx, "dismissed")] {
         let staged = db
             .execute_in_tx(

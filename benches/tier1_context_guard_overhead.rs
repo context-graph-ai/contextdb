@@ -21,7 +21,7 @@ fn seed(path: &std::path::Path, ctx_a: Uuid, ctx_b: Uuid, rows: u128) {
         &empty(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..rows {
         db.insert_row(
             tx,

@@ -24,7 +24,7 @@ fn ds01_rows_available_after_reopen() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "items",
@@ -183,7 +183,7 @@ fn ds03_edges_available_after_reopen() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "nodes",
@@ -243,7 +243,7 @@ fn ds04_vectors_available_after_reopen() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let row_id = db
             .insert_row(
                 tx,
@@ -290,7 +290,7 @@ fn ds05_edge_restart_push_full_dataset() {
                 &HashMap::new(),
             )
             .unwrap();
-        let tx = edge_db.begin();
+        let tx = edge_db.begin_or_panic();
         edge_db
             .insert_row(
                 tx,
@@ -338,7 +338,7 @@ fn ds06_idempotent_row_reapply() {
         )
         .unwrap();
     let known_id = Uuid::new_v4();
-    let tx = source.begin();
+    let tx = source.begin_or_panic();
     source
         .insert_row(
             tx,
@@ -382,7 +382,7 @@ fn ds07_idempotent_edge_reapply() {
         .unwrap();
     let src_id = Uuid::new_v4();
     let tgt_id = Uuid::new_v4();
-    let tx = source.begin();
+    let tx = source.begin_or_panic();
     source
         .insert_row(
             tx,
@@ -448,7 +448,7 @@ fn ds08_idempotent_vector_reapply() {
         )
         .unwrap();
     let obs_id = Uuid::new_v4();
-    let tx = source.begin();
+    let tx = source.begin_or_panic();
     let row_id = source
         .insert_row(tx, "obs", vals(vec![("id", Value::Uuid(obs_id))]))
         .unwrap();
@@ -502,7 +502,7 @@ fn ds09_future_watermark_returns_empty() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "items",
@@ -583,7 +583,7 @@ fn ds10_schema_divergence_detected() {
         "divergent column 'unit' must not appear in local schema"
     );
 
-    let tx = server.begin();
+    let tx = server.begin_or_panic();
     server
         .insert_row(
             tx,
@@ -667,7 +667,7 @@ fn ds12_edge_only_db_after_reopen() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "nodes",
@@ -712,7 +712,7 @@ fn ds13_vector_only_after_reopen() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let row_id = db
             .insert_row(
                 tx,
@@ -759,7 +759,7 @@ fn ds14_both_sides_restart_bidirectional() {
                 &HashMap::new(),
             )
             .unwrap();
-        let tx = server.begin();
+        let tx = server.begin_or_panic();
         server
             .insert_row(
                 tx,
@@ -782,7 +782,7 @@ fn ds14_both_sides_restart_bidirectional() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = edge.begin();
+        let tx = edge.begin_or_panic();
         edge.insert_row(
             tx,
             "config",
@@ -870,7 +870,7 @@ fn ds15_drop_table_syncs() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "temp",
@@ -923,7 +923,7 @@ fn ds16_deletion_tombstone_sync() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     for (id, name) in [(alice_id, "alice"), (bob_id, "bob"), (carol_id, "carol")] {
         edge.insert_row(
             tx,
@@ -948,7 +948,7 @@ fn ds16_deletion_tombstone_sync() {
 
     let lsn_after_sync = edge.current_lsn();
 
-    let tx2 = edge.begin();
+    let tx2 = edge.begin_or_panic();
     let bob_row = edge
         .point_lookup("items", "id", &Value::Uuid(bob_id), edge.snapshot())
         .unwrap()
@@ -1000,7 +1000,7 @@ fn assert_delete_tombstone_syncs_for_scalar_id(create_sql: &str, id: Value) {
     let edge = Database::open_memory();
 
     edge.execute(create_sql, &HashMap::new()).unwrap();
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "items",
@@ -1032,7 +1032,7 @@ fn assert_delete_tombstone_syncs_for_scalar_id(create_sql: &str, id: Value) {
         .point_lookup("items", "id", &id, edge.snapshot())
         .unwrap()
         .expect("edge row must exist before delete");
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.delete_row(tx, "items", row.row_id).unwrap();
     edge.commit(tx).unwrap();
 
@@ -1084,7 +1084,7 @@ fn ds19_primary_key_wins_over_non_key_id_for_delete_tombstone_sync() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "items",
@@ -1115,7 +1115,7 @@ fn ds19_primary_key_wins_over_non_key_id_for_delete_tombstone_sync() {
         )
         .unwrap()
         .expect("edge row must exist before delete");
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.delete_row(tx, "items", row.row_id).unwrap();
     edge.commit(tx).unwrap();
 
@@ -1158,7 +1158,7 @@ fn ds20_delete_tombstone_uses_latest_primary_key_after_key_update() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
         "items",
@@ -1236,7 +1236,7 @@ fn ds20_delete_tombstone_uses_latest_primary_key_after_key_update() {
         )
         .unwrap()
         .expect("edge row must exist with updated primary key before delete");
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     edge.delete_row(tx, "items", row.row_id).unwrap();
     edge.commit(tx).unwrap();
 

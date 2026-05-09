@@ -10,7 +10,7 @@ fn bc_01_empty_database() {
 fn bc_02_depth_bound() {
     let db = setup_ontology_db();
     let nodes: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..5 {
         db.insert_edge(
             tx,

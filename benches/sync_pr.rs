@@ -108,7 +108,7 @@ fn setup_chunked_mixed_push(
     create_observation_tables(&server_db);
 
     let known_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
-    let tx = edge_db.begin();
+    let tx = edge_db.begin_or_panic();
     for i in 0..400usize {
         let uuid = Uuid::new_v4();
         let vec: Vec<f32> = if i == 0 {
@@ -167,7 +167,7 @@ fn setup_chunked_large_pull(
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     create_observation_tables(&server_db);
-    let tx = server_db.begin();
+    let tx = server_db.begin_or_panic();
     for _ in 0..600usize {
         server_db
             .insert_row(
@@ -216,7 +216,7 @@ fn setup_multi_edge_converge(
     create_items_table(&edge_b_db);
     create_items_table(&server_db);
 
-    let tx_a = edge_a_db.begin();
+    let tx_a = edge_a_db.begin_or_panic();
     for i in 0..100usize {
         edge_a_db
             .insert_row(
@@ -231,7 +231,7 @@ fn setup_multi_edge_converge(
     }
     edge_a_db.commit(tx_a).unwrap();
 
-    let tx_b = edge_b_db.begin();
+    let tx_b = edge_b_db.begin_or_panic();
     for i in 0..100usize {
         edge_b_db
             .insert_row(

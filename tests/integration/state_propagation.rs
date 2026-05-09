@@ -52,7 +52,7 @@ fn t01_fk_propagation_basic() {
     let intention_id = Uuid::new_v4();
     let decision_id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -82,7 +82,7 @@ fn t01_fk_propagation_basic() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -134,7 +134,7 @@ fn t02_fk_propagation_multi_level() {
     let d = Uuid::new_v4();
     let sd = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -169,7 +169,7 @@ fn t02_fk_propagation_multi_level() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -203,7 +203,7 @@ fn t03_fk_propagation_depth_limit() {
 
     let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "tasks",
@@ -230,7 +230,7 @@ fn t03_fk_propagation_depth_limit() {
     }
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "tasks",
@@ -264,7 +264,7 @@ fn t04_edge_propagation_basic() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "decisions",
@@ -295,7 +295,7 @@ fn t04_edge_propagation_basic() {
         .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "decisions",
@@ -323,7 +323,7 @@ fn t05_edge_propagation_respects_direction() {
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "decisions",
@@ -369,7 +369,7 @@ fn t05_edge_propagation_respects_direction() {
         .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "decisions",
@@ -406,7 +406,7 @@ fn t06_fk_plus_edge_combined() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -446,7 +446,7 @@ fn t06_fk_plus_edge_combined() {
         .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -469,7 +469,7 @@ fn t07_vector_exclusion_basic() {
     let db = setup_propagation_db();
     let d = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(
             tx,
@@ -502,7 +502,7 @@ fn t07_vector_exclusion_basic() {
         .is_empty()
     );
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "decisions",
@@ -534,7 +534,7 @@ fn t08_fk_propagation_plus_vector_exclusion() {
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -569,7 +569,7 @@ fn t08_fk_propagation_plus_vector_exclusion() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -615,7 +615,7 @@ fn t09_skip_and_warn_on_invalid_transition() {
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -639,7 +639,7 @@ fn t09_skip_and_warn_on_invalid_transition() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -671,7 +671,7 @@ fn t10_cycle_detection() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "tasks",
@@ -694,7 +694,7 @@ fn t10_cycle_detection() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "tasks",
@@ -717,7 +717,7 @@ fn t11_no_matching_rows_noop() {
     let db = setup_propagation_db();
     let i = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -730,7 +730,7 @@ fn t11_no_matching_rows_noop() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -766,7 +766,7 @@ fn t12_abort_on_failure_policy() {
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -790,7 +790,7 @@ fn t12_abort_on_failure_policy() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let upsert_result = db.upsert_row(
         tx2,
         "intentions",
@@ -834,7 +834,7 @@ fn t15_end_to_end_fk_edge_vector_full_chain() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -890,7 +890,7 @@ fn t15_end_to_end_fk_edge_vector_full_chain() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -927,7 +927,7 @@ fn t16_supersession_with_vector_exclusion() {
     let db = setup_propagation_db();
     let d = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(
             tx,
@@ -951,7 +951,7 @@ fn t16_supersession_with_vector_exclusion() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "decisions",
@@ -990,7 +990,7 @@ fn t17_sync_propagation_server_archives_client_applies_and_propagates() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = server.begin();
+    let tx = server.begin_or_panic();
     server
         .insert_row(
             tx,
@@ -1043,7 +1043,7 @@ fn t17_sync_propagation_server_archives_client_applies_and_propagates() {
         .unwrap();
 
     let before = server.current_lsn();
-    let tx2 = server.begin();
+    let tx2 = server.begin_or_panic();
     server
         .upsert_row(
             tx2,
@@ -1089,7 +1089,7 @@ fn t18_sync_does_not_repropagate_already_propagated_rows() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
 
-    let tx = server.begin();
+    let tx = server.begin_or_panic();
     server
         .insert_row(
             tx,
@@ -1174,7 +1174,7 @@ fn t19_propagation_does_not_fire_without_rules() {
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -1198,7 +1198,7 @@ fn t19_propagation_does_not_fire_without_rules() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -1235,7 +1235,7 @@ fn t20_impossible_state_transition_during_propagation_skip_and_warn() {
     let i = Uuid::new_v4();
     let d = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -1259,7 +1259,7 @@ fn t20_impossible_state_transition_during_propagation_skip_and_warn() {
     .unwrap();
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",

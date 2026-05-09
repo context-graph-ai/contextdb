@@ -36,7 +36,7 @@ fn t17_01_general_delete_then_insert_recall_returns_new_vector() {
 
     // General delete+insert in one tx using engine API.
     let idx = VectorIndexRef::new("memories", "embedding");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.delete_vector(tx, idx.clone(), row_id).unwrap();
     db.insert_vector(tx, idx.clone(), row_id, vec![0.0, 0.0, 1.0])
         .unwrap();
@@ -93,7 +93,7 @@ fn t17_02_batch_reindex_all_rows_resolve_to_new_vectors() {
     }
 
     let idx = VectorIndexRef::new("memories", "embedding");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (i, row_id) in row_ids.iter().enumerate() {
         let new_vec = batch_reindex_vector(i, row_ids.len());
         db.delete_vector(tx, idx.clone(), *row_id).unwrap();
@@ -196,7 +196,7 @@ fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
         "target should have exactly one raw HNSW entry before reindex"
     );
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.delete_vector(tx, idx.clone(), target_row_id).unwrap();
     db.insert_vector(tx, idx.clone(), target_row_id, vec![0.0, 0.0, 1.0])
         .unwrap();
@@ -285,7 +285,7 @@ fn t17_03_delete_one_insert_other_in_same_tx_both_visible() {
         .unwrap();
     assert_eq!(pre[0].0, row_id_a);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.delete_vector(tx, idx.clone(), row_id_a).unwrap();
     db.insert_vector(tx, idx.clone(), row_id_b, vec![0.0, 0.0, 1.0])
         .unwrap();
@@ -373,7 +373,7 @@ fn t17_05_per_index_isolation_for_same_row() {
     let idx_vision = VectorIndexRef::new("evidence", "vector_vision");
 
     // Reindex only the text vector.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.delete_vector(tx, idx_text.clone(), row_id).unwrap();
     db.insert_vector(tx, idx_text.clone(), row_id, vec![0.0, 0.0, 1.0])
         .unwrap();
@@ -449,7 +449,7 @@ fn t17_06_general_delete_insert_survives_reopen() {
         row_id = scan[0].row_id;
 
         let idx = VectorIndexRef::new("memories", "embedding");
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.delete_vector(tx, idx.clone(), row_id).unwrap();
         db.insert_vector(tx, idx, row_id, vec![0.0, 0.0, 1.0])
             .unwrap();
@@ -542,14 +542,14 @@ fn t17_09_same_tx_pending_inserts_then_delete_leave_no_vector_after_reopen() {
         )
         .unwrap();
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut values = HashMap::new();
         values.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
         row_id = db.insert_row(tx, "memories", values).unwrap();
         db.commit(tx).unwrap();
 
         let idx = VectorIndexRef::new("memories", "embedding");
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_vector(tx, idx.clone(), row_id, vec![1.0, 0.0, 0.0])
             .unwrap();
         db.insert_vector(tx, idx.clone(), row_id, vec![0.0, 0.0, 1.0])
@@ -594,14 +594,14 @@ fn t17_10_same_tx_repeated_inserts_keep_only_latest_after_reopen() {
         )
         .unwrap();
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut values = HashMap::new();
         values.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
         row_id = db.insert_row(tx, "memories", values).unwrap();
         db.commit(tx).unwrap();
 
         let idx = VectorIndexRef::new("memories", "embedding");
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_vector(tx, idx.clone(), row_id, vec![1.0, 0.0, 0.0])
             .unwrap();
         db.insert_vector(tx, idx.clone(), row_id, vec![0.0, 0.0, 1.0])
@@ -661,7 +661,7 @@ fn t17_11_move_then_vector_replacement_in_same_tx_does_not_resurrect_old_vector(
     )
     .unwrap();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut p1 = HashMap::new();
     p1.insert("id".into(), Value::Uuid(id));
     p1.insert("label".into(), Value::Text("renamed".into()));
@@ -722,7 +722,7 @@ fn t17_12_chained_same_tx_updates_move_vector_to_final_row_after_reopen() {
         )
         .unwrap();
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut p1 = HashMap::new();
         p1.insert("id".into(), Value::Uuid(id));
         p1.insert("label".into(), Value::Text("b".into()));

@@ -565,7 +565,7 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
     );
 
     let index = VectorIndexRef::new("entities", "embedding");
-    let mutate_existing = db.begin();
+    let mutate_existing = db.begin_or_panic();
     db.delete_edge(mutate_existing, source_id, target_id, "LINKS")
         .unwrap();
     db.commit(mutate_existing).unwrap();
@@ -1015,7 +1015,7 @@ fn t21_10_snapshot_at_lsn_survives_reopen_after_later_mutations() {
             &later,
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.delete_edge(tx, source_id, target_id, "LINKS").unwrap();
         db.commit(tx).unwrap();
         db.execute(
@@ -1092,7 +1092,7 @@ fn t21_11_snapshot_at_lsn_preserves_reinserted_graph_edge_after_reopen() {
         let db = Database::open(&path).unwrap();
         let rx = db.subscribe();
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_edge(
             tx,
             source_id,
@@ -1107,7 +1107,7 @@ fn t21_11_snapshot_at_lsn_preserves_reinserted_graph_edge_after_reopen() {
             .expect("insert edge event must publish")
             .lsn;
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.delete_edge(tx, source_id, target_id, "LINKS").unwrap();
         db.commit(tx).unwrap();
         let delete_lsn = rx
@@ -1115,7 +1115,7 @@ fn t21_11_snapshot_at_lsn_preserves_reinserted_graph_edge_after_reopen() {
             .expect("delete edge event must publish")
             .lsn;
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_edge(
             tx,
             source_id,
@@ -1232,7 +1232,7 @@ fn t21_13_same_tx_graph_delete_then_reinsert_keeps_new_edge() {
 
     {
         let db = Database::open(&path).unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_edge(
             tx,
             source_id,
@@ -1243,7 +1243,7 @@ fn t21_13_same_tx_graph_delete_then_reinsert_keeps_new_edge() {
         .unwrap();
         db.commit(tx).unwrap();
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.delete_edge(tx, source_id, target_id, "LINKS").unwrap();
         db.insert_edge(
             tx,

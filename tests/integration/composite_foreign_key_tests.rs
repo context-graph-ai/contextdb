@@ -407,7 +407,7 @@ fn cfk_insert_rejects_partial_parent_match() {
 fn cfk_insert_sametx_parent_either_order() {
     let (_tmp, path, db) = file_db("same-tx-parent.db");
     create_parent_child(&db);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(tx, "INSERT INTO child (id, c1, c2) VALUES (1, 1, 2)", &p())
         .unwrap();
     db.execute_in_tx(tx, "INSERT INTO parent (a, b) VALUES (1, 2)", &p())
@@ -421,7 +421,7 @@ fn cfk_insert_sametx_parent_either_order() {
 fn cfk_insert_self_ref_within_one_tx() {
     let (_tmp, path, db) = file_db("self-ref-same-tx.db");
     db.execute("CREATE TABLE node (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, pa INTEGER, pb INTEGER, UNIQUE(a, b), FOREIGN KEY (pa, pb) REFERENCES node(a, b))", &p()).unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(tx, "INSERT INTO node (id, a, b) VALUES (1, 1, 2)", &p())
         .unwrap();
     db.execute_in_tx(
@@ -572,8 +572,8 @@ fn cfk_delete_race_serializes_with_barrier() {
     let (_tmp, path, db) = file_db("delete-race.db");
     create_parent_child(&db);
     insert_parent(&db, 1, 2);
-    let child_tx = db.begin();
-    let delete_tx = db.begin();
+    let child_tx = db.begin_or_panic();
+    let delete_tx = db.begin_or_panic();
     db.execute_in_tx(
         child_tx,
         "INSERT INTO child (id, c1, c2) VALUES (1, 1, 2)",
@@ -625,8 +625,8 @@ fn cfk_concurrent_child_inserts_against_live_parent_both_commit() {
     let db = db();
     create_parent_child(&db);
     insert_parent(&db, 1, 2);
-    let tx1 = db.begin();
-    let tx2 = db.begin();
+    let tx1 = db.begin_or_panic();
+    let tx2 = db.begin_or_panic();
     db.execute_in_tx(tx1, "INSERT INTO child (id, c1, c2) VALUES (1, 1, 2)", &p())
         .unwrap();
     db.execute_in_tx(tx2, "INSERT INTO child (id, c1, c2) VALUES (2, 1, 2)", &p())
@@ -640,7 +640,7 @@ fn cfk_concurrent_child_inserts_against_live_parent_both_commit() {
 fn cfk_netzero_child_insert_then_delete_same_tx() {
     let (_tmp, path, db) = file_db("netzero-child.db");
     create_parent_child(&db);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(tx, "INSERT INTO child (id, c1, c2) VALUES (1, 9, 9)", &p())
         .unwrap();
     db.execute_in_tx(tx, "DELETE FROM child WHERE id = 1", &p())
@@ -654,7 +654,7 @@ fn cfk_netzero_child_insert_then_delete_same_tx() {
 fn cfk_netzero_parent_only_no_sibling_break() {
     let (_tmp, path, db) = file_db("netzero-parent-only.db");
     create_parent_child(&db);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(tx, "INSERT INTO parent (a, b) VALUES (1, 2)", &p())
         .unwrap();
     db.execute_in_tx(tx, "DELETE FROM parent WHERE a = 1 AND b = 2", &p())
@@ -671,7 +671,7 @@ fn cfk_netzero_parent_only_no_sibling_break() {
 fn cfk_netzero_parent_and_child_rejects() {
     let (_tmp, path, db) = file_db("netzero-parent-child.db");
     create_parent_child(&db);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(tx, "INSERT INTO parent (a, b) VALUES (1, 2)", &p())
         .unwrap();
     db.execute_in_tx(tx, "INSERT INTO child (id, c1, c2) VALUES (1, 1, 2)", &p())
@@ -690,7 +690,7 @@ fn cfk_parent_rewrite_new_tuple_child_matches_new() {
     create_parent_child(&db);
     insert_parent(&db, 1, 2);
     insert_child(&db, 1, "1", "2").unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.execute_in_tx(
         tx,
         "UPDATE parent SET a = 3, b = 4 WHERE a = 1 AND b = 2",
@@ -793,7 +793,7 @@ fn cfk_batch_uses_indexed_tuple_probes() {
     create_parent_child(&db);
     insert_parent(&db, 1, 2);
     db.__reset_fk_probe_stats();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for id in 0..1000 {
         db.execute_in_tx(
             tx,
