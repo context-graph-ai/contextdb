@@ -3586,7 +3586,7 @@ impl Database {
         for column in meta
             .columns
             .iter()
-            .filter(|column| !column.nullable && matches!(column.column_type, ColumnType::TxId))
+            .filter(|column| matches!(column.column_type, ColumnType::TxId))
         {
             if matches!(values.get(&column.name), Some(Value::TxId(tx)) if *tx == origin_tx) {
                 values.insert(column.name.clone(), Value::TxId(canonical_tx));

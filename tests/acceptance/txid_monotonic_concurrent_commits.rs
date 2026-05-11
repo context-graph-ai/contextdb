@@ -355,3 +355,69 @@ fn t18_06_commit_time_upsert_rewrites_txid_post_image_to_canonical() {
         "test setup must begin and commit in different orders"
     );
 }
+
+#[test]
+fn t18_07_commit_time_rewrites_nullable_txid_update_to_canonical() {
+    // REGRESSION GUARD. Nullable TXID columns are used for lifecycle close
+    // markers. An active TxId written there must be canonicalized when commit
+    // order differs from begin order.
+    let (_dir, db) = open_db();
+    let db = &db;
+    db.execute(
+        "CREATE TABLE lifecycle (id UUID PRIMARY KEY, opened_at TXID NOT NULL, closed_at TXID)",
+        &empty(),
+    )
+    .unwrap();
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO lifecycle (id) VALUES ($id)",
+        &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
+    )
+    .unwrap();
+    let receiver = db.subscribe();
+
+    let deferred_update_tx = db.begin_or_panic();
+    let first_commit_tx = db.begin_or_panic();
+    db.execute_in_tx(
+        deferred_update_tx,
+        "UPDATE lifecycle SET closed_at = $closed_at WHERE id = $id",
+        &[
+            ("id".to_string(), Value::Uuid(id)),
+            ("closed_at".to_string(), Value::TxId(deferred_update_tx)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        first_commit_tx,
+        "INSERT INTO lifecycle (id) VALUES ($id)",
+        &[("id".to_string(), Value::Uuid(Uuid::new_v4()))]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+
+    db.commit(first_commit_tx).unwrap();
+    let _first_event = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first commit event");
+    db.commit(deferred_update_tx).unwrap();
+    let update_event = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("deferred update commit event");
+    let expected = TxId(db.snapshot_at(update_event.lsn).0);
+
+    let rows = db
+        .execute(
+            "SELECT closed_at FROM lifecycle WHERE id = $id",
+            &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(rows, vec![vec![Value::TxId(expected)]]);
+    assert_ne!(
+        expected, deferred_update_tx,
+        "test setup must begin and commit in different orders"
+    );
+}
