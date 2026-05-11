@@ -2159,6 +2159,71 @@ impl Database {
         self.execute_statement(&stmt, sql, params, Some(tx))
     }
 
+    /// Register a commit-time guard that requires the visible row selected by
+    /// `key_column = key_value` to keep the supplied column values until this
+    /// transaction commits. Returns `Ok(false)` when the row is not visible or
+    /// does not currently match the predicates.
+    pub fn guard_row_conditions_in_tx(
+        &self,
+        tx: TxId,
+        table: &str,
+        key_column: &str,
+        key_value: &Value,
+        predicates: &[(String, Value)],
+    ) -> Result<bool> {
+        let _operation = self.open_operation_after_public_tx_control_wait_for_tx(
+            "guard_row_conditions_in_tx",
+            Some(tx),
+        )?;
+        self.tx_mgr.with_write_set(tx, |_| ())?;
+        self.assert_table_read_allowed(table)?;
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        if !meta.columns.iter().any(|column| column.name == key_column) {
+            return Err(Error::ColumnNotFound {
+                table: table.to_string(),
+                column: key_column.to_string(),
+            });
+        }
+        for (column, _) in predicates {
+            if !meta
+                .columns
+                .iter()
+                .any(|definition| definition.name == *column)
+            {
+                return Err(Error::ColumnNotFound {
+                    table: table.to_string(),
+                    column: column.clone(),
+                });
+            }
+        }
+
+        let snapshot = self.snapshot();
+        let Some(row) = self.point_lookup_in_tx(tx, table, key_column, key_value, snapshot)? else {
+            return Ok(false);
+        };
+        if !self.read_allowed_for_row(table, &meta, &row, snapshot)? {
+            return Ok(false);
+        }
+        if !predicates
+            .iter()
+            .all(|(column, value)| row.values.get(column) == Some(value))
+        {
+            return Ok(false);
+        }
+        let counts = self.write_set_counts(tx)?;
+        self.record_conditional_update_guard(
+            tx,
+            table.to_string(),
+            row.row_id,
+            predicates.to_vec(),
+            counts,
+            counts,
+        )?;
+        Ok(true)
+    }
+
     fn commit_with_source(&self, tx: TxId, source: CommitSource) -> Result<()> {
         let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
         self.commit_with_source_and_event_bus_ddl(tx, source, &event_bus_ddl)
@@ -2209,6 +2274,7 @@ impl Database {
             |_| {
                 if source != CommitSource::SyncPull {
                     let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
+                    Self::reject_user_conditional_update_conflicts(source, &outcome)?;
                     validation_noop_count.set(
                         validation_noop_count
                             .get()
@@ -2230,6 +2296,7 @@ impl Database {
                         }
                     }
                     let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
+                    Self::reject_user_conditional_update_conflicts(source, &outcome)?;
                     validation_noop_count.set(
                         validation_noop_count
                             .get()
@@ -2244,6 +2311,7 @@ impl Database {
                         self.rewrite_txid_placeholders(tx, ws)?;
                     }
                     let final_validation = self.commit_validate(tx, ws)?;
+                    Self::reject_user_conditional_update_conflicts(source, &final_validation)?;
                     validation_noop_count.set(
                         validation_noop_count
                             .get()
@@ -2335,6 +2403,18 @@ impl Database {
         Ok(CommitValidationOutcome {
             conditional_noop_count: validation_noop_count.get(),
         })
+    }
+
+    fn reject_user_conditional_update_conflicts(
+        source: CommitSource,
+        outcome: &CommitValidationOutcome,
+    ) -> Result<()> {
+        if source == CommitSource::User && outcome.conditional_noop_count > 0 {
+            return Err(Error::ConditionalUpdateConflict {
+                count: outcome.conditional_noop_count,
+            });
+        }
+        Ok(())
     }
 
     fn build_commit_event(

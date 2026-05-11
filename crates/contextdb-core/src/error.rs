@@ -31,6 +31,8 @@ pub enum Error {
     ImmutableColumn { table: String, column: String },
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
+    #[error("conditional update conflict: {count} staged update(s) no longer matched at commit")]
+    ConditionalUpdateConflict { count: u64 },
     #[error("propagation aborted: {table}.{column} transition {from} -> {to} is invalid")]
     PropagationAborted {
         table: String,

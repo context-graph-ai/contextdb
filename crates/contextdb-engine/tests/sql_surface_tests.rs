@@ -1,5 +1,5 @@
 use contextdb_core::Lsn;
-use contextdb_core::{MemoryAccountant, Value};
+use contextdb_core::{Error, MemoryAccountant, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2217,6 +2217,132 @@ fn upd_03_update_embedding_changes_vector_recall_immediately() {
     assert_eq!(after.rows.len(), 2);
     assert_eq!(after.rows[0][0], Value::Uuid(id_b));
     assert_eq!(after.rows[1][0], Value::Uuid(id_a));
+}
+
+#[test]
+fn upd_04_stale_conditional_update_in_explicit_tx_fails_commit_atomically() {
+    let db = Database::open_memory();
+    let id = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tasks (id, status) VALUES ($id, 'pending')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let tx_a = db.begin_or_panic();
+    let tx_b = db.begin_or_panic();
+    let stale_predicate = params(vec![
+        ("id", Value::Uuid(id)),
+        ("pending", Value::Text("pending".to_string())),
+        ("done", Value::Text("done".to_string())),
+    ]);
+
+    let a = db
+        .execute_in_tx(
+            tx_a,
+            "UPDATE tasks SET status = $done WHERE id = $id AND status = $pending",
+            &stale_predicate,
+        )
+        .unwrap();
+    let b = db
+        .execute_in_tx(
+            tx_b,
+            "UPDATE tasks SET status = $done WHERE id = $id AND status = $pending",
+            &stale_predicate,
+        )
+        .unwrap();
+    assert_eq!(a.rows_affected, 1);
+    assert_eq!(b.rows_affected, 1);
+
+    db.commit(tx_a).expect("first conditional update commits");
+    let err = db
+        .commit(tx_b)
+        .expect_err("stale conditional update must fail commit");
+    assert!(
+        matches!(err, Error::ConditionalUpdateConflict { count: 1 }),
+        "expected ConditionalUpdateConflict, got {err:?}"
+    );
+
+    let row = db
+        .point_lookup("tasks", "id", &Value::Uuid(id), db.snapshot())
+        .unwrap()
+        .expect("task must still exist");
+    assert_eq!(
+        row.values.get("status"),
+        Some(&Value::Text("done".to_string()))
+    );
+}
+
+#[test]
+fn upd_05_row_condition_guard_in_explicit_tx_fails_commit_atomically() {
+    let db = Database::open_memory();
+    let id = Uuid::new_v4();
+    db.execute(
+        "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE task_audit (id UUID PRIMARY KEY, task_id UUID, note TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tasks (id, status) VALUES ($id, 'active')",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let tx_guarded = db.begin_or_panic();
+    assert!(
+        db.guard_row_conditions_in_tx(
+            tx_guarded,
+            "tasks",
+            "id",
+            &Value::Uuid(id),
+            &[("status".to_string(), Value::Text("active".to_string()))],
+        )
+        .expect("register guard")
+    );
+    db.execute_in_tx(
+        tx_guarded,
+        "INSERT INTO task_audit (id, task_id, note) VALUES ($id, $task_id, 'guarded side effect')",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("task_id", Value::Uuid(id)),
+        ]),
+    )
+    .unwrap();
+
+    db.execute(
+        "UPDATE tasks SET status = 'archived' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let err = db
+        .commit(tx_guarded)
+        .expect_err("stale guarded transaction must fail");
+    assert!(
+        matches!(err, Error::ConditionalUpdateConflict { count: 1 }),
+        "expected ConditionalUpdateConflict, got {err:?}"
+    );
+    let audit_rows = db
+        .execute(
+            "SELECT id FROM task_audit WHERE task_id = $task_id",
+            &params(vec![("task_id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(
+        audit_rows.rows.len(),
+        0,
+        "guarded side effects must roll back with the stale transaction"
+    );
 }
 
 fn setup_cte_sensor_db() -> Database {
