@@ -590,6 +590,116 @@ fn t4_07_multi_context_set_sees_subset_excludes_others() {
     );
 }
 
+/// RED — t4_07b: products need independently scoped handles over one already-open store.
+#[test]
+fn t4_07b_scoped_view_over_open_handle_filters_without_second_open() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("view.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    seed_memos(&path, &[(1, "in-a", ctx_a), (2, "in-b", ctx_b)]);
+
+    let admin = Database::open(&path).unwrap();
+    let scoped = admin.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+
+    let visible = scoped
+        .execute("SELECT id, body FROM memos", &empty())
+        .unwrap();
+    assert_eq!(visible.rows.len(), 1);
+    assert!(matches!(&visible.rows[0][1], Value::Text(body) if body == "in-a"));
+
+    let admin_visible = admin
+        .execute("SELECT id, body FROM memos", &empty())
+        .unwrap();
+    assert_eq!(
+        admin_visible.rows.len(),
+        2,
+        "scoped view must not narrow the owner handle"
+    );
+
+    let mut denied = HashMap::new();
+    denied.insert("id".into(), Value::Uuid(Uuid::from_u128(3)));
+    denied.insert("body".into(), Value::Text("denied".into()));
+    denied.insert("ctx".into(), Value::Uuid(ctx_b));
+    let err = assert_error(
+        scoped.execute(
+            "INSERT INTO memos (id, body, context_id) VALUES ($id, $body, $ctx)",
+            &denied,
+        ),
+        "scoped view must reject writes outside its context set",
+    );
+    assert_context_violation(err, ctx_b, &[ctx_a], "scoped-view insert");
+
+    scoped.close().unwrap();
+    let after_view_close = admin.execute("SELECT id FROM memos", &empty()).unwrap();
+    assert_eq!(
+        after_view_close.rows.len(),
+        2,
+        "closing a scoped view must not close the owner resource"
+    );
+    admin.close().unwrap();
+}
+
+/// REGRESSION GUARD — a scoped view cannot mint an unscoped sibling over the same resource.
+#[test]
+fn t4_07c_scoped_view_cannot_widen_or_clear_scope() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("view-narrow.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    seed_memos(&path, &[(1, "in-a", ctx_a), (2, "in-b", ctx_b)]);
+
+    let admin = Database::open(&path).unwrap();
+    let scoped_a = admin.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+
+    let attempted_admin = scoped_a.scoped_with_constraints(None, None, None);
+    let visible = attempted_admin
+        .execute("SELECT id, body FROM memos", &empty())
+        .unwrap();
+    assert_eq!(
+        visible.rows.len(),
+        1,
+        "clearing child constraints must preserve the parent scope"
+    );
+    assert!(matches!(&visible.rows[0][1], Value::Text(body) if body == "in-a"));
+
+    let attempted_widen = scoped_a.scoped_with_contexts(BTreeSet::from([
+        ContextId::new(ctx_a),
+        ContextId::new(ctx_b),
+    ]));
+    let widened_visible = attempted_widen
+        .execute("SELECT id, body FROM memos", &empty())
+        .unwrap();
+    assert_eq!(
+        widened_visible.rows.len(),
+        1,
+        "child contexts must intersect with the parent scope, not widen it"
+    );
+    assert!(matches!(&widened_visible.rows[0][1], Value::Text(body) if body == "in-a"));
+}
+
+/// RED — t4_07c: scoped views must stop using storage after the owner closes.
+#[test]
+fn t4_07d_scoped_view_observes_owner_close() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("view-close.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    seed_memos(&path, &[(1, "in-a", ctx_a)]);
+
+    let admin = Database::open(&path).unwrap();
+    let scoped = admin.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    admin.close().unwrap();
+
+    let err = assert_error(
+        scoped.execute("SELECT id FROM memos", &empty()),
+        "scoped view must close when the owner resource closes",
+    );
+    assert!(
+        matches!(err, Error::Other(ref msg) if msg.contains("closed")),
+        "expected closed database error, got {err:?}"
+    );
+}
+
 /// REGRESSION GUARD — t4_08
 #[test]
 fn t4_08_admin_handle_sees_all_contexts() {

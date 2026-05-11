@@ -399,7 +399,7 @@ pub struct Database {
     ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     persistence: Option<Arc<RedbPersistence>>,
     open_registry_path: Mutex<Option<PathBuf>>,
-    operation_gate: RwLock<()>,
+    operation_gate: Arc<RwLock<()>>,
     apply_phase_pause: Arc<ApplyPhasePause>,
     relational: MemRelationalExecutor<DynStore>,
     graph: MemGraphExecutor<DynStore>,
@@ -459,6 +459,17 @@ pub(crate) struct AccessConstraints {
     contexts: Option<BTreeSet<ContextId>>,
     scope_labels: Option<BTreeSet<ScopeLabel>>,
     principal: Option<Principal>,
+}
+
+fn narrowed_constraint_set<T: Ord + Clone>(
+    parent: &Option<BTreeSet<T>>,
+    child: Option<BTreeSet<T>>,
+) -> Option<BTreeSet<T>> {
+    match (parent, child) {
+        (Some(parent), Some(child)) => Some(parent.intersection(&child).cloned().collect()),
+        (Some(parent), None) => Some(parent.clone()),
+        (None, child) => child,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -885,7 +896,7 @@ impl Database {
             ddl_log,
             persistence,
             open_registry_path: Mutex::new(open_registry_path),
-            operation_gate: RwLock::new(()),
+            operation_gate: Arc::new(RwLock::new(())),
             apply_phase_pause,
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
@@ -1030,6 +1041,82 @@ impl Database {
         self
     }
 
+    pub fn scoped_with_contexts(
+        &self,
+        contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
+    ) -> Self {
+        self.scoped_with_constraints(Some(contexts), None, None)
+    }
+
+    pub fn scoped_with_constraints(
+        &self,
+        contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
+        scope_labels: Option<std::collections::BTreeSet<contextdb_core::types::ScopeLabel>>,
+        principal: Option<contextdb_core::types::Principal>,
+    ) -> Self {
+        let contexts = narrowed_constraint_set(&self.access.contexts, contexts);
+        let scope_labels = narrowed_constraint_set(&self.access.scope_labels, scope_labels);
+        let principal = self.access.principal.clone().or(principal);
+        Self {
+            tx_mgr: self.tx_mgr.clone(),
+            relational_store: self.relational_store.clone(),
+            graph_store: self.graph_store.clone(),
+            vector_store: self.vector_store.clone(),
+            change_log: self.change_log.clone(),
+            ddl_log: self.ddl_log.clone(),
+            persistence: self.persistence.clone(),
+            open_registry_path: Mutex::new(None),
+            operation_gate: self.operation_gate.clone(),
+            apply_phase_pause: self.apply_phase_pause.clone(),
+            relational: MemRelationalExecutor::new(
+                self.relational_store.clone(),
+                self.tx_mgr.clone(),
+            ),
+            graph: MemGraphExecutor::new(self.graph_store.clone(), self.tx_mgr.clone()),
+            vector: MemVectorExecutor::new_with_accountant(
+                self.vector_store.clone(),
+                self.tx_mgr.clone(),
+                Arc::new(OnceLock::new()),
+                self.accountant.clone(),
+            ),
+            session_tx: Mutex::new(None),
+            instance_id: uuid::Uuid::new_v4(),
+            owner_thread: thread::current().id(),
+            plugin: self.plugin.clone(),
+            access: AccessConstraints {
+                contexts,
+                scope_labels,
+                principal,
+            },
+            accountant: self.accountant.clone(),
+            conflict_policies: RwLock::new(self.conflict_policies.read().clone()),
+            subscriptions: self.subscriptions.clone(),
+            pruning_runtime: Mutex::new(PruningRuntime::new()),
+            pruning_guard: self.pruning_guard.clone(),
+            cron: self.cron.clone(),
+            event_bus: self.event_bus.clone(),
+            trigger: self.trigger.clone(),
+            pending_event_bus_ddl: Mutex::new(HashMap::new()),
+            pending_commit_metadata: Mutex::new(HashMap::new()),
+            disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
+            disk_limit_startup_ceiling: AtomicU64::new(
+                self.disk_limit_startup_ceiling.load(Ordering::SeqCst),
+            ),
+            sync_watermark: self.sync_watermark.clone(),
+            closed: AtomicBool::new(false),
+            resource_closed: self.resource_closed.clone(),
+            rows_examined: AtomicU64::new(0),
+            statement_cache: RwLock::new(HashMap::new()),
+            rank_formula_cache: RwLock::new(HashMap::new()),
+            acl_grant_cache: RwLock::new(HashMap::new()),
+            rank_policy_eval_count: AtomicU64::new(0),
+            rank_policy_formula_parse_count: AtomicU64::new(0),
+            fk_indexed_tuple_probes: AtomicU64::new(0),
+            fk_full_scan_fallbacks: AtomicU64::new(0),
+            corrupt_joined_values: RwLock::new(HashSet::new()),
+            resource_owner: false,
+        }
+    }
     fn open_loaded(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -7341,7 +7428,11 @@ impl Database {
             }
             self.release_open_registry();
         }
-        self.plugin.on_close()
+        if self.resource_owner {
+            self.plugin.on_close()
+        } else {
+            Ok(())
+        }
     }
 
     fn open_operation(&self) -> Result<DatabaseOperationGuard<'_>> {
@@ -7353,7 +7444,7 @@ impl Database {
         }
 
         let lock = self.operation_gate.read();
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::SeqCst) || self.resource_closed.load(Ordering::SeqCst) {
             return Err(closed_database_error());
         }
         DB_OPERATION_STACK.with(|stack| stack.borrow_mut().push(db_id));

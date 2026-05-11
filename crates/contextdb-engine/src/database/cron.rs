@@ -712,7 +712,7 @@ impl Database {
             ddl_log: self.ddl_log.clone(),
             persistence: self.persistence.clone(),
             open_registry_path: Mutex::new(None),
-            operation_gate: RwLock::new(()),
+            operation_gate: self.operation_gate.clone(),
             apply_phase_pause: self.apply_phase_pause.clone(),
             relational: MemRelationalExecutor::new(
                 self.relational_store.clone(),
