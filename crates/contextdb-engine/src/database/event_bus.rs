@@ -16,6 +16,7 @@ pub(crate) struct EventBusState {
     staged_ddl_for_persistence: Mutex<HashMap<Lsn, StagedEventBusDdlCommit>>,
     metrics: Mutex<HashMap<String, SinkMetricsState>>,
     runtimes: Mutex<HashMap<String, SinkRuntime>>,
+    runtime_starts: Mutex<HashMap<String, u64>>,
     wait_lock: Mutex<()>,
     waiters: Condvar,
     next_queue_id: AtomicU64,
@@ -154,6 +155,7 @@ impl EventBusState {
             staged_ddl_for_persistence: Mutex::new(HashMap::new()),
             metrics: Mutex::new(HashMap::new()),
             runtimes: Mutex::new(HashMap::new()),
+            runtime_starts: Mutex::new(HashMap::new()),
             wait_lock: Mutex::new(()),
             waiters: Condvar::new(),
             next_queue_id: AtomicU64::new(1),
@@ -737,6 +739,28 @@ impl Database {
         }
     }
 
+    #[doc(hidden)]
+    pub fn runtimes_count_for_test(&self, sink: &str) -> usize {
+        let _operation = self.assert_open_operation();
+        self.event_bus
+            .runtimes
+            .lock()
+            .get(sink)
+            .map(|_| 1)
+            .unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn runtime_starts_count_for_test(&self, sink: &str) -> u64 {
+        let _operation = self.assert_open_operation();
+        self.event_bus
+            .runtime_starts
+            .lock()
+            .get(sink)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub(super) fn prepare_sink_events_for_write_set(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -930,6 +954,12 @@ impl Database {
         if runtimes.contains_key(sink) {
             return;
         }
+        *self
+            .event_bus
+            .runtime_starts
+            .lock()
+            .entry(sink.to_string())
+            .or_default() += 1;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker = EventBusWorker {
             sink: sink.to_string(),

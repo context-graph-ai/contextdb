@@ -1,4 +1,8 @@
 use crate::common::run_cli_script;
+use crate::common_tracing::{
+    T5_EVENT_BUS_COUNT_ENABLED, T5_EVENT_BUS_LAST_PANIC_FIELDS, T5_EVENT_BUS_PANIC_COUNT,
+    install_global_subscriber as t5_install_global_subscriber, t5_event_bus_reset,
+};
 use contextdb_core::{Lsn, Value};
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange, SyncDirection,
@@ -1826,5 +1830,1731 @@ fn t5_14_sink_metrics_field_accuracy() {
         settled,
         "held metrics never settled (queued={}, delivered={})",
         last.queued, last.delivered
+    );
+}
+
+/// RED — t5_28: scoped_with_contexts register_sink delivers only authorized context events.
+#[test]
+fn t5_28_scoped_with_contexts_register_sink_delivers_only_authorized_context_events() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-ctx.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "scoped sink must receive exactly the ctx_a INSERT, not the ctx_b INSERT"
+    );
+    assert_eq!(
+        captured[0].row_values.get("context_id"),
+        Some(&Value::Uuid(ctx_a))
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("context_id"), Some(Value::Uuid(u)) if *u == ctx_b
+        )),
+        "ctx_b INSERT must NOT fire on ctx_a-scoped sink"
+    );
+    drop(captured);
+
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(metrics.delivered, 1, "exactly one authorized delivery");
+    assert_eq!(
+        metrics.queued, 1,
+        "denied ctx_b row must remain queued exactly once for future broader re-registration"
+    );
+}
+
+/// RED — t5_29: scoped_with_constraints register_sink delivers only authorized scope label events.
+#[test]
+fn t5_29_scoped_with_constraints_register_sink_delivers_only_authorized_scope_label_events() {
+    use contextdb_core::types::ScopeLabel;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-label.redb");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE invs (
+            id UUID PRIMARY KEY,
+            severity TEXT,
+            scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('edge', 'server')
+        )",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    for (id, scope) in [(1u128, "edge"), (2u128, "server")] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        db.execute(
+            "INSERT INTO invs (id, severity, scope_label) VALUES ($id, $sev, $scope)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let scoped =
+        db.scoped_with_constraints(None, Some(BTreeSet::from([ScopeLabel::new("edge")])), None);
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    {
+        let captured = log.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "edge-scoped sink must replay exactly the pre-registration edge INSERT"
+        );
+        assert_eq!(
+            captured[0].row_values.get("scope_label"),
+            Some(&Value::Text("edge".into()))
+        );
+    }
+
+    for (id, scope) in [(3u128, "edge"), (4u128, "server")] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        db.execute(
+            "INSERT INTO invs (id, severity, scope_label) VALUES ($id, $sev, $scope)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "edge-scoped sink must receive replayed and live edge INSERTs, not server INSERTs"
+    );
+    assert!(
+        captured
+            .iter()
+            .all(|e| e.row_values.get("scope_label") == Some(&Value::Text("edge".into()))),
+        "every delivered row must carry the authorized edge scope"
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("scope_label"), Some(Value::Text(s)) if s == "server"
+        )),
+        "server-scope INSERTs must NOT fire on edge-scoped sink"
+    );
+    drop(captured);
+
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(
+        metrics.delivered, 2,
+        "exactly two authorized deliveries: replayed edge and live edge"
+    );
+    assert_eq!(
+        metrics.queued, 2,
+        "denied replay and live server-scope rows must remain queued exactly once each"
+    );
+
+    let broad_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let broad_cb = broad_log.clone();
+    db.register_sink("slack", None, move |e| {
+        broad_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && broad_log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let broad = broad_log.lock().unwrap();
+    assert_eq!(
+        broad.len(),
+        2,
+        "broader re-registration must replay the two previously denied server rows exactly once"
+    );
+    let ids = broad
+        .iter()
+        .filter_map(|e| e.row_values.get("id").cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids.iter()
+            .filter(|v| **v == Value::Uuid(Uuid::from_u128(2)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ids.iter()
+            .filter(|v| **v == Value::Uuid(Uuid::from_u128(4)))
+            .count(),
+        1
+    );
+    assert!(
+        broad
+            .iter()
+            .all(|e| e.row_values.get("scope_label") == Some(&Value::Text("server".into()))),
+        "broader replay must contain only the retained server-scope rows"
+    );
+    drop(broad);
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        0,
+        "broader re-registration must drain exactly the retained denied rows"
+    );
+}
+
+/// RED — t5_30: scoped-handle principal sink excludes ACL-denied rows; replay + live-commit paths.
+#[test]
+fn t5_30_scoped_handle_principal_register_sink_excludes_acl_denied_rows() {
+    use contextdb_core::types::Principal;
+    let acl_a = Uuid::from_u128(0xA);
+    let acl_b = Uuid::from_u128(0xB);
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-acl.redb");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE secret_event WHEN INSERT ON secrets",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK alice_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT secret_event TO alice_sink", &empty())
+        .unwrap();
+
+    let mut g1 = HashMap::new();
+    g1.insert("id".into(), Value::Uuid(Uuid::from_u128(0x100)));
+    g1.insert("kind".into(), Value::Text("Agent".into()));
+    g1.insert("pid".into(), Value::Text("alice".into()));
+    g1.insert("aid".into(), Value::Uuid(acl_a));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g1,
+    )
+    .unwrap();
+    let mut g2 = HashMap::new();
+    g2.insert("id".into(), Value::Uuid(Uuid::from_u128(0x101)));
+    g2.insert("kind".into(), Value::Text("Agent".into()));
+    g2.insert("pid".into(), Value::Text("bob".into()));
+    g2.insert("aid".into(), Value::Uuid(acl_b));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g2,
+    )
+    .unwrap();
+
+    for (i, aid, body) in [
+        (1u128, acl_a, "replay-granted"),
+        (2u128, acl_b, "replay-denied"),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(i)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO secrets (id, body, acl_id) VALUES ($id, $body, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let bob_scoped = db.scoped_with_constraints(None, None, Some(Principal::Agent("bob".into())));
+    let err = bob_scoped
+        .register_sink("alice_sink", Some(Principal::Agent("alice".into())), |_e| {
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("principal-scoped handles cannot register sinks for another principal"),
+        "explicit register_sink principal must not be silently overridden by the handle principal: {err:?}"
+    );
+
+    let scoped = db.scoped_with_constraints(None, None, None);
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink(
+            "alice_sink",
+            Some(Principal::Agent("alice".into())),
+            move |e| {
+                log_cb.lock().unwrap().push(e.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    {
+        let captured = log.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "alice's scoped sink must replay exactly the granted row, not the bob-granted row"
+        );
+        assert_eq!(
+            captured[0].row_values.get("body"),
+            Some(&Value::Text("replay-granted".into()))
+        );
+    }
+
+    for (i, aid, body) in [
+        (3u128, acl_a, "live-granted"),
+        (4u128, acl_b, "live-denied"),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(i)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO secrets (id, body, acl_id) VALUES ($id, $body, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "alice's scoped sink must receive the replayed and live granted rows only"
+    );
+    let bodies: Vec<_> = captured
+        .iter()
+        .map(|e| e.row_values.get("body").cloned())
+        .collect();
+    assert!(bodies.contains(&Some(Value::Text("replay-granted".into()))));
+    assert!(bodies.contains(&Some(Value::Text("live-granted".into()))));
+    assert!(!bodies.contains(&Some(Value::Text("replay-denied".into()))));
+    assert!(!bodies.contains(&Some(Value::Text("live-denied".into()))));
+    drop(captured);
+
+    let metrics = db.sink_metrics_for_test("alice_sink");
+    assert_eq!(
+        metrics.delivered, 2,
+        "engine-route delivered count must reflect both authorized deliveries"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("alice_sink").queued,
+        2,
+        "bob-granted replay and live rows must remain queued exactly once each for future broader re-registration"
+    );
+
+    let broad_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let broad_cb = broad_log.clone();
+    db.register_sink("alice_sink", None, move |e| {
+        broad_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && broad_log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let broad = broad_log.lock().unwrap();
+    assert_eq!(
+        broad.len(),
+        2,
+        "broader re-registration must replay the two previously ACL-denied rows exactly once"
+    );
+    let bodies = broad
+        .iter()
+        .filter_map(|e| e.row_values.get("body").cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|v| **v == Value::Text("replay-denied".into()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|v| **v == Value::Text("live-denied".into()))
+            .count(),
+        1
+    );
+    drop(broad);
+    assert_eq!(
+        db.sink_metrics_for_test("alice_sink").queued,
+        0,
+        "broader re-registration must drain exactly the retained ACL-denied rows"
+    );
+}
+
+/// RED — t5_31: scoped-handle register_sink replays durably queued events across child-process restart.
+#[test]
+fn t5_31_scoped_handle_register_sink_replays_durably_queued_events_child_process_restart() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-replay.redb");
+    let script = "\
+CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)
+CREATE EVENT TYPE inv_match WHEN INSERT ON invs
+CREATE SINK slack TYPE callback
+CREATE ROUTE r EVENT inv_match TO slack
+INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000002', 'warning', '00000000-0000-0000-0000-00000000000b')
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed durable scoped events; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Database::open(&path).unwrap();
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "scoped sink must replay exactly the durable ctx_a row, not the ctx_b row"
+    );
+    assert_eq!(
+        captured[0].row_values.get("context_id"),
+        Some(&Value::Uuid(ctx_a))
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("context_id"), Some(Value::Uuid(u)) if *u == ctx_b
+        )),
+        "ctx_b durable row must NOT replay to ctx_a-scoped sink"
+    );
+    drop(captured);
+
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(metrics.delivered, 1, "exactly the ctx_a row was delivered");
+    assert_eq!(
+        metrics.queued, 1,
+        "ctx_b row remains queued exactly once — no shallow-ack duplicate, no silent drop"
+    );
+}
+
+/// RED — t5_32: re-registering same sink from different scoped handles replaces registration; one worker.
+#[test]
+fn t5_32_scoped_handle_register_sink_replaces_prior_registration_one_worker_invariant() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-replace.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped_a = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log_a: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_a_cb = log_a.clone();
+    scoped_a
+        .register_sink("slack", None, move |e| {
+            log_a_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let mut pre = HashMap::new();
+    pre.insert("id".into(), Value::Uuid(Uuid::from_u128(10)));
+    pre.insert("sev".into(), Value::Text("warning".into()));
+    pre.insert("ctx".into(), Value::Uuid(ctx_b));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &pre,
+    )
+    .unwrap();
+
+    let initial_delivered = db.sink_metrics_for_test("slack").delivered;
+    assert_eq!(
+        initial_delivered, 0,
+        "ctx_b pre-replacement row is denied by the ctx_a registration and must not deliver"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        1,
+        "pre-replacement denied row must remain queued before registration replacement"
+    );
+
+    let scoped_b = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_b)]));
+    let log_b: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_b_cb = log_b.clone();
+    scoped_b
+        .register_sink("slack", None, move |e| {
+            log_b_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    for (id, ctx) in [(11u128, ctx_a), (12u128, ctx_b)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log_b.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let captured_b = log_b.lock().unwrap();
+    assert_eq!(
+        captured_b.len(),
+        2,
+        "latest registration (ctx_b) must receive the pre-existing ctx_b queued row and live ctx_b INSERT"
+    );
+    let delivered_ids = captured_b
+        .iter()
+        .filter_map(|e| e.row_values.get("id").cloned())
+        .collect::<Vec<_>>();
+    assert!(delivered_ids.contains(&Value::Uuid(Uuid::from_u128(10))));
+    assert!(delivered_ids.contains(&Value::Uuid(Uuid::from_u128(12))));
+    assert!(
+        captured_b
+            .iter()
+            .all(|e| e.row_values.get("context_id") == Some(&Value::Uuid(ctx_b))),
+        "ctx_b registration must not receive ctx_a rows"
+    );
+    drop(captured_b);
+
+    let captured_a = log_a.lock().unwrap();
+    assert!(
+        !captured_a.iter().any(|e| matches!(
+            e.row_values.get("id"),
+            Some(Value::Uuid(u)) if *u == Uuid::from_u128(10) || *u == Uuid::from_u128(11) || *u == Uuid::from_u128(12)
+        )),
+        "pre-replacement denied and post-replacement events must NOT fire on the replaced ctx_a callback"
+    );
+    drop(captured_a);
+
+    let final_delivered = db.sink_metrics_for_test("slack").delivered;
+    assert_eq!(
+        final_delivered - initial_delivered,
+        2,
+        "engine-route delivered count must include preserved pre-replacement ctx_b row plus live ctx_b row"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        1,
+        "ctx_a row denied by scoped_b's access remains queued exactly once; ctx_b row was durably acked on delivery"
+    );
+    assert_eq!(
+        db.runtimes_count_for_test("slack"),
+        1,
+        "exactly one worker for the named sink — re-registration must not spawn a second runtime"
+    );
+    assert_eq!(
+        db.runtime_starts_count_for_test("slack"),
+        1,
+        "runtime start counter must prove replacement did not spawn and leak an extra worker thread"
+    );
+}
+
+/// RED — t5_33: panic in scoped-handle callback is isolated; next event delivers; engine emits a structured tracing event with the panic message.
+#[test]
+fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    t5_install_global_subscriber();
+    t5_event_bus_reset();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-panic.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let invocations = Arc::new(AtomicU64::new(0));
+    let invocations_cb = invocations.clone();
+    scoped
+        .register_sink("slack", None, move |_e| {
+            let n = invocations_cb.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                panic!("scoped-handle sink panic on first event");
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    T5_EVENT_BUS_PANIC_COUNT.store(0, Ordering::SeqCst);
+    T5_EVENT_BUS_COUNT_ENABLED.store(true, Ordering::SeqCst);
+    for id in [1u128, 2u128] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx_a));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && invocations.load(Ordering::SeqCst) < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        2,
+        "scoped-handle callback must be invoked for both events: panicking on the first does not stop the second"
+    );
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(
+        metrics.permanent_failures, 1,
+        "panic on a scoped-handle callback must be recorded as a permanent failure"
+    );
+    let panic_log_count = T5_EVENT_BUS_PANIC_COUNT.load(Ordering::SeqCst);
+    T5_EVENT_BUS_COUNT_ENABLED.store(false, Ordering::SeqCst);
+    assert_eq!(
+        panic_log_count, 1,
+        "panic-tracing event must be emitted exactly once with the panic message"
+    );
+    let fields = T5_EVENT_BUS_LAST_PANIC_FIELDS
+        .get()
+        .and_then(|cell| cell.lock().unwrap().clone())
+        .expect("panic tracing fields captured");
+    assert!(
+        fields.contains("scoped-handle sink panic on first event"),
+        "panic tracing fields must include the panic message; got {fields:?}"
+    );
+    assert!(
+        fields.contains("sink=") && fields.contains("slack"),
+        "panic tracing fields must include a structured sink field; got {fields:?}"
+    );
+    assert!(
+        fields.contains("entry_id="),
+        "panic tracing fields must include a structured entry_id field; got {fields:?}"
+    );
+    assert!(
+        fields.contains("panic_message="),
+        "panic tracing fields must include a structured panic_message field; got {fields:?}"
+    );
+    assert_eq!(
+        metrics.delivered, 1,
+        "the post-panic event must be recorded as delivered exactly once"
+    );
+    assert_eq!(metrics.queued, 0, "durable ack must drain both entries");
+}
+
+/// REGRESSION GUARD — t5_34: resource-owner sink unaffected by sibling scoped-handle sink.
+#[test]
+fn t5_34_resource_owner_sink_unaffected_by_sibling_scoped_handle_sink() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-sibling.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK audit TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_audit EVENT inv_match TO audit", &empty())
+        .unwrap();
+    db.execute("CREATE SINK scoped_slack TYPE callback", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE ROUTE r_scoped EVENT inv_match TO scoped_slack",
+        &empty(),
+    )
+    .unwrap();
+
+    let audit_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_log.clone();
+    db.register_sink("audit", None, move |e| {
+        audit_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let scoped_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let scoped_cb = scoped_log.clone();
+    scoped
+        .register_sink("scoped_slack", None, move |e| {
+            scoped_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let ctx_b = Uuid::from_u128(0xB);
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && audit_log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let audit = audit_log.lock().unwrap();
+    assert_eq!(
+        audit.len(),
+        2,
+        "owner-registered audit sink must continue to receive both events while a scoped sibling sink is registered"
+    );
+    let audit_ctx_ids: Vec<_> = audit
+        .iter()
+        .filter_map(|e| e.row_values.get("context_id").cloned())
+        .collect();
+    assert!(audit_ctx_ids.contains(&Value::Uuid(ctx_a)));
+    assert!(audit_ctx_ids.contains(&Value::Uuid(ctx_b)));
+    drop(audit);
+
+    let audit_metrics = db.sink_metrics_for_test("audit");
+    assert_eq!(audit_metrics.delivered, 2);
+    assert_eq!(audit_metrics.queued, 0);
+}
+
+/// RED — t5_35: scoped handle covering N contexts produces ONE worker admitting all authorized contexts.
+#[test]
+fn t5_35_scoped_handle_register_sink_multi_context_one_worker_admits_all_authorized_contexts() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-multi-ctx.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let ctx_c = Uuid::from_u128(0xC);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([
+        ContextId::new(ctx_a),
+        ContextId::new(ctx_b),
+    ]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b), (3u128, ctx_c)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "scoped handle covering {{ctx_a, ctx_b}} must deliver both authorized rows and not the ctx_c row"
+    );
+    let ctx_ids: Vec<_> = captured
+        .iter()
+        .filter_map(|e| e.row_values.get("context_id").cloned())
+        .collect();
+    assert!(ctx_ids.contains(&Value::Uuid(ctx_a)));
+    assert!(ctx_ids.contains(&Value::Uuid(ctx_b)));
+    assert!(!ctx_ids.contains(&Value::Uuid(ctx_c)));
+    drop(captured);
+
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(
+        metrics.delivered, 2,
+        "exactly two authorized deliveries; ctx_c row must not contribute"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        1,
+        "ctx_c row remains queued exactly once — the engine retains denied events; multi-context single-worker delivers ctx_a + ctx_b"
+    );
+    assert_eq!(
+        db.runtimes_count_for_test("slack"),
+        1,
+        "multi-context scoped handle must produce a single worker for the named sink"
+    );
+    assert_eq!(
+        db.runtime_starts_count_for_test("slack"),
+        1,
+        "multi-context scoped handle must start one worker, not one worker per context"
+    );
+}
+
+/// RED — t5_36: scoped-handle SinkError::Transient retries and succeeds on the scoped path.
+#[test]
+fn t5_36_scoped_handle_register_sink_transient_error_retries_and_succeeds() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-transient.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let attempts_cb = attempts.clone();
+    scoped
+        .register_sink("slack", None, move |_e| {
+            let n = attempts_cb.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(SinkError::Transient("first try".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && attempts.load(Ordering::SeqCst) < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "retry path must invoke the scoped callback exactly twice (transient then success)"
+    );
+    let metrics = db.sink_metrics_for_test("slack");
+    assert!(metrics.retried >= 1, "at least one retry recorded");
+    assert_eq!(metrics.delivered, 1, "exactly one final delivery");
+    assert_eq!(metrics.queued, 0, "durable ack must drain on success");
+}
+
+/// RED — t5_37: DROP ROUTE against scoped-handle-registered sink stops enqueueing; sibling owner sink unaffected.
+#[test]
+fn t5_37_scoped_handle_register_sink_drop_route_stops_enqueueing_siblings_unaffected() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-drop-route.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_slack EVENT inv_match TO slack", &empty())
+        .unwrap();
+    db.execute("CREATE SINK audit TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_audit EVENT inv_match TO audit", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let scoped_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let scoped_cb = scoped_log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            scoped_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let audit_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_log.clone();
+    db.register_sink("audit", None, move |e| {
+        audit_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && scoped_log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    let pre_drop_scoped_delivered = db.sink_metrics_for_test("slack").delivered;
+    assert!(
+        pre_drop_scoped_delivered >= 1,
+        "scoped sink must have delivered the pre-drop event"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        0,
+        "pre-drop scoped route must have drained before testing route removal"
+    );
+
+    db.execute("DROP ROUTE r_slack", &empty()).unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(2)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && audit_log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let post_drop_scoped_delivered = db.sink_metrics_for_test("slack").delivered;
+    assert_eq!(
+        post_drop_scoped_delivered, pre_drop_scoped_delivered,
+        "DROP ROUTE must stop further deliveries to the scoped sink"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        0,
+        "DROP ROUTE must stop enqueueing new slack entries, not merely suppress delivery"
+    );
+
+    let audit = audit_log.lock().unwrap();
+    assert_eq!(
+        audit.len(),
+        2,
+        "sibling owner-registered audit sink must continue receiving events through its own route"
+    );
+}
+
+/// REGRESSION GUARD — t5_38: scoped.register_sink with unknown sink name returns Err.
+#[test]
+fn t5_38_scoped_handle_register_sink_unknown_sink_returns_err() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let db = Database::open_memory();
+    let ctx_a = Uuid::from_u128(0xA);
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let err = scoped
+        .register_sink("nonexistent", None, |_e| Ok(()))
+        .expect_err("register_sink on undeclared sink must return Err");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("sink not found"),
+        "error message must name the missing-sink class; got: {msg}"
+    );
+}
+
+/// RED — t5_39: in-process owner commits a queue, scoped handle then registers and replay flows.
+#[test]
+fn t5_39_scoped_handle_register_sink_in_process_pre_existing_queue_replays() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-prequeue.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b), (3u128, ctx_a)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "scoped sink must replay both pre-existing ctx_a rows from the queue"
+    );
+    let ctx_ids: Vec<_> = captured
+        .iter()
+        .filter_map(|e| e.row_values.get("context_id").cloned())
+        .collect();
+    assert!(ctx_ids.iter().all(|v| *v == Value::Uuid(ctx_a)));
+    drop(captured);
+
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(metrics.delivered, 2);
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        1,
+        "ctx_b row remains queued exactly once — the engine retains denied events; pre-existing queue replay drains the two ctx_a rows"
+    );
+}
+
+/// RED — t5_40: parallel registrations from distinct scoped handles spawn one worker.
+#[test]
+fn t5_40_scoped_handle_register_sink_parallel_registrations_spawn_one_worker() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-parallel.redb");
+    let db = Arc::new(Database::open(&path).unwrap());
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let db_thread = db.clone();
+        let barrier_thread = barrier.clone();
+        let ctx = ctx_a;
+        handles.push(std::thread::spawn(move || {
+            let scoped = db_thread.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx)]));
+            barrier_thread.wait();
+            scoped.register_sink("slack", None, |_e| Ok(())).unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(
+        db.runtimes_count_for_test("slack"),
+        1,
+        "parallel scoped registrations must converge on a single worker"
+    );
+    assert_eq!(
+        db.runtime_starts_count_for_test("slack"),
+        1,
+        "parallel scoped registrations must not spawn duplicate worker threads before converging"
+    );
+}
+
+/// RED — t5_41: file-backed in-process drop and reopen replays scoped queue exactly once.
+#[test]
+fn t5_41_scoped_handle_register_sink_inprocess_drop_and_reopen_replay() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-inproc-reopen.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+            &empty(),
+        )
+        .unwrap();
+        db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+            .unwrap();
+        db.execute("CREATE SINK slack TYPE callback", &empty())
+            .unwrap();
+        db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+            .unwrap();
+        let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+        scoped
+            .register_sink("slack", None, |_e| {
+                Err(SinkError::Transient("offline".into()))
+            })
+            .unwrap();
+        for id in [1u128, 2u128] {
+            let mut p = HashMap::new();
+            p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+            p.insert("sev".into(), Value::Text("warning".into()));
+            p.insert("ctx".into(), Value::Uuid(ctx_a));
+            db.execute(
+                "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+                &p,
+            )
+            .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        db.execute(
+            "DELETE FROM invs WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(1)))]),
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM invs WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(2)))]),
+        )
+        .unwrap();
+        db.close().unwrap();
+        drop(scoped);
+        drop(db);
+    }
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.scan("invs", db.snapshot()).unwrap().len(),
+            0,
+            "source rows deleted; replay must come from durable queue"
+        );
+        let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+        let log_cb = log.clone();
+        scoped
+            .register_sink("slack", None, move |e| {
+                log_cb.lock().unwrap().push(e.clone());
+                Ok(())
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && log.lock().unwrap().len() < 2 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let captured = log.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            2,
+            "both durably queued ctx_a events must replay after reopen"
+        );
+        drop(captured);
+        db.close().unwrap();
+        drop(scoped);
+        drop(db);
+    }
+
+    {
+        let db = Database::open(&path).unwrap();
+        let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+        let replay_count = Arc::new(AtomicU64::new(0));
+        let replay_cb = replay_count.clone();
+        scoped
+            .register_sink("slack", None, move |_e| {
+                replay_cb.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            replay_count.load(Ordering::SeqCst),
+            0,
+            "first replay must have durably acked; second reopen must see empty queue"
+        );
+    }
+}
+
+/// REGRESSION GUARD — t5_42: scoped-handle drop mid-dispatch does not panic.
+#[test]
+fn t5_42_scoped_handle_drop_mid_dispatch_does_not_panic() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-drop-mid.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_slack EVENT inv_match TO slack", &empty())
+        .unwrap();
+    db.execute("CREATE SINK audit TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_audit EVENT inv_match TO audit", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    scoped
+        .register_sink("slack", None, |_e| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        })
+        .unwrap();
+
+    let audit_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_log.clone();
+    db.register_sink("audit", None, move |e| {
+        audit_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    for id in 1u128..=5 {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx_a));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    std::thread::sleep(Duration::from_millis(80));
+    drop(scoped);
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(100)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && audit_log.lock().unwrap().len() < 6 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    let audit = audit_log.lock().unwrap();
+    assert!(
+        audit.len() >= 6,
+        "sibling owner sink must continue receiving events after scoped drop; got {}",
+        audit.len()
+    );
+}
+
+/// RED — t5_43: scoped handle WITHOUT principal does not bypass ACL (production-path analog of t5_17).
+#[test]
+fn t5_43_scoped_handle_register_sink_no_principal_does_not_bypass_acl() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-no-principal-acl.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xCA);
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, context_id UUID CONTEXT_ID, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE secret_event WHEN INSERT ON secrets",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK scoped_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT secret_event TO scoped_sink", &empty())
+        .unwrap();
+
+    let mut grant = HashMap::new();
+    grant.insert("id".into(), Value::Uuid(Uuid::from_u128(0x100)));
+    grant.insert("kind".into(), Value::Text("Agent".into()));
+    grant.insert("pid".into(), Value::Text("alice".into()));
+    grant.insert("acl".into(), Value::Uuid(Uuid::from_u128(0xA)));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $acl)",
+        &grant,
+    )
+    .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("scoped_sink", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("body".into(), Value::Text("must-not-leak".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    p.insert("acl".into(), Value::Uuid(Uuid::from_u128(0xA)));
+    db.execute(
+        "INSERT INTO secrets (id, body, context_id, acl_id) VALUES ($id, $body, $ctx, $acl)",
+        &p,
+    )
+    .unwrap();
+
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "context-scoped handle without principal must NOT receive ACL-gated events through register_sink"
+    );
+    let metrics = db.sink_metrics_for_test("scoped_sink");
+    assert_eq!(
+        db.runtimes_count_for_test("scoped_sink"),
+        1,
+        "principal-less scoped register_sink must still start a dispatcher; ACL denial must come from the access gate, not from silent inertia"
+    );
+    assert_eq!(
+        metrics.delivered, 0,
+        "principal-less scoped sink must not bypass ACL — no ACL'd row may ever be delivered"
+    );
+    assert_eq!(
+        metrics.queued, 1,
+        "ACL'd row must remain durably queued exactly once; the engine must not duplicate or silently drop denied events"
+    );
+}
+
+/// RED — t5_44: scoped_with_constraints across all three dimensions filters as logical AND.
+#[test]
+fn t5_44_scoped_with_constraints_three_dimensions_combined_filter() {
+    use contextdb_core::types::{ContextId, Principal, ScopeLabel};
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-three-dim.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let acl_a = Uuid::from_u128(0xAA);
+    let acl_b = Uuid::from_u128(0xBB);
+
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE invs (
+            id UUID PRIMARY KEY,
+            body TEXT,
+            context_id UUID CONTEXT_ID,
+            scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('edge', 'server'),
+            acl_id UUID ACL REFERENCES acl_grants(acl_id)
+        )",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK alice_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO alice_sink", &empty())
+        .unwrap();
+
+    let mut g = HashMap::new();
+    g.insert("id".into(), Value::Uuid(Uuid::from_u128(0x100)));
+    g.insert("kind".into(), Value::Text("Agent".into()));
+    g.insert("pid".into(), Value::Text("alice".into()));
+    g.insert("aid".into(), Value::Uuid(acl_a));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g,
+    )
+    .unwrap();
+    let mut g = HashMap::new();
+    g.insert("id".into(), Value::Uuid(Uuid::from_u128(0x101)));
+    g.insert("kind".into(), Value::Text("Agent".into()));
+    g.insert("pid".into(), Value::Text("bob".into()));
+    g.insert("aid".into(), Value::Uuid(acl_b));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g,
+    )
+    .unwrap();
+
+    let bob_scoped = db.scoped_with_constraints(
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        Some(BTreeSet::from([ScopeLabel::new("edge")])),
+        Some(Principal::Agent("bob".into())),
+    );
+    let err = bob_scoped
+        .register_sink("alice_sink", Some(Principal::Agent("alice".into())), |_e| {
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("principal-scoped handles cannot register sinks for another principal"),
+        "explicit register_sink principal must not be silently overridden by a principal-scoped handle: {err:?}"
+    );
+
+    for (id, body, ctx, scope, aid) in [
+        (1u128, "replay-all-pass", ctx_a, "edge", acl_a),
+        (2u128, "replay-fail-ctx", ctx_b, "edge", acl_a),
+        (3u128, "replay-fail-scope", ctx_a, "server", acl_a),
+        (4u128, "replay-fail-acl", ctx_a, "edge", acl_b),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO invs (id, body, context_id, scope_label, acl_id) VALUES ($id, $body, $ctx, $scope, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let scoped = db.scoped_with_constraints(
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        Some(BTreeSet::from([ScopeLabel::new("edge")])),
+        None,
+    );
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink(
+            "alice_sink",
+            Some(Principal::Agent("alice".into())),
+            move |e| {
+                log_cb.lock().unwrap().push(e.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one replay row passes all three dimensions (ctx_a AND edge AND alice-granted)"
+    );
+    assert_eq!(
+        captured[0].row_values.get("body"),
+        Some(&Value::Text("replay-all-pass".into()))
+    );
+    drop(captured);
+
+    for (id, body, ctx, scope, aid) in [
+        (5u128, "live-all-pass", ctx_a, "edge", acl_a),
+        (6u128, "live-fail-ctx", ctx_b, "edge", acl_a),
+        (7u128, "live-fail-scope", ctx_a, "server", acl_a),
+        (8u128, "live-fail-acl", ctx_a, "edge", acl_b),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO invs (id, body, context_id, scope_label, acl_id) VALUES ($id, $body, $ctx, $scope, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "exactly two rows pass all three dimensions: one replay row and one live row"
+    );
+    let bodies = captured
+        .iter()
+        .filter_map(|e| e.row_values.get("body").cloned())
+        .collect::<Vec<_>>();
+    assert!(bodies.contains(&Value::Text("replay-all-pass".into())));
+    assert!(bodies.contains(&Value::Text("live-all-pass".into())));
+    assert!(
+        bodies
+            .iter()
+            .all(|v| matches!(v, Value::Text(s) if s.ends_with("all-pass"))),
+        "rows failing context, scope, or explicit registration principal must not deliver"
+    );
+    drop(captured);
+    assert_eq!(
+        db.sink_metrics_for_test("alice_sink").delivered,
+        2,
+        "delivered count must include only replay and live rows that satisfy all dimensions"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("alice_sink").queued,
+        6,
+        "six denied rows remain queued exactly once each; replay and live filters retain denied events durably"
+    );
+
+    let broad_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let broad_cb = broad_log.clone();
+    db.register_sink("alice_sink", None, move |e| {
+        broad_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && broad_log.lock().unwrap().len() < 6 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    let broad = broad_log.lock().unwrap();
+    assert_eq!(
+        broad.len(),
+        6,
+        "broader re-registration must replay each retained denied row exactly once"
+    );
+    let bodies = broad
+        .iter()
+        .filter_map(|e| e.row_values.get("body").cloned())
+        .collect::<Vec<_>>();
+    for body in [
+        "replay-fail-ctx",
+        "replay-fail-scope",
+        "replay-fail-acl",
+        "live-fail-ctx",
+        "live-fail-scope",
+        "live-fail-acl",
+    ] {
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|v| **v == Value::Text(body.into()))
+                .count(),
+            1,
+            "retained denied row {body} must replay exactly once under broader access"
+        );
+    }
+    drop(broad);
+    assert_eq!(
+        db.sink_metrics_for_test("alice_sink").queued,
+        0,
+        "broader re-registration must drain exactly the retained three-dimension denied rows"
     );
 }
