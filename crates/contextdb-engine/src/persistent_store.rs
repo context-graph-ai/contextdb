@@ -32,14 +32,11 @@ impl PersistentCompositeStore {
 impl WriteSetApplicator for PersistentCompositeStore {
     fn apply(&self, ws: WriteSet) -> Result<()> {
         let log_entries = self.inner.build_change_log_entries(&ws);
-        let sink_events = ws
-            .commit_lsn
-            .and_then(|lsn| {
-                self.event_bus
-                    .as_ref()
-                    .map(|event_bus| event_bus.take_staged_sink_events_for_persistence(lsn))
-            })
-            .unwrap_or_default();
+        let sink_events = ws.commit_lsn.and_then(|lsn| {
+            self.event_bus
+                .as_ref()
+                .and_then(|event_bus| event_bus.staged_sink_events_for_persistence(lsn))
+        });
         let event_bus_ddl = ws.commit_lsn.and_then(|lsn| {
             self.event_bus
                 .as_ref()
@@ -61,7 +58,7 @@ impl WriteSetApplicator for PersistentCompositeStore {
         self.persistence.flush_data_with_logs_and_sink_events(
             &ws,
             &log_entries,
-            &sink_events,
+            sink_events.as_deref().map(Vec::as_slice).unwrap_or(&[]),
             &trigger_audits,
             SchemaDdlPersistence {
                 event_bus: event_bus_ddl.as_ref(),

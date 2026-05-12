@@ -4,7 +4,7 @@ const EVENT_TYPES_CONFIG_KEY: &str = "__event_bus_event_types";
 const SINKS_CONFIG_KEY: &str = "__event_bus_sinks";
 const ROUTES_CONFIG_KEY: &str = "__event_bus_routes";
 pub(crate) const MAX_SINK_QUEUE_DEPTH: usize = 100_000;
-const SINK_DISPATCH_BATCH: usize = 256;
+const SINK_DISPATCH_BATCH: usize = 1024;
 
 type SinkCallback = Arc<dyn Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync>;
 
@@ -12,7 +12,7 @@ pub(crate) struct EventBusState {
     definitions: Mutex<EventBusDefinitions>,
     callbacks: RwLock<HashMap<String, SinkRegistration>>,
     queues: Mutex<HashMap<String, VecDeque<SinkQueueEntry>>>,
-    staged_for_persistence: Mutex<HashMap<Lsn, Vec<PreparedSinkEvent>>>,
+    staged_for_persistence: Mutex<HashMap<Lsn, Arc<Vec<PreparedSinkEvent>>>>,
     staged_ddl_for_persistence: Mutex<HashMap<Lsn, StagedEventBusDdlCommit>>,
     metrics: Mutex<HashMap<String, SinkMetricsState>>,
     runtimes: Mutex<HashMap<String, SinkRuntime>>,
@@ -123,6 +123,13 @@ struct RowEventCandidate {
     values: HashMap<String, Value>,
 }
 
+struct RowEventCandidateRef<'a> {
+    trigger: EventTrigger,
+    table: &'a str,
+    row_id: RowId,
+    values: &'a HashMap<String, Value>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct EventGateSnapshot {
     context_column: Option<String>,
@@ -172,18 +179,30 @@ impl EventBusState {
         events: Vec<PreparedSinkEvent>,
     ) {
         if !events.is_empty() {
-            self.staged_for_persistence.lock().insert(lsn, events);
+            self.staged_for_persistence
+                .lock()
+                .insert(lsn, Arc::new(events));
         }
+    }
+
+    pub(crate) fn staged_sink_events_for_persistence(
+        &self,
+        lsn: Lsn,
+    ) -> Option<Arc<Vec<PreparedSinkEvent>>> {
+        self.staged_for_persistence.lock().get(&lsn).cloned()
     }
 
     pub(crate) fn take_staged_sink_events_for_persistence(
         &self,
         lsn: Lsn,
+    ) -> Option<Arc<Vec<PreparedSinkEvent>>> {
+        self.staged_for_persistence.lock().remove(&lsn)
+    }
+
+    pub(crate) fn materialize_staged_sink_events(
+        events: Arc<Vec<PreparedSinkEvent>>,
     ) -> Vec<PreparedSinkEvent> {
-        self.staged_for_persistence
-            .lock()
-            .remove(&lsn)
-            .unwrap_or_default()
+        Arc::try_unwrap(events).unwrap_or_else(|events| (*events).clone())
     }
 
     pub(crate) fn staged_event_bus_persistence_commit(
@@ -639,6 +658,12 @@ impl Database {
         }
     }
 
+    /// Register or replace the in-process callback for a declared sink.
+    ///
+    /// Sinks may be registered from owner or scoped handles. The handle's
+    /// context and scope-label constraints, plus the resolved registration
+    /// principal, are captured at registration time and gate every replayed and
+    /// live delivery before the callback is invoked.
     pub fn register_sink<F>(
         &self,
         name: &str,
@@ -783,61 +808,129 @@ impl Database {
         if definitions.event_types.is_empty() || definitions.routes.is_empty() {
             return Ok(Vec::new());
         }
+        let mut static_gate_cache = HashMap::new();
+        if ws.relational_deletes.is_empty() {
+            let mut out = Vec::with_capacity(ws.relational_inserts.len());
+            for (table, row) in &ws.relational_inserts {
+                self.append_prepared_sink_events_for_candidate(
+                    &mut out,
+                    &definitions,
+                    RowEventCandidateRef {
+                        table,
+                        trigger: EventTrigger::Insert,
+                        row_id: row.row_id,
+                        values: &row.values,
+                    },
+                    lsn,
+                    ws,
+                    &mut static_gate_cache,
+                );
+            }
+            return Ok(out);
+        }
         let candidates = self.row_event_candidates(ws)?;
         let mut out = Vec::new();
         for candidate in candidates {
-            for event_type in definitions.event_types.values() {
-                if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
-                    continue;
-                }
-                let event = SinkEvent {
-                    event_type: event_type.name.clone(),
-                    table: candidate.table.clone(),
-                    severity: candidate
-                        .values
-                        .get("severity")
-                        .and_then(Value::as_text)
-                        .unwrap_or("")
-                        .to_string(),
-                    row_values: candidate.values.clone(),
-                    at_lsn: lsn,
-                };
-                let gate = self.event_gate_snapshot(&candidate.table, &candidate.values, ws);
-                for route in definitions
-                    .routes
-                    .values()
-                    .filter(|route| route.event_type == event_type.name)
-                {
-                    if !route_matches(route, &event.row_values) {
-                        continue;
-                    }
-                    out.push((
-                        route.sink.clone(),
-                        SinkQueueEntry {
-                            id: self.event_bus.allocate_queue_id(),
-                            event: event.clone(),
-                            row_id: candidate.row_id,
-                            attempts: 0,
-                            gate: gate.clone(),
-                        },
-                    ));
-                }
-            }
+            self.append_prepared_sink_events_for_candidate(
+                &mut out,
+                &definitions,
+                RowEventCandidateRef {
+                    table: &candidate.table,
+                    trigger: candidate.trigger,
+                    row_id: candidate.row_id,
+                    values: &candidate.values,
+                },
+                lsn,
+                ws,
+                &mut static_gate_cache,
+            );
         }
         Ok(out)
     }
 
-    fn event_gate_snapshot(
+    fn append_prepared_sink_events_for_candidate(
+        &self,
+        out: &mut Vec<PreparedSinkEvent>,
+        definitions: &EventBusDefinitions,
+        candidate: RowEventCandidateRef<'_>,
+        lsn: Lsn,
+        ws: &contextdb_tx::WriteSet,
+        static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
+    ) {
+        for event_type in definitions.event_types.values() {
+            if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
+                continue;
+            }
+            let severity = candidate
+                .values
+                .get("severity")
+                .and_then(Value::as_text)
+                .unwrap_or("")
+                .to_string();
+            let gate = self.event_gate_snapshot_cached(
+                candidate.table,
+                candidate.values,
+                ws,
+                static_gate_cache,
+            );
+            for route in definitions
+                .routes
+                .values()
+                .filter(|route| route.event_type == event_type.name)
+            {
+                if !route_matches(route, candidate.values) {
+                    continue;
+                }
+                let event = SinkEvent {
+                    event_type: event_type.name.clone(),
+                    table: candidate.table.to_string(),
+                    severity: severity.clone(),
+                    row_values: candidate.values.clone(),
+                    at_lsn: lsn,
+                };
+                out.push((
+                    route.sink.clone(),
+                    SinkQueueEntry {
+                        id: self.event_bus.allocate_queue_id(),
+                        event,
+                        row_id: candidate.row_id,
+                        attempts: 0,
+                        gate: gate.clone(),
+                    },
+                ));
+            }
+        }
+    }
+
+    fn event_gate_snapshot_cached(
         &self,
         table: &str,
         values: &HashMap<String, Value>,
         ws: &contextdb_tx::WriteSet,
+        static_gate_cache: &mut HashMap<String, EventGateSnapshot>,
     ) -> EventGateSnapshot {
+        if let Some(gate) = static_gate_cache.get(table) {
+            return gate.clone();
+        }
         let Some(meta) = self.table_meta(table) else {
             return EventGateSnapshot::default();
         };
+        if meta.columns.iter().all(|column| column.acl_ref.is_none()) {
+            let gate = event_gate_snapshot_from_meta(&meta);
+            static_gate_cache.insert(table.to_string(), gate.clone());
+            return gate;
+        }
+        self.event_gate_snapshot_with_meta(&meta, values, ws)
+    }
+
+    fn event_gate_snapshot_with_meta(
+        &self,
+        meta: &TableMeta,
+        values: &HashMap<String, Value>,
+        ws: &contextdb_tx::WriteSet,
+    ) -> EventGateSnapshot {
         let snapshot = self.snapshot();
-        let mut gate = event_gate_snapshot_from_meta(&meta);
+        let mut gate = event_gate_snapshot_from_meta(meta);
         let acl = meta
             .columns
             .iter()
@@ -947,9 +1040,6 @@ impl Database {
     }
 
     fn ensure_sink_dispatcher_running(&self, sink: &str) {
-        if !self.resource_owner {
-            return;
-        }
         let mut runtimes = self.event_bus.runtimes.lock();
         if runtimes.contains_key(sink) {
             return;
@@ -1196,7 +1286,13 @@ impl EventBusWorker {
                         acked.push(entry.id);
                     }
                     Err(payload) => {
-                        let _ = panic_payload_to_string(payload);
+                        let panic_message = panic_payload_to_string(payload);
+                        tracing::warn!(
+                            sink = %self.sink,
+                            entry_id = entry.id,
+                            panic_message = %panic_message,
+                            "sink callback panicked"
+                        );
                         permanent_failure_count = permanent_failure_count.saturating_add(1);
                         acked.push(entry.id);
                     }

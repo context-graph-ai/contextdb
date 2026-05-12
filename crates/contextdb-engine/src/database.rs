@@ -2325,13 +2325,15 @@ impl Database {
                         self.stage_trigger_ddl_for_commit(lsn, trigger_ddl)?;
                     }
                     self.plugin.pre_commit(ws, source)?;
-                    pending_sink_events = self
+                    let prepared_sink_events = self
                         .prepare_sink_events_for_write_set_with_event_bus_ddl(ws, event_bus_ddl)?;
                     if self.persistence.is_some()
                         && let Some(lsn) = ws.commit_lsn
                     {
                         self.event_bus
-                            .stage_sink_events_for_persistence(lsn, pending_sink_events.clone());
+                            .stage_sink_events_for_persistence(lsn, prepared_sink_events);
+                    } else {
+                        pending_sink_events = prepared_sink_events;
                     }
                     if let Some(lsn) = ws.commit_lsn {
                         committed_trigger_audit_entries = if source == CommitSource::SyncPull {
@@ -2366,7 +2368,7 @@ impl Database {
             Ok(committed) => committed,
             Err(failure) => {
                 if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
-                    self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                    let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
                     self.discard_staged_event_bus_ddl_commit(lsn);
                     self.discard_staged_trigger_ddl_commit(lsn);
                     self.discard_staged_trigger_audits_for_persistence(lsn);
@@ -2391,7 +2393,15 @@ impl Database {
         if !ws.is_empty() {
             self.release_delete_allocations(&ws);
             self.plugin.post_commit(&ws, source);
-            self.publish_prepared_sink_events_to_memory(pending_sink_events);
+            let sink_events_to_publish = if self.persistence.is_some() {
+                ws.commit_lsn
+                    .and_then(|lsn| self.event_bus.take_staged_sink_events_for_persistence(lsn))
+                    .map(EventBusState::materialize_staged_sink_events)
+                    .unwrap_or_default()
+            } else {
+                pending_sink_events
+            };
+            self.publish_prepared_sink_events_to_memory(sink_events_to_publish);
             self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
             self.publish_commit_event_if_subscribers(&ws, source, lsn);
         } else {
