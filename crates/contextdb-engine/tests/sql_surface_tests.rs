@@ -2220,7 +2220,7 @@ fn upd_03_update_embedding_changes_vector_recall_immediately() {
 }
 
 #[test]
-fn upd_04_stale_conditional_update_in_explicit_tx_fails_commit_atomically() {
+fn upd_04_stale_conditional_update_in_explicit_tx_commits_as_noop_atomically() {
     let db = Database::open_memory();
     let id = Uuid::new_v4();
     db.execute(
@@ -2260,13 +2260,8 @@ fn upd_04_stale_conditional_update_in_explicit_tx_fails_commit_atomically() {
     assert_eq!(b.rows_affected, 1);
 
     db.commit(tx_a).expect("first conditional update commits");
-    let err = db
-        .commit(tx_b)
-        .expect_err("stale conditional update must fail commit");
-    assert!(
-        matches!(err, Error::ConditionalUpdateConflict { count: 1 }),
-        "expected ConditionalUpdateConflict, got {err:?}"
-    );
+    db.commit(tx_b)
+        .expect("ordinary stale conditional update commits as commit-time no-op");
 
     let row = db
         .point_lookup("tasks", "id", &Value::Uuid(id), db.snapshot())

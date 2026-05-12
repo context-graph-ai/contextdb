@@ -517,6 +517,7 @@ struct PendingConditionalUpdateGuard {
     predicates: Vec<(ColName, Value)>,
     before: WriteSetCounts,
     after: WriteSetCounts,
+    fail_on_conflict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +534,7 @@ struct PendingUpsertIntent {
 #[derive(Debug, Default)]
 struct CommitValidationOutcome {
     conditional_noop_count: u64,
+    conditional_conflict_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -2220,6 +2222,7 @@ impl Database {
             predicates.to_vec(),
             counts,
             counts,
+            true,
         )?;
         Ok(true)
     }
@@ -2402,6 +2405,7 @@ impl Database {
 
         Ok(CommitValidationOutcome {
             conditional_noop_count: validation_noop_count.get(),
+            conditional_conflict_count: 0,
         })
     }
 
@@ -2409,9 +2413,9 @@ impl Database {
         source: CommitSource,
         outcome: &CommitValidationOutcome,
     ) -> Result<()> {
-        if source == CommitSource::User && outcome.conditional_noop_count > 0 {
+        if source == CommitSource::User && outcome.conditional_conflict_count > 0 {
             return Err(Error::ConditionalUpdateConflict {
-                count: outcome.conditional_noop_count,
+                count: outcome.conditional_conflict_count,
             });
         }
         Ok(())
@@ -3772,14 +3776,12 @@ impl Database {
             .remove(&origin_tx)
             .unwrap_or_default();
         let snapshot = self.snapshot();
-        let conditional_noop_count =
+        let validation =
             self.revalidate_conditional_updates(ws, snapshot, &metadata.conditional_update_guards)?;
         self.validate_unique_constraints_in_write_set(ws, snapshot, &metadata.upsert_intents)?;
         self.validate_foreign_keys_in_write_set(ws, snapshot)?;
         self.validate_composite_foreign_keys_in_write_set(ws, snapshot)?;
-        Ok(CommitValidationOutcome {
-            conditional_noop_count,
-        })
+        Ok(validation)
     }
 
     fn take_conditional_update_guards_for_tx(
@@ -4922,8 +4924,8 @@ impl Database {
         ws: &mut WriteSet,
         snapshot: SnapshotId,
         guards: &[PendingConditionalUpdateGuard],
-    ) -> Result<u64> {
-        let mut conditional_noop_count = 0_u64;
+    ) -> Result<CommitValidationOutcome> {
+        let mut outcome = CommitValidationOutcome::default();
         for guard in guards.iter().rev() {
             let matches = self
                 .relational_store
@@ -4940,9 +4942,14 @@ impl Database {
 
             self.release_insert_allocations_for_slice(ws, guard.before, guard.after);
             remove_write_set_slice(ws, guard.before, guard.after);
-            conditional_noop_count = conditional_noop_count.saturating_add(1);
+            if guard.fail_on_conflict {
+                outcome.conditional_conflict_count =
+                    outcome.conditional_conflict_count.saturating_add(1);
+            } else {
+                outcome.conditional_noop_count = outcome.conditional_noop_count.saturating_add(1);
+            }
         }
-        Ok(conditional_noop_count)
+        Ok(outcome)
     }
 
     fn release_insert_allocations_for_slice(
@@ -7482,12 +7489,14 @@ impl Database {
             ));
         }
         self.assert_public_tx_control_cross_thread_allowed_for_surface("close")?;
-        let _operation_barrier = self.operation_gate.write();
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        if self.resource_owner {
-            self.resource_closed.store(true, Ordering::SeqCst);
+        {
+            let _operation_barrier = self.operation_gate.write();
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            if self.resource_owner {
+                self.resource_closed.store(true, Ordering::SeqCst);
+            }
         }
         let tx = self.session_tx.lock().take();
         if let Some(tx) = tx {
@@ -7791,6 +7800,10 @@ impl Database {
             .with_write_set(tx, |ws| current_write_set_counts(ws))
     }
 
+    // 8th parameter `fail_on_conflict` is load-bearing: it differentiates
+    // stale-conditional-UPDATE silent no-ops from explicit row-guard atomic
+    // rollbacks. Internal pub(crate) helper; struct refactor is overkill.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_conditional_update_guard(
         &self,
         tx: TxId,
@@ -7799,6 +7812,7 @@ impl Database {
         predicates: Vec<(ColName, Value)>,
         before: WriteSetCounts,
         after: WriteSetCounts,
+        fail_on_conflict: bool,
     ) -> Result<()> {
         self.tx_mgr.with_write_set(tx, |_| ())?;
         self.pending_commit_metadata
@@ -7812,6 +7826,7 @@ impl Database {
                 predicates,
                 before,
                 after,
+                fail_on_conflict,
             });
         Ok(())
     }
@@ -12059,12 +12074,14 @@ fn estimate_edge_bytes(
 
 impl Drop for Database {
     fn drop(&mut self) {
-        let _operation_barrier = self.operation_gate.write();
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        if self.resource_owner {
-            self.resource_closed.store(true, Ordering::SeqCst);
+        {
+            let _operation_barrier = self.operation_gate.write();
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            if self.resource_owner {
+                self.resource_closed.store(true, Ordering::SeqCst);
+            }
         }
         self.stop_cron_tickler();
         self.stop_event_bus_threads();

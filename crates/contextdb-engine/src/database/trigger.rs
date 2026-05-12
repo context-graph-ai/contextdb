@@ -819,13 +819,11 @@ impl Database {
             }
             self.rewrite_txid_placeholders(tx, ws)?;
             let snapshot = self.snapshot();
-            let conditional_noop_count =
+            let validation =
                 self.revalidate_conditional_updates(ws, snapshot, &conditional_update_guards)?;
             self.rewrite_commit_time_upserts_for_write_set(ws, snapshot, &upsert_intents)?;
             ws.canonicalize_final_state();
-            Ok(CommitValidationOutcome {
-                conditional_noop_count,
-            })
+            Ok(validation)
         })?
     }
 

@@ -2097,6 +2097,7 @@ fn exec_update(
                 predicates,
                 before_counts,
                 after_counts,
+                false,
             )?;
         }
     }
