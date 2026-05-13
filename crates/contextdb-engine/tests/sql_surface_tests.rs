@@ -1,7 +1,7 @@
 use contextdb_core::Lsn;
-use contextdb_core::{Error, MemoryAccountant, Value};
-use contextdb_engine::Database;
-use std::collections::HashMap;
+use contextdb_core::{ContextId, Error, MemoryAccountant, Principal, RowId, ScopeLabel, Value};
+use contextdb_engine::{Database, sync_types as sync};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -1821,6 +1821,1448 @@ fn jn_06_cte_filtered_vector_ordering_executes() {
     assert_eq!(result.rows[0][1], Value::Text("near".into()));
     assert_eq!(result.rows[1][0], Value::Uuid(far));
     assert_eq!(result.rows[1][1], Value::Text("far".into()));
+}
+
+fn sarg_uuid(n: u128) -> Uuid {
+    Uuid::from_u128(n)
+}
+
+fn sarg_contexts(contexts: &[Uuid]) -> BTreeSet<ContextId> {
+    contexts.iter().copied().map(ContextId::new).collect()
+}
+
+fn sarg_labels(labels: &[&str]) -> BTreeSet<ScopeLabel> {
+    labels.iter().copied().map(ScopeLabel::new).collect()
+}
+
+fn sarg_insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source)),
+            ("target_id", Value::Uuid(target)),
+            ("edge_type", Value::Text(edge_type.to_string())),
+        ]),
+    )
+    .unwrap();
+}
+
+fn sarg_insert_context_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str, ctx: Uuid) {
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id) VALUES ($id, $source_id, $target_id, $edge_type, $ctx)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("source_id", Value::Uuid(source)),
+            ("target_id", Value::Uuid(target)),
+            ("edge_type", Value::Text(edge_type.to_string())),
+            ("ctx", Value::Uuid(ctx)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn sarg_insert_node(db: &Database, id: Uuid, ctx: Option<Uuid>, kind: Option<&str>) {
+    match (ctx, kind) {
+        (Some(ctx), Some(kind)) => db
+            .execute(
+                "INSERT INTO nodes (id, context_id, kind) VALUES ($id, $ctx, $kind)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("ctx", Value::Uuid(ctx)),
+                    ("kind", Value::Text(kind.to_string())),
+                ]),
+            )
+            .unwrap(),
+        (Some(ctx), None) => db
+            .execute(
+                "INSERT INTO nodes (id, context_id) VALUES ($id, $ctx)",
+                &params(vec![("id", Value::Uuid(id)), ("ctx", Value::Uuid(ctx))]),
+            )
+            .unwrap(),
+        (None, Some(kind)) => db
+            .execute(
+                "INSERT INTO nodes (id, kind) VALUES ($id, $kind)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("kind", Value::Text(kind.to_string())),
+                ]),
+            )
+            .unwrap(),
+        (None, None) => db
+            .execute(
+                "INSERT INTO nodes (id) VALUES ($id)",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .unwrap(),
+    };
+}
+
+fn sarg_uuid_column_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
+    let idx = result
+        .columns
+        .iter()
+        .position(|c| c == column || c.rsplit('.').next() == Some(column))
+        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns));
+    result
+        .rows
+        .iter()
+        .map(|row| match &row[idx] {
+            Value::Uuid(id) => *id,
+            other => panic!("expected UUID in column {column}, got {other:?}"),
+        })
+        .collect()
+}
+
+fn sarg_row_id_for_uuid(db: &Database, table: &str, id: Uuid) -> RowId {
+    db.scan(table, db.snapshot())
+        .unwrap()
+        .into_iter()
+        .find(|row| row.values.get("id") == Some(&Value::Uuid(id)))
+        .map(|row| row.row_id)
+        .unwrap_or_else(|| panic!("row {id} not found in {table}"))
+}
+
+fn sarg_expect_context_violation(err: Error, requested: Uuid, allowed: &[Uuid]) {
+    match err {
+        Error::ContextScopeViolation {
+            requested: got_requested,
+            allowed: got_allowed,
+        } => {
+            assert_eq!(got_requested, ContextId::new(requested));
+            assert_eq!(got_allowed, sarg_contexts(allowed));
+        }
+        other => panic!("expected ContextScopeViolation, got {other:?}"),
+    }
+}
+
+fn sarg_expect_scope_violation(err: Error, requested: &str, allowed: &[&str]) {
+    match err {
+        Error::ScopeLabelViolation {
+            requested: got_requested,
+            allowed: got_allowed,
+        } => {
+            assert_eq!(got_requested, ScopeLabel::new(requested));
+            assert_eq!(got_allowed, sarg_labels(allowed));
+        }
+        other => panic!("expected ScopeLabelViolation, got {other:?}"),
+    }
+}
+
+fn sarg_expect_acl_denied(err: Error, table: &str, row_id: RowId, principal: &str) {
+    match err {
+        Error::AclDenied {
+            table: got_table,
+            row_id: got_row_id,
+            principal: got_principal,
+        } => {
+            assert_eq!(got_table, table);
+            assert_eq!(got_row_id, row_id);
+            assert_eq!(got_principal, Principal::Agent(principal.to_string()));
+        }
+        other => panic!("expected AclDenied, got {other:?}"),
+    }
+}
+
+fn sarg_insert_acl_grant(db: &Database, id: Uuid, principal: &str, acl: Uuid) {
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, 'Agent', $principal, $acl)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("principal", Value::Text(principal.to_string())),
+            ("acl", Value::Uuid(acl)),
+        ]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn scoped_anchor_read_reports_context_scope_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, data) in [
+        (sarg_uuid(1), ctx_a, "a1"),
+        (sarg_uuid(2), ctx_a, "a2"),
+        (sarg_uuid(3), ctx_b, "b"),
+        (sarg_uuid(4), ctx_c, "c"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("ctx", Value::Uuid(ctx)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err_b = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(3)))]),
+        )
+        .expect_err("hidden ctx-b anchor must be refused");
+    sarg_expect_context_violation(err_b, ctx_b, &[ctx_a]);
+    let err_c = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(4)))]),
+        )
+        .expect_err("hidden ctx-c anchor must be refused");
+    sarg_expect_context_violation(err_c, ctx_c, &[ctx_a]);
+}
+
+#[test]
+fn scoped_anchor_read_reports_scope_label_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, scope TEXT SCOPE_LABEL_READ ('a','b','c') WRITE ('a','b','c'), data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    for (id, scope) in [(1, "a"), (2, "b"), (3, "c")] {
+        db.execute(
+            "INSERT INTO t (id, scope, data) VALUES ($id, $scope, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("scope", Value::Text(scope.to_string())),
+                ("data", Value::Text(scope.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(None, Some(sarg_labels(&["a"])), None);
+    for (id, label) in [(2, "b"), (3, "c")] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(sarg_uuid(id)))]),
+            )
+            .expect_err("hidden scope-label anchor must be refused");
+        sarg_expect_scope_violation(err, label, &["a"]);
+    }
+}
+
+#[test]
+fn scoped_anchor_read_reports_acl_denied() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-a";
+    let acl_visible = sarg_uuid(0xA1);
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, 'Agent', $principal, $acl)",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(0xAA))),
+            ("principal", Value::Text(principal.to_string())),
+            ("acl", Value::Uuid(acl_visible)),
+        ]),
+    )
+    .unwrap();
+    for (id, acl, data) in [
+        (sarg_uuid(1), acl_visible, "visible"),
+        (sarg_uuid(2), sarg_uuid(0xB1), "hidden-b"),
+        (sarg_uuid(3), sarg_uuid(0xC1), "hidden-c"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, acl_id, data) VALUES ($id, $acl, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("acl", Value::Uuid(acl)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let row_2 = sarg_row_id_for_uuid(&db, "t", sarg_uuid(2));
+    let row_3 = sarg_row_id_for_uuid(&db, "t", sarg_uuid(3));
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    for (id, row_id) in [(sarg_uuid(2), row_2), (sarg_uuid(3), row_3)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .expect_err("ungranted ACL anchor must be refused");
+        sarg_expect_acl_denied(err, "t", row_id, principal);
+    }
+}
+
+#[test]
+fn unique_column_anchor_read_under_constraint_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, uniq_col TEXT UNIQUE, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, key) in [(1, ctx_a, "a"), (2, ctx_b, "b"), (3, ctx_c, "c")] {
+        db.execute(
+            "INSERT INTO t (id, context_id, uniq_col, data) VALUES ($id, $ctx, $key, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("key", Value::Text(key.to_string())),
+                ("data", Value::Text(key.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (key, ctx) in [("b", ctx_b), ("c", ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE uniq_col = $key",
+                &params(vec![("key", Value::Text(key.to_string()))]),
+            )
+            .expect_err("hidden unique anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn scope_label_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, scope TEXT SCOPE_LABEL_READ ('a','b','c') WRITE ('a','b','c'), uniq_col TEXT UNIQUE, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    for (id, scope, key) in [(1, "a", "a"), (2, "b", "b"), (3, "c", "c")] {
+        db.execute(
+            "INSERT INTO t (id, scope, uniq_col, data) VALUES ($id, $scope, $key, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("scope", Value::Text(scope.to_string())),
+                ("key", Value::Text(key.to_string())),
+                ("data", Value::Text(key.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(None, Some(sarg_labels(&["a"])), None);
+    for (key, label) in [("b", "b"), ("c", "c")] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE uniq_col = $key",
+                &params(vec![("key", Value::Text(key.to_string()))]),
+            )
+            .expect_err("hidden scope-label unique anchor must be refused");
+        sarg_expect_scope_violation(err, label, &["a"]);
+    }
+}
+
+#[test]
+fn acl_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), uniq_col TEXT UNIQUE, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-a";
+    let acl_visible = sarg_uuid(0xA1);
+    sarg_insert_acl_grant(&db, sarg_uuid(0xAA), principal, acl_visible);
+    for (id, acl, key) in [
+        (sarg_uuid(1), acl_visible, "a"),
+        (sarg_uuid(2), sarg_uuid(0xB1), "b"),
+        (sarg_uuid(3), sarg_uuid(0xC1), "c"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, acl_id, uniq_col, data) VALUES ($id, $acl, $key, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("acl", Value::Uuid(acl)),
+                ("key", Value::Text(key.to_string())),
+                ("data", Value::Text(key.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let row_b = sarg_row_id_for_uuid(&db, "t", sarg_uuid(2));
+    let row_c = sarg_row_id_for_uuid(&db, "t", sarg_uuid(3));
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    for (key, row_id) in [("b", row_b), ("c", row_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE uniq_col = $key",
+                &params(vec![("key", Value::Text(key.to_string()))]),
+            )
+            .expect_err("hidden ACL unique anchor must be refused");
+        sarg_expect_acl_denied(err, "t", row_id, principal);
+    }
+}
+
+#[test]
+fn composite_unique_anchor_read_under_constraint_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, u_a INTEGER, u_b INTEGER, data TEXT, UNIQUE (u_a, u_b))",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, u_a, u_b, data) in [
+        (1, ctx_b, 1, 1, "b"),
+        (2, ctx_c, 1, 2, "c"),
+        (3, ctx_a, 2, 1, "a"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, u_a, u_b, data) VALUES ($id, $ctx, $u_a, $u_b, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("u_a", Value::Int64(u_a)),
+                ("u_b", Value::Int64(u_b)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (u_b, ctx) in [(1, ctx_b), (2, ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE u_a = $u_a AND u_b = $u_b",
+                &params(vec![("u_a", Value::Int64(1)), ("u_b", Value::Int64(u_b))]),
+            )
+            .expect_err("hidden composite unique anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn scope_label_composite_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, scope TEXT SCOPE_LABEL_READ ('a','b','c') WRITE ('a','b','c'), u_a INTEGER, u_b INTEGER, data TEXT, UNIQUE (u_a, u_b))",
+        &empty(),
+    )
+    .unwrap();
+    for (id, scope, u_a, u_b, data) in [
+        (1, "b", 1, 1, "b"),
+        (2, "c", 1, 2, "c"),
+        (3, "a", 2, 1, "a"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, scope, u_a, u_b, data) VALUES ($id, $scope, $u_a, $u_b, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("scope", Value::Text(scope.to_string())),
+                ("u_a", Value::Int64(u_a)),
+                ("u_b", Value::Int64(u_b)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(None, Some(sarg_labels(&["a"])), None);
+    for (u_b, label) in [(1, "b"), (2, "c")] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE u_a = $u_a AND u_b = $u_b",
+                &params(vec![("u_a", Value::Int64(1)), ("u_b", Value::Int64(u_b))]),
+            )
+            .expect_err("hidden scope-label composite unique anchor must be refused");
+        sarg_expect_scope_violation(err, label, &["a"]);
+    }
+}
+
+#[test]
+fn acl_composite_unique_anchor_read_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), u_a INTEGER, u_b INTEGER, data TEXT, UNIQUE (u_a, u_b))",
+        &empty(),
+    )
+    .unwrap();
+    let principal = "agent-a";
+    let acl_visible = sarg_uuid(0xA1);
+    sarg_insert_acl_grant(&db, sarg_uuid(0xAA), principal, acl_visible);
+    for (id, acl, u_a, u_b, data) in [
+        (sarg_uuid(1), sarg_uuid(0xB1), 1, 1, "b"),
+        (sarg_uuid(2), sarg_uuid(0xC1), 1, 2, "c"),
+        (sarg_uuid(3), acl_visible, 2, 1, "a"),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, acl_id, u_a, u_b, data) VALUES ($id, $acl, $u_a, $u_b, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("acl", Value::Uuid(acl)),
+                ("u_a", Value::Int64(u_a)),
+                ("u_b", Value::Int64(u_b)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let row_b = sarg_row_id_for_uuid(&db, "t", sarg_uuid(1));
+    let row_c = sarg_row_id_for_uuid(&db, "t", sarg_uuid(2));
+    let scoped =
+        db.scoped_with_constraints(None, None, Some(Principal::Agent(principal.to_string())));
+    for (u_b, row_id) in [(1, row_b), (2, row_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE u_a = $u_a AND u_b = $u_b",
+                &params(vec![("u_a", Value::Int64(1)), ("u_b", Value::Int64(u_b))]),
+            )
+            .expect_err("hidden ACL composite unique anchor must be refused");
+        sarg_expect_acl_denied(err, "t", row_id, principal);
+    }
+}
+
+#[test]
+fn null_context_id_row_anchor_read_under_scoped_handle_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    db.execute(
+        "INSERT INTO t (id, data) VALUES ($id, 'null-context')",
+        &params(vec![("id", Value::Uuid(sarg_uuid(1)))]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'ctx-b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(ctx_b)),
+        ]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err_null = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(1)))]),
+        )
+        .expect_err("NULL context anchor must be refused");
+    sarg_expect_context_violation(err_null, Uuid::from_u128(u128::MAX), &[ctx_a]);
+    let err_b = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+        )
+        .expect_err("foreign context anchor must be refused");
+    sarg_expect_context_violation(err_b, ctx_b, &[ctx_a]);
+}
+
+#[test]
+fn stacked_constraints_anchor_read_reports_first_violating_gate_context_first() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, scope TEXT SCOPE_LABEL_READ ('a','c','d') WRITE ('a','c','d'), acl_id UUID ACL REFERENCES acl_grants(acl_id), data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    for (id, ctx, scope, acl) in [
+        (1, ctx_b, "c", sarg_uuid(0xB1)),
+        (2, ctx_c, "d", sarg_uuid(0xC1)),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, scope, acl_id, data) VALUES ($id, $ctx, $scope, $acl, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("scope", Value::Text(scope.to_string())),
+                ("acl", Value::Uuid(acl)),
+                ("data", Value::Text(scope.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_constraints(
+        Some(sarg_contexts(&[ctx_a])),
+        Some(sarg_labels(&["a"])),
+        Some(Principal::Agent("agent-a".to_string())),
+    );
+    for (id, ctx) in [(1, ctx_b), (2, ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(sarg_uuid(id)))]),
+            )
+            .expect_err("first violating gate must be context");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn scoped_list_query_continues_to_filter_hidden_rows_silently_across_shapes() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, category TEXT, score INTEGER)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    for (id, ctx, category, score) in [
+        (1, ctx_a, "x", 10),
+        (2, ctx_a, "x", 90),
+        (3, ctx_b, "x", 80),
+        (4, ctx_b, "x", 81),
+        (5, ctx_b, "y", 82),
+        (6, ctx_b, "y", 83),
+    ] {
+        db.execute(
+            "INSERT INTO t (id, context_id, category, score) VALUES ($id, $ctx, $category, $score)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("category", Value::Text(category.to_string())),
+                ("score", Value::Int64(score)),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let all = scoped.execute("SELECT id FROM t", &empty()).unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&all, "id"),
+        BTreeSet::from([sarg_uuid(1), sarg_uuid(2)])
+    );
+    let x = scoped
+        .execute("SELECT id FROM t WHERE category = 'x'", &empty())
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&x, "id"),
+        BTreeSet::from([sarg_uuid(1), sarg_uuid(2)])
+    );
+    let range = scoped
+        .execute("SELECT id FROM t WHERE score > 50", &empty())
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&range, "id"),
+        BTreeSet::from([sarg_uuid(2)])
+    );
+    let y = scoped
+        .execute("SELECT id FROM t WHERE category = 'y'", &empty())
+        .unwrap();
+    assert!(y.rows.is_empty());
+    let limit = scoped
+        .execute("SELECT id FROM t LIMIT 1", &empty())
+        .unwrap();
+    assert_eq!(limit.rows.len(), 1);
+    assert!(
+        sarg_uuid_column_set(&limit, "id").is_subset(&BTreeSet::from([sarg_uuid(1), sarg_uuid(2)]))
+    );
+    let ordered = scoped
+        .execute("SELECT id FROM t ORDER BY id LIMIT 1", &empty())
+        .unwrap();
+    assert_eq!(ordered.rows, vec![vec![Value::Uuid(sarg_uuid(1))]]);
+}
+
+#[test]
+fn scoped_anchor_read_returns_empty_when_row_does_not_exist() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'a')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(1))),
+            ("ctx", Value::Uuid(ctx_a)),
+        ]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(999)))]),
+        )
+        .unwrap();
+    assert!(result.rows.is_empty());
+}
+
+#[test]
+fn in_list_against_primary_key_under_constraint_returns_visible_subset_no_typed_err() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    for (id, ctx) in [(1, ctx_a), (2, ctx_b), (3, ctx_b)] {
+        db.execute(
+            "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, $data)",
+            &params(vec![
+                ("id", Value::Uuid(sarg_uuid(id))),
+                ("ctx", Value::Uuid(ctx)),
+                ("data", Value::Text(id.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute(
+            "SELECT id FROM t WHERE id IN ($a, $b, $c)",
+            &params(vec![
+                ("a", Value::Uuid(sarg_uuid(1))),
+                ("b", Value::Uuid(sarg_uuid(2))),
+                ("c", Value::Uuid(sarg_uuid(3))),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "id"),
+        BTreeSet::from([sarg_uuid(1)])
+    );
+}
+
+#[test]
+fn update_delete_predicate_against_hidden_only_rows_preserves_rows_affected_zero() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(ctx_b)),
+        ]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let update = scoped
+        .execute(
+            "UPDATE t SET data = $data WHERE id = $id",
+            &params(vec![
+                ("data", Value::Text("new".to_string())),
+                ("id", Value::Uuid(sarg_uuid(2))),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(update.rows_affected, 0);
+    let delete = scoped
+        .execute(
+            "DELETE FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+        )
+        .unwrap();
+    assert_eq!(delete.rows_affected, 0);
+}
+
+#[test]
+fn admin_handle_anchor_read_under_no_constraints_returns_ok_rows() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(sarg_uuid(0xB))),
+        ]),
+    )
+    .unwrap();
+    let result = db
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Text("b".to_string())]]);
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_traversal() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    for id in [n1, n2, n3] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n1, n3, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_filter_derived_start_nodes() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, kind TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n4 = sarg_uuid(4);
+    let n5 = sarg_uuid(5);
+    sarg_insert_node(&db, n1, None, Some("seed"));
+    sarg_insert_node(&db, n2, None, None);
+    sarg_insert_node(&db, n4, None, Some("other"));
+    sarg_insert_node(&db, n5, None, None);
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n4, n5, "T");
+    let snapshot = db.snapshot();
+    db.execute(
+        "UPDATE nodes SET kind = 'seed' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(n4))]),
+    )
+    .unwrap();
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.kind = 'seed' COLUMNS (b.id AS target))",
+            &empty(),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_subquery_derived_start_nodes() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE seeds (id UUID PRIMARY KEY, node_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    let n5 = sarg_uuid(5);
+    for id in [n1, n2, n3, n4, n5] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n4, n5, "T");
+    db.execute(
+        "INSERT INTO seeds (id, node_id) VALUES ($id, $node)",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(10))),
+            ("node", Value::Uuid(n1)),
+        ]),
+    )
+    .unwrap();
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n1, n3, "T");
+    db.execute(
+        "INSERT INTO seeds (id, node_id) VALUES ($id, $node)",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(11))),
+            ("node", Value::Uuid(n4)),
+        ]),
+    )
+    .unwrap();
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id IN (SELECT node_id FROM seeds) COLUMNS (b.id AS target))",
+            &empty(),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_pins_multi_hop_bfs_depth() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    for id in [n1, n2, n3, n4] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n2, n3, "T");
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n2, n4, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->{1,2}(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2, n3])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_uses_pinned_snapshot_for_unbound_start_fallback() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    for id in [n1, n2, n3, n4] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    sarg_insert_edge(&db, n1, n2, "T");
+    let snapshot = db.snapshot();
+    let tx = db.begin_or_panic();
+    db.delete_edge(tx, n1, n2, "T").unwrap();
+    db.commit(tx).unwrap();
+    sarg_insert_edge(&db, n3, n4, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT source, target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) COLUMNS (a.id AS source, b.id AS target))",
+            &empty(),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "source"),
+        BTreeSet::from([n1])
+    );
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([n2])
+    );
+}
+
+#[test]
+fn graph_table_execute_at_snapshot_under_scoped_handle_uses_pinned_snapshot() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let src = sarg_uuid(1);
+    let pre_a = sarg_uuid(2);
+    let post_a = sarg_uuid(3);
+    let pre_b = sarg_uuid(4);
+    let post_b = sarg_uuid(5);
+    let gate_flip = sarg_uuid(6);
+    for (id, ctx) in [
+        (src, ctx_a),
+        (pre_a, ctx_a),
+        (post_a, ctx_a),
+        (pre_b, ctx_b),
+        (post_b, ctx_b),
+        (gate_flip, ctx_a),
+    ] {
+        sarg_insert_node(&db, id, Some(ctx), None);
+    }
+    sarg_insert_context_edge(&db, src, pre_a, "T", ctx_a);
+    sarg_insert_context_edge(&db, src, pre_b, "T", ctx_b);
+    sarg_insert_context_edge(&db, src, gate_flip, "T", ctx_b);
+    let snapshot = db.snapshot();
+    db.execute(
+        "UPDATE edges SET context_id = $ctx WHERE source_id = $src AND target_id = $target AND edge_type = 'T'",
+        &params(vec![
+            ("ctx", Value::Uuid(ctx_a)),
+            ("src", Value::Uuid(src)),
+            ("target", Value::Uuid(gate_flip)),
+        ]),
+    )
+    .unwrap();
+    sarg_insert_context_edge(&db, src, post_a, "T", ctx_a);
+    sarg_insert_context_edge(&db, src, post_b, "T", ctx_b);
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let result = scoped
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(src))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "target"),
+        BTreeSet::from([pre_a])
+    );
+}
+
+#[test]
+fn multi_cte_graph_table_composition_at_pinned_snapshot_via_in_select() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    let n4 = sarg_uuid(4);
+    let n5 = sarg_uuid(5);
+    for id in [n1, n2, n3, n4, n5] {
+        db.execute(
+            "INSERT INTO nodes (id, data) VALUES ($id, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("data", Value::Text(id.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    sarg_insert_edge(&db, n2, n1, "BASED_ON");
+    sarg_insert_edge(&db, n3, n1, "ABOUT");
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n4, n1, "BASED_ON");
+    sarg_insert_edge(&db, n5, n1, "ABOUT");
+    let sql = "WITH based AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:BASED_ON]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))
+        ), about AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:ABOUT]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))
+        )
+        SELECT id, data FROM nodes
+        WHERE id IN (SELECT src FROM based) OR id IN (SELECT src FROM about)";
+    let result = db
+        .execute_at_snapshot(sql, &params(vec![("anchor", Value::Uuid(n1))]), snapshot)
+        .unwrap();
+    assert_eq!(
+        sarg_uuid_column_set(&result, "id"),
+        BTreeSet::from([n2, n3])
+    );
+    let based = db
+        .execute_at_snapshot(
+            "WITH based AS (SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:BASED_ON]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))) SELECT src FROM based",
+            &params(vec![("anchor", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(sarg_uuid_column_set(&based, "src"), BTreeSet::from([n2]));
+    let about = db
+        .execute_at_snapshot(
+            "WITH about AS (SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:ABOUT]-(a) WHERE b.id = $anchor COLUMNS (a.id AS target))) SELECT src FROM about",
+            &params(vec![("anchor", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert_eq!(sarg_uuid_column_set(&about, "src"), BTreeSet::from([n3]));
+}
+
+#[test]
+fn graph_table_at_pinned_snapshot_with_no_pre_pin_edges_returns_ok_empty() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let n1 = sarg_uuid(1);
+    let n2 = sarg_uuid(2);
+    let n3 = sarg_uuid(3);
+    for id in [n1, n2, n3] {
+        sarg_insert_node(&db, id, None, None);
+    }
+    let snapshot = db.snapshot();
+    sarg_insert_edge(&db, n1, n2, "T");
+    sarg_insert_edge(&db, n1, n3, "T");
+    let result = db
+        .execute_at_snapshot(
+            "SELECT target FROM GRAPH_TABLE (edges MATCH (a)-[:T]->(b) WHERE a.id = $start COLUMNS (b.id AS target))",
+            &params(vec![("start", Value::Uuid(n1))]),
+            snapshot,
+        )
+        .unwrap();
+    assert!(result.rows.is_empty());
+}
+
+#[test]
+fn scoped_anchor_read_at_pinned_snapshot_reports_context_scope_violation_at_pin_state() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    db.execute(
+        "INSERT INTO t (id, context_id, data) VALUES ($id, $ctx, 'b')",
+        &params(vec![
+            ("id", Value::Uuid(sarg_uuid(2))),
+            ("ctx", Value::Uuid(ctx_b)),
+        ]),
+    )
+    .unwrap();
+    let snapshot = db.snapshot();
+    db.execute(
+        "DELETE FROM t WHERE id = $id",
+        &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err = scoped
+        .execute_at_snapshot(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
+            snapshot,
+        )
+        .expect_err("hidden row at pinned snapshot must be refused");
+    sarg_expect_context_violation(err, ctx_b, &[ctx_a]);
+}
+
+#[test]
+fn scoped_multi_cte_graph_table_with_cross_scope_anchor_parameter_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let visible_anchor = sarg_uuid(1);
+    let visible_source = sarg_uuid(2);
+    let hidden_anchor = sarg_uuid(3);
+    let hidden_source = sarg_uuid(4);
+    for (id, ctx, data) in [
+        (visible_anchor, ctx_a, "visible-anchor"),
+        (visible_source, ctx_a, "visible-source"),
+        (hidden_anchor, ctx_b, "hidden-anchor"),
+        (hidden_source, ctx_b, "hidden-source"),
+    ] {
+        db.execute(
+            "INSERT INTO nodes (id, context_id, data) VALUES ($id, $ctx, $data)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("ctx", Value::Uuid(ctx)),
+                ("data", Value::Text(data.to_string())),
+            ]),
+        )
+        .unwrap();
+    }
+    sarg_insert_context_edge(&db, visible_source, visible_anchor, "VISIBLE", ctx_a);
+    sarg_insert_context_edge(&db, hidden_source, hidden_anchor, "HIDDEN", ctx_b);
+    let snapshot = db.snapshot();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let sql = "WITH visible AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:VISIBLE]-(a) WHERE b.id = $visible_anchor COLUMNS (a.id AS target))
+        ), hidden AS (
+            SELECT target AS src FROM GRAPH_TABLE (edges MATCH (b)<-[:HIDDEN]-(a) WHERE b.id = $hidden_anchor COLUMNS (a.id AS target))
+        )
+        SELECT id FROM nodes
+        WHERE id IN (SELECT src FROM visible) OR id IN (SELECT src FROM hidden)";
+    let err = scoped
+        .execute_at_snapshot(
+            sql,
+            &params(vec![
+                ("visible_anchor", Value::Uuid(visible_anchor)),
+                ("hidden_anchor", Value::Uuid(hidden_anchor)),
+            ]),
+            snapshot,
+        )
+        .expect_err("cross-scope graph anchor in any CTE must be refused");
+    sarg_expect_context_violation(err, ctx_b, &[ctx_a]);
+}
+
+#[test]
+fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: vec![
+                sync::RowChange {
+                    table: "t".to_string(),
+                    natural_key: sync::NaturalKey {
+                        column: "id".to_string(),
+                        value: Value::Uuid(sarg_uuid(2)),
+                    },
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(sarg_uuid(2))),
+                        ("context_id".to_string(), Value::Uuid(ctx_b)),
+                        ("data".to_string(), Value::Text("b".to_string())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(1),
+                },
+                sync::RowChange {
+                    table: "t".to_string(),
+                    natural_key: sync::NaturalKey {
+                        column: "id".to_string(),
+                        value: Value::Uuid(sarg_uuid(3)),
+                    },
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(sarg_uuid(3))),
+                        ("context_id".to_string(), Value::Uuid(ctx_c)),
+                        ("data".to_string(), Value::Text("c".to_string())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(2),
+                },
+            ],
+            ..sync::ChangeSet::default()
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (id, ctx) in [(sarg_uuid(2), ctx_b), (sarg_uuid(3), ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .expect_err("sync-replicated hidden anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
+}
+
+#[test]
+fn typed_error_display_messages_describe_hidden_by_scope_with_actionable_phrasing() {
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let context = Error::ContextScopeViolation {
+        requested: ContextId::new(ctx_b),
+        allowed: sarg_contexts(&[ctx_a]),
+    };
+    let msg = context.to_string();
+    assert!(msg.to_lowercase().contains("hidden") && msg.to_lowercase().contains("scope"));
+    assert!(msg.contains(&ctx_b.to_string()));
+    assert!(msg.contains('{') && msg.contains(&ctx_a.to_string()) && msg.contains('}'));
+    assert!(!msg.contains("ContextId(") && !msg.contains("Uuid(") && !msg.contains("BTreeSet"));
+
+    let missing = Error::ContextScopeViolation {
+        requested: ContextId::new(Uuid::from_u128(u128::MAX)),
+        allowed: sarg_contexts(&[ctx_a]),
+    }
+    .to_string();
+    assert!(missing.to_lowercase().contains("no context"));
+
+    let scope = Error::ScopeLabelViolation {
+        requested: ScopeLabel::new("b"),
+        allowed: sarg_labels(&["a"]),
+    };
+    let msg = scope.to_string();
+    assert!(msg.to_lowercase().contains("hidden") && msg.to_lowercase().contains("scope label"));
+    assert!(msg.contains("{a}"));
+    assert!(!msg.contains("ScopeLabel(") && !msg.contains("BTreeSet"));
+
+    let acl = Error::AclDenied {
+        table: "t".to_string(),
+        row_id: RowId(7),
+        principal: Principal::Agent("agent-a".to_string()),
+    };
+    let msg = acl.to_string();
+    assert!(msg.to_lowercase().contains("hidden") && msg.to_lowercase().contains("acl"));
+    assert!(msg.contains("t"));
+}
+
+#[test]
+fn scoped_anchor_read_with_degenerate_input_returns_error_or_empty_no_panic() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[sarg_uuid(0xA)]));
+    let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scoped.execute(
+            "SELECT data FROM nonexistent_table WHERE id = $id",
+            &params(vec![("id", Value::Uuid(sarg_uuid(1)))]),
+        )
+    }))
+    .expect("nonexistent table query must not panic");
+    assert!(matches!(missing, Err(Error::TableNotFound(_))));
+
+    let wrong_type = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scoped.execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Text("not-a-uuid".to_string()))]),
+        )
+    }))
+    .expect("wrong typed parameter query must not panic")
+    .unwrap();
+    assert!(wrong_type.rows.is_empty());
+}
+
+#[test]
+fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typed_violation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE obs (id UUID PRIMARY KEY, kind TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE TRIGGER tr ON obs WHEN INSERT", &empty())
+        .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let ctx_c = sarg_uuid(0xC);
+    db.register_trigger_callback("tr", move |db_handle, ctx| {
+        let id = ctx
+            .row_values
+            .get("id")
+            .and_then(Value::as_uuid)
+            .copied()
+            .ok_or_else(|| Error::Other("obs id missing".to_string()))?;
+        let target_ctx = if id == sarg_uuid(21) { ctx_b } else { ctx_c };
+        db_handle.insert_row(
+            ctx.tx,
+            "t",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("context_id".to_string(), Value::Uuid(target_ctx)),
+                ("data".to_string(), Value::Text("triggered".to_string())),
+            ]),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+    for id in [sarg_uuid(21), sarg_uuid(22)] {
+        db.execute(
+            "INSERT INTO obs (id, kind, context_id) VALUES ($id, 'k', $ctx)",
+            &params(vec![("id", Value::Uuid(id)), ("ctx", Value::Uuid(ctx_a))]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    for (id, ctx) in [(sarg_uuid(21), ctx_b), (sarg_uuid(22), ctx_c)] {
+        let err = scoped
+            .execute(
+                "SELECT data FROM t WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            )
+            .expect_err("trigger-written hidden anchor must be refused");
+        sarg_expect_context_violation(err, ctx, &[ctx_a]);
+    }
 }
 
 // ============================================================
