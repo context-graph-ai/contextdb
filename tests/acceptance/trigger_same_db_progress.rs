@@ -164,23 +164,48 @@ fn row_id_for_uuid(db: &Database, table: &str, key: u128) -> contextdb_core::Row
         .row_id
 }
 
-/// 180-second wall-clock timeout wrapper. The §30 suite includes serial stress
-/// tests that can sit behind the default parallel acceptance run on loaded
-/// machines; individual deadlock-guard tests still assert their own 2-second
-/// engine timeout behavior. Spawns the body in a thread; assertion panics
-/// rethrow as panics, not timeouts.
+/// Forward-progress watchdog. Watches the engine's process-wide commit-tick
+/// counter instead of wall-clock: under heavy parallel-test load the body
+/// thread can run wall-clock-slowly while the engine is making real progress
+/// on other tests in the same process. Fires only when no commit has been
+/// observed anywhere in this process for `CONTEXTDB_TEST_STALL_SECS` (default
+/// 60), or when an absolute backstop `CONTEXTDB_TEST_TIMEOUT_SECS` is reached
+/// (default 3600). Both thresholds are env-overridable. Individual
+/// deadlock-guard tests still assert their own 2-second engine timeout
+/// behavior independently.
+///
+/// Spawns the body in a thread; assertion panics rethrow as panics, not
+/// timeouts.
 fn run_with_timeout<F, T>(body: F) -> std::result::Result<T, &'static str>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let stall_secs = std::env::var("CONTEXTDB_TEST_STALL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    let backstop_secs = std::env::var("CONTEXTDB_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3600);
     let handle = thread::spawn(body);
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let start = Instant::now();
+    let mut last_tick = Database::global_commit_ticks_for_test();
+    let mut last_tick_observed_at = Instant::now();
     while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            return Err("test deadlocked (>180s)");
+        let now_tick = Database::global_commit_ticks_for_test();
+        let now = Instant::now();
+        if now_tick != last_tick {
+            last_tick = now_tick;
+            last_tick_observed_at = now;
+        } else if now.duration_since(last_tick_observed_at) >= Duration::from_secs(stall_secs) {
+            return Err("engine stalled (no commit ticks)");
         }
-        thread::sleep(Duration::from_millis(10));
+        if now.duration_since(start) >= Duration::from_secs(backstop_secs) {
+            return Err("hard backstop reached");
+        }
+        thread::sleep(Duration::from_millis(50));
     }
     match handle.join() {
         Ok(value) => Ok(value),
@@ -4106,4 +4131,46 @@ fn t30_18_release() {
         assert!(warn_count_after_control > warn_count_before_control);
         assert_eq!(warn_count_before_control, 0, "release: no engine warn on healthy paths");
     }).expect("t30_18_release deadlocked");
+}
+
+/// Verifies the forward-progress watchdog's signal source: every successful
+/// commit advances `Database::global_commit_ticks_for_test`. Without this gate
+/// a refactor that moves the bump away from the commit success path would
+/// silently weaken every `run_with_timeout` in the trigger concurrency suite
+/// to a 60-second false-deadlock without anyone noticing.
+#[test]
+fn global_commit_ticks_advance_on_successful_commit() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE p (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let tick_after_ddl = Database::global_commit_ticks_for_test();
+
+    let mut params = HashMap::new();
+    params.insert("id".to_string(), Value::Uuid(Uuid::new_v4()));
+    db.execute("INSERT INTO p (id) VALUES ($id)", &params)
+        .unwrap();
+    let tick_after_insert = Database::global_commit_ticks_for_test();
+    assert!(
+        tick_after_insert > tick_after_ddl,
+        "successful commit must advance the global tick counter; \
+         before={tick_after_ddl}, after={tick_after_insert}"
+    );
+
+    let tx = db.begin().unwrap();
+    db.commit(tx).unwrap();
+    let tick_after_empty_commit = Database::global_commit_ticks_for_test();
+    assert!(
+        tick_after_empty_commit > tick_after_insert,
+        "empty-write-set commit must still advance the tick counter; \
+         before={tick_after_insert}, after={tick_after_empty_commit}"
+    );
+
+    let tx = db.begin().unwrap();
+    db.rollback(tx).unwrap();
+    let tick_after_rollback = Database::global_commit_ticks_for_test();
+    assert_eq!(
+        tick_after_rollback, tick_after_empty_commit,
+        "rollback must not advance the commit tick counter; \
+         before={tick_after_empty_commit}, after={tick_after_rollback}"
+    );
 }

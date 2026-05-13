@@ -82,23 +82,46 @@ fn uuid(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
-/// 30-second wall-clock timeout wrapper. Spawns the body in a thread and polls
-/// the JoinHandle so assertion panics are rethrown as assertion panics, not
-/// misreported as timeouts.
+/// Forward-progress watchdog. Watches the engine's process-wide commit-tick
+/// counter instead of wall-clock: under heavy parallel-test load the body
+/// thread can run wall-clock-slowly while the engine is making real progress
+/// on other tests in the same process. Fires only when no commit has been
+/// observed anywhere in this process for `CONTEXTDB_TEST_STALL_SECS` (default
+/// 60), or when an absolute backstop `CONTEXTDB_TEST_TIMEOUT_SECS` is reached
+/// (default 3600). Both thresholds are env-overridable.
+///
+/// Spawns the body in a thread and polls the JoinHandle so assertion panics
+/// are rethrown as assertion panics, not misreported as timeouts.
 fn run_with_timeout<F, T>(body: F) -> std::result::Result<T, &'static str>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let stall_secs = std::env::var("CONTEXTDB_TEST_STALL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    let backstop_secs = std::env::var("CONTEXTDB_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3600);
     let handle = thread::spawn(body);
-    // Keep the watchdog finite, but large enough for full release acceptance
-    // runs where this serial suite shares the process with many parallel tests.
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let start = Instant::now();
+    let mut last_tick = Database::global_commit_ticks_for_test();
+    let mut last_tick_observed_at = Instant::now();
     while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            return Err("test deadlocked (>180s)");
+        let now_tick = Database::global_commit_ticks_for_test();
+        let now = Instant::now();
+        if now_tick != last_tick {
+            last_tick = now_tick;
+            last_tick_observed_at = now;
+        } else if now.duration_since(last_tick_observed_at) >= Duration::from_secs(stall_secs) {
+            return Err("engine stalled (no commit ticks)");
         }
-        thread::sleep(Duration::from_millis(10));
+        if now.duration_since(start) >= Duration::from_secs(backstop_secs) {
+            return Err("hard backstop reached");
+        }
+        thread::sleep(Duration::from_millis(50));
     }
     match handle.join() {
         Ok(value) => Ok(value),

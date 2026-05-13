@@ -555,6 +555,16 @@ enum ConstraintProbe {
 
 static OPEN_FILE_DATABASES: OnceLock<OpenFileRegistry> = OnceLock::new();
 
+/// Process-wide counter, incremented once at the end of every successful commit
+/// through `commit_with_source_and_sync_ddl_and_trigger_audit_projection`
+/// (which funnels every `pub fn commit` path: user, auto-commit, sync-pull,
+/// trigger callback tx-bound commit, plugin-driven commit). The acceptance
+/// test harness reads this via `Database::global_commit_ticks_for_test` to
+/// distinguish "engine is alive but my test is being scheduled slowly" from
+/// "engine has actually stopped making progress" under heavy parallel test
+/// load, without depending on wall-clock budgets.
+static GLOBAL_COMMIT_TICKS: AtomicU64 = AtomicU64::new(0);
+
 fn open_file_registry() -> &'static OpenFileRegistry {
     OPEN_FILE_DATABASES.get_or_init(|| OpenFileRegistry {
         entries: Mutex::new(BTreeMap::new()),
@@ -2411,6 +2421,8 @@ impl Database {
                 self.apply_trigger_ddl_batch(trigger_ddl.to_vec())?;
             }
         }
+
+        GLOBAL_COMMIT_TICKS.fetch_add(1, Ordering::Relaxed);
 
         Ok(CommitValidationOutcome {
             conditional_noop_count: validation_noop_count.get(),
@@ -6711,6 +6723,18 @@ impl Database {
     pub fn __rank_policy_formula_parse_count(&self) -> u64 {
         let _operation = self.assert_open_operation();
         self.rank_policy_formula_parse_count.load(Ordering::SeqCst)
+    }
+
+    /// Acceptance-test accessor. Returns the process-wide successful-commit
+    /// counter, bumped once at the end of every successful commit through
+    /// `commit_with_source_and_sync_ddl_and_trigger_audit_projection`. The
+    /// test harness uses this as a forward-progress signal for its watchdog —
+    /// distinguishing "engine is alive but my test is being scheduled slowly"
+    /// from "engine has stopped making progress" without depending on
+    /// wall-clock budgets that flake under parallel test load.
+    #[doc(hidden)]
+    pub fn global_commit_ticks_for_test() -> u64 {
+        GLOBAL_COMMIT_TICKS.load(Ordering::Relaxed)
     }
 
     /// Acceptance-test accessor. Reads at steady state (after stop signal
