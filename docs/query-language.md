@@ -118,6 +118,24 @@ SELECT * FROM active WHERE name LIKE 'sensor%'
 
 Multiple CTEs via comma separation. Non-recursive only.
 
+### Anchor-Shape vs List-Shape Reads
+
+Scoped handles filter ordinary reads to the rows visible to that handle. List
+shapes keep this silent-filter behavior: full scans, non-unique predicates,
+ranges, `IN (...)` predicates even on primary keys, ordered `LIMIT 1`, and
+sort-elided index walks return `Ok` with only visible rows.
+
+Explicit-anchor `SELECT` shapes are different. If a constrained handle names a
+specific row identity through equality on a primary key, a single-column
+`UNIQUE`, or every column of a composite `UNIQUE`, and the row exists but is
+hidden by the handle, the query returns the typed visibility error from the
+gate that hid it: `ContextScopeViolation`, `ScopeLabelViolation`, or
+`AclDenied`. Missing rows still return an empty result.
+
+Predicate writes keep their existing contract. `UPDATE ... WHERE pk = $id` and
+`DELETE ... WHERE pk = $id` against a hidden row return
+`Ok(rows_affected = 0)` rather than a typed read-refusal error.
+
 ### Transactions
 
 ```sql

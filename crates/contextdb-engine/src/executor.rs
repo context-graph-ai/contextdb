@@ -537,7 +537,16 @@ pub(crate) fn execute_plan(
             if let Some(a) = analysis {
                 if let Some(pick) = a.pick {
                     // IndexScan path. Fetch by BTree range; apply residual filter.
-                    let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
+                    let (rows, examined) = execute_index_scan(
+                        db,
+                        table,
+                        &pick,
+                        snapshot,
+                        tx,
+                        IndexScanAccessMode::Select,
+                        resolved_filter.as_ref(),
+                        params,
+                    )?;
                     db.__bump_rows_examined(examined);
                     let mut result = materialize_rows(
                         rows,
@@ -603,8 +612,15 @@ pub(crate) fn execute_plan(
             steps,
             filter,
         } => {
+            // GRAPH_TABLE must use this captured read snapshot throughout this arm.
+            // Calling db.snapshot() from here would leak live graph state into execute_at_snapshot.
+            let snapshot = db.snapshot_for_read();
             let start_uuids = match resolve_uuid(start_expr, params) {
-                Ok(start) => vec![start],
+                Ok(start) => {
+                    let starts = vec![start];
+                    db.assert_graph_anchor_nodes_readable(&starts, snapshot)?;
+                    starts
+                }
                 Err(Error::PlanError(_))
                     if matches!(
                         start_expr,
@@ -613,10 +629,27 @@ pub(crate) fn execute_plan(
                 {
                     // Start node not directly specified — check if a subquery or filter can help
                     if let Some(candidate_plan) = start_candidates {
-                        resolve_graph_start_nodes_from_plan(db, candidate_plan, params, tx)?
+                        resolve_graph_start_nodes_from_plan(
+                            db,
+                            candidate_plan,
+                            params,
+                            tx,
+                            snapshot,
+                        )?
                     } else if let Some(filter_expr) = filter {
-                        let resolved_filter = resolve_in_subqueries(db, filter_expr, params, tx)?;
-                        resolve_graph_start_nodes_from_filter(db, &resolved_filter, params)?
+                        let resolved_filter = resolve_graph_filter_at_snapshot(
+                            db,
+                            filter_expr,
+                            params,
+                            tx,
+                            snapshot,
+                        )?;
+                        resolve_graph_start_nodes_from_filter(
+                            db,
+                            &resolved_filter,
+                            params,
+                            snapshot,
+                        )?
                     } else {
                         let first_step = steps.first().ok_or_else(|| {
                             Error::PlanError("graph plan missing traversal step".to_string())
@@ -629,7 +662,7 @@ pub(crate) fn execute_plan(
                         db.graph_start_nodes_for_match(
                             edge_types_ref,
                             first_step.direction,
-                            db.snapshot(),
+                            snapshot,
                         )?
                     }
                 }
@@ -644,7 +677,6 @@ pub(crate) fn execute_plan(
                     cascade: None,
                 });
             }
-            let snapshot = db.snapshot();
             let mut frontier = start_uuids
                 .into_iter()
                 .map(|id| (HashMap::from([(start_alias.clone(), id)]), id, 0_u32))
@@ -1905,7 +1937,18 @@ fn exec_update(
         let indexed_rows = db
             .table_meta(&p.table)
             .and_then(|meta| analyze_filter_for_index(where_clause, &meta.indexes, params).pick)
-            .map(|pick| execute_index_scan(db, &p.table, &pick, snapshot, Some(txid)))
+            .map(|pick| {
+                execute_index_scan(
+                    db,
+                    &p.table,
+                    &pick,
+                    snapshot,
+                    Some(txid),
+                    IndexScanAccessMode::Predicate,
+                    resolved_where.as_ref(),
+                    params,
+                )
+            })
             .transpose()?;
         if let Some((rows, examined)) = indexed_rows {
             db.__bump_rows_examined(examined);
@@ -2283,6 +2326,12 @@ struct IndexAnalysis {
     considered: Vec<crate::database::IndexCandidate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexScanAccessMode {
+    Select,
+    Predicate,
+}
+
 /// Coerce every literal value inside `pick.shape` to `pick.pushed_column`'s
 /// declared type. B-tree walks use variant-exact comparisons by design, so a
 /// SELECT `WHERE uuid_col = 'text-literal'` must arrive at the executor with
@@ -2394,6 +2443,64 @@ fn analyze_filter_for_index(
         .map(|(p, _, _)| p);
 
     IndexAnalysis { pick, considered }
+}
+
+fn is_anchor_shape_index_pick(
+    db: &Database,
+    table: &str,
+    pick: &IndexPick,
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+) -> bool {
+    if !matches!(pick.shape, IndexPredicateShape::Equality(_)) {
+        return false;
+    }
+    let Some(meta) = db.table_meta(table) else {
+        return false;
+    };
+    let pick_cols: Vec<&str> = pick.columns.iter().map(|(col, _)| col.as_str()).collect();
+    let Some(anchor_cols) = unique_anchor_columns_for_pick(&meta, &pick_cols) else {
+        return false;
+    };
+    filter_has_equality_for_columns(filter, params, &anchor_cols)
+}
+
+fn unique_anchor_columns_for_pick(meta: &TableMeta, pick_cols: &[&str]) -> Option<Vec<String>> {
+    if pick_cols.len() == 1 {
+        let column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == pick_cols[0])?;
+        if column.primary_key || column.unique {
+            return Some(vec![column.name.clone()]);
+        }
+    }
+    for unique in &meta.unique_constraints {
+        if unique.len() == pick_cols.len()
+            && unique.iter().zip(pick_cols.iter()).all(|(a, b)| a == b)
+        {
+            return Some(unique.clone());
+        }
+    }
+    None
+}
+
+fn filter_has_equality_for_columns(
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+    required_columns: &[String],
+) -> bool {
+    let mut equality_columns = HashSet::new();
+    for conjunct in split_conjuncts(filter) {
+        if let Some((column, IndexPredicateShape::Equality(_))) =
+            classify_index_predicate(&conjunct, params)
+        {
+            equality_columns.insert(column);
+        }
+    }
+    required_columns
+        .iter()
+        .all(|column| equality_columns.contains(column))
 }
 
 /// Combine multiple index-shapes on the same column into the most-selective
@@ -2746,6 +2853,9 @@ fn execute_index_scan(
     pick: &IndexPick,
     snapshot: contextdb_core::SnapshotId,
     tx: Option<TxId>,
+    access_mode: IndexScanAccessMode,
+    residual_filter: Option<&Expr>,
+    params: &HashMap<String, Value>,
 ) -> Result<(Vec<VersionedRow>, u64)> {
     use contextdb_core::{DirectedValue, SortDirection, TotalOrdAsc, TotalOrdDesc};
     use std::ops::Bound;
@@ -2986,7 +3096,18 @@ fn execute_index_scan(
         out.retain(|row| !deleted_row_ids.contains(&row.row_id));
         out.extend(overlay.matching_inserts);
     }
-    out = db.filter_rows_for_read(table, out, snapshot)?;
+    let anchor_shape = access_mode == IndexScanAccessMode::Select
+        && residual_filter
+            .map(|filter| is_anchor_shape_index_pick(db, table, pick, filter, params))
+            .unwrap_or(false);
+    if anchor_shape {
+        if let Some(filter) = residual_filter {
+            out.retain(|row| row_matches(row, filter, params).unwrap_or(false));
+        }
+        out = db.filter_rows_for_anchor_read(table, out, snapshot)?;
+    } else {
+        out = db.filter_rows_for_read(table, out, snapshot)?;
+    }
     Ok((out, rows_examined))
 }
 
@@ -3114,7 +3235,16 @@ fn run_index_scan_with_order(
         },
         pushed_column: decl.columns[0].0.clone(),
     };
-    let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
+    let (rows, examined) = execute_index_scan(
+        db,
+        table,
+        &pick,
+        snapshot,
+        tx,
+        IndexScanAccessMode::Select,
+        resolved_filter.as_ref(),
+        params,
+    )?;
     db.__bump_rows_examined(examined);
     let mut result = materialize_rows(
         rows,
@@ -4087,6 +4217,16 @@ fn resolve_in_subqueries(
     resolve_in_subqueries_with_ctes(db, expr, params, tx, &[])
 }
 
+fn resolve_graph_filter_at_snapshot(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: SnapshotId,
+) -> Result<Expr> {
+    db.with_snapshot_override(snapshot, || resolve_in_subqueries(db, expr, params, tx))
+}
+
 pub(crate) fn resolve_in_subqueries_with_ctes(
     db: &Database,
     expr: &Expr,
@@ -4513,8 +4653,9 @@ fn resolve_graph_start_nodes_from_filter(
     db: &Database,
     filter: &Expr,
     params: &HashMap<String, Value>,
+    snapshot: contextdb_core::SnapshotId,
 ) -> Result<Vec<uuid::Uuid>> {
-    if let Some(ids) = resolve_graph_start_ids_from_filter(filter, params)? {
+    if let Some(ids) = resolve_graph_start_ids_from_filter(db, filter, params, snapshot)? {
         return Ok(ids);
     }
 
@@ -4536,7 +4677,6 @@ fn resolve_graph_start_nodes_from_filter(
         _ => return Ok(vec![]),
     };
 
-    let snapshot = db.snapshot();
     let mut uuids = Vec::new();
     for table_name in db.table_names() {
         let meta = match db.table_meta(&table_name) {
@@ -4566,8 +4706,9 @@ fn resolve_graph_start_nodes_from_plan(
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
 ) -> Result<Vec<uuid::Uuid>> {
-    let result = execute_plan(db, plan, params, tx)?;
+    let result = db.with_snapshot_override(snapshot, || execute_plan(db, plan, params, tx))?;
     result
         .rows
         .into_iter()
@@ -4584,8 +4725,10 @@ fn resolve_graph_start_nodes_from_plan(
 }
 
 fn resolve_graph_start_ids_from_filter(
+    db: &Database,
     filter: &Expr,
     params: &HashMap<String, Value>,
+    snapshot: contextdb_core::SnapshotId,
 ) -> Result<Option<Vec<uuid::Uuid>>> {
     match filter {
         Expr::BinaryOp {
@@ -4609,7 +4752,9 @@ fn resolve_graph_start_ids_from_filter(
                     )));
                 }
             };
-            Ok(Some(vec![id]))
+            let ids = vec![id];
+            db.assert_graph_anchor_nodes_readable(&ids, snapshot)?;
+            Ok(Some(ids))
         }
         Expr::InList { expr, list, .. } if is_graph_id_ref(expr) => {
             let ids = list
@@ -4628,12 +4773,14 @@ fn resolve_graph_start_ids_from_filter(
             Ok(Some(ids))
         }
         Expr::BinaryOp { left, right, .. } => {
-            if let Some(ids) = resolve_graph_start_ids_from_filter(left, params)? {
+            if let Some(ids) = resolve_graph_start_ids_from_filter(db, left, params, snapshot)? {
                 return Ok(Some(ids));
             }
-            resolve_graph_start_ids_from_filter(right, params)
+            resolve_graph_start_ids_from_filter(db, right, params, snapshot)
         }
-        Expr::UnaryOp { operand, .. } => resolve_graph_start_ids_from_filter(operand, params),
+        Expr::UnaryOp { operand, .. } => {
+            resolve_graph_start_ids_from_filter(db, operand, params, snapshot)
+        }
         _ => Ok(None),
     }
 }
@@ -6054,6 +6201,64 @@ mod tests {
         assert!(
             matches!(target_result, Err(Error::PlanError(_))),
             "graph frontier projection should return a plan error on missing target alias binding, got {target_result:?}"
+        );
+    }
+
+    #[test]
+    fn graph_02_filter_subqueries_resolve_at_graph_snapshot_without_outer_override() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE seeds (id UUID PRIMARY KEY, node_id UUID)",
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let pre_pin_seed = Uuid::from_u128(1);
+        let post_pin_seed = Uuid::from_u128(2);
+        db.execute(
+            "INSERT INTO seeds (id, node_id) VALUES ($id, $node_id)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(Uuid::from_u128(10))),
+                ("node_id".to_string(), Value::Uuid(pre_pin_seed)),
+            ]),
+        )
+        .unwrap();
+        let snapshot = db.snapshot();
+        db.execute(
+            "INSERT INTO seeds (id, node_id) VALUES ($id, $node_id)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(Uuid::from_u128(11))),
+                ("node_id".to_string(), Value::Uuid(post_pin_seed)),
+            ]),
+        )
+        .unwrap();
+
+        let stmt =
+            contextdb_parser::parse("SELECT id FROM nodes WHERE id IN (SELECT node_id FROM seeds)")
+                .unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
+        let filter = select.body.where_clause.expect("expected WHERE filter");
+
+        let resolved =
+            resolve_graph_filter_at_snapshot(&db, &filter, &HashMap::new(), None, snapshot)
+                .unwrap();
+        let Expr::InList { list, .. } = resolved else {
+            panic!("expected resolved IN list");
+        };
+        let resolved_ids = list
+            .into_iter()
+            .map(|expr| match expr {
+                Expr::Literal(Literal::Text(value)) => Uuid::parse_str(&value).unwrap(),
+                other => panic!("expected UUID text literal, got {other:?}"),
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(resolved_ids, BTreeSet::from([pre_pin_seed]));
+        assert!(
+            !resolved_ids.contains(&post_pin_seed),
+            "post-pin seed leaked into graph filter subquery resolution"
         );
     }
 }

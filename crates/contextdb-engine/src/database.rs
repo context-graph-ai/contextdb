@@ -7227,21 +7227,41 @@ impl Database {
         self.relational_store.table_meta(table)
     }
 
-    /// Execute at a specific snapshot. Threads `snapshot` through via a
-    /// thread-local override so scans / IndexScans filter visibility using
-    /// the caller-provided snapshot, not the live committed watermark.
-    #[doc(hidden)]
+    /// Execute a query at a specific snapshot.
+    ///
+    /// Relational reads and `GRAPH_TABLE` traversal inside the query see state
+    /// at or before `snapshot`. Under constrained handles, explicit anchor
+    /// reads at the pinned snapshot return typed visibility errors for rows
+    /// hidden by context, scope-label, or ACL gates at that snapshot.
     pub fn execute_at_snapshot(
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
         snapshot: SnapshotId,
     ) -> Result<QueryResult> {
+        self.with_snapshot_override(snapshot, || self.execute(sql, params))
+    }
+
+    pub(crate) fn with_snapshot_override<T>(
+        &self,
+        snapshot: SnapshotId,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         SNAPSHOT_OVERRIDE.with(|cell| {
+            struct SnapshotOverrideGuard<'a> {
+                cell: &'a std::cell::RefCell<Option<SnapshotId>>,
+                prior: Option<SnapshotId>,
+            }
+
+            impl Drop for SnapshotOverrideGuard<'_> {
+                fn drop(&mut self) {
+                    self.cell.replace(self.prior);
+                }
+            }
+
             let prior = cell.replace(Some(snapshot));
-            let r = self.execute(sql, params);
-            cell.replace(prior);
-            r
+            let _guard = SnapshotOverrideGuard { cell, prior };
+            f()
         })
     }
 

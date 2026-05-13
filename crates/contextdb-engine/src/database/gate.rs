@@ -109,15 +109,87 @@ impl Database {
         snapshot: SnapshotId,
         allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
     ) -> Result<bool> {
-        let _ = meta;
-        row_payload_visible_for_access(
-            &self.relational_store,
-            &self.access,
-            table,
-            &row.values,
-            snapshot,
-            allowed_acl_ids,
-        )
+        Ok(self
+            .read_denial_for_row_cached(table, meta, row, snapshot, allowed_acl_ids)?
+            .is_none())
+    }
+
+    fn read_denial_for_row_cached(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        snapshot: SnapshotId,
+        allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
+    ) -> Result<Option<Error>> {
+        if self.access_is_admin() {
+            return Ok(None);
+        }
+        if let (Some(contexts), Some(column)) =
+            (self.access.contexts.as_ref(), self.context_column(meta))
+        {
+            let requested = match row.values.get(&column.name) {
+                Some(Value::Uuid(context)) => ContextId::new(*context),
+                _ => ContextId::new(uuid::Uuid::from_u128(u128::MAX)),
+            };
+            if !contexts.contains(&requested) {
+                return Ok(Some(Error::ContextScopeViolation {
+                    requested,
+                    allowed: contexts.clone(),
+                }));
+            }
+        }
+        if let (Some(labels), Some(column)) =
+            (self.access.scope_labels.as_ref(), self.scope_column(meta))
+            && let Some(ScopeLabelKind::Split { read_labels, .. }) = column.scope_label.as_ref()
+        {
+            let requested = match row.values.get(&column.name) {
+                Some(Value::Text(label)) => ScopeLabel::new(label.clone()),
+                _ => ScopeLabel::new(""),
+            };
+            if !read_labels.iter().any(|read| read == &requested.0) {
+                return Ok(Some(Error::ScopeLabelViolation {
+                    requested,
+                    allowed: BTreeSet::new(),
+                }));
+            }
+            if !labels.contains(&requested) {
+                return Ok(Some(Error::ScopeLabelViolation {
+                    requested,
+                    allowed: labels.clone(),
+                }));
+            }
+        }
+        if let Some(column) = self.acl_column(meta) {
+            let Some(principal) = self.access.principal.as_ref() else {
+                return Err(Error::PrincipalRequired {
+                    table: table.to_string(),
+                });
+            };
+            if matches!(principal, Principal::System) {
+                return Err(Error::PrincipalRequired {
+                    table: table.to_string(),
+                });
+            }
+            let allowed = match row.values.get(&column.name) {
+                Some(Value::Uuid(acl_id)) => match allowed_acl_ids {
+                    Some(allowed) => allowed.contains(acl_id),
+                    None => {
+                        let acl_ref = column.acl_ref.as_ref().expect("acl column");
+                        self.principal_has_acl_grant(principal, acl_ref, *acl_id, snapshot)?
+                    }
+                },
+                _ => false,
+            };
+            if !allowed {
+                return Ok(Some(Error::AclDenied {
+                    table: table.to_string(),
+                    row_id: row.row_id,
+                    principal: principal.clone(),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn filter_rows_for_read(
@@ -158,6 +230,59 @@ impl Database {
             )? {
                 out.push(row);
             }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn filter_rows_for_anchor_read(
+        &self,
+        table: &str,
+        rows: Vec<VersionedRow>,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<VersionedRow>> {
+        self.assert_table_read_allowed(table)?;
+        if self.access_is_admin() || rows.is_empty() {
+            return Ok(rows);
+        }
+        let Some(meta) = self.table_meta(table) else {
+            return Err(Error::TableNotFound(table.to_string()));
+        };
+        let allowed_acl_ids = if let Some(column) = self.acl_column(&meta) {
+            let principal = self
+                .access
+                .principal
+                .as_ref()
+                .expect("assert_table_read_allowed rejects missing principals");
+            Some(self.allowed_acl_ids_for_principal(
+                principal,
+                column.acl_ref.as_ref().expect("acl column"),
+                snapshot,
+            )?)
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        let mut first_denial = None;
+        for row in rows {
+            match self.read_denial_for_row_cached(
+                table,
+                &meta,
+                &row,
+                snapshot,
+                allowed_acl_ids.as_ref().map(|ids| ids.as_ref()),
+            )? {
+                Some(err) => {
+                    if first_denial.is_none() {
+                        first_denial = Some(err);
+                    }
+                }
+                None => out.push(row),
+            }
+        }
+        if out.is_empty()
+            && let Some(err) = first_denial
+        {
+            return Err(err);
         }
         Ok(out)
     }
@@ -691,6 +816,45 @@ impl Database {
         Ok(true)
     }
 
+    pub(crate) fn assert_graph_anchor_nodes_readable(
+        &self,
+        nodes: &[NodeId],
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        if self.access_is_admin() {
+            return Ok(());
+        }
+        for node in nodes {
+            let rows = self.rows_for_node(*node, snapshot);
+            if rows.is_empty() {
+                continue;
+            }
+            let mut visible = false;
+            let mut first_denial = None;
+            for (table, row) in rows {
+                if !self.table_has_read_gate(&table)? {
+                    visible = true;
+                    continue;
+                }
+                let Some(meta) = self.table_meta(&table) else {
+                    continue;
+                };
+                match self.read_denial_for_row_cached(&table, &meta, &row, snapshot, None)? {
+                    Some(err) => {
+                        if first_denial.is_none() {
+                            first_denial = Some(err);
+                        }
+                    }
+                    None => visible = true,
+                }
+            }
+            if !visible && let Some(err) = first_denial {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn assert_node_write_allowed(
         &self,
         node: NodeId,
@@ -834,144 +998,4 @@ impl Database {
         }
         Ok(out)
     }
-}
-
-pub(crate) fn row_payload_visible_for_access(
-    relational_store: &RelationalStore,
-    access: &AccessConstraints,
-    table: &str,
-    values: &HashMap<ColName, Value>,
-    snapshot: SnapshotId,
-    allowed_acl_ids: Option<&HashSet<uuid::Uuid>>,
-) -> Result<bool> {
-    if access.contexts.is_none() && access.scope_labels.is_none() && access.principal.is_none() {
-        return Ok(true);
-    }
-
-    let metas = relational_store.table_meta.read();
-    let Some(meta) = metas.get(table) else {
-        return Ok(false);
-    };
-
-    if let (Some(contexts), Some(column)) = (
-        access.contexts.as_ref(),
-        meta.columns.iter().find(|column| column.context_id),
-    ) {
-        match values.get(&column.name) {
-            Some(Value::Uuid(context)) if contexts.contains(&ContextId::new(*context)) => {}
-            _ => return Ok(false),
-        }
-    }
-
-    if let (Some(labels), Some(column)) = (
-        access.scope_labels.as_ref(),
-        meta.columns
-            .iter()
-            .find(|column| column.scope_label.is_some()),
-    ) && let Some(ScopeLabelKind::Split { read_labels, .. }) = column.scope_label.as_ref()
-    {
-        match values.get(&column.name) {
-            Some(Value::Text(label))
-                if read_labels.iter().any(|read| read == label)
-                    && labels.contains(&ScopeLabel::new(label.clone())) => {}
-            _ => return Ok(false),
-        }
-    }
-
-    if let Some(column) = meta.columns.iter().find(|column| column.acl_ref.is_some()) {
-        let Some(principal) = access.principal.as_ref() else {
-            return Err(Error::PrincipalRequired {
-                table: table.to_string(),
-            });
-        };
-        if matches!(principal, Principal::System) {
-            return Err(Error::PrincipalRequired {
-                table: table.to_string(),
-            });
-        }
-        let Some(Value::Uuid(acl_id)) = values.get(&column.name) else {
-            return Ok(false);
-        };
-        let acl_ref = column.acl_ref.as_ref().expect("acl column").clone();
-        drop(metas);
-        let granted = match allowed_acl_ids {
-            Some(allowed) => allowed.contains(acl_id),
-            None => principal_has_acl_grant_for_payload(
-                relational_store,
-                access,
-                principal,
-                &acl_ref,
-                *acl_id,
-                snapshot,
-            ),
-        };
-        if !granted {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
-}
-
-fn principal_has_acl_grant_for_payload(
-    relational_store: &RelationalStore,
-    access: &AccessConstraints,
-    principal: &Principal,
-    acl_ref: &AclRef,
-    acl_id: uuid::Uuid,
-    snapshot: SnapshotId,
-) -> bool {
-    let (kind, principal_id) = match principal {
-        Principal::System => return false,
-        Principal::Agent(id) => ("Agent", id.as_str()),
-        Principal::Human(id) => ("Human", id.as_str()),
-    };
-    let metas = relational_store.table_meta.read();
-    let grant_meta = metas.get(&acl_ref.ref_table).cloned();
-    drop(metas);
-    let tables = relational_store.tables.read();
-    let Some(rows) = tables.get(&acl_ref.ref_table) else {
-        return false;
-    };
-    rows.iter().any(|row| {
-        row.visible_at(snapshot)
-            && grant_context_scope_allowed_for_payload(access, grant_meta.as_ref(), &row.values)
-            && row.values.get("principal_kind") == Some(&Value::Text(kind.to_string()))
-            && row.values.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
-            && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
-    })
-}
-
-fn grant_context_scope_allowed_for_payload(
-    access: &AccessConstraints,
-    meta: Option<&TableMeta>,
-    values: &HashMap<ColName, Value>,
-) -> bool {
-    let Some(meta) = meta else {
-        return true;
-    };
-    if let (Some(contexts), Some(column)) = (
-        access.contexts.as_ref(),
-        meta.columns.iter().find(|column| column.context_id),
-    ) {
-        match values.get(&column.name) {
-            Some(Value::Uuid(context)) if contexts.contains(&ContextId::new(*context)) => {}
-            _ => return false,
-        }
-    }
-    if let (Some(labels), Some(column)) = (
-        access.scope_labels.as_ref(),
-        meta.columns
-            .iter()
-            .find(|column| column.scope_label.is_some()),
-    ) && let Some(ScopeLabelKind::Split { read_labels, .. }) = column.scope_label.as_ref()
-    {
-        match values.get(&column.name) {
-            Some(Value::Text(label))
-                if read_labels.iter().any(|read| read == label)
-                    && labels.contains(&ScopeLabel::new(label.clone())) => {}
-            _ => return false,
-        }
-    }
-    true
 }

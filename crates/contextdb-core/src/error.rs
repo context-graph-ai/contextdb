@@ -1,4 +1,5 @@
-use crate::types::{Principal, RowId, TxId, VectorIndexRef};
+use crate::types::{ContextId, Principal, RowId, ScopeLabel, TxId, VectorIndexRef};
+use std::collections::BTreeSet;
 
 /// Distinguishes which callback context produced a callback-active error.
 ///
@@ -19,6 +20,59 @@ impl std::fmt::Display for CallbackKind {
             CallbackKind::Cron => "cron",
         })
     }
+}
+
+fn format_context_set(values: &BTreeSet<ContextId>) -> String {
+    let body = values
+        .iter()
+        .map(|context| context.0.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{body}}}")
+}
+
+fn format_scope_label_set(values: &BTreeSet<ScopeLabel>) -> String {
+    let body = values
+        .iter()
+        .map(|label| label.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{body}}}")
+}
+
+fn format_principal(principal: &Principal) -> String {
+    match principal {
+        Principal::System => "system".to_string(),
+        Principal::Agent(id) => format!("agent:{id}"),
+        Principal::Human(id) => format!("human:{id}"),
+    }
+}
+
+fn context_scope_violation_display(requested: &ContextId, allowed: &BTreeSet<ContextId>) -> String {
+    let requested = if requested.0 == uuid::Uuid::from_u128(u128::MAX) {
+        "row has no context".to_string()
+    } else {
+        format!("context {}", requested.0)
+    };
+    format!(
+        "row hidden by context scope: requested {requested}, allowed {}",
+        format_context_set(allowed)
+    )
+}
+
+fn scope_label_violation_display(requested: &ScopeLabel, allowed: &BTreeSet<ScopeLabel>) -> String {
+    format!(
+        "row hidden by scope label: requested {}, allowed {}",
+        requested.0,
+        format_scope_label_set(allowed)
+    )
+}
+
+fn acl_denied_display(table: &str, row_id: &RowId, principal: &Principal) -> String {
+    format!(
+        "row hidden by ACL on table `{table}` row {row_id} for principal {}",
+        format_principal(principal)
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -242,19 +296,19 @@ pub enum Error {
         holder_pid: u32,
         path: std::path::PathBuf,
     },
-    #[error("context scope violation: requested {requested:?}, allowed {allowed:?}")]
+    #[error("{}", context_scope_violation_display(requested, allowed))]
     ContextScopeViolation {
         requested: crate::types::ContextId,
         allowed: std::collections::BTreeSet<crate::types::ContextId>,
     },
-    #[error("scope label violation: requested {requested:?}, allowed {allowed:?}")]
+    #[error("{}", scope_label_violation_display(requested, allowed))]
     ScopeLabelViolation {
         requested: crate::types::ScopeLabel,
         allowed: std::collections::BTreeSet<crate::types::ScopeLabel>,
     },
     #[error("principal required for read on table `{table}`")]
     PrincipalRequired { table: String },
-    #[error("ACL denied on `{table}` row {row_id:?} for principal {principal:?}")]
+    #[error("{}", acl_denied_display(table, row_id, principal))]
     AclDenied {
         table: String,
         row_id: RowId,
