@@ -30,7 +30,6 @@ pub(crate) struct TriggerState {
     pub(super) ready: AtomicBool,
     pub(super) wait_observed_count: AtomicU64,
     pub(super) typed_err_observed_same_db_count: AtomicU64,
-    pub(super) typed_err_observed_cross_db_count: AtomicU64,
     pub(super) deadlock_guard_timeout_observed_count: AtomicU64,
 }
 
@@ -117,7 +116,6 @@ impl TriggerState {
             ready: AtomicBool::new(true),
             wait_observed_count: AtomicU64::new(0),
             typed_err_observed_same_db_count: AtomicU64::new(0),
-            typed_err_observed_cross_db_count: AtomicU64::new(0),
             deadlock_guard_timeout_observed_count: AtomicU64::new(0),
         }
     }

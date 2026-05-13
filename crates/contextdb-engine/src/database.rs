@@ -450,7 +450,6 @@ pub struct TriggerProgressTelemetrySnapshot {
     /// this stays 0 under healthy contention; it is positive only when the
     /// deadlock-guard timeout regime surfaces the same-DB typed Err.
     pub typed_err_observed_same_db: u64,
-    pub typed_err_observed_cross_db: u64,
     pub deadlock_guard_timeout_observed: u64,
 }
 
@@ -6723,10 +6722,6 @@ impl Database {
             typed_err_observed_same_db: self
                 .trigger
                 .typed_err_observed_same_db_count
-                .load(Ordering::SeqCst),
-            typed_err_observed_cross_db: self
-                .trigger
-                .typed_err_observed_cross_db_count
                 .load(Ordering::SeqCst),
             deadlock_guard_timeout_observed: self
                 .trigger

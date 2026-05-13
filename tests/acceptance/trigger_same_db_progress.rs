@@ -689,10 +689,6 @@ fn t30_03b_two_writer_interleave_cross_db_non_owner_probe_proceeds_without_engag
         fire_x.join().unwrap().unwrap();
         let snap = db_y.trigger_progress_telemetry_snapshot_for_test();
         assert_eq!(
-            snap.typed_err_observed_cross_db, 0,
-            "unrelated DB-Y work must not report cross-DB typed-Err observations; saw {snap:?}"
-        );
-        assert_eq!(
             snap.deadlock_guard_timeout_observed, 0,
             "unrelated DB-Y work must not increment deadlock-guard counter; saw {snap:?}"
         );
