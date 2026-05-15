@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 use uuid::Uuid;
 
 const CHILD_ENV: &str = "CONTEXTDB_T34_CHILD";
@@ -429,6 +430,78 @@ fn run_last_owner_drop_scenario(
         first_event_id,
         runtime_starts,
         dispatcher_released
+    )
+}
+
+fn run_file_backed_last_owner_drop_ack_scenario() -> String {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("event-bus-self-drop.redb");
+    let db = Arc::new(Database::open(&path).unwrap());
+    db.complete_initialization().unwrap();
+    declare_inv_schema(&db, "durable", false);
+
+    let weak = Arc::downgrade(&db);
+    let (callback_entered_tx, callback_entered_rx) = mpsc::sync_channel::<()>(1);
+    let (proceed_tx, proceed_rx) = mpsc::sync_channel::<()>(1);
+    let proceed_rx = Arc::new(Mutex::new(proceed_rx));
+    let last_strong_count = Arc::new(AtomicUsize::new(0));
+    let after_drop = Arc::new(AtomicBool::new(false));
+    let invocation_count = Arc::new(AtomicUsize::new(0));
+    let first_event_id = Arc::new(AtomicU64::new(0));
+    let dispatcher_released = Arc::new(AtomicBool::new(false));
+
+    let runtime_starts = register_last_owner_callback(
+        &db,
+        "durable",
+        RegistrationPath::Unscoped,
+        LastOwnerCallbackState {
+            weak,
+            exit: CallbackExit::Ok,
+            callback_entered_tx,
+            proceed_rx,
+            last_strong_count: last_strong_count.clone(),
+            after_drop: after_drop.clone(),
+            invocation_count: invocation_count.clone(),
+            first_event_id: first_event_id.clone(),
+            dispatcher_released: dispatcher_released.clone(),
+        },
+    );
+
+    let writer_db = db.clone();
+    let (writer_done_tx, writer_done_rx) = mpsc::sync_channel::<()>(1);
+    let writer = thread::spawn(move || {
+        insert_inv(&writer_db, 10, false);
+        drop(writer_db);
+        writer_done_tx.send(()).unwrap();
+    });
+
+    callback_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("callback must acquire a local database Arc");
+    writer_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer must drop its Arc");
+    drop(db);
+    proceed_tx.send(()).unwrap();
+    writer.join().unwrap();
+
+    let release_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < release_deadline && !dispatcher_released.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let reopened = Database::open(&path).unwrap();
+    reopened.complete_initialization().unwrap();
+    let queued_after_reopen = reopened.sink_metrics_for_test("durable").queued;
+    format!(
+        "{{\"last_strong_count\":{},\"after_drop\":{},\"invocations\":{},\"first_event_id\":{},\"runtime_starts\":{},\"dispatcher_released\":{},\"queued_after_reopen\":{}}}",
+        last_strong_count.load(Ordering::SeqCst),
+        after_drop.load(Ordering::SeqCst),
+        invocation_count.load(Ordering::SeqCst),
+        first_event_id.load(Ordering::SeqCst),
+        runtime_starts,
+        dispatcher_released.load(Ordering::SeqCst),
+        queued_after_reopen
     )
 }
 
@@ -957,4 +1030,25 @@ fn t34_09_transient_error_return_drops_resource_owner_arc_on_dispatcher_no_abort
     assert_json_bool(&json, "after_drop", true);
     assert_json_u64(&json, "runtime_starts", 1);
     assert_json_bool(&json, "dispatcher_released", true);
+}
+
+#[test]
+fn t34_10_file_backed_self_drop_acks_delivered_event_before_persistence_close() {
+    let name = "t34_10_file_backed_self_drop_acks_delivered_event_before_persistence_close";
+    if is_child("t34_10") {
+        let json = run_file_backed_last_owner_drop_ack_scenario();
+        println!("{RESULT_PREFIX}{json}");
+        return;
+    }
+
+    let run = run_child(&current_test_name(name), "t34_10", child_budget());
+    assert_child_success(&run);
+    let json = result_json(&run);
+    assert_json_u64(&json, "last_strong_count", 1);
+    assert_json_bool(&json, "after_drop", true);
+    assert_json_u64(&json, "invocations", 1);
+    assert_json_u64(&json, "first_event_id", 10);
+    assert_json_u64(&json, "runtime_starts", 1);
+    assert_json_bool(&json, "dispatcher_released", true);
+    assert_json_u64(&json, "queued_after_reopen", 0);
 }
