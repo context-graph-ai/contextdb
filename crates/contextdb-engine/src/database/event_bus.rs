@@ -17,6 +17,7 @@ pub(crate) struct EventBusState {
     metrics: Mutex<HashMap<String, SinkMetricsState>>,
     runtimes: Mutex<HashMap<String, SinkRuntime>>,
     runtime_starts: Mutex<HashMap<String, u64>>,
+    deferred_resource_cleanup: Mutex<Option<EventBusResourceCleanup>>,
     wait_lock: Mutex<()>,
     waiters: Condvar,
     next_queue_id: AtomicU64,
@@ -115,6 +116,35 @@ struct SinkRuntime {
     handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventBusThreadShutdown {
+    AllJoined,
+    DeferredResourceCleanup,
+}
+
+impl EventBusThreadShutdown {
+    pub(super) fn deferred_resource_cleanup(self) -> bool {
+        matches!(self, Self::DeferredResourceCleanup)
+    }
+}
+
+struct EventBusResourceCleanup {
+    sink: String,
+    persistence: Option<Arc<RedbPersistence>>,
+    open_registry_path: Option<PathBuf>,
+}
+
+impl EventBusResourceCleanup {
+    fn close(self) {
+        if let Some(persistence) = self.persistence {
+            persistence.close();
+        }
+        if let Some(path) = self.open_registry_path {
+            release_open_registry_path(&path);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RowEventCandidate {
     trigger: EventTrigger,
@@ -163,6 +193,7 @@ impl EventBusState {
             metrics: Mutex::new(HashMap::new()),
             runtimes: Mutex::new(HashMap::new()),
             runtime_starts: Mutex::new(HashMap::new()),
+            deferred_resource_cleanup: Mutex::new(None),
             wait_lock: Mutex::new(()),
             waiters: Condvar::new(),
             next_queue_id: AtomicU64::new(1),
@@ -1020,10 +1051,11 @@ impl Database {
         self.event_bus.waiters.notify_all();
     }
 
-    pub(super) fn stop_event_bus_threads(&self) {
+    pub(super) fn stop_event_bus_threads(&self) -> EventBusThreadShutdown {
         if !self.resource_owner {
-            return;
+            return EventBusThreadShutdown::AllJoined;
         }
+        let current_thread_id = thread::current().id();
         let runtimes = {
             let mut runtimes = self.event_bus.runtimes.lock();
             for runtime in runtimes.values() {
@@ -1032,11 +1064,45 @@ impl Database {
             self.event_bus.waiters.notify_all();
             std::mem::take(&mut *runtimes)
         };
-        for (_, mut runtime) in runtimes {
+        let mut current_dispatcher = None;
+        for (sink, mut runtime) in runtimes {
+            let is_current_thread = runtime
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.thread().id() == current_thread_id);
+            if is_current_thread {
+                current_dispatcher = runtime.handle.take().map(|handle| (sink, handle));
+                continue;
+            }
             if let Some(handle) = runtime.handle.take() {
                 let _ = handle.join();
             }
         }
+        if let Some((sink, handle)) = current_dispatcher {
+            drop(handle);
+            self.defer_current_dispatcher_resource_cleanup(sink);
+            return EventBusThreadShutdown::DeferredResourceCleanup;
+        }
+        EventBusThreadShutdown::AllJoined
+    }
+
+    fn defer_current_dispatcher_resource_cleanup(&self, sink: String) {
+        // The current dispatcher still has to ack the callback's event after
+        // Database::drop returns, so it closes file resources at loop exit.
+        let cleanup = EventBusResourceCleanup {
+            sink,
+            persistence: self.persistence.clone(),
+            open_registry_path: self.open_registry_path.lock().take(),
+        };
+        let previous = self
+            .event_bus
+            .deferred_resource_cleanup
+            .lock()
+            .replace(cleanup);
+        debug_assert!(
+            previous.is_none(),
+            "event bus resource cleanup was already deferred"
+        );
     }
 
     fn ensure_sink_dispatcher_running(&self, sink: &str) {
@@ -1261,6 +1327,9 @@ impl EventBusWorker {
             let mut delivered_count = 0u64;
             let mut permanent_failure_count = 0u64;
             for entry in entries {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
                 self.add_in_flight(1);
                 let callback = registration.callback.clone();
                 let result = catch_unwind(AssertUnwindSafe(|| callback(&entry.event)));
@@ -1301,6 +1370,24 @@ impl EventBusWorker {
             let _ = self.ack_front_entries(&acked);
             self.record_delivered(delivered_count);
             self.record_permanent_failure(permanent_failure_count);
+        }
+        self.finish_deferred_resource_cleanup();
+    }
+
+    fn finish_deferred_resource_cleanup(&self) {
+        let cleanup = {
+            let mut deferred = self.event_bus.deferred_resource_cleanup.lock();
+            if deferred
+                .as_ref()
+                .is_some_and(|cleanup| cleanup.sink == self.sink)
+            {
+                deferred.take()
+            } else {
+                None
+            }
+        };
+        if let Some(cleanup) = cleanup {
+            cleanup.close();
         }
     }
 

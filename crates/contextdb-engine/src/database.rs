@@ -7557,14 +7557,16 @@ impl Database {
             let _ = self.tx_mgr.rollback(tx);
         }
         self.stop_cron_tickler();
-        self.stop_event_bus_threads();
+        let event_bus_shutdown = self.stop_event_bus_threads();
         self.stop_pruning_thread();
         if self.resource_owner {
             self.subscriptions.lock().subscribers.clear();
-            if let Some(persistence) = &self.persistence {
-                persistence.close();
+            if !event_bus_shutdown.deferred_resource_cleanup() {
+                if let Some(persistence) = &self.persistence {
+                    persistence.close();
+                }
+                self.release_open_registry();
             }
-            self.release_open_registry();
         }
         if self.resource_owner {
             self.plugin.on_close()
@@ -12133,7 +12135,7 @@ impl Drop for Database {
             }
         }
         self.stop_cron_tickler();
-        self.stop_event_bus_threads();
+        let event_bus_shutdown = self.stop_event_bus_threads();
         let runtime = self.pruning_runtime.get_mut();
         runtime.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = runtime.handle.take() {
@@ -12141,10 +12143,12 @@ impl Drop for Database {
         }
         if self.resource_owner {
             self.subscriptions.lock().subscribers.clear();
-            if let Some(persistence) = &self.persistence {
-                persistence.close();
+            if !event_bus_shutdown.deferred_resource_cleanup() {
+                if let Some(persistence) = &self.persistence {
+                    persistence.close();
+                }
+                self.release_open_registry();
             }
-            self.release_open_registry();
         }
     }
 }
