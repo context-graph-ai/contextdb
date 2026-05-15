@@ -1,9 +1,9 @@
-use contextdb_core::Lsn;
-use contextdb_core::{ContextId, Error, MemoryAccountant, Principal, RowId, ScopeLabel, Value};
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
+use contextdb_core::{ContextId, Error, Lsn, MemoryAccountant, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
 use contextdb_engine::{Database, sync_types as sync};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
+use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, TryRecvError}, Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -5544,4 +5544,571 @@ fn orderby_txid_asc_desc() {
         ],
         "ORDER BY x DESC must reverse the ASC sequence",
     );
+}
+
+#[cfg(feature = "test-seams")]
+const PER_INDEX_SQL_ROWS: usize = 1024;
+const PER_INDEX_SQL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "test-seams")]
+fn per_index_ranked3(rank: usize) -> Vec<f32> {
+    let score = (1.0 - rank as f32 * 0.0005).clamp(0.05, 1.0);
+    vec![score, (1.0 - score * score).max(0.0).sqrt(), 0.0]
+}
+
+fn per_index_axis3(axis: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; 3];
+    vector[axis.min(2)] = 1.0;
+    vector
+}
+
+fn per_index_top_id(db: &Database, table: &str, column: &str, query: Vec<f32>) -> Uuid {
+    let sql = format!("SELECT id FROM {table} ORDER BY {column} <=> $query LIMIT 1");
+    let result = db
+        .execute(&sql, &params(vec![("query", Value::Vector(query))]))
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    match result.rows[0][0] {
+        Value::Uuid(id) => id,
+        ref other => panic!("expected UUID id, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "test-seams")]
+fn seed_two_vector_evidence(db: &Database) -> Vec<Uuid> {
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(3), vector_vision VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let ids = (0..PER_INDEX_SQL_ROWS)
+        .map(|i| Uuid::from_u128(10_000 + i as u128))
+        .collect::<Vec<_>>();
+    for (i, id) in ids.iter().copied().enumerate() {
+        db.execute(
+            "INSERT INTO evidence (id, vector_text, vector_vision) VALUES ($id, $text, $vision)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("text", Value::Vector(per_index_ranked3(i))),
+                (
+                    "vision",
+                    Value::Vector(vec![0.0, 1.0 - i as f32 * 0.0001, 0.0]),
+                ),
+            ]),
+        )
+        .unwrap();
+    }
+    ids
+}
+
+#[test]
+fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let id_text = Uuid::from_u128(1);
+    let id_face = Uuid::from_u128(2);
+    let pause = db.pause_after_relational_apply_for_test();
+    let writer_db = db.clone();
+    let writer = thread::spawn(move || {
+        let tx = writer_db.begin().unwrap();
+        writer_db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO table_text (id, embedding) VALUES ($id, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id_text)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+        writer_db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO table_face (id, embedding) VALUES ($id, $embedding)",
+                &params(vec![
+                    ("id", Value::Uuid(id_face)),
+                    ("embedding", Value::Vector(per_index_axis3(1))),
+                ]),
+            )
+            .unwrap();
+        writer_db.commit(tx).unwrap();
+    });
+
+    assert!(pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    assert_eq!(
+        db.execute("SELECT id FROM table_text", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM table_face", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM table_text ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))])
+        )
+        .unwrap()
+        .rows
+        .len(),
+        0
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM table_face ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(1)))])
+        )
+        .unwrap()
+        .rows
+        .len(),
+        0
+    );
+
+    pause.release();
+    writer.join().unwrap();
+    assert_eq!(
+        per_index_top_id(&db, "table_text", "embedding", per_index_axis3(0)),
+        id_text
+    );
+    assert_eq!(
+        per_index_top_id(&db, "table_face", "embedding", per_index_axis3(1)),
+        id_face
+    );
+}
+
+#[test]
+fn multi_ref_tx_abort_leaves_no_vectors_visible() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO table_text (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(11))),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO table_face (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(12))),
+            ("embedding", Value::Vector(per_index_axis3(1))),
+        ]),
+    )
+    .unwrap();
+    db.rollback(tx).unwrap();
+
+    assert_eq!(
+        db.execute("SELECT id FROM table_text", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute("SELECT id FROM table_face", &empty())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.execute(
+            "SELECT id FROM table_text ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))])
+        )
+        .unwrap()
+        .rows
+        .len(),
+        0
+    );
+}
+
+#[test]
+fn concurrent_distinct_table_sql_updates_yield_correct_vector_recall() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE table_text (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE table_face (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let text_id = Uuid::from_u128(21);
+    let face_id = Uuid::from_u128(22);
+    db.execute(
+        "INSERT INTO table_text (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(text_id)),
+            ("embedding", Value::Vector(per_index_axis3(1))),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO table_face (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(face_id)),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    let db_text = db.clone();
+    let text_worker = thread::spawn(move || {
+        db_text
+            .execute(
+                "UPDATE table_text SET embedding = $embedding WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(text_id)),
+                    ("embedding", Value::Vector(per_index_axis3(0))),
+                ]),
+            )
+            .unwrap();
+    });
+    let db_face = db.clone();
+    let face_worker = thread::spawn(move || {
+        db_face
+            .execute(
+                "UPDATE table_face SET embedding = $embedding WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(face_id)),
+                    ("embedding", Value::Vector(per_index_axis3(1))),
+                ]),
+            )
+            .unwrap();
+    });
+    text_worker.join().unwrap();
+    face_worker.join().unwrap();
+
+    assert_eq!(
+        per_index_top_id(&db, "table_text", "embedding", per_index_axis3(0)),
+        text_id
+    );
+    assert_eq!(
+        per_index_top_id(&db, "table_face", "embedding", per_index_axis3(1)),
+        face_id
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn same_table_vision_sql_update_and_search_completes_while_text_build_paused() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let db = Arc::new(Database::open_memory());
+    let ids = seed_two_vector_evidence(&db);
+    let text_ref = VectorIndexRef::new("evidence", "vector_text");
+    let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
+    let vector_store = db.vector_store_for_test();
+    let text_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Build);
+    let (done_text_tx, done_text_rx) = mpsc::channel();
+    let db_text = db.clone();
+    thread::spawn(move || {
+        done_text_tx
+            .send(per_index_top_id(
+                &db_text,
+                "evidence",
+                "vector_text",
+                per_index_axis3(0),
+            ))
+            .unwrap();
+    });
+    assert!(text_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let target_id = ids[3];
+    let (done_vision_tx, done_vision_rx) = mpsc::channel();
+    let db_vision = db.clone();
+    thread::spawn(move || {
+        db_vision
+            .execute(
+                "UPDATE evidence SET vector_vision = $vision WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(target_id)),
+                    ("vision", Value::Vector(per_index_axis3(2))),
+                ]),
+            )
+            .unwrap();
+        done_vision_tx
+            .send(per_index_top_id(
+                &db_vision,
+                "evidence",
+                "vector_vision",
+                per_index_axis3(2),
+            ))
+            .unwrap();
+    });
+    let vision_first = done_vision_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    let vision_hnsw_before_release = vector_store.has_hnsw_index_for(&vision_ref);
+    let text_still_paused = done_text_rx.try_recv();
+    text_pause.release();
+    let _ = done_text_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).unwrap();
+    let vision_id = match vision_first {
+        Ok(id) => id,
+        Err(_) => done_vision_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).unwrap(),
+    };
+
+    assert_eq!(vision_id, target_id);
+    assert!(vision_hnsw_before_release);
+    assert!(matches!(text_still_paused, Err(TryRecvError::Empty)));
+    assert!(vector_store.has_hnsw_index_for(&text_ref));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let db = Arc::new(Database::open_memory());
+    seed_two_vector_evidence(&db);
+    let text_ref = VectorIndexRef::new("evidence", "vector_text");
+    let vector_store = db.vector_store_for_test();
+    let build_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Build);
+    let (done_build_tx, done_build_rx) = mpsc::channel();
+    let db_build = db.clone();
+    thread::spawn(move || {
+        done_build_tx
+            .send(db_build.execute(
+                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+                &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+            ))
+            .unwrap();
+    });
+    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Ddl);
+    let (started_drop_tx, started_drop_rx) = mpsc::channel();
+    let (done_drop_tx, done_drop_rx) = mpsc::channel();
+    let db_drop = db.clone();
+    thread::spawn(move || {
+        started_drop_tx.send(()).unwrap();
+        let result = db_drop.execute("ALTER TABLE evidence DROP COLUMN vector_text", &empty());
+        done_drop_tx.send(result).unwrap();
+    });
+    assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
+    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let old_shape_during_pause = db
+        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    let vision_shape_during_pause = db
+        .execute("SELECT vector_vision FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    let ref_present_during_pause = vector_store
+        .index_infos()
+        .iter()
+        .any(|info| info.index == text_ref);
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    ddl_pause.release();
+    let drop_done_before_build_release = done_drop_rx.try_recv();
+    let old_shape_after_ddl_release = db
+        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    build_pause.release();
+    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+
+    assert!(old_shape_during_pause);
+    assert!(vision_shape_during_pause);
+    assert!(ref_present_during_pause);
+    assert!(matches!(
+        drop_done_before_build_release,
+        Err(TryRecvError::Empty)
+    ));
+    assert!(old_shape_after_ddl_release);
+    assert!(
+        db.execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
+            .is_err()
+    );
+    build_result.unwrap().unwrap();
+    drop_result.unwrap().unwrap();
+    assert_eq!(
+        per_index_top_id(&db, "evidence", "vector_vision", per_index_axis3(1)),
+        Uuid::from_u128(10_000)
+    );
+    assert!(!vector_store.has_hnsw_index_for(&text_ref));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let db = Arc::new(Database::open_memory());
+    seed_two_vector_evidence(&db);
+    let old_ref = VectorIndexRef::new("evidence", "vector_text");
+    let new_ref = VectorIndexRef::new("evidence", "vector_text_v2");
+    let vector_store = db.vector_store_for_test();
+    let build_pause = vector_store.arm_maintenance_pause_for_test(&old_ref, PauseWindow::Build);
+    let (done_build_tx, done_build_rx) = mpsc::channel();
+    let db_build = db.clone();
+    thread::spawn(move || {
+        done_build_tx
+            .send(db_build.execute(
+                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+                &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+            ))
+            .unwrap();
+    });
+    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&old_ref, PauseWindow::Ddl);
+    let (started_rename_tx, started_rename_rx) = mpsc::channel();
+    let (done_rename_tx, done_rename_rx) = mpsc::channel();
+    let db_rename = db.clone();
+    thread::spawn(move || {
+        started_rename_tx.send(()).unwrap();
+        let result = db_rename.execute(
+            "ALTER TABLE evidence RENAME COLUMN vector_text TO vector_text_v2",
+            &empty(),
+        );
+        done_rename_tx.send(result).unwrap();
+    });
+    assert!(
+        started_rename_rx
+            .recv_timeout(PER_INDEX_SQL_TIMEOUT)
+            .is_ok()
+    );
+    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let old_shape_during_pause = db
+        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    let new_shape_during_pause = db
+        .execute("SELECT vector_text_v2 FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    let old_ref_present_during_pause = vector_store
+        .index_infos()
+        .iter()
+        .any(|info| info.index == old_ref);
+    assert!(matches!(
+        done_rename_rx.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    ddl_pause.release();
+    let rename_done_before_build_release = done_rename_rx.try_recv();
+    let old_shape_after_ddl_release = db
+        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    let new_shape_after_ddl_release = db
+        .execute("SELECT vector_text_v2 FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    build_pause.release();
+    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    let rename_result = done_rename_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+
+    assert!(old_shape_during_pause);
+    assert!(!new_shape_during_pause);
+    assert!(old_ref_present_during_pause);
+    assert!(matches!(
+        rename_done_before_build_release,
+        Err(TryRecvError::Empty)
+    ));
+    assert!(old_shape_after_ddl_release);
+    assert!(!new_shape_after_ddl_release);
+    assert!(
+        db.execute(
+            "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))])
+        )
+        .is_err()
+    );
+    build_result.unwrap().unwrap();
+    rename_result.unwrap().unwrap();
+    assert_eq!(
+        per_index_top_id(&db, "evidence", "vector_text_v2", per_index_axis3(0)),
+        Uuid::from_u128(10_000)
+    );
+    assert!(!vector_store.has_hnsw_index_for(&old_ref));
+    assert!(vector_store.has_hnsw_index_for(&new_ref));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let db = Arc::new(Database::open_memory());
+    seed_two_vector_evidence(&db);
+    let text_ref = VectorIndexRef::new("evidence", "vector_text");
+    let vision_ref = VectorIndexRef::new("evidence", "vector_vision");
+    let table_ref = VectorIndexRef::new("evidence", "*");
+    let vector_store = db.vector_store_for_test();
+    let build_pause = vector_store.arm_maintenance_pause_for_test(&text_ref, PauseWindow::Build);
+    let (done_build_tx, done_build_rx) = mpsc::channel();
+    let db_build = db.clone();
+    thread::spawn(move || {
+        done_build_tx
+            .send(db_build.execute(
+                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+                &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+            ))
+            .unwrap();
+    });
+    assert!(build_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+
+    let ddl_pause = vector_store.arm_maintenance_pause_for_test(&table_ref, PauseWindow::Ddl);
+    let (started_drop_tx, started_drop_rx) = mpsc::channel();
+    let (done_drop_tx, done_drop_rx) = mpsc::channel();
+    let db_drop = db.clone();
+    thread::spawn(move || {
+        started_drop_tx.send(()).unwrap();
+        let result = db_drop.execute("DROP TABLE evidence", &empty());
+        done_drop_tx.send(result).unwrap();
+    });
+    assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
+    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    let table_shape_during_pause = db
+        .execute("SELECT id FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    ddl_pause.release();
+    let drop_done_before_build_release = done_drop_rx.try_recv();
+    let table_shape_after_ddl_release = db
+        .execute("SELECT id FROM evidence LIMIT 1", &empty())
+        .is_ok();
+    build_pause.release();
+    let _ = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+
+    assert!(table_shape_during_pause);
+    assert!(matches!(
+        drop_done_before_build_release,
+        Err(TryRecvError::Empty)
+    ));
+    assert!(table_shape_after_ddl_release);
+    drop_result.unwrap().unwrap();
+    assert!(
+        db.execute("SELECT id FROM evidence LIMIT 1", &empty())
+            .is_err()
+    );
+    assert!(!vector_store.has_hnsw_index_for(&text_ref));
+    assert!(!vector_store.has_hnsw_index_for(&vision_ref));
 }

@@ -10357,6 +10357,12 @@ impl Database {
         ApplyPhasePauseGuard { inner, generation }
     }
 
+    #[cfg(feature = "test-seams")]
+    pub fn vector_store_for_test(&self) -> Arc<VectorStore> {
+        let _operation = self.assert_open_operation();
+        self.vector_store.clone()
+    }
+
     /// Subscribe to commit events. Returns a receiver that yields a `CommitEvent`
     /// after each commit.
     pub fn subscribe(&self) -> Receiver<CommitEvent> {

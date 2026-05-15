@@ -8,6 +8,9 @@ repository.workspace = true
 readme = "../../README.md"
 description = "Embedded database engine for agentic memory — relational, graph, and vector under unified MVCC transactions"
 
+[features]
+test-seams = ["contextdb-vector/test-seams"]
+
 [dependencies]
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
 contextdb-tx = { path = "../contextdb-tx", version = "1.0" }

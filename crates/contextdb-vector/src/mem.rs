@@ -98,6 +98,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             return None;
         }
 
+        #[cfg(feature = "test-seams")]
+        self.store
+            .pause_registry()
+            .maybe_pause(index, crate::test_seam::PauseWindow::Build);
+
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.with_entries(|entries| HnswIndex::new(entries, dim, state.quantization()))
         }))
@@ -158,6 +163,11 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
 
             let guard = lock.read();
             if let Some(hnsw) = guard.as_ref() {
+                #[cfg(feature = "test-seams")]
+                self.store
+                    .pause_registry()
+                    .maybe_pause(&index, crate::test_seam::PauseWindow::Search);
+
                 let raw_candidates = hnsw.search(&index, query, k)?;
                 let raw_candidate_count = raw_candidates.len();
 

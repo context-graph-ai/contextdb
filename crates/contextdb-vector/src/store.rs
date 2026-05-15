@@ -203,6 +203,8 @@ pub struct VectorIndexInfo {
 pub struct VectorStore {
     registry: RwLock<HashMap<VectorIndexRef, Arc<IndexState>>>,
     build_mutex: Mutex<()>,
+    #[cfg(feature = "test-seams")]
+    pause_registry: crate::test_seam::PauseRegistry,
 }
 
 impl Default for VectorStore {
@@ -216,7 +218,14 @@ impl VectorStore {
         Self {
             registry: RwLock::new(HashMap::new()),
             build_mutex: Mutex::new(()),
+            #[cfg(feature = "test-seams")]
+            pause_registry: crate::test_seam::PauseRegistry::default(),
         }
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn pause_registry(&self) -> &crate::test_seam::PauseRegistry {
+        &self.pause_registry
     }
 
     pub fn register_index(
@@ -248,6 +257,9 @@ impl VectorStore {
     }
 
     pub fn deregister_index(&self, index: &VectorIndexRef, accountant: &MemoryAccountant) {
+        #[cfg(feature = "test-seams")]
+        self.pause_registry
+            .maybe_pause(index, crate::test_seam::PauseWindow::Ddl);
         let _build_guard = self.build_mutex.lock();
         if let Some(state) = self.registry.write().remove(index) {
             state.clear_hnsw(accountant);
@@ -255,6 +267,11 @@ impl VectorStore {
     }
 
     pub fn deregister_table(&self, table: &str, accountant: &MemoryAccountant) {
+        #[cfg(feature = "test-seams")]
+        self.pause_registry.maybe_pause(
+            &contextdb_core::VectorIndexRef::new(table, "*"),
+            crate::test_seam::PauseWindow::Ddl,
+        );
         let _build_guard = self.build_mutex.lock();
         let removed = {
             let mut registry = self.registry.write();
@@ -273,6 +290,9 @@ impl VectorStore {
     }
 
     pub fn rename_index(&self, old: &VectorIndexRef, new: VectorIndexRef) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        self.pause_registry
+            .maybe_pause(old, crate::test_seam::PauseWindow::Ddl);
         let mut registry = self.registry.write();
         if registry.contains_key(&new) {
             return Err(Error::Other(format!(
@@ -341,6 +361,9 @@ impl VectorStore {
         accountant: Option<&MemoryAccountant>,
     ) {
         for entry in inserts {
+            #[cfg(feature = "test-seams")]
+            self.pause_registry
+                .maybe_pause(&entry.index, crate::test_seam::PauseWindow::Apply);
             if let Some(state) = self.try_state(&entry.index) {
                 let stored_entry = state.stored_entry(entry);
                 state.push_entry(stored_entry);
@@ -377,6 +400,9 @@ impl VectorStore {
         accountant: Option<&MemoryAccountant>,
     ) {
         for (index, row_id, deleted_tx) in deletes {
+            #[cfg(feature = "test-seams")]
+            self.pause_registry
+                .maybe_pause(&index, crate::test_seam::PauseWindow::Apply);
             if let Some(state) = self.try_state(&index) {
                 state.tombstone_row(row_id, deleted_tx);
                 if let Some(accountant) = accountant {
@@ -413,6 +439,9 @@ impl VectorStore {
         accountant: Option<&MemoryAccountant>,
     ) {
         for (index, old_row_id, new_row_id, tx) in moves {
+            #[cfg(feature = "test-seams")]
+            self.pause_registry
+                .maybe_pause(&index, crate::test_seam::PauseWindow::Apply);
             if let Some(state) = self.try_state(&index)
                 && let Some(old) = state.stored_by_row_id(old_row_id)
                 && old.deleted_tx.is_none()
@@ -465,6 +494,11 @@ impl VectorStore {
 
     pub fn replace_loaded_vectors(&self, entries: Vec<VectorEntry>) {
         let _build_guard = self.build_mutex.lock();
+        #[cfg(feature = "test-seams")]
+        self.pause_registry.maybe_pause(
+            &contextdb_core::VectorIndexRef::default(),
+            crate::test_seam::PauseWindow::Bulk,
+        );
         for state in self.registry.read().values() {
             state.vectors.write().clear();
             state.drop_hnsw_without_accounting();
@@ -488,6 +522,11 @@ impl VectorStore {
         accountant: &MemoryAccountant,
     ) -> usize {
         let _build_guard = self.build_mutex.lock();
+        #[cfg(feature = "test-seams")]
+        self.pause_registry.maybe_pause(
+            &contextdb_core::VectorIndexRef::default(),
+            crate::test_seam::PauseWindow::Bulk,
+        );
         let mut released = 0usize;
         for state in self.registry.read().values() {
             let mut vectors = state.vectors.write();
@@ -532,6 +571,11 @@ impl VectorStore {
 
     pub fn clear_hnsw(&self, accountant: &MemoryAccountant) {
         let _build_guard = self.build_mutex.lock();
+        #[cfg(feature = "test-seams")]
+        self.pause_registry.maybe_pause(
+            &contextdb_core::VectorIndexRef::default(),
+            crate::test_seam::PauseWindow::Bulk,
+        );
         for state in self.registry.read().values() {
             state.clear_hnsw(accountant);
         }
