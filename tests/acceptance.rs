@@ -74,6 +74,8 @@ mod embedding;
 mod engine_cron;
 #[path = "acceptance/event_bus.rs"]
 mod event_bus;
+#[path = "acceptance/event_bus_self_join.rs"]
+mod event_bus_self_join;
 #[path = "acceptance/foreign_key_delete_race.rs"]
 mod foreign_key_delete_race;
 #[path = "acceptance/handle_scope_constraint.rs"]
