@@ -1129,6 +1129,66 @@ fn bulk_pause_blocks_unrelated_lazy_hnsw_build_then_build_completes() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn deregister_table_does_not_wait_for_unrelated_hnsw_build() {
+    use contextdb_vector::test_seam::PauseWindow;
+
+    let dropped = ref_named("evidence", "embedding");
+    let traffic = ref_named("traffic", "embedding");
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    let (store, _tx_mgr, exec) = setup_refs(
+        &[(dropped.clone(), 3), (traffic.clone(), 3)],
+        accountant.clone(),
+    );
+    seed_ranked(&store, &dropped, 1, 10, 3, 10, &accountant);
+    seed_ranked(
+        &store,
+        &traffic,
+        100_000,
+        HNSW_ROWS_FOR_TEST,
+        3,
+        20_000,
+        &accountant,
+    );
+
+    let build_pause = store.arm_maintenance_pause_for_test(&traffic, PauseWindow::Build);
+    let (done_build_tx, done_build_rx) = mpsc::channel();
+    let exec_build = exec.clone();
+    let traffic_build = traffic.clone();
+    thread::spawn(move || {
+        done_build_tx
+            .send(exec_build.search(
+                traffic_build,
+                &ranked_vector(0, 3),
+                1,
+                None,
+                SnapshotId(50_000),
+            ))
+            .unwrap();
+    });
+    assert!(build_pause.wait_until_reached(TEST_TIMEOUT));
+
+    let (done_drop_tx, done_drop_rx) = mpsc::channel();
+    let store_drop = store.clone();
+    let accountant_drop = accountant.clone();
+    thread::spawn(move || {
+        store_drop.deregister_table("evidence", accountant_drop.as_ref());
+        done_drop_tx.send(()).unwrap();
+    });
+
+    done_drop_rx
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("table-specific deregistration must not wait for unrelated ref build");
+    assert!(store.try_state(&dropped).is_none());
+    assert!(matches!(done_build_rx.try_recv(), Err(TryRecvError::Empty)));
+
+    build_pause.release();
+    let result = done_build_rx.recv_timeout(TEST_TIMEOUT).unwrap().unwrap();
+    assert_top_row(&result, RowId(100_000));
+    assert!(store.has_hnsw_index_for(&traffic));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn clear_hnsw_waits_for_inflight_lazy_build_then_releases_accountant() {
     use contextdb_vector::test_seam::PauseWindow;
 

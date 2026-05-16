@@ -6050,6 +6050,685 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
     assert!(vector_store.has_hnsw_index_for(&new_ref));
 }
 
+#[test]
+fn sync_alter_table_drop_vector_column_removes_receiver_index() {
+    let origin = Database::open_memory();
+    let receiver = Database::open_memory();
+    let schema = "CREATE TABLE evidence (
+        id UUID PRIMARY KEY,
+        vector_text VECTOR(3),
+        vector_vision VECTOR(8)
+    )";
+    origin.execute(schema, &empty()).unwrap();
+    receiver.execute(schema, &empty()).unwrap();
+
+    let id = Uuid::from_u128(42);
+    for db in [&origin, &receiver] {
+        db.execute(
+            "INSERT INTO evidence (id, vector_text, vector_vision) VALUES ($id, $text, $vision)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("text", Value::Vector(per_index_axis3(0))),
+                (
+                    "vision",
+                    Value::Vector(vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                ),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let watermark = origin.current_lsn();
+    origin
+        .execute("ALTER TABLE evidence DROP COLUMN vector_vision", &empty())
+        .unwrap();
+    receiver
+        .apply_changes(
+            origin.changes_since(watermark),
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("vector_text".to_string())));
+    assert!(!columns.contains(&Value::Text("vector_vision".to_string())));
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_text", per_index_axis3(0)),
+        id
+    );
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0_f32; 8]))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "vector_vision")
+    ));
+}
+
+#[test]
+fn sync_alter_table_rename_vector_column_moves_receiver_index() {
+    let origin = Database::open_memory();
+    let receiver = Database::open_memory();
+    let schema = "CREATE TABLE evidence (
+        id UUID PRIMARY KEY,
+        vector_text VECTOR(3),
+        vector_vision VECTOR(8)
+    )";
+    origin.execute(schema, &empty()).unwrap();
+    receiver.execute(schema, &empty()).unwrap();
+
+    let id = Uuid::from_u128(43);
+    let vision = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    for db in [&origin, &receiver] {
+        db.execute(
+            "INSERT INTO evidence (id, vector_text, vector_vision) VALUES ($id, $text, $vision)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("text", Value::Vector(per_index_axis3(0))),
+                ("vision", Value::Vector(vision.clone())),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let watermark = origin.current_lsn();
+    origin
+        .execute(
+            "ALTER TABLE evidence RENAME COLUMN vector_vision TO vector_image",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .apply_changes(
+            origin.changes_since(watermark),
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("vector_image".to_string())));
+    assert!(!columns.contains(&Value::Text("vector_vision".to_string())));
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_image", vision),
+        id
+    );
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0_f32; 8]))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "vector_vision")
+    ));
+}
+
+#[test]
+fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO evidence (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(44))),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![sync::DdlChange::AlterTable {
+                name: "evidence".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                    ("embedding".to_string(), "VECTOR(4)".to_string()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            }],
+            ddl_lsn: vec![Lsn(db.current_lsn().0 + 1)],
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    let err = db
+        .commit(tx)
+        .expect_err("commit must reject stale 3D vector staged for reshaped 4D index");
+    assert!(matches!(
+        err,
+        Error::VectorIndexDimensionMismatch {
+            index,
+            expected: 4,
+            actual: 3,
+        } if index == VectorIndexRef::new("evidence", "embedding")
+    ));
+    let _ = db.rollback(tx);
+    assert!(matches!(
+        db.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0, 0.0]))]),
+        ),
+        Ok(result) if result.rows.is_empty()
+    ));
+}
+
+#[test]
+fn commit_rejects_staged_vector_update_after_same_ref_sync_shape_change() {
+    let db = Database::open_memory();
+    let id = Uuid::from_u128(45);
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'old', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE evidence SET note = 'new' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    db.apply_changes(
+        sync::ChangeSet {
+            rows: Vec::new(),
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![sync::DdlChange::AlterTable {
+                name: "evidence".to_string(),
+                columns: vec![
+                    ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                    ("note".to_string(), "TEXT".to_string()),
+                    ("embedding".to_string(), "VECTOR(4)".to_string()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            }],
+            ddl_lsn: vec![Lsn(db.current_lsn().0 + 1)],
+        },
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    let err = db
+        .commit(tx)
+        .expect_err("commit must reject stale 3D vector carried by UPDATE row image");
+    assert!(matches!(
+        err,
+        Error::VectorIndexDimensionMismatch {
+            index,
+            expected: 4,
+            actual: 3,
+        } if index == VectorIndexRef::new("evidence", "embedding")
+    ));
+    let _ = db.rollback(tx);
+}
+
+#[test]
+fn sync_alter_table_shape_change_accepts_following_vector_payload() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(46);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    let reshaped = vec![0.0_f32, 1.0, 0.0, 0.0];
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: vec![sync::VectorChange {
+                    index: VectorIndexRef::new("evidence", "embedding"),
+                    row_id: RowId(1),
+                    vector: reshaped.clone(),
+                    lsn: Lsn(11),
+                }],
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("embedding".to_string(), "VECTOR(4)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "embedding", reshaped),
+        id
+    );
+    let row = receiver
+        .execute(
+            "SELECT note FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+}
+
+#[test]
+fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(47);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("embedding".to_string(), "VECTOR(4)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let row = receiver
+        .execute(
+            "SELECT note FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0, 0.0]))]),
+        ),
+        Err(Error::VectorIndexDimensionMismatch {
+            expected: 3,
+            actual: 4,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_index() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(48);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, vector_text VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, vector_text) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("vector_vision".to_string(), "VECTOR(8)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_text", per_index_axis3(0)),
+        id
+    );
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("vector_text".to_string())));
+    assert!(columns.contains(&Value::Text("vector_vision".to_string())));
+}
+
+#[test]
+fn sync_additive_non_vector_alter_does_not_drop_omitted_vector_index() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(4801);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, vector_text VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, vector_text) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("tag".to_string(), "TEXT".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "vector_text", per_index_axis3(0)),
+        id
+    );
+    let row = receiver
+        .execute(
+            "SELECT tag FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Null);
+}
+
+#[test]
+fn sync_vector_rename_persists_row_image_across_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("receiver.db");
+    let origin = Database::open_memory();
+    let id = Uuid::from_u128(49);
+    let vision = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let schema = "CREATE TABLE evidence (
+        id UUID PRIMARY KEY,
+        note TEXT,
+        vector_text VECTOR(3),
+        vector_vision VECTOR(8)
+    )";
+
+    {
+        let receiver = Database::open(&db_path).unwrap();
+        origin.execute(schema, &empty()).unwrap();
+        receiver.execute(schema, &empty()).unwrap();
+        for db in [&origin, &receiver] {
+            db.execute(
+                "INSERT INTO evidence (id, note, vector_text, vector_vision) VALUES ($id, 'kept', $text, $vision)",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("text", Value::Vector(per_index_axis3(0))),
+                    ("vision", Value::Vector(vision.clone())),
+                ]),
+            )
+            .unwrap();
+        }
+        let watermark = origin.current_lsn();
+        origin
+            .execute(
+                "ALTER TABLE evidence RENAME COLUMN vector_vision TO vector_image",
+                &empty(),
+            )
+            .unwrap();
+        receiver
+            .apply_changes(
+                origin.changes_since(watermark),
+                &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+            )
+            .unwrap();
+        receiver.close().unwrap();
+    }
+
+    let reopened = Database::open(&db_path).unwrap();
+    let row = reopened
+        .execute(
+            "SELECT note, vector_image FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows[0][1], Value::Vector(vision));
+    assert!(matches!(
+        reopened.execute(
+            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vec![0.0_f32; 8]))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "vector_vision")
+    ));
+}
+
+#[test]
+fn sync_single_vector_column_rename_moves_receiver_index() {
+    let origin = Database::open_memory();
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(50);
+    let schema = "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))";
+    origin.execute(schema, &empty()).unwrap();
+    receiver.execute(schema, &empty()).unwrap();
+    for db in [&origin, &receiver] {
+        db.execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let watermark = origin.current_lsn();
+    origin
+        .execute(
+            "ALTER TABLE evidence RENAME COLUMN embedding TO embedding_v2",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .apply_changes(
+            origin.changes_since(watermark),
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "embedding_v2", per_index_axis3(0)),
+        id
+    );
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("embedding_v2".to_string())));
+    assert!(!columns.contains(&Value::Text("embedding".to_string())));
+    assert!(matches!(
+        receiver.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+        ),
+        Err(Error::UnknownVectorIndex { index })
+            if index == VectorIndexRef::new("evidence", "embedding")
+    ));
+}
+
+#[test]
+fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() {
+    let receiver = Database::open_memory();
+    let id = Uuid::from_u128(51);
+    receiver
+        .execute(
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+            &empty(),
+        )
+        .unwrap();
+    receiver
+        .execute(
+            "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'kept', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("embedding", Value::Vector(per_index_axis3(0))),
+            ]),
+        )
+        .unwrap();
+
+    receiver
+        .apply_changes(
+            sync::ChangeSet {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                vectors: Vec::new(),
+                ddl: vec![sync::DdlChange::AlterTable {
+                    name: "evidence".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("note".to_string(), "TEXT".to_string()),
+                        ("thumbnail".to_string(), "VECTOR(3)".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert_eq!(
+        per_index_top_id(&receiver, "evidence", "embedding", per_index_axis3(0)),
+        id
+    );
+    let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
+    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let columns = indexes
+        .rows
+        .iter()
+        .map(|row| row[column_idx].clone())
+        .collect::<Vec<_>>();
+    assert!(columns.contains(&Value::Text("embedding".to_string())));
+    assert!(columns.contains(&Value::Text("thumbnail".to_string())));
+    let added_search = receiver
+        .execute(
+            "SELECT id FROM evidence ORDER BY thumbnail <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+        )
+        .unwrap();
+    assert!(added_search.rows.is_empty());
+}
+
 #[cfg(feature = "test-seams")]
 #[test]
 fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
