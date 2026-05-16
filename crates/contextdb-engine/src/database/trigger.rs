@@ -1017,6 +1017,9 @@ impl Database {
         let result = TRIGGER_CALLBACK_TX.with(|tx_slot| {
             let prior_tx = tx_slot.replace(Some(tx));
             let prior_db = TRIGGER_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
+            let gate_id = self.vector_schema_gate_id();
+            let prior_gate = TRIGGER_CALLBACK_VECTOR_SCHEMA_GATE
+                .with(|gate_slot| gate_slot.replace(Some(gate_id)));
             let prior_active = TRIGGER_CALLBACK_ACTIVE.with(|active| active.replace(true));
             let prior_name =
                 TRIGGER_CALLBACK_NAME.with(|name| name.replace(Some(ctx.trigger_name.clone())));
@@ -1024,6 +1027,7 @@ impl Database {
             let user_commit_reentry = self.take_user_commit_trigger_reentry();
             TRIGGER_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
             TRIGGER_CALLBACK_NAME.with(|name| name.replace(prior_name));
+            TRIGGER_CALLBACK_VECTOR_SCHEMA_GATE.with(|gate_slot| gate_slot.set(prior_gate));
             TRIGGER_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
             tx_slot.set(prior_tx);
             (result, user_commit_reentry)

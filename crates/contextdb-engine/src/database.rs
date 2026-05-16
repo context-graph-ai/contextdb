@@ -20,7 +20,7 @@ use contextdb_planner::{OnConflictPlan, PhysicalPlan};
 use contextdb_relational::{MemRelationalExecutor, RelationalStore, index_key_from_values};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use contextdb_vector::{HnswGraphStats, HnswIndex, MemVectorExecutor, VectorStore};
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -306,11 +306,15 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static CRON_CALLBACK_DB: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static CRON_CALLBACK_VECTOR_SCHEMA_GATE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     static CRON_CALLBACK_ACTIVE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static TRIGGER_CALLBACK_TX: std::cell::Cell<Option<TxId>> =
         const { std::cell::Cell::new(None) };
     static TRIGGER_CALLBACK_DB: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static TRIGGER_CALLBACK_VECTOR_SCHEMA_GATE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
     static TRIGGER_CALLBACK_ACTIVE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -326,6 +330,8 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static VECTOR_SCHEMA_READ_STACK: std::cell::RefCell<Vec<(usize, VectorIndexRef)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 struct SyncApplyTriggerGateGuard;
@@ -333,6 +339,82 @@ struct SyncApplyTriggerGateGuard;
 struct SqlWriteControlBypassGuard {
     db_id: usize,
     tx: TxId,
+}
+
+#[derive(Default)]
+struct VectorSchemaGates {
+    gates: Mutex<HashMap<VectorIndexRef, Arc<RwLock<()>>>>,
+    epochs: Mutex<HashMap<VectorIndexRef, u64>>,
+}
+
+impl VectorSchemaGates {
+    fn sorted_refs(refs: impl IntoIterator<Item = VectorIndexRef>) -> Vec<VectorIndexRef> {
+        let mut refs = refs.into_iter().collect::<Vec<_>>();
+        refs.sort_by(|a, b| a.table.cmp(&b.table).then(a.column.cmp(&b.column)));
+        refs.dedup();
+        refs
+    }
+
+    fn gate_for(&self, index: &VectorIndexRef) -> Arc<RwLock<()>> {
+        self.gates
+            .lock()
+            .entry(index.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    fn epoch_for(&self, index: &VectorIndexRef) -> u64 {
+        self.epochs.lock().get(index).copied().unwrap_or(0)
+    }
+
+    fn bump_epochs(&self, refs: &[VectorIndexRef]) {
+        let mut epochs = self.epochs.lock();
+        for index in refs {
+            let epoch = epochs.entry(index.clone()).or_insert(0);
+            *epoch = epoch.saturating_add(1);
+        }
+    }
+}
+
+pub(crate) struct VectorSchemaReadGuard {
+    db_id: usize,
+    refs: Vec<VectorIndexRef>,
+    _guards: Vec<ArcRwLockReadGuard<parking_lot::RawRwLock, ()>>,
+}
+
+impl VectorSchemaReadGuard {
+    fn new(
+        db_id: usize,
+        refs: Vec<VectorIndexRef>,
+        guards: Vec<ArcRwLockReadGuard<parking_lot::RawRwLock, ()>>,
+    ) -> Self {
+        VECTOR_SCHEMA_READ_STACK.with(|stack| {
+            stack
+                .borrow_mut()
+                .extend(refs.iter().cloned().map(|index| (db_id, index)));
+        });
+        Self {
+            db_id,
+            refs,
+            _guards: guards,
+        }
+    }
+}
+
+impl Drop for VectorSchemaReadGuard {
+    fn drop(&mut self) {
+        VECTOR_SCHEMA_READ_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            for expected in self.refs.iter().rev() {
+                let popped = stack.pop();
+                debug_assert_eq!(popped, Some((self.db_id, expected.clone())));
+            }
+        });
+    }
+}
+
+pub(crate) struct VectorSchemaWriteGuard {
+    _guards: Vec<ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>>,
 }
 
 impl Drop for SyncApplyTriggerGateGuard {
@@ -395,6 +477,7 @@ pub struct Database {
     relational_store: Arc<RelationalStore>,
     graph_store: Arc<GraphStore>,
     vector_store: Arc<VectorStore>,
+    vector_schema_gates: Arc<VectorSchemaGates>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
     ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     persistence: Option<Arc<RedbPersistence>>,
@@ -499,6 +582,7 @@ pub(crate) struct WriteSetCounts {
 struct PendingCommitMetadata {
     conditional_update_guards: Vec<PendingConditionalUpdateGuard>,
     upsert_intents: Vec<PendingUpsertIntent>,
+    vector_schema_epochs: HashMap<VectorIndexRef, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -903,6 +987,7 @@ impl Database {
             relational_store: relational.clone(),
             graph_store: graph.clone(),
             vector_store: vector_store.clone(),
+            vector_schema_gates: Arc::new(VectorSchemaGates::default()),
             change_log,
             ddl_log,
             persistence,
@@ -1073,6 +1158,7 @@ impl Database {
             relational_store: self.relational_store.clone(),
             graph_store: self.graph_store.clone(),
             vector_store: self.vector_store.clone(),
+            vector_schema_gates: self.vector_schema_gates.clone(),
             change_log: self.change_log.clone(),
             ddl_log: self.ddl_log.clone(),
             persistence: self.persistence.clone(),
@@ -1154,6 +1240,7 @@ impl Database {
         let all_meta = persistence.load_all_table_meta()?;
 
         let relational = Arc::new(RelationalStore::new());
+        let mut sanitized_row_tables = HashSet::new();
         for (name, meta) in &all_meta {
             relational.create_table(name, meta.clone());
             // Register EVERY index declared in TableMeta.indexes — this
@@ -1162,7 +1249,10 @@ impl Database {
             for decl in &meta.indexes {
                 relational.create_index_storage(name, &decl.name, decl.columns.clone());
             }
-            for row in persistence.load_relational_table(name)? {
+            for mut row in persistence.load_relational_table(name)? {
+                if sanitize_loaded_row_for_meta(&mut row, meta) {
+                    sanitized_row_tables.insert(name.clone());
+                }
                 relational.insert_loaded_row(name, row);
             }
         }
@@ -1185,13 +1275,19 @@ impl Database {
                 }
             }
         }
-        let loaded_vectors = persistence.load_vectors()?;
+        let loaded_ddl_log = persistence.load_ddl_log()?;
+        let (mut loaded_vectors, repaired_vector_refs) = reconcile_loaded_vectors_for_meta(
+            persistence.load_vectors()?,
+            &all_meta,
+            &loaded_ddl_log,
+        );
+        let supplemented_vectors =
+            supplement_loaded_vectors_from_rows(&relational, &all_meta, &mut loaded_vectors);
         for entry in &loaded_vectors {
             vector.insert_loaded_vector(entry.clone());
         }
 
         let loaded_change_log = persistence.load_change_log()?;
-        let loaded_ddl_log = persistence.load_ddl_log()?;
         let mut commit_index = persistence.load_commit_index()?;
         let reconstructed_commit_index =
             commit_index_across_all(&relational, &graph, &vector, &loaded_change_log);
@@ -1202,7 +1298,6 @@ impl Database {
                 missing_commit_index.insert(lsn, tx);
             }
         }
-        let mut loaded_vectors = loaded_vectors;
         let repaired_visibility_order = repair_visibility_tx_order_if_needed(
             &relational,
             &graph,
@@ -1217,7 +1312,19 @@ impl Database {
         } else if !missing_commit_index.is_empty() {
             persistence.flush_commit_index_entries(&missing_commit_index)?;
         }
-        hydrate_relational_vector_values(&relational, &loaded_vectors);
+        let hydrated_row_tables = hydrate_relational_vector_values(&relational, &loaded_vectors);
+        if repaired_vector_refs || supplemented_vectors {
+            persistence.rewrite_vectors(&loaded_vectors)?;
+        }
+        for table in sanitized_row_tables
+            .into_iter()
+            .chain(hydrated_row_tables.into_iter())
+            .collect::<HashSet<_>>()
+        {
+            if let Some(rows) = relational.tables.read().get(&table) {
+                persistence.rewrite_table_rows(&table, rows)?;
+            }
+        }
 
         let max_row_id = relational.max_row_id();
         let max_tx = max_tx_across_all(&relational, &graph, &vector);
@@ -1569,6 +1676,18 @@ impl Database {
 
     fn callback_tx_bound_matches(&self, tx: TxId) -> bool {
         self.cron_callback_tx_bound_matches(tx) || self.trigger_callback_tx_bound_matches(tx)
+    }
+
+    pub(super) fn vector_schema_gate_id(&self) -> usize {
+        Arc::as_ptr(&self.vector_schema_gates) as usize
+    }
+
+    fn callback_active_on_current_thread_for_this_db(&self) -> bool {
+        let gate_id = self.vector_schema_gate_id();
+        (CRON_CALLBACK_ACTIVE.with(|active| active.get())
+            && CRON_CALLBACK_VECTOR_SCHEMA_GATE.with(|slot| slot.get()) == Some(gate_id))
+            || (TRIGGER_CALLBACK_ACTIVE.with(|active| active.get())
+                && TRIGGER_CALLBACK_VECTOR_SCHEMA_GATE.with(|slot| slot.get()) == Some(gate_id))
     }
 
     fn assert_callback_tx_bound_write_allowed(&self, tx: TxId) -> Result<()> {
@@ -2059,6 +2178,58 @@ impl Database {
         )
     }
 
+    fn plan_vector_schema_refs(&self, plan: &PhysicalPlan) -> Vec<VectorIndexRef> {
+        match plan {
+            PhysicalPlan::Insert(plan) => self.vector_schema_refs_for_table(&plan.table),
+            PhysicalPlan::Delete(plan) => self.vector_schema_refs_for_table(&plan.table),
+            PhysicalPlan::Update(plan) => self.vector_schema_refs_for_table(&plan.table),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn write_set_vector_schema_refs(ws: &WriteSet) -> Vec<VectorIndexRef> {
+        VectorSchemaGates::sorted_refs(
+            ws.vector_inserts
+                .iter()
+                .map(|entry| entry.index.clone())
+                .chain(ws.vector_deletes.iter().map(|(index, _, _)| index.clone()))
+                .chain(ws.vector_moves.iter().map(|(index, _, _, _)| index.clone())),
+        )
+    }
+
+    pub(crate) fn write_set_touches_vector_schema(ws: &WriteSet) -> bool {
+        !Self::write_set_vector_schema_refs(ws).is_empty()
+    }
+
+    fn record_vector_schema_epoch(&self, tx: TxId, index: &VectorIndexRef) -> Result<()> {
+        self.record_vector_schema_epochs(tx, [index.clone()])
+    }
+
+    fn record_vector_schema_epochs(
+        &self,
+        tx: TxId,
+        refs: impl IntoIterator<Item = VectorIndexRef>,
+    ) -> Result<()> {
+        let refs = VectorSchemaGates::sorted_refs(refs);
+        if refs.is_empty() {
+            return Ok(());
+        }
+        self.tx_mgr.with_write_set(tx, |_| ())?;
+        let observed = refs
+            .into_iter()
+            .map(|index| {
+                let epoch = self.vector_schema_gates.epoch_for(&index);
+                (index, epoch)
+            })
+            .collect::<Vec<_>>();
+        let mut metadata = self.pending_commit_metadata.lock();
+        let metadata = metadata.entry(tx).or_default();
+        for (index, epoch) in observed {
+            metadata.vector_schema_epochs.entry(index).or_insert(epoch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear_statement_cache(&self) {
         self.statement_cache.write().clear();
     }
@@ -2085,6 +2256,9 @@ impl Database {
                     Some(tx) => tx,
                     None => self.begin_for_public_autocommit_write()?,
                 };
+                let vector_schema_refs = self.plan_vector_schema_refs(plan);
+                let _vector_schema = (!vector_schema_refs.is_empty())
+                    .then(|| self.vector_schema_read_many(vector_schema_refs));
                 let result = {
                     let _write_gate = self.enter_sql_write_control_bypass(tx);
                     execute_plan(self, plan, params, Some(tx))
@@ -2126,6 +2300,9 @@ impl Database {
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
         let vector_index = vector_index_from_plan(&plan);
+        let _vector_schema = vector_index
+            .as_ref()
+            .map(|index| self.vector_schema_read(index));
         if let Some(index) = &vector_index
             && let Some(state) = self.vector_store.try_state(index)
             && state.vector_count() >= 1000
@@ -2281,126 +2458,134 @@ impl Database {
         let mut pending_sink_events = Vec::new();
         let mut committed_trigger_audit_entries = Vec::new();
         let validation_noop_count = std::cell::Cell::new(0_u64);
-        let (lsn, ws) = match self.tx_mgr.commit_with_lsn_active_prepare_and_applied_mut(
-            tx,
-            |_| {
-                if source != CommitSource::SyncPull {
-                    let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
-                    Self::reject_user_conditional_update_conflicts(source, &outcome)?;
-                    validation_noop_count.set(
-                        validation_noop_count
-                            .get()
-                            .saturating_add(outcome.conditional_noop_count),
-                    );
-                    match self.dispatch_triggers_for_tx(tx) {
-                        Ok(outcome) => {
-                            *pending_trigger_audits.borrow_mut() = outcome.pending;
-                            pending_trigger_active_guards
-                                .borrow_mut()
-                                .extend(outcome.active_guards);
-                        }
-                        Err(failure) => {
-                            let failure = *failure;
-                            pending_trigger_active_guards
-                                .borrow_mut()
-                                .extend(failure.active_guards);
-                            return Err(failure.error);
-                        }
-                    }
-                    let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
-                    Self::reject_user_conditional_update_conflicts(source, &outcome)?;
-                    validation_noop_count.set(
-                        validation_noop_count
-                            .get()
-                            .saturating_add(outcome.conditional_noop_count),
-                    );
-                }
-                Ok(())
-            },
-            |ws| {
-                if !ws.is_empty() {
+        let (lsn, ws) = {
+            match self.tx_mgr.commit_with_lsn_active_prepare_and_applied_mut(
+                tx,
+                |_| {
                     if source != CommitSource::SyncPull {
-                        self.rewrite_txid_placeholders(tx, ws)?;
-                    }
-                    let final_validation = self.commit_validate(tx, ws)?;
-                    Self::reject_user_conditional_update_conflicts(source, &final_validation)?;
-                    validation_noop_count.set(
-                        validation_noop_count
-                            .get()
-                            .saturating_add(final_validation.conditional_noop_count),
-                    );
-                    if let Some(lsn) = ws.commit_lsn {
-                        self.stage_event_bus_ddl_for_commit(lsn, event_bus_ddl)?;
-                        self.stage_trigger_ddl_for_commit(lsn, trigger_ddl)?;
-                    }
-                    self.plugin.pre_commit(ws, source)?;
-                    let prepared_sink_events = self
-                        .prepare_sink_events_for_write_set_with_event_bus_ddl(ws, event_bus_ddl)?;
-                    if self.persistence.is_some()
-                        && let Some(lsn) = ws.commit_lsn
-                    {
-                        self.event_bus
-                            .stage_sink_events_for_persistence(lsn, prepared_sink_events);
-                    } else {
-                        pending_sink_events = prepared_sink_events;
-                    }
-                    if let Some(lsn) = ws.commit_lsn {
-                        committed_trigger_audit_entries = if source == CommitSource::SyncPull {
-                            let projected_declarations =
-                                self.staged_trigger_declarations_for_commit(lsn);
-                            let audit_projection = sync_pull_trigger_audit_projection
-                                .or(projected_declarations.as_ref());
-                            self.committed_sync_pull_trigger_audits_for_write_set(
-                                ws,
-                                lsn,
-                                audit_projection,
-                            )?
-                        } else {
-                            let pending = pending_trigger_audits.borrow();
-                            self.committed_trigger_audits_for_pending(&pending, ws, lsn)
-                        };
-                        self.stage_trigger_audits_for_persistence(
-                            lsn,
-                            &committed_trigger_audit_entries,
+                        let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
+                        Self::reject_user_conditional_update_conflicts(source, &outcome)?;
+                        validation_noop_count.set(
+                            validation_noop_count
+                                .get()
+                                .saturating_add(outcome.conditional_noop_count),
+                        );
+                        match self.dispatch_triggers_for_tx(tx) {
+                            Ok(outcome) => {
+                                *pending_trigger_audits.borrow_mut() = outcome.pending;
+                                pending_trigger_active_guards
+                                    .borrow_mut()
+                                    .extend(outcome.active_guards);
+                            }
+                            Err(failure) => {
+                                let failure = *failure;
+                                pending_trigger_active_guards
+                                    .borrow_mut()
+                                    .extend(failure.active_guards);
+                                return Err(failure.error);
+                            }
+                        }
+                        let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
+                        Self::reject_user_conditional_update_conflicts(source, &outcome)?;
+                        validation_noop_count.set(
+                            validation_noop_count
+                                .get()
+                                .saturating_add(outcome.conditional_noop_count),
                         );
                     }
-                }
-                Ok(())
-            },
-            |lsn, ws| {
-                if !ws.is_empty() {
-                    self.publish_staged_event_bus_ddl_commit(lsn);
-                    self.publish_staged_trigger_ddl_commit(lsn);
-                }
-            },
-        ) {
-            Ok(committed) => committed,
-            Err(failure) => {
-                if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
-                    let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
-                    self.discard_staged_event_bus_ddl_commit(lsn);
-                    self.discard_staged_trigger_ddl_commit(lsn);
-                    self.discard_staged_trigger_audits_for_persistence(lsn);
-                }
-                if let Some(ws) = &failure.write_set {
-                    self.release_insert_allocations(ws);
-                }
-                if let Err(audit_error) = self.append_rolled_back_trigger_audits(
-                    &pending_trigger_audits.borrow(),
-                    tx,
-                    &failure.error.to_string(),
-                ) {
+                    Ok(())
+                },
+                |ws| {
+                    if !ws.is_empty() {
+                        if source != CommitSource::SyncPull {
+                            self.rewrite_txid_placeholders(tx, ws)?;
+                        }
+                        let final_validation = self.commit_validate(tx, ws)?;
+                        Self::reject_user_conditional_update_conflicts(source, &final_validation)?;
+                        validation_noop_count.set(
+                            validation_noop_count
+                                .get()
+                                .saturating_add(final_validation.conditional_noop_count),
+                        );
+                        if let Some(lsn) = ws.commit_lsn {
+                            self.stage_event_bus_ddl_for_commit(lsn, event_bus_ddl)?;
+                            self.stage_trigger_ddl_for_commit(lsn, trigger_ddl)?;
+                        }
+                        self.plugin.pre_commit(ws, source)?;
+                        let prepared_sink_events = self
+                            .prepare_sink_events_for_write_set_with_event_bus_ddl(
+                                ws,
+                                event_bus_ddl,
+                            )?;
+                        if self.persistence.is_some()
+                            && let Some(lsn) = ws.commit_lsn
+                        {
+                            self.event_bus
+                                .stage_sink_events_for_persistence(lsn, prepared_sink_events);
+                        } else {
+                            pending_sink_events = prepared_sink_events;
+                        }
+                        if let Some(lsn) = ws.commit_lsn {
+                            committed_trigger_audit_entries = if source == CommitSource::SyncPull {
+                                let projected_declarations =
+                                    self.staged_trigger_declarations_for_commit(lsn);
+                                let audit_projection = sync_pull_trigger_audit_projection
+                                    .or(projected_declarations.as_ref());
+                                self.committed_sync_pull_trigger_audits_for_write_set(
+                                    ws,
+                                    lsn,
+                                    audit_projection,
+                                )?
+                            } else {
+                                let pending = pending_trigger_audits.borrow();
+                                self.committed_trigger_audits_for_pending(&pending, ws, lsn)
+                            };
+                            self.stage_trigger_audits_for_persistence(
+                                lsn,
+                                &committed_trigger_audit_entries,
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+                |lsn, ws| {
+                    if !ws.is_empty() {
+                        self.publish_staged_event_bus_ddl_commit(lsn);
+                        self.publish_staged_trigger_ddl_commit(lsn);
+                        // DDL metadata mutation also needs the commit mutex.
+                        // Release delete-side accounting here so DROP/RENAME
+                        // cannot remove vector state before cleanup observes it.
+                        self.release_delete_allocations(ws);
+                    }
+                },
+            ) {
+                Ok(committed) => committed,
+                Err(failure) => {
+                    if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
+                        let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                        self.discard_staged_event_bus_ddl_commit(lsn);
+                        self.discard_staged_trigger_ddl_commit(lsn);
+                        self.discard_staged_trigger_audits_for_persistence(lsn);
+                    }
+                    if let Some(ws) = &failure.write_set {
+                        self.release_insert_allocations(ws);
+                    }
+                    if let Err(audit_error) = self.append_rolled_back_trigger_audits(
+                        &pending_trigger_audits.borrow(),
+                        tx,
+                        &failure.error.to_string(),
+                    ) {
+                        self.pending_commit_metadata.lock().remove(&tx);
+                        return Err(audit_error);
+                    }
                     self.pending_commit_metadata.lock().remove(&tx);
-                    return Err(audit_error);
+                    return Err(failure.error);
                 }
-                self.pending_commit_metadata.lock().remove(&tx);
-                return Err(failure.error);
             }
         };
         self.pending_commit_metadata.lock().remove(&tx);
 
         if !ws.is_empty() {
-            self.release_delete_allocations(&ws);
             self.plugin.post_commit(&ws, source);
             let sink_events_to_publish = if self.persistence.is_some() {
                 ws.commit_lsn
@@ -3799,10 +3984,118 @@ impl Database {
         let snapshot = self.snapshot();
         let validation =
             self.revalidate_conditional_updates(ws, snapshot, &metadata.conditional_update_guards)?;
+        self.validate_vector_schema_epochs(ws, &metadata.vector_schema_epochs)?;
+        self.validate_vector_write_set_schema(ws)?;
         self.validate_unique_constraints_in_write_set(ws, snapshot, &metadata.upsert_intents)?;
         self.validate_foreign_keys_in_write_set(ws, snapshot)?;
         self.validate_composite_foreign_keys_in_write_set(ws, snapshot)?;
+        self.validate_vector_schema_epochs(ws, &metadata.vector_schema_epochs)?;
+        self.validate_vector_write_set_schema(ws)?;
         Ok(validation)
+    }
+
+    fn validate_vector_schema_epochs(
+        &self,
+        ws: &WriteSet,
+        recorded_epochs: &HashMap<VectorIndexRef, u64>,
+    ) -> Result<()> {
+        for index in Self::write_set_vector_schema_refs(ws) {
+            let Some(recorded_epoch) = recorded_epochs.get(&index) else {
+                return Err(Self::stale_vector_schema_error(&index));
+            };
+            let current_epoch = self.vector_schema_gates.epoch_for(&index);
+            if current_epoch != *recorded_epoch {
+                return Err(Self::stale_vector_schema_error(&index));
+            }
+        }
+        Ok(())
+    }
+
+    fn stale_vector_schema_error(index: &VectorIndexRef) -> Error {
+        Error::SchemaInvalid {
+            reason: format!(
+                "vector index {}.{} changed while transaction was open; retry transaction",
+                index.table, index.column
+            ),
+        }
+    }
+
+    fn validate_vector_write_set_schema(&self, ws: &WriteSet) -> Result<()> {
+        let mut refs = ws
+            .vector_inserts
+            .iter()
+            .map(|entry| entry.index.clone())
+            .chain(ws.vector_deletes.iter().map(|(index, _, _)| index.clone()))
+            .chain(ws.vector_moves.iter().map(|(index, _, _, _)| index.clone()))
+            .collect::<Vec<_>>();
+        refs.sort_by(|a, b| a.table.cmp(&b.table).then(a.column.cmp(&b.column)));
+        refs.dedup();
+
+        for index in refs {
+            let Some(meta) = self.table_meta(&index.table) else {
+                return Err(Error::UnknownVectorIndex { index });
+            };
+            let Some(column) = meta
+                .columns
+                .iter()
+                .find(|column| column.name == index.column)
+            else {
+                return Err(Error::UnknownVectorIndex { index });
+            };
+            let ColumnType::Vector(expected) = column.column_type else {
+                return Err(Error::UnknownVectorIndex { index });
+            };
+            let state = self.vector_store.state(&index)?;
+            if state.dimension() != expected {
+                return Err(Error::VectorIndexDimensionMismatch {
+                    index,
+                    expected,
+                    actual: state.dimension(),
+                });
+            }
+        }
+
+        for entry in &ws.vector_inserts {
+            let state = self.vector_store.state(&entry.index)?;
+            let expected = state.dimension();
+            if entry.vector.len() != expected {
+                return Err(Error::VectorIndexDimensionMismatch {
+                    index: entry.index.clone(),
+                    expected,
+                    actual: entry.vector.len(),
+                });
+            }
+        }
+        for (table, row) in &ws.relational_inserts {
+            let Some(meta) = self.table_meta(table) else {
+                continue;
+            };
+            for (column_name, value) in &row.values {
+                let Value::Vector(vector) = value else {
+                    continue;
+                };
+                let index = VectorIndexRef::new(table, column_name);
+                let Some(column) = meta
+                    .columns
+                    .iter()
+                    .find(|column| column.name == *column_name)
+                else {
+                    return Err(Error::UnknownVectorIndex { index });
+                };
+                let ColumnType::Vector(expected) = column.column_type else {
+                    return Err(Error::UnknownVectorIndex { index });
+                };
+                if vector.len() != expected {
+                    return Err(Error::VectorIndexDimensionMismatch {
+                        index,
+                        expected,
+                        actual: vector.len(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn take_conditional_update_guards_for_tx(
@@ -6270,6 +6563,7 @@ impl Database {
         vector: Vec<f32>,
     ) -> Result<()> {
         let _operation = self.open_operation_after_write_control_wait(tx, "insert_vector")?;
+        let _vector_schema = self.vector_schema_read(&index);
         self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
         self.vector_store.state(&index)?;
         self.assert_existing_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
@@ -6294,6 +6588,8 @@ impl Database {
         row_id: RowId,
         vector: Vec<f32>,
     ) -> Result<()> {
+        let _vector_schema = self.vector_schema_read(&index);
+        self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "insert_vector")?;
         self.vector_store.validate_vector(&index, vector.len())?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
@@ -6379,6 +6675,8 @@ impl Database {
 
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         let _operation = self.open_operation_after_write_control_wait(tx, "delete_vector")?;
+        let _vector_schema = self.vector_schema_read(&index);
+        self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "delete_vector")?;
         self.vector_store.state(&index)?;
         self.assert_row_id_write_allowed(Some(tx), &index.table, row_id, self.snapshot())?;
@@ -6454,8 +6752,15 @@ impl Database {
         old_row_id: RowId,
         new_row_id: RowId,
     ) -> Result<()> {
+        let _vector_schema = self.vector_schema_read(&index);
+        self.record_vector_schema_epoch(tx, &index)?;
         self.ensure_trigger_table_ready(&index.table, "move_vector")?;
-        self.vector_store.state(&index)?;
+        if self.vector_store.try_state(&index).is_none() {
+            return Err(Error::UnknownVectorIndex { index });
+        }
+        if old_row_id == new_row_id {
+            return Ok(());
+        }
         let existing_live = self
             .vector_store
             .live_entry_for_row(&index, old_row_id, self.snapshot())
@@ -6559,6 +6864,7 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
         let _operation = self.open_operation()?;
+        let _vector_schema = self.vector_schema_read(&index);
         if self.vector_store.try_state(&index).is_none() {
             return Err(Error::UnknownVectorIndex { index });
         }
@@ -6574,6 +6880,16 @@ impl Database {
     }
 
     pub(crate) fn semantic_search_with_candidates(
+        &self,
+        query: SemanticQuery,
+        candidates: Option<RoaringTreemap>,
+    ) -> Result<Vec<SearchResult>> {
+        let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
+        let _vector_schema = self.vector_schema_read(&index);
+        self.semantic_search_with_candidates_under_schema_read(query, candidates)
+    }
+
+    pub(crate) fn semantic_search_with_candidates_under_schema_read(
         &self,
         query: SemanticQuery,
         candidates: Option<RoaringTreemap>,
@@ -7092,14 +7408,23 @@ impl Database {
     #[doc(hidden)]
     pub fn __debug_vector_hnsw_len(&self, index: VectorIndexRef) -> Option<usize> {
         let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read(&index);
+        self.vector_hnsw_len_under_schema_read(&index)
+    }
+
+    pub(crate) fn vector_hnsw_len_under_schema_read(
+        &self,
+        index: &VectorIndexRef,
+    ) -> Option<usize> {
         self.vector_store
-            .try_state(&index)
+            .try_state(index)
             .and_then(|state| state.hnsw_len())
     }
 
     #[doc(hidden)]
     pub fn __debug_vector_hnsw_stats(&self, index: VectorIndexRef) -> Option<HnswGraphStats> {
         let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read(&index);
         self.vector_store
             .try_state(&index)
             .and_then(|state| state.hnsw_stats())
@@ -7113,6 +7438,7 @@ impl Database {
         k: usize,
     ) -> Option<Vec<(RowId, f32)>> {
         let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read(&index);
         self.vector_store
             .raw_hnsw_search(&index, query, k)
             .and_then(Result::ok)
@@ -7125,6 +7451,7 @@ impl Database {
         row_id: RowId,
     ) -> Option<usize> {
         let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read(&index);
         self.vector_store
             .raw_hnsw_entry_count_for_row(&index, row_id)
     }
@@ -7135,11 +7462,13 @@ impl Database {
         index: VectorIndexRef,
     ) -> Result<Vec<usize>> {
         let _operation = self.open_operation()?;
+        let _vector_schema = self.vector_schema_read(&index);
         self.vector_store.storage_bytes_per_entry(&index)
     }
 
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> bool {
         let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read_many(self.vector_store_schema_refs());
         self.vector_store
             .live_entries_for_row(row_id, snapshot)
             .into_iter()
@@ -7148,6 +7477,7 @@ impl Database {
 
     pub fn live_vector_entry(&self, row_id: RowId, snapshot: SnapshotId) -> Option<VectorEntry> {
         let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read_many(self.vector_store_schema_refs());
         self.vector_store
             .live_entries_for_row(row_id, snapshot)
             .into_iter()
@@ -7267,6 +7597,169 @@ impl Database {
 
     pub(crate) fn snapshot_for_read(&self) -> SnapshotId {
         SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or_else(|| self.snapshot()))
+    }
+
+    pub(crate) fn vector_schema_read(&self, index: &VectorIndexRef) -> VectorSchemaReadGuard {
+        self.vector_schema_read_many([index.clone()])
+    }
+
+    pub(crate) fn vector_schema_read_table(&self, table: &str) -> Option<VectorSchemaReadGuard> {
+        let refs = self.vector_schema_refs_for_table(table);
+        (!refs.is_empty()).then(|| self.vector_schema_read_many(refs))
+    }
+
+    pub(crate) fn vector_schema_read_many(
+        &self,
+        refs: impl IntoIterator<Item = VectorIndexRef>,
+    ) -> VectorSchemaReadGuard {
+        let db_id = self.vector_schema_gate_id();
+        // Same-thread trigger/cron callbacks already run inside the commit
+        // mutex. Vector DDL metadata mutation also takes that mutex, so taking
+        // the schema gate here would create commit-mutex -> schema-gate order.
+        let callback_thread = self.callback_active_on_current_thread_for_this_db();
+        let refs = VectorSchemaGates::sorted_refs(refs);
+        let guards = if callback_thread {
+            Vec::new()
+        } else {
+            let held = VECTOR_SCHEMA_READ_STACK.with(|stack| stack.borrow().clone());
+            refs.iter()
+                .filter(|index| !held.contains(&(db_id, (*index).clone())))
+                .map(|index| self.vector_schema_gates.gate_for(index).read_arc())
+                .collect()
+        };
+        VectorSchemaReadGuard::new(db_id, refs, guards)
+    }
+
+    pub(crate) fn vector_schema_write(&self, index: &VectorIndexRef) -> VectorSchemaWriteGuard {
+        self.vector_schema_write_many([index.clone()])
+    }
+
+    pub(crate) fn vector_schema_write_table(&self, table: &str) -> Option<VectorSchemaWriteGuard> {
+        let refs = self.vector_schema_refs_for_table(table);
+        (!refs.is_empty()).then(|| self.vector_schema_write_many(refs))
+    }
+
+    pub(crate) fn vector_schema_write_many(
+        &self,
+        refs: impl IntoIterator<Item = VectorIndexRef>,
+    ) -> VectorSchemaWriteGuard {
+        let refs = VectorSchemaGates::sorted_refs(refs);
+        let guards = refs
+            .iter()
+            .map(|index| self.vector_schema_gates.gate_for(index).write_arc())
+            .collect();
+        self.vector_schema_gates.bump_epochs(&refs);
+        VectorSchemaWriteGuard { _guards: guards }
+    }
+
+    pub(crate) fn vector_schema_refs_for_table(&self, table: &str) -> Vec<VectorIndexRef> {
+        self.table_meta(table)
+            .map(|meta| {
+                meta.columns
+                    .into_iter()
+                    .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                    .map(|column| VectorIndexRef::new(table, column.name))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn vector_schema_refs_for_state_propagation_from_table(
+        &self,
+        table: &str,
+    ) -> Vec<VectorIndexRef> {
+        let metas = self.relational_store().table_meta.read().clone();
+        let mut roots = HashSet::new();
+        if let Some(meta) = metas.get(table) {
+            for rule in &meta.propagation_rules {
+                match rule {
+                    PropagationRule::Edge { trigger_state, .. }
+                    | PropagationRule::VectorExclusion { trigger_state } => {
+                        roots.insert(trigger_state.clone());
+                    }
+                    PropagationRule::ForeignKey { .. } => {}
+                }
+            }
+        }
+        for meta in metas.values() {
+            for rule in &meta.propagation_rules {
+                if let PropagationRule::ForeignKey {
+                    referenced_table,
+                    trigger_state,
+                    ..
+                } = rule
+                    && referenced_table == table
+                {
+                    roots.insert(trigger_state.clone());
+                }
+            }
+        }
+
+        let mut refs = Vec::new();
+        let mut queue = roots
+            .into_iter()
+            .map(|state| (table.to_string(), state))
+            .collect::<VecDeque<_>>();
+        let mut visited = HashSet::new();
+        while let Some((source_table, source_state)) = queue.pop_front() {
+            if !visited.insert((source_table.clone(), source_state.clone())) {
+                continue;
+            }
+            let Some(meta) = metas.get(&source_table) else {
+                continue;
+            };
+            for rule in &meta.propagation_rules {
+                match rule {
+                    PropagationRule::VectorExclusion { trigger_state }
+                        if trigger_state == &source_state =>
+                    {
+                        refs.extend(
+                            meta.columns
+                                .iter()
+                                .filter(|column| {
+                                    matches!(column.column_type, ColumnType::Vector(_))
+                                })
+                                .map(|column| {
+                                    VectorIndexRef::new(&source_table, column.name.clone())
+                                }),
+                        );
+                    }
+                    PropagationRule::Edge {
+                        trigger_state,
+                        target_state,
+                        ..
+                    } if trigger_state == &source_state => {
+                        queue.push_back((source_table.clone(), target_state.clone()));
+                    }
+                    _ => {}
+                }
+            }
+
+            for (owner_table, owner_meta) in &metas {
+                for rule in &owner_meta.propagation_rules {
+                    if let PropagationRule::ForeignKey {
+                        referenced_table,
+                        trigger_state,
+                        target_state,
+                        ..
+                    } = rule
+                        && referenced_table == &source_table
+                        && trigger_state == &source_state
+                    {
+                        queue.push_back((owner_table.clone(), target_state.clone()));
+                    }
+                }
+            }
+        }
+        VectorSchemaGates::sorted_refs(refs)
+    }
+
+    fn vector_store_schema_refs(&self) -> Vec<VectorIndexRef> {
+        self.vector_store
+            .index_infos()
+            .into_iter()
+            .map(|info| info.index)
+            .collect()
     }
 
     /// Return the row changes since `since`. Walks `change_log` for
@@ -7677,7 +8170,46 @@ impl Database {
         self.vector_store.deregister_table(table, self.accountant());
     }
 
+    pub(crate) fn drain_vector_index_maintenance_for_ddl(&self, index: &VectorIndexRef) {
+        let Some(state) = self.vector_store.try_state(index) else {
+            return;
+        };
+        #[cfg(feature = "test-seams")]
+        // Marks entry to the DDL drain; tests then assert schema mutation waits
+        // for the subsequent same-ref maintenance drain to complete.
+        self.pause_vector_ddl_for_test(index);
+        // Reconfiguration with the current shape is a no-op, but it acquires
+        // the affected ref's maintenance lock before SQL metadata changes.
+        self.vector_store.register_or_reconfigure_empty_index(
+            index.clone(),
+            state.dimension(),
+            state.quantization(),
+        );
+    }
+
+    pub(crate) fn drain_vector_table_maintenance_for_ddl(&self, table: &str) {
+        #[cfg(feature = "test-seams")]
+        // Same entry marker as the per-ref drain, keyed by table.* for DROP TABLE.
+        self.pause_vector_ddl_for_test(&VectorIndexRef::new(table, "*"));
+        let indexes = self
+            .vector_store
+            .index_infos()
+            .into_iter()
+            .filter(|info| info.index.table == table)
+            .map(|info| info.index)
+            .collect::<Vec<_>>();
+        for index in indexes {
+            self.drain_vector_index_maintenance_for_ddl(&index);
+        }
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn pause_vector_ddl_for_test(&self, index: &VectorIndexRef) {
+        self.vector_store.maybe_pause_ddl_for_test(index);
+    }
+
     pub(crate) fn vector_index_infos(&self) -> Vec<contextdb_vector::store::VectorIndexInfo> {
+        let _vector_schema = self.vector_schema_read_many(self.vector_store_schema_refs());
         self.vector_store.index_infos()
     }
 
@@ -7792,10 +8324,6 @@ impl Database {
                     .release(self.vector_insert_accounted_bytes(index, vector.vector.len()));
             }
         }
-
-        if !ws.vector_deletes.is_empty() {
-            self.vector_store.clear_hnsw(self.accountant());
-        }
     }
 
     fn find_row_by_id(&self, table: &str, row_id: RowId) -> Option<VersionedRow> {
@@ -7889,6 +8417,19 @@ impl Database {
         row_id: RowId,
         details: UpsertIntentDetails,
     ) -> Result<()> {
+        let mut vector_schema_refs = self.vector_schema_refs_for_table(&table);
+        if self.table_meta(&table).is_some_and(|meta| {
+            meta.state_machine.is_some_and(|state_machine| {
+                details
+                    .update_columns
+                    .iter()
+                    .any(|(column_name, _)| *column_name == state_machine.column)
+            })
+        }) {
+            vector_schema_refs
+                .extend(self.vector_schema_refs_for_state_propagation_from_table(&table));
+        }
+        self.record_vector_schema_epochs(tx, vector_schema_refs)?;
         self.tx_mgr.with_write_set(tx, |_| ())?;
         self.pending_commit_metadata
             .lock()
@@ -8011,23 +8552,61 @@ impl Database {
     }
 
     pub(crate) fn log_alter_table_ddl(&self, name: &str, meta: &TableMeta, lsn: Lsn) -> Result<()> {
-        let change = DdlChange::AlterTable {
-            name: name.to_string(),
-            columns: meta
-                .columns
-                .iter()
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        sql_type_for_meta_column(c, &meta.propagation_rules),
-                    )
-                })
-                .collect(),
-            constraints: create_table_constraints_from_meta(meta),
-            foreign_keys: single_column_foreign_keys_from_meta(meta, &HashSet::new()),
-            composite_foreign_keys: meta.composite_foreign_keys.clone(),
-            composite_unique: meta.unique_constraints.clone(),
-        };
+        let change = alter_table_ddl_change(name, meta, Vec::new());
+        self.append_ddl_change(lsn, change)
+    }
+
+    pub(crate) fn persist_table_meta_rows_vectors_and_log_alter_table_ddl(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        lsn: Lsn,
+    ) -> Result<()> {
+        self.persist_table_meta_rows_vectors_and_append_alter_table_ddl(name, meta, lsn, Vec::new())
+    }
+
+    pub(crate) fn persist_table_meta_rows_vectors_and_log_alter_table_ddl_with_vector_rename(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        from: &str,
+        to: &str,
+        lsn: Lsn,
+    ) -> Result<()> {
+        self.persist_table_meta_rows_vectors_and_append_alter_table_ddl(
+            name,
+            meta,
+            lsn,
+            vec![sync_vector_rename_constraint(from, to)],
+        )
+    }
+
+    fn persist_table_meta_rows_vectors_and_append_alter_table_ddl(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        lsn: Lsn,
+        extra_constraints: Vec<String>,
+    ) -> Result<()> {
+        let change = alter_table_ddl_change(name, meta, extra_constraints);
+        if let Some(persistence) = &self.persistence {
+            let rows = self
+                .relational_store
+                .tables
+                .read()
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
+            let vectors = self.vector_store.all_entries();
+            persistence.rewrite_table_meta_rows_vectors_and_append_ddl_log(
+                name, meta, &rows, &vectors, lsn, &change,
+            )?;
+        }
+        self.ddl_log.write().push((lsn, change));
+        Ok(())
+    }
+
+    fn append_ddl_change(&self, lsn: Lsn, change: DdlChange) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             persistence.append_ddl_log(lsn, &change)?;
         }
@@ -8207,14 +8786,6 @@ impl Database {
             if let Some(rows) = tables.get(name) {
                 persistence.rewrite_table_rows(name, rows)?;
             }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn persist_vectors(&self) -> Result<()> {
-        if let Some(persistence) = &self.persistence {
-            let vectors = self.vector_store.all_entries();
-            persistence.rewrite_vectors(&vectors)?;
         }
         Ok(())
     }
@@ -8766,36 +9337,12 @@ impl Database {
                         composite_foreign_keys,
                         composite_unique,
                     );
-                    let mut existing = meta
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect::<HashSet<_>>();
-                    for column in incoming.columns {
-                        if existing.insert(column.name.clone()) {
-                            meta.columns.push(column);
-                        } else if let Some(current) = meta
-                            .columns
-                            .iter_mut()
-                            .find(|current| current.name == column.name)
-                        {
-                            current.references = column.references;
-                        }
-                    }
-                    if !incoming.unique_constraints.is_empty() {
-                        meta.unique_constraints = incoming.unique_constraints;
-                    }
-                    if !incoming.composite_foreign_keys.is_empty() {
-                        meta.composite_foreign_keys = incoming.composite_foreign_keys;
-                    }
-                    let user_indexes = meta
-                        .indexes
-                        .iter()
-                        .filter(|index| index.kind == IndexKind::UserDeclared)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    meta.indexes = crate::executor::auto_indexes_for_table_meta(meta);
-                    meta.indexes.extend(user_indexes);
+                    Self::apply_sync_alter_to_projected_table_meta(
+                        name,
+                        meta,
+                        incoming,
+                        constraints,
+                    );
                 }
             }
             DdlChange::DropTable { name } => {
@@ -8828,6 +9375,207 @@ impl Database {
             | DdlChange::CreateRoute { .. }
             | DdlChange::DropRoute { .. } => {}
         }
+    }
+
+    fn sync_meta_column_names(meta: &TableMeta) -> HashSet<String> {
+        meta.columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    }
+
+    fn sync_vector_columns(meta: &TableMeta) -> BTreeMap<String, (usize, VectorQuantization)> {
+        meta.columns
+            .iter()
+            .filter_map(|column| match column.column_type {
+                ColumnType::Vector(dimension) => {
+                    Some((column.name.clone(), (dimension, column.quantization)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sync_alter_is_full_shape(
+        existing: &TableMeta,
+        incoming: &TableMeta,
+        constraints: &[String],
+    ) -> bool {
+        let incoming_column_names = Self::sync_meta_column_names(incoming);
+        if existing
+            .columns
+            .iter()
+            .filter(|column| !matches!(column.column_type, ColumnType::Vector(_)))
+            .any(|column| !incoming_column_names.contains(&column.name))
+        {
+            return false;
+        }
+
+        let existing_vector_columns = Self::sync_vector_columns(existing);
+        let incoming_vector_columns = Self::sync_vector_columns(incoming);
+        let existing_column_names = Self::sync_meta_column_names(existing);
+        let added_non_vector = incoming.columns.iter().any(|column| {
+            !matches!(column.column_type, ColumnType::Vector(_))
+                && !existing_column_names.contains(&column.name)
+        });
+        if existing_vector_columns.iter().any(|(column, shape)| {
+            incoming_vector_columns
+                .get(column)
+                .is_some_and(|incoming_shape| incoming_shape != shape)
+        }) {
+            return true;
+        }
+        let marked_rename =
+            Self::sync_marked_vector_rename(existing, incoming, constraints).is_some();
+
+        let removed = existing_vector_columns
+            .keys()
+            .filter(|column| !incoming_vector_columns.contains_key(*column))
+            .count();
+        let added = incoming_vector_columns
+            .keys()
+            .filter(|column| !existing_vector_columns.contains_key(*column))
+            .count();
+        if removed == 0 {
+            return added > 0;
+        }
+        if added == 0 {
+            return !added_non_vector;
+        }
+        marked_rename
+    }
+
+    fn sync_marked_vector_rename(
+        existing: &TableMeta,
+        incoming: &TableMeta,
+        constraints: &[String],
+    ) -> Option<(String, String)> {
+        let marked = sync_vector_rename_from_constraints(constraints)?;
+        let existing_vector_columns = Self::sync_vector_columns(existing);
+        let incoming_vector_columns = Self::sync_vector_columns(incoming);
+        let (from, to) = marked;
+        if incoming_vector_columns.contains_key(&from) || existing_vector_columns.contains_key(&to)
+        {
+            return None;
+        }
+        (existing_vector_columns.get(&from) == incoming_vector_columns.get(&to))
+            .then_some((from, to))
+    }
+
+    fn merged_sync_full_shape_vector_alter_meta(
+        table_name: &str,
+        existing: &TableMeta,
+        incoming: TableMeta,
+        constraints: &[String],
+    ) -> TableMeta {
+        let existing_columns = existing
+            .columns
+            .iter()
+            .map(|column| (column.name.clone(), column.clone()))
+            .collect::<HashMap<_, _>>();
+        let renamed_vector_column =
+            Self::sync_marked_vector_rename(existing, &incoming, constraints);
+        let mut merged = existing.clone();
+        merged.columns = incoming
+            .columns
+            .into_iter()
+            .map(|incoming_column| {
+                let existing_column = existing_columns
+                    .get(&incoming_column.name)
+                    .or_else(|| {
+                        renamed_vector_column
+                            .as_ref()
+                            .and_then(|(from, to)| (to == &incoming_column.name).then_some(from))
+                            .and_then(|from| existing_columns.get(from))
+                    })
+                    .cloned();
+                if let Some(mut column) = existing_column {
+                    column.name = incoming_column.name;
+                    column.column_type = incoming_column.column_type;
+                    column.quantization = incoming_column.quantization;
+                    column.references = incoming_column.references;
+                    column
+                } else {
+                    incoming_column
+                }
+            })
+            .collect();
+        if !incoming.unique_constraints.is_empty() {
+            merged.unique_constraints = incoming.unique_constraints;
+        }
+        if !incoming.composite_foreign_keys.is_empty() {
+            merged.composite_foreign_keys = incoming.composite_foreign_keys;
+        }
+        let final_column_names = Self::sync_meta_column_names(&merged);
+        let user_indexes = existing
+            .indexes
+            .iter()
+            .filter(|index| {
+                index.kind == IndexKind::UserDeclared
+                    && index
+                        .columns
+                        .iter()
+                        .all(|(column, _)| final_column_names.contains(column))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        merged.indexes = crate::executor::auto_indexes_for_table_meta(&merged);
+        merged.indexes.extend(user_indexes);
+        resolve_sync_rank_policies(table_name, &mut merged);
+        merged
+    }
+
+    fn sync_alter_vector_shape_changed(
+        existing: &TableMeta,
+        incoming: &TableMeta,
+        constraints: &[String],
+    ) -> bool {
+        Self::sync_alter_is_full_shape(existing, incoming, constraints)
+            && Self::sync_vector_columns(existing) != Self::sync_vector_columns(incoming)
+    }
+
+    fn apply_sync_alter_to_projected_table_meta(
+        table_name: &str,
+        meta: &mut TableMeta,
+        incoming: TableMeta,
+        constraints: &[String],
+    ) {
+        if Self::sync_alter_vector_shape_changed(meta, &incoming, constraints) {
+            *meta = Self::merged_sync_full_shape_vector_alter_meta(
+                table_name,
+                meta,
+                incoming,
+                constraints,
+            );
+            return;
+        }
+
+        let mut existing = Self::sync_meta_column_names(meta);
+        for column in incoming.columns {
+            if existing.insert(column.name.clone()) {
+                meta.columns.push(column);
+            } else if let Some(current) = meta
+                .columns
+                .iter_mut()
+                .find(|current| current.name == column.name)
+            {
+                current.references = column.references;
+            }
+        }
+        if !incoming.unique_constraints.is_empty() {
+            meta.unique_constraints = incoming.unique_constraints;
+        }
+        if !incoming.composite_foreign_keys.is_empty() {
+            meta.composite_foreign_keys = incoming.composite_foreign_keys;
+        }
+        let user_indexes = meta
+            .indexes
+            .iter()
+            .filter(|index| index.kind == IndexKind::UserDeclared)
+            .cloned()
+            .collect::<Vec<_>>();
+        meta.indexes = crate::executor::auto_indexes_for_table_meta(meta);
+        meta.indexes.extend(user_indexes);
     }
 
     fn projected_sync_ddl_metadata_bytes(&self, ddl: &[DdlChange]) -> usize {
@@ -8873,36 +9621,12 @@ impl Database {
                             composite_foreign_keys,
                             composite_unique,
                         );
-                        let mut existing = meta
-                            .columns
-                            .iter()
-                            .map(|column| column.name.clone())
-                            .collect::<HashSet<_>>();
-                        for column in incoming.columns {
-                            if existing.insert(column.name.clone()) {
-                                meta.columns.push(column);
-                            } else if let Some(current) = meta
-                                .columns
-                                .iter_mut()
-                                .find(|current| current.name == column.name)
-                            {
-                                current.references = column.references;
-                            }
-                        }
-                        if !incoming.unique_constraints.is_empty() {
-                            meta.unique_constraints = incoming.unique_constraints;
-                        }
-                        if !incoming.composite_foreign_keys.is_empty() {
-                            meta.composite_foreign_keys = incoming.composite_foreign_keys;
-                        }
-                        let user_indexes = meta
-                            .indexes
-                            .iter()
-                            .filter(|index| index.kind == IndexKind::UserDeclared)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        meta.indexes = crate::executor::auto_indexes_for_table_meta(meta);
-                        meta.indexes.extend(user_indexes);
+                        Self::apply_sync_alter_to_projected_table_meta(
+                            name,
+                            meta,
+                            incoming,
+                            constraints,
+                        );
                         required =
                             required.saturating_add(meta.estimated_bytes().saturating_sub(before));
                     }
@@ -10081,6 +10805,7 @@ impl Database {
     /// Extracts changes from this database since the given LSN.
     pub fn changes_since(&self, since_lsn: Lsn) -> ChangeSet {
         let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read_many(self.vector_store_schema_refs());
         // Future watermark guard
         if since_lsn > self.current_lsn() {
             return ChangeSet::default();
@@ -10839,6 +11564,8 @@ impl Database {
                             let bytes_to_release =
                                 crate::executor::estimate_drop_table_bytes(self, &name);
                             let prefix_trigger_ddl = std::mem::take(&mut trigger_ddl);
+                            self.drain_vector_table_maintenance_for_ddl(&name);
+                            let _vector_schema = self.vector_schema_write_table(&name);
                             self.allocate_ddl_lsn(|lsn| {
                                 self.log_drop_table_ddl_and_remove_triggers_with_prefix(
                                     &name,
@@ -10850,6 +11577,8 @@ impl Database {
                             self.clear_statement_cache();
                         } else if table_had_triggers {
                             let prefix_trigger_ddl = std::mem::take(&mut trigger_ddl);
+                            self.drain_vector_table_maintenance_for_ddl(&name);
+                            let _vector_schema = self.vector_schema_write_table(&name);
                             self.allocate_ddl_lsn(|lsn| {
                                 self.log_drop_table_ddl_and_remove_triggers_with_prefix(
                                     &name,
@@ -10876,28 +11605,151 @@ impl Database {
                             continue;
                         }
                         let existing = self.table_meta(&name).unwrap_or_default();
-                        let existing_cols: HashSet<String> =
-                            existing.columns.iter().map(|c| c.name.clone()).collect();
-                        for (col, ty) in &columns {
-                            if existing_cols.contains(col.as_str()) {
-                                continue;
+                        let incoming = rough_sync_table_meta(
+                            &columns,
+                            &constraints,
+                            &foreign_keys,
+                            &composite_foreign_keys,
+                            &composite_unique,
+                        );
+                        let existing_vector_columns = Self::sync_vector_columns(&existing);
+                        let incoming_vector_columns = Self::sync_vector_columns(&incoming);
+                        let existing_column_names = Self::sync_meta_column_names(&existing);
+                        let vector_shape_changed = Self::sync_alter_vector_shape_changed(
+                            &existing,
+                            &incoming,
+                            &constraints,
+                        );
+                        if vector_shape_changed {
+                            let removed_vector_columns = existing_vector_columns
+                                .keys()
+                                .filter(|column| !incoming_vector_columns.contains_key(*column))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let renamed_vector_column =
+                                Self::sync_marked_vector_rename(&existing, &incoming, &constraints);
+                            let changed_existing_columns = existing_vector_columns
+                                .iter()
+                                .filter(|(column, shape)| {
+                                    incoming_vector_columns
+                                        .get(*column)
+                                        .is_some_and(|incoming_shape| incoming_shape != *shape)
+                                })
+                                .map(|(column, _)| column.clone())
+                                .collect::<Vec<_>>();
+                            for column in removed_vector_columns
+                                .iter()
+                                .chain(changed_existing_columns.iter())
+                            {
+                                self.drain_vector_index_maintenance_for_ddl(&VectorIndexRef::new(
+                                    &name,
+                                    column.clone(),
+                                ));
                             }
-                            let sql = format!(
-                                "ALTER TABLE {} ADD COLUMN {} {}",
-                                name,
-                                col,
-                                sync_column_type_with_foreign_key(col, ty, &foreign_keys)
-                            );
-                            self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                            let vector_schema_refs = existing_vector_columns
+                                .keys()
+                                .chain(incoming_vector_columns.keys())
+                                .map(|column| VectorIndexRef::new(&name, column.clone()));
+                            let _vector_schema = self.vector_schema_write_many(vector_schema_refs);
+                            self.allocate_ddl_lsn(|lsn| {
+                                let store = self.relational_store();
+                                let meta = Self::merged_sync_full_shape_vector_alter_meta(
+                                    &name,
+                                    &existing,
+                                    incoming.clone(),
+                                    &constraints,
+                                );
+                                if let Some((from, to)) = &renamed_vector_column {
+                                    store
+                                        .alter_table_rename_column(&name, from, to)
+                                        .map_err(Error::Other)?;
+                                }
+                                for column in &removed_vector_columns {
+                                    if renamed_vector_column
+                                        .as_ref()
+                                        .is_some_and(|(from, _)| from == column)
+                                    {
+                                        continue;
+                                    }
+                                    store
+                                        .alter_table_drop_column(&name, column)
+                                        .map_err(Error::Other)?;
+                                }
+                                for column in &changed_existing_columns {
+                                    store
+                                        .alter_table_drop_column(&name, column)
+                                        .map_err(Error::Other)?;
+                                }
+
+                                store.table_meta.write().insert(name.clone(), meta.clone());
+                                for index in meta
+                                    .indexes
+                                    .iter()
+                                    .filter(|index| index.kind == IndexKind::Auto)
+                                {
+                                    store.create_index_storage(
+                                        &name,
+                                        &index.name,
+                                        index.columns.clone(),
+                                    );
+                                    store.rebuild_index(&name, &index.name);
+                                }
+
+                                if let Some((from, to)) = &renamed_vector_column
+                                    && self
+                                        .vector_store
+                                        .try_state(&VectorIndexRef::new(&name, from))
+                                        .is_some()
+                                {
+                                    self.rename_vector_index(&name, from, to)?;
+                                }
+                                for column in &removed_vector_columns {
+                                    if renamed_vector_column
+                                        .as_ref()
+                                        .is_some_and(|(from, _)| from == column)
+                                    {
+                                        continue;
+                                    }
+                                    self.deregister_vector_index(&name, column);
+                                }
+                                for column in &changed_existing_columns {
+                                    self.deregister_vector_index(&name, column);
+                                }
+                                for column in &meta.columns {
+                                    if matches!(column.column_type, ColumnType::Vector(_))
+                                        && self
+                                            .vector_store
+                                            .try_state(&VectorIndexRef::new(&name, &column.name))
+                                            .is_none()
+                                    {
+                                        self.register_vector_index_for_column(&name, column);
+                                    }
+                                }
+                                if let Some((from, to)) = &renamed_vector_column {
+                                    self.persist_table_meta_rows_vectors_and_log_alter_table_ddl_with_vector_rename(
+                                        &name, &meta, from, to, lsn,
+                                    )
+                                } else {
+                                    self.persist_table_meta_rows_vectors_and_log_alter_table_ddl(
+                                        &name, &meta, lsn,
+                                    )
+                                }
+                            })?;
+                        } else {
+                            for (col, ty) in &columns {
+                                if existing_column_names.contains(col.as_str()) {
+                                    continue;
+                                }
+                                let sql = format!(
+                                    "ALTER TABLE {} ADD COLUMN {} {}",
+                                    name,
+                                    col,
+                                    sync_column_type_with_foreign_key(col, ty, &foreign_keys)
+                                );
+                                self.execute_in_tx(tx, &sql, &HashMap::new())?;
+                            }
                         }
-                        if let Some(mut meta) = self.table_meta(&name) {
-                            let incoming = rough_sync_table_meta(
-                                &columns,
-                                &constraints,
-                                &foreign_keys,
-                                &composite_foreign_keys,
-                                &composite_unique,
-                            );
+                        if !vector_shape_changed && let Some(mut meta) = self.table_meta(&name) {
                             for incoming_column in incoming.columns {
                                 if let Some(existing_column) = meta
                                     .columns
@@ -12048,9 +12900,189 @@ fn vector_index_from_plan(plan: &PhysicalPlan) -> Option<VectorIndexRef> {
     }
 }
 
-fn hydrate_relational_vector_values(relational: &RelationalStore, vectors: &[VectorEntry]) {
+fn sanitize_loaded_row_for_meta(row: &mut VersionedRow, meta: &TableMeta) -> bool {
+    let columns = meta
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), &column.column_type))
+        .collect::<HashMap<_, _>>();
+    let before = row.values.len();
+    row.values
+        .retain(|column, value| match columns.get(column.as_str()) {
+            Some(ColumnType::Vector(dimension)) => {
+                matches!(value, Value::Vector(vector) if vector.len() == *dimension)
+            }
+            Some(_) => true,
+            None => false,
+        });
+    row.values.len() != before
+}
+
+fn vector_specs_from_meta(
+    table_meta: &HashMap<String, TableMeta>,
+) -> HashMap<VectorIndexRef, usize> {
+    let mut specs = HashMap::new();
+    for (table, meta) in table_meta {
+        for column in &meta.columns {
+            if let ColumnType::Vector(dimension) = column.column_type {
+                specs.insert(
+                    VectorIndexRef::new(table.clone(), column.name.clone()),
+                    dimension,
+                );
+            }
+        }
+    }
+    specs
+}
+
+#[derive(Clone)]
+struct VectorRenameDdl {
+    lsn: Lsn,
+    from: VectorIndexRef,
+    to: VectorIndexRef,
+}
+
+fn vector_renames_from_ddl_log(ddl_log: &[(Lsn, DdlChange)]) -> Vec<VectorRenameDdl> {
+    let mut renames = Vec::new();
+    for (lsn, change) in ddl_log {
+        let DdlChange::AlterTable {
+            name, constraints, ..
+        } = change
+        else {
+            continue;
+        };
+        if let Some((from, to)) = sync_vector_rename_from_constraints(constraints) {
+            renames.push(VectorRenameDdl {
+                lsn: *lsn,
+                from: VectorIndexRef::new(name, from),
+                to: VectorIndexRef::new(name, to),
+            });
+        }
+    }
+    renames.sort_by(|a, b| {
+        a.lsn
+            .cmp(&b.lsn)
+            .then(a.from.table.cmp(&b.from.table))
+            .then(a.from.column.cmp(&b.from.column))
+            .then(a.to.table.cmp(&b.to.table))
+            .then(a.to.column.cmp(&b.to.column))
+    });
+    renames
+}
+
+fn resolve_loaded_vector_index(
+    index: &VectorIndexRef,
+    entry_lsn: Lsn,
+    vector_specs: &HashMap<VectorIndexRef, usize>,
+    renames: &[VectorRenameDdl],
+) -> Option<VectorIndexRef> {
+    let mut current = index.clone();
+    let mut seen = HashSet::new();
+    for _ in 0..=renames.len() {
+        if !seen.insert(current.clone()) {
+            return None;
+        }
+        if let Some(rename) = renames
+            .iter()
+            .filter(|rename| rename.from == current && entry_lsn <= rename.lsn)
+            .min_by_key(|rename| rename.lsn)
+        {
+            current = rename.to.clone();
+            continue;
+        }
+        return vector_specs.contains_key(&current).then_some(current);
+    }
+    None
+}
+
+fn reconcile_loaded_vectors_for_meta(
+    vectors: Vec<VectorEntry>,
+    table_meta: &HashMap<String, TableMeta>,
+    ddl_log: &[(Lsn, DdlChange)],
+) -> (Vec<VectorEntry>, bool) {
+    let vector_specs = vector_specs_from_meta(table_meta);
+    let renames = vector_renames_from_ddl_log(ddl_log);
+    let mut repaired = false;
+    let mut reconciled = Vec::with_capacity(vectors.len());
+    for mut entry in vectors {
+        let Some(index) =
+            resolve_loaded_vector_index(&entry.index, entry.lsn, &vector_specs, &renames)
+        else {
+            repaired = true;
+            continue;
+        };
+        if entry.index != index {
+            entry.index = index;
+            repaired = true;
+        }
+        if vector_specs.get(&entry.index).copied() == Some(entry.vector.len()) {
+            reconciled.push(entry);
+        } else {
+            repaired = true;
+        }
+    }
+    (reconciled, repaired)
+}
+
+fn supplement_loaded_vectors_from_rows(
+    relational: &RelationalStore,
+    table_meta: &HashMap<String, TableMeta>,
+    vectors: &mut Vec<VectorEntry>,
+) -> bool {
+    let mut seen = vectors
+        .iter()
+        .map(|entry| {
+            (
+                entry.index.clone(),
+                entry.row_id,
+                entry.created_tx,
+                entry.lsn,
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut supplemented = false;
+    let tables = relational.tables.read();
+    for (table, meta) in table_meta {
+        let Some(rows) = tables.get(table) else {
+            continue;
+        };
+        for column in &meta.columns {
+            let ColumnType::Vector(dimension) = column.column_type else {
+                continue;
+            };
+            let index = VectorIndexRef::new(table.clone(), column.name.clone());
+            for row in rows {
+                let Some(Value::Vector(vector)) = row.values.get(&column.name) else {
+                    continue;
+                };
+                if vector.len() != dimension {
+                    continue;
+                }
+                let key = (index.clone(), row.row_id, row.created_tx, row.lsn);
+                if seen.insert(key) {
+                    vectors.push(VectorEntry {
+                        index: index.clone(),
+                        row_id: row.row_id,
+                        vector: vector.clone(),
+                        created_tx: row.created_tx,
+                        deleted_tx: row.deleted_tx,
+                        lsn: row.lsn,
+                    });
+                    supplemented = true;
+                }
+            }
+        }
+    }
+    supplemented
+}
+
+fn hydrate_relational_vector_values(
+    relational: &RelationalStore,
+    vectors: &[VectorEntry],
+) -> HashSet<String> {
+    let mut changed = HashSet::new();
     if vectors.is_empty() {
-        return;
+        return changed;
     }
     let mut tables = relational.tables.write();
     for entry in vectors {
@@ -12060,12 +13092,14 @@ fn hydrate_relational_vector_values(relational: &RelationalStore, vectors: &[Vec
         if let Some(row) = rows.iter_mut().find(|row| {
             row.row_id == entry.row_id && row.created_tx == entry.created_tx && row.lsn == entry.lsn
         }) {
-            row.values.insert(
-                entry.index.column.clone(),
-                Value::Vector(entry.vector.clone()),
-            );
+            let value = Value::Vector(entry.vector.clone());
+            if row.values.get(&entry.index.column) != Some(&value) {
+                row.values.insert(entry.index.column.clone(), value);
+                changed.insert(entry.index.table.clone());
+            }
         }
     }
+    changed
 }
 
 fn remove_cached_row(cache: &mut HashMap<String, Vec<VersionedRow>>, table: &str, row_id: RowId) {
@@ -13346,6 +14380,9 @@ fn sync_create_table_sql(
         }
     }
     for constraint in constraints {
+        if sync_constraint_is_vector_rename(constraint) {
+            continue;
+        }
         if sync_constraint_is_table_element(constraint) {
             if seen_table_elements.insert(schema_clause_key(constraint)) {
                 table_elements.push(constraint.clone());
@@ -13361,6 +14398,32 @@ fn sync_create_table_sql(
         sql.push_str(&table_options.join(" "));
     }
     sql
+}
+
+fn alter_table_ddl_change(
+    name: &str,
+    meta: &TableMeta,
+    extra_constraints: Vec<String>,
+) -> DdlChange {
+    let mut constraints = create_table_constraints_from_meta(meta);
+    constraints.extend(extra_constraints);
+    DdlChange::AlterTable {
+        name: name.to_string(),
+        columns: meta
+            .columns
+            .iter()
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    sql_type_for_meta_column(c, &meta.propagation_rules),
+                )
+            })
+            .collect(),
+        constraints,
+        foreign_keys: single_column_foreign_keys_from_meta(meta, &HashSet::new()),
+        composite_foreign_keys: meta.composite_foreign_keys.clone(),
+        composite_unique: meta.unique_constraints.clone(),
+    }
 }
 
 fn sync_column_type_with_foreign_key(
@@ -13386,6 +14449,13 @@ fn sync_column_type_with_foreign_key(
 fn sync_constraint_is_table_element(constraint: &str) -> bool {
     let upper = normalize_schema_type(constraint).to_ascii_uppercase();
     upper.starts_with("UNIQUE") || upper.starts_with("FOREIGN KEY")
+}
+
+fn sync_constraint_is_vector_rename(constraint: &str) -> bool {
+    constraint
+        .trim()
+        .to_ascii_uppercase()
+        .starts_with("VECTOR_RENAME(")
 }
 
 fn schema_clause_key(value: &str) -> String {
@@ -13449,6 +14519,35 @@ fn ddl_unique_constraints(constraints: &[String]) -> Vec<Vec<String>> {
             (!columns.is_empty()).then_some(columns)
         })
         .collect()
+}
+
+fn sync_vector_rename_constraint(from: &str, to: &str) -> String {
+    format!("VECTOR_RENAME({from},{to})")
+}
+
+fn sync_vector_rename_from_constraints(constraints: &[String]) -> Option<(String, String)> {
+    const PREFIX: &str = "VECTOR_RENAME(";
+    for constraint in constraints {
+        let trimmed = constraint.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if !upper.starts_with(PREFIX) || !trimmed.ends_with(')') {
+            continue;
+        }
+        let body = &trimmed[PREFIX.len()..trimmed.len().saturating_sub(1)];
+        let (from, to) = body.split_once(',')?;
+        let from = from
+            .trim()
+            .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
+            .to_string();
+        let to = to
+            .trim()
+            .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`')
+            .to_string();
+        if !from.is_empty() && !to.is_empty() {
+            return Some((from, to));
+        }
+    }
+    None
 }
 
 fn ddl_column_reference(ty: &str) -> Option<ForeignKeyReference> {
@@ -13593,6 +14692,8 @@ fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
         ColumnType::Text
     };
 
+    let rank_policy = sync_rank_policy_from_column_type(name, ty);
+
     ColumnDef {
         name: name.to_string(),
         column_type,
@@ -13604,10 +14705,115 @@ fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
         expires,
         immutable,
         quantization,
-        rank_policy: None,
+        rank_policy,
         context_id: upper.contains("CONTEXT_ID"),
         scope_label: None,
         acl_ref: None,
+    }
+}
+
+fn sync_rank_policy_from_column_type(name: &str, ty: &str) -> Option<RankPolicy> {
+    if !normalize_schema_type(ty)
+        .to_ascii_uppercase()
+        .contains("RANK_POLICY")
+    {
+        return None;
+    }
+    let sql = format!("CREATE TABLE __sync_rank_policy ({name} {ty})");
+    let Ok(Statement::CreateTable(table)) = contextdb_parser::parse(&sql) else {
+        return None;
+    };
+    table.columns.into_iter().next().and_then(|column| {
+        column
+            .rank_policy
+            .map(|policy| crate::executor::map_rank_policy(&policy))
+    })
+}
+
+fn resolve_sync_rank_policies(table_name: &str, meta: &mut TableMeta) {
+    let joined_meta = meta.clone();
+    let anchor_columns = joined_meta.columns.clone();
+    for column in &mut meta.columns {
+        let Some(policy) = column.rank_policy.as_mut() else {
+            continue;
+        };
+        if policy.joined_table != table_name {
+            continue;
+        }
+        if let Some(protected_index) =
+            sync_rank_policy_protected_index(&joined_meta, &policy.joined_column)
+        {
+            policy.protected_index = protected_index;
+        }
+        if let Some(anchor_column) =
+            resolve_sync_rank_policy_anchor_column(policy, &anchor_columns, &joined_meta)
+        {
+            policy.anchor_column = anchor_column;
+        }
+    }
+}
+
+fn sync_rank_policy_protected_index(meta: &TableMeta, joined_column: &str) -> Option<String> {
+    meta.indexes
+        .iter()
+        .filter(|index| index.kind == IndexKind::UserDeclared)
+        .chain(meta.indexes.iter())
+        .find(|index| {
+            index
+                .columns
+                .first()
+                .is_some_and(|(column, _)| column == joined_column)
+        })
+        .map(|index| index.name.clone())
+}
+
+fn resolve_sync_rank_policy_anchor_column(
+    policy: &RankPolicy,
+    anchor_columns: &[ColumnDef],
+    joined_meta: &TableMeta,
+) -> Option<String> {
+    let joined_column = joined_meta
+        .columns
+        .iter()
+        .find(|column| column.name == policy.joined_column)?;
+    let anchor_by_name = |name: &str| anchor_columns.iter().find(|column| column.name == name);
+    let mut candidates = Vec::new();
+    if joined_column.primary_key {
+        let singular = sync_singular_table_name(&policy.joined_table);
+        for name in [
+            format!("{singular}_id"),
+            format!("{}_id", policy.joined_table),
+        ] {
+            if anchor_by_name(&name).is_some() && !candidates.contains(&name) {
+                candidates.push(name);
+            }
+        }
+    }
+    if candidates.is_empty() && anchor_by_name(&policy.joined_column).is_some() {
+        candidates.push(policy.joined_column.clone());
+    }
+    if candidates.is_empty()
+        && let Some(primary_key) = anchor_columns.iter().find(|column| column.primary_key)
+    {
+        candidates.push(primary_key.name.clone());
+    }
+    if candidates.is_empty() && anchor_by_name("id").is_some() {
+        candidates.push("id".to_string());
+    }
+    let [anchor_column] = candidates.as_slice() else {
+        return None;
+    };
+    let anchor_def = anchor_by_name(anchor_column)?;
+    (anchor_def.column_type == joined_column.column_type).then(|| anchor_column.clone())
+}
+
+fn sync_singular_table_name(table: &str) -> String {
+    if let Some(stem) = table.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if let Some(stem) = table.strip_suffix('s') {
+        stem.to_string()
+    } else {
+        table.to_string()
     }
 }
 

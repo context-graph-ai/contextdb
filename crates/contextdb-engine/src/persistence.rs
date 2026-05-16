@@ -1342,6 +1342,81 @@ impl RedbPersistence {
         })
     }
 
+    pub fn rewrite_table_meta_rows_vectors_and_append_ddl_log(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        rows: &[VersionedRow],
+        vectors: &[VectorEntry],
+        lsn: Lsn,
+        ddl: &DdlChange,
+    ) -> Result<()> {
+        let mut table_meta = self.load_all_table_meta()?;
+        table_meta.insert(name.to_string(), meta.clone());
+        let vector_quantization = Self::vector_quantization_map(&table_meta);
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::meta_key(name);
+                let encoded = Self::encode(meta)?;
+                meta_table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            {
+                let table_name = Self::rel_table_name(name);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let _ = write_txn.delete_table(table_def);
+                let legacy_table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let _ = write_txn.delete_table(legacy_table_def);
+                let mut redb_table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+                for row in rows {
+                    let encoded = Self::encode_versioned_row(row, Some(meta))?;
+                    let key = Self::rel_row_key(row);
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            let _ = write_txn.delete_table(VECTORS_TABLE);
+            {
+                let mut table = write_txn
+                    .open_table(VECTORS_TABLE)
+                    .map_err(Self::storage_error)?;
+                for entry in vectors {
+                    let quantization = vector_quantization
+                        .get(&entry.index)
+                        .copied()
+                        .unwrap_or_default();
+                    let encoded = Self::encode_vector_entry(entry, quantization)?;
+                    let key = Self::vector_key(entry);
+                    table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::ddl_log_key(lsn);
+                let encoded = Self::encode(ddl)?;
+                ddl_table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
     pub fn rewrite_graph_edges(&self, edges: &[AdjEntry]) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;

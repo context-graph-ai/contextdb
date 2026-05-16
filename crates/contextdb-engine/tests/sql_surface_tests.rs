@@ -6222,11 +6222,9 @@ fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
         .expect_err("commit must reject stale 3D vector staged for reshaped 4D index");
     assert!(matches!(
         err,
-        Error::VectorIndexDimensionMismatch {
-            index,
-            expected: 4,
-            actual: 3,
-        } if index == VectorIndexRef::new("evidence", "embedding")
+        Error::SchemaInvalid { reason }
+            if reason.contains("evidence.embedding")
+                && reason.contains("changed while transaction was open")
     ));
     let _ = db.rollback(tx);
     assert!(matches!(
@@ -6260,8 +6258,11 @@ fn commit_rejects_staged_vector_insert_after_same_ref_drop_readd_same_shape() {
 
     db.execute("ALTER TABLE evidence DROP COLUMN embedding", &empty())
         .unwrap();
-    db.execute("ALTER TABLE evidence ADD COLUMN embedding VECTOR(3)", &empty())
-        .unwrap();
+    db.execute(
+        "ALTER TABLE evidence ADD COLUMN embedding VECTOR(3)",
+        &empty(),
+    )
+    .unwrap();
 
     let err = db
         .commit(tx)
@@ -6280,6 +6281,68 @@ fn commit_rejects_staged_vector_insert_after_same_ref_drop_readd_same_shape() {
         ),
         Ok(result) if result.rows.is_empty()
     ));
+}
+
+#[test]
+fn commit_rejects_commit_time_vector_exclusion_after_same_ref_drop_readd_same_shape() {
+    let db = Database::open_memory();
+    let id = Uuid::from_u128(445);
+    db.execute(
+        "CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT, embedding VECTOR(3)) STATE MACHINE (status: active -> [invalidated]) PROPAGATE ON STATE invalidated EXCLUDE VECTOR",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO decisions (id, status, embedding) VALUES ($id, 'active', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO decisions (id, status) VALUES ($id, 'invalidated') ON CONFLICT (id) DO UPDATE SET status = 'invalidated'",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    db.execute("ALTER TABLE decisions DROP COLUMN embedding", &empty())
+        .unwrap();
+    db.execute(
+        "ALTER TABLE decisions ADD COLUMN embedding VECTOR(3)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE decisions SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(per_index_axis3(1))),
+        ]),
+    )
+    .unwrap();
+
+    let err = db.commit(tx).expect_err(
+        "commit-time vector exclusion must not delete a newer same-ref vector generation",
+    );
+    assert!(matches!(
+        err,
+        Error::SchemaInvalid { reason }
+            if reason.contains("decisions.embedding")
+                && reason.contains("changed while transaction was open")
+    ));
+    let _ = db.rollback(tx);
+
+    let result = db
+        .execute(
+            "SELECT id FROM decisions ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(1)))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
 }
 
 #[test]

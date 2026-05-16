@@ -203,4 +203,8 @@ impl VectorStore {
         let generation = slot.arm();
         MaintenancePauseHandle { slot, generation }
     }
+
+    pub fn maybe_pause_ddl_for_test(&self, index: &VectorIndexRef) {
+        self.pause_registry().maybe_pause(index, PauseWindow::Ddl);
+    }
 }

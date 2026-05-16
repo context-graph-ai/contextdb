@@ -553,6 +553,12 @@ impl Database {
         let pending_trigger_active_guards =
             std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
         let mut committed_trigger_audit_entries = Vec::new();
+        // Cron callbacks are arbitrary user code and can stage vector writes
+        // while the tx manager's commit mutex is held. Acquire current vector
+        // schema refs before entering that mutex so DDL keeps the normal
+        // schema-gate -> commit-mutex lock order.
+        let mut vector_schema_guard =
+            Some(self.vector_schema_read_many(self.vector_store_schema_refs()));
         let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
             tx,
             |reserved_lsn| {
@@ -561,6 +567,9 @@ impl Database {
                     let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
                     let this_db = self as *const Self as usize;
                     let prior_db = CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
+                    let gate_id = self.vector_schema_gate_id();
+                    let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                        .with(|gate_slot| gate_slot.replace(Some(gate_id)));
                     let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
                     let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)));
                     if let Ok(Ok(())) = &result
@@ -592,6 +601,7 @@ impl Database {
                     }
                     CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
                     CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
+                    CRON_CALLBACK_VECTOR_SCHEMA_GATE.with(|gate_slot| gate_slot.set(prior_gate));
                     CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
                     slot.replace(prior_lsn);
                     result
@@ -606,6 +616,9 @@ impl Database {
             },
             |ws| {
                 if !ws.is_empty() {
+                    debug_assert!(
+                        !Self::write_set_touches_vector_schema(ws) || vector_schema_guard.is_some()
+                    );
                     self.rewrite_txid_placeholders(tx, ws)?;
                     let _validation = self.commit_validate(tx, ws)?;
                     self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
@@ -637,6 +650,7 @@ impl Database {
                 self.pending_commit_metadata.lock().remove(&tx);
                 if !ws.is_empty() {
                     self.release_delete_allocations(&ws);
+                    drop(vector_schema_guard.take());
                     self.plugin.post_commit(&ws, CommitSource::AutoCommit);
                     let sink_events_to_publish = if self.persistence.is_some() {
                         ws.commit_lsn
@@ -720,6 +734,7 @@ impl Database {
             relational_store: self.relational_store.clone(),
             graph_store: self.graph_store.clone(),
             vector_store: self.vector_store.clone(),
+            vector_schema_gates: self.vector_schema_gates.clone(),
             change_log: self.change_log.clone(),
             ddl_log: self.ddl_log.clone(),
             persistence: self.persistence.clone(),

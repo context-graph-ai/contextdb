@@ -36,23 +36,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         }
     }
 
-    fn brute_force_search(
+    fn brute_force_search_state(
         &self,
-        index: &VectorIndexRef,
+        _index: &VectorIndexRef,
+        state: &crate::store::IndexState,
         query: &[f32],
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<Vec<(RowId, f32)>> {
-        let state = self.store.state(index)?;
-        if query.len() != state.dimension() {
-            return Err(Error::VectorIndexDimensionMismatch {
-                index: index.clone(),
-                expected: state.dimension(),
-                actual: query.len(),
-            });
-        }
-
+    ) -> Vec<(RowId, f32)> {
         let mut scored: Vec<(RowId, f32)> = state.with_entries(|entries| {
             let mut scored = Vec::new();
             for entry in entries {
@@ -74,7 +66,28 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
-        Ok(scored)
+        scored
+    }
+
+    fn brute_force_search(
+        &self,
+        index: &VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<(RowId, f32)>> {
+        self.store.with_registered_state(index, |state| {
+            if query.len() != state.dimension() {
+                return Err(Error::VectorIndexDimensionMismatch {
+                    index: index.clone(),
+                    expected: state.dimension(),
+                    actual: query.len(),
+                });
+            }
+
+            Ok(self.brute_force_search_state(index, &state, query, k, candidates, snapshot))
+        })?
     }
 
     fn build_hnsw_from_state(
@@ -84,11 +97,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     ) -> Option<HnswIndex> {
         let dim = state.dimension();
         let entry_count = state.vector_count();
-        let estimated_bytes = estimate_hnsw_bytes(entry_count, dim, state.quantization());
+        let final_bytes = estimate_hnsw_bytes(entry_count, dim, state.quantization());
+        let reservation_bytes =
+            estimate_hnsw_build_reservation(entry_count, dim, state.quantization());
         if self
             .accountant
             .try_allocate_for(
-                estimated_bytes,
+                reservation_bytes,
                 "vector_index",
                 &format!("build_hnsw@{}.{}", index.table, index.column),
                 "Reduce vector volume or raise MEMORY_LIMIT so the HNSW index can be built.",
@@ -108,11 +123,173 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         }))
         .ok();
         if built.is_none() {
-            self.accountant.release(estimated_bytes);
+            self.accountant.release(reservation_bytes);
         } else {
-            state.set_hnsw_bytes(estimated_bytes);
+            self.accountant
+                .release(reservation_bytes.saturating_sub(final_bytes));
+            state.set_hnsw_bytes_with_accountant(final_bytes, self.accountant.clone());
         }
         built
+    }
+
+    fn search_with_strategy(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<(Vec<(RowId, f32)>, bool)> {
+        self.store.with_bulk_read(|| {
+            if k == 0 {
+                return Ok((Vec::new(), false));
+            }
+            enum BuildOutcome {
+                Ready,
+                Fallback,
+            }
+            enum SearchStep {
+                Done(Vec<(RowId, f32)>, bool),
+                BuildHnsw,
+            }
+
+            loop {
+                let snapshot_tx = TxId::from_snapshot(snapshot);
+                let step = self.store.with_registered_state(&index, |state| {
+                    if query.len() != state.dimension() {
+                        return Err(Error::VectorIndexDimensionMismatch {
+                            index: index.clone(),
+                            expected: state.dimension(),
+                            actual: query.len(),
+                        });
+                    }
+                    if state.entry_count() == 0 {
+                        return Ok(SearchStep::Done(Vec::new(), false));
+                    }
+
+                    if state.max_tx() > snapshot_tx {
+                        let rows = self.brute_force_search_state(
+                            &index, &state, query, k, candidates, snapshot,
+                        );
+                        return Ok(SearchStep::Done(rows, false));
+                    }
+                    if state.vector_count() < HNSW_THRESHOLD {
+                        let rows = self.brute_force_search_state(
+                            &index, &state, query, k, candidates, snapshot,
+                        );
+                        return Ok(SearchStep::Done(rows, false));
+                    }
+
+                    let Some(lock) = state.hnsw().get() else {
+                        return Ok(SearchStep::BuildHnsw);
+                    };
+                    let guard = lock.read();
+                    let Some(hnsw) = guard.as_ref() else {
+                        return Ok(SearchStep::BuildHnsw);
+                    };
+                    #[cfg(feature = "test-seams")]
+                    self.store
+                        .pause_registry()
+                        .maybe_pause(&index, crate::test_seam::PauseWindow::Search);
+
+                    let raw_candidates = hnsw.search(&index, query, k)?;
+                    let raw_candidate_count = raw_candidates.len();
+
+                    if candidates.is_some() && raw_candidates.len() < hnsw.len() {
+                        let rows = self.brute_force_search_state(
+                            &index, &state, query, k, candidates, snapshot,
+                        );
+                        return Ok(SearchStep::Done(rows, false));
+                    }
+
+                    let supplement_missing = raw_candidate_count.saturating_add(64) >= hnsw.len();
+                    let raw_row_ids = if supplement_missing {
+                        raw_candidates
+                            .iter()
+                            .map(|(row_id, _)| *row_id)
+                            .collect::<HashSet<_>>()
+                    } else {
+                        HashSet::new()
+                    };
+                    let mut visible = state.with_entries(|entries| {
+                        let mut visible = raw_candidates
+                            .into_iter()
+                            .filter_map(|(rid, _)| {
+                                entries
+                                    .iter()
+                                    .find(|entry| entry.row_id == rid && entry.visible_at(snapshot))
+                                    .and_then(|entry| {
+                                        if let Some(cands) = candidates
+                                            && !cands.contains(entry.row_id.0)
+                                        {
+                                            return None;
+                                        }
+                                        Some((entry.row_id, entry.vector.cosine_similarity(query)))
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        if supplement_missing {
+                            for entry in entries {
+                                if raw_row_ids.contains(&entry.row_id)
+                                    || !entry.visible_at(snapshot)
+                                {
+                                    continue;
+                                }
+                                visible.push((entry.row_id, entry.vector.cosine_similarity(query)));
+                            }
+                        }
+                        visible
+                    });
+
+                    visible
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    if visible.len() < k && raw_candidate_count < hnsw.len() {
+                        let rows = self.brute_force_search_state(
+                            &index, &state, query, k, candidates, snapshot,
+                        );
+                        return Ok(SearchStep::Done(rows, false));
+                    }
+                    visible.truncate(k);
+                    Ok(SearchStep::Done(visible, true))
+                })??;
+
+                match step {
+                    SearchStep::Done(rows, used_hnsw) => return Ok((rows, used_hnsw)),
+                    SearchStep::BuildHnsw => {
+                        let outcome = self.store.with_index_maintenance(&index, || {
+                            let Some(current) = self.store.try_state(&index) else {
+                                return Err(Error::UnknownVectorIndex {
+                                    index: index.clone(),
+                                });
+                            };
+                            if current.max_tx() > snapshot_tx
+                                || current.vector_count() < HNSW_THRESHOLD
+                            {
+                                return Ok(BuildOutcome::Fallback);
+                            }
+                            let current_lock = current.hnsw().get_or_init(|| RwLock::new(None));
+                            let mut guard = current_lock.write();
+                            if guard.is_none() {
+                                let Some(hnsw) = self.build_hnsw_from_state(&index, &current)
+                                else {
+                                    return Ok(BuildOutcome::Fallback);
+                                };
+                                *guard = Some(hnsw);
+                            }
+                            Ok(BuildOutcome::Ready)
+                        })?;
+                        match outcome {
+                            BuildOutcome::Ready => continue,
+                            BuildOutcome::Fallback => {
+                                let rows = self
+                                    .brute_force_search(&index, query, k, candidates, snapshot)?;
+                                return Ok((rows, false));
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -125,103 +302,8 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
     ) -> Result<Vec<(RowId, f32)>> {
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let Some(state) = self.store.try_state(&index) else {
-            return Err(Error::UnknownVectorIndex { index });
-        };
-        if query.len() != state.dimension() {
-            return Err(Error::VectorIndexDimensionMismatch {
-                index,
-                expected: state.dimension(),
-                actual: query.len(),
-            });
-        }
-        if state.entry_count() == 0 {
-            return Ok(Vec::new());
-        }
-
-        let snapshot_tx = TxId::from_snapshot(snapshot);
-        if state.max_tx() > snapshot_tx {
-            return self.brute_force_search(&index, query, k, candidates, snapshot);
-        }
-        let use_hnsw = state.vector_count() >= HNSW_THRESHOLD;
-        if use_hnsw {
-            let lock = state.hnsw().get_or_init(|| RwLock::new(None));
-
-            if lock.read().is_none() {
-                let _build_guard = self.store.build_lock();
-                if state.max_tx() > snapshot_tx || state.vector_count() < HNSW_THRESHOLD {
-                    return self.brute_force_search(&index, query, k, candidates, snapshot);
-                }
-                let mut guard = lock.write();
-                if guard.is_none() {
-                    *guard = self.build_hnsw_from_state(&index, &state);
-                }
-            }
-
-            let guard = lock.read();
-            if let Some(hnsw) = guard.as_ref() {
-                #[cfg(feature = "test-seams")]
-                self.store
-                    .pause_registry()
-                    .maybe_pause(&index, crate::test_seam::PauseWindow::Search);
-
-                let raw_candidates = hnsw.search(&index, query, k)?;
-                let raw_candidate_count = raw_candidates.len();
-
-                if candidates.is_some() && raw_candidates.len() < hnsw.len() {
-                    return self.brute_force_search(&index, query, k, candidates, snapshot);
-                }
-
-                let supplement_missing = raw_candidate_count.saturating_add(64) >= hnsw.len();
-                let raw_row_ids = if supplement_missing {
-                    raw_candidates
-                        .iter()
-                        .map(|(row_id, _)| *row_id)
-                        .collect::<HashSet<_>>()
-                } else {
-                    HashSet::new()
-                };
-                let mut visible = state.with_entries(|entries| {
-                    let mut visible = raw_candidates
-                        .into_iter()
-                        .filter_map(|(rid, _)| {
-                            entries
-                                .iter()
-                                .find(|entry| entry.row_id == rid && entry.visible_at(snapshot))
-                                .and_then(|entry| {
-                                    if let Some(cands) = candidates
-                                        && !cands.contains(entry.row_id.0)
-                                    {
-                                        return None;
-                                    }
-                                    Some((entry.row_id, entry.vector.cosine_similarity(query)))
-                                })
-                        })
-                        .collect::<Vec<_>>();
-                    if supplement_missing {
-                        for entry in entries {
-                            if raw_row_ids.contains(&entry.row_id) || !entry.visible_at(snapshot) {
-                                continue;
-                            }
-                            visible.push((entry.row_id, entry.vector.cosine_similarity(query)));
-                        }
-                    }
-                    visible
-                });
-
-                visible.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                if visible.len() < k && raw_candidate_count < hnsw.len() {
-                    return self.brute_force_search(&index, query, k, candidates, snapshot);
-                }
-                visible.truncate(k);
-                return Ok(visible);
-            }
-        }
-
-        self.brute_force_search(&index, query, k, candidates, snapshot)
+        self.search_with_strategy(index, query, k, candidates, snapshot)
+            .map(|(rows, _)| rows)
     }
 
     fn insert_vector(
@@ -361,4 +443,51 @@ fn estimate_hnsw_bytes(
             .saturating_mul(3)
             .saturating_add(exact_key_bytes),
     )
+}
+
+fn estimate_hnsw_build_reservation(
+    entry_count: usize,
+    dimension: usize,
+    quantization: VectorQuantization,
+) -> usize {
+    let final_bytes = estimate_hnsw_bytes(entry_count, dimension, quantization);
+    let (m, ef_construction, max_level_bound) = match quantization {
+        VectorQuantization::F32 => match entry_count {
+            0..=5000 => (16usize, 200usize, 16usize),
+            5001..=50000 => (24, 400, 16),
+            _ => (16, 200, 16),
+        },
+        _ => match entry_count {
+            0..=5000 => (8usize, 32usize, 16usize),
+            5001..=50000 => (12, 64, 16),
+            _ => (12, 64, 16),
+        },
+    };
+    let stored_vector_bytes = quantization.storage_bytes(dimension);
+    let word = std::mem::size_of::<usize>();
+    let sorted_entry_refs = entry_count.saturating_mul(word);
+    let cloned_vectors_and_refs = entry_count.saturating_mul(
+        stored_vector_bytes
+            .saturating_add(word.saturating_mul(5))
+            .saturating_add(std::mem::size_of::<RowId>()),
+    );
+    let map_and_exact_key_overhead = entry_count.saturating_mul(
+        std::mem::size_of::<RowId>()
+            .saturating_add(word.saturating_mul(3))
+            .saturating_add(64),
+    );
+    let graph_link_upper_bound = entry_count
+        .saturating_mul(m)
+        .saturating_mul(max_level_bound)
+        .saturating_mul(word.saturating_add(std::mem::size_of::<f32>()));
+    let construction_scratch = entry_count.min(ef_construction).saturating_mul(
+        word.saturating_mul(6)
+            .saturating_add(std::mem::size_of::<f32>().saturating_mul(2)),
+    );
+    final_bytes
+        .saturating_add(sorted_entry_refs)
+        .saturating_add(cloned_vectors_and_refs)
+        .saturating_add(map_and_exact_key_overhead)
+        .saturating_add(graph_link_upper_bound)
+        .saturating_add(construction_scratch)
 }

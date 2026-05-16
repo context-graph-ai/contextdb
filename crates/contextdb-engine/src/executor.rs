@@ -170,18 +170,53 @@ pub(crate) fn execute_plan(
                 "create_table",
                 "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
             )?;
-            db.relational_store().create_table(&p.name, meta);
-            for idx in &auto_indexes {
-                db.relational_store()
-                    .create_index_storage(&p.name, &idx.name, idx.columns.clone());
-            }
-            if let Some(table_meta) = db.table_meta(&p.name) {
-                for column in &table_meta.columns {
-                    db.register_vector_index_for_column(&p.name, column);
+            let has_vector_columns = meta
+                .columns
+                .iter()
+                .any(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)));
+            if has_vector_columns {
+                let vector_schema_refs = meta
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                    })
+                    .map(|column| VectorIndexRef::new(&p.name, column.name.clone()));
+                let _vector_schema = db.vector_schema_write_many(vector_schema_refs);
+                db.allocate_ddl_lsn(|lsn| {
+                    db.relational_store().create_table(&p.name, meta);
+                    for idx in &auto_indexes {
+                        db.relational_store().create_index_storage(
+                            &p.name,
+                            &idx.name,
+                            idx.columns.clone(),
+                        );
+                    }
+                    if let Some(table_meta) = db.table_meta(&p.name) {
+                        for column in &table_meta.columns {
+                            db.register_vector_index_for_column(&p.name, column);
+                        }
+                    }
+                    for (column, resolved) in resolved_policies {
+                        db.register_rank_formula(&p.name, &column, resolved.formula);
+                    }
+                    if let Some(table_meta) = db.table_meta(&p.name) {
+                        db.persist_table_meta(&p.name, &table_meta)?;
+                        db.log_create_table_ddl(&p.name, &table_meta, lsn)?;
+                    }
+                    Ok(())
+                })?;
+                db.clear_statement_cache();
+                return Ok(QueryResult::empty_with_affected(0));
+            } else {
+                db.relational_store().create_table(&p.name, meta);
+                for idx in &auto_indexes {
+                    db.relational_store().create_index_storage(
+                        &p.name,
+                        &idx.name,
+                        idx.columns.clone(),
+                    );
                 }
-            }
-            for (column, resolved) in resolved_policies {
-                db.register_rank_formula(&p.name, &column, resolved.formula);
             }
             if let Some(table_meta) = db.table_meta(&p.name) {
                 db.persist_table_meta(&p.name, &table_meta)?;
@@ -196,6 +231,8 @@ pub(crate) fn execute_plan(
                 return Err(block);
             }
             let bytes_to_release = estimate_drop_table_bytes(db, name);
+            db.drain_vector_table_maintenance_for_ddl(name);
+            let _vector_schema = db.vector_schema_write_table(name);
             db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl_and_remove_triggers(name, lsn))?;
             db.accountant().release(bytes_to_release);
             db.clear_statement_cache();
@@ -205,7 +242,6 @@ pub(crate) fn execute_plan(
             require_admin_for_ddl(db)?;
             db.check_disk_budget("ALTER TABLE")?;
             let store = db.relational_store();
-            let mut rewrite_vectors_after_alter = false;
             match &p.action {
                 AlterAction::AddColumn(col) => {
                     if col.primary_key {
@@ -265,6 +301,40 @@ pub(crate) fn execute_plan(
                             .as_ref()
                             .map(|resolved| resolved.policy.clone()),
                     );
+                    if matches!(col.data_type, DataType::Vector(_)) {
+                        let index = VectorIndexRef::new(&p.table, col.name.clone());
+                        let _vector_schema = db.vector_schema_write(&index);
+                        db.allocate_ddl_lsn(|lsn| {
+                            store
+                                .alter_table_add_column(&p.table, core_col)
+                                .map_err(Error::Other)?;
+                            if let Some(table_meta) = db.table_meta(&p.table)
+                                && let Some(column) = table_meta
+                                    .columns
+                                    .iter()
+                                    .find(|column| column.name == col.name)
+                            {
+                                db.register_vector_index_for_column(&p.table, column);
+                            }
+                            if col.expires {
+                                let mut meta = store.table_meta.write();
+                                let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
+                                    Error::Other(format!("table '{}' not found", p.table))
+                                })?;
+                                table_meta.expires_column = Some(col.name.clone());
+                            }
+                            if let Some(resolved) = resolved_policy {
+                                db.register_rank_formula(&p.table, &col.name, resolved.formula);
+                            }
+                            if let Some(table_meta) = db.table_meta(&p.table) {
+                                db.persist_table_meta(&p.table, &table_meta)?;
+                                db.log_alter_table_ddl(&p.table, &table_meta, lsn)?;
+                            }
+                            Ok(())
+                        })?;
+                        db.clear_statement_cache();
+                        return Ok(QueryResult::empty_with_affected(0));
+                    }
                     store
                         .alter_table_add_column(&p.table, core_col)
                         .map_err(Error::Other)?;
@@ -357,42 +427,80 @@ pub(crate) fn execute_plan(
                             index: dependent_user_indexes[0].clone(),
                         });
                     }
-                    store
-                        .alter_table_drop_column(&p.table, name)
-                        .map_err(Error::Other)?;
-                    db.remove_rank_formula(&p.table, name);
-                    db.deregister_vector_index(&p.table, name);
-                    rewrite_vectors_after_alter = dropped_vector_column;
-                    if *cascade {
-                        // Remove IndexDecls referencing `name`, release storage.
-                        {
-                            let mut metas = store.table_meta.write();
-                            if let Some(m) = metas.get_mut(&p.table) {
-                                m.indexes
-                                    .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
+                    if dropped_vector_column {
+                        let index = VectorIndexRef::new(&p.table, name.clone());
+                        db.drain_vector_index_maintenance_for_ddl(&index);
+                        let _vector_schema = db.vector_schema_write(&index);
+                        db.allocate_ddl_lsn(|lsn| {
+                            store
+                                .alter_table_drop_column(&p.table, name)
+                                .map_err(Error::Other)?;
+                            db.remove_rank_formula(&p.table, name);
+                            if *cascade {
+                                {
+                                    let mut metas = store.table_meta.write();
+                                    if let Some(m) = metas.get_mut(&p.table) {
+                                        m.indexes
+                                            .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
+                                    }
+                                }
+                                for idx in &dependent_indexes {
+                                    store.drop_index_storage(&p.table, idx);
+                                    db.log_drop_index_ddl(&p.table, idx, lsn)?;
+                                }
+                            }
+                            let mut meta = store.table_meta.write();
+                            if let Some(table_meta) = meta.get_mut(&p.table)
+                                && table_meta.expires_column.as_deref() == Some(name.as_str())
+                            {
+                                table_meta.expires_column = None;
+                            }
+                            drop(meta);
+                            if let Some(table_meta) = db.table_meta(&p.table) {
+                                db.deregister_vector_index(&p.table, name);
+                                db.persist_table_meta_rows_vectors_and_log_alter_table_ddl(
+                                    &p.table,
+                                    &table_meta,
+                                    lsn,
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                    } else {
+                        store
+                            .alter_table_drop_column(&p.table, name)
+                            .map_err(Error::Other)?;
+                        db.remove_rank_formula(&p.table, name);
+                        if *cascade {
+                            // Remove IndexDecls referencing `name`, release storage.
+                            {
+                                let mut metas = store.table_meta.write();
+                                if let Some(m) = metas.get_mut(&p.table) {
+                                    m.indexes
+                                        .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
+                                }
+                            }
+                            for idx in &dependent_indexes {
+                                store.drop_index_storage(&p.table, idx);
+                                db.allocate_ddl_lsn(|lsn| {
+                                    db.log_drop_index_ddl(&p.table, idx, lsn)
+                                })?;
                             }
                         }
-                        for idx in &dependent_indexes {
-                            store.drop_index_storage(&p.table, idx);
-                            db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&p.table, idx, lsn))?;
+                        let mut meta = store.table_meta.write();
+                        if let Some(table_meta) = meta.get_mut(&p.table)
+                            && table_meta.expires_column.as_deref() == Some(name.as_str())
+                        {
+                            table_meta.expires_column = None;
                         }
-                    }
-                    let mut meta = store.table_meta.write();
-                    if let Some(table_meta) = meta.get_mut(&p.table)
-                        && table_meta.expires_column.as_deref() == Some(name.as_str())
-                    {
-                        table_meta.expires_column = None;
-                    }
-                    drop(meta);
-                    if let Some(table_meta) = db.table_meta(&p.table) {
-                        db.persist_table_meta(&p.table, &table_meta)?;
-                        db.persist_table_rows(&p.table)?;
-                        if rewrite_vectors_after_alter {
-                            db.persist_vectors()?;
+                        drop(meta);
+                        if let Some(table_meta) = db.table_meta(&p.table) {
+                            db.persist_table_meta(&p.table, &table_meta)?;
+                            db.persist_table_rows(&p.table)?;
+                            db.allocate_ddl_lsn(|lsn| {
+                                db.log_alter_table_ddl(&p.table, &table_meta, lsn)
+                            })?;
                         }
-                        db.allocate_ddl_lsn(|lsn| {
-                            db.log_alter_table_ddl(&p.table, &table_meta, lsn)
-                        })?;
                     }
                     db.clear_statement_cache();
                     return Ok(QueryResult {
@@ -430,12 +538,51 @@ pub(crate) fn execute_plan(
                             column: from.clone(),
                         });
                     }
-                    store
-                        .alter_table_rename_column(&p.table, from, to)
-                        .map_err(Error::Other)?;
+                    if renamed_vector_column
+                        && db
+                            .table_meta(&p.table)
+                            .is_some_and(|meta| meta.columns.iter().any(|c| c.name == *to))
+                    {
+                        return Err(Error::Other(format!(
+                            "column '{}' already exists in table '{}'",
+                            to, p.table
+                        )));
+                    }
                     if renamed_vector_column {
-                        db.rename_vector_index(&p.table, from, to)?;
-                        rewrite_vectors_after_alter = true;
+                        let old_index = VectorIndexRef::new(&p.table, from.clone());
+                        let new_index = VectorIndexRef::new(&p.table, to.clone());
+                        db.drain_vector_index_maintenance_for_ddl(&old_index);
+                        let _vector_schema =
+                            db.vector_schema_write_many([old_index.clone(), new_index]);
+                        db.allocate_ddl_lsn(|lsn| {
+                            store
+                                .alter_table_rename_column(&p.table, from, to)
+                                .map_err(Error::Other)?;
+                            let mut meta = store.table_meta.write();
+                            if let Some(table_meta) = meta.get_mut(&p.table)
+                                && table_meta.expires_column.as_deref() == Some(from.as_str())
+                            {
+                                table_meta.expires_column = Some(to.clone());
+                            }
+                            drop(meta);
+                            if let Some(table_meta) = db.table_meta(&p.table) {
+                                db.rename_vector_index(&p.table, from, to)?;
+                                db.persist_table_meta_rows_vectors_and_log_alter_table_ddl_with_vector_rename(
+                                    &p.table,
+                                    &table_meta,
+                                    from,
+                                    to,
+                                    lsn,
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                        db.clear_statement_cache();
+                        return Ok(QueryResult::empty_with_affected(0));
+                    } else {
+                        store
+                            .alter_table_rename_column(&p.table, from, to)
+                            .map_err(Error::Other)?;
                     }
                     let mut meta = store.table_meta.write();
                     if let Some(table_meta) = meta.get_mut(&p.table)
@@ -487,9 +634,6 @@ pub(crate) fn execute_plan(
                         | AlterAction::DropSyncConflictPolicy
                 ) {
                     db.persist_table_rows(&p.table)?;
-                }
-                if rewrite_vectors_after_alter {
-                    db.persist_vectors()?;
                 }
                 db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn))?;
             }
@@ -816,6 +960,7 @@ pub(crate) fn execute_plan(
                 "Reduce LIMIT/dimensionality or raise MEMORY_LIMIT before vector search.",
             )?;
             if let Some(sort_key) = sort_key {
+                let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
                 let mut semantic_query = crate::database::SemanticQuery::new(
                     table.clone(),
                     column.clone(),
@@ -823,7 +968,11 @@ pub(crate) fn execute_plan(
                     *k as usize,
                 );
                 semantic_query.sort_key = Some(sort_key.clone());
-                let res = db.semantic_search_with_candidates(semantic_query, candidate_bitmap);
+                let _vector_schema = db.vector_schema_read(&index);
+                let res = db.semantic_search_with_candidates_under_schema_read(
+                    semantic_query,
+                    candidate_bitmap,
+                );
                 db.accountant().release(vector_bytes);
                 let results = res?;
                 let schema_columns = db.table_meta(table).map(|meta| {
@@ -863,13 +1012,16 @@ pub(crate) fn execute_plan(
                     cascade: None,
                 });
             }
+            let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
+            let _vector_schema = db.vector_schema_read(&index);
             let res = db.query_vector_strict(
-                contextdb_core::VectorIndexRef::new(table.clone(), column.clone()),
+                index.clone(),
                 &query_vec,
                 *k as usize,
                 candidate_bitmap.as_ref(),
                 db.snapshot(),
             );
+            let used_hnsw = db.vector_hnsw_len_under_schema_read(&index).is_some();
             db.accountant().release(vector_bytes);
             let res = res?;
 
@@ -920,13 +1072,7 @@ pub(crate) fn execute_plan(
                 rows,
                 rows_affected: 0,
                 trace: vector_search_trace(
-                    if db
-                        .__debug_vector_hnsw_len(contextdb_core::VectorIndexRef::new(
-                            table.clone(),
-                            column.clone(),
-                        ))
-                        .is_some()
-                    {
+                    if used_hnsw {
                         "HNSWSearch"
                     } else {
                         "VectorSearch"
@@ -1504,9 +1650,19 @@ fn exec_insert(
     db.check_disk_budget("INSERT")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for insert".to_string()))?;
 
-    let insert_meta = db
+    let mut insert_meta = db
         .table_meta(&p.table)
         .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+    let _vector_schema = if !vector_columns_for_meta(&insert_meta).is_empty() {
+        let refs = vector_refs_for_meta(&p.table, &insert_meta);
+        let guard = db.vector_schema_read_many(refs);
+        insert_meta = db
+            .table_meta(&p.table)
+            .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+        Some(guard)
+    } else {
+        None
+    };
     // When no column list is provided (INSERT INTO t VALUES (...)),
     // infer column names from table metadata in declaration order.
     let columns: Vec<String> = if p.columns.is_empty() {
@@ -1832,6 +1988,7 @@ fn exec_delete(
     tx: Option<TxId>,
 ) -> Result<QueryResult> {
     let txid = tx.ok_or_else(|| Error::Other("missing tx for delete".to_string()))?;
+    let _vector_schema = db.vector_schema_read_table(&p.table);
     let snapshot = db.snapshot();
     let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
     let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
@@ -1924,6 +2081,7 @@ fn exec_update(
 ) -> Result<QueryResult> {
     db.check_disk_budget("UPDATE")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for update".to_string()))?;
+    let _vector_schema = db.vector_schema_read_table(&p.table);
     let snapshot = db.snapshot();
     let resolved_where = p
         .where_clause
@@ -4842,6 +5000,14 @@ fn vector_columns_for_meta(meta: &TableMeta) -> Vec<String> {
         .iter()
         .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
         .map(|column| column.name.clone())
+        .collect()
+}
+
+fn vector_refs_for_meta(table: &str, meta: &TableMeta) -> Vec<contextdb_core::VectorIndexRef> {
+    meta.columns
+        .iter()
+        .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
+        .map(|column| contextdb_core::VectorIndexRef::new(table, column.name.clone()))
         .collect()
 }
 
