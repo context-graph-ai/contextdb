@@ -6239,6 +6239,50 @@ fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
 }
 
 #[test]
+fn commit_rejects_staged_vector_insert_after_same_ref_drop_readd_same_shape() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE evidence (id UUID PRIMARY KEY, note TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO evidence (id, note, embedding) VALUES ($id, 'stale', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(444))),
+            ("embedding", Value::Vector(per_index_axis3(0))),
+        ]),
+    )
+    .unwrap();
+
+    db.execute("ALTER TABLE evidence DROP COLUMN embedding", &empty())
+        .unwrap();
+    db.execute("ALTER TABLE evidence ADD COLUMN embedding VECTOR(3)", &empty())
+        .unwrap();
+
+    let err = db
+        .commit(tx)
+        .expect_err("commit must reject a vector staged for an older same-ref generation");
+    assert!(matches!(
+        err,
+        Error::SchemaInvalid { reason }
+            if reason.contains("evidence.embedding")
+                && reason.contains("changed while transaction was open")
+    ));
+    let _ = db.rollback(tx);
+    assert!(matches!(
+        db.execute(
+            "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
+        ),
+        Ok(result) if result.rows.is_empty()
+    ));
+}
+
+#[test]
 fn commit_rejects_staged_vector_update_after_same_ref_sync_shape_change() {
     let db = Database::open_memory();
     let id = Uuid::from_u128(45);
