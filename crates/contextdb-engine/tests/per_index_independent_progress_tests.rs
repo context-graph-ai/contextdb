@@ -1,6 +1,4 @@
-use contextdb_core::Value;
-#[cfg(feature = "test-seams")]
-use contextdb_core::VectorIndexRef;
+use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::Database;
 use std::collections::HashMap;
 #[cfg(feature = "test-seams")]
@@ -15,6 +13,9 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const REOPEN_ROWS: usize = 1024;
+#[cfg(feature = "test-seams")]
+const MIN_EXACT_COSINE: f64 = 0.99999;
+const COSINE_EPSILON: f64 = 1e-6;
 #[cfg(feature = "test-seams")]
 const REOPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,21 +79,66 @@ fn seed_reopen_tables(db: &Database) -> (Vec<Uuid>, Vec<Uuid>) {
     (text_ids, face_ids)
 }
 
-fn top_ids(db: &Database, table: &str, limit: usize) -> Vec<Uuid> {
-    let result = db
+fn top_ranked(db: &Database, table: &str, limit: usize) -> Vec<(Uuid, f64)> {
+    let ids = db
         .execute(
             &format!("SELECT id FROM {table} ORDER BY embedding <=> $query LIMIT {limit}"),
             &params(vec![("query", Value::Vector(axis3(0)))]),
         )
         .unwrap();
-    result
+    let id_idx = ids
+        .columns
+        .iter()
+        .position(|column| column == "id")
+        .expect("vector result should include id");
+    let ids = ids
         .rows
         .into_iter()
-        .map(|row| match row[0] {
-            Value::Uuid(id) => id,
-            ref other => panic!("expected UUID id, got {other:?}"),
+        .map(|row| match row.get(id_idx) {
+            Some(Value::Uuid(id)) => *id,
+            other => panic!("expected UUID id, got {other:?}"),
         })
+        .collect::<Vec<_>>();
+    let scores = db
+        .query_vector(
+            VectorIndexRef::new(table, "embedding"),
+            &axis3(0),
+            limit,
+            None,
+            db.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(
+        ids.len(),
+        scores.len(),
+        "id and score result lengths differ"
+    );
+    ids.into_iter()
+        .zip(scores)
+        .map(|(id, (_, score))| (id, score as f64))
         .collect()
+}
+
+#[cfg(feature = "test-seams")]
+fn assert_top_ranked(result: &[(Uuid, f64)], expected_id: Uuid) {
+    assert_eq!(result.first().map(|(id, _)| *id), Some(expected_id));
+    assert!(
+        result.first().map(|(_, score)| *score).unwrap_or_default() >= MIN_EXACT_COSINE,
+        "top row cosine too low: {result:?}"
+    );
+}
+
+fn assert_ranked_results_match(actual: &[(Uuid, f64)], expected: &[(Uuid, f64)]) {
+    assert_eq!(actual.len(), expected.len(), "top-k lengths differ");
+    for (rank, ((actual_id, actual_score), (expected_id, expected_score))) in
+        actual.iter().zip(expected).enumerate()
+    {
+        assert_eq!(actual_id, expected_id, "row id mismatch at rank {rank}");
+        assert!(
+            (actual_score - expected_score).abs() <= COSINE_EPSILON,
+            "cosine mismatch at rank {rank}: actual {actual_score}, expected {expected_score}"
+        );
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -120,7 +166,7 @@ fn reopened_store_two_refs_both_enter_build_windows_concurrently() {
     let db_text = db.clone();
     thread::spawn(move || {
         done_text_tx
-            .send(top_ids(&db_text, "table_text", 1))
+            .send(top_ranked(&db_text, "table_text", 1))
             .unwrap();
     });
     assert!(text_pause.wait_until_reached(REOPEN_TIMEOUT));
@@ -129,7 +175,7 @@ fn reopened_store_two_refs_both_enter_build_windows_concurrently() {
     let db_face = db.clone();
     thread::spawn(move || {
         done_face_tx
-            .send(top_ids(&db_face, "table_face", 1))
+            .send(top_ranked(&db_face, "table_face", 1))
             .unwrap();
     });
     let face_reached_before_text_release = face_pause.wait_until_reached(REOPEN_TIMEOUT);
@@ -150,8 +196,8 @@ fn reopened_store_two_refs_both_enter_build_windows_concurrently() {
     assert!(face_reached_before_text_release);
     assert!(matches!(text_done_before_release, Err(TryRecvError::Empty)));
     assert!(matches!(face_done_before_release, Err(TryRecvError::Empty)));
-    assert_eq!(text_result, vec![Uuid::from_u128(100_000)]);
-    assert_eq!(face_result, vec![Uuid::from_u128(200_000)]);
+    assert_top_ranked(&text_result, Uuid::from_u128(100_000));
+    assert_top_ranked(&face_result, Uuid::from_u128(200_000));
     assert!(vector_store.has_hnsw_index_for(&text_ref));
     assert!(vector_store.has_hnsw_index_for(&face_ref));
 }
@@ -164,15 +210,15 @@ fn reopen_per_index_hnsw_rebuild_yields_same_live_set() {
         let db = Database::open(&path).unwrap();
         create_reopen_tables(&db);
         seed_reopen_tables(&db);
-        let pre_text = top_ids(&db, "table_text", 50);
-        let pre_face = top_ids(&db, "table_face", 50);
+        let pre_text = top_ranked(&db, "table_text", 50);
+        let pre_face = top_ranked(&db, "table_face", 50);
         db.close().unwrap();
         (pre_text, pre_face)
     };
 
     let reopened = Database::open(&path).unwrap();
-    let post_text = top_ids(&reopened, "table_text", 50);
-    let post_face = top_ids(&reopened, "table_face", 50);
-    assert_eq!(post_text, pre_text);
-    assert_eq!(post_face, pre_face);
+    let post_text = top_ranked(&reopened, "table_text", 50);
+    let post_face = top_ranked(&reopened, "table_face", 50);
+    assert_ranked_results_match(&post_text, &pre_text);
+    assert_ranked_results_match(&post_face, &pre_face);
 }

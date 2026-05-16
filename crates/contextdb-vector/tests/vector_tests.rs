@@ -16,6 +16,7 @@ use std::time::Duration;
 
 const HNSW_THRESHOLD_FOR_TEST: usize = 1000;
 const HNSW_ROWS_FOR_TEST: usize = 1024;
+const MIN_EXACT_COSINE: f32 = 0.99999;
 #[cfg(feature = "test-seams")]
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "test-seams")]
@@ -200,7 +201,7 @@ fn vector_count_for(store: &VectorStore, index: &VectorIndexRef) -> usize {
 fn assert_top_row(result: &[(RowId, f32)], row_id: RowId) {
     assert_eq!(result.first().map(|(row, _)| *row), Some(row_id));
     assert!(
-        result.first().map(|(_, cos)| *cos).unwrap_or_default() >= 0.999,
+        result.first().map(|(_, cos)| *cos).unwrap_or_default() >= MIN_EXACT_COSINE,
         "top row cosine too low: {result:?}"
     );
 }
@@ -852,7 +853,7 @@ fn reindex_on_index_a_does_not_block_ingest_on_index_b() {
     assert!(
         b_rows
             .iter()
-            .all(|(row, cos)| row.0 >= 500_000 && *cos >= 0.999)
+            .all(|(row, cos)| row.0 >= 500_000 && *cos >= MIN_EXACT_COSINE)
     );
     assert_eq!(vector_count_for(&store, &a), HNSW_ROWS_FOR_TEST);
 }
