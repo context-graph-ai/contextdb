@@ -2561,6 +2561,9 @@ impl Database {
             ) {
                 Ok(committed) => committed,
                 Err(failure) => {
+                    if let Some(ws) = failure.write_set.as_deref() {
+                        self.plugin.commit_failed(ws, source, &failure.error);
+                    }
                     if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
                         let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
                         self.discard_staged_event_bus_ddl_commit(lsn);
