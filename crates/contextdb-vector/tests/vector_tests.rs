@@ -238,6 +238,106 @@ fn search_returns_top_k_descending() {
 }
 
 #[test]
+fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
+    let r = ref_named("tie_vectors", "embedding");
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 2)], accountant.clone());
+
+    store.apply_inserts_with_accountant(
+        vec![
+            test_entry(&r, 30, exact_vector(2, 0), 30),
+            test_entry(&r, 10, exact_vector(2, 0), 10),
+            test_entry(&r, 20, exact_vector(2, 0), 20),
+        ],
+        Some(accountant.as_ref()),
+    );
+    let brute_force = exec
+        .search(r.clone(), &exact_vector(2, 0), 3, None, SnapshotId(10_000))
+        .unwrap();
+    assert_eq!(
+        brute_force
+            .iter()
+            .map(|(row_id, _)| *row_id)
+            .collect::<Vec<_>>(),
+        vec![RowId(10), RowId(20), RowId(30)]
+    );
+
+    let hnsw_entries = (0..HNSW_ROWS_FOR_TEST)
+        .rev()
+        .map(|i| test_entry(&r, 1_000 + i as u64, exact_vector(2, 0), 20_000 + i as u64))
+        .collect::<Vec<_>>();
+    store.apply_inserts_with_accountant(hnsw_entries, Some(accountant.as_ref()));
+    let hnsw = exec
+        .search(r.clone(), &exact_vector(2, 0), 8, None, SnapshotId(50_000))
+        .unwrap();
+    assert!(store.has_hnsw_index_for(&r));
+    assert_eq!(
+        hnsw.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        vec![
+            RowId(10),
+            RowId(20),
+            RowId(30),
+            RowId(1_000),
+            RowId(1_001),
+            RowId(1_002),
+            RowId(1_003),
+            RowId(1_004),
+        ]
+    );
+    assert!(hnsw.iter().all(|(_, score)| (*score - 1.0).abs() < 1e-6));
+}
+
+#[test]
+fn hnsw_exact_duplicate_bucket_orders_by_row_id_before_search_cap() {
+    let r = ref_named("many_tie_vectors", "embedding");
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 2)], accountant.clone());
+    let count = 6_000u64;
+    let entries = (0..count)
+        .map(|i| test_entry(&r, count - i, exact_vector(2, 0), 10_000 + i))
+        .collect::<Vec<_>>();
+    store.apply_inserts_with_accountant(entries, Some(accountant.as_ref()));
+
+    let rows = exec
+        .search(r.clone(), &exact_vector(2, 0), 8, None, SnapshotId(20_000))
+        .unwrap();
+
+    assert!(store.has_hnsw_index_for(&r));
+    assert_eq!(
+        rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        (1..=8).map(RowId).collect::<Vec<_>>()
+    );
+    assert!(rows.iter().all(|(_, score)| (*score - 1.0).abs() < 1e-6));
+}
+
+#[test]
+fn zero_norm_query_uses_public_row_id_tie_order_with_materialized_hnsw() {
+    let r = ref_named("zero_query_vectors", "embedding");
+    let accountant = Arc::new(MemoryAccountant::no_limit());
+    let (store, _tx_mgr, exec) = setup_refs(&[(r.clone(), 2)], accountant.clone());
+
+    let mut entries = (1..=500)
+        .map(|row| test_entry(&r, row, exact_vector(2, 1), row))
+        .collect::<Vec<_>>();
+    entries.extend((0..5_500).map(|i| test_entry(&r, 10_000 + i, vec![0.0, 0.0], 20_000 + i)));
+    store.apply_inserts_with_accountant(entries, Some(accountant.as_ref()));
+
+    exec.search(r.clone(), &exact_vector(2, 1), 8, None, SnapshotId(30_000))
+        .unwrap();
+    assert!(store.has_hnsw_index_for(&r));
+
+    let rows = exec
+        .search(r.clone(), &[0.0, 0.0], 8, None, SnapshotId(30_000))
+        .unwrap();
+
+    assert_eq!(
+        rows.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+        (1..=8).map(RowId).collect::<Vec<_>>()
+    );
+    assert!(rows.iter().all(|(_, score)| *score == 0.0));
+}
+
+#[test]
 fn candidate_prefilter_is_applied() {
     let (tx_mgr, exec) = setup();
     let tx = tx_mgr.begin();

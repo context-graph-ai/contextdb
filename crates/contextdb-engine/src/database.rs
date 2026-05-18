@@ -2317,7 +2317,10 @@ impl Database {
             && state.max_tx() <= TxId::from_snapshot(self.snapshot())
             && state.hnsw_len().is_none()
         {
-            let query = vec![0.0_f32; state.dimension()];
+            let mut query = vec![0.0_f32; state.dimension()];
+            if let Some(first) = query.first_mut() {
+                *first = 1.0;
+            }
             let _ = self.query_vector_strict(index.clone(), &query, 1, None, self.snapshot());
         }
         let mut output = plan.explain();

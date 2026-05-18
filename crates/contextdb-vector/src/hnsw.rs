@@ -18,6 +18,7 @@ pub struct HnswIndex {
 }
 
 static NEXT_HNSW_BUILD_SERIAL: AtomicUsize = AtomicUsize::new(1);
+const HNSW_BUILD_SEED: u64 = 0x55c8_6f2d_21a4_7bd3;
 
 enum HnswInner {
     F32(Hnsw<'static, f32, DistCosine>),
@@ -67,88 +68,77 @@ impl HnswIndex {
         let max_elements = sorted_entries.len().max(1);
         let hnsw = match quantization {
             VectorQuantization::F32 => {
-                let mut hnsw = Hnsw::new(m, max_elements, 16, ef_construction, DistCosine);
+                let mut hnsw = Hnsw::new_with_seed(
+                    m,
+                    max_elements,
+                    16,
+                    ef_construction,
+                    DistCosine,
+                    HNSW_BUILD_SEED,
+                );
                 hnsw.set_extend_candidates(true);
                 hnsw.set_keeping_pruned(true);
                 HnswInner::F32(hnsw)
             }
             VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
-                let mut hnsw = Hnsw::new(
+                let mut hnsw = Hnsw::new_with_seed(
                     m,
                     max_elements,
                     16,
                     ef_construction,
                     DistQuantizedCosine { quantization },
+                    HNSW_BUILD_SEED,
                 );
                 hnsw.set_extend_candidates(true);
                 hnsw.set_keeping_pruned(true);
                 HnswInner::Quantized(hnsw)
             }
         };
-        let id_to_row = RwLock::new(HashMap::with_capacity(sorted_entries.len()));
-        let exact_rows = RwLock::new(HashMap::<Vec<u8>, Vec<RowId>>::with_capacity(
-            sorted_entries.len(),
-        ));
+        let mut id_to_row = HashMap::with_capacity(sorted_entries.len());
+        let mut exact_rows = HashMap::<Vec<u8>, Vec<RowId>>::with_capacity(sorted_entries.len());
         let mut inserted_count = 0usize;
 
         match &hnsw {
             HnswInner::F32(index) => {
-                let data = sorted_entries
-                    .iter()
-                    .filter_map(|entry| {
-                        entry.vector.as_f32_slice().map(|vector| {
-                            let data_id = inserted_count;
-                            inserted_count += 1;
-                            id_to_row.write().insert(data_id, entry.row_id);
-                            if let Some(key) = exact_key_for_stored_vector(&entry.vector) {
-                                exact_rows
-                                    .write()
-                                    .entry(key)
-                                    .or_default()
-                                    .push(entry.row_id);
-                            }
-                            (vector.to_vec(), data_id)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let refs = data
-                    .iter()
-                    .map(|(vector, data_id)| (vector, *data_id))
-                    .collect::<Vec<_>>();
-                index.parallel_insert(&refs);
+                for entry in &sorted_entries {
+                    let Some(vector) = entry.vector.as_f32_slice() else {
+                        continue;
+                    };
+                    let data_id = inserted_count;
+                    inserted_count += 1;
+                    id_to_row.insert(data_id, entry.row_id);
+                    if let Some(key) = exact_key_for_stored_vector(&entry.vector) {
+                        exact_rows.entry(key).or_default().push(entry.row_id);
+                    }
+                    index.insert((vector, data_id));
+                }
             }
             HnswInner::Quantized(index) => {
-                let data = sorted_entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let encoded = entry.vector.to_hnsw_u8();
-                        (!encoded.is_empty()).then(|| {
-                            let data_id = inserted_count;
-                            inserted_count += 1;
-                            id_to_row.write().insert(data_id, entry.row_id);
-                            if let Some(key) = exact_key_for_stored_vector(&entry.vector) {
-                                exact_rows
-                                    .write()
-                                    .entry(key)
-                                    .or_default()
-                                    .push(entry.row_id);
-                            }
-                            (encoded, data_id)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let refs = data
-                    .iter()
-                    .map(|(vector, data_id)| (vector, *data_id))
-                    .collect::<Vec<_>>();
-                index.parallel_insert(&refs);
+                for entry in &sorted_entries {
+                    let encoded = entry.vector.to_hnsw_u8();
+                    if encoded.is_empty() {
+                        continue;
+                    }
+                    let data_id = inserted_count;
+                    inserted_count += 1;
+                    id_to_row.insert(data_id, entry.row_id);
+                    if let Some(key) = exact_key_for_stored_vector(&entry.vector) {
+                        exact_rows.entry(key).or_default().push(entry.row_id);
+                    }
+                    index.insert((encoded.as_slice(), data_id));
+                }
             }
+        }
+
+        for row_ids in exact_rows.values_mut() {
+            row_ids.sort_unstable();
+            row_ids.dedup();
         }
 
         Self {
             hnsw,
-            id_to_row,
-            exact_rows,
+            id_to_row: RwLock::new(id_to_row),
+            exact_rows: RwLock::new(exact_rows),
             next_id: AtomicUsize::new(inserted_count),
             build_serial: NEXT_HNSW_BUILD_SERIAL.fetch_add(1, Ordering::SeqCst) as u64,
             dimension,
@@ -215,10 +205,15 @@ impl HnswIndex {
             cap.saturating_add(neighbors.len())
                 .min(cap.saturating_mul(2)),
         );
-        if let Some(key) = exact_key_for_query(query, self.quantization)
+        if let Some((key, exact_score)) = exact_key_for_query(query, self.quantization)
             && let Some(row_ids) = self.exact_rows.read().get(&key)
         {
-            scored.extend(row_ids.iter().take(cap).map(|row_id| (*row_id, 1.0)));
+            scored.extend(
+                row_ids
+                    .iter()
+                    .take(cap)
+                    .map(|row_id| (*row_id, exact_score)),
+            );
         }
 
         scored.extend(neighbors.into_iter().filter_map(|neighbor| {
@@ -227,7 +222,7 @@ impl HnswIndex {
                 .copied()
                 .map(|row_id| (row_id, 1.0 - neighbor.distance))
         }));
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut seen = HashSet::new();
         scored.retain(|(row_id, _)| seen.insert(*row_id));
         scored.truncate(cap);
@@ -267,14 +262,20 @@ fn exact_key_for_stored_vector(vector: &StoredVector) -> Option<Vec<u8>> {
     }
 }
 
-fn exact_key_for_query(query: &[f32], quantization: VectorQuantization) -> Option<Vec<u8>> {
+fn exact_key_for_query(query: &[f32], quantization: VectorQuantization) -> Option<(Vec<u8>, f32)> {
+    let exact_score = exact_query_score(query, quantization)?;
     match quantization {
-        VectorQuantization::F32 => Some(f32_exact_key(query)),
+        VectorQuantization::F32 => Some((f32_exact_key(query), exact_score)),
         VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
             let encoded = StoredVector::from_f32(query, quantization).to_hnsw_u8();
-            (!encoded.is_empty()).then_some(encoded)
+            (!encoded.is_empty()).then_some((encoded, exact_score))
         }
     }
+}
+
+fn exact_query_score(query: &[f32], quantization: VectorQuantization) -> Option<f32> {
+    let score = StoredVector::from_f32(query, quantization).cosine_similarity(query);
+    (score.is_finite() && score > 0.0).then_some(score)
 }
 
 fn f32_exact_key(values: &[f32]) -> Vec<u8> {

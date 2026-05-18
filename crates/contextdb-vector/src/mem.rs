@@ -8,6 +8,21 @@ use std::sync::{Arc, OnceLock};
 
 const HNSW_THRESHOLD: usize = 1000;
 
+fn sort_vector_scores(rows: &mut [(RowId, f32)]) {
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
+fn query_has_positive_finite_norm(query: &[f32]) -> bool {
+    let mut norm = 0.0_f32;
+    for value in query {
+        if !value.is_finite() {
+            return false;
+        }
+        norm += value * value;
+    }
+    norm > 0.0
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorSearchDebugTrace {
@@ -116,7 +131,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             scored
         });
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_vector_scores(&mut scored);
         scored.truncate(k);
         scored
     }
@@ -225,6 +240,19 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         ));
                     }
 
+                    if !query_has_positive_finite_norm(query) {
+                        let rows = self.brute_force_search_state(
+                            &index, &state, query, k, candidates, snapshot,
+                        );
+                        let trace = VectorSearchDebugTrace::brute_force(
+                            &index,
+                            &rows,
+                            "non_positive_query_norm",
+                            state.hnsw_len(),
+                        );
+                        return Ok(SearchStep::Done(rows, trace));
+                    }
+
                     if state.max_tx() > snapshot_tx {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
@@ -324,8 +352,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         (visible, supplemented_row_count)
                     });
 
-                    visible
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    sort_vector_scores(&mut visible);
                     if visible.len() < k && raw_candidate_count < hnsw_len {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
