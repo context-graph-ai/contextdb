@@ -191,7 +191,7 @@ impl HnswIndex {
             });
         }
 
-        let ef = self.ef_search.max(k.saturating_mul(10)).max(1);
+        let ef = hnsw_search_ef(self.ef_search, k);
         let neighbors = match &self.hnsw {
             HnswInner::F32(hnsw) => hnsw.search(query, ef, ef),
             HnswInner::Quantized(hnsw) => {
@@ -200,7 +200,7 @@ impl HnswIndex {
             }
         };
         let id_to_row = self.id_to_row.read();
-        let cap = ef.max(k);
+        let cap = hnsw_search_candidate_cap(self.ef_search, k);
         let mut scored = Vec::with_capacity(
             cap.saturating_add(neighbors.len())
                 .min(cap.saturating_mul(2)),
@@ -349,6 +349,23 @@ fn digest_i32(digest: &mut u64, value: i32) {
 fn digest_u64(digest: &mut u64, value: u64) {
     *digest ^= value;
     *digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
+pub(crate) fn hnsw_search_candidate_cap_for_count(
+    count: usize,
+    quantization: VectorQuantization,
+    k: usize,
+) -> usize {
+    let (_, _, ef_search) = select_params(count, quantization);
+    hnsw_search_candidate_cap(ef_search, k)
+}
+
+fn hnsw_search_candidate_cap(ef_search: usize, k: usize) -> usize {
+    hnsw_search_ef(ef_search, k).max(k)
+}
+
+fn hnsw_search_ef(ef_search: usize, k: usize) -> usize {
+    ef_search.max(k.saturating_mul(10)).max(1)
 }
 
 fn select_params(count: usize, quantization: VectorQuantization) -> (usize, usize, usize) {

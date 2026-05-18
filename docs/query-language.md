@@ -754,6 +754,27 @@ LIMIT 10
 
 Lower distance = more similar. A `LIMIT` clause is required — unbounded vector searches are rejected.
 
+The query vector can also come from an existing row:
+
+```sql
+SELECT id, data FROM observations
+WHERE id != $query_id
+ORDER BY embedding <=> ROW_VECTOR('observations', 'embedding', $query_id)
+LIMIT 10
+```
+
+`ROW_VECTOR(table, column, key)` is only valid as the right side of `<=>` in
+`ORDER BY`. The table and column arguments are string literals naming a
+`VECTOR(n)` column, and `key` is a literal or parameter matched against the
+source table's natural key, usually its primary key. The source vector is read
+from the same MVCC snapshot as candidate filtering and vector scoring. Scoped
+handles honor source-row visibility: a hidden source row returns the same typed
+read-scope error as an explicit anchor read. Missing source tables return
+`TableNotFound`, non-vector source columns return `UnknownVectorIndex`,
+dimension mismatches return `VectorIndexDimensionMismatch`, missing source rows
+return `PersistedRowVectorRowMissing`, and rows with NULL vector cells return
+`PersistedRowVectorCellNull`.
+
 ### Pre-Filtered Search
 
 Combine WHERE filters with vector ranking. The engine filters first, then scores only matching rows:
@@ -770,7 +791,8 @@ LIMIT 5
 The engine automatically selects the search strategy based on vector count:
 
 - Below ~1000 vectors: brute-force linear scan (exact)
-- At/above ~1000 vectors: HNSW approximate nearest neighbors (recall target >= 95%)
+- F32 at/above ~1000 vectors: HNSW approximate nearest neighbors (recall target >= 95%)
+- SQ8/SQ4 through 5000 vectors: exact scan to preserve self-recall; larger quantized indexes use HNSW
 
 No manual index creation needed. Use `.explain` in the CLI to see which strategy is active:
 

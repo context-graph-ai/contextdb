@@ -21,6 +21,7 @@ use contextdb_relational::{MemRelationalExecutor, RelationalStore, index_key_fro
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
 use contextdb_vector::{
     HnswGraphStats, HnswIndex, MemVectorExecutor, VectorSearchDebugTrace, VectorStore,
+    cosine_similarity,
 };
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
@@ -2308,37 +2309,40 @@ impl Database {
         let _operation = self.open_operation()?;
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
-        let vector_index = vector_index_from_plan(&plan);
-        let _vector_schema = vector_index
+        let vector_shape = vector_search_shape_from_plan(&plan);
+        let _vector_schema = vector_shape
             .as_ref()
-            .map(|index| self.vector_schema_read(index));
-        if let Some(index) = &vector_index
-            && let Some(state) = self.vector_store.try_state(index)
-            && state.vector_count() >= 1000
-            && state.max_tx() <= TxId::from_snapshot(self.snapshot())
-            && state.hnsw_len().is_none()
-        {
-            // Non-zero first slot is required: the HNSW path skips zero/non-finite-norm queries
-            // (see crates/contextdb-vector/src/mem.rs::query_has_positive_finite_norm). If that
-            // rule tightens, this warm-up must be updated in lockstep or EXPLAIN will mislabel.
-            let mut query = vec![0.0_f32; state.dimension()];
-            if let Some(first) = query.first_mut() {
-                *first = 1.0;
-            }
-            let _ = self.query_vector_strict(index.clone(), &query, 1, None, self.snapshot());
-        }
+            .map(|shape| self.vector_schema_read(&shape.index));
+        let snapshot = self.snapshot();
         let mut output = plan.explain();
-        let uses_hnsw = vector_index
+        let uses_hnsw = vector_shape
             .as_ref()
-            .is_some_and(|index| self.vector_store.has_hnsw_index_for(index));
+            .is_some_and(|shape| self.vector_hnsw_strategy_for_explain(shape, snapshot));
         if uses_hnsw {
             output = output.replace("VectorSearch(", "HNSWSearch(");
             output = output.replace("VectorSearch {", "HNSWSearch {");
         } else {
-            output = output.replace("VectorSearch(", "VectorSearch(strategy=BruteForce, ");
+            output = annotate_vector_search_strategy(output, "BruteForce");
             output = output.replace("VectorSearch {", "VectorSearch { strategy: BruteForce,");
         }
         Ok(output)
+    }
+
+    fn vector_hnsw_strategy_for_explain(
+        &self,
+        shape: &VectorExplainShape,
+        snapshot: SnapshotId,
+    ) -> bool {
+        if !self
+            .vector
+            .hnsw_eligible_without_build(&shape.index, snapshot)
+        {
+            return false;
+        }
+        !shape.restricted_candidates
+            || self
+                .vector
+                .hnsw_search_covers_all_without_build(&shape.index, shape.k)
     }
 
     pub fn execute_in_tx(
@@ -6921,6 +6925,26 @@ impl Database {
         query: SemanticQuery,
         candidates: Option<RoaringTreemap>,
     ) -> Result<Vec<SearchResult>> {
+        self.semantic_search_with_candidates_under_schema_read_with_strategy(query, candidates)
+            .map(|(results, _)| results)
+    }
+
+    pub(crate) fn semantic_search_with_candidates_under_schema_read_with_strategy(
+        &self,
+        query: SemanticQuery,
+        candidates: Option<RoaringTreemap>,
+    ) -> Result<(Vec<SearchResult>, bool)> {
+        self.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
+            None, query, candidates,
+        )
+    }
+
+    pub(crate) fn semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
+        &self,
+        tx: Option<TxId>,
+        query: SemanticQuery,
+        candidates: Option<RoaringTreemap>,
+    ) -> Result<(Vec<SearchResult>, bool)> {
         let index = VectorIndexRef::new(query.table.clone(), query.vector_column.clone());
         let snapshot = self.snapshot_for_read();
         let meta = self
@@ -6949,11 +6973,12 @@ impl Database {
 
         let Some(sort_key) = query.sort_key.as_deref() else {
             let raw_k = if query.min_similarity.is_some() || candidate_bitmap.is_some() {
-                self.vector_entry_count(&index).max(query.limit)
+                self.vector_entry_count_in_tx(tx, &index)?.max(query.limit)
             } else {
                 query.limit
             };
-            let mut rows = self.query_vector_strict(
+            let (mut rows, used_hnsw) = self.query_vector_strict_in_tx_with_strategy(
+                tx,
                 index.clone(),
                 &query.query,
                 raw_k,
@@ -6964,11 +6989,17 @@ impl Database {
                 rows.retain(|(_, score)| *score >= min_similarity);
                 rows.truncate(query.limit);
             }
-            return rows
+            let results = rows
                 .into_iter()
                 .map(|(row_id, vector_score)| {
-                    let anchor = self.find_row_by_id_at(&query.table, row_id, snapshot)?;
-                    let values = self.search_result_values(&index, row_id, snapshot, anchor.values);
+                    let anchor = self.find_row_by_id_in_tx(tx, &query.table, row_id, snapshot)?;
+                    let values = self.search_result_values_in_tx(
+                        tx,
+                        &index,
+                        row_id,
+                        snapshot,
+                        anchor.values,
+                    )?;
                     Ok(SearchResult {
                         row_id,
                         values,
@@ -6976,7 +7007,8 @@ impl Database {
                         rank: vector_score,
                     })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
+            return Ok((results, used_hnsw));
         };
 
         let Some(policy) = vector_column.rank_policy.as_ref() else {
@@ -6992,9 +7024,10 @@ impl Database {
             });
         }
         let formula = self.rank_formula(&query.table, &query.vector_column)?;
-        let entry_count = self.vector_entry_count(&index);
+        let entry_count = self.vector_entry_count_in_tx(tx, &index)?;
         let internal_k = self.rank_policy_candidate_k(entry_count, query.limit);
-        let mut raw = self.query_vector_strict(
+        let (mut raw, used_hnsw) = self.query_vector_strict_in_tx_with_strategy(
+            tx,
             index.clone(),
             &query.query,
             internal_k,
@@ -7007,8 +7040,8 @@ impl Database {
 
         let mut ranked = Vec::with_capacity(raw.len());
         for (row_id, vector_score) in raw {
-            let anchor = self.find_row_by_id_at(&query.table, row_id, snapshot)?;
-            let joined = self.joined_row_for_rank_policy(policy, &anchor, snapshot)?;
+            let anchor = self.find_row_by_id_in_tx(tx, &query.table, row_id, snapshot)?;
+            let joined = self.joined_row_for_rank_policy(tx, policy, &anchor, snapshot)?;
             self.rank_policy_eval_count.fetch_add(1, Ordering::SeqCst);
             let eval = formula.eval_with_resolver(vector_score, |column| {
                 self.resolve_rank_formula_column(policy, &anchor, joined.as_ref(), column)
@@ -7032,12 +7065,13 @@ impl Database {
                     continue;
                 }
             };
-            let values = self.search_result_values(
+            let values = self.search_result_values_in_tx(
+                tx,
                 &index,
                 row_id,
                 snapshot,
                 merged_rank_values(&anchor, joined.as_ref()),
-            );
+            )?;
             ranked.push(SearchResult {
                 row_id,
                 values,
@@ -7047,7 +7081,7 @@ impl Database {
         }
         ranked.sort_by(compare_ranked_results);
         ranked.truncate(query.limit);
-        Ok(ranked)
+        Ok((ranked, used_hnsw))
     }
 
     #[doc(hidden)]
@@ -7112,15 +7146,35 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn query_vector_strict(
+    pub(crate) fn query_vector_strict_in_tx_with_strategy(
         &self,
+        tx: Option<TxId>,
         index: VectorIndexRef,
         query: &[f32],
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<Vec<(RowId, f32)>> {
+    ) -> Result<(Vec<(RowId, f32)>, bool)> {
         self.vector_store.validate_vector(&index, query.len())?;
+        if let Some(tx) = tx {
+            let overlay_result = self.tx_mgr.with_write_set(tx, |ws| {
+                if write_set_touches_vector_search(ws, &index) {
+                    Some(self.query_vector_strict_with_write_set_exact(
+                        ws,
+                        index.clone(),
+                        query,
+                        k,
+                        candidates,
+                        snapshot,
+                    ))
+                } else {
+                    None
+                }
+            })?;
+            if let Some(result) = overlay_result {
+                return result;
+            }
+        }
         let effective_candidates =
             self.effective_read_candidates(&index.table, snapshot, candidates)?;
         let (rows, trace) = self.vector.search_with_strategy_for_test(
@@ -7132,8 +7186,98 @@ impl Database {
         )?;
         self.last_vector_search_used_hnsw
             .store(trace.used_hnsw, Ordering::SeqCst);
+        let used_hnsw = trace.used_hnsw;
         *self.last_vector_search_trace.write() = Some(trace);
-        Ok(rows)
+        Ok((rows, used_hnsw))
+    }
+
+    fn query_vector_strict_with_write_set_exact(
+        &self,
+        ws: &WriteSet,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<(Vec<(RowId, f32)>, bool)> {
+        if k == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let state = self.vector_store.state(&index)?;
+        let staged_entries = ws
+            .vector_inserts
+            .iter()
+            .filter(|entry| entry.index == index && entry.deleted_tx.is_none())
+            .count();
+        let overlay_bytes = estimate_active_tx_vector_overlay_bytes(
+            state.entry_count().saturating_add(staged_entries),
+            state.dimension(),
+        );
+        self.accountant.try_allocate_for(
+            overlay_bytes,
+            "query",
+            &format!("active_tx_vector_overlay@{}.{}", index.table, index.column),
+            "Reduce active transaction vector search scope or raise MEMORY_LIMIT.",
+        )?;
+
+        let result = (|| -> Result<(Vec<(RowId, f32)>, bool)> {
+            let mut entries: HashMap<RowId, Vec<f32>> = HashMap::new();
+            for entry in self.vector_store.entries_for_index(&index)? {
+                if entry.visible_at(snapshot) {
+                    entries.insert(entry.row_id, entry.vector);
+                }
+            }
+
+            for (delete_table, row_id, _) in &ws.relational_deletes {
+                let has_same_row_replacement =
+                    ws.relational_inserts.iter().any(|(insert_table, row)| {
+                        insert_table == &index.table && row.row_id == *row_id
+                    });
+                if delete_table == &index.table && !has_same_row_replacement {
+                    entries.remove(row_id);
+                }
+            }
+            for (delete_index, row_id, _) in &ws.vector_deletes {
+                if delete_index == &index {
+                    entries.remove(row_id);
+                }
+            }
+            for (move_index, from_row_id, to_row_id, _) in &ws.vector_moves {
+                if move_index == &index
+                    && let Some(vector) = entries.remove(from_row_id)
+                {
+                    entries.insert(*to_row_id, vector);
+                }
+            }
+            for entry in &ws.vector_inserts {
+                if entry.index == index && entry.deleted_tx.is_none() {
+                    entries.insert(entry.row_id, entry.vector.clone());
+                }
+            }
+
+            let mut scored = Vec::with_capacity(entries.len().min(k));
+            for (row_id, vector) in entries {
+                if let Some(candidates) = candidates
+                    && !candidates.contains(row_id.0)
+                {
+                    continue;
+                }
+                if !self.row_id_read_allowed_in_write_set_for_query(
+                    ws,
+                    &index.table,
+                    row_id,
+                    snapshot,
+                )? {
+                    continue;
+                }
+                scored.push((row_id, cosine_similarity(&vector, query)));
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(k);
+            Ok((scored, false))
+        })();
+        self.accountant.release(overlay_bytes);
+        result
     }
 
     pub(crate) fn register_rank_formula(
@@ -7204,6 +7348,21 @@ impl Database {
             .unwrap_or(0)
     }
 
+    fn vector_entry_count_in_tx(&self, tx: Option<TxId>, index: &VectorIndexRef) -> Result<usize> {
+        let base = self.vector_entry_count(index);
+        let Some(tx) = tx else {
+            return Ok(base);
+        };
+        self.tx_mgr.with_write_set(tx, |ws| {
+            base.saturating_add(
+                ws.vector_inserts
+                    .iter()
+                    .filter(|entry| entry.index == *index && entry.deleted_tx.is_none())
+                    .count(),
+            )
+        })
+    }
+
     fn rank_policy_candidate_k(&self, entry_count: usize, limit: usize) -> usize {
         if entry_count == 0 || limit == 0 {
             return limit;
@@ -7254,6 +7413,7 @@ impl Database {
 
     fn joined_row_for_rank_policy(
         &self,
+        tx: Option<TxId>,
         policy: &RankPolicy,
         anchor: &VersionedRow,
         snapshot: SnapshotId,
@@ -7293,6 +7453,10 @@ impl Database {
                 "rank policy protected index `{}` on `{}` no longer leads with `{}`",
                 policy.protected_index, policy.joined_table, policy.joined_column
             )));
+        }
+        if let Some(tx) = tx {
+            drop(indexes);
+            return self.joined_row_for_rank_policy_in_tx(tx, policy, &join_value, snapshot);
         }
 
         let key_component = match direction {
@@ -7345,6 +7509,35 @@ impl Database {
         Ok(Some(row))
     }
 
+    fn joined_row_for_rank_policy_in_tx(
+        &self,
+        tx: TxId,
+        policy: &RankPolicy,
+        join_value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VersionedRow>> {
+        let rows = self.scan_in_tx_raw(tx, &policy.joined_table, snapshot)?;
+        let mut best: Option<VersionedRow> = None;
+        for row in rows {
+            let Some(value) = row.values.get(&policy.joined_column) else {
+                continue;
+            };
+            if !values_equal_for_rank_join(value, join_value) {
+                continue;
+            }
+            if !self.row_read_allowed_for_change(&policy.joined_table, &row, snapshot) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|current| current.row_id < row.row_id)
+            {
+                best = Some(row);
+            }
+        }
+        Ok(best)
+    }
+
     fn resolve_rank_formula_column(
         &self,
         policy: &RankPolicy,
@@ -7393,28 +7586,28 @@ impl Database {
         );
     }
 
-    fn search_result_values(
+    fn search_result_values_in_tx(
         &self,
+        tx: Option<TxId>,
         index: &VectorIndexRef,
         row_id: RowId,
         snapshot: SnapshotId,
         mut values: HashMap<String, Value>,
-    ) -> HashMap<String, Value> {
-        if let Some(entry) = self.vector_store_live_entry_for_row(index, row_id, snapshot) {
+    ) -> Result<HashMap<String, Value>> {
+        if let Some(entry) = self.vector_entry_for_row_in_tx(tx, index, row_id, snapshot)? {
             values.insert(index.column.clone(), Value::Vector(entry.vector));
         }
-        values
+        Ok(values)
     }
 
     fn pending_vector_dimension(&self, tx: TxId, index: &VectorIndexRef) -> Result<Option<usize>> {
-        Ok(self
-            .tx_mgr
-            .cloned_write_set(tx)?
-            .vector_inserts
-            .iter()
-            .rev()
-            .find(|entry| entry.index == *index && entry.deleted_tx.is_none())
-            .map(|entry| entry.vector.len()))
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.vector_inserts
+                .iter()
+                .rev()
+                .find(|entry| entry.index == *index && entry.deleted_tx.is_none())
+                .map(|entry| entry.vector.len())
+        })
     }
 
     fn direct_vector_dimension_error(
@@ -7467,6 +7660,27 @@ impl Database {
         self.vector_store
             .try_state(index)
             .and_then(|state| state.hnsw_len())
+    }
+
+    pub(crate) fn assert_vector_index_exists_under_schema_read(
+        &self,
+        index: &VectorIndexRef,
+    ) -> Result<()> {
+        if self.vector_store.try_state(index).is_some() {
+            Ok(())
+        } else {
+            Err(Error::UnknownVectorIndex {
+                index: index.clone(),
+            })
+        }
+    }
+
+    pub(crate) fn validate_vector_under_schema_read(
+        &self,
+        index: &VectorIndexRef,
+        actual: usize,
+    ) -> Result<()> {
+        self.vector_store.validate_vector(index, actual)
     }
 
     #[doc(hidden)]
@@ -7557,6 +7771,204 @@ impl Database {
     ) -> Option<VectorEntry> {
         self.vector_store
             .live_entry_for_row(index, row_id, snapshot)
+    }
+
+    pub(crate) fn natural_key_column_for_table(&self, table: &str) -> Result<String> {
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        natural_key_column_for_meta(&meta).ok_or_else(|| {
+            Error::PlanError(format!(
+                "ROW_VECTOR source table `{table}` has no natural key"
+            ))
+        })
+    }
+
+    pub(crate) fn row_id_for_natural_key_in_tx(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        key_col: &str,
+        key_value: &Value,
+        snapshot: SnapshotId,
+    ) -> Result<Option<RowId>> {
+        if let Some(tx) = tx {
+            let staged = self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_inserts
+                    .iter()
+                    .rev()
+                    .find(|(insert_table, row)| {
+                        insert_table == table && row.values.get(key_col) == Some(key_value)
+                    })
+                    .map(|(_, row)| row.row_id)
+            })?;
+            if staged.is_some() {
+                return Ok(staged);
+            }
+        }
+
+        let Some(row_id) = self.row_id_for_natural_key(table, key_col, key_value, snapshot) else {
+            return Ok(None);
+        };
+
+        if let Some(tx) = tx {
+            let deleted = self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_deletes
+                    .iter()
+                    .any(|(delete_table, deleted_row_id, _)| {
+                        delete_table == table && *deleted_row_id == row_id
+                    })
+            })?;
+            if deleted {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(row_id))
+    }
+
+    pub(crate) fn vector_entry_for_row_in_tx(
+        &self,
+        tx: Option<TxId>,
+        index: &VectorIndexRef,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<Option<VectorEntry>> {
+        if let Some(tx) = tx {
+            enum VectorEntryOverlay {
+                Found(VectorEntry),
+                Deleted,
+                Moved { from: RowId, to: RowId },
+                Unchanged,
+            }
+
+            let overlay =
+                self.tx_mgr.with_write_set(tx, |ws| {
+                    if let Some(entry) = ws
+                        .vector_inserts
+                        .iter()
+                        .rev()
+                        .find(|entry| {
+                            entry.index == *index
+                                && entry.row_id == row_id
+                                && entry.deleted_tx.is_none()
+                        })
+                        .cloned()
+                    {
+                        return VectorEntryOverlay::Found(entry);
+                    }
+                    if ws
+                        .vector_deletes
+                        .iter()
+                        .rev()
+                        .any(|(deleted_index, deleted_row_id, _)| {
+                            deleted_index == index && *deleted_row_id == row_id
+                        })
+                    {
+                        return VectorEntryOverlay::Deleted;
+                    }
+                    if let Some((_, from_row_id, to_row_id, _)) = ws.vector_moves.iter().rev().find(
+                        |(moved_index, from_row_id, to_row_id, _)| {
+                            moved_index == index && (*from_row_id == row_id || *to_row_id == row_id)
+                        },
+                    ) {
+                        return VectorEntryOverlay::Moved {
+                            from: *from_row_id,
+                            to: *to_row_id,
+                        };
+                    }
+                    VectorEntryOverlay::Unchanged
+                })?;
+            match overlay {
+                VectorEntryOverlay::Found(entry) => return Ok(Some(entry)),
+                VectorEntryOverlay::Deleted => return Ok(None),
+                VectorEntryOverlay::Moved { from, to } => {
+                    if from == row_id {
+                        return Ok(None);
+                    }
+                    let mut entry = self.vector_store_live_entry_for_row(index, from, snapshot);
+                    if let Some(entry) = entry.as_mut() {
+                        entry.row_id = to;
+                    }
+                    return Ok(entry);
+                }
+                VectorEntryOverlay::Unchanged => {}
+            }
+        }
+
+        Ok(self.vector_store_live_entry_for_row(index, row_id, snapshot))
+    }
+
+    pub(crate) fn find_row_by_id_in_tx(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<VersionedRow> {
+        if let Some(tx) = tx {
+            let staged = self.tx_mgr.with_write_set(tx, |ws| {
+                let staged_insert = ws
+                    .relational_inserts
+                    .iter()
+                    .rev()
+                    .find(|(insert_table, row)| insert_table == table && row.row_id == row_id)
+                    .map(|(_, row)| row.clone());
+                if staged_insert.is_some() {
+                    return staged_insert;
+                }
+                if ws
+                    .relational_deletes
+                    .iter()
+                    .any(|(delete_table, deleted_row_id, _)| {
+                        delete_table == table && *deleted_row_id == row_id
+                    })
+                {
+                    return None;
+                }
+                None
+            })?;
+            if let Some(row) = staged {
+                return Ok(row);
+            }
+        }
+        self.find_row_by_id_at(table, row_id, snapshot)
+    }
+
+    fn row_id_read_allowed_in_write_set_for_query(
+        &self,
+        ws: &WriteSet,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        if let Some(row) = ws
+            .relational_inserts
+            .iter()
+            .rev()
+            .find(|(insert_table, row)| insert_table == table && row.row_id == row_id)
+            .map(|(_, row)| row.clone())
+        {
+            return Ok(!self
+                .filter_rows_for_read(table, vec![row], snapshot)?
+                .is_empty());
+        }
+        if ws
+            .relational_deletes
+            .iter()
+            .any(|(delete_table, deleted_row_id, _)| {
+                delete_table == table && *deleted_row_id == row_id
+            })
+        {
+            return Ok(false);
+        }
+        let row = self.row_visible_at_snapshot(table, row_id, snapshot);
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        Ok(!self
+            .filter_rows_for_read(table, vec![row], snapshot)?
+            .is_empty())
     }
 
     pub(crate) fn drop_table_aux_state(&self, table: &str) {
@@ -12630,6 +13042,42 @@ impl Database {
             .unwrap_or(false)
     }
 
+    pub(crate) fn assert_row_id_read_allowed_for_change(
+        &self,
+        tx: Option<TxId>,
+        table: &str,
+        row_id: RowId,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        if let Some(tx) = tx {
+            let staged = self.tx_mgr.with_write_set(tx, |ws| {
+                ws.relational_inserts
+                    .iter()
+                    .rev()
+                    .find(|(insert_table, row)| insert_table == table && row.row_id == row_id)
+                    .map(|(_, row)| row.clone())
+            })?;
+            if let Some(row) = staged {
+                let rows = self.filter_rows_for_anchor_read(table, vec![row], snapshot)?;
+                if rows.is_empty() {
+                    return Err(Error::NotFound(format!("row {row_id} in table {table}")));
+                }
+                return Ok(());
+            }
+        }
+        if self.row_id_read_allowed_for_change(table, row_id, snapshot) {
+            return Ok(());
+        }
+        let Some(row) = self.row_visible_at_snapshot(table, row_id, snapshot) else {
+            return Err(Error::NotFound(format!("row {row_id} in table {table}")));
+        };
+        let rows = self.filter_rows_for_anchor_read(table, vec![row], snapshot)?;
+        if rows.is_empty() {
+            return Err(Error::NotFound(format!("row {row_id} in table {table}")));
+        }
+        Ok(())
+    }
+
     fn row_id_read_allowed_for_change(
         &self,
         table: &str,
@@ -12707,6 +13155,31 @@ fn current_write_set_counts(ws: &WriteSet) -> WriteSetCounts {
         vector_deletes: ws.vector_deletes.len(),
         vector_moves: ws.vector_moves.len(),
     }
+}
+
+fn write_set_touches_vector_search(ws: &WriteSet, index: &VectorIndexRef) -> bool {
+    ws.vector_inserts.iter().any(|entry| entry.index == *index)
+        || ws
+            .vector_deletes
+            .iter()
+            .any(|(delete_index, _, _)| delete_index == index)
+        || ws
+            .vector_moves
+            .iter()
+            .any(|(move_index, _, _, _)| move_index == index)
+        || ws
+            .relational_deletes
+            .iter()
+            .any(|(delete_table, _, _)| delete_table == &index.table)
+}
+
+fn estimate_active_tx_vector_overlay_bytes(entry_count: usize, dimension: usize) -> usize {
+    let decoded_vector_bytes = dimension.saturating_mul(std::mem::size_of::<f32>());
+    let per_entry = std::mem::size_of::<VectorEntry>()
+        .saturating_add(std::mem::size_of::<(RowId, Vec<f32>)>())
+        .saturating_add(decoded_vector_bytes)
+        .saturating_add(64);
+    entry_count.saturating_mul(per_entry)
 }
 
 fn current_wallclock() -> Wallclock {
@@ -12946,24 +13419,88 @@ fn consume_failed_vector_row_group(
     }
 }
 
-fn vector_index_from_plan(plan: &PhysicalPlan) -> Option<VectorIndexRef> {
+struct VectorExplainShape {
+    index: VectorIndexRef,
+    k: usize,
+    restricted_candidates: bool,
+}
+
+fn vector_search_shape_from_plan(plan: &PhysicalPlan) -> Option<VectorExplainShape> {
     match plan {
-        PhysicalPlan::VectorSearch { table, column, .. }
-        | PhysicalPlan::HnswSearch { table, column, .. } => {
-            Some(VectorIndexRef::new(table.clone(), column.clone()))
+        PhysicalPlan::VectorSearch {
+            table,
+            column,
+            k,
+            candidates,
+            ..
         }
+        | PhysicalPlan::HnswSearch {
+            table,
+            column,
+            k,
+            candidates,
+            ..
+        } => Some(VectorExplainShape {
+            index: VectorIndexRef::new(table.clone(), column.clone()),
+            k: usize::try_from(*k).unwrap_or(usize::MAX),
+            restricted_candidates: candidates
+                .as_deref()
+                .is_some_and(|candidate| !is_unrestricted_scan_for_table(candidate, table)),
+        }),
         PhysicalPlan::Project { input, .. }
         | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
-        | PhysicalPlan::MaterializeCte { input, .. } => vector_index_from_plan(input),
+        | PhysicalPlan::MaterializeCte { input, .. } => vector_search_shape_from_plan(input),
         PhysicalPlan::Join { left, right, .. } => {
-            vector_index_from_plan(left).or_else(|| vector_index_from_plan(right))
+            vector_search_shape_from_plan(left).or_else(|| vector_search_shape_from_plan(right))
         }
-        PhysicalPlan::Pipeline(plans) => plans.iter().find_map(vector_index_from_plan),
+        PhysicalPlan::Pipeline(plans) => plans.iter().find_map(vector_search_shape_from_plan),
         _ => None,
     }
+}
+
+fn is_unrestricted_scan_for_table(plan: &PhysicalPlan, table: &str) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::Scan {
+            table: scan_table,
+            filter: None,
+            ..
+        } if scan_table == table
+    )
+}
+
+fn annotate_vector_search_strategy(mut output: String, strategy: &str) -> String {
+    let needle = "VectorSearch(";
+    let mut search_from = 0;
+    while let Some(relative_pos) = output[search_from..].find(needle) {
+        let operator_start = search_from + relative_pos;
+        let open_paren = operator_start + needle.len() - 1;
+        let mut depth = 0_u32;
+        let mut insert_at = None;
+        for (relative_idx, ch) in output[open_paren..].char_indices() {
+            match ch {
+                '(' => depth = depth.saturating_add(1),
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        insert_at = Some(open_paren + relative_idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(insert_at) = insert_at else {
+            break;
+        };
+        let annotation = format!(", strategy={strategy}");
+        output.insert_str(insert_at, &annotation);
+        search_from = insert_at + annotation.len();
+    }
+    output
 }
 
 fn sanitize_loaded_row_for_meta(row: &mut VersionedRow, meta: &TableMeta) -> bool {

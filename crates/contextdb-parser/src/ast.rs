@@ -240,6 +240,11 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    RowVectorSource {
+        table: String,
+        column: String,
+        key: Box<Expr>,
+    },
     InList {
         expr: Box<Expr>,
         list: Vec<Expr>,

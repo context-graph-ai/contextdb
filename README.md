@@ -230,6 +230,10 @@ INSERT INTO evidence (id, vector_text, vector_vision) VALUES
   ('11111111-1111-1111-1111-111111111111', [1,0,0,0], [0,1,0,0,0,0,0,0]);
 SHOW VECTOR_INDEXES;
 SELECT id FROM evidence ORDER BY vector_text <=> '[1,0,0,0]' LIMIT 1;
+SELECT id
+FROM evidence
+ORDER BY vector_text <=> ROW_VECTOR('evidence', 'vector_text', '11111111-1111-1111-1111-111111111111')
+LIMIT 1;
 ```
 
 Each `VECTOR(N)` column is its own index, keyed by `(table, column)`. Use
@@ -249,7 +253,7 @@ recreate the schema and reimport the data.
 
 **Graph (SQL/PGQ-style)** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded BFS, typed edges, variable-length paths (`{1,3}`), and direction control. DAG constraint enforcement prevents cycles. State propagation cascades changes along graph edges.
 
-**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Every `VECTOR(N)` column is a named index; `SHOW VECTOR_INDEXES` reports table, column, dimension, quantization, vector count, and bytes. Auto-switches between brute-force (< 1000 vectors) and HNSW indexing. Pre-filtered search narrows candidates before scoring.
+**Vector (pgvector conventions)** — Cosine similarity search via `<=>`. Query with a bound vector, vector literal, or `ROW_VECTOR('table', 'column', key)` to reuse a persisted row vector as the query vector. Every `VECTOR(N)` column is a named index; `SHOW VECTOR_INDEXES` reports table, column, dimension, quantization, vector count, and bytes. F32 auto-switches between brute-force (< 1000 vectors) and HNSW indexing; SQ8/SQ4 keep exact search through 5000 vectors to preserve self-recall. Pre-filtered search narrows candidates before scoring.
 
 **Unified transactions** — One transaction atomically updates relational rows, graph adjacency structures, and vector indexes. One read snapshot sees consistent state across all three. MVCC with consistent snapshots — readers never block writers.
 

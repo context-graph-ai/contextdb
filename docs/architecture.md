@@ -61,7 +61,9 @@ audio, or policy embeddings with different dimensions and quantization choices.
 - SQ8/SQ4 columns keep quantized live payloads and quantized HNSW payloads;
   f32 is reconstructed only at API/materialization boundaries
 - Below ~1000 vectors: brute-force exact scan
-- At/above ~1000 vectors: HNSW (via `hnsw_rs`) with 10x overfetch + exact reranking
+- F32 at/above ~1000 vectors: HNSW (via `hnsw_rs`) with overfetch + exact reranking
+- SQ8/SQ4 through 5000 vectors: exact scan to preserve self-recall; larger
+  quantized indexes use HNSW
 - Pre-filtered search: WHERE clause narrows candidates before scoring
 - HNSW is built lazily per index; a search against one vector column does not
   build sibling indexes

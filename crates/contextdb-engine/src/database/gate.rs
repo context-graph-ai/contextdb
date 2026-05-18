@@ -43,7 +43,7 @@ impl Database {
         Ok(context_gate || scope_gate || acl_gate)
     }
 
-    pub(super) fn assert_table_read_allowed(&self, table: &str) -> Result<()> {
+    pub(crate) fn assert_table_read_allowed(&self, table: &str) -> Result<()> {
         if self.access_is_admin() {
             return Ok(());
         }

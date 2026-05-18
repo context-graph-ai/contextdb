@@ -112,14 +112,36 @@ impl PhysicalPlan {
                 )
             }
             PhysicalPlan::VectorSearch {
-                table, column, k, ..
+                table,
+                column,
+                query_expr,
+                k,
+                ..
             } => {
-                format!("VectorSearch(table={}, column={}, k={})", table, column, k)
+                format!(
+                    "VectorSearch(table={}, column={}, k={}{}{})",
+                    table,
+                    column,
+                    k,
+                    query_source_prefix(query_expr),
+                    query_source_suffix(query_expr)
+                )
             }
             PhysicalPlan::HnswSearch {
-                table, column, k, ..
+                table,
+                column,
+                query_expr,
+                k,
+                ..
             } => {
-                format!("HNSWSearch(table={}, column={}, k={})", table, column, k)
+                format!(
+                    "HNSWSearch(table={}, column={}, k={}{}{})",
+                    table,
+                    column,
+                    k,
+                    query_source_prefix(query_expr),
+                    query_source_suffix(query_expr)
+                )
             }
             PhysicalPlan::Scan { table, .. } => format!("Scan(table={})", table),
             PhysicalPlan::AlterTable(p) => format!("AlterTable(table={})", p.table),
@@ -131,8 +153,45 @@ impl PhysicalPlan {
                 .map(Self::explain)
                 .collect::<Vec<_>>()
                 .join(" -> "),
+            PhysicalPlan::Project { input, .. } => {
+                format!("Project -> {}", input.explain())
+            }
             _ => format!("{:?}", self),
         }
+    }
+}
+
+fn query_source_prefix(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::RowVectorSource { .. } => ", query_source=",
+        _ => "",
+    }
+}
+
+fn query_source_suffix(expr: &Expr) -> String {
+    match expr {
+        Expr::RowVectorSource { table, column, key } => {
+            format!(
+                "RowVectorSource(table={}, column={}, key={})",
+                table,
+                column,
+                row_vector_key_for_explain(key)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn row_vector_key_for_explain(expr: &Expr) -> String {
+    match expr {
+        Expr::Literal(contextdb_parser::ast::Literal::Null) => "NULL".to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Bool(value)) => value.to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Integer(value)) => value.to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Real(value)) => value.to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Text(value)) => value.clone(),
+        Expr::Literal(contextdb_parser::ast::Literal::Vector(_)) => "<vector>".to_string(),
+        Expr::Parameter(name) => format!("${name}"),
+        _ => "<expr>".to_string(),
     }
 }
 

@@ -557,7 +557,7 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
                     it.next()
                         .ok_or_else(|| Error::ParseError("invalid cosine expr".to_string()))?,
                 )?;
-                let right = build_additive_expr(
+                let right = build_cosine_rhs(
                     it.next()
                         .ok_or_else(|| Error::ParseError("invalid cosine expr".to_string()))?,
                 )?;
@@ -584,6 +584,79 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
             .ok_or_else(|| Error::ParseError("ORDER BY item missing expression".to_string()))?,
         direction,
     })
+}
+
+fn build_cosine_rhs(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid cosine RHS".to_string()))?;
+    match inner.as_rule() {
+        Rule::row_vector_source => build_row_vector_source(inner),
+        Rule::additive_expr => build_additive_expr(inner),
+        other => Err(unexpected_rule(other, "build_cosine_rhs")),
+    }
+}
+
+fn build_row_vector_source(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut values = pair.into_inner();
+    let table = match values.next() {
+        Some(p) if p.as_rule() == Rule::string => parse_string_literal(p.as_str()),
+        _ => {
+            return Err(Error::ParseError(
+                "ROW_VECTOR table must be a string".to_string(),
+            ));
+        }
+    };
+    let column = match values.next() {
+        Some(p) if p.as_rule() == Rule::string => parse_string_literal(p.as_str()),
+        _ => {
+            return Err(Error::ParseError(
+                "ROW_VECTOR column must be a string".to_string(),
+            ));
+        }
+    };
+    let key = values
+        .next()
+        .ok_or_else(|| Error::ParseError("ROW_VECTOR key missing".to_string()))
+        .and_then(build_row_vector_key)?;
+    if values.next().is_some() {
+        return Err(Error::ParseError(
+            "ROW_VECTOR requires exactly three arguments".to_string(),
+        ));
+    }
+    Ok(Expr::RowVectorSource {
+        table,
+        column,
+        key: Box::new(key),
+    })
+}
+
+fn build_row_vector_key(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("ROW_VECTOR key missing".to_string()))?;
+    match inner.as_rule() {
+        Rule::parameter => Ok(Expr::Parameter(
+            inner.as_str().trim_start_matches('$').to_string(),
+        )),
+        Rule::bool_lit => Ok(Expr::Literal(Literal::Bool(
+            inner.as_str().eq_ignore_ascii_case("true"),
+        ))),
+        Rule::float => Ok(Expr::Literal(Literal::Real(parse_f64(
+            inner.as_str(),
+            "invalid ROW_VECTOR key float",
+        )?))),
+        Rule::integer => Ok(Expr::Literal(Literal::Integer(parse_i64(
+            inner.as_str(),
+            "invalid ROW_VECTOR key integer",
+        )?))),
+        Rule::string => Ok(Expr::Literal(Literal::Text(parse_string_literal(
+            inner.as_str(),
+        )))),
+        other => Err(unexpected_rule(other, "build_row_vector_key")),
+    }
 }
 
 fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
@@ -979,10 +1052,14 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
         }
     }
 
-    Ok(Expr::FunctionCall {
-        name: name.ok_or_else(|| Error::ParseError("function name missing".to_string()))?,
-        args,
-    })
+    let name = name.ok_or_else(|| Error::ParseError("function name missing".to_string()))?;
+    if name.eq_ignore_ascii_case("ROW_VECTOR") {
+        return Err(Error::ParseError(
+            "ROW_VECTOR is only valid as the right side of ORDER BY <=>".to_string(),
+        ));
+    }
+
+    Ok(Expr::FunctionCall { name, args })
 }
 
 fn build_column_ref(pair: Pair<'_, Rule>) -> Result<Expr> {
@@ -2470,6 +2547,7 @@ fn validate_expr(expr: &Expr) -> Result<()> {
             validate_expr(left)?;
             validate_expr(right)?;
         }
+        Expr::RowVectorSource { key, .. } => validate_row_vector_key_expr(key)?,
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 validate_expr(arg)?;
@@ -2519,6 +2597,7 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
             validate_subquery_expr(left, cte_names)?;
             validate_subquery_expr(right, cte_names)?;
         }
+        Expr::RowVectorSource { key, .. } => validate_row_vector_key_expr(key)?,
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 validate_subquery_expr(arg, cte_names)?;
@@ -2528,6 +2607,19 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_row_vector_key_expr(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Literal(Literal::Bool(_))
+        | Expr::Literal(Literal::Integer(_))
+        | Expr::Literal(Literal::Real(_))
+        | Expr::Literal(Literal::Text(_))
+        | Expr::Parameter(_) => Ok(()),
+        _ => Err(Error::PlanError(
+            "ROW_VECTOR key must be a literal or parameter".to_string(),
+        )),
+    }
 }
 
 fn unexpected_rule(rule: Rule, context: &str) -> Error {

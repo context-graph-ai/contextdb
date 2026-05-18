@@ -259,6 +259,28 @@ fn plan_select_body(
         }
     }
 
+    let row_vector_order_count = body
+        .order_by
+        .iter()
+        .filter(|order| expr_contains_row_vector_source(&order.expr))
+        .count();
+    if row_vector_order_count > 0 {
+        let supported_row_vector_order = body.order_by.len() == 1
+            && body.order_by.first().is_some_and(|order| {
+                matches!(order.direction, SortDirection::CosineDistance)
+                    && matches!(
+                        &order.expr,
+                        Expr::CosineDistance { right, .. }
+                            if matches!(right.as_ref(), Expr::RowVectorSource { .. })
+                    )
+            });
+        if !supported_row_vector_order {
+            return Err(Error::PlanError(
+                "ROW_VECTOR cosine distance must be the only ORDER BY item".to_string(),
+            ));
+        }
+    }
+
     let uses_vector_search = body
         .order_by
         .first()
@@ -357,6 +379,45 @@ fn vector_search_parts(expr: &Expr) -> Result<(String, Expr)> {
             "vector search requires a cosine distance expression".to_string(),
         )),
     }
+}
+
+fn expr_contains_row_vector_source(expr: &Expr) -> bool {
+    match expr {
+        Expr::RowVectorSource { .. } => true,
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            expr_contains_row_vector_source(left) || expr_contains_row_vector_source(right)
+        }
+        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+            expr_contains_row_vector_source(operand)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_row_vector_source),
+        Expr::InList { expr, list, .. } => {
+            expr_contains_row_vector_source(expr)
+                || list.iter().any(expr_contains_row_vector_source)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_contains_row_vector_source(expr) || expr_contains_row_vector_source(pattern)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_contains_row_vector_source(expr)
+                || select_body_contains_row_vector_source(subquery)
+        }
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => false,
+    }
+}
+
+fn select_body_contains_row_vector_source(body: &SelectBody) -> bool {
+    body.columns
+        .iter()
+        .any(|column| expr_contains_row_vector_source(&column.expr))
+        || body
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_contains_row_vector_source)
+        || body
+            .order_by
+            .iter()
+            .any(|order| expr_contains_row_vector_source(&order.expr))
 }
 
 fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {

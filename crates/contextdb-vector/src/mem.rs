@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 const HNSW_THRESHOLD: usize = 1000;
+const QUANTIZED_EXACT_SEARCH_LIMIT: usize = 5000;
 
 fn sort_vector_scores(rows: &mut [(RowId, f32)]) {
     rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -199,7 +200,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         built
     }
 
-    fn search_with_strategy(
+    pub fn search_with_strategy(
         &self,
         index: VectorIndexRef,
         query: &[f32],
@@ -277,6 +278,20 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         );
                         return Ok(SearchStep::Done(rows, trace));
                     }
+                    if !matches!(state.quantization(), VectorQuantization::F32)
+                        && state.vector_count() <= QUANTIZED_EXACT_SEARCH_LIMIT
+                    {
+                        let rows = self.brute_force_search_state(
+                            &index, &state, query, k, candidates, snapshot,
+                        );
+                        let trace = VectorSearchDebugTrace::brute_force(
+                            &index,
+                            &rows,
+                            "quantized_exact_search",
+                            state.hnsw_len(),
+                        );
+                        return Ok(SearchStep::Done(rows, trace));
+                    }
 
                     let Some(lock) = state.hnsw().get() else {
                         return Ok(SearchStep::BuildHnsw);
@@ -297,8 +312,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         .map(|(row_id, _)| *row_id)
                         .collect::<Vec<_>>();
                     let raw_candidate_count = raw_candidates.len();
+                    let graph_covering_request = crate::hnsw::hnsw_search_candidate_cap_for_count(
+                        hnsw_len,
+                        state.quantization(),
+                        k,
+                    ) >= hnsw_len;
 
-                    if candidates.is_some() && raw_candidates.len() < hnsw_len {
+                    if candidates.is_some()
+                        && raw_candidate_count < hnsw_len
+                        && !graph_covering_request
+                    {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
                         );
@@ -311,7 +334,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         return Ok(SearchStep::Done(rows, trace));
                     }
 
-                    let supplement_missing = raw_candidate_count.saturating_add(64) >= hnsw_len;
+                    let supplement_missing = graph_covering_request
+                        || raw_candidate_count.saturating_add(64) >= hnsw_len;
                     let raw_row_ids = if supplement_missing {
                         raw_candidates
                             .iter()
@@ -323,7 +347,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     let (mut visible, supplemented_row_count) = state.with_entries(|entries| {
                         let mut visible = raw_candidates
                             .into_iter()
-                            .filter_map(|(rid, _)| {
+                            .filter_map(|(rid, raw_score)| {
                                 entries
                                     .iter()
                                     .find(|entry| entry.row_id == rid && entry.visible_at(snapshot))
@@ -333,7 +357,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                         {
                                             return None;
                                         }
-                                        Some((entry.row_id, entry.vector.cosine_similarity(query)))
+                                        let score = if raw_score >= 1.0 {
+                                            // Exact-key hits preserve self-probe semantics for
+                                            // quantized vectors; approximate neighbors are reranked
+                                            // against the stored vector payload below.
+                                            1.0
+                                        } else {
+                                            entry.vector.cosine_similarity(query)
+                                        };
+                                        Some((entry.row_id, score))
                                     })
                             })
                             .collect::<Vec<_>>();
@@ -345,6 +377,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                 {
                                     continue;
                                 }
+                                if let Some(cands) = candidates
+                                    && !cands.contains(entry.row_id.0)
+                                {
+                                    continue;
+                                }
                                 visible.push((entry.row_id, entry.vector.cosine_similarity(query)));
                                 supplemented_row_count += 1;
                             }
@@ -353,7 +390,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     });
 
                     sort_vector_scores(&mut visible);
-                    if visible.len() < k && raw_candidate_count < hnsw_len {
+                    if visible.len() < k
+                        && raw_candidate_count < hnsw_len
+                        && !graph_covering_request
+                    {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
                         );
@@ -431,6 +471,41 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         snapshot: SnapshotId,
     ) -> Result<(Vec<(RowId, f32)>, VectorSearchDebugTrace)> {
         self.search_with_strategy(index, query, k, candidates, snapshot)
+    }
+
+    pub fn hnsw_eligible_without_build(
+        &self,
+        index: &VectorIndexRef,
+        snapshot: SnapshotId,
+    ) -> bool {
+        self.store.with_bulk_read(|| {
+            let Some(state) = self.store.try_state(index) else {
+                return false;
+            };
+            if state.entry_count() == 0 {
+                return false;
+            }
+            let snapshot_tx = TxId::from_snapshot(snapshot);
+            if state.max_tx() > snapshot_tx {
+                return false;
+            }
+            if state.vector_count() < HNSW_THRESHOLD {
+                return false;
+            }
+            matches!(state.quantization(), VectorQuantization::F32)
+                || state.vector_count() > QUANTIZED_EXACT_SEARCH_LIMIT
+        })
+    }
+
+    pub fn hnsw_search_covers_all_without_build(&self, index: &VectorIndexRef, k: usize) -> bool {
+        self.store.with_bulk_read(|| {
+            let Some(state) = self.store.try_state(index) else {
+                return false;
+            };
+            let graph_len = state.hnsw_len().unwrap_or_else(|| state.vector_count());
+            crate::hnsw::hnsw_search_candidate_cap_for_count(graph_len, state.quantization(), k)
+                >= graph_len
+        })
     }
 }
 

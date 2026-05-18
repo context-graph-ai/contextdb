@@ -164,8 +164,10 @@ pub(crate) fn handle_meta_command(
             if rest.eq_ignore_ascii_case("vector") {
                 println!("VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')");
                 println!("SHOW VECTOR_INDEXES");
+                println!("ORDER BY embedding <=> [0.1, 0.2, 0.3] LIMIT 5");
+                println!("ORDER BY embedding <=> ROW_VECTOR('table', 'embedding', $key) LIMIT 5");
                 println!(
-                    "Vector errors include LegacyVectorStoreDetected, StoreCorrupted, VectorIndexDimensionMismatch, and UnknownVectorIndex"
+                    "Vector errors include LegacyVectorStoreDetected, StoreCorrupted, VectorIndexDimensionMismatch, UnknownVectorIndex, PersistedRowVectorRowMissing, and PersistedRowVectorCellNull"
                 );
                 return true;
             }
@@ -506,6 +508,8 @@ fn is_fatal_cli_error(error: &Error) -> bool {
         | Error::FullTextSearchNotSupported
         | Error::VectorIndexDimensionMismatch { .. }
         | Error::UnknownVectorIndex { .. }
+        | Error::PersistedRowVectorRowMissing { .. }
+        | Error::PersistedRowVectorCellNull { .. }
         | Error::StoreCorrupted { .. }
         | Error::LegacyVectorStoreDetected { .. } => true,
         Error::MemoryBudgetExceeded { operation, .. } => operation.contains('@'),

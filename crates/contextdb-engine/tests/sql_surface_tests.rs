@@ -8072,6 +8072,578 @@ fn prv_12_row_vector_query_in_active_tx_sees_active_tx_view() {
 }
 
 #[test]
+fn prv_17_row_vector_query_scores_active_tx_target_vector_updates() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.far)),
+            ("embedding", Value::Vector(f.source_vec.clone())),
+        ]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction target own-write ROW_VECTOR query",
+    );
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.far);
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.source_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_18_row_vector_query_keeps_target_vector_on_non_vector_tx_update() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET label = 'near-updated' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.near))]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction non-vector target update ROW_VECTOR query",
+    );
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
+    let label_idx = prv_column(&persisted, "label");
+    assert_eq!(
+        persisted.rows[0].get(label_idx),
+        Some(&Value::Text("near-updated".to_string())),
+        "vector search must preserve the committed vector while materializing the staged row"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.source_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_19_row_vector_query_candidate_filter_uses_active_tx_row_overlay() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET label = 'eligible' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.near))]),
+    )
+    .unwrap();
+
+    let newly_matching = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE label = 'eligible' ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction ROW_VECTOR query with staged candidate newly matching filter",
+    );
+    assert_eq!(prv_uuid_at(&newly_matching, 0, "id"), f.near);
+    let label_idx = prv_column(&newly_matching, "label");
+    assert_eq!(
+        newly_matching.rows[0].get(label_idx),
+        Some(&Value::Text("eligible".to_string()))
+    );
+
+    let literal_newly_matching = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE label = 'eligible' ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal_newly_matching, &newly_matching);
+
+    let stopped_matching = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, label, score FROM docs WHERE label = 'near' ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction ROW_VECTOR query with staged candidate no longer matching filter",
+    );
+    assert!(
+        stopped_matching.rows.is_empty(),
+        "candidate bitmap must exclude the pre-update row image once the active tx changed the non-indexed filter column: {stopped_matching:?}"
+    );
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_20_row_vector_source_missing_key_still_checks_table_read_gate() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id), embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO docs (id, acl_id, embedding) VALUES ($id, $acl, [1,0,0])",
+        &params(vec![
+            (
+                "id",
+                Value::Uuid(Uuid::from_u128(0x7700_0000_0000_0000_0000_0000_0000_0001)),
+            ),
+            (
+                "acl",
+                Value::Uuid(Uuid::from_u128(0x7700_0000_0000_0000_0000_0000_0000_00aa)),
+            ),
+        ]),
+    )
+    .unwrap();
+
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[sarg_uuid(0xA)]));
+    let missing_key = Uuid::from_u128(0x7700_0000_0000_0000_0000_0000_0000_dead);
+    let err = prv_expect_query_err(
+        scoped.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(missing_key))]),
+        ),
+        "ROW_VECTOR source missing key under ACL-gated table without principal",
+    );
+    assert!(
+        matches!(err, Error::PrincipalRequired { .. }),
+        "source table read gate must run before returning missing-key ROW_VECTOR errors, got {err:?}"
+    );
+}
+
+#[test]
+fn prv_21_row_vector_query_treats_vector_null_update_as_null_cell() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = NULL WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.source))]),
+    )
+    .unwrap();
+
+    let active_err = prv_expect_query_err(
+        db.execute_in_tx(
+            tx,
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "active transaction ROW_VECTOR source with vector cell updated to NULL",
+    );
+    assert!(
+        matches!(active_err, Error::PersistedRowVectorCellNull { .. }),
+        "active tx source vector NULL must not read the stale committed vector entry: {active_err:?}"
+    );
+
+    db.commit(tx).unwrap();
+    let committed_err = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "committed ROW_VECTOR source with vector cell updated to NULL",
+    );
+    assert!(
+        matches!(committed_err, Error::PersistedRowVectorCellNull { .. }),
+        "committed source vector NULL must not read the old vector entry: {committed_err:?}"
+    );
+}
+
+#[test]
+fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
+    let accountant = Arc::new(MemoryAccountant::with_budget(4 * 1024 * 1024));
+    let db = Database::open_memory_with_accountant(accountant.clone());
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = NULL WHERE id = $id",
+        &params(vec![("id", Value::Uuid(f.near))]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "active transaction target vector updated to NULL",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        f.far,
+        "target vector NULL update must remove the stale near-vector candidate from scoring"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.source_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+
+    let before_budget_probe = accountant.usage().used;
+    let vector_search_bytes = 3usize
+        .saturating_mul(f.source_vec.len())
+        .saturating_mul(std::mem::size_of::<f32>());
+    accountant
+        .set_budget(Some(
+            before_budget_probe
+                .saturating_add(vector_search_bytes)
+                .saturating_add(32),
+        ))
+        .unwrap();
+    let budget_err = prv_expect_query_err(
+        db.execute_in_tx(
+            tx,
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "active transaction vector overlay should respect MEMORY_LIMIT",
+    );
+    assert!(
+        matches!(
+            budget_err,
+            Error::MemoryBudgetExceeded { ref operation, .. }
+                if operation.starts_with("active_tx_vector_overlay@docs.embedding")
+        ),
+        "active tx exact overlay must be memory-accounted before cloning vectors: {budget_err:?}"
+    );
+    assert_eq!(
+        accountant.usage().used,
+        before_budget_probe,
+        "failed overlay reservation must release the vector-search working set"
+    );
+}
+
+#[test]
+fn prv_23_row_vector_query_cte_projected_id_candidates_use_active_tx_overlay() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let staged = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0c7e);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO docs (id, label, embedding) VALUES ($id, 'eligible', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(staged)),
+            ("embedding", Value::Vector(f.source_vec.clone())),
+        ]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "WITH filtered AS (SELECT id, embedding FROM docs WHERE label = 'eligible')
+             SELECT id, score FROM filtered ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "projected CTE candidate ids must map staged rows to row ids",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        staged,
+        "candidate bitmap fallback from projected UUID id must include active-tx inserts"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "WITH filtered AS (SELECT id, embedding FROM docs WHERE label = 'eligible')
+             SELECT id, score FROM filtered ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_24_row_vector_order_by_rejects_unsupported_sort_shapes() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let unsupported = [
+        (
+            "SELECT id FROM docs ORDER BY label ASC, embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            "ROW_VECTOR as a non-leading ORDER BY item",
+        ),
+        (
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id), label ASC LIMIT 1",
+            "ROW_VECTOR with a secondary ORDER BY item",
+        ),
+    ];
+
+    for (sql, context) in unsupported {
+        let err = prv_expect_query_err(
+            db.execute(sql, &params(vec![("query_id", Value::Uuid(f.source))])),
+            context,
+        );
+        assert!(
+            matches!(err, Error::PlanError(ref message)
+                if message.contains("ROW_VECTOR") && message.contains("only ORDER BY item")),
+            "{context} must be rejected instead of silently ignoring the ROW_VECTOR source: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn prv_25_row_vector_use_rank_joined_row_uses_active_tx_overlay() {
+    let db = Database::open_memory();
+    let f = prv_seed_rank_policy_docs(&db, 4);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE outcomes SET success_rate = 10.0 WHERE decision_id = $decision_id",
+        &params(vec![("decision_id", Value::Uuid(f.far))]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "ROW_VECTOR USE RANK query must see active transaction joined-row updates",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        f.far,
+        "rank policy must score against the active transaction image of the joined row"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_26_row_vector_use_rank_overfetch_includes_active_tx_vector_inserts() {
+    let db = Database::open_memory();
+    let f = prv_seed_rank_policy_docs(&db, 4);
+    let staged = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0027);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO docs (id, label, embedding) VALUES ($id, 'staged-rank', $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(staged)),
+            ("embedding", Value::Vector(vec![-1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO outcomes (id, decision_id, success_rate) VALUES ($id, $decision_id, -10.0)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::new_v4())),
+            ("decision_id", Value::Uuid(staged)),
+        ]),
+    )
+    .unwrap();
+
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "ROW_VECTOR USE RANK query must include active transaction vector inserts in rank overfetch",
+    );
+    assert_eq!(
+        prv_uuid_at(&persisted, 0, "id"),
+        staged,
+        "active-tx staged vector inserts must be ranked before truncating the final top-k"
+    );
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 1",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+
+    let committed = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "committed ROW_VECTOR USE RANK query after staged insert commit",
+    );
+    assert_eq!(
+        prv_uuid_at(&committed, 0, "id"),
+        staged,
+        "active transaction and committed ranked search must agree on the winning row"
+    );
+}
+
+#[test]
+fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
+    let db = Database::open_memory();
+    let f = prv_seed_hnsw_docs(&db, 1000);
+    let index = VectorIndexRef::new("docs", "embedding");
+    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), None);
+
+    let explain = db
+        .explain(&format!(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding','{}') LIMIT 5",
+            f.source
+        ))
+        .unwrap();
+    assert!(
+        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
+        "EXPLAIN must still describe the vector operator without building HNSW: {explain}"
+    );
+    assert_eq!(
+        db.__debug_vector_hnsw_len(index),
+        None,
+        "EXPLAIN must be read-only and must not lazily materialize HNSW state"
+    );
+}
+
+#[test]
+fn prv_28_row_vector_explain_matches_filtered_hnsw_runtime_strategy() {
+    let covering_db = Database::open_memory();
+    let f = prv_seed_hnsw_docs(&covering_db, 1000);
+    let index = VectorIndexRef::new("docs", "embedding");
+    assert_eq!(covering_db.__debug_vector_hnsw_len(index.clone()), None);
+
+    let covering_explain = covering_db
+        .explain(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+        )
+        .unwrap();
+    assert!(
+        covering_explain.contains("HNSWSearch"),
+        "filtered EXPLAIN must match runtime HNSW strategy when the effective search width covers the graph: {covering_explain}"
+    );
+    assert_eq!(
+        covering_db.__debug_vector_hnsw_len(index.clone()),
+        None,
+        "covering EXPLAIN must derive strategy without building HNSW"
+    );
+
+    let covering_result = covering_db
+        .execute(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        )
+        .unwrap();
+    assert!(
+        covering_result.trace.physical_plan.contains("HNSWSearch"),
+        "filtered graph-covering runtime must use the HNSW path: {:?}",
+        covering_result.trace.physical_plan
+    );
+    assert!(
+        covering_result
+            .rows
+            .iter()
+            .all(|row| row.first() != Some(&Value::Uuid(f.source))),
+        "graph-covering HNSW supplement path must preserve the candidate filter"
+    );
+
+    let fallback_db = Database::open_memory();
+    let fallback = prv_seed_hnsw_docs(&fallback_db, 5001);
+    let fallback_index = VectorIndexRef::new("docs", "embedding");
+    assert_eq!(
+        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
+        None
+    );
+
+    let fallback_explain = fallback_db
+        .explain(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+        )
+        .unwrap();
+    assert!(
+        fallback_explain.contains("VectorSearch")
+            && fallback_explain.contains("strategy=BruteForce"),
+        "filtered EXPLAIN must match runtime fallback when the effective search width cannot cover the graph: {fallback_explain}"
+    );
+    assert_eq!(
+        fallback_db.__debug_vector_hnsw_len(fallback_index.clone()),
+        None,
+        "fallback EXPLAIN must not build HNSW"
+    );
+
+    let fallback_result = fallback_db
+        .execute(
+            "SELECT id FROM docs WHERE id != $query_id \
+             ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 5",
+            &params(vec![("query_id", Value::Uuid(fallback.source))]),
+        )
+        .unwrap();
+    assert!(
+        fallback_result.trace.physical_plan.contains("VectorSearch")
+            && !fallback_result.trace.physical_plan.contains("HNSWSearch"),
+        "filtered non-covering runtime must use the fallback vector path: {:?}",
+        fallback_result.trace.physical_plan
+    );
+    assert!(
+        fallback_result
+            .rows
+            .iter()
+            .all(|row| row.first() != Some(&Value::Uuid(fallback.source))),
+        "fallback path must preserve the candidate filter"
+    );
+}
+
+#[test]
 fn prv_13_row_vector_query_honors_scoped_handle_context_isolation() {
     let db = Database::open_memory();
     db.execute(

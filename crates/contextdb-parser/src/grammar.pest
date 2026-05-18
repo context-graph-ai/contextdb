@@ -91,7 +91,10 @@ clause_end = _{ EOI | ";" | ")" | "," }
 order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
 order_item = { cosine_expr | expr ~ sort_dir? }
 sort_dir = { ^"ASC" | ^"DESC" }
-cosine_expr = { additive_expr ~ "<=>" ~ additive_expr }
+cosine_expr = { additive_expr ~ "<=>" ~ cosine_rhs }
+cosine_rhs = { row_vector_source | additive_expr }
+row_vector_source = { ^"ROW_VECTOR" ~ "(" ~ string ~ "," ~ string ~ "," ~ row_vector_key ~ ")" }
+row_vector_key = { parameter | bool_lit | float | integer | string }
 
 use_rank_clause = { ^"USE" ~ ^"RANK" ~ identifier }
 

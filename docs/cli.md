@@ -90,6 +90,7 @@ For file-backed databases, `SET DISK_LIMIT` persists in the database file and su
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `.help` | `\?` | Show available commands. |
+| `.help vector` | | Show vector index syntax, `<=>` examples, `ROW_VECTOR(...)`, and vector error variants. |
 | `.quit` / `.exit` | `\q` | Exit the REPL. |
 | `.tables` | `\dt` | List all table names. |
 | `.schema <table>` | `\d <table>` | Show table DDL and constraints. Per-column `IMMUTABLE`, vector quantization, and `RANK_POLICY` clauses render alongside `NOT NULL` / `PRIMARY KEY`. |

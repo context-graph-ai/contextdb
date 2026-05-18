@@ -718,7 +718,7 @@ pub(crate) fn execute_plan(
                     return Ok(result);
                 } else {
                     // Scan with rejection trace.
-                    let rows = db.scan(table, snapshot)?;
+                    let rows = scan_rows_for_select(db, table, snapshot, tx)?;
                     db.__bump_rows_examined(rows.len() as u64);
                     let mut result = materialize_rows(
                         rows,
@@ -740,7 +740,7 @@ pub(crate) fn execute_plan(
                 }
             }
 
-            let rows = db.scan(table, snapshot)?;
+            let rows = scan_rows_for_select(db, table, snapshot, tx)?;
             db.__bump_rows_examined(rows.len() as u64);
             let mut result = materialize_rows(
                 rows,
@@ -918,11 +918,19 @@ pub(crate) fn execute_plan(
             sort_key,
             ..
         } => {
-            let query_vec = resolve_vector_from_expr(query_expr, params)?;
-            let snapshot = db.snapshot();
+            let snapshot = db.snapshot_for_read();
+            let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
             let mut candidate_trace = None;
-            let candidate_bitmap = if let Some(cands_plan) = candidates {
-                let qr = execute_plan(db, cands_plan, params, tx)?;
+            let unrestricted_scan_candidates = candidates
+                .as_deref()
+                .is_some_and(|plan| is_unrestricted_scan_for_table(plan, table));
+            let candidate_bitmap = if unrestricted_scan_candidates {
+                candidate_trace = Some(QueryTrace::scan());
+                None
+            } else if let Some(cands_plan) = candidates {
+                let qr = db.with_snapshot_override(snapshot, || {
+                    execute_plan(db, cands_plan, params, tx)
+                })?;
                 candidate_trace = Some(qr.trace.clone());
                 let mut bm = RoaringTreemap::new();
                 let row_id_idx = qr.columns.iter().position(|column| {
@@ -940,7 +948,7 @@ pub(crate) fn execute_plan(
                         }
                     }
                 } else if let Some(idx) = id_idx {
-                    let uuid_to_row_id = uuid_to_row_id_map(db, table, snapshot)?;
+                    let uuid_to_row_id = uuid_to_row_id_map(db, table, snapshot, tx)?;
                     for row in qr.rows {
                         if let Some(Value::Uuid(uuid)) = row.get(idx)
                             && let Some(row_id) = uuid_to_row_id.get(uuid)
@@ -954,6 +962,14 @@ pub(crate) fn execute_plan(
                 None
             };
 
+            let mut vector_schema_refs = vec![index.clone()];
+            if let Some(source) = row_vector_source_ref(query_expr) {
+                vector_schema_refs.push(source);
+            }
+            let _vector_schema = db.vector_schema_read_many(vector_schema_refs);
+            db.assert_vector_index_exists_under_schema_read(&index)?;
+            let (query_vec, query_vector_source) =
+                resolve_query_vector_from_expr(db, query_expr, params, tx, snapshot)?;
             let vector_bytes = estimate_vector_search_bytes(query_vec.len(), *k as usize);
             db.accountant().try_allocate_for(
                 vector_bytes,
@@ -962,7 +978,6 @@ pub(crate) fn execute_plan(
                 "Reduce LIMIT/dimensionality or raise MEMORY_LIMIT before vector search.",
             )?;
             if let Some(sort_key) = sort_key {
-                let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
                 let mut semantic_query = crate::database::SemanticQuery::new(
                     table.clone(),
                     column.clone(),
@@ -970,13 +985,15 @@ pub(crate) fn execute_plan(
                     *k as usize,
                 );
                 semantic_query.sort_key = Some(sort_key.clone());
-                let _vector_schema = db.vector_schema_read(&index);
-                let res = db.semantic_search_with_candidates_under_schema_read(
-                    semantic_query,
-                    candidate_bitmap,
-                );
+                let res = db.with_snapshot_override(snapshot, || {
+                    db.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
+                        tx,
+                        semantic_query,
+                        candidate_bitmap,
+                    )
+                });
                 db.accountant().release(vector_bytes);
-                let results = res?;
+                let (results, used_hnsw) = res?;
                 let schema_columns = db.table_meta(table).map(|meta| {
                     meta.columns
                         .into_iter()
@@ -1010,26 +1027,32 @@ pub(crate) fn execute_plan(
                     columns,
                     rows,
                     rows_affected: 0,
-                    trace: vector_search_trace("VectorSearch", candidate_trace),
+                    trace: vector_search_trace_with_source(
+                        if used_hnsw {
+                            "HNSWSearch"
+                        } else {
+                            "VectorSearch"
+                        },
+                        candidate_trace,
+                        query_vector_source,
+                    ),
                     cascade: None,
                 });
             }
-            let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
-            let _vector_schema = db.vector_schema_read(&index);
-            let res = db.query_vector_strict(
+            let res = db.query_vector_strict_in_tx_with_strategy(
+                tx,
                 index.clone(),
                 &query_vec,
                 *k as usize,
                 candidate_bitmap.as_ref(),
-                db.snapshot(),
+                snapshot,
             );
-            let used_hnsw = db.vector_hnsw_len_under_schema_read(&index).is_some();
             db.accountant().release(vector_bytes);
-            let res = res?;
+            let (res, used_hnsw) = res?;
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
             let result_row_ids = res.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
-            let result_rows = rows_by_row_id(db, table, &result_row_ids, snapshot)?;
+            let result_rows = rows_by_row_id(db, table, &result_row_ids, snapshot, tx)?;
             let schema_columns = db.table_meta(table).map(|meta| {
                 meta.columns
                     .into_iter()
@@ -1073,13 +1096,14 @@ pub(crate) fn execute_plan(
                 columns,
                 rows,
                 rows_affected: 0,
-                trace: vector_search_trace(
+                trace: vector_search_trace_with_source(
                     if used_hnsw {
                         "HNSWSearch"
                     } else {
                         "VectorSearch"
                     },
                     candidate_trace,
+                    query_vector_source,
                 ),
                 cascade: None,
             })
@@ -2196,17 +2220,29 @@ fn exec_update(
 
         validate_vector_columns(db, &p.table, &values)?;
         db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
+        let assigned_vector_columns: HashSet<String> = db
+            .table_meta(&p.table)
+            .map(|meta| {
+                let vector_columns = vector_columns_for_meta(&meta)
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                p.assignments
+                    .iter()
+                    .filter_map(|(column, _)| {
+                        vector_columns.contains(column).then_some(column.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let assigned_vector_values: Vec<(String, Vec<f32>)> = p
             .assignments
             .iter()
             .filter_map(|(column, _)| match values.get(column) {
-                Some(Value::Vector(vector)) => Some((column.clone(), vector.clone())),
+                Some(Value::Vector(vector)) if assigned_vector_columns.contains(column) => {
+                    Some((column.clone(), vector.clone()))
+                }
                 _ => None,
             })
-            .collect();
-        let assigned_vector_columns: HashSet<String> = assigned_vector_values
-            .iter()
-            .map(|(column, _)| column.clone())
             .collect();
         planned.push(PlannedUpdate {
             row: row.clone(),
@@ -3726,49 +3762,49 @@ fn materialize_rows(
     })
 }
 
+fn scan_rows_for_select(
+    db: &Database,
+    table: &str,
+    snapshot: SnapshotId,
+    tx: Option<TxId>,
+) -> Result<Vec<VersionedRow>> {
+    if let Some(tx) = tx {
+        let rows = db.scan_in_tx_raw(tx, table, snapshot)?;
+        db.filter_rows_for_read(table, rows, snapshot)
+    } else {
+        db.scan(table, snapshot)
+    }
+}
+
 fn rows_by_row_id(
     db: &Database,
     table: &str,
     row_ids: &[RowId],
     snapshot: SnapshotId,
+    tx: Option<TxId>,
 ) -> Result<Vec<VersionedRow>> {
     if row_ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let wanted = row_ids.iter().copied().collect::<HashSet<_>>();
-    let tables = db.relational_store().tables.read();
-    let rows = tables
-        .get(table)
-        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
-    let mut found = HashMap::with_capacity(wanted.len());
-    for row in rows {
-        if wanted.contains(&row.row_id) && row.visible_at(snapshot) {
-            found.insert(row.row_id, row.clone());
-            if found.len() == wanted.len() {
-                break;
-            }
+    let mut rows = Vec::with_capacity(row_ids.len());
+    for row_id in row_ids {
+        if let Ok(row) = db.find_row_by_id_in_tx(tx, table, *row_id, snapshot) {
+            rows.push(row);
         }
     }
-
-    Ok(row_ids
-        .iter()
-        .filter_map(|row_id| found.remove(row_id))
-        .collect())
+    Ok(rows)
 }
 
 fn uuid_to_row_id_map(
     db: &Database,
     table: &str,
     snapshot: SnapshotId,
+    tx: Option<TxId>,
 ) -> Result<HashMap<uuid::Uuid, RowId>> {
-    let tables = db.relational_store().tables.read();
-    let rows = tables
-        .get(table)
-        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+    let rows = scan_rows_for_select(db, table, snapshot, tx)?;
     Ok(rows
         .iter()
-        .filter(|row| row.visible_at(snapshot))
         .filter_map(|row| match row.values.get("id") {
             Some(Value::Uuid(uuid)) => Some((*uuid, row.row_id)),
             _ => None,
@@ -3794,6 +3830,37 @@ fn vector_search_trace(operator: &'static str, candidate_trace: Option<QueryTrac
     };
     trace.sort_elided = false;
     trace
+}
+
+fn vector_search_trace_with_source(
+    operator: &'static str,
+    candidate_trace: Option<QueryTrace>,
+    query_vector_source: Option<contextdb_core::VectorIndexRef>,
+) -> QueryTrace {
+    let mut trace = vector_search_trace(operator, candidate_trace);
+    trace.query_vector_source = query_vector_source;
+    trace
+}
+
+fn row_vector_source_ref(expr: &Expr) -> Option<contextdb_core::VectorIndexRef> {
+    match expr {
+        Expr::RowVectorSource { table, column, .. } => Some(contextdb_core::VectorIndexRef::new(
+            table.clone(),
+            column.clone(),
+        )),
+        _ => None,
+    }
+}
+
+fn is_unrestricted_scan_for_table(plan: &PhysicalPlan, table: &str) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::Scan {
+            table: scan_table,
+            filter: None,
+            ..
+        } if scan_table == table
+    )
 }
 
 pub(crate) fn row_matches(
@@ -4972,6 +5039,103 @@ fn resolve_vector_from_expr(expr: &Expr, params: &HashMap<String, Value>) -> Res
         _ => Err(Error::PlanError(
             "invalid vector query expression".to_string(),
         )),
+    }
+}
+
+fn resolve_query_vector_from_expr(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: SnapshotId,
+) -> Result<(Vec<f32>, Option<contextdb_core::VectorIndexRef>)> {
+    match expr {
+        Expr::RowVectorSource { table, column, key } => {
+            let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
+            let vector = resolve_row_vector_source(db, &index, key, params, tx, snapshot)?;
+            Ok((vector, Some(index)))
+        }
+        _ => Ok((resolve_vector_from_expr(expr, params)?, None)),
+    }
+}
+
+fn resolve_row_vector_source(
+    db: &Database,
+    index: &contextdb_core::VectorIndexRef,
+    key_expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: SnapshotId,
+) -> Result<Vec<f32>> {
+    let meta = db
+        .table_meta(&index.table)
+        .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+    db.assert_table_read_allowed(&index.table)?;
+    if !meta.columns.iter().any(|column| {
+        column.name == index.column
+            && matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+    }) {
+        return Err(Error::UnknownVectorIndex {
+            index: index.clone(),
+        });
+    }
+    db.assert_vector_index_exists_under_schema_read(index)?;
+
+    let raw_key = resolve_expr(key_expr, params)?;
+    if matches!(raw_key, Value::Null) {
+        return Err(Error::PlanError(
+            "ROW_VECTOR key cannot be NULL".to_string(),
+        ));
+    }
+    if matches!(raw_key, Value::Vector(_)) {
+        return Err(Error::PlanError(
+            "ROW_VECTOR key cannot be a vector".to_string(),
+        ));
+    }
+
+    let key_column = db.natural_key_column_for_table(&index.table)?;
+    let key =
+        coerce_into_column(db, &index.table, &key_column, raw_key, None, tx).map_err(|err| {
+            Error::PlanError(format!(
+                "ROW_VECTOR argument 3 key cannot be coerced to `{}`.`{}` natural key: {err}",
+                index.table, key_column
+            ))
+        })?;
+    if matches!(key, Value::Null) {
+        return Err(Error::PlanError(
+            "ROW_VECTOR key cannot be NULL".to_string(),
+        ));
+    }
+    let key_label = row_vector_key_label(&key);
+    let row_id = db
+        .row_id_for_natural_key_in_tx(tx, &index.table, &key_column, &key, snapshot)?
+        .ok_or_else(|| Error::PersistedRowVectorRowMissing {
+            index: index.clone(),
+            key: key_label.clone(),
+        })?;
+    db.assert_row_id_read_allowed_for_change(tx, &index.table, row_id, snapshot)?;
+    let entry = db
+        .vector_entry_for_row_in_tx(tx, index, row_id, snapshot)?
+        .ok_or_else(|| Error::PersistedRowVectorCellNull {
+            index: index.clone(),
+            key: key_label,
+        })?;
+    db.validate_vector_under_schema_read(index, entry.vector.len())?;
+    Ok(entry.vector)
+}
+
+fn row_vector_key_label(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Int64(value) => value.to_string(),
+        Value::Float64(value) => value.to_string(),
+        Value::Text(value) => value.clone(),
+        Value::Uuid(value) => value.to_string(),
+        Value::Timestamp(value) => value.to_string(),
+        Value::Json(value) => value.to_string(),
+        Value::Vector(_) => "<vector>".to_string(),
+        Value::TxId(value) => value.to_string(),
     }
 }
 
