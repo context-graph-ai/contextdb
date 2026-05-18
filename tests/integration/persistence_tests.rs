@@ -1,25 +1,50 @@
+use crate::cli_spawn::{cli_bin, spawn_cli, spawn_cli_no_stdin};
 use contextdb_core::*;
 use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, NaturalKey, RowChange};
 use contextdb_server::{SyncClient, SyncServer};
+use fs2::FileExt;
+use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Barrier, mpsc};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
+const CLI_BAD_PATH: &str = "/nonexistent/deeply/nested/path/test.db";
+const CLI_SPAWN_STABILITY_WORKERS: usize = 16;
+const CLI_SPAWN_STABILITY_OUTER_ITERATIONS: usize = 3;
+const CLI_DEBUG_LOCK_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_BUILD_PROBE_WORKERS: usize = 12;
+const CLI_BUILD_PROBE_ENV: &str = "CONTEXTDB_CLI_BUILD_PROBE";
+const CLI_BUILD_PROBE_COUNT_ENV: &str = "CONTEXTDB_CLI_BUILD_PROBE_COUNT";
+const CLI_BUILD_PROBE_REAL_CARGO_ENV: &str = "CONTEXTDB_CLI_BUILD_PROBE_REAL_CARGO";
+
 struct NatsFixture {
     _container: ContainerAsync<GenericImage>,
     nats_url: String,
 }
+
+struct DebugCargoLockProbe<T> {
+    outputs: Vec<T>,
+    timed_out: bool,
+    completed_before_timeout: usize,
+}
+
+type BadPathCliOutput = (usize, std::result::Result<std::process::Output, String>);
+type MemoryModeCliOutput = (
+    usize,
+    Uuid,
+    std::result::Result<(std::process::Output, std::process::Output), String>,
+);
 
 fn values(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
@@ -73,6 +98,572 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / (an * bn)
     }
+}
+
+fn run_bad_path_cli_workers() -> DebugCargoLockProbe<BadPathCliOutput> {
+    warm_cli_spawn_helper();
+    let mut debug_lock = Some(lock_debug_cargo_target());
+    let (tx, rx) = mpsc::channel();
+    let handles: Vec<_> = (0..CLI_SPAWN_STABILITY_WORKERS)
+        .map(|child_index| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut child = spawn_cli_no_stdin(CLI_BAD_PATH, &[]);
+                if let Err(err) = verify_child_is_release_cli_binary(&mut child, &release_cli_bin())
+                {
+                    let _ = tx.send((child_index, Err(err)));
+                    return;
+                }
+                let output = child.wait_with_output().expect("CLI should finish");
+                let _ = tx.send((child_index, Ok(output)));
+            })
+        })
+        .collect();
+    drop(tx);
+
+    let mut outputs = Vec::with_capacity(CLI_SPAWN_STABILITY_WORKERS);
+    let timed_out = collect_outputs_until_probe_deadline(&rx, &mut outputs);
+    let completed_before_timeout = outputs.len();
+    drop(debug_lock.take());
+
+    for handle in handles {
+        handle.join().expect("bad-path CLI worker should not panic");
+    }
+    outputs.extend(rx.try_iter());
+    outputs.sort_by_key(|(child_index, _)| *child_index);
+
+    DebugCargoLockProbe {
+        outputs,
+        timed_out,
+        completed_before_timeout,
+    }
+}
+
+fn release_cli_bin() -> std::path::PathBuf {
+    let mut path = workspace_root_path()
+        .join("target")
+        .join("release")
+        .join("contextdb-cli");
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+    path
+}
+
+fn workspace_root_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn run_memory_mode_cli_workers() -> DebugCargoLockProbe<MemoryModeCliOutput> {
+    warm_cli_spawn_helper();
+    let mut debug_lock = Some(lock_debug_cargo_target());
+    let (tx, rx) = mpsc::channel();
+    let handles: Vec<_> = (0..CLI_SPAWN_STABILITY_WORKERS)
+        .map(|worker_index| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let id = Uuid::new_v4();
+                let script1 = format!(
+                    "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)\n\
+                     INSERT INTO t (id, v) VALUES ('{id}', 'memory_val')\n\
+                     SELECT * FROM t\n\
+                     .quit\n"
+                );
+                let result = run_live_cli_script(":memory:", &script1).and_then(|output1| {
+                    run_live_cli_script(":memory:", "SELECT * FROM t\n.quit\n")
+                        .map(|output2| (output1, output2))
+                });
+                let _ = tx.send((worker_index, id, result));
+            })
+        })
+        .collect();
+    drop(tx);
+
+    let mut outputs = Vec::with_capacity(CLI_SPAWN_STABILITY_WORKERS);
+    let timed_out = collect_outputs_until_probe_deadline(&rx, &mut outputs);
+    let completed_before_timeout = outputs.len();
+    drop(debug_lock.take());
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("memory-mode CLI worker should not panic");
+    }
+    outputs.extend(rx.try_iter());
+    outputs.sort_by_key(|(worker_index, _, _)| *worker_index);
+
+    DebugCargoLockProbe {
+        outputs,
+        timed_out,
+        completed_before_timeout,
+    }
+}
+
+fn warm_cli_spawn_helper() {
+    let output = spawn_cli_no_stdin(CLI_BAD_PATH, &[])
+        .wait_with_output()
+        .expect("CLI should finish");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "CLI warmup should hit the typed bad-path exit before the lock probe\nstderr:\n{stderr}"
+    );
+}
+
+fn run_identity_checked_cli_no_stdin(db_path: &str, extra_args: &[&str]) -> std::process::Output {
+    let mut child = spawn_cli_no_stdin(db_path, extra_args);
+    assert_child_is_release_cli_binary(&mut child, &release_cli_bin());
+    child.wait_with_output().expect("CLI should finish")
+}
+
+fn run_live_cli_script(
+    db_path: &str,
+    script: &str,
+) -> std::result::Result<std::process::Output, String> {
+    let mut child = spawn_cli(db_path, &[]);
+    verify_child_is_release_cli_binary(&mut child, &release_cli_bin())?;
+    match child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(script.as_bytes())
+    {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("write script to CLI: {err}"),
+    }
+    Ok(child.wait_with_output().expect("CLI should finish"))
+}
+
+fn collect_outputs_until_probe_deadline<T>(rx: &mpsc::Receiver<T>, outputs: &mut Vec<T>) -> bool {
+    let deadline = Instant::now() + CLI_DEBUG_LOCK_PROBE_TIMEOUT;
+    while outputs.len() < CLI_SPAWN_STABILITY_WORKERS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(output) => outputs.push(output),
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+fn assert_spawn_helper_targets_release_cli() {
+    let expected = release_cli_bin();
+    assert_eq!(
+        cli_bin(),
+        expected,
+        "CLI spawn helper must expose the release contextdb-cli binary path"
+    );
+
+    let mut child = spawn_cli(":memory:", &[]);
+    assert_child_is_release_cli_binary(&mut child, &expected);
+    {
+        let stdin = child.stdin.as_mut().expect("stdin pipe");
+        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
+        writeln!(
+            stdin,
+            "INSERT INTO t (id, v) VALUES ('{}', 'identity_probe')",
+            Uuid::new_v4()
+        )
+        .unwrap();
+        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, ".quit").unwrap();
+    }
+    let output = child.wait_with_output().expect("CLI should finish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "release CLI identity probe should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("identity_probe"),
+        "release CLI identity probe should execute the scripted SELECT, got stdout:\n{stdout}"
+    );
+}
+
+fn assert_cli_spawn_helper_build_shape() {
+    let source = fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("tests")
+            .join("integration")
+            .join("cli_spawn.rs"),
+    )
+    .expect("cli_spawn helper source should be readable");
+    assert!(
+        source.contains("Once") && source.contains(".call_once("),
+        "CLI spawn helper must gate the release build with std::sync::Once"
+    );
+    assert!(
+        source.contains("Command::new(\"cargo\")")
+            && source.contains("\"build\"")
+            && source.contains("\"--release\"")
+            && source.contains("\"-p\"")
+            && source.contains("\"contextdb-cli\""),
+        "CLI spawn helper must build contextdb-cli in release mode before spawning it"
+    );
+    assert!(
+        !source.contains("\"run\", \"-p\", \"contextdb-cli\"")
+            && !source.contains("\"run\"")
+            && !source.contains("cargo_run_command"),
+        "CLI spawn helper must not use cargo run after the RED stub is replaced"
+    );
+}
+
+fn assert_file_backed_cli_persistence_through_spawn_helper() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("cli-helper-persistence.db");
+    let id = Uuid::new_v4();
+    let script1 = format!(
+        "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)\n\
+         INSERT INTO t (id, v) VALUES ('{id}', 'alpha')\n\
+         .quit\n"
+    );
+    let output1 = run_live_cli_script(path.to_str().unwrap(), &script1)
+        .expect("file-backed CLI session 1 should spawn release binary");
+    let stdout1 = String::from_utf8_lossy(&output1.stdout);
+    let stderr1 = String::from_utf8_lossy(&output1.stderr);
+    assert!(
+        output1.status.success(),
+        "file-backed CLI session 1 should succeed\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
+    );
+
+    let output2 = run_live_cli_script(path.to_str().unwrap(), "SELECT * FROM t\n.quit\n")
+        .expect("file-backed CLI session 2 should spawn release binary");
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+    assert!(
+        output2.status.success(),
+        "file-backed CLI session 2 should succeed\nstdout:\n{stdout2}\nstderr:\n{stderr2}"
+    );
+    assert!(
+        stdout2.contains("alpha"),
+        "file-backed CLI session 2 should read persisted value, got stdout:\n{stdout2}"
+    );
+}
+
+fn assert_spawn_helper_owns_once_gated_release_build() {
+    #[cfg(unix)]
+    {
+        let expected = release_cli_bin();
+        ensure_release_cli_bin_exists_for_probe(&expected);
+        run_build_probe_subprocess("existing release binary");
+
+        let _guard = ReleaseCliBinaryGuard::move_aside(&expected);
+        run_build_probe_subprocess("missing release binary");
+    }
+}
+
+#[cfg(unix)]
+fn ensure_release_cli_bin_exists_for_probe(expected: &std::path::Path) {
+    if expected.exists() {
+        return;
+    }
+    let output = Command::new("cargo")
+        .args(["build", "--release", "-p", "contextdb-cli"])
+        .current_dir(workspace_root_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("release CLI seed build should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "release CLI seed build failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        expected.exists(),
+        "release CLI seed build should produce {}",
+        expected.display()
+    );
+}
+
+#[cfg(unix)]
+fn run_build_probe_subprocess(label: &str) {
+    let tmp = TempDir::new().unwrap();
+    let count_path = tmp.path().join("cargo-count");
+    let fake_cargo = write_fake_cargo(tmp.path(), &count_path);
+    let real_cargo = find_real_cargo();
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            "persistence_tests::cli_spawn_helper_build_probe_subprocess",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CLI_BUILD_PROBE_ENV, "1")
+        .env(CLI_BUILD_PROBE_COUNT_ENV, &count_path)
+        .env(CLI_BUILD_PROBE_REAL_CARGO_ENV, &real_cargo)
+        .env("PATH", prepend_path(fake_cargo.parent().unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("build probe subprocess should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "CLI spawn helper build probe subprocess failed for {label}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        fake_cargo_invocation_count(&count_path),
+        1,
+        "build probe subprocess for {label} should observe exactly one cargo build"
+    );
+}
+
+#[cfg(unix)]
+struct ReleaseCliBinaryGuard {
+    original: std::path::PathBuf,
+    backup: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+impl ReleaseCliBinaryGuard {
+    fn move_aside(original: &std::path::Path) -> Self {
+        let backup = original.with_extension(format!("build-probe-backup-{}", std::process::id()));
+        if backup.exists() {
+            fs::remove_file(&backup).expect("stale release CLI backup should be removable");
+        }
+        let backup = if original.exists() {
+            fs::rename(original, &backup).expect("release CLI binary should move aside");
+            Some(backup)
+        } else {
+            None
+        };
+        Self {
+            original: original.to_path_buf(),
+            backup,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReleaseCliBinaryGuard {
+    fn drop(&mut self) {
+        if let Some(backup) = self.backup.take() {
+            if self.original.exists() {
+                let _ = fs::remove_file(&self.original);
+            }
+            let _ = fs::rename(backup, &self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_cargo(dir: &std::path::Path, _count_path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = dir.join("bin");
+    fs::create_dir_all(&bin_dir).expect("fake cargo bin dir should be creatable");
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nprintf '1\\n' >> \"$CONTEXTDB_CLI_BUILD_PROBE_COUNT\"\nsleep 2\nexec \"$CONTEXTDB_CLI_BUILD_PROBE_REAL_CARGO\" \"$@\"\n",
+    )
+    .expect("fake cargo wrapper should be writable");
+    let mut permissions = fs::metadata(&fake_cargo)
+        .expect("fake cargo metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions).expect("fake cargo should be executable");
+    fake_cargo
+}
+
+#[cfg(unix)]
+fn find_real_cargo() -> std::path::PathBuf {
+    let output = Command::new("rustup")
+        .args(["which", "cargo"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("rustup should locate cargo");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rustup which cargo failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    std::path::PathBuf::from(stdout.trim())
+}
+
+#[cfg(unix)]
+fn prepend_path(dir: &std::path::Path) -> std::ffi::OsString {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(existing) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    env::join_paths(paths).expect("probe PATH should be joinable")
+}
+
+fn fake_cargo_invocation_count(count_path: &std::path::Path) -> usize {
+    fs::read_to_string(count_path)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+fn run_build_probe_helper(worker_index: usize) -> (&'static str, std::process::Output) {
+    match worker_index % 3 {
+        0 => (
+            "run_identity_checked_cli_no_stdin",
+            run_identity_checked_cli_no_stdin(CLI_BAD_PATH, &[]),
+        ),
+        1 => (
+            "spawn_cli_no_stdin",
+            spawn_cli_no_stdin(CLI_BAD_PATH, &[])
+                .wait_with_output()
+                .expect("spawn_cli_no_stdin probe child should finish"),
+        ),
+        _ => (
+            "spawn_cli",
+            spawn_cli(CLI_BAD_PATH, &[])
+                .wait_with_output()
+                .expect("spawn_cli probe child should finish"),
+        ),
+    }
+}
+
+#[test]
+#[serial(cli_spawn_helper)]
+fn cli_spawn_helper_build_probe_subprocess() {
+    if env::var_os(CLI_BUILD_PROBE_ENV).is_none() {
+        return;
+    }
+
+    let barrier = Arc::new(Barrier::new(CLI_BUILD_PROBE_WORKERS));
+    let handles: Vec<_> = (0..CLI_BUILD_PROBE_WORKERS)
+        .map(|worker_index| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let (helper_name, output) = run_build_probe_helper(worker_index);
+                (worker_index, helper_name, output)
+            })
+        })
+        .collect();
+    for handle in handles {
+        let (worker_index, helper_name, output) =
+            handle.join().expect("build probe worker should not panic");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "build probe worker {worker_index} using {helper_name} should hit typed bad-path exit\nstderr:\n{stderr}"
+        );
+    }
+    assert!(
+        release_cli_bin().exists(),
+        "probe helper should recreate the missing release CLI binary"
+    );
+
+    let count_path =
+        std::path::PathBuf::from(env::var_os(CLI_BUILD_PROBE_COUNT_ENV).expect("count path env"));
+    assert_eq!(
+        fake_cargo_invocation_count(&count_path),
+        1,
+        "probe helper should invoke cargo exactly once across concurrent first spawns"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_child_is_release_cli_binary(child: &mut Child, expected: &std::path::Path) {
+    if let Err(err) = verify_child_is_release_cli_binary(child, expected) {
+        panic!("{err}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_child_is_release_cli_binary(
+    child: &mut Child,
+    expected: &std::path::Path,
+) -> std::result::Result<(), String> {
+    let expected = match fs::canonicalize(expected) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "release CLI binary should exist before identity probe at {}: {err}",
+                expected.display()
+            ));
+        }
+    };
+    let actual = match fs::read_link(format!("/proc/{}/exe", child.id())) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "spawned CLI child executable should be inspectable: {err}"
+            ));
+        }
+    };
+    if actual != expected {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "CLI spawn helper must spawn the release contextdb-cli binary directly, expected {}, got {}",
+            expected.display(),
+            actual.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn assert_child_is_release_cli_binary(_child: &mut Child, expected: &std::path::Path) {
+    if let Err(err) = verify_child_is_release_cli_binary(_child, expected) {
+        panic!("{err}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_child_is_release_cli_binary(
+    _child: &mut Child,
+    expected: &std::path::Path,
+) -> std::result::Result<(), String> {
+    if !expected.exists() {
+        return Err(format!(
+            "release CLI binary should exist before identity probe at {}",
+            expected.display()
+        ));
+    }
+    Ok(())
+}
+
+fn lock_debug_cargo_target() -> fs::File {
+    let lock_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join("target")
+        .join("debug")
+        .join(".cargo-lock");
+    let parent = lock_path.parent().expect("cargo lock parent");
+    fs::create_dir_all(parent).expect("target/debug should be creatable");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("target/debug cargo lock should open");
+    file.lock_exclusive()
+        .expect("target/debug cargo lock should lock");
+    file
 }
 
 fn brute_force_top_k(vectors: &[(RowId, Vec<f32>)], query: &[f32], k: usize) -> Vec<RowId> {
@@ -1296,17 +1887,11 @@ fn p20_dimension_mismatch_rejected_after_restart() {
 }
 
 #[test]
+#[serial(cli_spawn_helper)]
 fn p21_cli_persists_across_sessions() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("cli.db");
-    let mut child1 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", path.to_str().unwrap()])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child1 = spawn_cli(path.to_str().unwrap(), &[]);
     {
         let stdin = child1.stdin.as_mut().unwrap();
         writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
@@ -1321,14 +1906,7 @@ fn p21_cli_persists_across_sessions() {
     let output1 = child1.wait_with_output().unwrap();
     assert!(output1.status.success());
 
-    let mut child2 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", path.to_str().unwrap()])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child2 = spawn_cli(path.to_str().unwrap(), &[]);
     {
         let stdin = child2.stdin.as_mut().unwrap();
         writeln!(stdin, "SELECT * FROM t").unwrap();
@@ -1341,25 +1919,88 @@ fn p21_cli_persists_across_sessions() {
 }
 
 #[test]
+#[serial(cli_spawn_helper)]
 fn p22_cli_bad_path_prints_clear_error() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "contextdb-cli",
-            "--",
-            "/nonexistent/deeply/nested/path/test.db",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    let output = spawn_cli_no_stdin(CLI_BAD_PATH, &[])
+        .wait_with_output()
+        .expect("CLI should finish");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1));
     assert!(!stderr.is_empty());
     assert!(stderr.contains("path") || stderr.contains("open") || stderr.contains("writable"));
+}
+
+#[test]
+#[serial(cli_spawn_helper)]
+fn cli_child_process_spawn_stability_under_simulated_workspace_parallel_load() {
+    assert_cli_spawn_helper_build_shape();
+    assert_spawn_helper_owns_once_gated_release_build();
+    assert_spawn_helper_targets_release_cli();
+    assert_file_backed_cli_persistence_through_spawn_helper();
+
+    for iteration in 0..CLI_SPAWN_STABILITY_OUTER_ITERATIONS {
+        let probe = run_bad_path_cli_workers();
+        assert!(
+            !probe.timed_out,
+            "iteration {iteration}: CLI helper waited on target/debug/.cargo-lock; received {}/{} workers before {:?}",
+            probe.completed_before_timeout,
+            CLI_SPAWN_STABILITY_WORKERS,
+            CLI_DEBUG_LOCK_PROBE_TIMEOUT
+        );
+        for (child_index, output) in &probe.outputs {
+            let output = output
+                .as_ref()
+                .unwrap_or_else(|err| panic!("iteration {iteration}, child {child_index}: {err}"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.code() == Some(1),
+                "iteration {iteration}, child {child_index}: expected bad-path exit 1, got {:?}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+            assert!(
+                !stderr.is_empty(),
+                "iteration {iteration}, child {child_index}: expected non-empty bad-path stderr, got exit {:?}",
+                output.status.code()
+            );
+        }
+    }
+}
+
+#[test]
+#[serial(cli_spawn_helper)]
+fn cli_bad_path_exit_code_is_deterministic_under_concurrent_load() {
+    for iteration in 0..CLI_SPAWN_STABILITY_OUTER_ITERATIONS {
+        let probe = run_bad_path_cli_workers();
+        assert!(
+            !probe.timed_out,
+            "iteration {iteration}: CLI helper waited on target/debug/.cargo-lock; received {}/{} workers before {:?}",
+            probe.completed_before_timeout,
+            CLI_SPAWN_STABILITY_WORKERS,
+            CLI_DEBUG_LOCK_PROBE_TIMEOUT
+        );
+        for (child_index, output) in &probe.outputs {
+            let output = output
+                .as_ref()
+                .unwrap_or_else(|err| panic!("iteration {iteration}, child {child_index}: {err}"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "iteration {iteration}, child {child_index}: observed exit {:?}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+            assert!(
+                !stderr.is_empty(),
+                "iteration {iteration}, child {child_index}: observed exit {:?}",
+                output.status.code()
+            );
+            assert!(
+                stderr.contains("path") || stderr.contains("open") || stderr.contains("writable"),
+                "iteration {iteration}, child {child_index}: observed exit {:?}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2144,16 +2785,10 @@ async fn p33_bidirectional_sync_with_persistence() {
 }
 
 #[test]
+#[serial(cli_spawn_helper)]
 fn p34_cli_memory_mode_smoke_test() {
     let id = Uuid::new_v4();
-    let mut child1 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", ":memory:"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child1 = spawn_cli(":memory:", &[]);
     {
         let stdin = child1.stdin.as_mut().unwrap();
         writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
@@ -2181,14 +2816,7 @@ fn p34_cli_memory_mode_smoke_test() {
         "SELECT output should contain inserted UUID, got: {stdout1}"
     );
 
-    let mut child2 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", ":memory:"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child2 = spawn_cli(":memory:", &[]);
     {
         let stdin = child2.stdin.as_mut().unwrap();
         writeln!(stdin, "SELECT * FROM t").unwrap();
@@ -2210,6 +2838,55 @@ fn p34_cli_memory_mode_smoke_test() {
         !stdout2.contains("memory_val"),
         "memory_val should not persist across :memory: sessions, stdout: {stdout2}"
     );
+}
+
+#[test]
+#[serial(cli_spawn_helper)]
+fn cli_memory_mode_smoke_session_completes_under_concurrent_load() {
+    for iteration in 0..CLI_SPAWN_STABILITY_OUTER_ITERATIONS {
+        let probe = run_memory_mode_cli_workers();
+        assert!(
+            !probe.timed_out,
+            "iteration {iteration}: CLI helper waited on target/debug/.cargo-lock; received {}/{} workers before {:?}",
+            probe.completed_before_timeout,
+            CLI_SPAWN_STABILITY_WORKERS,
+            CLI_DEBUG_LOCK_PROBE_TIMEOUT
+        );
+
+        for (worker_index, id, outputs) in probe.outputs {
+            let (output1, output2) = outputs.unwrap_or_else(|err| {
+                panic!("iteration {iteration}, worker {worker_index}: {err}")
+            });
+            assert!(
+                output1.status.success(),
+                "iteration {iteration}, worker {worker_index}: CLI session 1 exited with non-zero status"
+            );
+            let stdout1 = String::from_utf8_lossy(&output1.stdout);
+            assert!(
+                stdout1.contains("memory_val"),
+                "iteration {iteration}, worker {worker_index}: SELECT output should contain inserted value, got: {stdout1}"
+            );
+            assert!(
+                stdout1.contains(&id.to_string()),
+                "iteration {iteration}, worker {worker_index}: SELECT output should contain inserted UUID, got: {stdout1}"
+            );
+
+            let stdout2 = String::from_utf8_lossy(&output2.stdout);
+            let stderr2 = String::from_utf8_lossy(&output2.stderr);
+            assert!(
+                !stdout2.is_empty() || !stderr2.is_empty(),
+                "iteration {iteration}, worker {worker_index}: CLI session 2 produced no output at all - process may not have started"
+            );
+            assert!(
+                !stdout2.contains(&id.to_string()),
+                "iteration {iteration}, worker {worker_index}: UUID from session 1 should not appear in session 2, stdout: {stdout2}"
+            );
+            assert!(
+                !stdout2.contains("memory_val"),
+                "iteration {iteration}, worker {worker_index}: memory_val should not persist across :memory: sessions, stdout: {stdout2}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -6,6 +6,8 @@ mod alter_table_tests;
 mod anti_tests;
 #[path = "integration/boundary_conditions.rs"]
 mod boundary_conditions;
+#[path = "integration/cli_spawn.rs"]
+mod cli_spawn;
 #[path = "integration/column_level_immutable_tests.rs"]
 mod column_level_immutable_tests;
 #[path = "integration/commit_failed_observer_tests.rs"]
