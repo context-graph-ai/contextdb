@@ -8,6 +8,58 @@ use std::sync::{Arc, OnceLock};
 
 const HNSW_THRESHOLD: usize = 1000;
 
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSearchDebugTrace {
+    pub index: VectorIndexRef,
+    pub used_hnsw: bool,
+    pub hnsw_len: Option<usize>,
+    pub hnsw_candidate_count: usize,
+    pub hnsw_candidate_row_ids: Vec<RowId>,
+    pub final_row_ids: Vec<RowId>,
+    pub supplemented_row_count: usize,
+    pub fallback_reason: Option<&'static str>,
+}
+
+impl VectorSearchDebugTrace {
+    fn brute_force(
+        index: &VectorIndexRef,
+        rows: &[(RowId, f32)],
+        fallback_reason: &'static str,
+        hnsw_len: Option<usize>,
+    ) -> Self {
+        Self {
+            index: index.clone(),
+            used_hnsw: false,
+            hnsw_len,
+            hnsw_candidate_count: 0,
+            hnsw_candidate_row_ids: Vec::new(),
+            final_row_ids: rows.iter().map(|(row_id, _)| *row_id).collect(),
+            supplemented_row_count: 0,
+            fallback_reason: Some(fallback_reason),
+        }
+    }
+
+    fn hnsw(
+        index: &VectorIndexRef,
+        hnsw_len: usize,
+        hnsw_candidate_row_ids: Vec<RowId>,
+        rows: &[(RowId, f32)],
+        supplemented_row_count: usize,
+    ) -> Self {
+        Self {
+            index: index.clone(),
+            used_hnsw: true,
+            hnsw_len: Some(hnsw_len),
+            hnsw_candidate_count: hnsw_candidate_row_ids.len(),
+            hnsw_candidate_row_ids,
+            final_row_ids: rows.iter().map(|(row_id, _)| *row_id).collect(),
+            supplemented_row_count,
+            fallback_reason: None,
+        }
+    }
+}
+
 pub struct MemVectorExecutor<S: WriteSetApplicator> {
     store: Arc<VectorStore>,
     tx_mgr: Arc<TxManager<S>>,
@@ -139,17 +191,20 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot: SnapshotId,
-    ) -> Result<(Vec<(RowId, f32)>, bool)> {
+    ) -> Result<(Vec<(RowId, f32)>, VectorSearchDebugTrace)> {
         self.store.with_bulk_read(|| {
             if k == 0 {
-                return Ok((Vec::new(), false));
+                return Ok((
+                    Vec::new(),
+                    VectorSearchDebugTrace::brute_force(&index, &[], "empty_limit", None),
+                ));
             }
             enum BuildOutcome {
                 Ready,
                 Fallback,
             }
             enum SearchStep {
-                Done(Vec<(RowId, f32)>, bool),
+                Done(Vec<(RowId, f32)>, VectorSearchDebugTrace),
                 BuildHnsw,
             }
 
@@ -164,20 +219,35 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         });
                     }
                     if state.entry_count() == 0 {
-                        return Ok(SearchStep::Done(Vec::new(), false));
+                        return Ok(SearchStep::Done(
+                            Vec::new(),
+                            VectorSearchDebugTrace::brute_force(&index, &[], "empty_index", None),
+                        ));
                     }
 
                     if state.max_tx() > snapshot_tx {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
                         );
-                        return Ok(SearchStep::Done(rows, false));
+                        let trace = VectorSearchDebugTrace::brute_force(
+                            &index,
+                            &rows,
+                            "snapshot_has_newer_vectors",
+                            state.hnsw_len(),
+                        );
+                        return Ok(SearchStep::Done(rows, trace));
                     }
                     if state.vector_count() < HNSW_THRESHOLD {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
                         );
-                        return Ok(SearchStep::Done(rows, false));
+                        let trace = VectorSearchDebugTrace::brute_force(
+                            &index,
+                            &rows,
+                            "below_hnsw_threshold",
+                            state.hnsw_len(),
+                        );
+                        return Ok(SearchStep::Done(rows, trace));
                     }
 
                     let Some(lock) = state.hnsw().get() else {
@@ -193,16 +263,27 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         .maybe_pause(&index, crate::test_seam::PauseWindow::Search);
 
                     let raw_candidates = hnsw.search(&index, query, k)?;
+                    let hnsw_len = hnsw.len();
+                    let hnsw_candidate_row_ids = raw_candidates
+                        .iter()
+                        .map(|(row_id, _)| *row_id)
+                        .collect::<Vec<_>>();
                     let raw_candidate_count = raw_candidates.len();
 
-                    if candidates.is_some() && raw_candidates.len() < hnsw.len() {
+                    if candidates.is_some() && raw_candidates.len() < hnsw_len {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
                         );
-                        return Ok(SearchStep::Done(rows, false));
+                        let trace = VectorSearchDebugTrace::brute_force(
+                            &index,
+                            &rows,
+                            "candidate_filter_requires_exact_scan",
+                            Some(hnsw_len),
+                        );
+                        return Ok(SearchStep::Done(rows, trace));
                     }
 
-                    let supplement_missing = raw_candidate_count.saturating_add(64) >= hnsw.len();
+                    let supplement_missing = raw_candidate_count.saturating_add(64) >= hnsw_len;
                     let raw_row_ids = if supplement_missing {
                         raw_candidates
                             .iter()
@@ -211,7 +292,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     } else {
                         HashSet::new()
                     };
-                    let mut visible = state.with_entries(|entries| {
+                    let (mut visible, supplemented_row_count) = state.with_entries(|entries| {
                         let mut visible = raw_candidates
                             .into_iter()
                             .filter_map(|(rid, _)| {
@@ -228,6 +309,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     })
                             })
                             .collect::<Vec<_>>();
+                        let mut supplemented_row_count = 0usize;
                         if supplement_missing {
                             for entry in entries {
                                 if raw_row_ids.contains(&entry.row_id)
@@ -236,25 +318,39 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     continue;
                                 }
                                 visible.push((entry.row_id, entry.vector.cosine_similarity(query)));
+                                supplemented_row_count += 1;
                             }
                         }
-                        visible
+                        (visible, supplemented_row_count)
                     });
 
                     visible
                         .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    if visible.len() < k && raw_candidate_count < hnsw.len() {
+                    if visible.len() < k && raw_candidate_count < hnsw_len {
                         let rows = self.brute_force_search_state(
                             &index, &state, query, k, candidates, snapshot,
                         );
-                        return Ok(SearchStep::Done(rows, false));
+                        let trace = VectorSearchDebugTrace::brute_force(
+                            &index,
+                            &rows,
+                            "hnsw_candidates_insufficient",
+                            Some(hnsw_len),
+                        );
+                        return Ok(SearchStep::Done(rows, trace));
                     }
                     visible.truncate(k);
-                    Ok(SearchStep::Done(visible, true))
+                    let trace = VectorSearchDebugTrace::hnsw(
+                        &index,
+                        hnsw_len,
+                        hnsw_candidate_row_ids,
+                        &visible,
+                        supplemented_row_count,
+                    );
+                    Ok(SearchStep::Done(visible, trace))
                 })??;
 
                 match step {
-                    SearchStep::Done(rows, used_hnsw) => return Ok((rows, used_hnsw)),
+                    SearchStep::Done(rows, trace) => return Ok((rows, trace)),
                     SearchStep::BuildHnsw => {
                         let outcome = self.store.with_index_maintenance(&index, || {
                             let Some(current) = self.store.try_state(&index) else {
@@ -283,13 +379,31 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             BuildOutcome::Fallback => {
                                 let rows = self
                                     .brute_force_search(&index, query, k, candidates, snapshot)?;
-                                return Ok((rows, false));
+                                let trace = VectorSearchDebugTrace::brute_force(
+                                    &index,
+                                    &rows,
+                                    "hnsw_build_unavailable",
+                                    None,
+                                );
+                                return Ok((rows, trace));
                             }
                         }
                     }
                 }
             }
         })
+    }
+
+    #[doc(hidden)]
+    pub fn search_with_strategy_for_test(
+        &self,
+        index: VectorIndexRef,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&RoaringTreemap>,
+        snapshot: SnapshotId,
+    ) -> Result<(Vec<(RowId, f32)>, VectorSearchDebugTrace)> {
+        self.search_with_strategy(index, query, k, candidates, snapshot)
     }
 }
 

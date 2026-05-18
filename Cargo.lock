@@ -634,6 +634,7 @@ dependencies = [
  "criterion",
  "fs2",
  "futures-util",
+ "num_cpus",
  "parking_lot",
  "redb",
  "regex",

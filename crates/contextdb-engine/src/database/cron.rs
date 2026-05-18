@@ -775,6 +775,8 @@ impl Database {
             closed: AtomicBool::new(false),
             resource_closed: self.resource_closed.clone(),
             rows_examined: AtomicU64::new(0),
+            last_vector_search_used_hnsw: AtomicBool::new(false),
+            last_vector_search_trace: RwLock::new(None),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: RwLock::new(self.rank_formula_cache.read().clone()),
             acl_grant_cache: RwLock::new(HashMap::new()),

@@ -11,10 +11,13 @@ pub struct HnswIndex {
     id_to_row: RwLock<HashMap<usize, RowId>>,
     exact_rows: RwLock<HashMap<Vec<u8>, Vec<RowId>>>,
     next_id: AtomicUsize,
+    build_serial: u64,
     dimension: usize,
     quantization: VectorQuantization,
     ef_search: usize,
 }
+
+static NEXT_HNSW_BUILD_SERIAL: AtomicUsize = AtomicUsize::new(1);
 
 enum HnswInner {
     F32(Hnsw<'static, f32, DistCosine>),
@@ -147,6 +150,7 @@ impl HnswIndex {
             id_to_row,
             exact_rows,
             next_id: AtomicUsize::new(inserted_count),
+            build_serial: NEXT_HNSW_BUILD_SERIAL.fetch_add(1, Ordering::SeqCst) as u64,
             dimension,
             quantization,
             ef_search,
@@ -238,6 +242,19 @@ impl HnswIndex {
             .filter(|indexed_row| **indexed_row == row_id)
             .count()
     }
+
+    #[doc(hidden)]
+    pub fn build_serial_for_test(&self) -> u64 {
+        self.build_serial
+    }
+
+    #[doc(hidden)]
+    pub fn graph_topology_digest_for_test(&self) -> u64 {
+        match &self.hnsw {
+            HnswInner::F32(hnsw) => hnsw_topology_digest(hnsw),
+            HnswInner::Quantized(hnsw) => hnsw_topology_digest(hnsw),
+        }
+    }
 }
 
 fn exact_key_for_stored_vector(vector: &StoredVector) -> Option<Vec<u8>> {
@@ -288,6 +305,49 @@ where
         layer0_neighbor_edges,
         hnsw.get_max_level_observed(),
     )
+}
+
+fn hnsw_topology_digest<T, D>(hnsw: &Hnsw<'_, T, D>) -> u64
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    digest_u64(&mut digest, hnsw.get_nb_point() as u64);
+    digest_u64(&mut digest, hnsw.get_max_level() as u64);
+    digest_u64(&mut digest, hnsw.get_max_level_observed() as u64);
+
+    let indexation = hnsw.get_point_indexation();
+    for layer in 0..hnsw.get_max_level() {
+        digest_u64(&mut digest, layer as u64);
+        for point in indexation.get_layer_iterator(layer) {
+            let point_id = point.get_point_id();
+            digest_u64(&mut digest, point.get_origin_id() as u64);
+            digest_u64(&mut digest, point_id.0 as u64);
+            digest_i32(&mut digest, point_id.1);
+            let neighborhoods = point.get_neighborhood_id();
+            for (neighbor_layer, neighbors) in neighborhoods.iter().enumerate() {
+                digest_u64(&mut digest, neighbor_layer as u64);
+                digest_u64(&mut digest, neighbors.len() as u64);
+                for neighbor in neighbors {
+                    digest_u64(&mut digest, neighbor.d_id as u64);
+                    digest_u64(&mut digest, neighbor.distance.to_bits() as u64);
+                    digest_u64(&mut digest, neighbor.p_id.0 as u64);
+                    digest_i32(&mut digest, neighbor.p_id.1);
+                }
+            }
+        }
+    }
+    digest
+}
+
+fn digest_i32(digest: &mut u64, value: i32) {
+    digest_u64(digest, value as u32 as u64);
+}
+
+fn digest_u64(digest: &mut u64, value: u64) {
+    *digest ^= value;
+    *digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
 }
 
 fn select_params(count: usize, quantization: VectorQuantization) -> (usize, usize, usize) {

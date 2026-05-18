@@ -253,6 +253,22 @@ impl IndexState {
         })
     }
 
+    pub fn raw_hnsw_topology_digest_for_test(&self) -> Option<u64> {
+        self.hnsw.get().and_then(|lock| {
+            lock.read()
+                .as_ref()
+                .map(|hnsw| hnsw.graph_topology_digest_for_test())
+        })
+    }
+
+    pub fn raw_hnsw_build_serial_for_test(&self) -> Option<u64> {
+        self.hnsw.get().and_then(|lock| {
+            lock.read()
+                .as_ref()
+                .map(|hnsw| hnsw.build_serial_for_test())
+        })
+    }
+
     pub fn set_hnsw(&self, hnsw: Option<HnswIndex>, bytes: usize) {
         if hnsw.is_some() {
             self.hnsw_bytes.store(bytes, Ordering::SeqCst);
@@ -880,6 +896,20 @@ impl VectorStore {
         self.with_bulk_read(|| {
             self.try_state(index)
                 .and_then(|state| state.raw_hnsw_entry_count_for_row(row_id))
+        })
+    }
+
+    pub fn raw_hnsw_topology_digest_for_test(&self, index: &VectorIndexRef) -> Option<u64> {
+        self.with_bulk_read(|| {
+            self.try_state(index)
+                .and_then(|state| state.raw_hnsw_topology_digest_for_test())
+        })
+    }
+
+    pub fn raw_hnsw_build_serial_for_test(&self, index: &VectorIndexRef) -> Option<u64> {
+        self.with_bulk_read(|| {
+            self.try_state(index)
+                .and_then(|state| state.raw_hnsw_build_serial_for_test())
         })
     }
 

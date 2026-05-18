@@ -19,7 +19,9 @@ use contextdb_parser::ast::{AlterAction, CreateTable, DataType, Expr};
 use contextdb_planner::{OnConflictPlan, PhysicalPlan};
 use contextdb_relational::{MemRelationalExecutor, RelationalStore, index_key_from_values};
 use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
-use contextdb_vector::{HnswGraphStats, HnswIndex, MemVectorExecutor, VectorStore};
+use contextdb_vector::{
+    HnswGraphStats, HnswIndex, MemVectorExecutor, VectorSearchDebugTrace, VectorStore,
+};
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -508,6 +510,8 @@ pub struct Database {
     closed: AtomicBool,
     resource_closed: Arc<AtomicBool>,
     rows_examined: AtomicU64,
+    last_vector_search_used_hnsw: AtomicBool,
+    last_vector_search_trace: RwLock<Option<VectorSearchDebugTrace>>,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,
     rank_formula_cache: RwLock<HashMap<(String, String), Arc<RankFormula>>>,
     acl_grant_cache: RwLock<HashMap<AclGrantCacheKey, Arc<HashSet<uuid::Uuid>>>>,
@@ -1023,6 +1027,8 @@ impl Database {
             closed: AtomicBool::new(false),
             resource_closed: Arc::new(AtomicBool::new(false)),
             rows_examined: AtomicU64::new(0),
+            last_vector_search_used_hnsw: AtomicBool::new(false),
+            last_vector_search_trace: RwLock::new(None),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: RwLock::new(HashMap::new()),
             acl_grant_cache: RwLock::new(HashMap::new()),
@@ -1203,6 +1209,8 @@ impl Database {
             closed: AtomicBool::new(false),
             resource_closed: self.resource_closed.clone(),
             rows_examined: AtomicU64::new(0),
+            last_vector_search_used_hnsw: AtomicBool::new(false),
+            last_vector_search_trace: RwLock::new(None),
             statement_cache: RwLock::new(HashMap::new()),
             rank_formula_cache: RwLock::new(HashMap::new()),
             acl_grant_cache: RwLock::new(HashMap::new()),
@@ -6873,8 +6881,17 @@ impl Database {
         }
         let effective_candidates =
             self.effective_read_candidates(&index.table, snapshot, candidates)?;
-        self.vector
-            .search(index, query, k, effective_candidates.as_ref(), snapshot)
+        let (rows, trace) = self.vector.search_with_strategy_for_test(
+            index,
+            query,
+            k,
+            effective_candidates.as_ref(),
+            snapshot,
+        )?;
+        self.last_vector_search_used_hnsw
+            .store(trace.used_hnsw, Ordering::SeqCst);
+        *self.last_vector_search_trace.write() = Some(trace);
+        Ok(rows)
     }
 
     pub fn semantic_search(&self, query: SemanticQuery) -> Result<Vec<SearchResult>> {
@@ -7099,8 +7116,17 @@ impl Database {
         self.vector_store.validate_vector(&index, query.len())?;
         let effective_candidates =
             self.effective_read_candidates(&index.table, snapshot, candidates)?;
-        self.vector
-            .search(index, query, k, effective_candidates.as_ref(), snapshot)
+        let (rows, trace) = self.vector.search_with_strategy_for_test(
+            index,
+            query,
+            k,
+            effective_candidates.as_ref(),
+            snapshot,
+        )?;
+        self.last_vector_search_used_hnsw
+            .store(trace.used_hnsw, Ordering::SeqCst);
+        *self.last_vector_search_trace.write() = Some(trace);
+        Ok(rows)
     }
 
     pub(crate) fn register_rank_formula(
@@ -7409,6 +7435,18 @@ impl Database {
     }
 
     #[doc(hidden)]
+    pub fn __debug_last_query_vector_used_hnsw_for_test(&self) -> bool {
+        let _operation = self.assert_open_operation();
+        self.last_vector_search_used_hnsw.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_last_query_vector_trace_for_test(&self) -> Option<VectorSearchDebugTrace> {
+        let _operation = self.assert_open_operation();
+        self.last_vector_search_trace.read().clone()
+    }
+
+    #[doc(hidden)]
     pub fn __debug_vector_hnsw_len(&self, index: VectorIndexRef) -> Option<usize> {
         let _operation = self.assert_open_operation();
         let _vector_schema = self.vector_schema_read(&index);
@@ -7457,6 +7495,23 @@ impl Database {
         let _vector_schema = self.vector_schema_read(&index);
         self.vector_store
             .raw_hnsw_entry_count_for_row(&index, row_id)
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_vector_hnsw_topology_digest_for_test(
+        &self,
+        index: VectorIndexRef,
+    ) -> Option<u64> {
+        let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read(&index);
+        self.vector_store.raw_hnsw_topology_digest_for_test(&index)
+    }
+
+    #[doc(hidden)]
+    pub fn __debug_vector_hnsw_build_serial_for_test(&self, index: VectorIndexRef) -> Option<u64> {
+        let _operation = self.assert_open_operation();
+        let _vector_schema = self.vector_schema_read(&index);
+        self.vector_store.raw_hnsw_build_serial_for_test(&index)
     }
 
     #[doc(hidden)]
