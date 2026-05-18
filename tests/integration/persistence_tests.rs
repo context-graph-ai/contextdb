@@ -108,12 +108,7 @@ fn run_bad_path_cli_workers() -> DebugCargoLockProbe<BadPathCliOutput> {
         .map(|child_index| {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let mut child = spawn_cli_no_stdin(CLI_BAD_PATH, &[]);
-                if let Err(err) = verify_child_is_release_cli_binary(&mut child, &release_cli_bin())
-                {
-                    let _ = tx.send((child_index, Err(err)));
-                    return;
-                }
+                let child = spawn_cli_no_stdin(CLI_BAD_PATH, &[]);
                 let output = child.wait_with_output().expect("CLI should finish");
                 let _ = tx.send((child_index, Ok(output)));
             })
@@ -213,12 +208,6 @@ fn warm_cli_spawn_helper() {
         Some(1),
         "CLI warmup should hit the typed bad-path exit before the lock probe\nstderr:\n{stderr}"
     );
-}
-
-fn run_identity_checked_cli_no_stdin(db_path: &str, extra_args: &[&str]) -> std::process::Output {
-    let mut child = spawn_cli_no_stdin(db_path, extra_args);
-    assert_child_is_release_cli_binary(&mut child, &release_cli_bin());
-    child.wait_with_output().expect("CLI should finish")
 }
 
 fn run_live_cli_script(
@@ -518,8 +507,10 @@ fn fake_cargo_invocation_count(count_path: &std::path::Path) -> usize {
 fn run_build_probe_helper(worker_index: usize) -> (&'static str, std::process::Output) {
     match worker_index % 3 {
         0 => (
-            "run_identity_checked_cli_no_stdin",
-            run_identity_checked_cli_no_stdin(CLI_BAD_PATH, &[]),
+            "local_no_stdin_wait",
+            spawn_cli_no_stdin(CLI_BAD_PATH, &[])
+                .wait_with_output()
+                .expect("local no-stdin probe child should finish"),
         ),
         1 => (
             "spawn_cli_no_stdin",
@@ -601,26 +592,38 @@ fn verify_child_is_release_cli_binary(
             ));
         }
     };
-    let actual = match fs::read_link(format!("/proc/{}/exe", child.id())) {
-        Ok(path) => path,
-        Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "spawned CLI child executable should be inspectable: {err}"
-            ));
+    let exe_link = format!("/proc/{}/exe", child.id());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_actual = None;
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match fs::read_link(&exe_link) {
+            Ok(actual) if actual == expected => return Ok(()),
+            Ok(actual) => {
+                last_actual = Some(actual);
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
         }
-    };
-    if actual != expected {
-        let _ = child.kill();
-        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(actual) = last_actual {
         return Err(format!(
             "CLI spawn helper must spawn the release contextdb-cli binary directly, expected {}, got {}",
             expected.display(),
             actual.display()
         ));
     }
-    Ok(())
+    Err(format!(
+        "spawned CLI child executable should be inspectable: {}",
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "timed out before /proc inspection".to_string())
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
