@@ -713,6 +713,7 @@ pub(crate) fn execute_plan(
                         predicates_pushed: pushed,
                         indexes_considered: considered,
                         sort_elided: false,
+                        query_vector_source: None,
                     };
                     return Ok(result);
                 } else {
@@ -733,6 +734,7 @@ pub(crate) fn execute_plan(
                         predicates_pushed: Default::default(),
                         indexes_considered: considered,
                         sort_elided: false,
+                        query_vector_source: None,
                     };
                     return Ok(result);
                 }
@@ -3418,6 +3420,7 @@ fn run_index_scan_with_order(
         predicates_pushed: pushed,
         indexes_considered: Default::default(),
         sort_elided: true,
+        query_vector_source: None,
     };
     Ok(Some(result))
 }

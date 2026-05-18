@@ -6898,3 +6898,1473 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
     assert!(!vector_store.has_hnsw_index_for(&text_ref));
     assert!(!vector_store.has_hnsw_index_for(&vision_ref));
 }
+
+// ============================================================
+// Persisted row vector query operand
+// ============================================================
+
+#[derive(Clone)]
+struct PrvFixture {
+    source: Uuid,
+    near: Uuid,
+    mid: Uuid,
+    far: Uuid,
+    source_vec: Vec<f32>,
+    near_vec: Vec<f32>,
+    mid_vec: Vec<f32>,
+    far_vec: Vec<f32>,
+}
+
+fn prv_fixture() -> PrvFixture {
+    PrvFixture {
+        source: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0001),
+        near: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0002),
+        mid: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0003),
+        far: Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0004),
+        source_vec: vec![0.731_234, 0.212_345, 0.648_901],
+        near_vec: vec![0.730_001, 0.214_001, 0.647_222],
+        mid_vec: vec![0.120_222, 0.970_111, 0.110_333],
+        far_vec: vec![0.030_111, 0.040_222, 0.998_333],
+    }
+}
+
+fn prv_create_docs_table(db: &Database) {
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, label TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+}
+
+fn prv_insert_doc(db: &Database, id: Uuid, label: &str, embedding: Vec<f32>) {
+    db.execute(
+        "INSERT INTO docs (id, label, embedding) VALUES ($id, $label, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("label", Value::Text(label.to_string())),
+            ("embedding", Value::Vector(embedding)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn prv_update_doc_embedding(db: &Database, id: Uuid, embedding: Vec<f32>) {
+    db.execute(
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("embedding", Value::Vector(embedding)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn prv_seed_docs(db: &Database) -> PrvFixture {
+    let f = prv_fixture();
+    prv_create_docs_table(db);
+    prv_insert_doc(db, f.source, "source", f.source_vec.clone());
+    prv_insert_doc(db, f.near, "near", f.near_vec.clone());
+    prv_insert_doc(db, f.mid, "mid", f.mid_vec.clone());
+    prv_insert_doc(db, f.far, "far", f.far_vec.clone());
+    f
+}
+
+fn prv_seed_hnsw_docs(db: &Database, rows: usize) -> PrvFixture {
+    let f = prv_seed_docs(db);
+    for idx in 4..rows {
+        let id = Uuid::from_u128(0x7200_0000_0000_0000_0000_0000_0000_0000 + idx as u128);
+        let angle = idx as f32 * 0.013;
+        prv_insert_doc(
+            db,
+            id,
+            &format!("hnsw-{idx}"),
+            vec![
+                angle.sin().abs(),
+                angle.cos().abs(),
+                (angle * 0.5).sin().abs(),
+            ],
+        );
+    }
+    f
+}
+
+fn prv_expect_query_ok(
+    result: contextdb_core::Result<contextdb_engine::QueryResult>,
+    context: &str,
+) -> contextdb_engine::QueryResult {
+    if let Err(err) = &result {
+        assert!(
+            result.is_ok(),
+            "{context}: expected ROW_VECTOR query to succeed, got {err:?}"
+        );
+    }
+    match result {
+        Ok(result) => result,
+        Err(_) => unreachable!(),
+    }
+}
+
+fn prv_expect_query_err(
+    result: contextdb_core::Result<contextdb_engine::QueryResult>,
+    context: &str,
+) -> Error {
+    if let Ok(ok_result) = &result {
+        assert!(
+            result.is_err(),
+            "{context}: expected ROW_VECTOR query to fail, got {ok_result:?}"
+        );
+    }
+    match result {
+        Ok(_) => unreachable!(),
+        Err(err) => err,
+    }
+}
+
+fn prv_column(result: &contextdb_engine::QueryResult, name: &str) -> usize {
+    result
+        .columns
+        .iter()
+        .position(|column| column == name || column.rsplit('.').next() == Some(name))
+        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns))
+}
+
+fn prv_uuid_at(result: &contextdb_engine::QueryResult, row: usize, column: &str) -> Uuid {
+    let idx = prv_column(result, column);
+    match result.rows.get(row).and_then(|values| values.get(idx)) {
+        Some(Value::Uuid(id)) => *id,
+        other => panic!("expected UUID in row {row} column {column}, got {other:?}"),
+    }
+}
+
+fn prv_score_at(result: &contextdb_engine::QueryResult, row: usize) -> f64 {
+    let idx = prv_column(result, "score");
+    match result.rows.get(row).and_then(|values| values.get(idx)) {
+        Some(Value::Float64(score)) => *score,
+        other => panic!("expected score in row {row}, got {other:?}"),
+    }
+}
+
+fn prv_assert_same_signature(
+    literal: &contextdb_engine::QueryResult,
+    persisted: &contextdb_engine::QueryResult,
+) {
+    assert_eq!(
+        persisted.trace.physical_plan, literal.trace.physical_plan,
+        "persisted ROW_VECTOR query must match literal-vector plan label"
+    );
+    assert_eq!(
+        persisted.trace.index_used, literal.trace.index_used,
+        "persisted ROW_VECTOR query must match literal-vector index trace"
+    );
+    assert_eq!(persisted.rows.len(), literal.rows.len());
+    for idx in 0..literal.rows.len() {
+        assert_eq!(
+            prv_uuid_at(persisted, idx, "id"),
+            prv_uuid_at(literal, idx, "id"),
+            "persisted ROW_VECTOR row order must match literal-vector row order at row {idx}"
+        );
+        let literal_score = prv_score_at(literal, idx);
+        let persisted_score = prv_score_at(persisted, idx);
+        let ulps = literal_score.to_bits().abs_diff(persisted_score.to_bits());
+        assert!(
+            ulps <= 1,
+            "persisted ROW_VECTOR score must match literal-vector score within 1 ULP at row {idx}: literal={literal_score:?}, persisted={persisted_score:?}, ulps={ulps}"
+        );
+    }
+}
+
+fn prv_row_vector_query(where_clause: &str) -> String {
+    format!(
+        "SELECT id, label, score FROM docs {where_clause} ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 3"
+    )
+}
+
+fn prv_literal_query(where_clause: &str) -> String {
+    format!(
+        "SELECT id, label, score FROM docs {where_clause} ORDER BY embedding <=> $query LIMIT 3"
+    )
+}
+
+fn prv_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let b0 = bytes[pos];
+        let b1 = bytes.get(pos + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(pos + 2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if pos + 1 < bytes.len() {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if pos + 2 < bytes.len() {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        pos += 3;
+    }
+    out
+}
+
+fn prv_assert_no_encoded_vector_bytes(surface: &str, label: &str, bytes: &[u8]) {
+    if bytes.iter().all(|byte| *byte == 0) {
+        return;
+    }
+    let lower = surface.to_ascii_lowercase();
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert!(
+        !lower.contains(&hex),
+        "surface leaked {label} vector bytes as hex {hex}: {surface}"
+    );
+    let decimal = bytes
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        !surface.contains(&decimal),
+        "surface leaked {label} vector bytes as decimal list {decimal}: {surface}"
+    );
+    let b64 = prv_base64(bytes);
+    assert!(
+        !surface.contains(&b64),
+        "surface leaked {label} vector bytes as base64 {b64}: {surface}"
+    );
+}
+
+fn prv_assert_no_source_vector_leak_in_debug(debug: &str, source_vec: &[f32]) {
+    assert!(
+        !debug.contains("query: ["),
+        "debug surface must not expose an internal query vector: {debug}"
+    );
+    assert!(
+        !debug.contains("Value::Vector") && !debug.contains("Vector(["),
+        "debug surface must not expose a vector-valued payload: {debug}"
+    );
+    for component in source_vec {
+        let token = format!("{component:?}");
+        assert!(
+            !debug.contains(&token),
+            "debug surface leaked source vector component {token}: {debug}"
+        );
+        let little = component.to_le_bytes();
+        let big = component.to_be_bytes();
+        prv_assert_no_encoded_vector_bytes(debug, "little-endian component", &little);
+        prv_assert_no_encoded_vector_bytes(debug, "big-endian component", &big);
+    }
+    let little_vec = source_vec
+        .iter()
+        .flat_map(|component| component.to_le_bytes())
+        .collect::<Vec<_>>();
+    let big_vec = source_vec
+        .iter()
+        .flat_map(|component| component.to_be_bytes())
+        .collect::<Vec<_>>();
+    prv_assert_no_encoded_vector_bytes(debug, "little-endian full", &little_vec);
+    prv_assert_no_encoded_vector_bytes(debug, "big-endian full", &big_vec);
+}
+
+fn prv_assert_result_has_no_vector_payload(
+    result: &contextdb_engine::QueryResult,
+    source_vec: &[f32],
+) {
+    for row in &result.rows {
+        for value in row {
+            assert!(
+                !matches!(value, Value::Vector(_)),
+                "ROW_VECTOR query result must not expose vector-valued cells: {result:?}"
+            );
+        }
+    }
+    prv_assert_no_source_vector_leak_in_debug(&format!("{result:?}"), source_vec);
+}
+
+fn prv_memory_usage_tuple(db: &Database) -> (Option<usize>, usize, Option<usize>, Option<usize>) {
+    let usage = db.accountant().usage();
+    (
+        usage.limit,
+        usage.used,
+        usage.available,
+        usage.startup_ceiling,
+    )
+}
+
+fn prv_seed_rank_policy_docs(db: &Database, rows: usize) -> PrvFixture {
+    db.execute(
+        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID, success_rate REAL)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE docs (
+            id UUID PRIMARY KEY,
+            label TEXT,
+            embedding VECTOR(3) RANK_POLICY (
+                JOIN outcomes ON decision_id,
+                FORMULA '{vector_score} * coalesce({success_rate}, 1.0)',
+                SORT_KEY weighted
+            )
+        )",
+        &empty(),
+    )
+    .unwrap();
+
+    let f = prv_fixture();
+    let fixed = [
+        (f.source, "source", f.source_vec.clone(), 1.0),
+        (f.near, "near", f.near_vec.clone(), 0.75),
+        (f.mid, "mid", f.mid_vec.clone(), 2.0),
+        (f.far, "far", f.far_vec.clone(), 0.25),
+    ];
+    let fixed_len = fixed.len();
+    for (id, label, vector, success_rate) in fixed {
+        db.execute(
+            "INSERT INTO docs (id, label, embedding) VALUES ($id, $label, $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("label", Value::Text(label.to_string())),
+                ("embedding", Value::Vector(vector)),
+            ]),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO outcomes (id, decision_id, success_rate) VALUES ($id, $decision_id, $success_rate)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("decision_id", Value::Uuid(id)),
+                ("success_rate", Value::Float64(success_rate)),
+            ]),
+        )
+        .unwrap();
+    }
+    for idx in fixed_len..rows {
+        let id = Uuid::from_u128(0x7100_0000_0000_0000_0000_0000_0000_0000 + idx as u128);
+        let angle = idx as f32 * 0.017;
+        let vector = vec![angle.sin().abs(), angle.cos().abs(), 0.125];
+        prv_insert_doc(db, id, &format!("bulk-{idx}"), vector);
+        db.execute(
+            "INSERT INTO outcomes (id, decision_id, success_rate) VALUES ($id, $decision_id, $success_rate)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("decision_id", Value::Uuid(id)),
+                ("success_rate", Value::Float64(1.0)),
+            ]),
+        )
+        .unwrap();
+    }
+    f
+}
+
+fn prv_06_child_process() {
+    let db_path = std::env::var("CONTEXTDB_PRV06_DB").unwrap();
+    let barrier_dir = std::path::PathBuf::from(std::env::var("CONTEXTDB_PRV06_BARRIER").unwrap());
+    let query_id = Uuid::parse_str(&std::env::var("CONTEXTDB_PRV06_QUERY_ID").unwrap()).unwrap();
+    let f = prv_fixture();
+    let db = Database::open(&db_path).unwrap();
+    for phase in 0..3 {
+        let go = barrier_dir.join(format!("phase-{phase}.go"));
+        let done = barrier_dir.join(format!("phase-{phase}.done"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !go.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child timed out waiting for barrier {go:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        match phase {
+            1 => {
+                prv_update_doc_embedding(&db, f.source, f.mid_vec.clone());
+                prv_update_doc_embedding(&db, f.near, f.mid_vec.clone());
+                prv_update_doc_embedding(&db, f.mid, f.far_vec.clone());
+                prv_update_doc_embedding(&db, f.far, f.source_vec.clone());
+            }
+            2 => {
+                prv_update_doc_embedding(&db, f.source, f.near_vec.clone());
+                prv_update_doc_embedding(&db, f.mid, f.near_vec.clone());
+                prv_update_doc_embedding(&db, f.near, f.far_vec.clone());
+                prv_update_doc_embedding(&db, f.far, f.far_vec.clone());
+            }
+            _ => {}
+        }
+        let result = prv_expect_query_ok(
+            db.execute(
+                "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+                &params(vec![("query_id", Value::Uuid(query_id))]),
+            ),
+            "child process ROW_VECTOR query",
+        );
+        let top = prv_uuid_at(&result, 0, "id");
+        std::fs::write(done, top.to_string()).unwrap();
+    }
+}
+
+fn prv_wait_for_file(path: &std::path::Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for barrier file {path:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn prv_01_parser_accepts_row_vector_as_cosine_distance_rhs() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let result = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 2",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "well-formed persisted row vector RHS",
+    );
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(prv_uuid_at(&result, 0, "id"), f.source);
+    assert_eq!(
+        result.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+}
+
+#[test]
+fn prv_02_parser_rejects_malformed_or_misplaced_row_vector_forms() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let positive = db.execute(
+        "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        &params(vec![("query_id", Value::Uuid(f.source))]),
+    );
+    assert!(
+        positive.is_ok(),
+        "well-formed ROW_VECTOR RHS must execute before malformed cases are meaningful: {positive:?}"
+    );
+
+    let uncorrelated_in = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id IN (SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1)",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "uncorrelated IN subquery with ROW_VECTOR order",
+    );
+    assert_eq!(prv_uuid_at(&uncorrelated_in, 0, "id"), f.source);
+
+    let malformed = [
+        (
+            "select-list placement",
+            "SELECT ROW_VECTOR('docs','embedding',$query_id) FROM docs",
+        ),
+        (
+            "where-predicate placement",
+            "SELECT id FROM docs WHERE ROW_VECTOR('docs','embedding',$query_id) = 1",
+        ),
+        (
+            "standalone order item",
+            "SELECT id FROM docs ORDER BY ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        ),
+        (
+            "row-vector as cosine lhs",
+            "SELECT id FROM docs ORDER BY ROW_VECTOR('docs','embedding',$query_id) <=> [1,0,0] LIMIT 1",
+        ),
+        (
+            "row-vector arithmetic",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) + 1 LIMIT 1",
+        ),
+        (
+            "join-on placement",
+            "SELECT d.id FROM docs d JOIN docs q ON ROW_VECTOR('docs','embedding',$query_id) = 1 ORDER BY d.id LIMIT 1",
+        ),
+        (
+            "aliased row-vector expression",
+            "SELECT ROW_VECTOR('docs','embedding',$query_id) AS query_vec FROM docs",
+        ),
+        (
+            "cte self-join column key leakage",
+            "WITH s AS (SELECT id FROM docs) SELECT d.id FROM docs d JOIN s ON d.id = s.id ORDER BY d.embedding <=> ROW_VECTOR('docs','embedding',s.id) LIMIT 1",
+        ),
+        (
+            "nested cosine distance",
+            "SELECT id FROM docs ORDER BY embedding <=> (ROW_VECTOR('docs','embedding',$query_id) <=> [1,0,0]) LIMIT 1",
+        ),
+        (
+            "correlated in-subquery leakage",
+            "SELECT id FROM docs WHERE id IN (SELECT q.id FROM docs q WHERE q.id = docs.id ORDER BY q.embedding <=> ROW_VECTOR('docs','embedding',docs.id) LIMIT 1) ORDER BY embedding <=> $query LIMIT 1",
+        ),
+        (
+            "subselect key argument",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',(SELECT id FROM docs LIMIT 1)) LIMIT 1",
+        ),
+        (
+            "parameterized table name",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR($table,'embedding',$query_id) LIMIT 1",
+        ),
+        (
+            "parameterized column name",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs',$column,$query_id) LIMIT 1",
+        ),
+        (
+            "computed key",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id + 1) LIMIT 1",
+        ),
+        (
+            "null key",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',NULL) LIMIT 1",
+        ),
+        (
+            "one-argument arity",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs') LIMIT 1",
+        ),
+        (
+            "two-argument arity",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding') LIMIT 1",
+        ),
+        (
+            "four-argument arity",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id,'extra') LIMIT 1",
+        ),
+        (
+            "multiple row-vector operands",
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) + ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+        ),
+    ];
+    for (case, sql) in malformed {
+        let err = prv_expect_query_err(
+            db.execute(
+                sql,
+                &params(vec![
+                    ("query_id", Value::Uuid(f.source)),
+                    ("table", Value::Text("docs".to_string())),
+                    ("column", Value::Text("embedding".to_string())),
+                    ("query", Value::Vector(f.source_vec.clone())),
+                ]),
+            ),
+            case,
+        );
+        assert!(
+            matches!(err, Error::ParseError(_) | Error::PlanError(_)),
+            "{case} must fail with a typed parse/plan error, got {err:?}"
+        );
+    }
+
+    let non_vector_source = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','label',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "non-vector source column in ROW_VECTOR",
+    );
+    assert!(matches!(
+        non_vector_source,
+        Error::UnknownVectorIndex { .. }
+    ));
+
+    let table_missing = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('missing','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "missing source table",
+    );
+    assert!(matches!(table_missing, Error::TableNotFound(_)));
+}
+
+#[test]
+fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let literal = db
+        .execute(
+            &prv_literal_query(""),
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    let persisted = prv_expect_query_ok(
+        db.execute(
+            &prv_row_vector_query(""),
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "persisted row vector parity query",
+    );
+    prv_assert_same_signature(&literal, &persisted);
+    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(
+        persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+
+    let hnsw_db = Database::open_memory();
+    let hnsw_f = prv_seed_hnsw_docs(&hnsw_db, 1024);
+    let hnsw_literal = hnsw_db
+        .execute(
+            &prv_literal_query(""),
+            &params(vec![("query", Value::Vector(hnsw_f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert!(
+        hnsw_literal.trace.physical_plan.contains("HNSWSearch"),
+        "literal-vector HNSW oracle must use the HNSW path, got {:?}",
+        hnsw_literal.trace
+    );
+    let hnsw_persisted = prv_expect_query_ok(
+        hnsw_db.execute(
+            &prv_row_vector_query(""),
+            &params(vec![("query_id", Value::Uuid(hnsw_f.source))]),
+        ),
+        "persisted row vector HNSW parity query",
+    );
+    prv_assert_same_signature(&hnsw_literal, &hnsw_persisted);
+    assert_eq!(
+        hnsw_persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+}
+
+#[test]
+fn prv_04_row_vector_query_returns_rows_score_trace_without_vector_bytes() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let persisted = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, label, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 2",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "persisted row vector byte non-exposure query",
+    );
+    assert!(persisted.columns.iter().any(|column| column == "score"));
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
+    prv_assert_result_has_no_vector_payload(&persisted, &f.source_vec);
+}
+
+#[test]
+fn prv_05_row_vector_query_respects_candidate_filter() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let result = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, label FROM docs WHERE id = $candidate_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 3",
+            &params(vec![
+                ("candidate_id", Value::Uuid(f.mid)),
+                ("query_id", Value::Uuid(f.source)),
+            ]),
+        ),
+        "candidate-filtered persisted row vector query",
+    );
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(prv_uuid_at(&result, 0, "id"), f.mid);
+    assert!(
+        result.trace.physical_plan.contains("VectorSearch")
+            || result.trace.physical_plan.contains("HNSWSearch"),
+        "trace must show candidate plan feeding vector search, got {:?}",
+        result.trace
+    );
+}
+
+#[test]
+fn prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process() {
+    if std::env::var_os("CONTEXTDB_PRV06_CHILD").is_some() {
+        prv_06_child_process();
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("prv06.db");
+    let f = {
+        let db = Database::open(&db_path).unwrap();
+        let f = prv_seed_docs(&db);
+        drop(db);
+        f
+    };
+
+    let db = Database::open(&db_path).unwrap();
+    let initial = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "reopened persisted row vector query",
+    );
+    assert_eq!(prv_uuid_at(&initial, 0, "id"), f.near);
+
+    let pinned_before_writer = db.snapshot();
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.source)),
+            ("embedding", Value::Vector(f.far_vec.clone())),
+        ]),
+    )
+    .unwrap();
+    let concurrent_read = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "read outside uncommitted writer",
+    );
+    assert_eq!(prv_uuid_at(&concurrent_read, 0, "id"), f.near);
+    db.commit(tx).unwrap();
+    let late_candidate = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_00aa);
+    prv_insert_doc(&db, late_candidate, "late-candidate", f.source_vec.clone());
+    db.execute(
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.mid)),
+            ("embedding", Value::Vector(f.source_vec.clone())),
+        ]),
+    )
+    .unwrap();
+    let pinned_after_commit = prv_expect_query_ok(
+        db.execute_at_snapshot(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+            pinned_before_writer,
+        ),
+        "pinned snapshot after committed writer",
+    );
+    assert_eq!(
+        prv_uuid_at(&pinned_after_commit, 0, "id"),
+        f.near,
+        "execute_at_snapshot must resolve source ROW_VECTOR, candidate visibility, and existing candidate vector payloads from the same pinned snapshot; live candidate state would rank first otherwise"
+    );
+    let post_commit = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "read after committed writer",
+    );
+    assert_eq!(prv_uuid_at(&post_commit, 0, "id"), f.far);
+    drop(db);
+
+    let barrier = tmp.path().join("prv06-barrier");
+    std::fs::create_dir(&barrier).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("prv_06_row_vector_query_uses_one_snapshot_after_reopen_and_fresh_process")
+        .env("CONTEXTDB_PRV06_CHILD", "1")
+        .env("CONTEXTDB_PRV06_DB", &db_path)
+        .env("CONTEXTDB_PRV06_BARRIER", &barrier)
+        .env("CONTEXTDB_PRV06_QUERY_ID", f.source.to_string())
+        .spawn()
+        .unwrap();
+
+    std::fs::write(barrier.join("phase-0.go"), b"go").unwrap();
+    let phase0 = prv_wait_for_file(&barrier.join("phase-0.done"));
+    assert_eq!(phase0.trim(), f.far.to_string());
+
+    std::fs::write(barrier.join("phase-1.go"), b"go").unwrap();
+    let phase1 = prv_wait_for_file(&barrier.join("phase-1.done"));
+    assert_eq!(phase1.trim(), f.near.to_string());
+
+    std::fs::write(barrier.join("phase-2.go"), b"go").unwrap();
+    let phase2 = prv_wait_for_file(&barrier.join("phase-2.done"));
+    assert_eq!(phase2.trim(), f.mid.to_string());
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_variants() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    db.execute(
+        "INSERT INTO docs (id, label) VALUES ($id, 'null-cell')",
+        &params(vec![(
+            "id",
+            Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_00ff)),
+        )]),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE source4 (id UUID PRIMARY KEY, embedding VECTOR(4))",
+        &empty(),
+    )
+    .unwrap();
+    let source4 = Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0f04);
+    db.execute(
+        "INSERT INTO source4 (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(source4)),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let missing = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$missing_id) LIMIT 1",
+            &params(vec![(
+                "missing_id",
+                Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_0bad)),
+            )]),
+        ),
+        "missing source row",
+    );
+    assert!(matches!(
+        missing,
+        Error::PersistedRowVectorRowMissing { .. }
+    ));
+
+    let null_cell = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$null_id) LIMIT 1",
+            &params(vec![(
+                "null_id",
+                Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_00ff)),
+            )]),
+        ),
+        "NULL source vector cell",
+    );
+    assert!(matches!(
+        null_cell,
+        Error::PersistedRowVectorCellNull { .. }
+    ));
+
+    let wrong_column = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','label',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "non-vector source column",
+    );
+    assert!(matches!(wrong_column, Error::UnknownVectorIndex { .. }));
+    assert_ne!(
+        std::mem::discriminant(&missing),
+        std::mem::discriminant(&null_cell)
+    );
+    assert_ne!(
+        std::mem::discriminant(&missing),
+        std::mem::discriminant(&wrong_column)
+    );
+    assert_ne!(
+        std::mem::discriminant(&null_cell),
+        std::mem::discriminant(&wrong_column)
+    );
+
+    let missing_table = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('missing','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "missing source table",
+    );
+    assert!(matches!(missing_table, Error::TableNotFound(_)));
+
+    let dim = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('source4','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(source4))]),
+        ),
+        "dimension mismatch source vector",
+    );
+    assert!(matches!(dim, Error::VectorIndexDimensionMismatch { .. }));
+
+    for err in [missing, null_cell, wrong_column, missing_table] {
+        let rendered = format!("{err:?} {err}");
+        prv_assert_no_source_vector_leak_in_debug(&rendered, &f.source_vec);
+    }
+    let rendered_dim = format!("{dim:?} {dim}");
+    prv_assert_no_source_vector_leak_in_debug(&rendered_dim, &[1.0, 0.0, 0.0, 0.0]);
+}
+
+struct PrvPluginCounters {
+    pre_commit: std::sync::atomic::AtomicUsize,
+    post_commit: std::sync::atomic::AtomicUsize,
+    commit_failed: std::sync::atomic::AtomicUsize,
+}
+
+impl contextdb_engine::plugin::DatabasePlugin for PrvPluginCounters {
+    fn pre_commit(
+        &self,
+        _ws: &contextdb_tx::WriteSet,
+        _source: contextdb_engine::plugin::CommitSource,
+    ) -> contextdb_core::Result<()> {
+        self.pre_commit.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn post_commit(
+        &self,
+        _ws: &contextdb_tx::WriteSet,
+        _source: contextdb_engine::plugin::CommitSource,
+    ) {
+        self.post_commit.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn commit_failed(
+        &self,
+        _ws: &contextdb_tx::WriteSet,
+        _source: contextdb_engine::plugin::CommitSource,
+        _error: &Error,
+    ) {
+        self.commit_failed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync() {
+    let counters = Arc::new(PrvPluginCounters {
+        pre_commit: std::sync::atomic::AtomicUsize::new(0),
+        post_commit: std::sync::atomic::AtomicUsize::new(0),
+        commit_failed: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let db = Database::open_memory_with_plugin(counters.clone()).unwrap();
+    let f = prv_seed_hnsw_docs(&db, 1024);
+    db.execute("CREATE TRIGGER prv08_tr ON docs WHEN UPDATE", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE prv08_doc_update WHEN UPDATE ON docs",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK prv08_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE ROUTE prv08_route EVENT prv08_doc_update TO prv08_sink",
+        &empty(),
+    )
+    .unwrap();
+    let trigger_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let trigger_count_for_callback = trigger_count.clone();
+    db.register_trigger_callback("prv08_tr", move |_db_handle, _ctx| {
+        trigger_count_for_callback.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+    db.execute(
+        "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 1",
+        &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+    )
+    .unwrap();
+    let index = VectorIndexRef::new("docs", "embedding");
+    let before_hnsw_len = db.__debug_vector_hnsw_len(index.clone());
+    let before_hnsw_stats = db.__debug_vector_hnsw_stats(index.clone());
+    assert!(
+        before_hnsw_len.is_some() && before_hnsw_stats.is_some(),
+        "read-only probe must exercise an already-built HNSW graph"
+    );
+    let sink_deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink_deliveries_for_callback = sink_deliveries.clone();
+    db.register_sink("prv08_sink", None, move |_event| {
+        sink_deliveries_for_callback.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+
+    let before_trigger = trigger_count.load(Ordering::SeqCst);
+    let before_sink_deliveries = sink_deliveries.load(Ordering::SeqCst);
+    let before_pre = counters.pre_commit.load(Ordering::SeqCst);
+    let before_post = counters.post_commit.load(Ordering::SeqCst);
+    let before_failed = counters.commit_failed.load(Ordering::SeqCst);
+    let before_watermark = db.committed_watermark();
+    let before_lsn = db.current_lsn();
+    let before_sink = db.sink_metrics_for_test("prv08_sink");
+
+    let result = prv_expect_query_ok(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "read-only persisted row vector query",
+    );
+    assert_eq!(prv_uuid_at(&result, 0, "id"), f.source);
+
+    assert_eq!(trigger_count.load(Ordering::SeqCst), before_trigger);
+    assert_eq!(
+        sink_deliveries.load(Ordering::SeqCst),
+        before_sink_deliveries
+    );
+    assert_eq!(counters.pre_commit.load(Ordering::SeqCst), before_pre);
+    assert_eq!(counters.post_commit.load(Ordering::SeqCst), before_post);
+    assert_eq!(counters.commit_failed.load(Ordering::SeqCst), before_failed);
+    assert_eq!(db.committed_watermark(), before_watermark);
+    assert_eq!(db.current_lsn(), before_lsn);
+    assert_eq!(db.sink_metrics_for_test("prv08_sink"), before_sink);
+    assert_eq!(db.__debug_vector_hnsw_len(index.clone()), before_hnsw_len);
+    assert_eq!(db.__debug_vector_hnsw_stats(index), before_hnsw_stats);
+    assert!(db.changes_since(before_lsn).rows.is_empty());
+    assert!(db.changes_since(before_lsn).vectors.is_empty());
+    assert!(db.changes_since(before_lsn).ddl.is_empty());
+}
+
+#[test]
+fn prv_09_existing_literal_and_parameter_cosine_distance_unchanged() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let parameter = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> $query LIMIT 3",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert_eq!(parameter.trace.physical_plan, "Scan -> VectorSearch");
+    assert_eq!(parameter.trace.query_vector_source, None);
+    assert_eq!(prv_uuid_at(&parameter, 0, "id"), f.source);
+    assert_eq!(prv_uuid_at(&parameter, 1, "id"), f.near);
+
+    let literal = db
+        .execute(
+            "SELECT id FROM docs ORDER BY embedding <=> [0.731234,0.212345,0.648901] LIMIT 3",
+            &empty(),
+        )
+        .unwrap();
+    assert_eq!(literal.trace.physical_plan, "Scan -> VectorSearch");
+    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(prv_uuid_at(&literal, 0, "id"), f.source);
+    assert_eq!(prv_uuid_at(&literal, 1, "id"), f.near);
+}
+
+#[test]
+fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
+    let small_db = Database::open_memory();
+    let small_f = prv_seed_rank_policy_docs(&small_db, 4);
+    let small_literal = small_db
+        .execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 3",
+            &params(vec![("query", Value::Vector(small_f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert!(
+        small_literal.trace.physical_plan.contains("VectorSearch")
+            && !small_literal.trace.physical_plan.contains("HNSWSearch"),
+        "small literal USE RANK query must exercise the non-HNSW path, got {:?}",
+        small_literal.trace
+    );
+    let small_persisted = prv_expect_query_ok(
+        small_db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 3",
+            &params(vec![("query_id", Value::Uuid(small_f.source))]),
+        ),
+        "small USE RANK persisted row vector query",
+    );
+    prv_assert_same_signature(&small_literal, &small_persisted);
+    assert_eq!(
+        small_persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+
+    let db = Database::open_memory();
+    let f = prv_seed_rank_policy_docs(&db, 1024);
+    let literal = db
+        .execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> $query USE RANK weighted LIMIT 3",
+            &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
+        )
+        .unwrap();
+    assert!(
+        literal.trace.physical_plan.contains("HNSWSearch"),
+        "literal USE RANK query must report actual HNSW path before ROW_VECTOR parity is accepted, got {:?}",
+        literal.trace
+    );
+    let persisted = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) USE RANK weighted LIMIT 3",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "USE RANK persisted row vector query",
+    );
+    prv_assert_same_signature(&literal, &persisted);
+    assert!(
+        persisted.trace.physical_plan.contains("HNSWSearch"),
+        "persisted USE RANK query must report actual HNSW path, got {:?}",
+        persisted.trace
+    );
+    assert_eq!(
+        persisted.trace.query_vector_source,
+        Some(VectorIndexRef::new("docs", "embedding"))
+    );
+}
+
+#[test]
+fn prv_11_row_vector_query_accepts_parameter_bound_key() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let param = prv_expect_query_ok(
+        db.execute(
+            "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 3",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "parameter-bound ROW_VECTOR key",
+    );
+    let literal = prv_expect_query_ok(
+        db.execute(
+            &format!(
+                "SELECT id, score FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding','{}') LIMIT 3",
+                f.source
+            ),
+            &empty(),
+        ),
+        "literal ROW_VECTOR key",
+    );
+    prv_assert_same_signature(&literal, &param);
+
+    let missing = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![(
+                "query_id",
+                Value::Uuid(Uuid::from_u128(0x7000_0000_0000_0000_0000_0000_0000_dead)),
+            )]),
+        ),
+        "missing parameter-bound ROW_VECTOR key",
+    );
+    assert!(matches!(
+        missing,
+        Error::PersistedRowVectorRowMissing { .. }
+    ));
+}
+
+#[test]
+fn prv_12_row_vector_query_in_active_tx_sees_active_tx_view() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let tx = db.begin().unwrap();
+    db.execute_in_tx(
+        tx,
+        "UPDATE docs SET embedding = $embedding WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(f.source)),
+            ("embedding", Value::Vector(f.far_vec.clone())),
+        ]),
+    )
+    .unwrap();
+    let persisted = prv_expect_query_ok(
+        db.execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(f.source))]),
+        ),
+        "in-transaction own-write ROW_VECTOR query",
+    );
+    assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.far);
+
+    let literal = db
+        .execute_in_tx(
+            tx,
+            "SELECT id, score FROM docs WHERE id != $query_id ORDER BY embedding <=> $query LIMIT 1",
+            &params(vec![
+                ("query_id", Value::Uuid(f.source)),
+                ("query", Value::Vector(f.far_vec.clone())),
+            ]),
+        )
+        .unwrap();
+    prv_assert_same_signature(&literal, &persisted);
+    db.commit(tx).unwrap();
+}
+
+#[test]
+fn prv_13_row_vector_query_honors_scoped_handle_context_isolation() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, label TEXT, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let ctx_b = sarg_uuid(0xB);
+    let allowed = Uuid::from_u128(0x7300_0000_0000_0000_0000_0000_0000_0001);
+    let hidden = Uuid::from_u128(0x7300_0000_0000_0000_0000_0000_0000_0002);
+    for (id, ctx, vector) in [
+        (allowed, ctx_a, vec![1.0, 0.0, 0.0]),
+        (hidden, ctx_b, vec![0.0, 1.0, 0.0]),
+    ] {
+        db.execute(
+            "INSERT INTO docs (id, context_id, label, embedding) VALUES ($id, $ctx, 'd', $embedding)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("ctx", Value::Uuid(ctx)),
+                ("embedding", Value::Vector(vector)),
+            ]),
+        )
+        .unwrap();
+    }
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+    let err = prv_expect_query_err(
+        scoped.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(hidden))]),
+        ),
+        "scoped handle hidden source row",
+    );
+    sarg_expect_context_violation(err, ctx_b, &[ctx_a]);
+
+    let ok = prv_expect_query_ok(
+        scoped.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$query_id) LIMIT 1",
+            &params(vec![("query_id", Value::Uuid(allowed))]),
+        ),
+        "scoped handle visible source row",
+    );
+    assert_eq!(prv_uuid_at(&ok, 0, "id"), allowed);
+}
+
+#[test]
+fn prv_14_row_vector_query_renders_in_explain_without_vector_bytes() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    let sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding','{}') LIMIT 1",
+        f.source
+    );
+    let explain_result = db.explain(&sql);
+    if let Err(err) = &explain_result {
+        assert!(
+            explain_result.is_ok(),
+            "EXPLAIN ROW_VECTOR query must succeed, got {err:?}"
+        );
+    }
+    let explain = explain_result.unwrap();
+    assert!(
+        explain.contains("VectorSearch") || explain.contains("HNSWSearch"),
+        "EXPLAIN must render the selected vector path, got {explain}"
+    );
+    assert!(explain.contains("docs"));
+    assert!(explain.contains("embedding"));
+    assert!(
+        explain.contains("RowVectorSource(table=docs, column=embedding"),
+        "EXPLAIN must render ROW_VECTOR as a resolved source reference, got {explain}"
+    );
+    assert!(
+        explain.contains(&f.source.to_string()),
+        "EXPLAIN must render ROW_VECTOR key identity, got {explain}"
+    );
+    prv_assert_no_source_vector_leak_in_debug(&explain, &f.source_vec);
+}
+
+#[test]
+fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
+    let db = Arc::new(Database::open_memory());
+    db.execute(
+        "CREATE TABLE sources (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE docs (id UUID PRIMARY KEY, embedding VECTOR(3))",
+        &empty(),
+    )
+    .unwrap();
+    let source = Uuid::from_u128(0x7500_0000_0000_0000_0000_0000_0000_0001);
+    let doc = Uuid::from_u128(0x7500_0000_0000_0000_0000_0000_0000_0002);
+    db.execute(
+        "INSERT INTO sources (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(source)),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO docs (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            ("id", Value::Uuid(doc)),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let mut writers = Vec::new();
+    for (table, id) in [("sources", source), ("docs", doc)] {
+        let db_writer = db.clone();
+        let running_writer = running.clone();
+        writers.push(thread::spawn(move || {
+            let mut tick = 0usize;
+            while running_writer.load(Ordering::SeqCst) {
+                let vector = if tick.is_multiple_of(2) {
+                    vec![1.0, 0.0, 0.0]
+                } else {
+                    vec![0.0, 1.0, 0.0]
+                };
+                db_writer
+                    .execute(
+                        &format!("UPDATE {table} SET embedding = $embedding WHERE id = $id"),
+                        &params(vec![
+                            ("id", Value::Uuid(id)),
+                            ("embedding", Value::Vector(vector)),
+                        ]),
+                    )
+                    .unwrap();
+                tick += 1;
+            }
+        }));
+    }
+
+    let db_reader = db.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = (|| {
+            for _ in 0..1000 {
+                db_reader.execute(
+                    "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('sources','embedding',$source_id) LIMIT 1",
+                    &params(vec![("source_id", Value::Uuid(source))]),
+                )?;
+            }
+            contextdb_core::Result::<()>::Ok(())
+        })();
+        done_tx.send(result).unwrap();
+    });
+    let done = done_rx.recv_timeout(Duration::from_secs(5));
+    running.store(false, Ordering::SeqCst);
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert!(
+        matches!(done, Ok(Ok(()))),
+        "persisted row vector reads must not deadlock or error under concurrent source/ordered writers: {done:?}"
+    );
+}
+
+#[test]
+fn prv_16_row_vector_query_releases_accountant_on_every_error_path() {
+    let db = Database::open_memory();
+    let f = prv_seed_docs(&db);
+    db.execute(
+        "INSERT INTO docs (id, label) VALUES ($id, 'null-cell')",
+        &params(vec![(
+            "id",
+            Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0001)),
+        )]),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE source4 (id UUID PRIMARY KEY, embedding VECTOR(4))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO source4 (id, embedding) VALUES ($id, $embedding)",
+        &params(vec![
+            (
+                "id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0002)),
+            ),
+            ("embedding", Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
+
+    fn is_missing(err: &Error) -> bool {
+        matches!(err, Error::PersistedRowVectorRowMissing { .. })
+    }
+    fn is_null_cell(err: &Error) -> bool {
+        matches!(err, Error::PersistedRowVectorCellNull { .. })
+    }
+    fn is_unknown_index(err: &Error) -> bool {
+        matches!(err, Error::UnknownVectorIndex { .. })
+    }
+    fn is_table_missing(err: &Error) -> bool {
+        matches!(err, Error::TableNotFound(_))
+    }
+    fn is_dimension_mismatch(err: &Error) -> bool {
+        matches!(err, Error::VectorIndexDimensionMismatch { .. })
+    }
+    struct PrvErrorCase {
+        label: &'static str,
+        sql: &'static str,
+        params: HashMap<String, Value>,
+        matches: fn(&Error) -> bool,
+    }
+
+    let baseline = prv_memory_usage_tuple(&db);
+    let missing_probe = prv_expect_query_err(
+        db.execute(
+            "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$missing_id) LIMIT 1",
+            &params(vec![(
+                "missing_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_dead)),
+            )]),
+        ),
+        "accountant missing-row typed probe",
+    );
+    assert!(matches!(
+        missing_probe,
+        Error::PersistedRowVectorRowMissing { .. }
+    ));
+    assert_eq!(
+        prv_memory_usage_tuple(&db),
+        baseline,
+        "typed missing-row probe must not change accountant usage"
+    );
+    let cases = [
+        PrvErrorCase {
+            label: "missing source row",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$missing_id) LIMIT 1",
+            params: params(vec![(
+                "missing_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_dead)),
+            )]),
+            matches: is_missing,
+        },
+        PrvErrorCase {
+            label: "NULL source cell",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','embedding',$null_id) LIMIT 1",
+            params: params(vec![(
+                "null_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0001)),
+            )]),
+            matches: is_null_cell,
+        },
+        PrvErrorCase {
+            label: "non-vector source column",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('docs','label',$query_id) LIMIT 1",
+            params: params(vec![("query_id", Value::Uuid(f.source))]),
+            matches: is_unknown_index,
+        },
+        PrvErrorCase {
+            label: "missing source table",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('missing','embedding',$query_id) LIMIT 1",
+            params: params(vec![("query_id", Value::Uuid(f.source))]),
+            matches: is_table_missing,
+        },
+        PrvErrorCase {
+            label: "dimension mismatch after vector resolution",
+            sql: "SELECT id FROM docs ORDER BY embedding <=> ROW_VECTOR('source4','embedding',$source4_id) LIMIT 1",
+            params: params(vec![(
+                "source4_id",
+                Value::Uuid(Uuid::from_u128(0x7600_0000_0000_0000_0000_0000_0000_0002)),
+            )]),
+            matches: is_dimension_mismatch,
+        },
+    ];
+    for _ in 0..100 {
+        for case in &cases {
+            let err = prv_expect_query_err(db.execute(case.sql, &case.params), case.label);
+            assert!(
+                (case.matches)(&err),
+                "accountant error-path probe {} returned wrong error: {err:?}",
+                case.label
+            );
+            assert_eq!(
+                prv_memory_usage_tuple(&db),
+                baseline,
+                "ROW_VECTOR error path {} must release every transient accountant allocation",
+                case.label
+            );
+        }
+    }
+    assert_eq!(
+        prv_memory_usage_tuple(&db),
+        baseline,
+        "ROW_VECTOR error paths must release every transient accountant allocation"
+    );
+}

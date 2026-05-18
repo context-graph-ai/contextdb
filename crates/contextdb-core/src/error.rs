@@ -106,6 +106,10 @@ pub enum Error {
     },
     #[error("unknown vector index {index:?}")]
     UnknownVectorIndex { index: VectorIndexRef },
+    #[error("persisted row vector source row missing on {index:?}: key {key}")]
+    PersistedRowVectorRowMissing { index: VectorIndexRef, key: String },
+    #[error("persisted row vector source cell is NULL on {index:?}: key {key}")]
+    PersistedRowVectorCellNull { index: VectorIndexRef, key: String },
     #[error("rank policy on index `{index}` references unknown column `{column}`")]
     RankPolicyColumnUnknown { index: String, column: String },
     #[error(

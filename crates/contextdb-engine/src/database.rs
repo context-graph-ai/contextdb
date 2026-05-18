@@ -67,6 +67,7 @@ pub struct QueryTrace {
     pub predicates_pushed: smallvec::SmallVec<[std::borrow::Cow<'static, str>; 4]>,
     pub indexes_considered: smallvec::SmallVec<[IndexCandidate; 4]>,
     pub sort_elided: bool,
+    pub query_vector_source: Option<contextdb_core::types::VectorIndexRef>,
 }
 
 impl QueryTrace {
@@ -7948,6 +7949,7 @@ impl Database {
                 predicates_pushed: Default::default(),
                 indexes_considered: Default::default(),
                 sort_elided: false,
+                query_vector_source: None,
             }
         } else {
             QueryTrace::scan()
