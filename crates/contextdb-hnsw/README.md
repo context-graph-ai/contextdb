@@ -1,5 +1,21 @@
 # hnsw-rs
 
+## Why this crate exists
+
+This crate is a temporary fork of upstream `hnsw_rs-0.3.4` (crates.io). Upstream
+does not expose a way to seed the level-assignment RNG, which contextdb requires
+for deterministic HNSW rebuilds (section 39). The only delta from upstream is
+`new_with_seed` constructors on `LayerGenerator`, `PointIndexation`, and `Hnsw`.
+
+**Retire this crate** when upstream `hnsw_rs` publishes a release that accepts a
+caller-provided RNG seed on `Hnsw::new`. At that point: bump the workspace
+`hnsw_rs` dependency to that release, delete `crates/contextdb-hnsw/`, remove it
+from `Cargo.toml` workspace members, and switch `crates/contextdb-vector/Cargo.toml`
+back to `hnsw_rs = "<new-version>"`.
+
+Upstream tracking: https://github.com/jean-pierreBoth/hnswlib-rs (file an issue or
+PR for `Hnsw::new_with_seed` if none exists).
+
 ContextDB packages this crate as `contextdb-hnsw` while keeping the Rust
 library name `hnsw_rs` for compatibility with the upstream API. This package is
 based on `hnsw_rs` 0.3.4 and adds ContextDB-owned seeded constructors for

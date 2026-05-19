@@ -2317,6 +2317,9 @@ impl Database {
             && state.max_tx() <= TxId::from_snapshot(self.snapshot())
             && state.hnsw_len().is_none()
         {
+            // Non-zero first slot is required: the HNSW path skips zero/non-finite-norm queries
+            // (see crates/contextdb-vector/src/mem.rs::query_has_positive_finite_norm). If that
+            // rule tightens, this warm-up must be updated in lockstep or EXPLAIN will mislabel.
             let mut query = vec![0.0_f32; state.dimension()];
             if let Some(first) = query.first_mut() {
                 *first = 1.0;
