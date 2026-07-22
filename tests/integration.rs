@@ -4,14 +4,28 @@ mod acceptance_retention;
 mod alter_table_tests;
 #[path = "integration/anti_tests.rs"]
 mod anti_tests;
+#[cfg(feature = "nats-tests")]
+#[path = "integration/auto_sync_update_push_visibility_tests.rs"]
+mod auto_sync_update_push_visibility_tests;
 #[path = "integration/boundary_conditions.rs"]
 mod boundary_conditions;
+#[path = "integration/bounded_tables_tests.rs"]
+mod bounded_tables_tests;
+#[path = "integration/cli_spawn.rs"]
+mod cli_spawn;
 #[path = "integration/column_level_immutable_tests.rs"]
 mod column_level_immutable_tests;
+#[path = "integration/commit_failed_observer_tests.rs"]
+mod commit_failed_observer_tests;
+#[path = "integration/commit_write_volume_scaling_tests.rs"]
+mod commit_write_volume_scaling_tests;
+#[path = "integration/composite_foreign_key_tests.rs"]
+mod composite_foreign_key_tests;
 #[path = "integration/ddl_sync_tests.rs"]
 mod ddl_sync_tests;
 #[path = "integration/gate_a_primitives.rs"]
 mod gate_a_primitives;
+#[cfg(feature = "nats-tests")]
 #[path = "integration/gate_a_sync.rs"]
 mod gate_a_sync;
 #[path = "integration/gate_b_workflows.rs"]
@@ -22,10 +36,12 @@ mod gate_c_d_lifecycle;
 mod golden_output;
 #[path = "integration/helpers.rs"]
 mod helpers;
-#[path = "integration/hiring_criteria.rs"]
-mod hiring_criteria;
+#[path = "integration/cross_cutting_acceptance_tests.rs"]
+mod cross_cutting_acceptance_tests;
 #[path = "integration/hnsw_tests.rs"]
 mod hnsw_tests;
+#[path = "integration/indexed_scan_filter_composite_routing_tests.rs"]
+mod indexed_scan_filter_composite_routing_tests;
 #[path = "integration/indexed_scan_filter_tests.rs"]
 mod indexed_scan_filter_tests;
 #[path = "integration/job_level.rs"]
@@ -49,5 +65,15 @@ mod retention_tests;
 mod safety_integrity;
 #[path = "integration/state_propagation.rs"]
 mod state_propagation;
+#[path = "integration/storage_scale_hardening_tests.rs"]
+mod storage_scale_hardening_tests;
 #[path = "integration/subscription_tests.rs"]
 mod subscription_tests;
+#[cfg(feature = "nats-tests")]
+#[path = "integration/sync_relay_trigger_tables_tests.rs"]
+mod sync_relay_trigger_tables_tests;
+#[cfg(feature = "nats-tests")]
+#[path = "integration/sync_server_nonblocking_apply.rs"]
+mod sync_server_nonblocking_apply;
+#[path = "integration/work_ledger_tests.rs"]
+mod work_ledger_tests;

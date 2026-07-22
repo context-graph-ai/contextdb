@@ -1,9 +1,6 @@
 ---
 fixture_basis: empirical
 source: "Replay input derived from [GO-05] 8 assertions validating decision_id, basis entities, state_at_decision_time, current_state, and diffs"
-status: draft
-owner: claude
-last_updated: 2026-03-07
 ---
 
 # Replay — Input Fixture

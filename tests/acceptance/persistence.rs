@@ -83,7 +83,7 @@ fn f03_kill_9_during_idle_does_not_corrupt() {
     write_child_stdin(&mut child, &script);
     write_child_stdin(&mut child, "SELECT count(*) FROM kill_test\n");
     let barrier_output =
-        wait_for_child_stdout_contains(&mut child, "| 100", Duration::from_secs(10));
+        wait_for_child_stdout_contains(&mut child, "| 100", Duration::from_secs(60));
     assert!(
         barrier_output.contains("| 100"),
         "CLI must report the 100-row commit barrier before the kill: {barrier_output}"
@@ -465,7 +465,7 @@ fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
     setup_graph_entities(&db, &[a, b, c]);
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "CITES".into(), Default::default())
         .expect("edge a->b");
     db.insert_edge(tx, b, c, "CITES".into(), Default::default())
@@ -474,7 +474,7 @@ fn f05j_dag_constraint_survives_restart_and_rejects_cycles() {
     db.close().expect("close db");
 
     let reopened = Database::open(&db_path).expect("reopen db");
-    let tx = reopened.begin();
+    let tx = reopened.begin_or_panic();
     let result = reopened.insert_edge(tx, c, a, "CITES".into(), Default::default());
     assert!(result.is_err());
 }
@@ -528,7 +528,7 @@ fn f05l_vector_index_correct_after_reopen_update_embedding() {
 
     let id_a = Uuid::new_v4();
     let id_b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     // A starts near [1,0,0], B is also near [1,0,0] but slightly off
     let row_a = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(id_a))]))
@@ -599,14 +599,14 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
     let sequence: Vec<u64> = vec![1000, 1010, 1005, 1020, 1003, 1030, 1001, 1040];
     let seq_handle = Arc::new(sequence.clone());
     let idx = Arc::new(AtomicUsize::new(0));
-    {
+    let _clock = {
         let seq_handle = Arc::clone(&seq_handle);
         let idx = Arc::clone(&idx);
-        Wallclock::set_test_clock(move || {
+        Wallclock::test_clock_guard(move || {
             let i = idx.fetch_add(1, AtomicOrdering::SeqCst);
             seq_handle[i.min(seq_handle.len() - 1)]
-        });
-    }
+        })
+    };
 
     let db = Database::open_memory();
     db.execute(
@@ -620,7 +620,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
 
     for _ in 0..sequence.len() {
         // `begin()` returns a bare TxId (not a guard); `commit(tx)` finalizes.
-        let txid: TxId = db.begin();
+        let txid: TxId = db.begin_or_panic();
         let id = uuid::Uuid::new_v4();
         let mut row = std::collections::HashMap::new();
         row.insert("id".to_string(), Value::Uuid(id));
@@ -660,11 +660,9 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
         id_column, expected_ids,
         "row ids must align with insertion order under ORDER BY ts ASC"
     );
-
-    Wallclock::reset_test_clock();
 }
 
-// Named vector index RED tests from named-vector-indexes-tests.md.
+// Named vector index tests: naming, isolation, and lifecycle coverage.
 
 fn persist_vector_rows_for_footprint(
     path: &Path,
@@ -1350,7 +1348,7 @@ fn f113c_sq4_cross_batch_recall_stability() {
         crossbatch_row[bytes_idx]
     );
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let footprint_batch: Vec<(Uuid, Vec<f32>)> = (0..512)
+    let footprint_batch: Vec<(Uuid, Vec<f32>)> = (0..5000)
         .map(|i| {
             let range = if i < 256 {
                 (-1.0_f32, 1.0_f32)

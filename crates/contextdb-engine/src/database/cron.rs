@@ -1,0 +1,984 @@
+use super::*;
+
+const CRON_SCHEDULES_CONFIG_KEY: &str = "__cron_schedules";
+const CRON_AUDIT_CONFIG_KEY: &str = "__cron_audit";
+const MAX_CRON_AUDIT_DEPTH: usize = 10_000;
+
+type CronCallback = Arc<dyn Fn(&Database) -> Result<()> + Send + Sync + 'static>;
+
+pub(super) struct CronState {
+    callbacks: RwLock<HashMap<String, CronCallback>>,
+    schedules: Mutex<BTreeMap<String, CronSchedule>>,
+    audit: Mutex<VecDeque<CronAuditEntry>>,
+    runtime: Mutex<CronRuntime>,
+    wait_lock: Mutex<()>,
+    waiters: Condvar,
+    dispatch_lock: Mutex<()>,
+    running_schedules: Mutex<HashSet<String>>,
+    callback_owner_threads: Mutex<HashMap<thread::ThreadId, usize>>,
+    callback_active_count: AtomicUsize,
+    pause_count: AtomicU64,
+    schedule_count: AtomicU64,
+}
+
+#[derive(Debug)]
+struct CronRuntime {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CronSchedule {
+    name: String,
+    every_text: String,
+    every_ms: u64,
+    callback: String,
+    policy: CronMissedPolicy,
+    next_fire_at_ms: u64,
+    last_fire_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum CronMissedPolicy {
+    SkipAndAudit,
+    CatchUp { within_ms: u64 },
+    FailLoud,
+}
+
+#[derive(Debug)]
+struct DueDecision {
+    fire_count: u64,
+    next_fire_at_ms: u64,
+    missed_skipped: u64,
+    caught_up: Option<u32>,
+    fail_loud: Option<Error>,
+}
+
+#[derive(Debug)]
+struct ReservedCronRun {
+    schedule: CronSchedule,
+    decision: DueDecision,
+}
+
+struct CronCallbackThreadGuard<'a> {
+    cron: &'a CronState,
+    owner: thread::ThreadId,
+}
+
+impl CronState {
+    pub(super) fn new() -> Self {
+        Self {
+            callbacks: RwLock::new(HashMap::new()),
+            schedules: Mutex::new(BTreeMap::new()),
+            audit: Mutex::new(VecDeque::new()),
+            runtime: Mutex::new(CronRuntime {
+                shutdown: Arc::new(AtomicBool::new(false)),
+                handle: None,
+            }),
+            wait_lock: Mutex::new(()),
+            waiters: Condvar::new(),
+            dispatch_lock: Mutex::new(()),
+            running_schedules: Mutex::new(HashSet::new()),
+            callback_owner_threads: Mutex::new(HashMap::new()),
+            callback_active_count: AtomicUsize::new(0),
+            pause_count: AtomicU64::new(0),
+            schedule_count: AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn callback_active_on_other_thread(&self) -> bool {
+        if self.callback_active_count.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let current = thread::current().id();
+        let owners = self.callback_owner_threads.lock();
+        !owners.is_empty() && !owners.contains_key(&current)
+    }
+
+    pub(super) fn has_schedules(&self) -> bool {
+        self.schedule_count.load(Ordering::SeqCst) > 0
+    }
+
+    fn enter_callback_thread_scope(&self) -> CronCallbackThreadGuard<'_> {
+        let owner = thread::current().id();
+        *self.callback_owner_threads.lock().entry(owner).or_default() += 1;
+        global_callback_active_count().fetch_add(1, Ordering::SeqCst);
+        self.callback_active_count.fetch_add(1, Ordering::SeqCst);
+        CronCallbackThreadGuard { cron: self, owner }
+    }
+
+    pub(super) fn resume_tickler(&self) {
+        let _ = self
+            .pause_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                Some(count.saturating_sub(1))
+            });
+        self.waiters.notify_all();
+    }
+}
+
+impl Drop for CronCallbackThreadGuard<'_> {
+    fn drop(&mut self) {
+        let mut owners = self.cron.callback_owner_threads.lock();
+        match owners.get_mut(&self.owner) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                owners.remove(&self.owner);
+            }
+            None => {}
+        }
+        self.cron
+            .callback_active_count
+            .fetch_sub(1, Ordering::SeqCst);
+        global_callback_active_count().fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Database {
+    pub(super) fn load_cron_state_from_persistence(&self) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        if let Some(schedules) =
+            persistence.load_config_value::<Vec<CronSchedule>>(CRON_SCHEDULES_CONFIG_KEY)?
+        {
+            let mut stored = self.cron.schedules.lock();
+            stored.clear();
+            stored.extend(
+                schedules
+                    .into_iter()
+                    .map(|schedule| (schedule.name.clone(), schedule)),
+            );
+            self.cron
+                .schedule_count
+                .store(stored.len() as u64, Ordering::SeqCst);
+        }
+        if let Some(entries) =
+            persistence.load_config_value::<Vec<CronAuditEntry>>(CRON_AUDIT_CONFIG_KEY)?
+        {
+            let mut audit = self.cron.audit.lock();
+            audit.clear();
+            let start = entries.len().saturating_sub(MAX_CRON_AUDIT_DEPTH);
+            audit.extend(entries.into_iter().skip(start));
+        }
+        Ok(())
+    }
+
+    pub(super) fn start_cron_tickler_if_schedules_present(&self) {
+        if self.access_is_admin() && !self.cron.schedules.lock().is_empty() {
+            self.ensure_cron_tickler_running();
+        }
+    }
+
+    pub(super) fn create_cron_schedule(
+        &self,
+        name: &str,
+        every: &str,
+        callback: &str,
+        missed_tick_policy: Option<&str>,
+        catch_up_within_seconds: Option<u32>,
+    ) -> Result<()> {
+        let _operation = self.open_operation()?;
+        self.require_admin_cron_ddl()?;
+        let every_ms = parse_cron_interval_ms(every)?;
+        let policy = parse_cron_policy(missed_tick_policy, catch_up_within_seconds)?;
+        let schedule = CronSchedule {
+            name: name.to_string(),
+            every_text: every.to_string(),
+            every_ms,
+            callback: callback.to_string(),
+            policy,
+            next_fire_at_ms: now_millis().saturating_add(every_ms),
+            last_fire_at_ms: None,
+        };
+        {
+            let _dispatch = self.cron.dispatch_lock.lock();
+            let previous = self
+                .cron
+                .schedules
+                .lock()
+                .insert(name.to_string(), schedule);
+            if let Err(err) = self.persist_cron_schedules() {
+                let mut schedules = self.cron.schedules.lock();
+                match previous {
+                    Some(previous) => {
+                        schedules.insert(name.to_string(), previous);
+                    }
+                    None => {
+                        schedules.remove(name);
+                    }
+                }
+                return Err(err);
+            }
+            let schedule_count = self.cron.schedules.lock().len();
+            self.cron
+                .schedule_count
+                .store(schedule_count as u64, Ordering::SeqCst);
+        }
+        self.ensure_cron_tickler_running();
+        self.cron.waiters.notify_all();
+        Ok(())
+    }
+
+    pub(super) fn drop_cron_schedule(&self, name: &str) -> Result<()> {
+        let _operation = self.open_operation()?;
+        self.require_admin_cron_ddl()?;
+        {
+            let _dispatch = self.cron.dispatch_lock.lock();
+            let removed = self.cron.schedules.lock().remove(name);
+            if let Err(err) = self.persist_cron_schedules() {
+                if let Some(removed) = removed {
+                    self.cron.schedules.lock().insert(name.to_string(), removed);
+                }
+                return Err(err);
+            }
+            let schedule_count = self.cron.schedules.lock().len();
+            self.cron
+                .schedule_count
+                .store(schedule_count as u64, Ordering::SeqCst);
+        }
+        self.cron.waiters.notify_all();
+        Ok(())
+    }
+
+    /// Registers a host callback for a cron schedule.
+    ///
+    /// Cron callbacks use the same Class A reentry rules as trigger callbacks:
+    /// tx-control from inside the callback returns [`Error::CallbackReentry`],
+    /// and writes are allowed only through the supplied tx-bound handle. Cron
+    /// same-DB Class B contention returns [`Error::CallbackActiveCrossThread`]
+    /// immediately; trigger same-DB Class B uses the wait-and-proceed contract
+    /// documented on [`Error::CallbackActiveCrossThread`].
+    pub fn register_cron_callback<F>(&self, name: &str, callback: F) -> Result<()>
+    where
+        F: Fn(&Database) -> Result<()> + Send + Sync + 'static,
+    {
+        let _operation = self.open_operation()?;
+        self.require_admin_cron_ddl()?;
+        self.cron
+            .callbacks
+            .write()
+            .insert(name.to_string(), Arc::new(callback));
+        if !self.cron.schedules.lock().is_empty() {
+            self.ensure_cron_tickler_running();
+        }
+        self.cron.waiters.notify_all();
+        Ok(())
+    }
+
+    pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
+        let _operation = self.open_operation()?;
+        self.wait_for_imminent_cron_due_for_test(Duration::from_millis(75));
+        self.dispatch_due_cron_schedules(true)
+    }
+
+    pub fn pause_cron_tickler_for_test(&self) -> CronPauseGuard {
+        let _operation = self.assert_open_operation();
+        self.cron.pause_count.fetch_add(1, Ordering::SeqCst);
+        self.cron.waiters.notify_all();
+        CronPauseGuard {
+            cron: self.cron.clone(),
+        }
+    }
+
+    /// Test-only: whether an autonomous cron tickler thread is currently
+    /// running. No shipped surface reads this; temporal-absence negatives
+    /// ("no tickler started" / "no further fires possible") assert on this
+    /// state instead of sleeping through a wall-clock window.
+    #[doc(hidden)]
+    pub fn cron_tickler_running_for_test(&self) -> bool {
+        self.cron.runtime.lock().handle.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn __trigger_progress_worker_handle_for_test(&self) -> Database {
+        let _operation = self.assert_open_operation();
+        self.worker_handle_for_background()
+    }
+
+    pub fn cron_audit_log_for_test(&self) -> Vec<CronAuditEntry> {
+        let _operation = self.assert_open_operation();
+        self.cron.audit.lock().iter().cloned().collect()
+    }
+
+    fn require_admin_cron_ddl(&self) -> Result<()> {
+        if self.has_access_constraints_for_query() {
+            return Err(Error::Other(
+                "DDL requires an admin database handle".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn stop_cron_tickler(&self) {
+        if !self.resource_owner {
+            return;
+        }
+        let handle = {
+            let mut runtime = self.cron.runtime.lock();
+            runtime.shutdown.store(true, Ordering::SeqCst);
+            self.cron.waiters.notify_all();
+            let handle = runtime.handle.take();
+            runtime.shutdown = Arc::new(AtomicBool::new(false));
+            handle
+        };
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    fn ensure_cron_tickler_running(&self) {
+        if !self.resource_owner {
+            return;
+        }
+        if self.resource_closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.cron.pause_count.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        self.start_cron_tickler_runtime();
+    }
+
+    fn start_cron_tickler_runtime(&self) {
+        let mut runtime = self.cron.runtime.lock();
+        if runtime.handle.is_some() {
+            return;
+        }
+        runtime.shutdown.store(false, Ordering::SeqCst);
+        let shutdown = runtime.shutdown.clone();
+        let db = self.worker_handle_for_background();
+        let handle = thread::spawn(move || db.cron_tickler_loop(shutdown));
+        runtime.handle = Some(handle);
+    }
+
+    fn cron_tickler_loop(self, shutdown: Arc<AtomicBool>) {
+        while !shutdown.load(Ordering::SeqCst) && !self.resource_closed.load(Ordering::SeqCst) {
+            if self.cron.pause_count.load(Ordering::SeqCst) == 0
+                && !shutdown.load(Ordering::SeqCst)
+                && !self.resource_closed.load(Ordering::SeqCst)
+            {
+                let _ = self.dispatch_due_cron_schedules(false);
+            }
+            if shutdown.load(Ordering::SeqCst) || self.resource_closed.load(Ordering::SeqCst) {
+                break;
+            }
+            let wait = if self.cron.pause_count.load(Ordering::SeqCst) > 0 {
+                Duration::from_millis(50)
+            } else {
+                self.duration_until_next_cron_fire()
+                    .unwrap_or_else(|| Duration::from_millis(500))
+                    .clamp(Duration::from_millis(10), Duration::from_millis(500))
+            };
+            let mut guard = self.cron.wait_lock.lock();
+            self.cron.waiters.wait_for(&mut guard, wait);
+        }
+    }
+
+    fn duration_until_next_cron_fire(&self) -> Option<Duration> {
+        let now = now_millis();
+        self.cron
+            .schedules
+            .lock()
+            .values()
+            .map(|schedule| Duration::from_millis(schedule.next_fire_at_ms.saturating_sub(now)))
+            .min()
+    }
+
+    fn wait_for_imminent_cron_due_for_test(&self, max_wait: Duration) {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            let Some(wait) = self.duration_until_next_cron_fire() else {
+                return;
+            };
+            if wait.is_zero() {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || wait > remaining {
+                return;
+            }
+            thread::sleep(wait.min(Duration::from_millis(10)));
+        }
+    }
+
+    fn dispatch_due_cron_schedules(&self, manual: bool) -> Result<u64> {
+        let reserved_runs = self.reserve_due_cron_runs()?;
+        let mut successful_fires = 0u64;
+        let mut fail_loud_error = None;
+        let mut dispatch_error = None;
+
+        for run in reserved_runs {
+            let schedule_name = run.schedule.name.clone();
+            let result = self.dispatch_reserved_cron_run(
+                run,
+                manual,
+                &mut successful_fires,
+                &mut fail_loud_error,
+            );
+            self.cron.running_schedules.lock().remove(&schedule_name);
+            self.cron.waiters.notify_all();
+            if let Err(err) = result
+                && dispatch_error.is_none()
+            {
+                dispatch_error = Some(err);
+            }
+        }
+
+        if let Some(err) = dispatch_error {
+            return Err(err);
+        }
+
+        if let Some(err) = fail_loud_error {
+            Err(err)
+        } else {
+            Ok(successful_fires)
+        }
+    }
+
+    fn reserve_due_cron_runs(&self) -> Result<Vec<ReservedCronRun>> {
+        let _dispatch = self.cron.dispatch_lock.lock();
+        let now = now_millis();
+        let mut reserved = Vec::new();
+        {
+            let mut schedules = self.cron.schedules.lock();
+            let mut running = self.cron.running_schedules.lock();
+            for schedule in schedules.values_mut() {
+                if schedule.next_fire_at_ms > now || running.contains(&schedule.name) {
+                    continue;
+                }
+                let snapshot = schedule.clone();
+                let decision = compute_due_decision(schedule, now);
+                schedule.next_fire_at_ms = decision.next_fire_at_ms;
+                if decision.fire_count > 0 {
+                    schedule.last_fire_at_ms = Some(now);
+                }
+                running.insert(snapshot.name.clone());
+                reserved.push(ReservedCronRun {
+                    schedule: snapshot,
+                    decision,
+                });
+            }
+        }
+        if !reserved.is_empty()
+            && let Err(err) = self.persist_cron_schedules()
+        {
+            {
+                let mut schedules = self.cron.schedules.lock();
+                for run in &reserved {
+                    if let Some(current) = schedules.get_mut(&run.schedule.name) {
+                        current.next_fire_at_ms = run.schedule.next_fire_at_ms;
+                        current.last_fire_at_ms = run.schedule.last_fire_at_ms;
+                    }
+                }
+            }
+            let mut running = self.cron.running_schedules.lock();
+            for run in &reserved {
+                running.remove(&run.schedule.name);
+            }
+            return Err(err);
+        }
+        Ok(reserved)
+    }
+
+    fn dispatch_reserved_cron_run(
+        &self,
+        run: ReservedCronRun,
+        manual: bool,
+        successful_fires: &mut u64,
+        fail_loud_error: &mut Option<Error>,
+    ) -> Result<()> {
+        let schedule = run.schedule;
+        let decision = run.decision;
+        for _ in 0..decision.missed_skipped {
+            self.append_cron_audit(
+                &schedule.name,
+                CronAuditKind::MissedSkipped,
+                self.current_lsn(),
+            )?;
+        }
+        if let Some(ticks) = decision.caught_up {
+            self.append_cron_audit(
+                &schedule.name,
+                CronAuditKind::MissedCaughtUp { ticks },
+                self.current_lsn(),
+            )?;
+        }
+        if let Some(err) = decision.fail_loud {
+            self.append_cron_audit(
+                &schedule.name,
+                CronAuditKind::Failed(err.to_string()),
+                self.current_lsn(),
+            )?;
+            if manual && fail_loud_error.is_none() {
+                *fail_loud_error = Some(err);
+            }
+            return Ok(());
+        }
+
+        let callback = self.cron.callbacks.read().get(&schedule.callback).cloned();
+        let Some(callback) = callback else {
+            self.append_cron_audit(
+                &schedule.name,
+                CronAuditKind::Failed(format!("no callback registered: {}", schedule.callback)),
+                self.current_lsn(),
+            )?;
+            return Ok(());
+        };
+
+        for _ in 0..decision.fire_count {
+            match self.run_cron_callback_transaction(callback.clone()) {
+                Ok(lsn) => {
+                    *successful_fires += 1;
+                    self.append_cron_audit(&schedule.name, CronAuditKind::Fired, lsn)?;
+                }
+                Err(err) => {
+                    self.append_cron_audit(
+                        &schedule.name,
+                        CronAuditKind::Failed(err.to_string()),
+                        self.current_lsn(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_cron_callback_transaction(&self, callback: CronCallback) -> Result<Lsn> {
+        let _callback_thread = self.cron.enter_callback_thread_scope();
+        let tx = self.begin_for_internal_write()?;
+        let mut pending_sink_events = Vec::new();
+        let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+        let pending_trigger_active_guards =
+            std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
+        let mut committed_trigger_audit_entries = Vec::new();
+        // Cron callbacks are arbitrary user code and can stage vector writes
+        // while the tx manager's commit mutex is held. Acquire current vector
+        // schema refs before entering that mutex so DDL keeps the normal
+        // schema-gate -> commit-mutex lock order.
+        let mut vector_schema_guard =
+            Some(self.vector_schema_read_many(self.vector_store_schema_refs()));
+        let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
+        let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
+            tx,
+            |reserved_lsn| {
+                let callback_result = CRON_LSN_OVERRIDE.with(|slot| {
+                    let prior_lsn = slot.replace(Some(reserved_lsn));
+                    let prior_tx = CRON_CALLBACK_TX.with(|tx_slot| tx_slot.replace(Some(tx)));
+                    let this_db = self as *const Self as usize;
+                    let prior_db = CRON_CALLBACK_DB.with(|db_slot| db_slot.replace(Some(this_db)));
+                    let gate_id = self.vector_schema_gate_id();
+                    let prior_gate = CRON_CALLBACK_VECTOR_SCHEMA_GATE
+                        .with(|gate_slot| gate_slot.replace(Some(gate_id)));
+                    let prior_active = CRON_CALLBACK_ACTIVE.with(|active| active.replace(true));
+                    let mut result = catch_unwind(AssertUnwindSafe(|| callback(self)));
+                    if let Ok(Ok(())) = &result
+                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
+                    {
+                        result = Ok(Err(error));
+                    }
+                    if let Ok(Ok(())) = &result {
+                        match self.dispatch_triggers_for_tx(tx) {
+                            Ok(outcome) => {
+                                *pending_trigger_audits.borrow_mut() = outcome.pending;
+                                pending_trigger_active_guards
+                                    .borrow_mut()
+                                    .extend(outcome.active_guards);
+                            }
+                            Err(failure) => {
+                                let failure = *failure;
+                                pending_trigger_active_guards
+                                    .borrow_mut()
+                                    .extend(failure.active_guards);
+                                result = Ok(Err(failure.error));
+                            }
+                        }
+                    }
+                    if let Ok(Ok(())) = &result
+                        && let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx)
+                    {
+                        result = Ok(Err(error));
+                    }
+                    CRON_CALLBACK_ACTIVE.with(|active| active.set(prior_active));
+                    CRON_CALLBACK_DB.with(|db_slot| db_slot.set(prior_db));
+                    CRON_CALLBACK_VECTOR_SCHEMA_GATE.with(|gate_slot| gate_slot.set(prior_gate));
+                    CRON_CALLBACK_TX.with(|tx_slot| tx_slot.set(prior_tx));
+                    slot.replace(prior_lsn);
+                    result
+                });
+                match callback_result {
+                    Ok(result) => result,
+                    Err(payload) => Err(Error::Other(format!(
+                        "cron callback panicked: {}",
+                        panic_payload_to_string(payload)
+                    ))),
+                }
+            },
+            |ws| {
+                if !ws.is_empty() {
+                    debug_assert!(
+                        !Self::write_set_touches_vector_schema(ws) || vector_schema_guard.is_some()
+                    );
+                    self.rewrite_txid_placeholders(tx, ws)?;
+                    let _validation = self.commit_validate(tx, ws)?;
+                    self.plugin.pre_commit(ws, CommitSource::AutoCommit)?;
+                    let prepared_sink_events = self.prepare_sink_events_for_write_set(ws)?;
+                    if self.persistence.is_some()
+                        && let Some(lsn) = ws.commit_lsn
+                    {
+                        self.event_bus
+                            .stage_sink_events_for_persistence(lsn, prepared_sink_events);
+                    } else {
+                        pending_sink_events = prepared_sink_events;
+                    }
+                    if let Some(lsn) = ws.commit_lsn {
+                        let pending = pending_trigger_audits.borrow();
+                        committed_trigger_audit_entries =
+                            self.committed_trigger_audits_for_pending(&pending, ws, lsn);
+                        self.stage_trigger_audits_for_persistence(
+                            lsn,
+                            &committed_trigger_audit_entries,
+                        );
+                    }
+                    *delete_release_bytes.borrow_mut() =
+                        self.delete_release_bytes_for_write_set(ws);
+                }
+                Ok(())
+            },
+        );
+
+        match result {
+            Ok((lsn, ws)) => {
+                self.pending_commit_metadata.lock().remove(&tx);
+                if !ws.is_empty() {
+                    self.release_delete_allocations_from_bytes(&delete_release_bytes.borrow());
+                    drop(vector_schema_guard.take());
+                    self.plugin.post_commit(&ws, CommitSource::AutoCommit);
+                    let sink_events_to_publish = if self.persistence.is_some() {
+                        ws.commit_lsn
+                            .and_then(|lsn| {
+                                self.event_bus.take_staged_sink_events_for_persistence(lsn)
+                            })
+                            .map(EventBusState::materialize_staged_sink_events)
+                            .unwrap_or_default()
+                    } else {
+                        pending_sink_events
+                    };
+                    self.publish_prepared_sink_events_to_memory(sink_events_to_publish);
+                    self.append_trigger_audits_to_memory(committed_trigger_audit_entries);
+                    self.publish_commit_event_if_subscribers(&ws, CommitSource::AutoCommit, lsn);
+                }
+                Ok(lsn)
+            }
+            Err(failure) => {
+                self.pending_commit_metadata.lock().remove(&tx);
+                if let Some(lsn) = failure.write_set.as_ref().and_then(|ws| ws.commit_lsn) {
+                    let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
+                    self.discard_staged_trigger_audits_for_persistence(lsn);
+                }
+                if let Some(ws) = failure.write_set {
+                    self.release_insert_allocations(&ws);
+                } else {
+                    let _ = self.rollback_without_callback_tx_control(tx);
+                }
+                let pending = pending_trigger_audits.borrow();
+                self.append_rolled_back_trigger_audits(&pending, tx, &failure.error.to_string())?;
+                Err(failure.error)
+            }
+        }
+    }
+
+    fn append_cron_audit(
+        &self,
+        schedule_name: &str,
+        kind: CronAuditKind,
+        at_lsn: Lsn,
+    ) -> Result<()> {
+        {
+            let mut audit = self.cron.audit.lock();
+            if audit.len() == MAX_CRON_AUDIT_DEPTH {
+                audit.pop_front();
+            }
+            audit.push_back(CronAuditEntry {
+                schedule_name: schedule_name.to_string(),
+                kind,
+                at_lsn,
+            });
+        }
+        self.persist_cron_audit()
+    }
+
+    fn persist_cron_schedules(&self) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let schedules = self
+            .cron
+            .schedules
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        persistence.flush_config_value(CRON_SCHEDULES_CONFIG_KEY, &schedules)
+    }
+
+    /// Encoded cron-schedule config for checkpoint export. DDL-declared
+    /// schedules are database state even on in-memory sources, so export
+    /// serializes them exactly as file-backed DDL persistence would have.
+    pub(super) fn export_cron_config_values(&self) -> Result<Vec<(&'static str, Vec<u8>)>> {
+        let schedules = self
+            .cron
+            .schedules
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(vec![(
+            CRON_SCHEDULES_CONFIG_KEY,
+            RedbPersistence::encode_config_value(&schedules)?,
+        )])
+    }
+
+    fn persist_cron_audit(&self) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let audit = self.cron.audit.lock().iter().cloned().collect::<Vec<_>>();
+        persistence.flush_config_value(CRON_AUDIT_CONFIG_KEY, &audit)
+    }
+
+    fn worker_handle_for_background(&self) -> Database {
+        Database {
+            tx_mgr: self.tx_mgr.clone(),
+            relational_store: self.relational_store.clone(),
+            graph_store: self.graph_store.clone(),
+            vector_store: self.vector_store.clone(),
+            vector_schema_gates: self.vector_schema_gates.clone(),
+            change_log: self.change_log.clone(),
+            ddl_log: self.ddl_log.clone(),
+            persistence: self.persistence.clone(),
+            open_registry_path: Mutex::new(None),
+            operation_gate: self.operation_gate.clone(),
+            apply_phase_pause: self.apply_phase_pause.clone(),
+            relational: MemRelationalExecutor::new(
+                self.relational_store.clone(),
+                self.tx_mgr.clone(),
+            ),
+            graph: MemGraphExecutor::new(self.graph_store.clone(), self.tx_mgr.clone()),
+            vector: MemVectorExecutor::new_with_accountant(
+                self.vector_store.clone(),
+                self.tx_mgr.clone(),
+                Arc::new(OnceLock::new()),
+                self.accountant.clone(),
+            ),
+            session_tx: Mutex::new(None),
+            instance_id: self.instance_id,
+            owner_thread: self.owner_thread,
+            plugin: self.plugin.clone(),
+            access: AccessConstraints::default(),
+            accountant: self.accountant.clone(),
+            conflict_policies: RwLock::new(self.conflict_policies.read().clone()),
+            subscriptions: self.subscriptions.clone(),
+            pruning_runtime: Mutex::new(PruningRuntime::new()),
+            pruning_guard: self.pruning_guard.clone(),
+            retention_sync_peer: Mutex::new(self.retention_sync_peer.lock().clone()),
+            cron: self.cron.clone(),
+            event_bus: self.event_bus.clone(),
+            trigger: self.trigger.clone(),
+            sync_relay_mode: self.sync_relay_mode.clone(),
+            in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
+            pending_event_bus_ddl: Mutex::new(HashMap::new()),
+            pending_commit_metadata: Mutex::new(HashMap::new()),
+            disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
+            disk_limit_startup_ceiling: AtomicU64::new(
+                self.disk_limit_startup_ceiling.load(Ordering::SeqCst),
+            ),
+            sync_watermark: self.sync_watermark.clone(),
+            closed: AtomicBool::new(false),
+            resource_closed: self.resource_closed.clone(),
+            rows_examined: AtomicU64::new(0),
+            last_vector_search_used_hnsw: AtomicBool::new(false),
+            last_vector_search_trace: RwLock::new(None),
+            statement_cache: RwLock::new(HashMap::new()),
+            rank_formula_cache: RwLock::new(self.rank_formula_cache.read().clone()),
+            acl_grant_cache: RwLock::new(HashMap::new()),
+            rank_policy_eval_count: AtomicU64::new(0),
+            rank_policy_formula_parse_count: AtomicU64::new(0),
+            fk_indexed_tuple_probes: AtomicU64::new(0),
+            fk_full_scan_fallbacks: AtomicU64::new(0),
+            commit_rows_validated: AtomicU64::new(0),
+            commit_indexed_probes: AtomicU64::new(0),
+            commit_staged_vs_staged_comparisons: AtomicU64::new(0),
+            commit_scan_rows_touched: AtomicU64::new(0),
+            commit_index_maintenance_visits: AtomicU64::new(0),
+            #[cfg(feature = "test-seams")]
+            commit_stage_wall_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            corrupt_joined_values: RwLock::new(self.corrupt_joined_values.read().clone()),
+            resource_owner: false,
+        }
+    }
+}
+
+fn parse_cron_interval_ms(input: &str) -> Result<u64> {
+    let mut parts = input.split_whitespace();
+    let amount = parts
+        .next()
+        .ok_or_else(|| Error::PlanError("cron interval is missing amount".to_string()))?
+        .parse::<u64>()
+        .map_err(|err| Error::PlanError(format!("invalid cron interval amount: {err}")))?;
+    let unit = parts
+        .next()
+        .ok_or_else(|| Error::PlanError("cron interval is missing unit".to_string()))?
+        .to_ascii_lowercase();
+    if parts.next().is_some() {
+        return Err(Error::PlanError(format!(
+            "unsupported cron interval: {input}"
+        )));
+    }
+    let multiplier = match unit.as_str() {
+        "millisecond" | "milliseconds" => 1,
+        "second" | "seconds" => 1_000,
+        "minute" | "minutes" => 60_000,
+        "hour" | "hours" => 3_600_000,
+        other => {
+            return Err(Error::PlanError(format!(
+                "unsupported cron interval unit: {other}"
+            )));
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .filter(|ms| *ms > 0)
+        .ok_or_else(|| Error::PlanError("cron interval must be positive".to_string()))
+}
+
+fn parse_cron_policy(
+    policy: Option<&str>,
+    within_seconds: Option<u32>,
+) -> Result<CronMissedPolicy> {
+    match policy
+        .unwrap_or("skip-and-audit")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "skip-and-audit" => Ok(CronMissedPolicy::SkipAndAudit),
+        "catch-up" => Ok(CronMissedPolicy::CatchUp {
+            within_ms: u64::from(within_seconds.unwrap_or(0)).saturating_mul(1_000),
+        }),
+        "fail-loud" => Ok(CronMissedPolicy::FailLoud),
+        other => Err(Error::PlanError(format!(
+            "unsupported missed tick policy: {other}"
+        ))),
+    }
+}
+
+fn compute_due_decision(schedule: &CronSchedule, now: u64) -> DueDecision {
+    if now < schedule.next_fire_at_ms {
+        return DueDecision {
+            fire_count: 0,
+            next_fire_at_ms: schedule.next_fire_at_ms,
+            missed_skipped: 0,
+            caught_up: None,
+            fail_loud: None,
+        };
+    }
+    let ticks_due = ((now - schedule.next_fire_at_ms) / schedule.every_ms) + 1;
+    let next_fire_at_ms = schedule
+        .next_fire_at_ms
+        .saturating_add(ticks_due.saturating_mul(schedule.every_ms));
+    match schedule.policy {
+        CronMissedPolicy::SkipAndAudit => DueDecision {
+            fire_count: 1,
+            next_fire_at_ms,
+            missed_skipped: ticks_due.saturating_sub(1),
+            caught_up: None,
+            fail_loud: None,
+        },
+        CronMissedPolicy::CatchUp { within_ms } => {
+            let cutoff = now.saturating_sub(within_ms);
+            let fire_count = (0..ticks_due)
+                .map(|offset| schedule.next_fire_at_ms + offset * schedule.every_ms)
+                .filter(|scheduled_at| *scheduled_at >= cutoff)
+                .count() as u64;
+            DueDecision {
+                fire_count,
+                next_fire_at_ms,
+                missed_skipped: 0,
+                caught_up: (fire_count > 1).then_some(fire_count.min(u64::from(u32::MAX)) as u32),
+                fail_loud: None,
+            }
+        }
+        CronMissedPolicy::FailLoud if ticks_due > 1 => {
+            let ticks = ticks_due.min(u64::from(u32::MAX)) as u32;
+            DueDecision {
+                fire_count: 0,
+                next_fire_at_ms,
+                missed_skipped: 0,
+                caught_up: None,
+                fail_loud: Some(Error::MissedTicksExceeded {
+                    ticks,
+                    policy: "fail-loud".to_string(),
+                }),
+            }
+        }
+        CronMissedPolicy::FailLoud => DueDecision {
+            fire_count: 1,
+            next_fire_at_ms,
+            missed_skipped: 0,
+            caught_up: None,
+            fail_loud: None,
+        },
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_manual_cron_guard_drop_does_not_restart_tickler() -> Result<()> {
+        let db = Database::open_memory();
+        let first_pause = db.pause_cron_tickler_for_test();
+        let second_pause = db.pause_cron_tickler_for_test();
+
+        db.create_cron_schedule("paused_manual", "1 HOUR", "cb", None, None)?;
+        db.register_cron_callback("cb", |_| Ok(()))?;
+
+        assert_eq!(db.cron.pause_count.load(Ordering::SeqCst), 2);
+        assert!(db.cron.runtime.lock().handle.is_none());
+
+        drop(first_pause);
+
+        assert_eq!(db.cron.pause_count.load(Ordering::SeqCst), 1);
+        assert!(db.cron.runtime.lock().handle.is_none());
+
+        drop(second_pause);
+
+        assert_eq!(db.cron.pause_count.load(Ordering::SeqCst), 0);
+        assert!(db.cron.runtime.lock().handle.is_none());
+
+        db.start_cron_tickler_if_schedules_present();
+        assert!(db.cron.runtime.lock().handle.is_some());
+
+        db.close()
+    }
+}

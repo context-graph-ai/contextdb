@@ -6,7 +6,7 @@ pub mod gate_b_workflows;
 pub mod gate_c_d_lifecycle;
 pub mod golden_output;
 pub mod helpers;
-pub mod hiring_criteria;
+pub mod cross_cutting_acceptance_tests;
 pub mod job_level;
 pub mod safety_integrity;
 pub mod state_propagation;

@@ -1,59 +1,110 @@
 use crate::protocol::{
-    ChunkAck, MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireChangeSet,
-    WireRowChange, decode, encode,
+    MessageType, PullRequest, PullResponse, PushRequest, PushResponse, SyncStatusRequest,
+    SyncStatusResponse, WireChangeSet, decode, encode, row_payload_bytes,
 };
-use crate::subjects::{pull_subject, push_subject};
-use contextdb_core::{AtomicLsn, Error, Lsn};
+use crate::subjects::{pull_subject, push_subject, status_subject};
+use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
+use crate::transport::{ClientTransport, TransportError};
+use contextdb_core::{AtomicLsn, Error, Lsn, TenantId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, SyncDirection,
 };
-use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
-/// Overall deadline for collecting all chunks in a chunked pull response.
-const CHUNK_COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
 const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+/// Bound on the sync-status probe. No responder / timeout / malformed
+/// reply all degrade to "no status" and the sync proceeds exactly as before
+/// the probe existed (contract item 5: never hang against an old server).
+const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const PULL_PAGE_SIZE: u32 = 500;
 const MAX_BATCH_BYTES: usize = 800 * 1024;
 const BATCH_ESTIMATE_SAFETY_MARGIN: usize = 32 * 1024;
 const TARGET_BATCH_BYTES: usize = MAX_BATCH_BYTES - BATCH_ESTIMATE_SAFETY_MARGIN;
+const MAX_BATCH_DATA_LSN_GROUPS: usize = 100;
 
 pub struct SyncClient {
     db: Arc<Database>,
-    nats: tokio::sync::Mutex<Option<async_nats::Client>>,
-    nats_url: String,
-    tenant_id: String,
+    transport: Arc<dyn ClientTransport>,
+    endpoint: String,
+    tenant_id: TenantId,
     push_watermark: AtomicLsn,
     pull_watermark: AtomicLsn,
     table_directions: std::sync::RwLock<HashMap<String, SyncDirection>>,
     conflict_policies: std::sync::RwLock<ConflictPolicies>,
+    /// Per-peer transfer counters for the sync plane. In memory only.
+    receipts: Arc<TransferLedger>,
+}
+
+impl std::fmt::Debug for SyncClient {
+    /// `db` is the engine handle and `transport` is the connection object —
+    /// neither implements `Debug`, so both are elided as placeholders. Every
+    /// other field is safe to print in full: no secrets live on this struct.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncClient")
+            .field("db", &"..")
+            .field("transport", &"..")
+            .field("endpoint", &self.endpoint)
+            .field("tenant_id", &self.tenant_id)
+            .field(
+                "push_watermark",
+                &self.push_watermark.load(Ordering::Relaxed),
+            )
+            .field(
+                "pull_watermark",
+                &self.pull_watermark.load(Ordering::Relaxed),
+            )
+            .field(
+                "table_directions",
+                &self.table_directions.read().map(|g| g.clone()).ok(),
+            )
+            .field(
+                "conflict_policies",
+                &self.conflict_policies.read().map(|g| g.clone()).ok(),
+            )
+            .finish()
+    }
 }
 
 impl SyncClient {
-    pub fn new(db: Arc<Database>, nats_url: &str, tenant_id: &str) -> Self {
+    pub fn new(db: Arc<Database>, endpoint: &str, tenant_id: TenantId) -> Self {
+        Self::build(
+            db,
+            crate::transport::client_transport(endpoint),
+            endpoint.to_string(),
+            tenant_id,
+        )
+    }
+
+    fn build(
+        db: Arc<Database>,
+        transport: Arc<dyn ClientTransport>,
+        endpoint: String,
+        tenant_id: TenantId,
+    ) -> Self {
         assert!(
-            !tenant_id.is_empty()
+            !tenant_id.as_str().is_empty()
                 && tenant_id
+                    .as_str()
                     .chars()
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "tenant_id must be non-empty and alphanumeric (hyphens and underscores allowed): {tenant_id}"
         );
         let (push_watermark, pull_watermark) = db
-            .persisted_sync_watermarks(tenant_id)
+            .persisted_sync_watermarks(&tenant_id)
             .unwrap_or_else(|err| {
                 tracing::warn!(%tenant_id, error = %err, "failed to load persisted sync watermarks");
                 (Lsn(0), Lsn(0))
-            });
+        });
         Self {
             db,
-            nats: tokio::sync::Mutex::new(None),
-            nats_url: nats_url.to_string(),
-            tenant_id: tenant_id.to_string(),
+            transport,
+            endpoint,
+            tenant_id,
             push_watermark: AtomicLsn::new(push_watermark),
             pull_watermark: AtomicLsn::new(pull_watermark),
             table_directions: std::sync::RwLock::new(HashMap::new()),
@@ -61,55 +112,74 @@ impl SyncClient {
                 per_table: HashMap::new(),
                 default: ConflictPolicy::ServerWins,
             }),
+            receipts: Arc::new(TransferLedger::new()),
         }
     }
 
-    /// Lazily connect to NATS, reuse existing connection.
-    /// Returns cloned Client (cheap — Arc internally) so the mutex is not held during NATS ops.
-    /// Returns Err with connection error message if NATS is unreachable.
-    pub async fn ensure_connected(&self) -> Result<async_nats::Client, String> {
-        let mut guard = self.nats.lock().await;
-        if guard.is_none() {
-            let mut last_err = None;
-            for attempt in 0..10u32 {
-                if attempt > 0 {
-                    tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
-                }
-                match async_nats::connect(&self.nats_url).await {
-                    Ok(client) => {
-                        *guard = Some(client);
-                        break;
-                    }
-                    Err(e) => last_err = Some(e.to_string()),
-                }
-            }
-            if guard.is_none() {
-                let err = last_err.unwrap_or_else(|| "unknown error".to_string());
-                return Err(format!(
-                    "cannot connect to NATS at {}: {err}",
-                    self.nats_url
-                ));
-            }
-        }
-        guard
-            .clone()
-            .ok_or_else(|| format!("cannot connect to NATS at {}", self.nats_url))
+    /// Construct a client that talks over `transport` instead of the default
+    /// NATS transport. Used to drive sync with no broker.
+    pub fn with_transport(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ClientTransport>,
+        tenant_id: TenantId,
+    ) -> Self {
+        Self::build(db, transport, "in-process".to_string(), tenant_id)
+    }
+
+    /// Lazily connect the configured transport and reuse its connection.
+    pub async fn ensure_connected(&self) -> Result<(), String> {
+        self.transport
+            .ensure_connected()
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// Drop existing connection and reconnect.
     pub async fn reconnect(&self) {
-        let mut guard = self.nats.lock().await;
-        *guard = None;
-        *guard = async_nats::connect(&self.nats_url).await.ok();
+        let _ = self.transport.reconnect().await;
     }
 
     pub async fn is_connected(&self) -> bool {
-        let guard = self.nats.lock().await;
-        guard.is_some()
+        self.transport.is_connected().await
+    }
+
+    /// Release the transport's resources gracefully before process exit
+    /// (closes the sync connection and its endpoint).
+    pub async fn shutdown(&self) {
+        let _ = self.transport.shutdown().await;
     }
 
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// What this edge has moved with its hub, per direction, since the client
+    /// was constructed. Monotonic and in memory only; the engine persists none
+    /// of it, so a fresh client on the same database starts from zero.
+    pub fn transfer_receipts(&self) -> Vec<TransferReceipt> {
+        self.receipts.receipts()
+    }
+
+    /// The hub's transport-authenticated node id, when the transport
+    /// authenticates one. The default transport dials by key, so this is the
+    /// hub the edge is provably talking to.
+    fn hub_node_id(&self) -> Option<String> {
+        self.transport.peer_node_id()
+    }
+
+    /// Before the FIRST retained-table push, bind this database to the hub it
+    /// is delivering to. A retained table is delivered to exactly one hub — a
+    /// second, different hub is refused here, by the push itself, with no
+    /// cooperation from the embedding application and before a single retained
+    /// row leaves the edge.
+    fn bind_retention_hub(&self) -> Result<(), Error> {
+        if push_only_retained_tables(&self.db).is_empty() {
+            return Ok(());
+        }
+        let Some(hub) = self.hub_node_id() else {
+            return Ok(());
+        };
+        self.db.register_retention_sync_peer(&hub)
     }
 
     pub fn has_pending_push_changes(&self) -> Result<bool, Error> {
@@ -119,15 +189,189 @@ impl SyncClient {
             .db
             .changes_since(since)
             .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
+        let changes = drop_rows_that_arrived_by_sync(&self.db, changes);
         Ok(!changes.rows.is_empty()
             || !changes.edges.is_empty()
             || !changes.vectors.is_empty()
             || !changes.ddl.is_empty())
     }
 
+    /// Stale-restore probe: best-effort, bounded status exchange on the
+    /// dedicated per-tenant status subject. Every failure mode (no responder,
+    /// timeout, transport status reply, malformed payload) yields `None`, and the
+    /// caller proceeds exactly as today.
+    async fn fetch_sync_status(&self) -> Option<SyncStatusResponse> {
+        let encoded = encode(MessageType::StatusRequest, &SyncStatusRequest {}).ok()?;
+        let reply = self
+            .transport
+            .request_single_reply(
+                &status_subject(self.tenant_id.as_str()),
+                encoded,
+                STATUS_REQUEST_TIMEOUT,
+            )
+            .await
+            .ok()?;
+        let envelope = decode(&reply).ok()?;
+        if !matches!(envelope.message_type, MessageType::StatusResponse) {
+            return None;
+        }
+        rmp_serde::from_slice(&envelope.payload).ok()
+    }
+
+    async fn request_push_once(&self, encoded: Vec<u8>) -> Result<ApplyResult, Error> {
+        let reply = self
+            .transport
+            .request(
+                &push_subject(self.tenant_id.as_str()),
+                encoded,
+                SYNC_TIMEOUT,
+            )
+            .await
+            .map_err(|err| Error::SyncError(format!("single-attempt push failed: {err}")))?;
+        decode_push_response(&reply).map_err(PushReplyError::into_error)
+    }
+
+    async fn request_push(&self, encoded: Vec<u8>) -> Result<ApplyResult, Error> {
+        match self.transport.ensure_single_reply_retry_safe(&encoded) {
+            Ok(()) => {}
+            Err(TransportError::RetryUnsafe(detail)) => {
+                tracing::debug!(
+                    %detail,
+                    "push request requires a single-attempt transport send"
+                );
+                return self.request_push_once(encoded).await;
+            }
+            Err(err) => return Err(Error::SyncError(format!("push failed: {err}"))),
+        }
+
+        let mut push_result = None;
+        for attempt in 0..5u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            }
+
+            match self
+                .transport
+                .request_single_reply(
+                    &push_subject(self.tenant_id.as_str()),
+                    encoded.clone(),
+                    PUSH_REQUEST_TIMEOUT,
+                )
+                .await
+            {
+                Ok(reply) => match decode_push_response(&reply) {
+                    Ok(result) => {
+                        push_result = Some(result);
+                        break;
+                    }
+                    Err(PushReplyError::Malformed(err)) if attempt < 4 => {
+                        tracing::debug!(attempt, error = %err, "push got malformed reply, retrying");
+                        continue;
+                    }
+                    Err(PushReplyError::Malformed(err)) => return Err(err),
+                    Err(PushReplyError::Terminal(err)) => return Err(err),
+                },
+                Err(
+                    TransportError::NoResponder
+                    | TransportError::Status(_)
+                    | TransportError::Timeout,
+                ) if attempt < 4 => {
+                    tracing::debug!(attempt, "push got retryable transport miss, retrying");
+                    continue;
+                }
+                Err(TransportError::IncompleteReply(detail)) => {
+                    return Err(Error::SyncError(format!(
+                        "push response incomplete: {detail}"
+                    )));
+                }
+                Err(err) => return Err(Error::SyncError(format!("push failed: {err}"))),
+            }
+        }
+        push_result.ok_or_else(|| {
+            Error::SyncError("push failed after retries: no response from server".to_string())
+        })
+    }
+
+    async fn request_pull(&self, request: PullRequest) -> Result<PullResponse, Error> {
+        let encoded = encode(MessageType::PullRequest, &request)
+            .map_err(|e| Error::SyncError(e.to_string()))?;
+
+        let mut first_attempt_response = None;
+        for attempt in 0..5u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            }
+            let timeout = if attempt < 2 {
+                Duration::from_secs(2)
+            } else {
+                SYNC_TIMEOUT
+            };
+
+            match self
+                .transport
+                .request(
+                    &pull_subject(self.tenant_id.as_str()),
+                    encoded.clone(),
+                    timeout,
+                )
+                .await
+            {
+                Ok(reply) => {
+                    first_attempt_response = Some(reply);
+                    break;
+                }
+                Err(TransportError::Timeout) if attempt < 4 => {
+                    tracing::debug!(attempt, "pull timed out, retrying");
+                    continue;
+                }
+                Err(TransportError::IncompleteReply(detail)) => {
+                    return Err(Error::SyncError(format!(
+                        "pull response incomplete: {detail}"
+                    )));
+                }
+                Err(err) => return Err(Error::SyncError(format!("pull failed: {err}"))),
+            }
+        }
+
+        let reply = first_attempt_response.ok_or_else(|| {
+            Error::SyncError("pull request timed out waiting for response".to_string())
+        })?;
+        let envelope = decode(&reply).map_err(|e| Error::SyncError(e.to_string()))?;
+        if !matches!(envelope.message_type, MessageType::PullResponse) {
+            return Err(Error::SyncError(
+                "unexpected message type in pull response".to_string(),
+            ));
+        }
+        rmp_serde::from_slice(&envelope.payload).map_err(|e| Error::SyncError(e.to_string()))
+    }
+
     pub async fn push(&self) -> Result<ApplyResult, Error> {
-        // Verify NATS connectivity early so users get a clear error even for empty pushes.
-        let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
+        // Verify connectivity early so users get a clear error even for empty pushes.
+        self.ensure_connected().await.map_err(Error::SyncError)?;
+        self.bind_retention_hub()?;
+        self.refuse_directions_that_break_delivery()?;
+
+        // Exchange status with the server before computing the changeset
+        // — including when there is nothing locally new (contract item 2). A
+        // server whose applied-push watermark is behind ours was restored from
+        // a stale artifact and silently lost acked commits; regress the local
+        // push watermark so the changeset recomputation re-pushes them.
+        let local = self.push_watermark.load(Ordering::SeqCst);
+        if let Some(status) = self.fetch_sync_status().await
+            && let Some(server_applied) = status.applied_push_watermark
+            && server_applied < local
+        {
+            tracing::info!(
+                tenant_id = %self.tenant_id,
+                local_watermark = local.0,
+                server_applied_watermark = server_applied.0,
+                "server applied-push watermark behind local; regressing to re-push acked commits"
+            );
+            self.push_watermark.store(server_applied, Ordering::SeqCst);
+            self.db
+                .persist_sync_push_watermark(&self.tenant_id, server_applied)
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+        }
 
         let since = self.push_watermark.load(Ordering::SeqCst);
         // Clone directions out of RwLock BEFORE any .await
@@ -136,6 +380,7 @@ impl SyncClient {
             .db
             .changes_since(since)
             .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
+        let changeset = drop_rows_that_arrived_by_sync(&self.db, changeset);
 
         if changeset.rows.is_empty()
             && changeset.edges.is_empty()
@@ -157,188 +402,71 @@ impl SyncClient {
             new_lsn: since,
         };
 
+        let hub = self.hub_node_id();
         let mut last_successful_lsn = since;
         for batch in split_changeset(changeset) {
-            let batch_max_lsn = [
-                batch.rows.last().map(|r| r.lsn),
-                batch.edges.last().map(|e| e.lsn),
-                batch.vectors.last().map(|v| v.lsn),
-            ]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(since);
-
+            let batch_max_lsn = batch.max_lsn().unwrap_or_else(|| {
+                if batch.ddl.is_empty() {
+                    since
+                } else {
+                    self.db.current_lsn()
+                }
+            });
+            // Taken BEFORE the send, so the success path and the lost-ack
+            // reconciliation below report the same transmitted set. Recomputing
+            // them separately on each path is how the two would drift.
+            let batch_items = batch.rows.len() as u64;
+            let batch_payload_bytes = row_payload_bytes(&batch.rows);
             let request = PushRequest {
                 changeset: batch.clone().into(),
             };
             let encoded = encode(MessageType::PushRequest, &request)
                 .map_err(|e| Error::SyncError(e.to_string()))?;
 
-            let result: ApplyResult = if crate::chunking::needs_chunking(&encoded) {
-                use crate::chunking::chunk;
-
-                tracing::info!(
-                    payload_size = encoded.len(),
-                    "push payload exceeds chunking threshold, using chunked send"
-                );
-
-                let inbox = nats_client.new_inbox();
-                let mut inbox_sub = nats_client
-                    .subscribe(inbox.clone())
-                    .await
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-
-                let subject = push_subject(&self.tenant_id);
-                let chunks = chunk(&encoded);
-                let chunk_id = chunks[0].chunk_id;
-                let total_chunks = chunks[0].total_chunks;
-
-                tracing::debug!(
-                    %chunk_id,
-                    total_chunks,
-                    "sending {} chunks for push request",
-                    total_chunks
-                );
-
-                for chunk_msg in &chunks {
-                    let chunk_encoded = encode(MessageType::Chunk, chunk_msg)
-                        .map_err(|e| Error::SyncError(e.to_string()))?;
-                    nats_client
-                        .publish(subject.clone(), chunk_encoded.into())
-                        .await
-                        .map_err(|e| Error::SyncError(e.to_string()))?;
-                }
-
-                let ack = ChunkAck {
-                    chunk_id,
-                    total_chunks,
-                    reply_inbox: inbox.clone(),
-                };
-                let ack_encoded = encode(MessageType::ChunkAck, &ack)
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-                nats_client
-                    .publish(subject, ack_encoded.into())
-                    .await
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-                nats_client
-                    .flush()
-                    .await
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-
-                let msg = tokio::time::timeout(SYNC_TIMEOUT, inbox_sub.next())
-                    .await
-                    .map_err(|_| Error::SyncError("chunked push timed out".to_string()))?
-                    .ok_or_else(|| {
-                        Error::SyncError("inbox closed before push response".to_string())
-                    })?;
-                let envelope = decode(&msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
-                let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-                if let Some(err) = response.error {
-                    return Err(Error::SyncError(err));
-                }
-                response
-                    .result
-                    .ok_or_else(|| Error::SyncError("push response missing result".to_string()))?
-                    .into()
-            } else {
-                let mut push_result = None;
-                for attempt in 0..5u32 {
-                    if attempt > 0 {
-                        tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
-                    }
-                    let inbox = nats_client.new_inbox();
-                    let mut inbox_sub = nats_client
-                        .subscribe(inbox.clone())
-                        .await
-                        .map_err(|e| Error::SyncError(e.to_string()))?;
-
-                    nats_client
-                        .publish_with_reply(
-                            push_subject(&self.tenant_id),
-                            inbox.clone(),
-                            encoded.clone().into(),
+            let result: ApplyResult = match self.request_push(encoded).await {
+                Ok(result) => result,
+                Err(err) => {
+                    // The batch bytes already left the edge, so this failure is
+                    // INDETERMINATE: the hub may have applied and committed the
+                    // batch before the acknowledgement was lost. Reconcile once
+                    // against the hub's applied-push watermark before reporting,
+                    // so a push whose data actually landed is never announced as
+                    // a definitive failure (usability job USR-19). Convergence is
+                    // unchanged: the watermark advances only on a CONFIRMED
+                    // batch, and an unconfirmed outcome leaves it untouched so a
+                    // later push re-sends the same batch idempotently.
+                    return self
+                        .finish_interrupted_push(
+                            err,
+                            batch_max_lsn,
+                            total,
+                            hub.as_deref(),
+                            batch_items,
+                            batch_payload_bytes,
                         )
-                        .await
-                        .map_err(|e| Error::SyncError(e.to_string()))?;
-
-                    match tokio::time::timeout(PUSH_REQUEST_TIMEOUT, inbox_sub.next()).await {
-                        Ok(Some(msg)) => {
-                            if let Some(status) = msg.status {
-                                if status == async_nats::StatusCode::NO_RESPONDERS && attempt < 4 {
-                                    tracing::debug!(attempt, "push got no responders, retrying");
-                                    continue;
-                                }
-                                if attempt < 4 {
-                                    tracing::debug!(
-                                        attempt,
-                                        ?status,
-                                        "push got status reply, retrying"
-                                    );
-                                    continue;
-                                }
-                                return Err(Error::SyncError(format!(
-                                    "push failed with NATS status reply: {status:?}"
-                                )));
-                            }
-
-                            let envelope = match decode(&msg.payload) {
-                                Ok(envelope) => envelope,
-                                Err(err) if attempt < 4 => {
-                                    tracing::debug!(attempt, error = %err, "push got malformed reply envelope, retrying");
-                                    continue;
-                                }
-                                Err(err) => return Err(Error::SyncError(err.to_string())),
-                            };
-                            let response: PushResponse = match rmp_serde::from_slice(
-                                &envelope.payload,
-                            ) {
-                                Ok(response) => response,
-                                Err(err) if attempt < 4 => {
-                                    tracing::debug!(attempt, error = %err, "push got malformed reply payload, retrying");
-                                    continue;
-                                }
-                                Err(err) => return Err(Error::SyncError(err.to_string())),
-                            };
-                            if let Some(err) = response.error {
-                                return Err(Error::SyncError(err));
-                            }
-                            push_result = Some(
-                                response
-                                    .result
-                                    .ok_or_else(|| {
-                                        Error::SyncError("push response missing result".to_string())
-                                    })?
-                                    .into(),
-                            );
-                            break;
-                        }
-                        Ok(None) => {
-                            return Err(Error::SyncError("push inbox closed".to_string()));
-                        }
-                        Err(_) if attempt < 4 => {
-                            tracing::debug!(attempt, "push timed out, retrying");
-                            continue;
-                        }
-                        Err(_) => {
-                            return Err(Error::SyncError(
-                                "NATS request timed out waiting for push response".to_string(),
-                            ));
-                        }
-                    }
+                        .await;
                 }
-                push_result.ok_or_else(|| {
-                    Error::SyncError(
-                        "push failed after retries: no response from server".to_string(),
-                    )
-                })?
             };
-            last_successful_lsn = batch_max_lsn;
+            let retryable_legacy_lsn_conflict = has_retryable_legacy_lsn_conflict(&result);
+            if !retryable_legacy_lsn_conflict {
+                last_successful_lsn = batch_max_lsn;
+            }
             total.applied_rows += result.applied_rows;
             total.skipped_rows += result.skipped_rows;
             total.conflicts.extend(result.conflicts);
             total.new_lsn = result.new_lsn;
+            if !retryable_legacy_lsn_conflict {
+                self.receipts.record(
+                    hub.as_deref(),
+                    TransferPlane::Sync,
+                    TransferDirection::Sent,
+                    batch.rows.len() as u64,
+                    row_payload_bytes(&batch.rows),
+                );
+            }
+            if retryable_legacy_lsn_conflict {
+                break;
+            }
         }
 
         self.push_watermark
@@ -346,14 +474,136 @@ impl SyncClient {
         self.db
             .persist_sync_push_watermark(&self.tenant_id, last_successful_lsn)
             .map_err(|err| Error::SyncError(err.to_string()))?;
+        self.advance_engine_sync_watermark(last_successful_lsn);
         Ok(total)
+    }
+
+    /// Open the engine's `SYNC SAFE` deletion gate up to — and only up to —
+    /// what the hub confirmed. The engine blocks pruning at
+    /// `row.lsn >= sync_watermark`, so the watermark is the EXCLUSIVE frontier:
+    /// the first LSN NOT yet confirmed. Confirmed through L therefore means
+    /// L + 1; one more would open the gate on an unconfirmed row, one less
+    /// would strand a confirmed one forever. No application code ever sets
+    /// this — the real client does, on hub-confirmed push.
+    fn advance_engine_sync_watermark(&self, confirmed_through: Lsn) {
+        if confirmed_through.0 == 0 {
+            return;
+        }
+        let frontier = Lsn(confirmed_through.0.saturating_add(1));
+        if frontier > self.db.sync_watermark() {
+            self.db.set_sync_watermark(frontier);
+        }
+    }
+
+    /// Resolve a push whose batch was transmitted but whose transport failed
+    /// before the acknowledgement returned. The batch may or may not have
+    /// committed on the hub, so ask the hub what it actually applied:
+    ///
+    /// * If the hub's applied-push watermark covers this batch's max LSN, the
+    ///   batch DID land: advance and persist the push watermark to it and report
+    ///   the push as the success it was. Any later batches this run never sent
+    ///   reconcile idempotently on the next push.
+    /// * Otherwise the hub is unreachable or its watermark does not (yet) confirm
+    ///   the batch. The outcome is genuinely UNKNOWN, so surface the distinct
+    ///   [`Error::SyncPushUnconfirmed`] (never a definitive failure) and leave the
+    ///   watermark untouched so a later push re-sends the batch idempotently.
+    async fn finish_interrupted_push(
+        &self,
+        transport_err: Error,
+        batch_max_lsn: Lsn,
+        applied_before_interruption: ApplyResult,
+        hub: Option<&str>,
+        batch_items: u64,
+        batch_payload_bytes: u64,
+    ) -> Result<ApplyResult, Error> {
+        // This confirmation rests on the same single-logical-writer /
+        // monotonic-LSN assumption the stale-restore reconcile above already
+        // relies on: the per-tenant `applied_push_watermark` is a meaningful
+        // "covers this batch" comparison only while one edge advances a tenant's
+        // LSN counter. Two edges sharing a tenant with diverged LSN counters
+        // could let a foreign commit false-confirm this batch.
+        let confirmed = self
+            .fetch_sync_status()
+            .await
+            .and_then(|status| status.applied_push_watermark)
+            .is_some_and(|server_applied| server_applied >= batch_max_lsn);
+
+        if confirmed {
+            tracing::info!(
+                tenant_id = %self.tenant_id,
+                batch_max_lsn = batch_max_lsn.0,
+                "push acknowledgement was lost but the hub confirms the batch landed; reconciling to success"
+            );
+            self.push_watermark.store(batch_max_lsn, Ordering::SeqCst);
+            self.db
+                .persist_sync_push_watermark(&self.tenant_id, batch_max_lsn)
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+            self.advance_engine_sync_watermark(batch_max_lsn);
+            // The batch is confirmed DELIVERED, so it is counted — recorded
+            // here, beside the watermark advance, because this is the one place
+            // that decides the push succeeded. Exactly once, with no
+            // de-duplication state: the watermark just advanced past this batch,
+            // so a later push cannot re-send it and cannot re-record it. The
+            // unconfirmed branch below records nothing, and its batch stays in
+            // the changeset to be sent — and counted — when a later push can
+            // prove it landed.
+            self.receipts.record(
+                hub,
+                TransferPlane::Sync,
+                TransferDirection::Sent,
+                batch_items,
+                batch_payload_bytes,
+            );
+            return Ok(applied_before_interruption);
+        }
+
+        Err(Error::SyncPushUnconfirmed {
+            detail: format!(
+                "the hub did not acknowledge the push and its status could not confirm the batch \
+                 landed ({transport_err}); the data may or may not have committed — run the push \
+                 again to reconcile"
+            ),
+        })
     }
 
     /// Pull with explicit policies (frozen test contract, library consumers).
     pub async fn pull(&self, policies: &ConflictPolicies) -> Result<ApplyResult, Error> {
-        let nats_client = self.ensure_connected().await.map_err(Error::SyncError)?;
+        self.ensure_connected().await.map_err(Error::SyncError)?;
+        // The work ledger's per-table policies are merged over whatever the
+        // caller passes (they are the ledger's contract, not caller policy):
+        // on pull, the ServerWins entries remap to EdgeWins below, which is
+        // what reconciles a losing edge's claim/result row to the hub's row.
+        let mut policies = policies.clone();
+        contextdb_engine::work_ledger::apply_work_ledger_policy_overrides(&mut policies);
+        contextdb_engine::peer_directory::apply_peer_directory_policy_overrides(&mut policies);
+        let policies = &policies;
         let directions = self.table_directions()?;
 
+        // Pull-side regression safety (contract item 4): a server whose
+        // LSN clock is behind our pull watermark was restored from a stale
+        // artifact — the watermark refers to a lost server history, and any
+        // post-restore commit may be stamped at or below it. The only resume
+        // point the client can prove safe is the beginning; re-delivered rows
+        // apply idempotently via the conflict policy, and genuinely new
+        // server commits are never skipped.
+        let local = self.pull_watermark.load(Ordering::SeqCst);
+        if let Some(status) = self.fetch_sync_status().await
+            && let Some(server_lsn) = status.server_current_lsn
+            && server_lsn < local
+        {
+            tracing::info!(
+                tenant_id = %self.tenant_id,
+                local_watermark = local.0,
+                server_current_lsn = server_lsn.0,
+                "server LSN clock behind local pull watermark; resetting pull watermark to re-pull"
+            );
+            self.pull_watermark.store(Lsn(0), Ordering::SeqCst);
+            self.db
+                .persist_sync_pull_watermark(&self.tenant_id, Lsn(0))
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+        }
+
+        let hub = self.hub_node_id();
         let mut since_lsn = self.pull_watermark.load(Ordering::SeqCst);
         #[allow(unused_assignments)]
         let mut last_server_lsn = since_lsn;
@@ -371,145 +621,39 @@ impl SyncClient {
             };
 
             let (changes, has_more, cursor) = {
-                let encoded = encode(MessageType::PullRequest, &request)
+                let response = self.request_pull(request).await?;
+                let changes = ChangeSet::try_from(response.changeset)
                     .map_err(|e| Error::SyncError(e.to_string()))?;
-
-                let mut first_attempt_response = None;
-                for attempt in 0..5u32 {
-                    if attempt > 0 {
-                        tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
-                    }
-                    // Use a fresh inbox per attempt so late responses from earlier attempts
-                    // cannot be mistaken for the current pull reply or chunk stream.
-                    let inbox = nats_client.new_inbox();
-                    let mut inbox_sub = nats_client
-                        .subscribe(inbox.clone())
-                        .await
-                        .map_err(|e| Error::SyncError(e.to_string()))?;
-                    let timeout = if attempt < 2 {
-                        Duration::from_secs(2)
-                    } else {
-                        SYNC_TIMEOUT
-                    };
-
-                    nats_client
-                        .publish_with_reply(
-                            pull_subject(&self.tenant_id),
-                            inbox.clone(),
-                            encoded.clone().into(),
-                        )
-                        .await
-                        .map_err(|e| Error::SyncError(e.to_string()))?;
-
-                    match tokio::time::timeout(timeout, inbox_sub.next()).await {
-                        Ok(Some(msg)) => {
-                            first_attempt_response = Some((msg, inbox_sub));
-                            break;
-                        }
-                        Ok(None) => {
-                            return Err(Error::SyncError("pull inbox closed".to_string()));
-                        }
-                        Err(_) if attempt < 4 => {
-                            tracing::debug!(attempt, "pull timed out, retrying");
-                            continue;
-                        }
-                        Err(_) => {}
-                    }
-                }
-
-                let (first_msg, mut inbox_sub) = first_attempt_response.ok_or_else(|| {
-                    Error::SyncError("NATS request timed out waiting for pull response".to_string())
-                })?;
-
-                let first_envelope =
-                    decode(&first_msg.payload).map_err(|e| Error::SyncError(e.to_string()))?;
-
-                let response_envelope = match first_envelope.message_type {
-                    MessageType::PullResponse => first_envelope,
-                    MessageType::Chunk => {
-                        let first_chunk: crate::protocol::ChunkMessage =
-                            rmp_serde::from_slice(&first_envelope.payload)
-                                .map_err(|e| Error::SyncError(e.to_string()))?;
-                        let total = first_chunk.total_chunks;
-                        let mut collected = vec![first_chunk];
-
-                        tracing::debug!(
-                            total_chunks = total,
-                            "pull response is chunked, collecting chunks"
-                        );
-
-                        let deadline = tokio::time::Instant::now() + CHUNK_COLLECT_TIMEOUT;
-
-                        while collected.len() < total as usize {
-                            let remaining = deadline.duration_since(tokio::time::Instant::now());
-                            if remaining.is_zero() {
-                                return Err(Error::SyncError(format!(
-                                    "overall chunk collection deadline exceeded after {}/{} chunks",
-                                    collected.len(),
-                                    total
-                                )));
-                            }
-                            let chunk_msg = tokio::time::timeout_at(deadline, inbox_sub.next())
-                                .await
-                                .map_err(|_| {
-                                    Error::SyncError(format!(
-                                        "timeout collecting pull chunks ({}/{})",
-                                        collected.len(),
-                                        total
-                                    ))
-                                })?
-                                .ok_or_else(|| {
-                                    Error::SyncError("pull chunk stream ended".to_string())
-                                })?;
-                            let env = decode(&chunk_msg.payload)
-                                .map_err(|e| Error::SyncError(e.to_string()))?;
-                            if matches!(env.message_type, MessageType::Chunk) {
-                                let c: crate::protocol::ChunkMessage =
-                                    rmp_serde::from_slice(&env.payload)
-                                        .map_err(|e| Error::SyncError(e.to_string()))?;
-                                collected.push(c);
-                            } else {
-                                return Err(Error::SyncError(format!(
-                                    "unexpected message type {:?} while collecting pull chunks",
-                                    env.message_type
-                                )));
-                            }
-                        }
-                        let reassembled = crate::chunking::reassemble(&mut collected);
-                        decode(&reassembled).map_err(|e| Error::SyncError(e.to_string()))?
-                    }
-                    _ => {
-                        return Err(Error::SyncError(
-                            "unexpected message type in pull response".to_string(),
-                        ));
-                    }
-                };
-
-                let response: PullResponse = rmp_serde::from_slice(&response_envelope.payload)
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-                (
-                    ChangeSet::from(response.changeset),
-                    response.has_more,
-                    response.cursor,
-                )
+                (changes, response.has_more, response.cursor)
             };
 
             // Extract server-side max LSN BEFORE filtering/applying
-            let server_lsn = [
-                changes.rows.last().map(|r| r.lsn),
-                changes.edges.last().map(|e| e.lsn),
-                changes.vectors.last().map(|v| v.lsn),
-            ]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(since_lsn);
+            let server_lsn = cursor.or_else(|| changes.max_lsn()).unwrap_or(since_lsn);
 
             let filtered = changes
                 .filter_by_direction(&directions, &[SyncDirection::Pull, SyncDirection::Both]);
+            // The declared one-way policy, read off THIS database's table meta
+            // — not off runtime registration, which starts empty on every
+            // construction. So it holds after a restart with no app call.
+            let filtered = drop_push_only_retained_rows(&self.db, filtered);
+            // Counted from the SAME row set the bytes are counted from: what
+            // this end took off the wire. Using the applied count here instead
+            // would pair an items figure with a payload figure drawn from two
+            // different sets, so a pull with skipped rows would report bytes for
+            // rows its own item count denied.
+            let received_items = filtered.rows.len() as u64;
+            let received_payload_bytes = row_payload_bytes(&filtered.rows);
+            let stop_for_trigger_bootstrap = filtered.has_create_trigger_ddl() && has_more;
             let result = self
                 .db
                 .apply_changes(filtered, &remap_pull_policies(policies))?;
+            self.receipts.record(
+                hub.as_deref(),
+                TransferPlane::Sync,
+                TransferDirection::Received,
+                received_items,
+                received_payload_bytes,
+            );
             total.applied_rows += result.applied_rows;
             total.skipped_rows += result.skipped_rows;
             total.conflicts.extend(result.conflicts);
@@ -517,6 +661,9 @@ impl SyncClient {
             last_server_lsn = server_lsn;
 
             if !has_more {
+                break;
+            }
+            if stop_for_trigger_bootstrap {
                 break;
             }
             since_lsn = cursor.unwrap_or(since_lsn);
@@ -549,20 +696,44 @@ impl SyncClient {
     }
 
     pub fn tenant_id(&self) -> &str {
-        &self.tenant_id
+        self.tenant_id.as_str()
     }
 
-    pub fn nats_url(&self) -> &str {
-        &self.nats_url
+    /// The configured sync endpoint (a ticket, or a deprecated broker URL).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
-    pub fn set_table_direction(&self, table: &str, direction: SyncDirection) {
+    /// Set the sync direction for `table`.
+    ///
+    /// Refused when the table is declared `SYNC SAFE` and the direction would
+    /// stop delivering it: that declaration promises deletion only AFTER
+    /// delivery, so a direction that keeps the table out of the outbound
+    /// changeset would let retention delete rows the hub never received. A
+    /// table whose meta is not known yet cannot be judged here — nothing is
+    /// knowable about a table that does not exist — so the same contradiction
+    /// is caught at push, once the table has arrived.
+    pub fn set_table_direction(&self, table: &str, direction: SyncDirection) -> Result<(), Error> {
+        refuse_direction_that_breaks_delivery(&self.db, table, direction)?;
         match self.table_directions.write() {
             Ok(mut directions) => {
                 directions.insert(table.to_string(), direction);
             }
             Err(_) => tracing::warn!("sync table_directions lock poisoned; ignoring update"),
         }
+        Ok(())
+    }
+
+    /// Re-check every configured direction against the tables as they stand
+    /// now. A direction set BEFORE its table existed could not be judged then;
+    /// this is where that contradiction becomes visible, and the push refuses
+    /// rather than shipping a changeset that silently omits a delivery-promising
+    /// table while the watermark advances over everything else in it.
+    fn refuse_directions_that_break_delivery(&self) -> Result<(), Error> {
+        for (table, direction) in self.table_directions()? {
+            refuse_direction_that_breaks_delivery(&self.db, &table, direction)?;
+        }
+        Ok(())
     }
 
     pub fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
@@ -598,10 +769,139 @@ impl SyncClient {
     }
 }
 
+#[derive(Debug)]
+enum PushReplyError {
+    Malformed(Error),
+    Terminal(Error),
+}
+
+impl PushReplyError {
+    fn into_error(self) -> Error {
+        match self {
+            PushReplyError::Malformed(err) | PushReplyError::Terminal(err) => err,
+        }
+    }
+}
+
+fn decode_push_response(reply: &[u8]) -> Result<ApplyResult, PushReplyError> {
+    let envelope =
+        decode(reply).map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+    if !matches!(envelope.message_type, MessageType::PushResponse) {
+        return Err(PushReplyError::Malformed(Error::SyncError(
+            "unexpected message type in push response".to_string(),
+        )));
+    }
+    let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
+        .map_err(|e| PushReplyError::Malformed(Error::SyncError(e.to_string())))?;
+    if let Some(err) = response.error {
+        return Err(PushReplyError::Terminal(Error::SyncError(err)));
+    }
+    response
+        .result
+        .ok_or_else(|| {
+            PushReplyError::Terminal(Error::SyncError("push response missing result".to_string()))
+        })
+        .map(Into::into)
+}
+
+/// Whether `direction` still delivers the table: the push filter includes
+/// `Push` and `Both`, so any other setting keeps the table out of the outbound
+/// changeset entirely.
+fn direction_delivers(direction: SyncDirection) -> bool {
+    matches!(direction, SyncDirection::Push | SyncDirection::Both)
+}
+
+/// Refuse a direction that would stop a `SYNC SAFE` table being delivered.
+/// A table with no such declaration promises nothing about delivery and may be
+/// configured however the application likes, including out of the changeset.
+fn refuse_direction_that_breaks_delivery(
+    db: &Database,
+    table: &str,
+    direction: SyncDirection,
+) -> Result<(), Error> {
+    if direction_delivers(direction) {
+        return Ok(());
+    }
+    let Some(meta) = db.table_meta(table) else {
+        return Ok(());
+    };
+    if !meta.sync_safe {
+        return Ok(());
+    }
+    Err(Error::SyncError(format!(
+        "table '{table}' is declared SYNC SAFE, so its rows are deleted only after they are \
+         DELIVERED to the hub. Sync direction {direction:?} would stop delivering '{table}', \
+         and retention would then delete rows the hub never received. Leave it on Push."
+    )))
+}
+
+/// An edge pushes what it WROTE, not what it was given: a row whose current
+/// local version arrived over sync is dropped from the outbound changeset.
+/// Pushing it back would hand the hub its own data — the echo that makes a
+/// pull-then-push cycle re-deliver rows forever — and it would also make the
+/// transfer receipt count rows that never needed to move. A row that was
+/// pulled and then EDITED here has lost the marker, so local work always
+/// propagates. Edges, vectors and DDL are untouched.
+pub(crate) fn drop_rows_that_arrived_by_sync(db: &Database, changes: ChangeSet) -> ChangeSet {
+    let mut changes = changes;
+    changes.rows.retain(|row| {
+        !db.row_version_arrived_by_sync(&row.table, &row.natural_key.column, &row.natural_key.value)
+    });
+    changes
+}
+
+/// Every table this database declares as a one-way retained table. Read from
+/// the persisted table meta, so the policy survives a restart with no app
+/// re-registration — the defect the declared policy exists to close.
+pub(crate) fn push_only_retained_tables(db: &Database) -> BTreeSet<String> {
+    db.table_names()
+        .into_iter()
+        .filter(|table| {
+            db.table_meta(table).is_some_and(|meta| {
+                meta.retained_sync_policy == Some(contextdb_core::RetainedSyncPolicy::PushOnly)
+            })
+        })
+        .collect()
+}
+
+/// Drop the ROWS (and vectors) of one-way retained tables from an inbound
+/// changeset. Their DDL is kept: a table must still be able to ARRIVE by sync.
+pub(crate) fn drop_push_only_retained_rows(db: &Database, changes: ChangeSet) -> ChangeSet {
+    let one_way = push_only_retained_tables(db);
+    if one_way.is_empty() {
+        return changes;
+    }
+    let mut changes = changes;
+    changes.rows.retain(|row| !one_way.contains(&row.table));
+    changes
+        .vectors
+        .retain(|vector| !one_way.contains(&vector.index.table));
+    changes
+}
+
 pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
+    let bootstrap_batches = changeset.split_at_trigger_bootstrap_barriers();
+    if bootstrap_batches.len() > 1 {
+        return bootstrap_batches
+            .into_iter()
+            .flat_map(split_changeset_by_size)
+            .collect();
+    }
+    split_changeset_by_size(bootstrap_batches.into_iter().next().unwrap_or_default())
+}
+
+fn has_retryable_legacy_lsn_conflict(result: &ApplyResult) -> bool {
+    result
+        .conflicts
+        .iter()
+        .any(|conflict| conflict.reason.as_deref() == Some("local_lsn_newer_or_equal"))
+}
+
+fn split_changeset_by_size(changeset: ChangeSet) -> Vec<ChangeSet> {
     let wire = WireChangeSet::from(changeset.clone());
     let estimated = rmp_serde::to_vec(&wire).map(|v| v.len()).unwrap_or(0);
-    if estimated <= MAX_BATCH_BYTES {
+    if estimated <= MAX_BATCH_BYTES && data_lsn_group_count(&changeset) <= MAX_BATCH_DATA_LSN_GROUPS
+    {
         return vec![changeset];
     }
 
@@ -616,6 +916,19 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
     precise_split_changeset(changeset)
 }
 
+#[doc(hidden)]
+pub fn split_changeset_for_test(changeset: ChangeSet) -> Vec<ChangeSet> {
+    split_changeset(changeset)
+}
+
+fn data_lsn_group_count(changeset: &ChangeSet) -> usize {
+    let mut lsns = BTreeSet::new();
+    lsns.extend(changeset.rows.iter().map(|row| row.lsn));
+    lsns.extend(changeset.edges.iter().map(|edge| edge.lsn));
+    lsns.extend(changeset.vectors.iter().map(|vector| vector.lsn));
+    lsns.len()
+}
+
 fn batch_wire_size(changeset: &ChangeSet) -> usize {
     rmp_serde::to_vec(&WireChangeSet::from(changeset.clone()))
         .map(|v| v.len())
@@ -623,235 +936,58 @@ fn batch_wire_size(changeset: &ChangeSet) -> usize {
 }
 
 fn fast_split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
-    let row_sizes: Vec<usize> = changeset
-        .rows
-        .iter()
-        .map(|r| {
-            let wire_row = WireRowChange::from(r.clone());
-            rmp_serde::to_vec(&wire_row).map(|v| v.len()).unwrap_or(128)
-        })
-        .collect();
-    let vector_sizes: Vec<usize> = changeset
-        .vectors
-        .iter()
-        .map(|v| {
-            let wire_vec = crate::protocol::WireVectorChange::from(v.clone());
-            rmp_serde::to_vec(&wire_vec).map(|v| v.len()).unwrap_or(64)
-        })
-        .collect();
-
-    let mut batches = Vec::new();
-    let mut batch_rows = Vec::new();
-    let mut batch_vectors = Vec::new();
-    let mut batch_size = 0usize;
-    let changeset_edges = changeset.edges;
-    let changeset_vectors = changeset.vectors;
-    let changeset_ddl = changeset.ddl;
-
-    let edges_size: usize = {
-        let edges_wire: Vec<crate::protocol::WireEdgeChange> =
-            changeset_edges.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&edges_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let ddl_size: usize = {
-        let ddl_wire: Vec<crate::protocol::WireDdlChange> =
-            changeset_ddl.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&ddl_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let first_batch_overhead = edges_size + ddl_size;
-
-    for (i, row) in changeset.rows.into_iter().enumerate() {
-        let row_size = row_sizes.get(i).copied().unwrap_or(128);
-        let vec_size_for_i = vector_sizes.get(i).copied().unwrap_or(64);
-        let item_size = row_size + vec_size_for_i;
-        let first_item_overhead = if batch_rows.is_empty() && batches.is_empty() {
-            first_batch_overhead
-        } else {
-            0
-        };
-
-        if !batch_rows.is_empty() && batch_size + item_size > TARGET_BATCH_BYTES {
-            batches.push(ChangeSet {
-                rows: std::mem::take(&mut batch_rows),
-                edges: if batches.is_empty() {
-                    changeset_edges.clone()
-                } else {
-                    Vec::new()
-                },
-                vectors: std::mem::take(&mut batch_vectors),
-                ddl: if batches.is_empty() {
-                    changeset_ddl.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-            batch_size = 0;
-        }
-
-        if i < changeset_vectors.len() {
-            batch_vectors.push(changeset_vectors[i].clone());
-            batch_size += vec_size_for_i;
-        }
-        batch_rows.push(row);
-        batch_size += row_size + first_item_overhead;
-    }
-
-    if !batch_rows.is_empty() {
-        batches.push(ChangeSet {
-            rows: batch_rows,
-            edges: if batches.is_empty() {
-                changeset_edges
-            } else {
-                Vec::new()
-            },
-            vectors: batch_vectors,
-            ddl: if batches.is_empty() {
-                changeset_ddl
-            } else {
-                Vec::new()
-            },
-        });
-    } else if batches.is_empty() {
-        batches.push(ChangeSet {
-            rows: Vec::new(),
-            edges: changeset_edges,
-            vectors: Vec::new(),
-            ddl: changeset_ddl,
-        });
-    }
-
-    batches
+    split_complete_lsn_groups(changeset, TARGET_BATCH_BYTES, false)
 }
 
 fn precise_split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
-    // Estimate per-row sizes by serializing each WireRowChange individually
-    let row_sizes: Vec<usize> = changeset
-        .rows
-        .iter()
-        .map(|r| {
-            let wire_row = WireRowChange::from(r.clone());
-            rmp_serde::to_vec(&wire_row).map(|v| v.len()).unwrap_or(128)
-        })
-        .collect();
-    let vector_sizes: Vec<usize> = changeset
-        .vectors
-        .iter()
-        .map(|v| {
-            let wire_vec = crate::protocol::WireVectorChange::from(v.clone());
-            rmp_serde::to_vec(&wire_vec).map(|v| v.len()).unwrap_or(64)
-        })
-        .collect();
+    split_complete_lsn_groups(changeset, MAX_BATCH_BYTES, true)
+}
 
+fn split_complete_lsn_groups(
+    changeset: ChangeSet,
+    target_bytes: usize,
+    precise: bool,
+) -> Vec<ChangeSet> {
+    let groups = changeset.split_by_data_lsn();
     let mut batches = Vec::new();
-    let mut batch_rows = Vec::new();
-    let mut batch_vectors = Vec::new();
-    let mut batch_size = 0usize;
-    // Extract edges, vectors, and ddl BEFORE consuming rows via into_iter()
-    let changeset_edges = changeset.edges;
-    let changeset_vectors = changeset.vectors;
-    let changeset_ddl = changeset.ddl;
+    let mut current = ChangeSet::default();
+    let mut current_groups = 0usize;
 
-    // Overhead for edges + DDL in first batch
-    let edges_size: usize = {
-        let edges_wire: Vec<crate::protocol::WireEdgeChange> =
-            changeset_edges.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&edges_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let ddl_size: usize = {
-        let ddl_wire: Vec<crate::protocol::WireDdlChange> =
-            changeset_ddl.iter().cloned().map(Into::into).collect();
-        rmp_serde::to_vec(&ddl_wire).map(|v| v.len()).unwrap_or(0)
-    };
-    let first_batch_overhead = edges_size + ddl_size;
-
-    for (i, row) in changeset.rows.into_iter().enumerate() {
-        let row_size = row_sizes.get(i).copied().unwrap_or(128);
-        let vec_size_for_i = vector_sizes.get(i).copied().unwrap_or(64);
-        let overhead = if batches.is_empty() {
-            first_batch_overhead
+    for group in groups {
+        let mut trial = current.clone();
+        trial.rows.extend(group.rows.clone());
+        trial.edges.extend(group.edges.clone());
+        trial.vectors.extend(group.vectors.clone());
+        trial.ddl.extend(group.ddl.clone());
+        trial.ddl_lsn.extend(group.ddl_lsn.clone());
+        let group_has_data = group.data_entry_count() > 0;
+        let trial_size = if precise {
+            batch_wire_size(&trial)
         } else {
-            0
+            batch_wire_size(&current).saturating_add(batch_wire_size(&group))
         };
+        let would_exceed_group_budget = group_has_data
+            && current_groups > 0
+            && current_groups.saturating_add(1) > MAX_BATCH_DATA_LSN_GROUPS;
 
-        let should_flush = if batch_rows.is_empty() {
-            false
-        } else {
-            let mut trial_rows = batch_rows.clone();
-            trial_rows.push(row.clone());
-            let mut trial_vectors = batch_vectors.clone();
-            if i < changeset_vectors.len() {
-                trial_vectors.push(changeset_vectors[i].clone());
-            }
-            let trial = ChangeSet {
-                rows: trial_rows.clone(),
-                edges: if batches.is_empty() {
-                    changeset_edges.clone()
-                } else {
-                    Vec::new()
-                },
-                vectors: trial_vectors,
-                ddl: if batches.is_empty() {
-                    changeset_ddl.clone()
-                } else {
-                    Vec::new()
-                },
-            };
-            let actual_size = rmp_serde::to_vec(&WireChangeSet::from(trial))
-                .map(|v| v.len())
-                .unwrap_or(usize::MAX);
-            batch_size + row_size + vec_size_for_i + overhead > MAX_BATCH_BYTES
-                || actual_size > MAX_BATCH_BYTES
-        };
-
-        if should_flush {
-            batches.push(ChangeSet {
-                rows: std::mem::take(&mut batch_rows),
-                edges: if batches.is_empty() {
-                    changeset_edges.clone()
-                } else {
-                    Vec::new()
-                },
-                vectors: std::mem::take(&mut batch_vectors),
-                ddl: if batches.is_empty() {
-                    changeset_ddl.clone()
-                } else {
-                    Vec::new()
-                },
-            });
-            batch_size = 0;
+        if current.data_entry_count() > 0
+            && (trial_size > target_bytes || would_exceed_group_budget)
+        {
+            batches.push(std::mem::take(&mut current));
+            current_groups = 0;
         }
-
-        // Pair with vector at same index if available
-        if i < changeset_vectors.len() {
-            batch_vectors.push(changeset_vectors[i].clone());
-            batch_size += vector_sizes.get(i).copied().unwrap_or(64);
+        current.rows.extend(group.rows);
+        current.edges.extend(group.edges);
+        current.vectors.extend(group.vectors);
+        current.ddl.extend(group.ddl);
+        current.ddl_lsn.extend(group.ddl_lsn);
+        if group_has_data {
+            current_groups = current_groups.saturating_add(1);
         }
-        batch_rows.push(row);
-        batch_size += row_size;
     }
 
-    if !batch_rows.is_empty() {
-        batches.push(ChangeSet {
-            rows: batch_rows,
-            edges: if batches.is_empty() {
-                changeset_edges
-            } else {
-                Vec::new()
-            },
-            vectors: batch_vectors,
-            ddl: if batches.is_empty() {
-                changeset_ddl
-            } else {
-                Vec::new()
-            },
-        });
-    } else if batches.is_empty() && (!changeset_edges.is_empty() || !changeset_ddl.is_empty()) {
-        batches.push(ChangeSet {
-            rows: Vec::new(),
-            edges: changeset_edges,
-            vectors: Vec::new(),
-            ddl: changeset_ddl,
-        });
+    if current.data_entry_count() > 0 || !current.ddl.is_empty() {
+        batches.push(current);
     }
 
     batches
@@ -879,18 +1015,24 @@ mod tests {
     use super::*;
     use contextdb_core::{RowId, Value};
     use contextdb_engine::Database;
-    use contextdb_engine::sync_types::{NaturalKey, RowChange, VectorChange};
+    use contextdb_engine::sync_types::{DdlChange, NaturalKey, RowChange, VectorChange};
+    #[cfg(feature = "nats")]
     use std::sync::Arc;
+    #[cfg(feature = "nats")]
     use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+    #[cfg(feature = "nats")]
     use testcontainers::runners::AsyncRunner;
+    #[cfg(feature = "nats")]
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
     use uuid::Uuid;
 
+    #[cfg(feature = "nats")]
     struct NatsFixture {
         _container: ContainerAsync<GenericImage>,
         nats_url: String,
     }
 
+    #[cfg(feature = "nats")]
     async fn start_nats() -> NatsFixture {
         let nats_conf = format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"));
 
@@ -911,13 +1053,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "nats")]
     #[tokio::test]
     async fn sync_01_client_push_survives_poisoned_direction_lock() {
         let nats = start_nats().await;
         let client = Arc::new(SyncClient::new(
             Arc::new(Database::open_memory()),
             &nats.nats_url,
-            "sync-01",
+            contextdb_core::TenantId::from("sync-01"),
         ));
 
         client.ensure_connected().await.expect("connect NATS");
@@ -940,13 +1083,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "nats")]
     #[tokio::test]
     async fn sync_02_client_pull_default_survives_poisoned_policy_lock() {
         let nats = start_nats().await;
         let client = Arc::new(SyncClient::new(
             Arc::new(Database::open_memory()),
             &nats.nats_url,
-            "sync-02",
+            contextdb_core::TenantId::from("sync-02"),
         ));
 
         client.ensure_connected().await.expect("connect NATS");
@@ -975,7 +1119,7 @@ mod tests {
         // Build a changeset with 10 rows, each ~100KB of data (total ~1MB)
         let large_text = "x".repeat(100 * 1024); // ~100KB per row
         let mut rows = Vec::new();
-        for _ in 0..10 {
+        for i in 0..10 {
             let id = Uuid::new_v4();
             let mut values = HashMap::new();
             values.insert("id".to_string(), Value::Uuid(id));
@@ -988,7 +1132,8 @@ mod tests {
                 },
                 values,
                 deleted: false,
-                lsn: Lsn(1),
+                lsn: Lsn(i + 1),
+                created_at: None,
             });
         }
 
@@ -1003,12 +1148,18 @@ mod tests {
                     ("data".to_string(), "TEXT".to_string()),
                 ],
                 constraints: vec!["PRIMARY KEY (id)".to_string()],
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             }],
+
+            ddl_lsn: vec![Lsn(1)],
         };
 
         let batches = split_changeset(changeset);
 
         // Must split into 2+ batches (10 rows * ~100KB > 800KB)
+        // because each row is from a distinct sender LSN and can be split.
         assert!(
             batches.len() >= 2,
             "10 rows of ~100KB each (~1MB total) must split into at least 2 batches, got {}",
@@ -1069,6 +1220,7 @@ mod tests {
                 values,
                 deleted: false,
                 lsn: Lsn((i + 1) as u64),
+                created_at: None,
             });
             vectors.push(VectorChange {
                 index: contextdb_core::VectorIndexRef::new(table, vector_column),
@@ -1095,7 +1247,12 @@ mod tests {
                     (vector_column.to_string(), "VECTOR(4)".to_string()),
                 ],
                 constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             }],
+
+            ddl_lsn: vec![Lsn(1)],
         };
 
         let batches = split_changeset(changeset);
@@ -1184,7 +1341,7 @@ mod tests {
     fn a14b_batch_splitting_accounts_for_vector_sizes() {
         let mut rows = Vec::new();
         let mut vectors = Vec::new();
-        for _ in 0..200 {
+        for i in 0..200 {
             let id = Uuid::new_v4();
             let mut values = HashMap::new();
             values.insert("id".to_string(), Value::Uuid(id));
@@ -1197,13 +1354,14 @@ mod tests {
                 },
                 values,
                 deleted: false,
-                lsn: Lsn(1),
+                lsn: Lsn(i as u64 + 1),
+                created_at: None,
             });
             vectors.push(VectorChange {
                 index: contextdb_core::VectorIndexRef::default(),
                 row_id: RowId(0),
                 vector: (0..384).map(|j| j as f32).collect(),
-                lsn: Lsn(1),
+                lsn: Lsn(i as u64 + 1),
             });
         }
         let changeset = ChangeSet {
@@ -1211,6 +1369,8 @@ mod tests {
             edges: Vec::new(),
             vectors,
             ddl: vec![],
+
+            ddl_lsn: Vec::new(),
         };
         let batches = split_changeset(changeset);
         assert!(
@@ -1232,6 +1392,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a14c_batch_splitting_caps_many_small_lsn_groups_below_byte_limit() {
+        let row_count = MAX_BATCH_DATA_LSN_GROUPS + 1;
+        let mut rows = Vec::new();
+        for i in 0..row_count {
+            let id = Uuid::new_v4();
+            rows.push(RowChange {
+                table: "t".to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    ("data".to_string(), Value::Text(format!("small-{i}"))),
+                ]),
+                deleted: false,
+                lsn: Lsn(i as u64 + 1),
+                created_at: None,
+            });
+        }
+        let changeset = ChangeSet {
+            rows,
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: Vec::new(),
+            ddl_lsn: Vec::new(),
+        };
+
+        let encoded_size = batch_wire_size(&changeset);
+        assert!(
+            encoded_size <= MAX_BATCH_BYTES,
+            "fixture must stay below byte split threshold to exercise the group-cap fast-path guard; encoded_size={encoded_size}"
+        );
+
+        let batches = split_changeset(changeset);
+        assert_eq!(
+            batches.len(),
+            2,
+            "{} small one-row LSN groups must split into two capped batches even under the byte limit",
+            row_count
+        );
+        assert_eq!(
+            batches.iter().map(|batch| batch.rows.len()).sum::<usize>(),
+            row_count,
+            "all rows must remain present across capped batches"
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| data_lsn_group_count(batch) <= MAX_BATCH_DATA_LSN_GROUPS),
+            "each split batch must obey the complete data-LSN-group cap; batches={batches:?}"
+        );
+    }
+
     // A15: split_changeset handles a single row that alone exceeds MAX_BATCH_BYTES
     #[test]
     fn a15_split_changeset_single_oversized_row() {
@@ -1249,12 +1464,15 @@ mod tests {
             values,
             deleted: false,
             lsn: Lsn(1),
+            created_at: None,
         };
         let changeset = ChangeSet {
             rows: vec![row],
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1293,6 +1511,7 @@ mod tests {
                 values,
                 deleted: false,
                 lsn: Lsn((i + 1) as u64),
+                created_at: None,
             });
             vectors.push(VectorChange {
                 index: contextdb_core::VectorIndexRef::default(),
@@ -1306,6 +1525,8 @@ mod tests {
             edges: Vec::new(),
             vectors,
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1349,6 +1570,8 @@ mod tests {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1385,6 +1608,8 @@ mod tests {
             edges,
             vectors: Vec::new(),
             ddl: Vec::new(),
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1416,6 +1641,9 @@ mod tests {
                     .map(|j| (format!("col_{}_{}", j, "x".repeat(500)), "TEXT".to_string()))
                     .collect(),
                 constraints: vec![format!("PRIMARY KEY (col_{})", "x".repeat(500))],
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
             });
         }
         let changeset = ChangeSet {
@@ -1423,6 +1651,8 @@ mod tests {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl,
+
+            ddl_lsn: Vec::new(),
         };
 
         let batches = split_changeset(changeset);
@@ -1437,6 +1667,125 @@ mod tests {
             total_ddl, 20,
             "all 20 DDL entries must be present across batches, got {}",
             total_ddl
+        );
+    }
+
+    #[test]
+    fn a20_split_changeset_emits_trigger_bootstrap_barrier_even_when_small() {
+        let id = Uuid::new_v4();
+        let changeset = ChangeSet {
+            rows: vec![RowChange {
+                table: "host_writes".to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    (
+                        "content".to_string(),
+                        Value::Text("after-trigger".to_string()),
+                    ),
+                ]),
+                deleted: false,
+                lsn: Lsn(3),
+                created_at: None,
+            }],
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: "host_writes".to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("content".to_string(), "TEXT".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                },
+                DdlChange::CreateTrigger {
+                    name: "host_write_trigger".to_string(),
+                    table: "host_writes".to_string(),
+                    on_events: vec!["INSERT".to_string()],
+                },
+            ],
+            ddl_lsn: vec![Lsn(2), Lsn(2)],
+        };
+
+        let batches = split_changeset(changeset);
+        assert!(
+            batches.len() >= 2
+                && batches
+                    .iter()
+                    .any(|batch| batch.has_create_trigger_ddl() && batch.data_entry_count() == 0)
+                && batches.iter().position(ChangeSet::has_create_trigger_ddl)
+                    < batches.iter().position(|batch| !batch.rows.is_empty()),
+            "small full-history batches must surface CREATE TRIGGER before any data so receivers can register callbacks; batches={batches:?}"
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .find(|batch| batch.has_create_trigger_ddl())
+                .and_then(ChangeSet::max_lsn),
+            Some(Lsn(2)),
+            "trigger bootstrap batch cursor must advance through schema without skipping first data LSN; batches={batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .filter(|batch| !batch.rows.is_empty())
+                .all(|batch| batch.ddl.is_empty() && batch.max_lsn() == Some(Lsn(3))),
+            "data after trigger bootstrap must remain available at its sender LSN without duplicated DDL; batches={batches:?}"
+        );
+    }
+
+    #[test]
+    fn a21_split_changeset_does_not_fabricate_cursor_for_same_lsn_trigger_data() {
+        let id = Uuid::new_v4();
+        let changeset = ChangeSet {
+            rows: vec![RowChange {
+                table: "host_writes".to_string(),
+                natural_key: NaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Uuid(id),
+                },
+                values: HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    (
+                        "content".to_string(),
+                        Value::Text("same-lsn-trigger-data".to_string()),
+                    ),
+                ]),
+                deleted: false,
+                lsn: Lsn(3),
+                created_at: None,
+            }],
+            edges: Vec::new(),
+            vectors: Vec::new(),
+            ddl: vec![DdlChange::CreateTrigger {
+                name: "host_write_trigger".to_string(),
+                table: "host_writes".to_string(),
+                on_events: vec!["INSERT".to_string()],
+            }],
+            ddl_lsn: vec![Lsn(3)],
+        };
+
+        let batches = split_changeset(changeset);
+        assert_eq!(
+            batches.len(),
+            1,
+            "a same-LSN trigger DDL/data group cannot be split safely with an exclusive LSN cursor; batches={batches:?}"
+        );
+        assert_eq!(
+            batches[0].max_lsn(),
+            Some(Lsn(3)),
+            "splitter must preserve the real sender LSN instead of fabricating LSN-1 progress"
+        );
+        assert!(
+            batches[0].has_create_trigger_ddl() && batches[0].data_entry_count() == 1,
+            "same-LSN trigger DDL/data remains atomic and will fail closed at apply if callbacks are missing; batches={batches:?}"
         );
     }
 }

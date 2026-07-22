@@ -1,12 +1,14 @@
 use crate::error::SyncError;
-use contextdb_core::{Lsn, RowId, Value, VectorIndexRef};
+use contextdb_core::{
+    CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
+};
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, VectorChange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -36,6 +38,12 @@ pub enum MessageType {
     PullResponse,
     Chunk,
     ChunkAck,
+    /// The sync-status probe (dedicated per-tenant status subject only).
+    /// New variants encode as their name string; existing variants' bytes are
+    /// untouched, and old peers never see these (old servers do not subscribe
+    /// to the status subject; old clients never send the request).
+    StatusRequest,
+    StatusResponse,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -116,6 +124,7 @@ pub struct ChunkAck {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireChangeSet {
     pub ddl: Vec<WireDdlChange>,
+    pub ddl_lsn: Vec<Lsn>,
     pub rows: Vec<WireRowChange>,
     pub edges: Vec<WireEdgeChange>,
     pub vectors: Vec<WireVectorChange>,
@@ -129,6 +138,11 @@ pub struct WireRowChange {
     #[serde(default)]
     pub deleted: bool,
     pub lsn: Lsn,
+    /// The row's birth time on the node that wrote it, so retention judges a
+    /// replicated row by the age it actually has. Defaulted, so a peer built
+    /// before this field decodes as "no stamp" and the receiver stamps its own.
+    #[serde(default)]
+    pub created_at: Option<contextdb_core::Wallclock>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -154,6 +168,12 @@ pub enum WireDdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+        #[serde(default)]
+        foreign_keys: Vec<SingleColumnForeignKey>,
+        #[serde(default)]
+        composite_foreign_keys: Vec<CompositeForeignKey>,
+        #[serde(default)]
+        composite_unique: Vec<Vec<String>>,
     },
     DropTable {
         name: String,
@@ -162,6 +182,12 @@ pub enum WireDdlChange {
         name: String,
         columns: Vec<(String, String)>,
         constraints: Vec<String>,
+        #[serde(default)]
+        foreign_keys: Vec<SingleColumnForeignKey>,
+        #[serde(default)]
+        composite_foreign_keys: Vec<CompositeForeignKey>,
+        #[serde(default)]
+        composite_unique: Vec<Vec<String>>,
     },
     // Direction is encoded as a string ("ASC" / "DESC") on the wire so the
     // server does not depend on contextdb-core's SortDirection type shape.
@@ -173,6 +199,37 @@ pub enum WireDdlChange {
     DropIndex {
         table: String,
         name: String,
+    },
+    CreateTrigger {
+        name: String,
+        table: String,
+        on_events: Vec<String>,
+    },
+    DropTrigger {
+        name: String,
+    },
+    CreateEventType {
+        name: String,
+        trigger: String,
+        table: String,
+    },
+    CreateSink {
+        name: String,
+        sink_type: String,
+        url: Option<String>,
+    },
+    CreateRoute {
+        name: String,
+        event_type: String,
+        sink: String,
+        #[serde(default)]
+        table: String,
+        where_in: Option<(String, Vec<String>)>,
+    },
+    DropRoute {
+        name: String,
+        #[serde(default)]
+        table: String,
     },
 }
 
@@ -232,6 +289,7 @@ impl From<ChangeSet> for WireChangeSet {
     fn from(value: ChangeSet) -> Self {
         Self {
             ddl: value.ddl.into_iter().map(Into::into).collect(),
+            ddl_lsn: value.ddl_lsn,
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             vectors: value.vectors.into_iter().map(Into::into).collect(),
@@ -239,14 +297,24 @@ impl From<ChangeSet> for WireChangeSet {
     }
 }
 
-impl From<WireChangeSet> for ChangeSet {
-    fn from(value: WireChangeSet) -> Self {
-        Self {
+impl TryFrom<WireChangeSet> for ChangeSet {
+    type Error = SyncError;
+
+    fn try_from(value: WireChangeSet) -> Result<Self, Self::Error> {
+        if value.ddl_lsn.len() != value.ddl.len() {
+            return Err(SyncError::Protocol(format!(
+                "WireChangeSet ddl_lsn length {} does not match ddl length {}",
+                value.ddl_lsn.len(),
+                value.ddl.len()
+            )));
+        }
+        Ok(Self {
             ddl: value.ddl.into_iter().map(Into::into).collect(),
+            ddl_lsn: value.ddl_lsn,
             rows: value.rows.into_iter().map(Into::into).collect(),
             edges: value.edges.into_iter().map(Into::into).collect(),
             vectors: value.vectors.into_iter().map(Into::into).collect(),
-        }
+        })
     }
 }
 
@@ -258,6 +326,7 @@ impl From<RowChange> for WireRowChange {
             values: value.values,
             deleted: value.deleted,
             lsn: value.lsn,
+            created_at: value.created_at,
         }
     }
 }
@@ -270,6 +339,7 @@ impl From<WireRowChange> for RowChange {
             values: value.values,
             deleted: value.deleted,
             lsn: value.lsn,
+            created_at: value.created_at,
         }
     }
 }
@@ -327,20 +397,32 @@ impl From<DdlChange> for WireDdlChange {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             } => Self::CreateTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             },
             DdlChange::DropTable { name } => Self::DropTable { name },
             DdlChange::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             } => Self::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             },
             DdlChange::CreateIndex {
                 table,
@@ -364,6 +446,48 @@ impl From<DdlChange> for WireDdlChange {
                 }
             }
             DdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
+            DdlChange::CreateTrigger {
+                name,
+                table,
+                on_events,
+            } => Self::CreateTrigger {
+                name,
+                table,
+                on_events,
+            },
+            DdlChange::DropTrigger { name } => Self::DropTrigger { name },
+            DdlChange::CreateEventType {
+                name,
+                trigger,
+                table,
+            } => Self::CreateEventType {
+                name,
+                trigger,
+                table,
+            },
+            DdlChange::CreateSink {
+                name,
+                sink_type,
+                url,
+            } => Self::CreateSink {
+                name,
+                sink_type,
+                url,
+            },
+            DdlChange::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            } => Self::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            },
+            DdlChange::DropRoute { name, table } => Self::DropRoute { name, table },
         }
     }
 }
@@ -375,20 +499,32 @@ impl From<WireDdlChange> for DdlChange {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             } => Self::CreateTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             },
             WireDdlChange::DropTable { name } => Self::DropTable { name },
             WireDdlChange::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             } => Self::AlterTable {
                 name,
                 columns,
                 constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
             },
             WireDdlChange::CreateIndex {
                 table,
@@ -413,6 +549,48 @@ impl From<WireDdlChange> for DdlChange {
                 }
             }
             WireDdlChange::DropIndex { table, name } => Self::DropIndex { table, name },
+            WireDdlChange::CreateTrigger {
+                name,
+                table,
+                on_events,
+            } => Self::CreateTrigger {
+                name,
+                table,
+                on_events,
+            },
+            WireDdlChange::DropTrigger { name } => Self::DropTrigger { name },
+            WireDdlChange::CreateEventType {
+                name,
+                trigger,
+                table,
+            } => Self::CreateEventType {
+                name,
+                trigger,
+                table,
+            },
+            WireDdlChange::CreateSink {
+                name,
+                sink_type,
+                url,
+            } => Self::CreateSink {
+                name,
+                sink_type,
+                url,
+            },
+            WireDdlChange::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            } => Self::CreateRoute {
+                name,
+                event_type,
+                sink,
+                table,
+                where_in,
+            },
+            WireDdlChange::DropRoute { name, table } => Self::DropRoute { name, table },
         }
     }
 }
@@ -481,4 +659,39 @@ impl From<WireConflict> for Conflict {
             reason: value.reason,
         }
     }
+}
+
+/// Request on the per-tenant sync-status subject. Tenant identity rides
+/// the subject; the body is intentionally empty and growth-tolerant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStatusRequest {}
+
+/// Reply on the per-tenant sync-status subject. This struct is NEW wire
+/// surface — old peers never see it (old servers are not subscribed; old
+/// clients never send the request). Both fields are `#[serde(default)]`
+/// Options from day one: absent = unknown = no regression detection = client
+/// behaves exactly as today.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SyncStatusResponse {
+    /// The server's persisted per-tenant record of the highest edge-LSN it has
+    /// applied (contract item 3 — rides `export_snapshot` artifacts).
+    #[serde(default)]
+    pub applied_push_watermark: Option<Lsn>,
+    /// The server's current LSN clock (contract item 4, pull-side resume).
+    #[serde(default)]
+    pub server_current_lsn: Option<Lsn>,
+}
+
+/// The payload bytes a set of row changes carries: each row's own values,
+/// serialized. Table names, natural keys, the protocol envelope and transport
+/// framing are all excluded — this is what the data itself weighs, and it is
+/// what a transfer receipt counts.
+pub(crate) fn row_payload_bytes(rows: &[RowChange]) -> u64 {
+    rows.iter()
+        .map(|row| {
+            rmp_serde::to_vec(&row.values)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0) as u64
+        })
+        .sum()
 }

@@ -10,7 +10,7 @@ For background on why these problems exist and how contextdb compares to alterna
 
 ## Example Use Cases
 
-Before diving into SQL, here are concrete scenarios where these problems surface:
+Before diving into SQL, here are concrete scenarios where these problems surface. **contextdb ships no built-in schema.** Every table you'll see below — `decisions`, `observations`, `intentions`, `entities`, `edges`, `digests`, and the rest — is an example schema these walkthroughs define on top of contextdb's own primitives: `STATE MACHINE`, `DAG`, `IMMUTABLE`, `PROPAGATE`, `RETAIN`, vector columns, graph traversal, and sync. You declare your own tables and attach whichever of these policies you need; contextdb enforces them. The agentic-memory ontology used throughout is one illustrative consumer schema, not contextdb's model.
 
 **An AI coding assistant** stores decisions about file locations, architecture patterns, and tool preferences. When a file is renamed (observation), any decision that referenced the old path should be flagged as stale (invalidation). When the assistant searches its memory, it needs to find semantically similar past decisions (vector search) that are still valid (relational filter on status) and trace what they were based on (graph traversal).
 
@@ -28,6 +28,7 @@ Before diving into SQL, here are concrete scenarios where these problems surface
 
 ```sql
 -- Entities that observations are about
+-- (example schema - contextdb ships no tables of its own; you define these)
 CREATE TABLE entities (
   id UUID PRIMARY KEY,
   name TEXT NOT NULL,
@@ -95,6 +96,8 @@ quantization, and HNSW state.
 **Correction-via-supersede.** Provenance columns — what was decided, what it was based on — are marked `IMMUTABLE`. A recorded decision is never silently rewritten. When a correction is needed, insert a *new* row with the corrected values and transition the original `status` to `superseded`. Nothing disappears from the audit trail.
 
 ```sql
+-- Example table (yours - contextdb defines no `decisions` schema);
+-- STATE MACHINE is the contextdb primitive doing the enforcement below
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL IMMUTABLE,
@@ -117,7 +120,7 @@ UPDATE decisions SET status = 'active' WHERE id = $id;
 
 -- Rejected by the database: draft -> superseded
 UPDATE decisions SET status = 'superseded' WHERE id = $id;
--- Error: InvalidStateTransition { from: "draft", to: "superseded" }
+-- Error: invalid state transition: draft -> superseded
 ```
 
 The composite `idx_decisions_by_ctx` index keeps filter-by-context +
@@ -132,6 +135,7 @@ decisions — the planner walks the index range directly and elides the
 **Problem:** A decision was based on an entity's state. The entity changed. Every decision that relied on the old state — and every decision that cited those decisions — should be flagged.
 
 ```sql
+-- Example tables - contextdb ships neither; PROPAGATE/STATE MACHINE are its primitives
 CREATE TABLE intentions (
   id UUID PRIMARY KEY,
   goal TEXT NOT NULL,
@@ -226,6 +230,43 @@ WHERE d.status = 'active'
 ```
 
 The PROPAGATE constraints (Scenario 3) handle automatic invalidation. This query is for when the application wants to inspect what *would* be affected before triggering a state change.
+In the CLI, enable `.trace on` before the query; an id-pinned single-hop
+traversal prints `AdjacencyProbe ... rows_examined=N`, proving the work is
+proportional to the changed entity's connections rather than the total
+edge-table size.
+
+For application-side edge-table lookups, use a composite index that matches the
+full route predicate:
+
+```sql
+CREATE TABLE edge_refs (
+  id UUID PRIMARY KEY,
+  source_id UUID,
+  target_id UUID,
+  edge_type TEXT,
+  UNIQUE (source_id, target_id)
+);
+
+CREATE INDEX idx_edge_refs_route ON edge_refs (source_id, target_id, edge_type);
+
+.explain SELECT id FROM edge_refs
+WHERE source_id IN ($changed_entity_id, $related_entity_id)
+  AND target_id = $decision_id
+  AND edge_type = 'BASED_ON';
+```
+
+The routed explanation shows a three-column covering index serving all three
+predicates. Note the chosen index: any table with `source_id`, `target_id`, and
+`edge_type` columns automatically gets an internal route index
+(`__graph_edge_source_target_type`), and here it covers the query, so the
+planner routes through it — your equivalent `idx_edge_refs_route` ties it and
+loses only on creation order. Either way the scan is fully index-driven:
+
+```text
+IndexScan { index: __graph_edge_source_target_type }
+  predicates_pushed: [source_id, target_id, edge_type]
+  indexes_considered: [__pk_id: first column not in WHERE, __unique_source_id_target_id: fewer predicate columns matched than chosen index, idx_edge_refs_route: tied with chosen index; lost by creation order]
+```
 
 ---
 
@@ -241,10 +282,10 @@ contextdb solves it structurally. A decision is `BASED_ON` an entity *as a whole
 -- Entity at decision time had: {region: "us-east-1", instance_type: "m5.large"}
 -- Observation adds a new property: {region: "us-east-1", instance_type: "m5.large", rate_limit: 500}
 
--- The basis_diff shows: rate_limit: null → 500
+-- The basis_diff shows: rate_limit: null -> 500
 -- (null = didn't exist when the decision was made)
 
--- Find decisions that were BASED_ON this entity — they're all potentially stale
+-- Find decisions that were BASED_ON this entity - they're all potentially stale
 WITH affected AS (
   SELECT b_id FROM GRAPH_TABLE(
     edges
@@ -303,6 +344,7 @@ Graph-first (narrow the scope), then vector (rank within scope). The inverse —
 
 ```sql
 -- Conversation digests are immutable with embeddings for search
+-- (example table - IMMUTABLE is the contextdb primitive; `digests` itself is not)
 CREATE TABLE digests (
   id UUID PRIMARY KEY,
   source TEXT NOT NULL,
@@ -336,22 +378,26 @@ INNER JOIN extracted e ON d.id = e.b_id
 **Problem:** Multiple local instances accumulate data independently — a developer's laptop, a browser plugin, a mobile app — sometimes offline for hours or days. When they reconnect, data should sync without duplication, with clear conflict resolution.
 
 ```bash
-# Central server
+# Central server — prints `enrollment ticket: <...>` to stdout on startup; copy it for the edges
 contextdb-server --tenant-id production --db-path ./server.db
 
-# Instance 1 (laptop app) — works offline, pushes when connected
-contextdb-cli ./local1.db --tenant-id production
+# Instance 1 (laptop app) — works offline, pushes when connected.
+# A pasted ticket is auto-pinned to this edge's identity key
+# (./local1.db.fabric-identity.key), so `.sync status` shows the rewritten spec.
+contextdb-cli ./local1.db --tenant-id production --sync-endpoint <ticket>
 contextdb> CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);
 contextdb> INSERT INTO sensors VALUES ('...', 'temp-north', 23.5);
 contextdb> .sync push
-Pushed: 2 applied, 0 skipped, 0 conflicts
+Pushed: 1 applied, 0 skipped, 0 conflicts
 
 # Instance 2 (another machine) — pulls and gets everything, including schema
-contextdb-cli ./local2.db --tenant-id production
+contextdb-cli ./local2.db --tenant-id production --sync-endpoint <ticket>
 contextdb> .sync pull
-Pulled: 2 applied, 0 skipped, 0 conflicts
+Pulled: 1 applied, 0 skipped, 0 conflicts
 contextdb> SELECT * FROM sensors;
 ```
+
+The applied count reports data rows; the `CREATE TABLE` replicates too (instance 2's schema is created on pull) but does not add to the row tally.
 
 Sync is bidirectional, per-table configurable:
 
@@ -368,16 +414,17 @@ contextdb> .sync direction scratch None
 
 Each instance stores its data in a single file. No WAL directories, no journal files, no auxiliary indexes. Back up the file, copy it to another machine, or embed it in a container image.
 
-Local instances use WebSocket transport (`ws://`) to connect to the NATS server. This is deliberate — WebSocket connections traverse NAT and firewalls without hole-punching, so a laptop behind a home router, a browser plugin, or a mobile app can all sync without network configuration.
+Local instances reach the server by dial-by-key — pasting its enrollment ticket into `--sync-endpoint`, connecting through the server's cryptographic identity rather than a broker address. This is deliberate — a node behind NAT dials outbound, so a laptop behind a home router, a browser plugin, or a mobile app can all sync without network configuration. Machines on one LAN sync over direct connections with zero external infrastructure; peers across networks are introduced by a self-hosted or opt-in relay.
 
-Sync survives restarts. Change logs are ephemeral — they exist in memory for incremental sync while the process runs. After a restart, the database reconstructs a full-state snapshot from persisted data when a peer requests changes. Large payloads (tables with high-dimensional vectors or large JSON blobs) are automatically chunked below NATS's message limit and reassembled on the receiver.
+Sync survives restarts. Change logs are ephemeral — they exist in memory for incremental sync while the process runs. After a restart, the database reconstructs a full-state snapshot from persisted data when a peer requests changes. Large payloads (tables with high-dimensional vectors or large JSON blobs) ride a framed stream that carries them whole — no message-size ceiling to chunk below.
 
 In Rust:
 
 ```rust
 use contextdb_server::SyncClient;
 
-let client = SyncClient::new(db.clone(), "ws://nats:9222", "production");
+// The endpoint parameter is the server's enrollment ticket.
+let client = SyncClient::new(db.clone(), &server_ticket, "production");
 client.push().await?;
 client.pull_default().await?;
 ```
@@ -479,7 +526,8 @@ No external scheduler. No cron daemon. No polling service. The database is in-pr
 Blueprints are parameterized intent templates. They normalize diverse expressions into a canonical form with typed slots:
 
 ```sql
--- Reusable intent templates
+-- Reusable intent templates (example table - contextdb has no built-in
+-- notion of "blueprints"; IMMUTABLE is the primitive declared on it)
 CREATE TABLE blueprints (
   id UUID PRIMARY KEY,
   name TEXT NOT NULL,
@@ -488,7 +536,7 @@ CREATE TABLE blueprints (
   embedding VECTOR(384)
 ) IMMUTABLE
 
--- What we're trying to achieve — an instance of a blueprint
+-- What we're trying to achieve - an instance of a blueprint
 CREATE TABLE intentions (
   id UUID PRIMARY KEY,
   goal TEXT NOT NULL,
@@ -499,7 +547,7 @@ CREATE TABLE intentions (
   embedding VECTOR(384)
 ) STATE MACHINE (status: active -> [archived, completed, paused], paused -> [active])
 
--- What we chose to do — always in service of an intention
+-- What we chose to do - always in service of an intention
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL,
@@ -549,7 +597,7 @@ When the decision is invalidated and replaced:
 ```sql
 -- New decision supersedes the old one, serves the same intention
 INSERT INTO decisions (id, description, status, confidence, intention_id, context_id, embedding)
-VALUES ($new_dec_id, 'Alert at 350ms p99 — adjusted for eu-west-1', 'active', 0.9,
+VALUES ($new_dec_id, 'Alert at 350ms p99 - adjusted for eu-west-1', 'active', 0.9,
         $int_id, $ctx_id, $new_embedding);
 
 INSERT INTO edges (id, source_id, target_id, edge_type)
@@ -813,10 +861,10 @@ The agentic memory ontology is one powerful schema built with these tools. It's 
 
 ## Scenario 16: The Full Picture
 
-A realistic agentic memory schema combines all of the above:
+A realistic agentic memory schema — one example schema built on contextdb's primitives, not a schema contextdb ships — combines all of the above:
 
 ```sql
--- Isolation boundary
+-- Isolation boundary (example table - you define contexts, contextdb doesn't ship one)
 CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT NOT NULL)
 
 -- Things in the world
@@ -848,7 +896,7 @@ CREATE TABLE blueprints (
   embedding VECTOR(384)
 ) IMMUTABLE
 
--- What we're trying to achieve — may instantiate a blueprint
+-- What we're trying to achieve - may instantiate a blueprint
 CREATE TABLE intentions (
   id UUID PRIMARY KEY,
   goal TEXT NOT NULL,
@@ -859,7 +907,7 @@ CREATE TABLE intentions (
   embedding VECTOR(384)
 ) STATE MACHINE (status: active -> [archived, completed, paused], paused -> [active])
 
--- What we chose to do — always in service of an intention
+-- What we chose to do - always in service of an intention
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL,
@@ -914,12 +962,14 @@ CREATE TABLE edges (
 ) DAG('DEPENDS_ON', 'BASED_ON', 'CITES')
 ```
 
-This schema gives an agent:
-- **Structured state** — entities with typed properties, decisions with enforced lifecycles
-- **Semantic recall** — vector search across observations, decisions, and digests
-- **Provenance** — graph traversal traces what was based on what, who cited whom
-- **Automatic invalidation** — state changes cascade through the graph, with first-class invalidation records
-- **Feedback loop** — outcomes record whether decisions worked, weighting future precedent search
-- **Intent normalization** — blueprints collapse diverse expressions into canonical patterns
-- **Sync** — local instances work offline, push/pull when connected
-- **Retention** — old observations expire, but not before syncing
+This example schema gives an agent all of this — but every capability below is a contextdb primitive doing the work; `decisions`, `observations`, `intentions`, and the rest are just the tables this walkthrough chose to declare it on:
+- **Structured state** — `STATE MACHINE` enforces lifecycles on whichever tables you declare it on (here, `decisions`, `intentions`, `invalidations`); `entities` carries typed properties as ordinary JSON columns, nothing contextdb-specific
+- **Semantic recall** — vector columns + `<=>` search work over any table you index — here, `observations`, `decisions`, and `digests`
+- **Provenance** — the `DAG`-declared `edges` table traces what was based on what, who cited whom; `edges` is an example graph table, not a built-in one
+- **Automatic invalidation** — `PROPAGATE` cascades status changes through the graph; `invalidations` is this schema's example of a first-class record of that, not something contextdb ships
+- **Feedback loop** — a `RANK_POLICY` join (Scenario 13) lets `outcomes` weight future precedent search; the joined table can be anything you define
+- **Intent normalization** — `blueprints` is an example pattern-normalization table, made durable only by the `IMMUTABLE` policy declared on it
+- **Sync** — contextdb's sync layer moves whatever tables you declare, `Both`/`Push`/`None` per table; local instances work offline, push/pull when connected
+- **Retention** — `RETAIN` expires rows on any table you attach it to; here, `observations`
+
+None of this is contextdb's schema — it's one example schema, built entirely from primitives contextdb actually ships: `STATE MACHINE`, `DAG`, `PROPAGATE`, `IMMUTABLE`, `RETAIN`, vector columns, graph traversal, and sync. Your schema will look different, and contextdb enforces it just the same.

@@ -6,15 +6,52 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
-description = "Sync server for contextdb — NATS-based replication with conflict resolution"
+description = "Sync server for contextdb — dial-by-key replication with conflict resolution"
+
+[features]
+# Iroh is the sole default transport. NATS is retained as a deprecated,
+# off-default adapter — a dormant revert option, never deleted. Its suites
+# run under `--features nats` (server crate) / `--features nats-tests`
+# (engine-hosted workspace suites) with a Docker daemon.
+default = ["iroh"]
+nats = ["dep:async-nats"]
+# Alias so the shared bench/test fixtures can gate on one feature name that
+# both this crate and contextdb-engine declare.
+nats-tests = ["nats"]
+iroh = [
+    "dep:iroh",
+    "dep:iroh-tickets",
+    "dep:iroh-blobs",
+    "dep:bytes",
+    "dep:blake3",
+    "dep:rustls-pki-types",
+    "dep:url",
+    "iroh/metrics",
+]
+# LAN-local mDNS lookup (lookup=mdns). A separate opt-in feature: the mdns
+# crate depends on iroh with DEFAULT features, whose unification would drag
+# the UPnP/MPL chain back into every downstream graph.
+mdns = ["dep:iroh-mdns-address-lookup"]
+# UPnP port-mapping (improves direct-connection odds through home routers) is
+# deliberately NOT declared as a feature here: even unused optional features
+# enter downstream lockfiles/metadata, and its chain carries an MPL-licensed
+# HTTP client that downstream dependency policies exclude. Self-builders who
+# want it enable the transport library's own feature at build time:
+#   cargo build --release -p contextdb-server --features iroh/portmapper
+
+[[bin]]
+name = "contextdb-server"
+path = "src/main.rs"
+required-features = ["iroh"]
 
 [dependencies]
+serde_json.workspace = true
 contextdb-engine = { path = "../contextdb-engine", version = "1.0" }
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
 contextdb-tx = { path = "../contextdb-tx", version = "1.0" }
 uuid.workspace = true
 tokio.workspace = true
-async-nats.workspace = true
+async-nats = { workspace = true, optional = true }
 rmp-serde.workspace = true
 serde.workspace = true
 tracing.workspace = true
@@ -23,15 +60,80 @@ clap.workspace = true
 thiserror.workspace = true
 futures-util = "0.3"
 serde_bytes = "0.11"
+# Trimmed features: tls-ring is the TLS provider; portmapper (UPnP — pulls an
+# MPL-licensed HTTP client), local metrics counters, and the Apple datapath
+# are dropped for a leaner dependency tree. Direct connections, holepunching,
+# and relays are unaffected.
+iroh = { version = "1.0.2", optional = true, default-features = false, features = ["tls-ring"] }
+iroh-blobs = { version = "0.103.0", optional = true }
+bytes = { version = "1", optional = true }
+blake3 = { version = "1", optional = true }
+# LAN-local address lookup (lookup=mdns): announce/resolve on the local
+# network only — no third party involved.
+iroh-mdns-address-lookup = { version = "0.4", optional = true }
+url = { version = "2", optional = true }
+iroh-tickets = { version = "1.0.0", optional = true }
+# relay-ca=<cert-file> support: parse an operator-supplied relay CA cert
+# (PEM via the maintained pki-types built-ins, or raw DER).
+rustls-pki-types = { version = "1", optional = true }
+# Identity keypair math for the transport-neutral fabric identity module.
+# Kept on the 2.x major deliberately: the iroh adapter's dependency tree pins
+# `ed25519-dalek =3.0.0-rc.0` (an exact pre-release), and the two majors
+# coexist; the ed25519 public-key derivation is identical, which
+# `bound_endpoint_uses_the_fabric_identity_not_a_transport_minted_one` proves
+# at runtime.
+ed25519-dalek = "2"
+getrandom = "0.3"
 
 [dev-dependencies]
+blake3 = "1"
 tokio-test = "0.4"
+# The relay-dialing integration test runs a localhost relay via iroh's
+# test-utils; iroh-tickets is imported directly to build relay-only tickets.
+iroh = { version = "1.0.2", features = ["test-utils"] }
+iroh-relay = { version = "1.0.2", features = ["server", "test-utils"] }
+iroh-tickets = "1.0.0"
 testcontainers = "0.27"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tempfile = "3"
 uuid = { workspace = true }
 tokio.workspace = true
 roaring.workspace = true
+
+[[test]]
+name = "iroh_transport_tests"
+path = "tests/iroh_transport_tests.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "media_transfer_tests"
+path = "tests/media_transfer_tests.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "media_transfer_memory"
+path = "tests/media_transfer_memory.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "media_transfer_reclaim_driver"
+path = "tests/media_transfer_reclaim_driver.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "media_transfer_fetch_retention"
+path = "tests/media_transfer_fetch_retention.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "stale_restore_tests"
+path = "tests/stale_restore_tests.rs"
+required-features = ["nats"]
+
+[[test]]
+name = "sync_integration"
+path = "tests/sync_integration.rs"
+required-features = ["nats"]
 
 [[bench]]
 name = "server_throughput"
@@ -42,8 +144,15 @@ path = "../../benches/server_throughput.rs"
 name = "server_sync_system"
 harness = false
 path = "../../benches/server_sync_system.rs"
+required-features = ["nats-tests"]
 
 [[bench]]
 name = "sync_pr"
 harness = false
 path = "../../benches/sync_pr.rs"
+required-features = ["nats"]
+
+[[bench]]
+name = "blob_transfer"
+harness = false
+required-features = ["iroh"]

@@ -19,6 +19,69 @@ pub enum Statement {
     SetSyncConflictPolicy(String),
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
+    CreateSchedule {
+        name: String,
+        every: String,
+        callback: String,
+        missed_tick_policy: Option<String>,
+        catch_up_within_seconds: Option<u32>,
+    },
+    DropSchedule {
+        name: String,
+    },
+    CreateTrigger {
+        name: String,
+        table: String,
+        on_events: Vec<TriggerEvent>,
+    },
+    DropTrigger {
+        name: String,
+    },
+    CreateEventType {
+        name: String,
+        when: EventTypeTrigger,
+        table: String,
+    },
+    CreateSink {
+        name: String,
+        sink_type: SinkType,
+        url: Option<String>,
+    },
+    CreateRoute {
+        name: String,
+        event_type: String,
+        sink: String,
+        where_in: Option<RouteWhereIn>,
+    },
+    DropRoute {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventTypeTrigger {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinkType {
+    Webhook,
+    Callback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteWhereIn {
+    pub column: String,
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +240,11 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    RowVectorSource {
+        table: String,
+        column: String,
+        key: Box<Expr>,
+    },
     InList {
         expr: Box<Expr>,
         list: Vec<Expr>,
@@ -255,6 +323,7 @@ pub struct CreateTable {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub unique_constraints: Vec<Vec<String>>,
+    pub composite_foreign_keys: Vec<CompositeForeignKey>,
     pub if_not_exists: bool,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
@@ -263,10 +332,31 @@ pub struct CreateTable {
     pub retain: Option<RetainOption>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeForeignKey {
+    pub child_columns: Vec<String>,
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
+}
+
+/// The sync direction a `RETAIN … SYNC SAFE` declaration spells out
+/// explicitly. Absent (`None` on [`RetainOption`]) means the declaration named
+/// no direction; the engine, not the parser, decides what that means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedSyncDirection {
+    PushOnly,
+    TwoWay,
+}
+
 #[derive(Debug, Clone)]
 pub struct RetainOption {
     pub duration_seconds: u64,
     pub sync_safe: bool,
+    /// The direction the DDL spelled out, when it spelled one out at all.
+    pub declared_sync_direction: Option<RetainedSyncDirection>,
+    /// The unit the window was written in, kept so the declaration can be
+    /// rendered back the way the operator wrote it.
+    pub declared_unit: contextdb_core::RetainUnit,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +379,8 @@ pub enum AlterAction {
     SetRetain {
         duration_seconds: u64,
         sync_safe: bool,
+        declared_sync_direction: Option<RetainedSyncDirection>,
+        declared_unit: contextdb_core::RetainUnit,
     },
     DropRetain,
     SetSyncConflictPolicy(String),
@@ -334,6 +426,26 @@ pub struct ColumnDef {
     pub immutable: bool,
     pub quantization: VectorQuantization,
     pub rank_policy: Option<Box<RankPolicyAst>>,
+    pub context_id: bool,
+    pub scope_label: Option<Box<ScopeLabelConstraint>>,
+    pub acl_ref: Option<Box<AclConstraint>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeLabelConstraint {
+    Simple {
+        labels: Vec<String>,
+    },
+    Split {
+        read: Vec<String>,
+        write: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclConstraint {
+    pub ref_table: String,
+    pub ref_column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -20,7 +20,7 @@ fn f45_backup_and_restore_a_database() {
         &empty_params(),
     )
     .expect("create table");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for _ in 0..1_000 {
         db.insert_row(
             tx,

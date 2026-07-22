@@ -1,7 +1,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
-    #[error("NATS error: {0}")]
-    Nats(String),
+    #[error("transport error: {0}")]
+    Transport(String),
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("engine error: {0}")]

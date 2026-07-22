@@ -127,7 +127,7 @@ fn f43c_mvcc_from_concurrent_threads() {
     for worker in 0..10_i64 {
         let db = db.clone();
         handles.push(thread::spawn(move || {
-            let tx = db.begin();
+            let tx = db.begin_or_panic();
             for _ in 0..100 {
                 db.insert_row(
                     tx,
@@ -371,7 +371,7 @@ fn f112_connection_string_api_is_obvious_for_common_cases() {
     );
 }
 
-// Named vector index RED tests from named-vector-indexes-tests.md.
+// Named vector index tests: naming, isolation, and lifecycle coverage.
 /// I created an `embeddings` table with a column literally named `embedding`, and a sibling `other` table with a
 /// column named `foo`. Each table got a vector that, if routing collapsed by row-id only, would WIN the wrong
 /// table's search at top-1 — proving routing is by (table, column) identity, not by the column name `embedding`
@@ -443,7 +443,7 @@ fn f110_single_vector_column_preserves_single_index_semantics_with_disjoint_colu
 }
 
 /// I inserted a 5-dim vector into evidence.vector_text VECTOR(4) on a table with two declared vector columns; the engine
-/// rejected the row with VectorIndexDimensionMismatch carrying the offending (table, column) — so cg can attribute the
+/// rejected the row with VectorIndexDimensionMismatch carrying the offending (table, column) — so a downstream consumer can attribute the
 /// error to the right embedding space without ambiguity.
 #[test]
 fn f114_vector_index_dimension_mismatch_carries_index_identity() {

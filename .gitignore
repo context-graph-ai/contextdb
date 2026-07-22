@@ -1,5 +1,8 @@
 /target
 .claude
+# Fabric identity secret (ed25519 seed) and its remembered-port sibling — never commit
+*.fabric-identity.key
+*.fabric-identity.key.port
 spikes/
 *.swp
 *.swo

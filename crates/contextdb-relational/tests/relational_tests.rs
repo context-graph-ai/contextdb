@@ -12,9 +12,9 @@ struct TestStore {
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: WriteSet) -> contextdb_core::Result<()> {
-        self.relational.apply_inserts(ws.relational_inserts);
-        self.relational.apply_deletes(ws.relational_deletes);
+    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
+        self.relational.apply_inserts(ws.relational_inserts.clone());
+        self.relational.apply_deletes(ws.relational_deletes.clone());
         Ok(())
     }
 

@@ -348,7 +348,7 @@ fn m07_bfs_succeeds_under_budget() {
     }
 
     // Insert edges: A -> B -> C.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new())
         .unwrap();
     db.insert_edge(tx, b, c, "LINKS".to_string(), HashMap::new())
@@ -406,7 +406,7 @@ fn m08_bfs_rejected_over_budget() {
         );
     }
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let _ = db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new());
     let _ = db.commit(tx);
 
@@ -617,7 +617,7 @@ fn m13_default_no_limit_allows_everything() {
         )
         .unwrap();
     }
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();
@@ -753,7 +753,7 @@ fn m16_graph_edge_insertion_accounted() {
 
     let used_before_edges = accountant.usage().used;
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "LINKS".to_string(), HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();

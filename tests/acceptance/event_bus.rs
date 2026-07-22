@@ -1,0 +1,3638 @@
+use crate::common::run_cli_script;
+use crate::common_tracing::{
+    T5_EVENT_BUS_COUNT_ENABLED, T5_EVENT_BUS_LAST_PANIC_FIELDS, T5_EVENT_BUS_PANIC_COUNT,
+    install_global_subscriber as t5_install_global_subscriber, t5_event_bus_reset,
+};
+use contextdb_core::{Lsn, Value};
+use contextdb_engine::sync_types::{
+    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange, SyncDirection,
+};
+use contextdb_engine::{Database, SinkError, SinkEvent, SinkMetrics};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+use uuid::Uuid;
+
+fn empty() -> HashMap<String, Value> {
+    HashMap::new()
+}
+
+/// Generous failure ceiling for the state polls below. The wait ENDS on the
+/// observed bus state; this only bounds a genuinely wedged dispatcher so a
+/// broken build fails loud instead of hanging.
+const BUS_POLL_CEILING: Duration = Duration::from_secs(10);
+
+/// Deterministic wait on observable event-bus state. Spins on `cond` (yielding
+/// the core to the dispatcher between checks) and panics past the ceiling.
+/// This is the replacement for the "sleep a fixed duration and hope the
+/// background dispatch settled" pattern: the wait is satisfied by what the bus
+/// reports, never by how long we happened to sleep.
+fn wait_for_bus(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + BUS_POLL_CEILING;
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Wait until `sink` reports at least `n` completed deliveries.
+fn wait_delivered(db: &Database, sink: &str, n: u64) {
+    wait_for_bus(&format!("{sink} delivered >= {n}"), || {
+        db.sink_metrics_for_test(sink).delivered >= n
+    });
+}
+
+/// Wait until `sink`'s queue is fully drained, then return the settled metrics.
+/// Deterministic terminal for a NON-scoped sink whose declared events all
+/// deliver: once the queue is empty every enqueued event has been consumed, so
+/// `delivered` is final — a stray extra event (a routing/filter bug) either
+/// remains queued or shows up in `delivered`, and the caller's assertions catch
+/// it. Replaces the trailing settle-sleep.
+fn wait_drained(db: &Database, sink: &str) -> SinkMetrics {
+    wait_for_bus(&format!("{sink} queue drained"), || {
+        db.sink_metrics_for_test(sink).queued == 0
+    });
+    db.sink_metrics_for_test(sink)
+}
+
+/// Wait until `sink`'s dispatcher has examined every entry queued at call time
+/// at least once (one full sweep), then return the settled metrics.
+///
+/// This is the deterministic terminal for a SCOPED sink, where gate-denied
+/// entries stay queued and rotate forever so the queue never drains. A full
+/// sweep proves each denied entry was pulled to the front and gate-evaluated
+/// (and thus rejected) rather than merely not-yet-processed — so a
+/// `delivered == authorized` / `queued == denied` assertion taken afterward is
+/// a true terminal, not a timing snapshot. Assumes delivering callbacks return
+/// `Ok` (a transient-retry would re-examine the same entry and inflate the
+/// count); every caller here delivers cleanly.
+fn wait_full_sweep(db: &Database, sink: &str) -> SinkMetrics {
+    let start = db.sink_metrics_for_test(sink);
+    let target = start.examined + start.queued;
+    wait_for_bus(&format!("{sink} full dispatch sweep"), || {
+        db.sink_metrics_for_test(sink).examined >= target
+    });
+    db.sink_metrics_for_test(sink)
+}
+
+fn declare_inv_schema(db: &Database) {
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE ROUTE inv_to_slack EVENT inv_match TO slack",
+        &empty(),
+    )
+    .unwrap();
+}
+
+fn insert_inv(db: &Database, severity: &str, reason: &str) {
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::new_v4()));
+    p.insert("sev".into(), Value::Text(severity.into()));
+    p.insert("rsn".into(), Value::Text(reason.into()));
+    db.execute(
+        "INSERT INTO invalidations (id, severity, reason) VALUES ($id, $sev, $rsn)",
+        &p,
+    )
+    .unwrap();
+}
+
+/// RED — t5_01
+#[test]
+fn t5_01_route_invokes_sink_with_row_values() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    db.execute(
+        "CREATE TABLE unrelated_invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let sink_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_log_cb = sink_log.clone();
+    db.register_sink("slack", None, move |evt| {
+        sink_log_cb.lock().unwrap().push(evt.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut other = HashMap::new();
+    other.insert("id".into(), Value::Uuid(Uuid::new_v4()));
+    other.insert("sev".into(), Value::Text("warning".into()));
+    other.insert("rsn".into(), Value::Text("wrong-table".into()));
+    db.execute(
+        "INSERT INTO unrelated_invalidations (id, severity, reason) VALUES ($id, $sev, $rsn)",
+        &other,
+    )
+    .unwrap();
+    insert_inv(&db, "warning", "stale-basis");
+
+    // Allow background dispatch to complete.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && sink_log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let log = sink_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "sink must be invoked exactly once for the declared table, not unrelated INSERTs"
+    );
+    assert_eq!(log[0].event_type, "inv_match");
+    assert_eq!(log[0].table, "invalidations");
+    assert_eq!(log[0].severity, "warning");
+    assert_eq!(
+        log[0].row_values.get("severity"),
+        Some(&Value::Text("warning".into()))
+    );
+    assert_eq!(
+        log[0].row_values.get("reason"),
+        Some(&Value::Text("stale-basis".into()))
+    );
+}
+
+/// RED — t5_02
+#[test]
+fn t5_02_severity_filter_respected() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE ROUTE inv_to_slack EVENT inv_match TO slack WHERE severity IN ('warning', 'critical', 'fatal')",
+        &empty(),
+    ).unwrap();
+
+    let sink_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_log_cb = sink_log.clone();
+    db.register_sink("slack", None, move |e| {
+        sink_log_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    insert_inv(&db, "info", "low");
+    insert_inv(&db, "warning", "high");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && sink_log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let log = sink_log.lock().unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "only warning row should match severity filter"
+    );
+    assert_eq!(
+        log[0].row_values.get("severity"),
+        Some(&Value::Text("warning".into()))
+    );
+}
+
+/// RED — t5_03
+#[test]
+fn t5_03_sink_isolation_slow_a_does_not_block_b() {
+    // Synchronization-based discriminator (no wall-clock budget). Sink A
+    // blocks on a Mutex held by the test thread, returning ONLY after a
+    // rendezvous Barrier(2) trips. Sink B also waits on the same Barrier.
+    // If dispatch is parallel, both sinks arrive at the Barrier and B's
+    // sentinel channel resolves. If dispatch is serial (A first), B is
+    // queued behind A and the Barrier never trips. A control sentinel
+    // (`b_rx.recv_timeout(Duration::from_secs(5))`) converts the otherwise-
+    // hanging deadlock into an assertion-equivalent panic with a clear
+    // message — satisfying the verification-gate "tests fail on assertion,
+    // not deadlock-killed-by-harness" condition.
+    use std::sync::Barrier;
+    use std::sync::mpsc;
+
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK slow_a TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE SINK fast_b TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_a EVENT inv_match TO slow_a", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_b EVENT inv_match TO fast_b", &empty())
+        .unwrap();
+
+    let rendezvous = Arc::new(Barrier::new(2));
+    let hold_mutex = Arc::new(Mutex::new(()));
+    let (b_tx, b_rx) = mpsc::sync_channel::<()>(1);
+
+    let r_a = rendezvous.clone();
+    let h_a = hold_mutex.clone();
+    db.register_sink("slow_a", None, move |_| {
+        r_a.wait();
+        let _g = h_a.lock().unwrap();
+        Ok(())
+    })
+    .unwrap();
+
+    let r_b = rendezvous.clone();
+    db.register_sink("fast_b", None, move |_| {
+        r_b.wait();
+        b_tx.send(()).unwrap();
+        Ok(())
+    })
+    .unwrap();
+
+    let guard = hold_mutex.lock().unwrap();
+    insert_inv(&db, "warning", "x");
+
+    // Bounded sentinel: recv_timeout converts a serial-dispatch deadlock into
+    // a clear assertion failure, not a harness-killed test.
+    assert!(
+        b_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "sink B did not complete within 5s — dispatcher serialized B behind A \
+         (parallel-dispatch isolation broken)"
+    );
+
+    drop(guard);
+}
+
+/// RED — t5_04
+#[test]
+fn t5_04_sink_failure_does_not_block_commit() {
+    // Synchronization-based discriminator (no wall-clock budget). The sink
+    // holds a Mutex controlled by the test and returns Permanent on every
+    // call. The test acquires the mutex BEFORE inserting; if commit is
+    // blocked on sink dispatch, INSERT hangs.
+    //
+    // Sentinel: a separate `commit_done_tx` channel is signaled inside the
+    // test thread immediately after `insert_inv` returns. The main thread
+    // reads this channel via `recv_timeout(Duration::from_secs(5))` — a
+    // timeout indicates the engine is blocked on the sink, and we panic
+    // with a clear assertion message rather than letting the harness kill
+    // the test.
+    use std::sync::mpsc;
+
+    let db = Arc::new(Database::open_memory());
+    declare_inv_schema(&db);
+
+    let sink_gate = Arc::new(Mutex::new(()));
+    let sink_gate_cb = sink_gate.clone();
+    db.register_sink("slack", None, move |_| {
+        let _g = sink_gate_cb.lock().unwrap();
+        Err(SinkError::Permanent("nope".into()))
+    })
+    .unwrap();
+
+    let gate_guard = sink_gate.lock().unwrap();
+
+    let (commit_done_tx, commit_done_rx) = mpsc::sync_channel::<()>(1);
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        insert_inv(&writer_db, "warning", "x");
+        commit_done_tx.send(()).unwrap();
+    });
+
+    // Engine commit must return well before the gate is released.
+    assert!(
+        commit_done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "engine commit did not return within 5s while sink was blocked — \
+         commit path is waiting on sink delivery (engine-blocked-on-sink bug)"
+    );
+
+    drop(gate_guard);
+    writer.join().unwrap();
+
+    // After releasing the gate, dispatch settles and metrics record the failure.
+    let metrics_deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_permanent_failure = false;
+    while Instant::now() <= metrics_deadline {
+        let m = db.sink_metrics_for_test("slack");
+        if m.permanent_failures >= 1 {
+            assert_eq!(
+                m.permanent_failures, 1,
+                "exactly one permanent failure recorded"
+            );
+            saw_permanent_failure = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        saw_permanent_failure,
+        "sink metrics did not record permanent_failures within 5s"
+    );
+}
+
+/// RED — t5_05
+#[test]
+fn t5_05_transient_failure_retries_and_succeeds() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    let attempts = Arc::new(AtomicU64::new(0));
+    let attempts_cb = attempts.clone();
+    db.register_sink("slack", None, move |_| {
+        let n = attempts_cb.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Err(SinkError::Transient("first try".into()))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+
+    insert_inv(&db, "warning", "retry-me");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && attempts.load(Ordering::SeqCst) < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "retry path must invoke the sink exactly twice (transient then success); got {}",
+        attempts.load(Ordering::SeqCst)
+    );
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(metrics.retried, 1, "exactly one retry");
+    assert_eq!(metrics.delivered, 1);
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("transient-restart.redb");
+    let db = Database::open(&path).unwrap();
+    declare_inv_schema(&db);
+    let durable_attempts = Arc::new(AtomicU64::new(0));
+    let durable_attempts_cb = durable_attempts.clone();
+    db.register_sink("slack", None, move |_| {
+        durable_attempts_cb.fetch_add(1, Ordering::SeqCst);
+        Err(SinkError::Transient("sink still offline".into()))
+    })
+    .unwrap();
+
+    let durable_id = Uuid::from_u128(55);
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(durable_id));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("rsn".into(), Value::Text("retry-after-reopen".into()));
+    db.execute(
+        "INSERT INTO invalidations (id, severity, reason) VALUES ($id, $sev, $rsn)",
+        &p,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && durable_attempts.load(Ordering::SeqCst) == 0 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        durable_attempts.load(Ordering::SeqCst) >= 1,
+        "transient sink must attempt delivery before simulated restart"
+    );
+    db.execute(
+        "DELETE FROM invalidations WHERE id = $id",
+        &HashMap::from([("id".into(), Value::Uuid(durable_id))]),
+    )
+    .unwrap();
+    db.close().unwrap();
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .scan("invalidations", reopened.snapshot())
+            .unwrap()
+            .len(),
+        0,
+        "transient retry replay must come from the durable queue, not source-table scan"
+    );
+    let replayed: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let replayed_cb = replayed.clone();
+    reopened
+        .register_sink("slack", None, move |event| {
+            replayed_cb.lock().unwrap().push(event.clone());
+            Ok(())
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && replayed.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let replayed_events = replayed.lock().unwrap();
+    assert_eq!(
+        replayed_events.len(),
+        1,
+        "transient-failed queue entry must survive restart and replay exactly once"
+    );
+    assert_eq!(
+        replayed_events[0].row_values.get("reason"),
+        Some(&Value::Text("retry-after-reopen".into()))
+    );
+}
+
+/// RED — t5_06
+#[test]
+fn t5_06_durable_queue_survives_restart() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("bus.redb");
+    let script = "\
+CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)
+CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations
+CREATE SINK slack TYPE callback
+CREATE SINK audit TYPE callback
+CREATE ROUTE inv_to_slack EVENT inv_match TO slack
+CREATE ROUTE inv_to_audit EVENT inv_match TO audit
+INSERT INTO invalidations (id, severity, reason) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', 'queue-me')
+DELETE FROM invalidations WHERE id = '00000000-0000-0000-0000-000000000001'
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed queued event; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Reopen and register a succeeding sink.
+    let db = Database::open(&path).unwrap();
+    assert_eq!(
+        db.scan("invalidations", db.snapshot()).unwrap().len(),
+        0,
+        "source row is deleted before reopen; delivery must come from durable sink queue, not table replay"
+    );
+    let received: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_cb = received.clone();
+    db.register_sink("slack", None, move |event| {
+        received_cb.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    wait_delivered(&db, "slack", 1);
+    let slack_events = received.lock().unwrap();
+    assert_eq!(
+        slack_events.len(),
+        1,
+        "previously queued event must be delivered exactly once after restart + new sink registration"
+    );
+    assert_eq!(slack_events[0].event_type, "inv_match");
+    assert_eq!(slack_events[0].table, "invalidations");
+    assert_eq!(
+        slack_events[0].row_values.get("severity"),
+        Some(&Value::Text("warning".into()))
+    );
+    assert_eq!(
+        slack_events[0].row_values.get("reason"),
+        Some(&Value::Text("queue-me".into()))
+    );
+    drop(slack_events);
+    db.close().unwrap();
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    let audit_events: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_events.clone();
+    reopened
+        .register_sink("audit", None, move |event| {
+            audit_cb.lock().unwrap().push(event.clone());
+            Ok(())
+        })
+        .unwrap();
+    wait_delivered(&reopened, "audit", 1);
+    let audit = audit_events.lock().unwrap();
+    assert_eq!(
+        audit.len(),
+        1,
+        "acking slack must not drain audit's independent per-sink durable queue"
+    );
+    assert_eq!(audit[0].event_type, "inv_match");
+    assert_eq!(
+        audit[0].row_values.get("reason"),
+        Some(&Value::Text("queue-me".into())),
+        "durable queue must preserve row payload, not just a replay token"
+    );
+    drop(audit);
+    reopened.close().unwrap();
+    drop(reopened);
+
+    let reopened = Database::open(&path).unwrap();
+    let replay_count = Arc::new(AtomicU64::new(0));
+    let replay_cb = replay_count.clone();
+    reopened
+        .register_sink("slack", None, move |_| {
+            replay_cb.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+    // The delivered entry was acked into the durable queue on the first reopen,
+    // so this reopen loads an EMPTY slack queue — nothing can be replayed
+    // regardless of dispatcher timing. An un-acked entry would show up here as
+    // a non-zero queue depth AND a replay, so the empty-queue assertion is the
+    // deterministic proof (no settle sleep needed).
+    assert_eq!(
+        reopened.sink_metrics_for_test("slack").queued,
+        0,
+        "delivered durable queue entry must be acked/drained on reopen, leaving nothing to replay"
+    );
+    assert_eq!(
+        replay_count.load(Ordering::SeqCst),
+        0,
+        "delivered durable queue entry must be acked/drained, not replayed on later sink registration"
+    );
+}
+
+/// RED — t5_07
+#[test]
+fn t5_07_drop_route_stops_dispatch() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    let count = Arc::new(AtomicU64::new(0));
+    let count_cb = count.clone();
+    db.register_sink("slack", None, move |_| {
+        count_cb.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+
+    insert_inv(&db, "warning", "before");
+    wait_delivered(&db, "slack", 1);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    db.execute("DROP ROUTE inv_to_slack", &empty()).unwrap();
+    insert_inv(&db, "warning", "after");
+    // With the route dropped the "after" INSERT enqueues NOTHING (event
+    // preparation runs synchronously inside execute), so the slack queue is
+    // already empty and delivered is pinned at 1. A regression that kept
+    // dispatching would enqueue the event — showing up as queued > 0 or a
+    // second delivery — so this is a deterministic terminal, not a settle wait.
+    let m = db.sink_metrics_for_test("slack");
+    assert_eq!(m.delivered, 1, "DROP ROUTE must stop further deliveries");
+    assert_eq!(
+        m.queued, 0,
+        "DROP ROUTE must stop enqueueing: no event may be staged for the dropped route"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "DROP ROUTE must stop further dispatches"
+    );
+}
+
+/// REGRESSION GUARD — t5_08
+#[test]
+fn t5_08_subscribe_primitive_still_works() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let rx = db.subscribe();
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    db.execute("INSERT INTO t (id) VALUES ($id)", &p).unwrap();
+    let event = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("CommitEvent must arrive");
+    assert!(event.tables_changed.contains(&"t".to_string()));
+}
+
+/// RED — t5_09: route fires on declared UPDATE event type.
+#[test]
+fn t5_09_route_fires_on_update_event_type() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE memos (id UUID PRIMARY KEY, body TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE memo_changed WHEN UPDATE ON memos",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT memo_changed TO slack", &empty())
+        .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("slack", None, move |e| {
+        log_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    // INSERT does NOT match (event type is UPDATE).
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("body".into(), Value::Text("v1".into()));
+    db.execute("INSERT INTO memos (id, body) VALUES ($id, $body)", &p)
+        .unwrap();
+    // The INSERT does not match an UPDATE event type, so it enqueues nothing:
+    // event preparation ran synchronously inside execute, so an empty queue and
+    // zero deliveries here is a true terminal, not a not-yet-processed snapshot.
+    let m = db.sink_metrics_for_test("slack");
+    assert_eq!(
+        m.queued, 0,
+        "INSERT must not enqueue for an UPDATE event type"
+    );
+    assert_eq!(
+        m.delivered, 0,
+        "INSERT must not fire UPDATE-event-type route"
+    );
+    assert_eq!(
+        log.lock().unwrap().len(),
+        0,
+        "INSERT must not fire UPDATE-event-type route"
+    );
+
+    // UPDATE matches.
+    p.insert("body".into(), Value::Text("v2".into()));
+    db.execute("UPDATE memos SET body = $body WHERE id = $id", &p)
+        .unwrap();
+
+    let m = wait_drained(&db, "slack");
+    assert_eq!(m.delivered, 1, "UPDATE must fire exactly once");
+    let captured = log.lock().unwrap();
+    assert_eq!(captured.len(), 1, "UPDATE must fire exactly once");
+    assert_eq!(captured[0].event_type, "memo_changed");
+}
+
+/// RED — t5_10: route fires on declared DELETE event type.
+#[test]
+fn t5_10_route_fires_on_delete_event_type() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE memos (id UUID PRIMARY KEY, body TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE memo_gone WHEN DELETE ON memos", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT memo_gone TO slack", &empty())
+        .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("slack", None, move |e| {
+        log_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("body".into(), Value::Text("v1".into()));
+    db.execute("INSERT INTO memos (id, body) VALUES ($id, $body)", &p)
+        .unwrap();
+    // INSERT does not match a DELETE event type — nothing is enqueued (event
+    // preparation is synchronous), so an empty queue / zero deliveries here is a
+    // true terminal.
+    let m = db.sink_metrics_for_test("slack");
+    assert_eq!(
+        m.queued, 0,
+        "INSERT must not enqueue for a DELETE event type"
+    );
+    assert_eq!(m.delivered, 0);
+    assert_eq!(log.lock().unwrap().len(), 0);
+
+    db.execute("DELETE FROM memos WHERE id = $id", &p).unwrap();
+    let m = wait_drained(&db, "slack");
+    assert_eq!(m.delivered, 1, "DELETE must fire exactly once");
+    let captured = log.lock().unwrap();
+    assert_eq!(captured.len(), 1, "DELETE must fire exactly once");
+    assert_eq!(captured[0].event_type, "memo_gone");
+}
+
+/// RED — t5_11: subscribe-scoped-to-context-and-scope-label (the context+scope-label routing seam).
+#[test]
+fn t5_11_route_scoped_to_context_excludes_other_contexts() {
+    use contextdb_core::types::{ContextId, ScopeLabel};
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let admin = Database::open(&path).unwrap();
+    admin
+        .execute(
+            "CREATE TABLE invs (
+                id UUID PRIMARY KEY,
+                severity TEXT,
+                context_id UUID CONTEXT_ID,
+                scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('edge', 'server')
+            )",
+            &empty(),
+        )
+        .unwrap();
+    admin
+        .execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    admin
+        .execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    admin
+        .execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+    admin
+        .execute("CREATE SINK audit TYPE callback", &empty())
+        .unwrap();
+    admin
+        .execute("CREATE ROUTE audit_r EVENT inv_match TO audit", &empty())
+        .unwrap();
+    for (id, ctx, scope) in [
+        (1u128, ctx_a, "edge"),
+        (2u128, ctx_b, "edge"),
+        (3u128, ctx_a, "server"),
+        (4u128, ctx_b, "server"),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        admin
+            .execute(
+                "INSERT INTO invs (id, severity, context_id, scope_label) VALUES ($id, $sev, $ctx, $scope)",
+                &p,
+            )
+            .unwrap();
+    }
+    admin.close().unwrap();
+
+    let scoped = Database::open_with_constraints(
+        &path,
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        Some(BTreeSet::from([ScopeLabel::new("edge")])),
+        None,
+    )
+    .unwrap();
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    // Registering a scoped sink should replay only already-queued rows whose
+    // context and scope label are visible to the registering handle.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "scoped sink must replay exactly the row passing both context and scope gates"
+    );
+    assert_eq!(
+        captured[0].row_values.get("id"),
+        Some(&Value::Uuid(Uuid::from_u128(1)))
+    );
+    assert_eq!(
+        captured[0].row_values.get("scope_label"),
+        Some(&Value::Text("edge".into()))
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("context_id"), Some(Value::Uuid(u)) if *u == ctx_b
+        )),
+        "ctx_b INSERT must NOT fire on ctx_a-scoped sink"
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("scope_label"), Some(Value::Text(label)) if label == "server"
+        )),
+        "server-scoped INSERT must NOT fire on edge-scoped sink"
+    );
+    drop(captured);
+
+    let future_ctx_a = Uuid::from_u128(5);
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(future_ctx_a));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    p.insert("scope".into(), Value::Text("edge".into()));
+    scoped
+        .execute(
+            "INSERT INTO invs (id, severity, context_id, scope_label) VALUES ($id, $sev, $ctx, $scope)",
+            &p,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && !log.lock().unwrap().iter().any(|e| {
+            matches!(
+                e.row_values.get("id"), Some(Value::Uuid(u)) if *u == future_ctx_a
+            )
+        })
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let captured = log.lock().unwrap();
+    assert!(
+        captured.iter().any(|e| matches!(
+            e.row_values.get("id"), Some(Value::Uuid(u)) if *u == future_ctx_a
+        )),
+        "future live ctx_a control event must fire while sink is registered"
+    );
+    drop(captured);
+
+    let denied_ctx_b = Uuid::from_u128(6);
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(denied_ctx_b));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_b));
+    p.insert("scope".into(), Value::Text("edge".into()));
+    assert!(
+        matches!(
+            scoped.execute(
+                "INSERT INTO invs (id, severity, context_id, scope_label) VALUES ($id, $sev, $ctx, $scope)",
+                &p,
+            ),
+            Err(contextdb_core::Error::ContextScopeViolation { .. })
+        ),
+        "ctx-a scoped handle must reject live ctx-b writes before they can enqueue"
+    );
+
+    let denied_server_scope = Uuid::from_u128(7);
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(denied_server_scope));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    p.insert("scope".into(), Value::Text("server".into()));
+    assert!(
+        matches!(
+            scoped.execute(
+                "INSERT INTO invs (id, severity, context_id, scope_label) VALUES ($id, $sev, $ctx, $scope)",
+                &p,
+            ),
+            Err(contextdb_core::Error::ScopeLabelViolation { .. })
+        ),
+        "edge-scoped handle must reject live server-scope writes before they can enqueue"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let captured = log.lock().unwrap();
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("id"), Some(Value::Uuid(u)) if *u == denied_ctx_b || *u == denied_server_scope
+        )),
+        "rejected live writes must not be delivered to the scoped sink"
+    );
+    drop(captured);
+    scoped.close().unwrap();
+
+    let admin = Database::open(&path).unwrap();
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(future_ctx_a));
+    let result = admin
+        .execute(
+            "SELECT id, context_id, scope_label FROM invs WHERE id = $id",
+            &p,
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            Value::Uuid(future_ctx_a),
+            Value::Uuid(ctx_a),
+            Value::Text("edge".into())
+        ]],
+        "future allowed scoped write must persist"
+    );
+    for id in [denied_ctx_b, denied_server_scope] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(id));
+        let result = admin
+            .execute("SELECT id FROM invs WHERE id = $id", &p)
+            .unwrap();
+        assert_eq!(result.rows.len(), 0, "denied scoped write must not persist");
+    }
+
+    let live_admin_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let live_admin_cb = live_admin_log.clone();
+    admin
+        .__debug_register_sink_with_constraints_for_test(
+            "slack",
+            Some(BTreeSet::from([ContextId::new(ctx_a)])),
+            Some(BTreeSet::from([ScopeLabel::new("edge")])),
+            None,
+            move |e| {
+                live_admin_cb.lock().unwrap().push(e.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    live_admin_log.lock().unwrap().clear();
+
+    let live_admin_allowed = Uuid::from_u128(8);
+    let live_admin_ctx_b = Uuid::from_u128(9);
+    let live_admin_server = Uuid::from_u128(10);
+    for (id, ctx, scope) in [
+        (live_admin_allowed, ctx_a, "edge"),
+        (live_admin_ctx_b, ctx_b, "edge"),
+        (live_admin_server, ctx_a, "server"),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(id));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        admin
+            .execute(
+                "INSERT INTO invs (id, severity, context_id, scope_label) VALUES ($id, $sev, $ctx, $scope)",
+                &p,
+            )
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && !live_admin_log.lock().unwrap().iter().any(|e| {
+            matches!(
+                e.row_values.get("id"), Some(Value::Uuid(u)) if *u == live_admin_allowed
+            )
+        })
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let captured = live_admin_log.lock().unwrap();
+    assert!(
+        captured.iter().any(|e| matches!(
+            e.row_values.get("id"), Some(Value::Uuid(u)) if *u == live_admin_allowed
+        )),
+        "scoped sink must receive live admin-source events that pass context and scope filters"
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("id"), Some(Value::Uuid(u)) if *u == live_admin_ctx_b || *u == live_admin_server
+        )),
+        "scoped sink must filter live admin-source events by context/scope, not rely only on scoped write rejection"
+    );
+    drop(captured);
+
+    for id in [Uuid::from_u128(2), Uuid::from_u128(3), Uuid::from_u128(4)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(id));
+        admin
+            .execute("DELETE FROM invs WHERE id = $id", &p)
+            .unwrap();
+        assert_eq!(
+            admin
+                .execute("SELECT id FROM invs WHERE id = $id", &p)
+                .unwrap()
+                .rows
+                .len(),
+            0,
+            "disallowed source rows are deleted before unscoped replay; audit delivery must come from queue"
+        );
+    }
+
+    let audit_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_log.clone();
+    admin
+        .register_sink("audit", None, move |e| {
+            audit_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let captured = audit_log.lock().unwrap();
+        let has_ctx_b = captured.iter().any(|e| {
+            matches!(
+                e.row_values.get("id"),
+                Some(Value::Uuid(u)) if *u == Uuid::from_u128(2)
+            )
+        });
+        let has_server_scope = captured.iter().any(|e| {
+            matches!(
+                e.row_values.get("id"),
+                Some(Value::Uuid(u)) if *u == Uuid::from_u128(3)
+            )
+        });
+        if has_ctx_b && has_server_scope {
+            break;
+        }
+        drop(captured);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        audit_log.lock().unwrap().iter().any(|e| matches!(
+            (
+                e.row_values.get("id"),
+                e.row_values.get("context_id"),
+                e.row_values.get("scope_label"),
+                e.row_values.get("severity"),
+            ),
+            (
+                Some(Value::Uuid(id)),
+                Some(Value::Uuid(ctx)),
+                Some(Value::Text(scope)),
+                Some(Value::Text(severity)),
+            ) if *id == Uuid::from_u128(2) && *ctx == ctx_b && scope == "edge" && severity == "warning"
+        )),
+        "unscoped audit sink must receive the queued ctx_b event with payload"
+    );
+    assert!(
+        audit_log.lock().unwrap().iter().any(|e| matches!(
+            (
+                e.row_values.get("id"),
+                e.row_values.get("context_id"),
+                e.row_values.get("scope_label"),
+                e.row_values.get("severity"),
+            ),
+            (
+                Some(Value::Uuid(id)),
+                Some(Value::Uuid(ctx)),
+                Some(Value::Text(scope)),
+                Some(Value::Text(severity)),
+            ) if *id == Uuid::from_u128(3) && *ctx == ctx_a && scope == "server" && severity == "warning"
+        )),
+        "unscoped audit sink must receive the queued server-scope event with payload"
+    );
+}
+
+/// RED — t5_12: panic in one sink does not poison the dispatcher.
+#[test]
+fn t5_12_subscribe_callback_exception_isolated() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    db.execute("CREATE SINK other TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r2 EVENT inv_match TO other", &empty())
+        .unwrap();
+
+    db.register_sink("slack", None, |_| panic!("sink panic"))
+        .unwrap();
+    let other_count = Arc::new(AtomicU64::new(0));
+    let other_cb = other_count.clone();
+    db.register_sink("other", None, move |_| {
+        other_cb.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+
+    insert_inv(&db, "warning", "boom");
+    wait_delivered(&db, "other", 1);
+    assert_eq!(
+        other_count.load(Ordering::SeqCst),
+        1,
+        "second sink must still fire after first sink panics"
+    );
+
+    // Engine itself must remain healthy.
+    insert_inv(&db, "warning", "after-panic");
+    wait_delivered(&db, "other", 2);
+    assert_eq!(
+        other_count.load(Ordering::SeqCst),
+        2,
+        "engine must keep accepting writes and routing events after sink panic"
+    );
+}
+
+/// RED — t5_13: principal-bound sink does not receive ACL-denied rows (the context+ACL-denied-rows seam).
+#[test]
+fn t5_13_sink_excludes_acl_denied_rows() {
+    use contextdb_core::types::Principal;
+    let acl_a = Uuid::from_u128(0xA);
+    let acl_b = Uuid::from_u128(0xB);
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("bus-acl.redb");
+    let script = "\
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
+CREATE SINK alice_sink TYPE callback
+CREATE ROUTE r EVENT secret_event TO alice_sink
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'replay-granted', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'replay-denied', '00000000-0000-0000-0000-00000000000b')
+DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000001'
+DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000002'
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed durable ACL events; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(
+        db.scan("secrets", db.snapshot()).unwrap().len(),
+        0,
+        "replay must come from the durable sink queue, not a current-table scan"
+    );
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink(
+        "alice_sink",
+        Some(Principal::Agent("alice".into())),
+        move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    {
+        let captured = log.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "alice's sink must replay exactly the durable granted row, not the denied queued row"
+        );
+        assert_eq!(
+            captured[0].row_values.get("acl_id"),
+            Some(&Value::Uuid(acl_a))
+        );
+        assert_eq!(
+            captured[0].row_values.get("body"),
+            Some(&Value::Text("replay-granted".into()))
+        );
+    }
+
+    // With the sink live, insert one row in acl_a (granted to alice) and one in
+    // acl_b (not granted). This keeps the live-delivery seam covered too.
+    for (i, aid, body) in [
+        (3u128, acl_a, "live-granted"),
+        (4u128, acl_b, "live-denied"),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(i)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO secrets (id, body, acl_id) VALUES ($id, $body, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().len() < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "alice's sink must receive the replayed granted row and live granted row only"
+    );
+    let bodies = captured
+        .iter()
+        .map(|event| event.row_values.get("body").cloned())
+        .collect::<Vec<_>>();
+    assert!(bodies.contains(&Some(Value::Text("replay-granted".into()))));
+    assert!(bodies.contains(&Some(Value::Text("live-granted".into()))));
+    assert!(!bodies.contains(&Some(Value::Text("replay-denied".into()))));
+    assert!(!bodies.contains(&Some(Value::Text("live-denied".into()))));
+    assert!(
+        captured
+            .iter()
+            .all(|event| event.row_values.get("acl_id") == Some(&Value::Uuid(acl_a)))
+    );
+}
+
+#[test]
+fn t5_15_durable_acl_replay_uses_route_time_gate_snapshot_after_schema_drop() {
+    use contextdb_core::types::Principal;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("bus-acl-route-time.redb");
+    let script = "\
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
+CREATE SINK alice_sink TYPE callback
+CREATE ROUTE r EVENT secret_event TO alice_sink
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'route-time-only', '00000000-0000-0000-0000-00000000000a')
+DROP TABLE secrets
+DROP TABLE acl_grants
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed durable ACL event and drop source schema; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Database::open(&path).unwrap();
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink(
+        "alice_sink",
+        Some(Principal::Agent("alice".into())),
+        move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "queued delivery must use the route-time ACL grants even after source/grant tables are gone"
+    );
+    assert_eq!(
+        captured[0].row_values.get("body"),
+        Some(&Value::Text("route-time-only".into()))
+    );
+}
+
+#[test]
+fn t5_16_principal_scoped_sink_uses_handle_principal_when_registration_omits_one() {
+    use contextdb_core::types::Principal;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("bus-principal-handle.redb");
+    let script = "\
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
+CREATE SINK alice_sink TYPE callback
+CREATE ROUTE r EVENT secret_event TO alice_sink
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'granted', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'denied', '00000000-0000-0000-0000-00000000000b')
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed durable ACL events; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Database::open_as_principal(&path, Principal::Agent("alice".into())).unwrap();
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("alice_sink", None, move |e| {
+        log_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "principal-scoped sink registration with None must use the handle principal, not ACL bypass"
+    );
+    assert_eq!(
+        captured[0].row_values.get("body"),
+        Some(&Value::Text("granted".into()))
+    );
+}
+
+#[test]
+fn t5_17_context_scoped_sink_without_principal_does_not_bypass_acl() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let db = Database::open_memory();
+    let ctx_a = Uuid::from_u128(0xCA);
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, context_id UUID CONTEXT_ID, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE secret_event WHEN INSERT ON secrets",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK scoped_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT secret_event TO scoped_sink", &empty())
+        .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.__debug_register_sink_with_constraints_for_test(
+        "scoped_sink",
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        None,
+        None,
+        move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("body".into(), Value::Text("must-not-leak".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    p.insert("acl".into(), Value::Uuid(Uuid::from_u128(0xA)));
+    db.execute(
+        "INSERT INTO secrets (id, body, context_id, acl_id) VALUES ($id, $body, $ctx, $acl)",
+        &p,
+    )
+    .unwrap();
+
+    // The ACL-gated row is enqueued but the principal-less scoped gate denies
+    // it, so it rotates in the queue forever and never drains. wait_full_sweep
+    // proves the dispatcher pulled it to the front and gate-evaluated it (and
+    // thus rejected it) — so "never delivered" is a settled fact, not a wait
+    // that might have ended before the dispatcher ever looked.
+    let m = wait_full_sweep(&db, "scoped_sink");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "context-scoped sink without principal must not receive ACL-gated events"
+    );
+    assert_eq!(
+        m.delivered, 0,
+        "no ACL-gated event may be delivered to a principal-less scoped sink"
+    );
+    assert_eq!(
+        m.queued, 1,
+        "the denied ACL row must remain queued exactly once—examined and rejected, never dropped or delivered"
+    );
+}
+
+#[test]
+fn t5_18_event_bus_ddl_full_snapshot_recreates_working_route_on_peer() {
+    let source = Database::open_memory();
+    declare_inv_schema(&source);
+    let changes = source.changes_since(Lsn(0));
+    assert!(
+        changes.ddl.iter().any(
+            |ddl| matches!(ddl, DdlChange::CreateEventType { name, .. } if name == "inv_match")
+        ),
+        "full sync snapshot must include CREATE EVENT TYPE"
+    );
+    assert!(
+        changes
+            .ddl
+            .iter()
+            .any(|ddl| matches!(ddl, DdlChange::CreateSink { name, .. } if name == "slack")),
+        "full sync snapshot must include CREATE SINK"
+    );
+    assert!(
+        changes.ddl.iter().any(
+            |ddl| matches!(ddl, DdlChange::CreateRoute { name, .. } if name == "inv_to_slack")
+        ),
+        "full sync snapshot must include CREATE ROUTE"
+    );
+
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    peer.register_sink("slack", None, move |event| {
+        log_cb.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .unwrap();
+    insert_inv(&peer, "warning", "synced-route");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "peer reconstructed from sync DDL must route future events"
+    );
+    assert_eq!(captured[0].event_type, "inv_match");
+}
+
+#[test]
+fn t5_19_event_bus_ddl_direction_filter_does_not_emit_orphan_routes() {
+    let source = Database::open_memory();
+    declare_inv_schema(&source);
+    let changes = source.changes_since(Lsn(0));
+
+    let filtered_out = changes.filter_by_direction(
+        &HashMap::from([("invalidations".to_string(), SyncDirection::None)]),
+        &[SyncDirection::Push, SyncDirection::Both],
+    );
+    assert!(
+        filtered_out.ddl.iter().all(|ddl| !matches!(
+            ddl,
+            DdlChange::CreateEventType { .. }
+                | DdlChange::CreateRoute { .. }
+                | DdlChange::DropRoute { .. }
+        )),
+        "excluding the event table must not emit event types or routes without their source table"
+    );
+    assert!(
+        filtered_out
+            .ddl
+            .iter()
+            .all(|ddl| !matches!(ddl, DdlChange::CreateSink { .. })),
+        "excluding the event table must not leak unrelated sink definitions"
+    );
+    Database::open_memory()
+        .apply_changes(
+            filtered_out,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let filtered_in = changes.filter_by_direction(
+        &HashMap::from([("invalidations".to_string(), SyncDirection::Push)]),
+        &[SyncDirection::Push, SyncDirection::Both],
+    );
+    assert!(
+        filtered_in
+            .ddl
+            .iter()
+            .any(|ddl| matches!(ddl, DdlChange::CreateSink { name, .. } if name == "slack")),
+        "including the event table must keep the sink needed by its route"
+    );
+    assert!(
+        filtered_in.ddl.iter().any(
+            |ddl| matches!(ddl, DdlChange::CreateRoute { name, .. } if name == "inv_to_slack")
+        ),
+        "including the event table must keep the route"
+    );
+}
+
+#[test]
+fn t5_20_failed_sync_event_bus_ddl_does_not_persist_partial_sink() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE existing (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let changes = contextdb_engine::sync_types::ChangeSet {
+        ddl: vec![
+            DdlChange::CreateSink {
+                name: "partial".into(),
+                sink_type: "CALLBACK".into(),
+                url: None,
+            },
+            DdlChange::CreateRoute {
+                name: "bad_route".into(),
+                event_type: "missing_event".into(),
+                sink: "partial".into(),
+                table: "existing".into(),
+                where_in: None,
+            },
+        ],
+        ddl_lsn: vec![Lsn(1), Lsn(1)],
+        ..Default::default()
+    };
+    assert!(
+        db.apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins)
+        )
+        .is_err(),
+        "invalid EventBus DDL batch must fail"
+    );
+    assert!(
+        db.register_sink("partial", None, |_| Ok(())).is_err(),
+        "failed sync batch must not leave behind a durable or in-memory sink"
+    );
+}
+
+#[test]
+fn t5_20b_failed_sync_event_bus_ddl_missing_table_does_not_persist_partial_sink() {
+    let db = Database::open_memory();
+    let changes = contextdb_engine::sync_types::ChangeSet {
+        ddl: vec![
+            DdlChange::CreateSink {
+                name: "partial_missing_table".into(),
+                sink_type: "CALLBACK".into(),
+                url: None,
+            },
+            DdlChange::CreateEventType {
+                name: "missing_event".into(),
+                trigger: "INSERT".into(),
+                table: "missing_table".into(),
+            },
+            DdlChange::CreateRoute {
+                name: "bad_missing_table_route".into(),
+                event_type: "missing_event".into(),
+                sink: "partial_missing_table".into(),
+                table: "missing_table".into(),
+                where_in: None,
+            },
+        ],
+        ddl_lsn: vec![Lsn(1), Lsn(1), Lsn(1)],
+        ..Default::default()
+    };
+    assert!(
+        db.apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins)
+        )
+        .is_err(),
+        "EventBus DDL that references a missing table must reject the whole sync batch"
+    );
+    assert!(
+        db.register_sink("partial_missing_table", None, |_| Ok(()))
+            .is_err(),
+        "failed sync batch must not leave behind the sink that preceded invalid table DDL"
+    );
+}
+
+#[test]
+fn t5_21_full_snapshot_omits_event_bus_ddl_for_dropped_source_table() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    db.execute("DROP TABLE invalidations", &empty()).unwrap();
+    let changes = db.changes_since(Lsn(0));
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+    assert!(
+        peer.register_sink("slack", None, |_| Ok(())).is_ok(),
+        "global sink DDL may remain applyable"
+    );
+    assert!(
+        peer.execute(
+            "CREATE ROUTE should_fail EVENT inv_match TO slack",
+            &empty()
+        )
+        .is_err(),
+        "replaying history through a dropped source table must not leave orphan event types/routes"
+    );
+}
+
+#[test]
+fn t5_22_execute_in_tx_event_bus_ddl_is_not_a_noop() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    let tx = db.begin_or_panic();
+    db.execute_in_tx(tx, "CREATE SINK tx_sink TYPE callback", &empty())
+        .unwrap();
+    db.commit(tx).unwrap();
+    db.execute("CREATE ROUTE tx_route EVENT inv_match TO tx_sink", &empty())
+        .unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("tx_sink", None, move |event| {
+        log_cb.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .unwrap();
+    insert_inv(&db, "warning", "tx-ddl");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "EventBus DDL through execute_in_tx must create real schema state"
+    );
+}
+
+#[test]
+fn t5_23_idempotent_event_bus_sync_ddl_does_not_echo_log() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    let before_lsn = db.current_lsn();
+    let before_ddl = db.ddl_log_since(Lsn(0));
+
+    db.apply_changes(
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateEventType {
+                    name: "inv_match".into(),
+                    trigger: "INSERT".into(),
+                    table: "invalidations".into(),
+                },
+                DdlChange::CreateSink {
+                    name: "slack".into(),
+                    sink_type: "CALLBACK".into(),
+                    url: None,
+                },
+                DdlChange::CreateRoute {
+                    name: "inv_to_slack".into(),
+                    event_type: "inv_match".into(),
+                    sink: "slack".into(),
+                    table: "invalidations".into(),
+                    where_in: None,
+                },
+            ],
+            ddl_lsn: vec![Lsn(1), Lsn(1), Lsn(1)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.current_lsn(),
+        before_lsn,
+        "idempotent EventBus DDL replay must not allocate an echo LSN"
+    );
+    assert_eq!(
+        format!("{:?}", db.ddl_log_since(Lsn(0))),
+        format!("{before_ddl:?}"),
+        "idempotent EventBus DDL replay must not append duplicate DDL"
+    );
+}
+
+#[test]
+fn t5_24_failed_sync_event_bus_ddl_rolls_back_rows_in_same_changeset() {
+    let db = Database::open_memory();
+    db.execute("CREATE TABLE existing (id UUID PRIMARY KEY)", &empty())
+        .unwrap();
+    let id = Uuid::from_u128(0xABCD);
+    let changes = ChangeSet {
+        ddl: vec![
+            DdlChange::CreateSink {
+                name: "partial".into(),
+                sink_type: "CALLBACK".into(),
+                url: None,
+            },
+            DdlChange::CreateRoute {
+                name: "bad_route".into(),
+                event_type: "missing_event".into(),
+                sink: "partial".into(),
+                table: "existing".into(),
+                where_in: None,
+            },
+        ],
+        ddl_lsn: vec![Lsn(42), Lsn(42)],
+        rows: vec![RowChange {
+            table: "existing".into(),
+            natural_key: NaturalKey {
+                column: "id".into(),
+                value: Value::Uuid(id),
+            },
+            values: HashMap::from([("id".into(), Value::Uuid(id))]),
+            deleted: false,
+            lsn: Lsn(42),
+            created_at: None,
+        }],
+        ..Default::default()
+    };
+
+    assert!(
+        db.apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins)
+        )
+        .is_err(),
+        "invalid EventBus DDL must reject the whole incoming changeset"
+    );
+    let rows = db.execute("SELECT * FROM existing", &empty()).unwrap();
+    assert_eq!(
+        rows.rows.len(),
+        0,
+        "rows in the same incoming changeset must not commit ahead of failed EventBus DDL"
+    );
+}
+
+#[test]
+fn t5_25_event_bus_ddl_rollback_does_not_leak_sink() {
+    let db = Database::open_memory();
+    let before_lsn = db.current_lsn();
+    db.execute("BEGIN", &empty()).unwrap();
+    db.execute("CREATE SINK rollback_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("ROLLBACK", &empty()).unwrap();
+
+    assert!(
+        db.register_sink("rollback_sink", None, |_| Ok(())).is_err(),
+        "EventBus DDL staged inside a rolled-back transaction must not become registerable"
+    );
+    assert_eq!(
+        db.current_lsn(),
+        before_lsn,
+        "rolled-back EventBus DDL must not allocate a durable DDL LSN"
+    );
+}
+
+#[test]
+fn t5_26_event_bus_ddl_in_tx_routes_rows_from_same_commit() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+        &empty(),
+    )
+    .unwrap();
+
+    db.execute("BEGIN", &empty()).unwrap();
+    db.execute("CREATE SINK tx_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE tx_route EVENT inv_match TO tx_sink", &empty())
+        .unwrap();
+    insert_inv(&db, "warning", "same-commit");
+    db.execute("COMMIT", &empty()).unwrap();
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    db.register_sink("tx_sink", None, move |event| {
+        log_cb.lock().unwrap().push(event.clone());
+        Ok(())
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && log.lock().unwrap().is_empty() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        log.lock().unwrap().len(),
+        1,
+        "EventBus DDL committed with rows must route those same-commit row events"
+    );
+}
+
+#[test]
+fn t5_27_standalone_sink_survives_sync_snapshot_without_route() {
+    let source = Database::open_memory();
+    source
+        .execute("CREATE SINK standalone TYPE callback", &empty())
+        .unwrap();
+    let peer = Database::open_memory();
+    peer.apply_changes(
+        source.changes_since(Lsn(0)),
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    assert!(
+        peer.register_sink("standalone", None, |_| Ok(())).is_ok(),
+        "standalone sink definitions are customer configuration and must sync even before routes exist"
+    );
+}
+
+/// RED — t5_14: SinkMetrics field accuracy across permanent_failures and queued.
+#[test]
+fn t5_14_sink_metrics_field_accuracy() {
+    let db = Database::open_memory();
+    declare_inv_schema(&db);
+    db.execute("CREATE SINK held TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_held EVENT inv_match TO held", &empty())
+        .unwrap();
+
+    // Sink "slack" returns Permanent on every call — exercise permanent_failures.
+    db.register_sink("slack", None, |_| Err(SinkError::Permanent("nope".into())))
+        .unwrap();
+
+    // Sink "held" blocks on a Mutex — exercise queued (events held mid-delivery).
+    let hold_gate = Arc::new(Mutex::new(()));
+    let hold_cb = hold_gate.clone();
+    db.register_sink("held", None, move |_| {
+        let _g = hold_cb.lock().unwrap();
+        Ok(())
+    })
+    .unwrap();
+
+    // Acquire the gate BEFORE inserting so "held" sink blocks on first dispatch.
+    let gate_guard = hold_gate.lock().unwrap();
+
+    for _ in 0..3 {
+        insert_inv(&db, "warning", "x");
+    }
+
+    // Drain permanent_failures for "slack". No gate held for slack, so it
+    // resolves all 3 failures.
+    let deadline_p = Instant::now() + Duration::from_secs(5);
+    let mut saw_slack_failures = false;
+    while Instant::now() <= deadline_p {
+        let m = db.sink_metrics_for_test("slack");
+        if m.permanent_failures >= 3 {
+            assert_eq!(
+                m.permanent_failures, 3,
+                "exactly 3 permanent failures recorded"
+            );
+            assert_eq!(
+                m.delivered, 0,
+                "permanent failures must not count as delivered"
+            );
+            assert_eq!(m.retried, 0, "permanent failures must not retry");
+            assert_eq!(
+                m.queued, 0,
+                "queued counts events held mid-delivery, not failed events"
+            );
+            saw_slack_failures = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        saw_slack_failures,
+        "slack metrics never reached permanent_failures=3"
+    );
+
+    // While "held" sink is blocked on the gate, queued must be > 0.
+    let deadline_q = Instant::now() + Duration::from_secs(5);
+    let mut saw_held_queue = false;
+    while Instant::now() <= deadline_q {
+        let m = db.sink_metrics_for_test("held");
+        if m.queued > 0 {
+            assert_eq!(
+                m.queued, 3,
+                "queued must count queued entries once, including the in-flight front entry"
+            );
+            assert_eq!(m.delivered, 0, "delivered must be 0 while held");
+            saw_held_queue = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        saw_held_queue,
+        "held metrics never showed queued > 0 while gate was held"
+    );
+
+    // Release the gate; queued must drain to 0 and delivered must increase.
+    drop(gate_guard);
+
+    let deadline_d = Instant::now() + Duration::from_secs(5);
+    let mut settled = false;
+    let mut last = db.sink_metrics_for_test("held");
+    while Instant::now() <= deadline_d {
+        let m = db.sink_metrics_for_test("held");
+        last = m.clone();
+        if m.queued == 0 && m.delivered >= 3 {
+            assert_eq!(m.queued, 0, "queued returns to 0 after gate release");
+            assert_eq!(m.delivered, 3, "all 3 events delivered after gate release");
+            settled = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        settled,
+        "held metrics never settled (queued={}, delivered={})",
+        last.queued, last.delivered
+    );
+}
+
+/// RED — t5_28: scoped_with_contexts register_sink delivers only authorized context events.
+#[test]
+fn t5_28_scoped_with_contexts_register_sink_delivers_only_authorized_context_events() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-ctx.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Full sweep: the ctx_a row delivers, the denied ctx_b row is examined and
+    // rejected (then rotates), so delivered/queued below are a settled terminal.
+    let metrics = wait_full_sweep(&db, "slack");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "scoped sink must receive exactly the ctx_a INSERT, not the ctx_b INSERT"
+    );
+    assert_eq!(
+        captured[0].row_values.get("context_id"),
+        Some(&Value::Uuid(ctx_a))
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("context_id"), Some(Value::Uuid(u)) if *u == ctx_b
+        )),
+        "ctx_b INSERT must NOT fire on ctx_a-scoped sink"
+    );
+    drop(captured);
+
+    assert_eq!(metrics.delivered, 1, "exactly one authorized delivery");
+    assert_eq!(
+        metrics.queued, 1,
+        "denied ctx_b row must remain queued exactly once for future broader re-registration"
+    );
+}
+
+/// RED — t5_29: scoped_with_constraints register_sink delivers only authorized scope label events.
+#[test]
+fn t5_29_scoped_with_constraints_register_sink_delivers_only_authorized_scope_label_events() {
+    use contextdb_core::types::ScopeLabel;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-label.redb");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE invs (
+            id UUID PRIMARY KEY,
+            severity TEXT,
+            scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('edge', 'server')
+        )",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    for (id, scope) in [(1u128, "edge"), (2u128, "server")] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        db.execute(
+            "INSERT INTO invs (id, severity, scope_label) VALUES ($id, $sev, $scope)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let scoped =
+        db.scoped_with_constraints(None, Some(BTreeSet::from([ScopeLabel::new("edge")])), None);
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    // Full sweep: the edge row delivers, the denied server row is examined and
+    // rejected, so "exactly the edge INSERT" is a settled fact.
+    wait_full_sweep(&db, "slack");
+
+    {
+        let captured = log.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "edge-scoped sink must replay exactly the pre-registration edge INSERT"
+        );
+        assert_eq!(
+            captured[0].row_values.get("scope_label"),
+            Some(&Value::Text("edge".into()))
+        );
+    }
+
+    for (id, scope) in [(3u128, "edge"), (4u128, "server")] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        db.execute(
+            "INSERT INTO invs (id, severity, scope_label) VALUES ($id, $sev, $scope)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Full sweep: the live edge row delivers, both server rows are examined and
+    // rejected — delivered/queued below are settled, not a timing snapshot.
+    let metrics = wait_full_sweep(&db, "slack");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "edge-scoped sink must receive replayed and live edge INSERTs, not server INSERTs"
+    );
+    assert!(
+        captured
+            .iter()
+            .all(|e| e.row_values.get("scope_label") == Some(&Value::Text("edge".into()))),
+        "every delivered row must carry the authorized edge scope"
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("scope_label"), Some(Value::Text(s)) if s == "server"
+        )),
+        "server-scope INSERTs must NOT fire on edge-scoped sink"
+    );
+    drop(captured);
+
+    assert_eq!(
+        metrics.delivered, 2,
+        "exactly two authorized deliveries: replayed edge and live edge"
+    );
+    assert_eq!(
+        metrics.queued, 2,
+        "denied replay and live server-scope rows must remain queued exactly once each"
+    );
+
+    let broad_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let broad_cb = broad_log.clone();
+    db.register_sink("slack", None, move |e| {
+        broad_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    // Broader (unscoped) re-registration replays the two retained server rows,
+    // which now all deliver — so the queue drains to empty. That drain is the
+    // deterministic terminal.
+    wait_drained(&db, "slack");
+    let broad = broad_log.lock().unwrap();
+    assert_eq!(
+        broad.len(),
+        2,
+        "broader re-registration must replay the two previously denied server rows exactly once"
+    );
+    let ids = broad
+        .iter()
+        .filter_map(|e| e.row_values.get("id").cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids.iter()
+            .filter(|v| **v == Value::Uuid(Uuid::from_u128(2)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ids.iter()
+            .filter(|v| **v == Value::Uuid(Uuid::from_u128(4)))
+            .count(),
+        1
+    );
+    assert!(
+        broad
+            .iter()
+            .all(|e| e.row_values.get("scope_label") == Some(&Value::Text("server".into()))),
+        "broader replay must contain only the retained server-scope rows"
+    );
+    drop(broad);
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        0,
+        "broader re-registration must drain exactly the retained denied rows"
+    );
+}
+
+/// RED — t5_30: scoped-handle principal sink excludes ACL-denied rows; replay + live-commit paths.
+#[test]
+fn t5_30_scoped_handle_principal_register_sink_excludes_acl_denied_rows() {
+    use contextdb_core::types::Principal;
+    let acl_a = Uuid::from_u128(0xA);
+    let acl_b = Uuid::from_u128(0xB);
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-acl.redb");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE secret_event WHEN INSERT ON secrets",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK alice_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT secret_event TO alice_sink", &empty())
+        .unwrap();
+
+    let mut g1 = HashMap::new();
+    g1.insert("id".into(), Value::Uuid(Uuid::from_u128(0x100)));
+    g1.insert("kind".into(), Value::Text("Agent".into()));
+    g1.insert("pid".into(), Value::Text("alice".into()));
+    g1.insert("aid".into(), Value::Uuid(acl_a));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g1,
+    )
+    .unwrap();
+    let mut g2 = HashMap::new();
+    g2.insert("id".into(), Value::Uuid(Uuid::from_u128(0x101)));
+    g2.insert("kind".into(), Value::Text("Agent".into()));
+    g2.insert("pid".into(), Value::Text("bob".into()));
+    g2.insert("aid".into(), Value::Uuid(acl_b));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g2,
+    )
+    .unwrap();
+
+    for (i, aid, body) in [
+        (1u128, acl_a, "replay-granted"),
+        (2u128, acl_b, "replay-denied"),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(i)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO secrets (id, body, acl_id) VALUES ($id, $body, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let bob_scoped = db.scoped_with_constraints(None, None, Some(Principal::Agent("bob".into())));
+    let err = bob_scoped
+        .register_sink("alice_sink", Some(Principal::Agent("alice".into())), |_e| {
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("principal-scoped handles cannot register sinks for another principal"),
+        "explicit register_sink principal must not be silently overridden by the handle principal: {err:?}"
+    );
+
+    let scoped = db.scoped_with_constraints(None, None, None);
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink(
+            "alice_sink",
+            Some(Principal::Agent("alice".into())),
+            move |e| {
+                log_cb.lock().unwrap().push(e.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    // Full sweep: alice's granted row delivers, the bob-granted row is examined
+    // and rejected, so "exactly the granted row" is settled.
+    wait_full_sweep(&db, "alice_sink");
+
+    {
+        let captured = log.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "alice's scoped sink must replay exactly the granted row, not the bob-granted row"
+        );
+        assert_eq!(
+            captured[0].row_values.get("body"),
+            Some(&Value::Text("replay-granted".into()))
+        );
+    }
+
+    for (i, aid, body) in [
+        (3u128, acl_a, "live-granted"),
+        (4u128, acl_b, "live-denied"),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(i)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO secrets (id, body, acl_id) VALUES ($id, $body, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Full sweep: the live granted row delivers, both bob-granted rows are
+    // examined and rejected — delivered/queued below are settled.
+    let metrics = wait_full_sweep(&db, "alice_sink");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "alice's scoped sink must receive the replayed and live granted rows only"
+    );
+    let bodies: Vec<_> = captured
+        .iter()
+        .map(|e| e.row_values.get("body").cloned())
+        .collect();
+    assert!(bodies.contains(&Some(Value::Text("replay-granted".into()))));
+    assert!(bodies.contains(&Some(Value::Text("live-granted".into()))));
+    assert!(!bodies.contains(&Some(Value::Text("replay-denied".into()))));
+    assert!(!bodies.contains(&Some(Value::Text("live-denied".into()))));
+    drop(captured);
+
+    assert_eq!(
+        metrics.delivered, 2,
+        "engine-route delivered count must reflect both authorized deliveries"
+    );
+    assert_eq!(
+        metrics.queued, 2,
+        "bob-granted replay and live rows must remain queued exactly once each for future broader re-registration"
+    );
+
+    let broad_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let broad_cb = broad_log.clone();
+    db.register_sink("alice_sink", None, move |e| {
+        broad_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    // Broader (unscoped) re-registration replays the two retained ACL-denied
+    // rows, which now all deliver — the queue drains to empty.
+    wait_drained(&db, "alice_sink");
+    let broad = broad_log.lock().unwrap();
+    assert_eq!(
+        broad.len(),
+        2,
+        "broader re-registration must replay the two previously ACL-denied rows exactly once"
+    );
+    let bodies = broad
+        .iter()
+        .filter_map(|e| e.row_values.get("body").cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|v| **v == Value::Text("replay-denied".into()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|v| **v == Value::Text("live-denied".into()))
+            .count(),
+        1
+    );
+    drop(broad);
+    assert_eq!(
+        db.sink_metrics_for_test("alice_sink").queued,
+        0,
+        "broader re-registration must drain exactly the retained ACL-denied rows"
+    );
+}
+
+/// RED — t5_31: scoped-handle register_sink replays durably queued events across child-process restart.
+#[test]
+fn t5_31_scoped_handle_register_sink_replays_durably_queued_events_child_process_restart() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-replay.redb");
+    let script = "\
+CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)
+CREATE EVENT TYPE inv_match WHEN INSERT ON invs
+CREATE SINK slack TYPE callback
+CREATE ROUTE r EVENT inv_match TO slack
+INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', '00000000-0000-0000-0000-00000000000a')
+INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000002', 'warning', '00000000-0000-0000-0000-00000000000b')
+";
+    let out = run_cli_script(&path, &[], script);
+    assert!(
+        out.status.success(),
+        "child process should seed durable scoped events; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Database::open(&path).unwrap();
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    // Full sweep: the durable ctx_a row delivers, the durable ctx_b row is
+    // examined and rejected, so delivered/queued below are settled.
+    let metrics = wait_full_sweep(&db, "slack");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "scoped sink must replay exactly the durable ctx_a row, not the ctx_b row"
+    );
+    assert_eq!(
+        captured[0].row_values.get("context_id"),
+        Some(&Value::Uuid(ctx_a))
+    );
+    assert!(
+        !captured.iter().any(|e| matches!(
+            e.row_values.get("context_id"), Some(Value::Uuid(u)) if *u == ctx_b
+        )),
+        "ctx_b durable row must NOT replay to ctx_a-scoped sink"
+    );
+    drop(captured);
+
+    assert_eq!(metrics.delivered, 1, "exactly the ctx_a row was delivered");
+    assert_eq!(
+        metrics.queued, 1,
+        "ctx_b row remains queued exactly once — no shallow-ack duplicate, no silent drop"
+    );
+}
+
+/// RED — t5_32: re-registering same sink from different scoped handles replaces registration; one worker.
+#[test]
+fn t5_32_scoped_handle_register_sink_replaces_prior_registration_one_worker_invariant() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-replace.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped_a = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log_a: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_a_cb = log_a.clone();
+    scoped_a
+        .register_sink("slack", None, move |e| {
+            log_a_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let mut pre = HashMap::new();
+    pre.insert("id".into(), Value::Uuid(Uuid::from_u128(10)));
+    pre.insert("sev".into(), Value::Text("warning".into()));
+    pre.insert("ctx".into(), Value::Uuid(ctx_b));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &pre,
+    )
+    .unwrap();
+
+    let initial_delivered = db.sink_metrics_for_test("slack").delivered;
+    assert_eq!(
+        initial_delivered, 0,
+        "ctx_b pre-replacement row is denied by the ctx_a registration and must not deliver"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        1,
+        "pre-replacement denied row must remain queued before registration replacement"
+    );
+
+    let scoped_b = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_b)]));
+    let log_b: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_b_cb = log_b.clone();
+    scoped_b
+        .register_sink("slack", None, move |e| {
+            log_b_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    for (id, ctx) in [(11u128, ctx_a), (12u128, ctx_b)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Full sweep: the two ctx_b rows (queued + live) deliver, the live ctx_a
+    // row is examined and rejected — so the counts below are settled.
+    wait_full_sweep(&db, "slack");
+    let captured_b = log_b.lock().unwrap();
+    assert_eq!(
+        captured_b.len(),
+        2,
+        "latest registration (ctx_b) must receive the pre-existing ctx_b queued row and live ctx_b INSERT"
+    );
+    let delivered_ids = captured_b
+        .iter()
+        .filter_map(|e| e.row_values.get("id").cloned())
+        .collect::<Vec<_>>();
+    assert!(delivered_ids.contains(&Value::Uuid(Uuid::from_u128(10))));
+    assert!(delivered_ids.contains(&Value::Uuid(Uuid::from_u128(12))));
+    assert!(
+        captured_b
+            .iter()
+            .all(|e| e.row_values.get("context_id") == Some(&Value::Uuid(ctx_b))),
+        "ctx_b registration must not receive ctx_a rows"
+    );
+    drop(captured_b);
+
+    let captured_a = log_a.lock().unwrap();
+    assert!(
+        !captured_a.iter().any(|e| matches!(
+            e.row_values.get("id"),
+            Some(Value::Uuid(u)) if *u == Uuid::from_u128(10) || *u == Uuid::from_u128(11) || *u == Uuid::from_u128(12)
+        )),
+        "pre-replacement denied and post-replacement events must NOT fire on the replaced ctx_a callback"
+    );
+    drop(captured_a);
+
+    let final_delivered = db.sink_metrics_for_test("slack").delivered;
+    assert_eq!(
+        final_delivered - initial_delivered,
+        2,
+        "engine-route delivered count must include preserved pre-replacement ctx_b row plus live ctx_b row"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        1,
+        "ctx_a row denied by scoped_b's access remains queued exactly once; ctx_b row was durably acked on delivery"
+    );
+    assert_eq!(
+        db.runtimes_count_for_test("slack"),
+        1,
+        "exactly one worker for the named sink — re-registration must not spawn a second runtime"
+    );
+    assert_eq!(
+        db.runtime_starts_count_for_test("slack"),
+        1,
+        "runtime start counter must prove replacement did not spawn and leak an extra worker thread"
+    );
+}
+
+/// RED — t5_33: panic in scoped-handle callback is isolated; next event delivers; engine emits a structured tracing event with the panic message.
+#[test]
+fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    t5_install_global_subscriber();
+    t5_event_bus_reset();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-panic.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let invocations = Arc::new(AtomicU64::new(0));
+    let invocations_cb = invocations.clone();
+    scoped
+        .register_sink("slack", None, move |_e| {
+            let n = invocations_cb.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                panic!("scoped-handle sink panic on first event");
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    T5_EVENT_BUS_PANIC_COUNT.store(0, Ordering::SeqCst);
+    T5_EVENT_BUS_COUNT_ENABLED.store(true, Ordering::SeqCst);
+    for id in [1u128, 2u128] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx_a));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Both events are consumed: the first panics (recorded as a permanent
+    // failure and acked) and the second delivers, so the queue drains to empty.
+    // A drained queue proves both entries were processed — hence both callback
+    // invocations happened — without a settle sleep.
+    wait_drained(&db, "slack");
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        2,
+        "scoped-handle callback must be invoked for both events: panicking on the first does not stop the second"
+    );
+    let metrics = db.sink_metrics_for_test("slack");
+    assert_eq!(
+        metrics.permanent_failures, 1,
+        "panic on a scoped-handle callback must be recorded as a permanent failure"
+    );
+    let panic_log_count = T5_EVENT_BUS_PANIC_COUNT.load(Ordering::SeqCst);
+    T5_EVENT_BUS_COUNT_ENABLED.store(false, Ordering::SeqCst);
+    assert_eq!(
+        panic_log_count, 1,
+        "panic-tracing event must be emitted exactly once with the panic message"
+    );
+    let fields = T5_EVENT_BUS_LAST_PANIC_FIELDS
+        .get()
+        .and_then(|cell| cell.lock().unwrap().clone())
+        .expect("panic tracing fields captured");
+    assert!(
+        fields.contains("scoped-handle sink panic on first event"),
+        "panic tracing fields must include the panic message; got {fields:?}"
+    );
+    assert!(
+        fields.contains("sink=") && fields.contains("slack"),
+        "panic tracing fields must include a structured sink field; got {fields:?}"
+    );
+    assert!(
+        fields.contains("entry_id="),
+        "panic tracing fields must include a structured entry_id field; got {fields:?}"
+    );
+    assert!(
+        fields.contains("panic_message="),
+        "panic tracing fields must include a structured panic_message field; got {fields:?}"
+    );
+    assert_eq!(
+        metrics.delivered, 1,
+        "the post-panic event must be recorded as delivered exactly once"
+    );
+    assert_eq!(metrics.queued, 0, "durable ack must drain both entries");
+}
+
+/// REGRESSION GUARD — t5_34: resource-owner sink unaffected by sibling scoped-handle sink.
+#[test]
+fn t5_34_resource_owner_sink_unaffected_by_sibling_scoped_handle_sink() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-sibling.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK audit TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_audit EVENT inv_match TO audit", &empty())
+        .unwrap();
+    db.execute("CREATE SINK scoped_slack TYPE callback", &empty())
+        .unwrap();
+    db.execute(
+        "CREATE ROUTE r_scoped EVENT inv_match TO scoped_slack",
+        &empty(),
+    )
+    .unwrap();
+
+    let audit_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_log.clone();
+    db.register_sink("audit", None, move |e| {
+        audit_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let scoped_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let scoped_cb = scoped_log.clone();
+    scoped
+        .register_sink("scoped_slack", None, move |e| {
+            scoped_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let ctx_b = Uuid::from_u128(0xB);
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // The owner audit sink sees both contexts, so its queue drains to empty —
+    // a deterministic terminal for "received both events".
+    let audit_metrics = wait_drained(&db, "audit");
+    let audit = audit_log.lock().unwrap();
+    assert_eq!(
+        audit.len(),
+        2,
+        "owner-registered audit sink must continue to receive both events while a scoped sibling sink is registered"
+    );
+    let audit_ctx_ids: Vec<_> = audit
+        .iter()
+        .filter_map(|e| e.row_values.get("context_id").cloned())
+        .collect();
+    assert!(audit_ctx_ids.contains(&Value::Uuid(ctx_a)));
+    assert!(audit_ctx_ids.contains(&Value::Uuid(ctx_b)));
+    drop(audit);
+
+    assert_eq!(audit_metrics.delivered, 2);
+    assert_eq!(audit_metrics.queued, 0);
+}
+
+/// RED — t5_35: scoped handle covering N contexts produces ONE worker admitting all authorized contexts.
+#[test]
+fn t5_35_scoped_handle_register_sink_multi_context_one_worker_admits_all_authorized_contexts() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-multi-ctx.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let ctx_c = Uuid::from_u128(0xC);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([
+        ContextId::new(ctx_a),
+        ContextId::new(ctx_b),
+    ]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b), (3u128, ctx_c)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Full sweep: both authorized rows deliver, the ctx_c row is examined and
+    // rejected — delivered/queued below are settled.
+    let metrics = wait_full_sweep(&db, "slack");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "scoped handle covering {{ctx_a, ctx_b}} must deliver both authorized rows and not the ctx_c row"
+    );
+    let ctx_ids: Vec<_> = captured
+        .iter()
+        .filter_map(|e| e.row_values.get("context_id").cloned())
+        .collect();
+    assert!(ctx_ids.contains(&Value::Uuid(ctx_a)));
+    assert!(ctx_ids.contains(&Value::Uuid(ctx_b)));
+    assert!(!ctx_ids.contains(&Value::Uuid(ctx_c)));
+    drop(captured);
+
+    assert_eq!(
+        metrics.delivered, 2,
+        "exactly two authorized deliveries; ctx_c row must not contribute"
+    );
+    assert_eq!(
+        metrics.queued, 1,
+        "ctx_c row remains queued exactly once — the engine retains denied events; multi-context single-worker delivers ctx_a + ctx_b"
+    );
+    assert_eq!(
+        db.runtimes_count_for_test("slack"),
+        1,
+        "multi-context scoped handle must produce a single worker for the named sink"
+    );
+    assert_eq!(
+        db.runtime_starts_count_for_test("slack"),
+        1,
+        "multi-context scoped handle must start one worker, not one worker per context"
+    );
+}
+
+/// RED — t5_36: scoped-handle SinkError::Transient retries and succeeds on the scoped path.
+#[test]
+fn t5_36_scoped_handle_register_sink_transient_error_retries_and_succeeds() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-transient.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let attempts_cb = attempts.clone();
+    scoped
+        .register_sink("slack", None, move |_e| {
+            let n = attempts_cb.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(SinkError::Transient("first try".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    // The transient first attempt retries and the second succeeds, acking the
+    // entry — so the queue drains to empty. A drained queue proves the retry
+    // ran to success (both callback attempts happened); no fixed wait needed.
+    let metrics = wait_drained(&db, "slack");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "retry path must invoke the scoped callback exactly twice (transient then success)"
+    );
+    assert!(metrics.retried >= 1, "at least one retry recorded");
+    assert_eq!(metrics.delivered, 1, "exactly one final delivery");
+    assert_eq!(metrics.queued, 0, "durable ack must drain on success");
+}
+
+/// RED — t5_37: DROP ROUTE against scoped-handle-registered sink stops enqueueing; sibling owner sink unaffected.
+#[test]
+fn t5_37_scoped_handle_register_sink_drop_route_stops_enqueueing_siblings_unaffected() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-drop-route.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_slack EVENT inv_match TO slack", &empty())
+        .unwrap();
+    db.execute("CREATE SINK audit TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_audit EVENT inv_match TO audit", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let scoped_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let scoped_cb = scoped_log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            scoped_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let audit_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_log.clone();
+    db.register_sink("audit", None, move |e| {
+        audit_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    // The ctx_a event delivers to the scoped slack sink and drains — a settled
+    // baseline before removing the route.
+    let pre = wait_drained(&db, "slack");
+    let pre_drop_scoped_delivered = pre.delivered;
+    assert!(
+        pre_drop_scoped_delivered >= 1,
+        "scoped sink must have delivered the pre-drop event"
+    );
+    assert_eq!(
+        pre.queued, 0,
+        "pre-drop scoped route must have drained before testing route removal"
+    );
+
+    db.execute("DROP ROUTE r_slack", &empty()).unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(2)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    // The sibling audit route is intact, so audit delivers the post-drop event
+    // too and its queue drains — a deterministic terminal. The dropped slack
+    // route enqueues nothing new, so the slack counts below stay pinned.
+    wait_drained(&db, "audit");
+
+    let post_drop_scoped_delivered = db.sink_metrics_for_test("slack").delivered;
+    assert_eq!(
+        post_drop_scoped_delivered, pre_drop_scoped_delivered,
+        "DROP ROUTE must stop further deliveries to the scoped sink"
+    );
+    assert_eq!(
+        db.sink_metrics_for_test("slack").queued,
+        0,
+        "DROP ROUTE must stop enqueueing new slack entries, not merely suppress delivery"
+    );
+
+    let audit = audit_log.lock().unwrap();
+    assert_eq!(
+        audit.len(),
+        2,
+        "sibling owner-registered audit sink must continue receiving events through its own route"
+    );
+}
+
+/// REGRESSION GUARD — t5_38: scoped.register_sink with unknown sink name returns Err.
+#[test]
+fn t5_38_scoped_handle_register_sink_unknown_sink_returns_err() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let db = Database::open_memory();
+    let ctx_a = Uuid::from_u128(0xA);
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let err = scoped
+        .register_sink("nonexistent", None, |_e| Ok(()))
+        .expect_err("register_sink on undeclared sink must return Err");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("sink not found"),
+        "error message must name the missing-sink class; got: {msg}"
+    );
+}
+
+/// RED — t5_39: in-process owner commits a queue, scoped handle then registers and replay flows.
+#[test]
+fn t5_39_scoped_handle_register_sink_in_process_pre_existing_queue_replays() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-prequeue.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    for (id, ctx) in [(1u128, ctx_a), (2u128, ctx_b), (3u128, ctx_a)] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("slack", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    // Full sweep: both pre-existing ctx_a rows deliver, the ctx_b row is
+    // examined and rejected — delivered/queued below are settled.
+    let metrics = wait_full_sweep(&db, "slack");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "scoped sink must replay both pre-existing ctx_a rows from the queue"
+    );
+    let ctx_ids: Vec<_> = captured
+        .iter()
+        .filter_map(|e| e.row_values.get("context_id").cloned())
+        .collect();
+    assert!(ctx_ids.iter().all(|v| *v == Value::Uuid(ctx_a)));
+    drop(captured);
+
+    assert_eq!(metrics.delivered, 2);
+    assert_eq!(
+        metrics.queued, 1,
+        "ctx_b row remains queued exactly once — the engine retains denied events; pre-existing queue replay drains the two ctx_a rows"
+    );
+}
+
+/// RED — t5_40: parallel registrations from distinct scoped handles spawn one worker.
+#[test]
+fn t5_40_scoped_handle_register_sink_parallel_registrations_spawn_one_worker() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-parallel.redb");
+    let db = Arc::new(Database::open(&path).unwrap());
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+        .unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let db_thread = db.clone();
+        let barrier_thread = barrier.clone();
+        let ctx = ctx_a;
+        handles.push(std::thread::spawn(move || {
+            let scoped = db_thread.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx)]));
+            barrier_thread.wait();
+            scoped.register_sink("slack", None, |_e| Ok(())).unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(
+        db.runtimes_count_for_test("slack"),
+        1,
+        "parallel scoped registrations must converge on a single worker"
+    );
+    assert_eq!(
+        db.runtime_starts_count_for_test("slack"),
+        1,
+        "parallel scoped registrations must not spawn duplicate worker threads before converging"
+    );
+}
+
+/// RED — t5_41: file-backed in-process drop and reopen replays scoped queue exactly once.
+#[test]
+fn t5_41_scoped_handle_register_sink_inprocess_drop_and_reopen_replay() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-inproc-reopen.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+            &empty(),
+        )
+        .unwrap();
+        db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+            .unwrap();
+        db.execute("CREATE SINK slack TYPE callback", &empty())
+            .unwrap();
+        db.execute("CREATE ROUTE r EVENT inv_match TO slack", &empty())
+            .unwrap();
+        let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+        scoped
+            .register_sink("slack", None, |_e| {
+                Err(SinkError::Transient("offline".into()))
+            })
+            .unwrap();
+        for id in [1u128, 2u128] {
+            let mut p = HashMap::new();
+            p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+            p.insert("sev".into(), Value::Text("warning".into()));
+            p.insert("ctx".into(), Value::Uuid(ctx_a));
+            db.execute(
+                "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+                &p,
+            )
+            .unwrap();
+        }
+        // Both events are staged into the (durable) queue synchronously at
+        // commit; the offline sink returns Transient so they never drain. Wait
+        // on that observable depth instead of a fixed sleep before deleting the
+        // source rows, so the reopen below genuinely replays from the queue.
+        wait_for_bus("slack queue holds both offline events", || {
+            db.sink_metrics_for_test("slack").queued == 2
+        });
+        db.execute(
+            "DELETE FROM invs WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(1)))]),
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM invs WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(2)))]),
+        )
+        .unwrap();
+        db.close().unwrap();
+        drop(scoped);
+        drop(db);
+    }
+
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.scan("invs", db.snapshot()).unwrap().len(),
+            0,
+            "source rows deleted; replay must come from durable queue"
+        );
+        let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+        let log_cb = log.clone();
+        scoped
+            .register_sink("slack", None, move |e| {
+                log_cb.lock().unwrap().push(e.clone());
+                Ok(())
+            })
+            .unwrap();
+        let m = wait_drained(&db, "slack");
+        assert_eq!(
+            m.delivered, 2,
+            "both durably queued ctx_a events must replay after reopen"
+        );
+        let captured = log.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            2,
+            "both durably queued ctx_a events must replay after reopen"
+        );
+        drop(captured);
+        db.close().unwrap();
+        drop(scoped);
+        drop(db);
+    }
+
+    {
+        let db = Database::open(&path).unwrap();
+        let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+        let replay_count = Arc::new(AtomicU64::new(0));
+        let replay_cb = replay_count.clone();
+        scoped
+            .register_sink("slack", None, move |_e| {
+                replay_cb.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        // The first reopen delivered and durably acked both events, so this
+        // reopen loads an empty queue — nothing to replay regardless of
+        // dispatcher timing. An un-acked entry would surface as queue depth and
+        // a replay, so the empty-queue check is the deterministic proof.
+        assert_eq!(
+            db.sink_metrics_for_test("slack").queued,
+            0,
+            "first replay must have durably acked; second reopen must see empty queue"
+        );
+        assert_eq!(
+            replay_count.load(Ordering::SeqCst),
+            0,
+            "first replay must have durably acked; second reopen must see empty queue"
+        );
+    }
+}
+
+/// REGRESSION GUARD — t5_42: scoped-handle drop mid-dispatch does not panic.
+#[test]
+fn t5_42_scoped_handle_drop_mid_dispatch_does_not_panic() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-drop-mid.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    db.execute(
+        "CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_slack EVENT inv_match TO slack", &empty())
+        .unwrap();
+    db.execute("CREATE SINK audit TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r_audit EVENT inv_match TO audit", &empty())
+        .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let (first_slack_tx, first_slack_rx) = std::sync::mpsc::channel::<()>();
+    let first_slack_tx = Mutex::new(Some(first_slack_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    scoped
+        .register_sink("slack", None, move |_e| {
+            // First callback: signal from INSIDE the dispatch, then BLOCK
+            // until the main thread has started the drop. This makes
+            // "drop begins mid-dispatch" a certainty, not a race the 50ms
+            // pacing usually wins (`delivered` records only post-batch, so no
+            // metrics wait can prove it).
+            if let Some(tx) = first_slack_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        })
+        .unwrap();
+
+    let audit_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let audit_cb = audit_log.clone();
+    db.register_sink("audit", None, move |e| {
+        audit_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    for id in 1u128..=5 {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("sev".into(), Value::Text("warning".into()));
+        p.insert("ctx".into(), Value::Uuid(ctx_a));
+        db.execute(
+            "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Drop the scoped handle WHILE its dispatcher is provably inside the
+    // first callback (entered-signal received, release not yet sent). The
+    // drop runs on a helper thread so it STARTS mid-dispatch even if it must
+    // join the dispatcher; the release then lets the blocked callback finish
+    // so that join can complete.
+    first_slack_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("slack dispatcher must start delivering before the drop");
+    let dropper = std::thread::spawn(move || drop(scoped));
+    release_tx
+        .send(())
+        .expect("release the parked first callback");
+    dropper.join().expect("scoped drop must not panic");
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(100)));
+    p.insert("sev".into(), Value::Text("warning".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    db.execute(
+        "INSERT INTO invs (id, severity, context_id) VALUES ($id, $sev, $ctx)",
+        &p,
+    )
+    .unwrap();
+
+    // The sibling owner sink must deliver all six events (five ctx_a inserts +
+    // the post-drop insert). Waiting on that delivery count is the terminal;
+    // the count is a `>= 6` promise, so no settle sleep can strengthen it.
+    wait_delivered(&db, "audit", 6);
+    let audit = audit_log.lock().unwrap();
+    assert!(
+        audit.len() >= 6,
+        "sibling owner sink must continue receiving events after scoped drop; got {}",
+        audit.len()
+    );
+}
+
+/// RED — t5_43: scoped handle WITHOUT principal does not bypass ACL (production-path analog of t5_17).
+#[test]
+fn t5_43_scoped_handle_register_sink_no_principal_does_not_bypass_acl() {
+    use contextdb_core::types::ContextId;
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-no-principal-acl.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xCA);
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, context_id UUID CONTEXT_ID, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE EVENT TYPE secret_event WHEN INSERT ON secrets",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE SINK scoped_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT secret_event TO scoped_sink", &empty())
+        .unwrap();
+
+    let mut grant = HashMap::new();
+    grant.insert("id".into(), Value::Uuid(Uuid::from_u128(0x100)));
+    grant.insert("kind".into(), Value::Text("Agent".into()));
+    grant.insert("pid".into(), Value::Text("alice".into()));
+    grant.insert("acl".into(), Value::Uuid(Uuid::from_u128(0xA)));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $acl)",
+        &grant,
+    )
+    .unwrap();
+
+    let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink("scoped_sink", None, move |e| {
+            log_cb.lock().unwrap().push(e.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("id".into(), Value::Uuid(Uuid::from_u128(1)));
+    p.insert("body".into(), Value::Text("must-not-leak".into()));
+    p.insert("ctx".into(), Value::Uuid(ctx_a));
+    p.insert("acl".into(), Value::Uuid(Uuid::from_u128(0xA)));
+    db.execute(
+        "INSERT INTO secrets (id, body, context_id, acl_id) VALUES ($id, $body, $ctx, $acl)",
+        &p,
+    )
+    .unwrap();
+
+    // The ACL row is enqueued but the principal-less scoped gate denies it, so
+    // it rotates forever and never drains. A full sweep proves the dispatcher
+    // pulled it to the front and gate-rejected it — the ACL denial comes from
+    // the access gate actively examining the row, not from the dispatcher never
+    // reaching it. That is exactly what the "must still start a dispatcher"
+    // assertion below guards, now backed by observed examinations.
+    let metrics = wait_full_sweep(&db, "scoped_sink");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "context-scoped handle without principal must NOT receive ACL-gated events through register_sink"
+    );
+    assert_eq!(
+        db.runtimes_count_for_test("scoped_sink"),
+        1,
+        "principal-less scoped register_sink must still start a dispatcher; ACL denial must come from the access gate, not from silent inertia"
+    );
+    assert_eq!(
+        metrics.delivered, 0,
+        "principal-less scoped sink must not bypass ACL — no ACL'd row may ever be delivered"
+    );
+    assert_eq!(
+        metrics.queued, 1,
+        "ACL'd row must remain durably queued exactly once; the engine must not duplicate or silently drop denied events"
+    );
+}
+
+/// RED — t5_44: scoped_with_constraints across all three dimensions filters as logical AND.
+#[test]
+fn t5_44_scoped_with_constraints_three_dimensions_combined_filter() {
+    use contextdb_core::types::{ContextId, Principal, ScopeLabel};
+    use std::collections::BTreeSet;
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("scoped-three-dim.redb");
+    let db = Database::open(&path).unwrap();
+    let ctx_a = Uuid::from_u128(0xA);
+    let ctx_b = Uuid::from_u128(0xB);
+    let acl_a = Uuid::from_u128(0xAA);
+    let acl_b = Uuid::from_u128(0xBB);
+
+    db.execute(
+        "CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE invs (
+            id UUID PRIMARY KEY,
+            body TEXT,
+            context_id UUID CONTEXT_ID,
+            scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('edge', 'server'),
+            acl_id UUID ACL REFERENCES acl_grants(acl_id)
+        )",
+        &empty(),
+    )
+    .unwrap();
+    db.execute("CREATE EVENT TYPE inv_match WHEN INSERT ON invs", &empty())
+        .unwrap();
+    db.execute("CREATE SINK alice_sink TYPE callback", &empty())
+        .unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO alice_sink", &empty())
+        .unwrap();
+
+    let mut g = HashMap::new();
+    g.insert("id".into(), Value::Uuid(Uuid::from_u128(0x100)));
+    g.insert("kind".into(), Value::Text("Agent".into()));
+    g.insert("pid".into(), Value::Text("alice".into()));
+    g.insert("aid".into(), Value::Uuid(acl_a));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g,
+    )
+    .unwrap();
+    let mut g = HashMap::new();
+    g.insert("id".into(), Value::Uuid(Uuid::from_u128(0x101)));
+    g.insert("kind".into(), Value::Text("Agent".into()));
+    g.insert("pid".into(), Value::Text("bob".into()));
+    g.insert("aid".into(), Value::Uuid(acl_b));
+    db.execute(
+        "INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ($id, $kind, $pid, $aid)",
+        &g,
+    )
+    .unwrap();
+
+    let bob_scoped = db.scoped_with_constraints(
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        Some(BTreeSet::from([ScopeLabel::new("edge")])),
+        Some(Principal::Agent("bob".into())),
+    );
+    let err = bob_scoped
+        .register_sink("alice_sink", Some(Principal::Agent("alice".into())), |_e| {
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("principal-scoped handles cannot register sinks for another principal"),
+        "explicit register_sink principal must not be silently overridden by a principal-scoped handle: {err:?}"
+    );
+
+    for (id, body, ctx, scope, aid) in [
+        (1u128, "replay-all-pass", ctx_a, "edge", acl_a),
+        (2u128, "replay-fail-ctx", ctx_b, "edge", acl_a),
+        (3u128, "replay-fail-scope", ctx_a, "server", acl_a),
+        (4u128, "replay-fail-acl", ctx_a, "edge", acl_b),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO invs (id, body, context_id, scope_label, acl_id) VALUES ($id, $body, $ctx, $scope, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    let scoped = db.scoped_with_constraints(
+        Some(BTreeSet::from([ContextId::new(ctx_a)])),
+        Some(BTreeSet::from([ScopeLabel::new("edge")])),
+        None,
+    );
+    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_cb = log.clone();
+    scoped
+        .register_sink(
+            "alice_sink",
+            Some(Principal::Agent("alice".into())),
+            move |e| {
+                log_cb.lock().unwrap().push(e.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    // Full sweep: the single all-pass replay row delivers, the three denied
+    // rows are each examined and rejected, so "exactly one" is settled.
+    wait_full_sweep(&db, "alice_sink");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one replay row passes all three dimensions (ctx_a AND edge AND alice-granted)"
+    );
+    assert_eq!(
+        captured[0].row_values.get("body"),
+        Some(&Value::Text("replay-all-pass".into()))
+    );
+    drop(captured);
+
+    for (id, body, ctx, scope, aid) in [
+        (5u128, "live-all-pass", ctx_a, "edge", acl_a),
+        (6u128, "live-fail-ctx", ctx_b, "edge", acl_a),
+        (7u128, "live-fail-scope", ctx_a, "server", acl_a),
+        (8u128, "live-fail-acl", ctx_a, "edge", acl_b),
+    ] {
+        let mut p = HashMap::new();
+        p.insert("id".into(), Value::Uuid(Uuid::from_u128(id)));
+        p.insert("body".into(), Value::Text(body.into()));
+        p.insert("ctx".into(), Value::Uuid(ctx));
+        p.insert("scope".into(), Value::Text(scope.into()));
+        p.insert("aid".into(), Value::Uuid(aid));
+        db.execute(
+            "INSERT INTO invs (id, body, context_id, scope_label, acl_id) VALUES ($id, $body, $ctx, $scope, $aid)",
+            &p,
+        )
+        .unwrap();
+    }
+
+    // Full sweep: the live all-pass row delivers, the three live denied rows
+    // are each examined and rejected — delivered/queued below are settled.
+    let metrics = wait_full_sweep(&db, "alice_sink");
+    let captured = log.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "exactly two rows pass all three dimensions: one replay row and one live row"
+    );
+    let bodies = captured
+        .iter()
+        .filter_map(|e| e.row_values.get("body").cloned())
+        .collect::<Vec<_>>();
+    assert!(bodies.contains(&Value::Text("replay-all-pass".into())));
+    assert!(bodies.contains(&Value::Text("live-all-pass".into())));
+    assert!(
+        bodies
+            .iter()
+            .all(|v| matches!(v, Value::Text(s) if s.ends_with("all-pass"))),
+        "rows failing context, scope, or explicit registration principal must not deliver"
+    );
+    drop(captured);
+    assert_eq!(
+        metrics.delivered, 2,
+        "delivered count must include only replay and live rows that satisfy all dimensions"
+    );
+    assert_eq!(
+        metrics.queued, 6,
+        "six denied rows remain queued exactly once each; replay and live filters retain denied events durably"
+    );
+
+    let broad_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let broad_cb = broad_log.clone();
+    db.register_sink("alice_sink", None, move |e| {
+        broad_cb.lock().unwrap().push(e.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    // Broader (unscoped) re-registration replays all six retained denied rows,
+    // which now deliver — the queue drains to empty.
+    wait_drained(&db, "alice_sink");
+    let broad = broad_log.lock().unwrap();
+    assert_eq!(
+        broad.len(),
+        6,
+        "broader re-registration must replay each retained denied row exactly once"
+    );
+    let bodies = broad
+        .iter()
+        .filter_map(|e| e.row_values.get("body").cloned())
+        .collect::<Vec<_>>();
+    for body in [
+        "replay-fail-ctx",
+        "replay-fail-scope",
+        "replay-fail-acl",
+        "live-fail-ctx",
+        "live-fail-scope",
+        "live-fail-acl",
+    ] {
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|v| **v == Value::Text(body.into()))
+                .count(),
+            1,
+            "retained denied row {body} must replay exactly once under broader access"
+        );
+    }
+    drop(broad);
+    assert_eq!(
+        db.sink_metrics_for_test("alice_sink").queued,
+        0,
+        "broader re-registration must drain exactly the retained three-dimension denied rows"
+    );
+}

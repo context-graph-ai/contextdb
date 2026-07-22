@@ -10,9 +10,9 @@ struct TestStore {
 }
 
 impl WriteSetApplicator for TestStore {
-    fn apply(&self, ws: WriteSet) -> contextdb_core::Result<()> {
-        self.graph.apply_inserts(ws.adj_inserts);
-        self.graph.apply_deletes(ws.adj_deletes);
+    fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
+        self.graph.apply_inserts(ws.adj_inserts.clone());
+        self.graph.apply_deletes(ws.adj_deletes.clone());
         Ok(())
     }
 
@@ -113,11 +113,17 @@ fn accepts_max_depth_one() {
 
 #[test]
 fn bfs_visited_limit_error() {
+    // The shipped ceiling stays asserted as the production constant; the
+    // refusal boundary itself is exercised through the test-only cap seam
+    // (was a 100_001-edge build taking most of this binary's runtime).
+    assert_eq!(contextdb_graph::mem::MAX_VISITED, 100_000);
+
     let (tx_mgr, exec) = setup();
     let root = Uuid::new_v4();
+    exec.__set_bfs_visited_cap_for_test(100);
 
     let tx = tx_mgr.begin();
-    for _ in 0..100_001 {
+    for _ in 0..101 {
         exec.insert_edge(tx, root, Uuid::new_v4(), "R".to_string(), HashMap::new())
             .unwrap();
     }
@@ -126,7 +132,7 @@ fn bfs_visited_limit_error() {
     let err = exec
         .bfs(root, None, Direction::Outgoing, 1, 1, tx_mgr.snapshot())
         .unwrap_err();
-    assert!(matches!(err, Error::BfsVisitedExceeded(100_000)));
+    assert!(matches!(err, Error::BfsVisitedExceeded(100)));
 }
 
 #[test]

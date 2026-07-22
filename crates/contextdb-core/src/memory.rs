@@ -1,6 +1,23 @@
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+/// Test-build only: a one-shot callback slot fired inside `try_allocate` at
+/// the TOCTOU window between reading `limit` and re-checking it. It lets a unit
+/// test force the exact `set_budget(None)`-races-`try_allocate` interleaving
+/// deterministically instead of hoping the scheduler lands it. Production
+/// carries neither this field nor its fire site (mirrors the engine's
+/// `#[cfg(test)]` `__maintenance_wakes` liveness counter).
+#[cfg(test)]
+#[derive(Default)]
+struct AllocRaceHook(std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AllocRaceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AllocRaceHook")
+    }
+}
+
 /// Budget enforcer for memory-constrained edge devices.
 /// All methods are &self — interior mutability via atomics.
 #[derive(Debug)]
@@ -10,6 +27,8 @@ pub struct MemoryAccountant {
     used: AtomicUsize,
     startup_ceiling: AtomicUsize,
     has_ceiling: AtomicBool,
+    #[cfg(test)]
+    alloc_race_hook: AllocRaceHook,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +47,8 @@ impl MemoryAccountant {
             used: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(0),
             has_ceiling: AtomicBool::new(false),
+            #[cfg(test)]
+            alloc_race_hook: AllocRaceHook::default(),
         }
     }
 
@@ -38,6 +59,8 @@ impl MemoryAccountant {
             used: AtomicUsize::new(0),
             startup_ceiling: AtomicUsize::new(bytes),
             has_ceiling: AtomicBool::new(true),
+            #[cfg(test)]
+            alloc_race_hook: AllocRaceHook::default(),
         }
     }
 
@@ -53,6 +76,12 @@ impl MemoryAccountant {
             if limit != 0 {
                 let available = limit.saturating_sub(used);
                 if bytes > available {
+                    // TOCTOU window: `limit` was loaded above; a concurrent
+                    // `set_budget(None)` may have cleared it since. The re-check
+                    // below closes that window. In test builds a hook lets a
+                    // unit test land exactly that interleaving deterministically.
+                    #[cfg(test)]
+                    self.fire_alloc_race_hook();
                     if self.limit.load(Ordering::SeqCst) != limit {
                         continue;
                     }
@@ -167,5 +196,61 @@ impl MemoryAccountant {
             },
             other => other,
         })
+    }
+}
+
+#[cfg(test)]
+impl MemoryAccountant {
+    /// Test-build only: install the one-shot interleaving hook.
+    fn set_alloc_race_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.alloc_race_hook.0.lock().unwrap() = Some(hook);
+    }
+
+    /// Test-build only: fire (and consume) the interleaving hook, if installed.
+    fn fire_alloc_race_hook(&self) {
+        let hook = self.alloc_race_hook.0.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The TOCTOU this guards: `try_allocate` loads `limit`, finds the request
+    /// over budget, and a concurrent `set_budget(None)` clears the limit before
+    /// the failure returns. The re-check must observe the change and retry so
+    /// the allocation succeeds under the now-unlimited budget — never a
+    /// spurious `MemoryBudgetExceeded`. The hook forces exactly that
+    /// interleaving; deleting the re-check makes this fail deterministically.
+    #[test]
+    fn set_budget_none_racing_allocate_never_spuriously_fails() {
+        // A REMOVABLE runtime budget: `no_limit()` + `set_budget(Some(..))`.
+        // (A `with_budget` construction sets a startup ceiling, which forbids
+        // removing the limit — the race under test needs a removable one.)
+        let accountant = Arc::new(MemoryAccountant::no_limit());
+        accountant
+            .set_budget(Some(1024))
+            .expect("adding a removable runtime budget must succeed");
+        accountant
+            .try_allocate(1024)
+            .expect("filling the budget to the brim must succeed");
+        assert_eq!(accountant.usage().available, Some(0));
+
+        let racer = Arc::clone(&accountant);
+        accountant.set_alloc_race_hook(Box::new(move || {
+            racer
+                .set_budget(None)
+                .expect("removing the budget must succeed");
+        }));
+
+        accountant.try_allocate(1).expect(
+            "allocate racing a concurrent set_budget(None) must observe the \
+             cleared limit via the re-check and succeed, never spuriously fail",
+        );
+        assert!(accountant.usage().limit.is_none());
     }
 }

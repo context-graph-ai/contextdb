@@ -48,6 +48,14 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::drop_table_stmt => Statement::DropTable(build_drop_table(inner)?),
         Rule::create_index_stmt => Statement::CreateIndex(build_create_index(inner)?),
         Rule::drop_index_stmt => Statement::DropIndex(build_drop_index(inner)?),
+        Rule::create_schedule_stmt => build_create_schedule(inner)?,
+        Rule::drop_schedule_stmt => build_drop_schedule(inner)?,
+        Rule::create_trigger_stmt => build_create_trigger(inner)?,
+        Rule::drop_trigger_stmt => build_drop_trigger(inner)?,
+        Rule::create_event_type_stmt => build_create_event_type(inner)?,
+        Rule::create_sink_stmt => build_create_sink(inner)?,
+        Rule::create_route_stmt => build_create_route(inner)?,
+        Rule::drop_route_stmt => build_drop_route(inner)?,
         Rule::insert_stmt => Statement::Insert(build_insert(inner)?),
         Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
         Rule::update_stmt => Statement::Update(build_update(inner)?),
@@ -549,7 +557,7 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
                     it.next()
                         .ok_or_else(|| Error::ParseError("invalid cosine expr".to_string()))?,
                 )?;
-                let right = build_additive_expr(
+                let right = build_cosine_rhs(
                     it.next()
                         .ok_or_else(|| Error::ParseError("invalid cosine expr".to_string()))?,
                 )?;
@@ -576,6 +584,79 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
             .ok_or_else(|| Error::ParseError("ORDER BY item missing expression".to_string()))?,
         direction,
     })
+}
+
+fn build_cosine_rhs(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid cosine RHS".to_string()))?;
+    match inner.as_rule() {
+        Rule::row_vector_source => build_row_vector_source(inner),
+        Rule::additive_expr => build_additive_expr(inner),
+        other => Err(unexpected_rule(other, "build_cosine_rhs")),
+    }
+}
+
+fn build_row_vector_source(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let mut values = pair.into_inner();
+    let table = match values.next() {
+        Some(p) if p.as_rule() == Rule::string => parse_string_literal(p.as_str()),
+        _ => {
+            return Err(Error::ParseError(
+                "ROW_VECTOR table must be a string".to_string(),
+            ));
+        }
+    };
+    let column = match values.next() {
+        Some(p) if p.as_rule() == Rule::string => parse_string_literal(p.as_str()),
+        _ => {
+            return Err(Error::ParseError(
+                "ROW_VECTOR column must be a string".to_string(),
+            ));
+        }
+    };
+    let key = values
+        .next()
+        .ok_or_else(|| Error::ParseError("ROW_VECTOR key missing".to_string()))
+        .and_then(build_row_vector_key)?;
+    if values.next().is_some() {
+        return Err(Error::ParseError(
+            "ROW_VECTOR requires exactly three arguments".to_string(),
+        ));
+    }
+    Ok(Expr::RowVectorSource {
+        table,
+        column,
+        key: Box::new(key),
+    })
+}
+
+fn build_row_vector_key(pair: Pair<'_, Rule>) -> Result<Expr> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("ROW_VECTOR key missing".to_string()))?;
+    match inner.as_rule() {
+        Rule::parameter => Ok(Expr::Parameter(
+            inner.as_str().trim_start_matches('$').to_string(),
+        )),
+        Rule::bool_lit => Ok(Expr::Literal(Literal::Bool(
+            inner.as_str().eq_ignore_ascii_case("true"),
+        ))),
+        Rule::float => Ok(Expr::Literal(Literal::Real(parse_f64(
+            inner.as_str(),
+            "invalid ROW_VECTOR key float",
+        )?))),
+        Rule::integer => Ok(Expr::Literal(Literal::Integer(parse_i64(
+            inner.as_str(),
+            "invalid ROW_VECTOR key integer",
+        )?))),
+        Rule::string => Ok(Expr::Literal(Literal::Text(parse_string_literal(
+            inner.as_str(),
+        )))),
+        other => Err(unexpected_rule(other, "build_row_vector_key")),
+    }
 }
 
 fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
@@ -971,10 +1052,14 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
         }
     }
 
-    Ok(Expr::FunctionCall {
-        name: name.ok_or_else(|| Error::ParseError("function name missing".to_string()))?,
-        args,
-    })
+    let name = name.ok_or_else(|| Error::ParseError("function name missing".to_string()))?;
+    if name.eq_ignore_ascii_case("ROW_VECTOR") {
+        return Err(Error::ParseError(
+            "ROW_VECTOR is only valid as the right side of ORDER BY <=>".to_string(),
+        ));
+    }
+
+    Ok(Expr::FunctionCall { name, args })
 }
 
 fn build_column_ref(pair: Pair<'_, Rule>) -> Result<Expr> {
@@ -1002,6 +1087,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut if_not_exists = false;
     let mut columns = Vec::new();
     let mut unique_constraints = Vec::new();
+    let mut composite_foreign_keys = Vec::new();
     let mut immutable = false;
     let mut state_machine = None;
     let mut dag_edge_types = Vec::new();
@@ -1040,6 +1126,9 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                     }
                     Rule::unique_table_constraint => {
                         unique_constraints.push(build_unique_table_constraint(element)?);
+                    }
+                    Rule::foreign_key_table_constraint => {
+                        composite_foreign_keys.push(build_composite_foreign_key(element)?);
                     }
                     other => {
                         return Err(unexpected_rule(other, "build_create_table.table_element"));
@@ -1178,6 +1267,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         name: name.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
         columns,
         unique_constraints,
+        composite_foreign_keys: std::mem::take(&mut composite_foreign_keys),
         if_not_exists,
         immutable,
         state_machine,
@@ -1263,6 +1353,8 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             Ok(AlterAction::SetRetain {
                 duration_seconds: retain.duration_seconds,
                 sync_safe: retain.sync_safe,
+                declared_sync_direction: retain.declared_sync_direction,
+                declared_unit: retain.declared_unit,
             })
         }
         Rule::drop_retain_action => Ok(AlterAction::DropRetain),
@@ -1296,6 +1388,9 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     let mut immutable_flag = false;
     let mut quantization = VectorQuantization::F32;
     let mut rank_policy = None;
+    let mut context_id = false;
+    let mut scope_label = None;
+    let mut acl_ref = None;
     // Track if we saw the type token before column_constraints. If IMMUTABLE appears
     // as the column name (i.e. before the data_type position), Pest will parse it as
     // the identifier rule; we detect that case by the column name.
@@ -1394,6 +1489,36 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
                         }
                         rank_policy = Some(Box::new(build_rank_policy_clause(c)?));
                     }
+                    Rule::context_id_constraint => {
+                        if context_id {
+                            return Err(Error::ParseError(
+                                "duplicate CONTEXT_ID constraint".to_string(),
+                            ));
+                        }
+                        context_id = true;
+                    }
+                    Rule::scope_label_simple => {
+                        if scope_label.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate SCOPE_LABEL constraint".to_string(),
+                            ));
+                        }
+                        scope_label = Some(Box::new(build_scope_label_simple(c)?));
+                    }
+                    Rule::scope_label_split => {
+                        if scope_label.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate SCOPE_LABEL constraint".to_string(),
+                            ));
+                        }
+                        scope_label = Some(Box::new(build_scope_label_split(c)?));
+                    }
+                    Rule::acl_constraint => {
+                        if acl_ref.is_some() {
+                            return Err(Error::ParseError("duplicate ACL constraint".to_string()));
+                        }
+                        acl_ref = Some(Box::new(build_acl_constraint(c)?));
+                    }
                     Rule::state_machine_option => {
                         if inline_state_machine.is_some() {
                             return Err(Error::ParseError(
@@ -1432,6 +1557,9 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
             immutable: immutable_flag,
             quantization,
             rank_policy,
+            context_id,
+            scope_label,
+            acl_ref,
         },
         inline_state_machine,
     ))
@@ -1510,10 +1638,43 @@ fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(columns)
 }
 
+fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
+    let mut identifiers = pair
+        .into_inner()
+        .filter(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .collect::<Vec<_>>();
+    if identifiers.len() < 3 {
+        return Err(Error::ParseError(
+            "FOREIGN KEY constraint requires child columns, parent table, and parent columns"
+                .to_string(),
+        ));
+    }
+
+    let child_count = identifiers.len().saturating_sub(1) / 2;
+    if identifiers.len() != child_count.saturating_mul(2).saturating_add(1) {
+        return Err(Error::ParseError(
+            "FOREIGN KEY constraint has mismatched child and parent columns".to_string(),
+        ));
+    }
+    let parent_columns = identifiers.split_off(child_count + 1);
+    let parent_table = identifiers
+        .pop()
+        .ok_or_else(|| Error::ParseError("FOREIGN KEY missing parent table".to_string()))?;
+    let child_columns = identifiers;
+
+    Ok(CompositeForeignKey {
+        child_columns,
+        parent_table,
+        parent_columns,
+    })
+}
+
 fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     let mut amount = None;
     let mut unit = None;
     let mut sync_safe = false;
+    let mut declared_sync_direction = None;
 
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -1526,28 +1687,117 @@ fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
                 })?);
             }
             Rule::retain_unit => unit = Some(part.as_str().to_ascii_uppercase()),
-            Rule::sync_safe_option => sync_safe = true,
+            Rule::sync_safe_option => {
+                sync_safe = true;
+                for direction in part.into_inner() {
+                    if direction.as_rule() != Rule::retained_sync_direction {
+                        return Err(unexpected_rule(direction.as_rule(), "build_retain_option"));
+                    }
+                    declared_sync_direction =
+                        direction
+                            .into_inner()
+                            .next()
+                            .map(|spelling| match spelling.as_rule() {
+                                Rule::two_way_direction => RetainedSyncDirection::TwoWay,
+                                _ => RetainedSyncDirection::PushOnly,
+                            });
+                }
+            }
             other => return Err(unexpected_rule(other, "build_retain_option")),
         }
     }
 
     let amount = amount.ok_or_else(|| Error::ParseError("RETAIN missing duration".to_string()))?;
     let unit = unit.ok_or_else(|| Error::ParseError("RETAIN missing unit".to_string()))?;
-    let duration_seconds = match unit.as_str() {
-        "SECONDS" | "SECOND" => amount,
-        "MINUTES" | "MINUTE" => amount.saturating_mul(60),
-        "HOURS" | "HOUR" => amount.saturating_mul(60 * 60),
-        "DAYS" | "DAY" => amount.saturating_mul(24 * 60 * 60),
+    let declared_unit = match unit.as_str() {
+        "SECONDS" | "SECOND" => contextdb_core::RetainUnit::Seconds,
+        "MINUTES" | "MINUTE" => contextdb_core::RetainUnit::Minutes,
+        "HOURS" | "HOUR" => contextdb_core::RetainUnit::Hours,
+        "DAYS" | "DAY" => contextdb_core::RetainUnit::Days,
         _ => {
             return Err(Error::ParseError(format!(
                 "unsupported RETAIN unit: {unit}"
             )));
         }
     };
+    let duration_seconds = amount.saturating_mul(declared_unit.seconds_multiplier());
 
     Ok(RetainOption {
         duration_seconds,
         sync_safe,
+        declared_sync_direction,
+        declared_unit,
+    })
+}
+
+fn build_scope_label_simple(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint> {
+    let labels = pair
+        .into_inner()
+        .filter(|part| part.as_rule() == Rule::string)
+        .map(|part| parse_string_literal(part.as_str()))
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        return Err(Error::ParseError(
+            "SCOPE_LABEL requires at least one label".to_string(),
+        ));
+    }
+    Ok(ScopeLabelConstraint::Simple { labels })
+}
+
+fn build_scope_label_split(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint> {
+    let raw = pair.as_str();
+    let write_pos = find_keyword_outside_strings(raw, "WRITE")
+        .ok_or_else(|| Error::ParseError("SCOPE_LABEL_READ missing WRITE".to_string()))?;
+    let read = parse_string_literals_in(&raw[..write_pos]);
+    let write = parse_string_literals_in(&raw[write_pos..]);
+    if read.is_empty() || write.is_empty() {
+        return Err(Error::ParseError(
+            "SCOPE_LABEL_READ ... WRITE ... requires read and write labels".to_string(),
+        ));
+    }
+    Ok(ScopeLabelConstraint::Split { read, write })
+}
+
+fn find_keyword_outside_strings(raw: &str, keyword: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let keyword = keyword.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if !in_string
+            && i + keyword.len() <= bytes.len()
+            && bytes[i..i + keyword.len()].eq_ignore_ascii_case(keyword)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn build_acl_constraint(pair: Pair<'_, Rule>) -> Result<AclConstraint> {
+    let mut identifiers = pair
+        .into_inner()
+        .filter(|part| part.as_rule() == Rule::identifier)
+        .map(|part| parse_identifier(part.as_str()));
+    let ref_table = identifiers
+        .next()
+        .ok_or_else(|| Error::ParseError("ACL REFERENCES missing table".to_string()))?;
+    let ref_column = identifiers
+        .next()
+        .ok_or_else(|| Error::ParseError("ACL REFERENCES missing column".to_string()))?;
+    Ok(AclConstraint {
+        ref_table,
+        ref_column,
     })
 }
 
@@ -1881,6 +2131,207 @@ fn build_drop_index(pair: Pair<'_, Rule>) -> Result<DropIndex> {
     })
 }
 
+fn build_create_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let mut name = None;
+    let mut every = None;
+    let mut callback = None;
+    let mut missed_tick_policy = None;
+    let mut catch_up_within_seconds = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::identifier if callback.is_none() => callback = Some(parse_identifier(p.as_str())),
+            Rule::string if every.is_none() => every = Some(parse_string_literal(p.as_str())),
+            Rule::missed_tick_clause => {
+                for inner in p.into_inner() {
+                    match inner.as_rule() {
+                        Rule::string => {
+                            missed_tick_policy = Some(parse_string_literal(inner.as_str()));
+                        }
+                        Rule::integer => {
+                            catch_up_within_seconds =
+                                Some(parse_u32(inner.as_str(), "invalid catch-up seconds")?);
+                        }
+                        other => {
+                            return Err(unexpected_rule(other, "build_create_schedule/policy"));
+                        }
+                    }
+                }
+            }
+            other => return Err(unexpected_rule(other, "build_create_schedule")),
+        }
+    }
+
+    Ok(Statement::CreateSchedule {
+        name: name.ok_or_else(|| Error::ParseError("CREATE SCHEDULE missing name".to_string()))?,
+        every: every
+            .ok_or_else(|| Error::ParseError("CREATE SCHEDULE missing EVERY".to_string()))?,
+        callback: callback
+            .ok_or_else(|| Error::ParseError("CREATE SCHEDULE missing callback".to_string()))?,
+        missed_tick_policy,
+        catch_up_within_seconds,
+    })
+}
+
+fn build_drop_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let name = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("DROP SCHEDULE missing name".to_string()))?;
+    Ok(Statement::DropSchedule { name })
+}
+
+fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let mut name = None;
+    let mut table = None;
+    let mut event = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::identifier if table.is_none() => table = Some(parse_identifier(p.as_str())),
+            Rule::event_trigger => {
+                event = Some(match p.as_str().to_ascii_uppercase().as_str() {
+                    "INSERT" => TriggerEvent::Insert,
+                    "UPDATE" => TriggerEvent::Update,
+                    "DELETE" => TriggerEvent::Delete,
+                    _ => return Err(Error::ParseError("invalid trigger event".to_string())),
+                });
+            }
+            other => return Err(unexpected_rule(other, "build_create_trigger")),
+        }
+    }
+    Ok(Statement::CreateTrigger {
+        name: name.ok_or_else(|| Error::ParseError("CREATE TRIGGER missing name".to_string()))?,
+        table: table
+            .ok_or_else(|| Error::ParseError("CREATE TRIGGER missing table".to_string()))?,
+        on_events: vec![
+            event.ok_or_else(|| Error::ParseError("CREATE TRIGGER missing event".to_string()))?,
+        ],
+    })
+}
+
+fn build_drop_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let name = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("DROP TRIGGER missing name".to_string()))?;
+    Ok(Statement::DropTrigger { name })
+}
+
+fn build_create_event_type(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let mut name = None;
+    let mut when = None;
+    let mut table = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::identifier if table.is_none() => table = Some(parse_identifier(p.as_str())),
+            Rule::event_trigger => {
+                let trigger = match p.as_str().to_ascii_uppercase().as_str() {
+                    "INSERT" => EventTypeTrigger::Insert,
+                    "UPDATE" => EventTypeTrigger::Update,
+                    "DELETE" => EventTypeTrigger::Delete,
+                    _ => return Err(Error::ParseError("invalid event trigger".to_string())),
+                };
+                when = Some(trigger);
+            }
+            other => return Err(unexpected_rule(other, "build_create_event_type")),
+        }
+    }
+    Ok(Statement::CreateEventType {
+        name: name
+            .ok_or_else(|| Error::ParseError("CREATE EVENT TYPE missing name".to_string()))?,
+        when: when
+            .ok_or_else(|| Error::ParseError("CREATE EVENT TYPE missing trigger".to_string()))?,
+        table: table
+            .ok_or_else(|| Error::ParseError("CREATE EVENT TYPE missing table".to_string()))?,
+    })
+}
+
+fn build_create_sink(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let mut name = None;
+    let mut sink_type = None;
+    let mut url = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
+            Rule::sink_type => {
+                sink_type = Some(match p.as_str().to_ascii_lowercase().as_str() {
+                    "webhook" => SinkType::Webhook,
+                    "callback" => SinkType::Callback,
+                    _ => return Err(Error::ParseError("invalid sink type".to_string())),
+                });
+            }
+            Rule::sink_url_clause => {
+                url = p
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::string)
+                    .map(|inner| parse_string_literal(inner.as_str()));
+            }
+            other => return Err(unexpected_rule(other, "build_create_sink")),
+        }
+    }
+    Ok(Statement::CreateSink {
+        name: name.ok_or_else(|| Error::ParseError("CREATE SINK missing name".to_string()))?,
+        sink_type: sink_type
+            .ok_or_else(|| Error::ParseError("CREATE SINK missing type".to_string()))?,
+        url,
+    })
+}
+
+fn build_create_route(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let mut idents = Vec::new();
+    let mut where_in = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier => idents.push(parse_identifier(p.as_str())),
+            Rule::route_where_clause => {
+                let mut column = None;
+                let mut values = Vec::new();
+                for inner in p.into_inner() {
+                    match inner.as_rule() {
+                        Rule::identifier if column.is_none() => {
+                            column = Some(parse_identifier(inner.as_str()));
+                        }
+                        Rule::string => values.push(parse_string_literal(inner.as_str())),
+                        other => return Err(unexpected_rule(other, "build_create_route/where")),
+                    }
+                }
+                where_in = Some(RouteWhereIn {
+                    column: column.ok_or_else(|| {
+                        Error::ParseError("ROUTE WHERE missing column".to_string())
+                    })?,
+                    values,
+                });
+            }
+            other => return Err(unexpected_rule(other, "build_create_route")),
+        }
+    }
+    if idents.len() < 3 {
+        return Err(Error::ParseError(
+            "CREATE ROUTE requires name, event type, and sink".to_string(),
+        ));
+    }
+    Ok(Statement::CreateRoute {
+        name: idents[0].clone(),
+        event_type: idents[1].clone(),
+        sink: idents[2].clone(),
+        where_in,
+    })
+}
+
+fn build_drop_route(pair: Pair<'_, Rule>) -> Result<Statement> {
+    let name = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::identifier)
+        .map(|p| parse_identifier(p.as_str()))
+        .ok_or_else(|| Error::ParseError("DROP ROUTE missing name".to_string()))?;
+    Ok(Statement::DropRoute { name })
+}
+
 fn build_insert(pair: Pair<'_, Rule>) -> Result<Insert> {
     let mut table = None;
     let mut columns = Vec::new();
@@ -2117,6 +2568,7 @@ fn validate_expr(expr: &Expr) -> Result<()> {
             validate_expr(left)?;
             validate_expr(right)?;
         }
+        Expr::RowVectorSource { key, .. } => validate_row_vector_key_expr(key)?,
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 validate_expr(arg)?;
@@ -2166,6 +2618,7 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
             validate_subquery_expr(left, cte_names)?;
             validate_subquery_expr(right, cte_names)?;
         }
+        Expr::RowVectorSource { key, .. } => validate_row_vector_key_expr(key)?,
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 validate_subquery_expr(arg, cte_names)?;
@@ -2175,6 +2628,19 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_row_vector_key_expr(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Literal(Literal::Bool(_))
+        | Expr::Literal(Literal::Integer(_))
+        | Expr::Literal(Literal::Real(_))
+        | Expr::Literal(Literal::Text(_))
+        | Expr::Parameter(_) => Ok(()),
+        _ => Err(Error::PlanError(
+            "ROW_VECTOR key must be a literal or parameter".to_string(),
+        )),
+    }
 }
 
 fn unexpected_rule(rule: Rule, context: &str) -> Error {
@@ -2197,6 +2663,29 @@ fn parse_string_literal(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn parse_string_literals_in(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = raw.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch != '\'' {
+            continue;
+        }
+        let mut end = start + ch.len_utf8();
+        while let Some((idx, next)) = chars.next() {
+            end = idx + next.len_utf8();
+            if next == '\'' {
+                if matches!(chars.peek(), Some((_, '\''))) {
+                    let _ = chars.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        out.push(parse_string_literal(&raw[start..end]));
+    }
+    out
 }
 
 fn parse_u32(s: &str, err: &str) -> Result<u32> {

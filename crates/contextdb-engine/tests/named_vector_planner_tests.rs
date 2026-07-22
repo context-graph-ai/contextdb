@@ -97,12 +97,15 @@ fn nv07a_sync_vector_change_round_trip_preserves_table_column_identity() {
             },
         ],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let wire: WireChangeSet = original.clone().into();
     let bytes = rmp_serde::to_vec(&wire)
         .expect("rmp_serde encode (matches protocol_newtype_roundtrip pattern)");
     let decoded: WireChangeSet = rmp_serde::from_slice(&bytes).expect("rmp_serde decode");
-    let restored: ChangeSet = decoded.into();
+    let restored =
+        ChangeSet::try_from(decoded).expect("valid WireChangeSet must convert through protocol");
     assert_eq!(
         restored.vectors[0].index,
         VectorIndexRef::new("evidence", "vector_text")
@@ -148,6 +151,7 @@ fn nv07b_sync_apply_routes_to_matching_index() {
             values: row_values,
             deleted: false,
             lsn,
+            created_at: None,
         }],
         edges: vec![],
         vectors: vec![
@@ -165,6 +169,8 @@ fn nv07b_sync_apply_routes_to_matching_index() {
             },
         ],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     receiver
         .apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))
@@ -246,6 +252,7 @@ fn nv07c_receiver_promoted_to_leader_emits_correct_index_keyed_envelopes() {
             values: row_values,
             deleted: false,
             lsn,
+            created_at: None,
         }],
         edges: vec![],
         vectors: vec![
@@ -263,6 +270,8 @@ fn nv07c_receiver_promoted_to_leader_emits_correct_index_keyed_envelopes() {
             },
         ],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     receiver
         .apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))

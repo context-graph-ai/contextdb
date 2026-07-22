@@ -1211,7 +1211,7 @@ fn bf01_banned_features_table() {
     }
 }
 
-/// RED: cg effective-confidence fixture ranks by confidence times outcome.
+/// An effective-confidence fixture ranks by confidence times outcome.
 #[test]
 fn fe01_base_arithmetic() {
     let db = Database::open_memory();
@@ -2005,6 +2005,7 @@ fn sy04_sync_drop_table_respects_rank_policy_restrict() {
             ddl: vec![DdlChange::DropTable {
                 name: "outcomes".into(),
             }],
+            ddl_lsn: vec![Lsn(1)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -2037,6 +2038,7 @@ fn sy05_sync_drop_index_respects_rank_policy_restrict() {
                 table: "outcomes".into(),
                 name: "outcomes_decision_id_idx".into(),
             }],
+            ddl_lsn: vec![Lsn(1)],
             ..Default::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -2745,7 +2747,7 @@ fn write02_new_outcome_surfaces_new_rank() {
     assert_eq!(after[0].rank, 0.0);
 }
 
-/// RED: first-run walkthrough matches the cg search-ranking fixture ordering.
+/// First-run walkthrough matches the search-ranking fixture ordering.
 #[test]
 fn walk01_first_run_walkthrough() {
     let db = Database::open_memory();

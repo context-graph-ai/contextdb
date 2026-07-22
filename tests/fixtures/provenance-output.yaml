@@ -1,9 +1,6 @@
 ---
 fixture_basis: empirical
 source: "Full provenance expected output: [GO-02] assertions validating ProvenanceResult with snapshots, reasoning, precedents, approvals, outcome, and timeline"
-status: draft
-owner: claude
-last_updated: 2026-03-07
 ---
 
 # Full Provenance — Expected Output Fixture

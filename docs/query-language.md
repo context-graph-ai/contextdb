@@ -6,7 +6,9 @@ contextdb's query language is built on three standards:
 - **pgvector conventions** — `<=>` operator for cosine similarity in `ORDER BY`
 - **SQL/PGQ-style graph queries** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded graph traversal (not a full standard implementation)
 
-On top of these, contextdb adds **declarative constraints for agentic memory workloads**: `IMMUTABLE`, `STATE MACHINE`, `DAG`, `RETAIN`, and `PROPAGATE`. These are contextdb-specific extensions — everything else should feel familiar if you've used PostgreSQL.
+On top of these, contextdb adds **declarative policy primitives**: `IMMUTABLE`, `STATE MACHINE`, `DAG`, `RETAIN`, and `PROPAGATE`. These are contextdb-specific extensions — everything else should feel familiar if you've used PostgreSQL.
+
+contextdb ships with no built-in tables or schema. You define your own tables and attach these primitives to whichever columns need them. The example tables in this reference (`documents`, `tasks`, `items`, `media`, and so on) are illustrative only — stand-ins for whatever schema you design, not something contextdb provides.
 
 All examples work in the Rust API via `db.execute(sql, &params)` where parameters are passed as `HashMap<String, Value>`. The CLI REPL does not support parameter binding (`$param`) — use literal values directly. Vector search works in the CLI using vector literals: `ORDER BY embedding <=> [0.1, 0.2, 0.3] LIMIT 5`.
 
@@ -16,16 +18,34 @@ All examples work in the Rust API via `db.execute(sql, &params)` where parameter
 
 ### CREATE TABLE
 
+`documents` here is an example table you might define — there is no built-in schema; name your own tables and columns:
+
 ```sql
-CREATE TABLE observations (
+CREATE TABLE documents (
   id UUID PRIMARY KEY,
   data JSON,
   embedding VECTOR(384),
+  bucket TEXT,
   recorded_at TIMESTAMP DEFAULT NOW()
 ) IMMUTABLE
 ```
 
 See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, and PROPAGATE.
+
+Later examples in this reference also use a second illustrative table, `items`:
+
+```sql
+CREATE TABLE items (
+  id UUID PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  item_type TEXT,
+  context_id UUID,
+  is_deprecated BOOLEAN DEFAULT FALSE,
+  embedding VECTOR(384),
+  created_at TIMESTAMP DEFAULT NOW()
+)
+```
 
 ### ALTER TABLE
 
@@ -45,6 +65,30 @@ ALTER TABLE t DROP SYNC_CONFLICT_POLICY
 DROP TABLE t
 ```
 
+### CREATE TRIGGER
+
+```sql
+CREATE TRIGGER document_seen ON documents WHEN INSERT
+CREATE TRIGGER item_changed ON items WHEN UPDATE
+DROP TRIGGER document_seen
+```
+
+`CREATE TRIGGER` declares a host-callback ObservationTrigger. The callback is
+registered through the Rust API with `Database::register_trigger_callback` and
+activated by `Database::complete_initialization`. ObservationTriggers are for
+transactional observation and cascade writes; they are not validation triggers.
+Use `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` for engine-enforced
+invariants.
+
+Concurrency: the callback runs inside the firing transaction. Same-DB
+cross-thread writers wait-and-proceed, unrelated databases proceed
+independently, callback-thread reentry receives `CallbackReentry`, callback
+tx-bound handles stay isolated to the runner thread, cron same-DB contention
+remains immediate, and the bounded deadlock guard emits a structured
+`tracing::warn!` with `trigger_name`, `waited_ms`, and `surface`.
+See [Architecture](architecture.md#trigger-concurrency) for the operator
+runbook.
+
 ### CREATE INDEX
 
 ```sql
@@ -54,21 +98,21 @@ CREATE INDEX idx_name ON t (col)
 ### INSERT
 
 ```sql
-INSERT INTO observations (id, data, embedding)
+INSERT INTO documents (id, data, embedding)
 VALUES ($id, $data, $embedding)
 
 -- Multiple rows
-INSERT INTO entities (id, name) VALUES ($id1, $name1), ($id2, $name2)
+INSERT INTO items (id, name) VALUES ($id1, $name1), ($id2, $name2)
 
 -- Upsert
-INSERT INTO entities (id, name) VALUES ($id, $name)
+INSERT INTO items (id, name) VALUES ($id, $name)
 ON CONFLICT (id) DO UPDATE SET name = $name
 ```
 
 ### UPDATE / DELETE
 
 ```sql
-UPDATE decisions SET status = 'superseded' WHERE id = $id
+UPDATE tasks SET status = 'superseded' WHERE id = $id
 DELETE FROM scratch WHERE created_at < $cutoff
 ```
 
@@ -87,12 +131,30 @@ SELECT [DISTINCT] columns FROM table
 
 ```sql
 WITH active AS (
-  SELECT id, name FROM entities WHERE status = 'active'
+  SELECT id, name FROM items WHERE status = 'active'
 )
 SELECT * FROM active WHERE name LIKE 'sensor%'
 ```
 
 Multiple CTEs via comma separation. Non-recursive only.
+
+### Anchor-Shape vs List-Shape Reads
+
+Scoped handles filter ordinary reads to the rows visible to that handle. List
+shapes keep this silent-filter behavior: full scans, non-unique predicates,
+ranges, `IN (...)` predicates even on primary keys, ordered `LIMIT 1`, and
+sort-elided index walks return `Ok` with only visible rows.
+
+Explicit-anchor `SELECT` shapes are different. If a constrained handle names a
+specific row identity through equality on a primary key, a single-column
+`UNIQUE`, or every column of a composite `UNIQUE`, and the row exists but is
+hidden by the handle, the query returns the typed visibility error from the
+gate that hid it: `ContextScopeViolation`, `ScopeLabelViolation`, or
+`AclDenied`. Missing rows still return an empty result.
+
+Predicate writes keep their existing contract. `UPDATE ... WHERE pk = $id` and
+`DELETE ... WHERE pk = $id` against a hidden row return
+`Ok(rows_affected = 0)` rather than a typed read-refusal error.
 
 ### Transactions
 
@@ -142,10 +204,11 @@ NULL values display as `NULL`. Vectors display as `[0.1, 0.2, ...]`.
 Vector columns can choose per-index scalar quantization:
 
 ```sql
-CREATE TABLE evidence (
+CREATE TABLE media (
   id UUID PRIMARY KEY,
-  vector_text VECTOR(768) WITH (quantization = 'SQ8'),
-  vector_vision VECTOR(512) WITH (quantization = 'SQ4')
+  source TEXT,
+  vector_text VECTOR(8) WITH (quantization = 'SQ8'),
+  vector_vision VECTOR(4) WITH (quantization = 'SQ4')
 );
 ```
 
@@ -154,7 +217,7 @@ Each vector column is a separate `(table, column)` index. Search routes to the
 column named in `ORDER BY`:
 
 ```sql
-SELECT id FROM evidence
+SELECT id FROM media
 WHERE source = 'camera-1'
 ORDER BY vector_vision <=> '[0,0,1,0]' LIMIT 5;
 ```
@@ -190,20 +253,20 @@ Grammar shape:
 ```
 
 ```sql
-CREATE TABLE outcomes (
+CREATE TABLE task_results (
   id UUID PRIMARY KEY,
-  decision_id UUID NOT NULL,
+  task_id UUID NOT NULL,
   success BOOLEAN NOT NULL
 );
 
-CREATE INDEX outcomes_decision_id_idx ON outcomes(decision_id);
+CREATE INDEX task_results_task_id_idx ON task_results(task_id);
 
-CREATE TABLE decisions (
+CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL,
   confidence REAL,
   embedding VECTOR(384) RANK_POLICY (
-    JOIN outcomes ON decision_id,
+    JOIN task_results ON task_id,
     FORMULA 'coalesce({confidence}, 1.0) * coalesce({success}, 1.0)',
     SORT_KEY effective_confidence
   )
@@ -214,7 +277,7 @@ Use the policy during vector search with `USE RANK <sort_key>`:
 
 ```sql
 SELECT id, description
-FROM decisions
+FROM tasks
 ORDER BY embedding <=> $query USE RANK effective_confidence
 LIMIT 10;
 ```
@@ -223,7 +286,7 @@ Without `USE RANK`, the same query returns cosine ordering:
 
 ```sql
 SELECT id, description
-FROM decisions
+FROM tasks
 ORDER BY embedding <=> $query
 LIMIT 3;
 
@@ -237,7 +300,7 @@ With the policy, ordering uses the formula before the final `LIMIT`:
 
 ```sql
 SELECT id, description
-FROM decisions
+FROM tasks
 ORDER BY embedding <=> $query USE RANK effective_confidence
 LIMIT 3;
 
@@ -306,15 +369,34 @@ Current limits to account for in production designs:
 
 ## Column Constraints
 
+`projects` is another illustrative table, referenced below by a foreign key:
+
 ```sql
-CREATE TABLE decisions (
+CREATE TABLE projects (id UUID PRIMARY KEY, name TEXT NOT NULL)
+```
+
+```sql
+CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL,
   status TEXT NOT NULL,
   confidence REAL DEFAULT 0.0,
   email TEXT UNIQUE,
-  intention_id UUID REFERENCES intentions(id)
+  project_id UUID REFERENCES projects(id)
 )
+```
+
+Table-level composite foreign keys are supported when the referenced parent
+tuple is covered by an ordered `PRIMARY KEY` or `UNIQUE` constraint:
+
+```sql
+CREATE TABLE parent (tenant INTEGER, number INTEGER, UNIQUE(tenant, number));
+CREATE TABLE child (
+  id INTEGER PRIMARY KEY,
+  tenant INTEGER,
+  number INTEGER,
+  FOREIGN KEY (tenant, number) REFERENCES parent(tenant, number)
+);
 ```
 
 | Constraint | Description |
@@ -323,7 +405,7 @@ CREATE TABLE decisions (
 | `NOT NULL` | Value required |
 | `UNIQUE` | No duplicate values (single column). A duplicate INSERT on a `UNIQUE` column is a silent no-op (returns `Ok(rows_affected=0)`), matching the composite-uniqueness contract. |
 | `DEFAULT expr` | Default value for inserts |
-| `REFERENCES table(col)` | Foreign key — writes are rejected if the referenced row does not exist; in explicit transactions the error may surface at `COMMIT` |
+| `REFERENCES table(col)` / `FOREIGN KEY (...) REFERENCES ...` | Foreign key — writes are rejected if the referenced row or tuple does not exist; in explicit transactions the error may surface at `COMMIT` |
 | `IMMUTABLE` | Column is audit-frozen — INSERT sets the value once; `UPDATE`, `ON CONFLICT DO UPDATE`, sync-apply mutations, and schema-altering DDL against the column are rejected with `Error::ImmutableColumn` |
 
 ### Audit-Frozen Columns
@@ -331,9 +413,9 @@ CREATE TABLE decisions (
 An audit-frozen column carries data that must not be silently rewritten by anyone, through any path. Declare it with `IMMUTABLE`:
 
 ```sql
-CREATE TABLE decisions (
+CREATE TABLE tasks (
   id UUID PRIMARY KEY,
-  decision_type TEXT NOT NULL IMMUTABLE,
+  task_type TEXT NOT NULL IMMUTABLE,
   description TEXT NOT NULL IMMUTABLE,
   reasoning JSON,
   confidence REAL,
@@ -341,19 +423,19 @@ CREATE TABLE decisions (
 ) STATE MACHINE (status: active -> [superseded, archived])
 ```
 
-`decision_type` and `description` are provenance — set once at INSERT and never rewritten. `status` and `confidence` remain mutable. An `UPDATE decisions SET decision_type = '…'` returns `Error::ImmutableColumn`; the row is unchanged. Sync-apply across a NATS edge enforces the same rule on the peer: incoming row-changes that mutate a flagged column are rejected and surface in `ApplyResult.conflicts`. `ALTER TABLE ... DROP COLUMN`, `RENAME COLUMN`, and column-type-altering ALTER against a flagged column are refused.
+`task_type` and `description` are provenance — set once at INSERT and never rewritten. `status` and `confidence` remain mutable. An `UPDATE tasks SET task_type = '…'` returns `Error::ImmutableColumn`; the row is unchanged. Sync-apply across a synced edge enforces the same rule on the peer: incoming row-changes that mutate a flagged column are rejected and surface in `ApplyResult.conflicts`. `ALTER TABLE ... DROP COLUMN`, `RENAME COLUMN`, and column-type-altering ALTER against a flagged column are refused.
 
-Correction without rewrite — the supersede pattern. When a recorded decision turns out to be wrong, insert a new row with the corrected values and mark the original `superseded`:
+Correction without rewrite — the supersede pattern. When a recorded row turns out to be wrong, insert a new row with the corrected values and mark the original `superseded`:
 
 ```sql
 -- Original (frozen)
-INSERT INTO decisions (id, decision_type, description, status)
-VALUES ('…A', 'sql-migration', 'adopt contextdb', 'active');
+INSERT INTO tasks (id, task_type, description, status)
+VALUES ('11111111-1111-4111-8111-111111111111', 'sql-migration', 'migrate to contextdb', 'active');
 
 -- Correction: a new row, not an update. Both rows remain queryable.
-INSERT INTO decisions (id, decision_type, description, status)
-VALUES ('…B', 'sql-migration', 'adopt contextdb (rev 2)', 'active');
-UPDATE decisions SET status = 'superseded' WHERE id = '…A';
+INSERT INTO tasks (id, task_type, description, status)
+VALUES ('22222222-2222-4222-8222-222222222222', 'sql-migration', 'migrate to contextdb (rev 2)', 'active');
+UPDATE tasks SET status = 'superseded' WHERE id = '11111111-1111-4111-8111-111111111111';
 ```
 
 Nothing disappears. The audit trail shows both the original commitment and its correction.
@@ -379,28 +461,28 @@ A duplicate `(source_id, target_id, edge_type)` tuple is a silent no-op — the 
 Trigger a state change on this row when the referenced row transitions:
 
 ```sql
-CREATE TABLE decisions (
+CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   status TEXT NOT NULL,
-  intention_id UUID REFERENCES intentions(id)
+  project_id UUID REFERENCES projects(id)
     ON STATE archived PROPAGATE SET invalidated
 ) STATE MACHINE (status: active -> [invalidated, superseded])
 ```
 
-When an `intentions` row transitions to `archived`, any `decisions` row referencing it transitions to `invalidated`.
+When a `projects` row transitions to `archived`, any `tasks` row referencing it transitions to `invalidated`.
 
 ---
 
 ## Table Options
 
-Table options appear after the closing `)` of the column list. Multiple options can be combined.
+Table options appear after the closing `)` of the column list. Multiple options can be combined. They attach to whatever table and columns you define — contextdb has no built-in tables of its own.
 
 ### IMMUTABLE
 
-Rows cannot be updated or deleted after insertion. Useful for append-only data like observations and audit logs:
+Rows cannot be updated or deleted after insertion. Useful for append-only data like event logs and audit trails:
 
 ```sql
-CREATE TABLE observations (
+CREATE TABLE documents (
   id UUID PRIMARY KEY,
   data JSON,
   embedding VECTOR(384)
@@ -412,7 +494,7 @@ CREATE TABLE observations (
 Restrict a column's value transitions to declared edges:
 
 ```sql
-CREATE TABLE decisions (
+CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   status TEXT NOT NULL
 ) STATE MACHINE (status: draft -> [active, rejected], active -> [superseded])
@@ -458,21 +540,21 @@ ALTER TABLE scratch DROP RETAIN
 Cascade state changes along graph edges when a row transitions:
 
 ```sql
-CREATE TABLE decisions (
+CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   status TEXT NOT NULL
 ) STATE MACHINE (status: active -> [invalidated, superseded])
   PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated
 ```
 
-When a `decisions` row transitions to `invalidated`, rows connected via incoming `CITES` edges also transition to `invalidated`. Options: `INCOMING`, `OUTGOING`, `BOTH` for edge direction. `MAX DEPTH n` limits traversal. `ABORT ON FAILURE` rolls back if any propagation fails.
+When a `tasks` row transitions to `invalidated`, rows connected via incoming `CITES` edges also transition to `invalidated`. Options: `INCOMING`, `OUTGOING`, `BOTH` for edge direction. `MAX DEPTH n` limits traversal. `ABORT ON FAILURE` rolls back if any propagation fails.
 
 ### PROPAGATE ON STATE ... EXCLUDE VECTOR
 
 Remove a row's vector from similarity search results when it enters a given state, without deleting the row:
 
 ```sql
-CREATE TABLE decisions (...)
+CREATE TABLE tasks (...)
   PROPAGATE ON STATE invalidated EXCLUDE VECTOR
   PROPAGATE ON STATE superseded EXCLUDE VECTOR
 ```
@@ -482,12 +564,13 @@ CREATE TABLE decisions (...)
 Options compose — a real-world table might use several:
 
 ```sql
-CREATE TABLE decisions (
+CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL,
   status TEXT NOT NULL,
   confidence REAL,
-  intention_id UUID REFERENCES intentions(id)
+  created_at TIMESTAMP DEFAULT NOW(),
+  project_id UUID REFERENCES projects(id)
     ON STATE archived PROPAGATE SET invalidated,
   embedding VECTOR(384)
 ) STATE MACHINE (status: active -> [invalidated, superseded])
@@ -565,11 +648,11 @@ In the Rust API, parameters are passed as `HashMap<String, Value>`:
 
 ```rust
 let mut params = HashMap::new();
-params.insert("entity_id".into(), Value::Uuid(id));
+params.insert("item_id".into(), Value::Uuid(id));
 params.insert("type".into(), Value::Text("sensor".into()));
 
 let result = db.execute(
-    "SELECT * FROM entities WHERE id = $entity_id AND type = $type",
+    "SELECT * FROM items WHERE id = $item_id AND type = $type",
     &params,
 )?;
 ```
@@ -631,7 +714,7 @@ Use WHERE to filter after traversal, COLUMNS to project results:
 SELECT target_id FROM GRAPH_TABLE(
   edges
   MATCH (a)-[:DEPENDS_ON]->{1,3}(b)
-  WHERE a.id = '550e8400-...'
+  WHERE a.id = '550e8400-e29b-41d4-a716-446655440000'
   COLUMNS (b.id AS target_id)
 )
 ```
@@ -649,14 +732,14 @@ WITH deps AS (
     COLUMNS (b.id AS b_id)
   )
 )
-SELECT d.id, d.status FROM decisions d
-INNER JOIN deps ON d.id = deps.b_id
-WHERE d.status = 'active'
+SELECT t.id, t.status FROM tasks t
+INNER JOIN deps ON t.id = deps.b_id
+WHERE t.status = 'active'
 ```
 
 ### Graph + Vector: Neighborhood Similarity Search
 
-Find semantically similar entities within a graph neighborhood:
+Find semantically similar items within a graph neighborhood:
 
 ```sql
 WITH neighborhood AS (
@@ -668,9 +751,9 @@ WITH neighborhood AS (
 ),
 candidates AS (
   SELECT id, name, embedding
-  FROM entities e
-  INNER JOIN neighborhood n ON e.id = n.b_id
-  WHERE e.is_deprecated = FALSE
+  FROM items i
+  INNER JOIN neighborhood n ON i.id = n.b_id
+  WHERE i.is_deprecated = FALSE
 )
 SELECT id, name FROM candidates
 ORDER BY embedding <=> $query
@@ -687,24 +770,48 @@ Cosine distance between two vectors. Used in ORDER BY for nearest-neighbor searc
 
 ```sql
 -- Rust API with parameter binding
-SELECT id, data FROM observations
+SELECT id, data FROM documents
 ORDER BY embedding <=> $query_vector
 LIMIT 10
 
--- CLI with vector literal
-SELECT id, data FROM observations
-ORDER BY embedding <=> [0.1, 0.2, 0.3]
+-- CLI with vector literal (against a table with a short vector dimension,
+-- so the literal can be written out in full)
+CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4));
+
+SELECT id FROM evidence
+ORDER BY vector_text <=> [0.1, 0.2, 0.3, 0.4]
 LIMIT 10
 ```
 
 Lower distance = more similar. A `LIMIT` clause is required — unbounded vector searches are rejected.
+
+The query vector can also come from an existing row:
+
+```sql
+SELECT id, data FROM documents
+WHERE id != $query_id
+ORDER BY embedding <=> ROW_VECTOR('documents', 'embedding', $query_id)
+LIMIT 10
+```
+
+`ROW_VECTOR(table, column, key)` is only valid as the right side of `<=>` in
+`ORDER BY`. The table and column arguments are string literals naming a
+`VECTOR(n)` column, and `key` is a literal or parameter matched against the
+source table's natural key, usually its primary key. The source vector is read
+from the same MVCC snapshot as candidate filtering and vector scoring. Scoped
+handles honor source-row visibility: a hidden source row returns the same typed
+read-scope error as an explicit anchor read. Missing source tables return
+`TableNotFound`, non-vector source columns return `UnknownVectorIndex`,
+dimension mismatches return `VectorIndexDimensionMismatch`, missing source rows
+return `PersistedRowVectorRowMissing`, and rows with NULL vector cells return
+`PersistedRowVectorCellNull`.
 
 ### Pre-Filtered Search
 
 Combine WHERE filters with vector ranking. The engine filters first, then scores only matching rows:
 
 ```sql
-SELECT id, description FROM decisions
+SELECT id, description FROM tasks
 WHERE status = 'active'
 ORDER BY embedding <=> $query
 LIMIT 5
@@ -715,14 +822,17 @@ LIMIT 5
 The engine automatically selects the search strategy based on vector count:
 
 - Below ~1000 vectors: brute-force linear scan (exact)
-- At/above ~1000 vectors: HNSW approximate nearest neighbors (recall target >= 95%)
+- F32 at/above ~1000 vectors: HNSW approximate nearest neighbors (recall target >= 95%)
+- SQ8/SQ4 through 5000 vectors: exact scan to preserve self-recall; larger quantized indexes use HNSW
 
 No manual index creation needed. Use `.explain` in the CLI to see which strategy is active:
 
 ```
-contextdb> .explain SELECT id FROM observations ORDER BY embedding <=> $q LIMIT 5
-HNSWSearch { table: "observations", limit: 5 }
+contextdb> .explain SELECT id FROM documents ORDER BY embedding <=> $q LIMIT 5
+Scan -> VectorSearch
 ```
+
+Below the HNSW threshold the vector search is brute-force (`Scan -> VectorSearch`); once the index switches to HNSW the same line reads `Scan -> HNSWSearch`.
 
 ---
 
@@ -732,7 +842,7 @@ Both styles are stripped before parsing:
 
 ```sql
 -- Line comment
-SELECT * FROM entities; /* Block comment */
+SELECT * FROM items; /* Block comment */
 ```
 
 ---
@@ -762,13 +872,13 @@ read sees the set of rows live at its snapshot.
 ### CREATE INDEX
 
 ```sql
-CREATE INDEX idx_bucket ON observations (bucket);
+CREATE INDEX idx_bucket ON documents (bucket);
 
 -- Per-column direction
-CREATE INDEX idx_recent ON decisions (created_at DESC, id DESC);
+CREATE INDEX idx_recent ON tasks (created_at DESC, id DESC);
 
--- Composite index (leading-column equality + residual filter)
-CREATE INDEX idx_entities ON entities (context_id, entity_type, created_at DESC, id DESC);
+-- Composite index (leading-prefix equality pushdown)
+CREATE INDEX idx_items ON items (context_id, item_type, created_at DESC, id DESC);
 ```
 
 Indexable column types: `INTEGER`, `TEXT`, `UUID`, `TIMESTAMP`, `TXID`,
@@ -782,8 +892,8 @@ returns `DuplicateIndex`; the same name on two different tables is allowed.
 ### DROP INDEX
 
 ```sql
-DROP INDEX idx_bucket ON observations;
-DROP INDEX IF EXISTS idx_bucket ON observations;
+DROP INDEX idx_bucket ON documents;
+DROP INDEX IF EXISTS idx_bucket ON documents;
 ```
 
 `DROP INDEX` without `IF EXISTS` on a nonexistent index returns
@@ -819,15 +929,81 @@ named `__pk_<col>` for `PRIMARY KEY`, `__unique_<col>` for a single-column
 `UNIQUE (col1, col2, ...)` constraint. These indexes exist so PK / UNIQUE
 constraint probes run in O(log n) and so `SELECT ... WHERE pk_col = $v`
 queries pick an `IndexScan` without requiring a user `CREATE INDEX`.
+Composite foreign keys also create child-side `__fk_...` auto-indexes so
+parent deletes and tuple validation do not rely on table scans. A table whose
+columns include `source_id`, `target_id`, and `edge_type` — the edge-row shape
+graph traversal uses — additionally gets an internal
+`__graph_edge_source_target_type` route index over that column triple, so
+adjacency lookups do not scan. Because it covers the same three columns, it ties
+a user-declared `(source_id, target_id, edge_type)` index and wins routing only
+by creation order; both are fully index-driven.
 
 Auto-indexes are elided from `.schema` output to keep schema printouts
 focused on user-authored DDL. They remain visible in `EXPLAIN <query>`
 output as index candidates so agents can programmatically confirm that
 a query routed through the auto-index rather than a table scan.
 
-User-declared index names must not begin with `__pk_` or `__unique_`.
+When several user-declared or auto-indexes can route a filtered scan, contextdb
+chooses the index with the longest matched leading prefix. Equality, `IN`, and
+`IS NULL` on the first indexed column can push adjacent suffix equalities into
+the same B-tree probe, so an index on `(source_id, target_id, edge_type)` is
+preferred over `(source_id)` for `WHERE source_id IN (...) AND target_id = ...
+AND edge_type = ...`. If two indexes match the same number of leading columns,
+the more selective leading predicate wins (`=` / `IN` before range predicates
+and `!=`, before `IS NULL` / `IS NOT NULL`). A remaining tie is resolved by index
+creation order. This choice is intentionally based on filter selectivity, not
+`ORDER BY`; a later sort can still be elided when the chosen index order proves
+compatible with the requested ordering.
+
+User-declared index names must not begin with `__pk_`, `__unique_`, or `__fk_`.
 `CREATE INDEX __pk_id ON t (id)` returns
 `ReservedIndexName { table, name, prefix }`.
+
+### Index-Selection Trace Reasons
+
+`.explain <sql>` and `QueryResult.trace` expose the chosen route and the
+rejected index candidates. A routed composite prefix renders every pushed
+column in index order:
+
+```text
+IndexScan { index: idx_edges_route }
+  predicates_pushed: [source_id, target_id, edge_type]
+  indexes_considered: [idx_edges_source: fewer predicate columns matched than chosen index]
+```
+
+Rejected candidates use stable reason strings so commercial products and
+agents can distinguish a missed index from a deliberate planner decision:
+
+| Reason | Meaning |
+|--------|---------|
+| `first column not in WHERE` | The index's leading column is absent from the filter. |
+| `function call in predicate` | The leading column is wrapped in a function such as `UPPER(col)`. |
+| `arithmetic in predicate` | The leading column appears inside arithmetic such as `col + 1`. |
+| `non-literal rhs` | The leading predicate compares to another column or subquery rather than a literal or bound parameter. |
+| `LIKE is residual-only` | `LIKE` remains a residual filter and does not drive an index scan. |
+| `fewer predicate columns matched than chosen index` | Another index matched a longer leading prefix. |
+| `lower selectivity than chosen index` | Another index matched the same prefix length with a more selective leading predicate. |
+| `tied with chosen index; lost by creation order` | The candidates were otherwise equivalent and the earlier index won. |
+| `no pinned vertex` | A graph adjacency candidate was rejected because the single-hop graph query had no pinned start or target vertex. |
+
+### Graph Adjacency Probe
+
+Single-hop `GRAPH_TABLE ... MATCH` queries with a pinned start or target vertex
+route through the per-vertex graph adjacency index automatically. No
+`CREATE INDEX` statement or schema change is required. In the CLI, run
+`.trace on` before the query to see the physical routing:
+
+```text
+trace: AdjacencyProbe index=forward_adj pushed=[a.id] rows_examined=5
+```
+
+`forward_adj` and `reverse_adj` are public trace identifiers for the chosen
+direction. For a single-hop query pinned directly by `a.id` or `b.id`,
+`rows_examined` is the pinned vertex's visible degree. When the pin is resolved
+from node metadata, the count also includes the start/target resolution work
+before the degree walk. An unpinned single-hop query reports `EdgesScan` and
+records the rejected adjacency candidate with reason `no pinned vertex` in the
+programmatic trace. Multi-hop or variable-length traversals report `GraphBfs`.
 
 ### Error variants
 
@@ -838,4 +1014,4 @@ User-declared index names must not begin with `__pk_` or `__unique_`.
 | `ColumnNotIndexable { table, column, column_type }` | `CREATE INDEX` on a `JSON` or `VECTOR` column |
 | `ColumnInIndex { table, column, index }` | `ALTER TABLE ... DROP COLUMN c RESTRICT` on a column referenced by an index |
 | `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table |
-| `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_` or `__unique_` (reserved for auto-indexes) |
+| `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_`, `__unique_`, or `__fk_` (reserved for auto-indexes) |

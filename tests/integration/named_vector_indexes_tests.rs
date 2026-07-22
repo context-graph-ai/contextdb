@@ -1061,7 +1061,7 @@ fn nv02b_null_vector_column_produces_no_index_entry() {
     )
     .expect("create");
 
-    // The cg evidence shape: a Text-kind row populates vector_text only; vector_vision is NULL.
+    // A downstream evidence shape: a Text-kind row populates vector_text only; vector_vision is NULL.
     let text_row = Uuid::new_v4();
     db.execute(
         "INSERT INTO evidence (id, kind, vector_text) VALUES ($id, $k, $t)",
@@ -1241,7 +1241,7 @@ fn nv14_snapshot_isolation_across_two_indexes() {
     let writer_db = Arc::clone(&db);
     let id = Uuid::new_v4();
     let writer = thread::spawn(move || -> Result<RowId, Error> {
-        let tx = writer_db.begin();
+        let tx = writer_db.begin_or_panic();
         let row_id = writer_db.insert_row(tx, "evidence", values(vec![("id", Value::Uuid(id))]))?;
         writer_db.insert_vector(
             tx,
@@ -1355,7 +1355,7 @@ fn nv14b_three_way_unified_transaction_atomicity() {
     // writes — that's what makes this a "unified-tx" test.
     let entity_id = Uuid::new_v4();
     let evidence_id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let _entity_row = db
         .insert_row(tx, "entities", values(vec![("id", Value::Uuid(entity_id))]))
         .expect("insert entity");
@@ -1651,8 +1651,8 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
     assert_eq!(column, "vector_text");
 
     // SHOW VECTOR_INDEXES surface columns are exactly the engine-level columns — no space_id, no
-    // cg-side metadata. cg's embedding_space_bindings table joins these (table, column) pairs back
-    // to embedding_space_id at the cg layer.
+    // downstream-side metadata. A downstream embedding_space_bindings table joins these
+    // (table, column) pairs back to embedding_space_id at the downstream layer.
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4))",
@@ -1676,7 +1676,7 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
     for col in &indexes.columns {
         assert!(
             allowed.contains(col.as_str()),
-            "SHOW VECTOR_INDEXES column `{col}` is not in the engine-only allowlist; embedding_space_id and cg-side metadata must NOT appear in the engine surface"
+            "SHOW VECTOR_INDEXES column `{col}` is not in the engine-only allowlist; embedding_space_id and downstream-side metadata must NOT appear in the engine surface"
         );
     }
 }
@@ -1719,6 +1719,7 @@ fn nv19b_changeset_ddl_applies_before_vector_changes_for_new_index() {
             values: row_values, // contains only id and vector_text; vector_vision is delivered ONLY via VectorChange
             deleted: false,
             lsn,
+            created_at: None,
         }],
         edges: vec![],
         vectors: vec![
@@ -1739,7 +1740,12 @@ fn nv19b_changeset_ddl_applies_before_vector_changes_for_new_index() {
             name: "evidence".into(),
             columns: vec![("vector_vision".into(), "VECTOR(8)".into())],
             constraints: vec![],
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
         }],
+
+        ddl_lsn: vec![contextdb_core::Lsn(10)],
     };
     receiver
         .apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))
@@ -2253,7 +2259,15 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
     use contextdb_engine::sync_types::{
         ChangeSet, ConflictPolicies, ConflictPolicy, NaturalKey, RowChange,
     };
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
 
     let receiver = Database::open_memory();
     receiver
@@ -2273,7 +2287,8 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
         )
         .expect("seed");
 
-    std::thread::sleep(Duration::from_millis(1500));
+    // Advance 1.5 s past the row's stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(1_500, AtomicOrdering::SeqCst);
     receiver.run_pruning_cycle();
 
     // The index is REGISTERED (DDL didn't change) but vector_count is 0. A push from a writer with a
@@ -2315,6 +2330,7 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
             values: row_values,
             deleted: false,
             lsn: Lsn(20),
+            created_at: None,
         }],
         edges: vec![],
         vectors: vec![VectorChange {
@@ -2324,6 +2340,8 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
             lsn: Lsn(20),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     receiver
         .apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))
@@ -2564,8 +2582,8 @@ fn nv13c_multi_row_multi_vector_insert_partial_failure_rolls_back_atomically() {
     )
     .expect("create");
 
-    // The cg ingest shape: one INSERT statement carries N rows (e.g., a vigil frame with N detected
-    // faces ingested as N evidence rows). One bad row anywhere in the batch must roll back the whole
+    // A downstream ingest shape: one INSERT statement carries N rows (e.g., a video frame with N
+    // detected objects ingested as N evidence rows). One bad row anywhere in the batch must roll back the whole
     // statement — not just the offending row.
     let id_a = Uuid::new_v4();
     let id_b = Uuid::new_v4(); // bad row: vector_vision dim 7
@@ -2744,7 +2762,7 @@ fn nv14c_record_observation_fanout_unified_tx_atomicity() {
 
     let pre_snap = db.snapshot();
 
-    // The cg record_observation fanout: 1 entity + 1 snapshot + 3 evidence rows (text, vision, mixed)
+    // A downstream record_observation fanout: 1 entity + 1 snapshot + 3 evidence rows (text, vision, mixed)
     // + a graph edge linking entity → snapshot, all in ONE transaction.
     let entity_id = Uuid::new_v4();
     let snapshot_id = Uuid::new_v4();
@@ -2753,7 +2771,7 @@ fn nv14c_record_observation_fanout_unified_tx_atomicity() {
     let ev2 = Uuid::new_v4();
     let ev3 = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(tx, "entities", values(vec![("id", Value::Uuid(entity_id))]))
         .expect("insert entity");
     db.insert_row(
@@ -2923,7 +2941,7 @@ fn nv_subscription_event_includes_table_for_vector_only_change() {
 
     // Seed and commit the relational row first. The observed commit below must be vector-only.
     let id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, "evidence", values(vec![("id", Value::Uuid(id))]))
         .expect("seed row");
@@ -2941,6 +2959,8 @@ fn nv_subscription_event_includes_table_for_vector_only_change() {
             lsn: Lsn(10),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins))
         .expect("apply vector-only");
@@ -2960,7 +2980,15 @@ fn nv_subscription_event_includes_table_for_vector_only_change() {
 
 #[test]
 fn nv_retain_prunes_every_vector_index_for_expired_row() {
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
 
     let db = Database::open_memory();
     db.execute(
@@ -2987,7 +3015,8 @@ fn nv_retain_prunes_every_vector_index_for_expired_row() {
     )
     .expect("insert");
 
-    std::thread::sleep(Duration::from_millis(1500));
+    // Advance 1.5 s past the row's stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(1_500, AtomicOrdering::SeqCst);
     db.run_pruning_cycle(); // returns u64 (count pruned); no Result, so no .expect()
 
     // Both indexes must drop the expired row — not just the first registered.
@@ -3267,9 +3296,9 @@ fn nv17_protocol_version_mismatch_returns_typed_error() {
 
 #[test]
 fn nv17b_protocol_version_mismatch_rejects_lower_version_envelopes() {
-    use contextdb_server::protocol::{Envelope, MessageType, decode};
+    use contextdb_server::protocol::{Envelope, MessageType, PROTOCOL_VERSION, decode};
 
-    // A v2 receiver must also reject a v1 envelope, not just envelopes claiming a higher version.
+    // The current receiver must also reject a v1 envelope, not just envelopes claiming a higher version.
     // Without symmetric rejection, the asymmetric-upgrade detection contract (RB17) is unwired.
     let envelope = Envelope {
         version: 1,
@@ -3279,20 +3308,17 @@ fn nv17b_protocol_version_mismatch_rejects_lower_version_envelopes() {
     let bytes = rmp_serde::to_vec(&envelope).expect("encode envelope");
 
     let result = decode(&bytes);
-    // At Step 3 stub time: PROTOCOL_VERSION = 1 and the guard is still `version > PROTOCOL_VERSION`,
-    // so a v1 envelope returns Ok(_) and the matches! arm fails — RED. After Step 5 sub-batch B4,
-    // PROTOCOL_VERSION = 2 and the guard becomes `version != PROTOCOL_VERSION`, returning the typed variant.
     assert!(
         matches!(
             result,
             Err(
                 contextdb_server::error::SyncError::ProtocolVersionMismatch {
                     received: 1,
-                    supported: 2
+                    supported: PROTOCOL_VERSION
                 }
             )
         ),
-        "v2 receiver must reject v1 envelope (asymmetric upgrade detection); got {result:?}"
+        "current receiver must reject v1 envelope (asymmetric upgrade detection); got {result:?}"
     );
 }
 
@@ -3320,6 +3346,8 @@ fn nv19_unknown_index_apply_returns_typed_error() {
             lsn: contextdb_core::Lsn(1),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let res = receiver.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::ServerWins));
     assert!(matches!(
@@ -3338,6 +3366,8 @@ fn nv19_unknown_index_apply_returns_typed_error() {
             lsn: contextdb_core::Lsn(2),
         }],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let res = receiver.apply_changes(
         existing_table_unknown_column,
@@ -3368,7 +3398,7 @@ fn nv19_unknown_index_apply_returns_typed_error() {
         "raw Rust API query_vector must reject undeclared indexes, not silently search/create an ad-hoc slot; got {raw_query:?}"
     );
 
-    let tx = receiver.begin();
+    let tx = receiver.begin_or_panic();
     let raw_row_id = receiver
         .insert_row(
             tx,
@@ -3410,6 +3440,8 @@ fn nv19_unknown_index_apply_returns_typed_error() {
             },
         ],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let mut directions = HashMap::new();
     directions.insert("evidence".to_string(), SyncDirection::Push);
@@ -3431,7 +3463,7 @@ fn nv19_unknown_index_apply_returns_typed_error() {
 #[test]
 fn nv19c_insert_vector_against_undeclared_index_fails() {
     let db = Database::open_memory();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let result = db.insert_vector(
         tx,
         VectorIndexRef::new("nonexistent", "vector_x"),

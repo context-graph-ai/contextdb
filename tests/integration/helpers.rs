@@ -1,4 +1,4 @@
-use contextdb_core::Value;
+use contextdb_core::{TxId, Value, VersionedRow};
 use contextdb_engine::Database;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -16,74 +16,21 @@ pub fn embedding384(values: &[f32]) -> Vec<f32> {
 }
 
 pub fn setup_ontology_db() -> Database {
-    let db = Database::open_memory();
-    let params = HashMap::new();
-
-    db.execute(
-        "CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT)",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT, status TEXT)",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT, confidence REAL, embedding VECTOR(2))",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT, embedding VECTOR(2))",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, entity_id UUID, state JSON, valid_from INTEGER, valid_to INTEGER)",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE observations (id UUID PRIMARY KEY, entity_id UUID, data JSON, embedding VECTOR(384)) IMMUTABLE",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID, success BOOLEAN)",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE invalidations (id UUID PRIMARY KEY, affected_decision_id UUID, status TEXT, severity TEXT) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed])",
-        &params,
-    )
-    .unwrap();
-    db.execute(
+    setup_ontology_db_with_edges(
         "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT)",
-        &params,
     )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE approvals (id UUID PRIMARY KEY, decision_id UUID)",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE patterns (id UUID PRIMARY KEY, description TEXT)",
-        &params,
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE sync_state (id UUID PRIMARY KEY, push_watermark INTEGER, pull_watermark INTEGER)",
-        &params,
-    )
-    .unwrap();
-
-    db
 }
 
 pub fn setup_ontology_db_with_dag() -> Database {
+    setup_ontology_db_with_edges(
+        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
+    )
+}
+
+/// The shared ontology schema. `setup_ontology_db` and
+/// `setup_ontology_db_with_dag` are byte-identical except for the `edges` table
+/// declaration, which is the one line they pass in here.
+fn setup_ontology_db_with_edges(edges_ddl: &str) -> Database {
     let db = Database::open_memory();
     let params = HashMap::new();
 
@@ -127,11 +74,7 @@ pub fn setup_ontology_db_with_dag() -> Database {
         &params,
     )
     .unwrap();
-    db.execute(
-        "CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('CITES')",
-        &params,
-    )
-    .unwrap();
+    db.execute(edges_ddl, &params).unwrap();
     db.execute(
         "CREATE TABLE approvals (id UUID PRIMARY KEY, decision_id UUID)",
         &params,
@@ -224,7 +167,7 @@ pub fn setup_impact_analysis_scenario(db: &Database) -> (Uuid, Uuid, Uuid) {
     let decision1_id = Uuid::new_v4();
     let decision2_id = Uuid::new_v4();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",
@@ -278,4 +221,54 @@ pub fn make_params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect::<HashMap<_, _>>()
+}
+
+pub fn text<'a>(row: &'a VersionedRow, key: &str) -> &'a str {
+    row.values.get(key).and_then(Value::as_text).expect("text")
+}
+
+pub fn insert_decision(
+    db: &Database,
+    tx: TxId,
+    id: Uuid,
+    description: &str,
+    status: &str,
+    confidence: f64,
+) {
+    db.insert_row(
+        tx,
+        "decisions",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            (
+                "description".to_string(),
+                Value::Text(description.to_string()),
+            ),
+            ("status".to_string(), Value::Text(status.to_string())),
+            ("confidence".to_string(), Value::Float64(confidence)),
+        ]),
+    )
+    .expect("insert decision");
+}
+
+pub fn insert_entity(db: &Database, tx: TxId, id: Uuid, name: &str, state: &str) {
+    db.insert_row(
+        tx,
+        "entities",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("name".to_string(), Value::Text(name.to_string())),
+            (
+                "entity_type".to_string(),
+                Value::Text("SERVICE".to_string()),
+            ),
+            ("properties".to_string(), Value::Text(state.to_string())),
+        ]),
+    )
+    .expect("insert entity");
+}
+
+pub fn add_edge(db: &Database, tx: TxId, s: Uuid, t: Uuid, ty: &str) {
+    db.insert_edge(tx, s, t, ty.to_string(), HashMap::new())
+        .expect("insert edge");
 }

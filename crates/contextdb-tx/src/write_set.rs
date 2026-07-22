@@ -1,15 +1,25 @@
 use contextdb_core::*;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationalDeletePredicate {
+    pub table: TableName,
+    pub predicates: Vec<(ColName, Value)>,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct WriteSet {
     pub relational_inserts: Vec<(TableName, VersionedRow)>,
     pub relational_deletes: Vec<(TableName, RowId, TxId)>,
+    pub relational_delete_predicates: Vec<RelationalDeletePredicate>,
     pub adj_inserts: Vec<AdjEntry>,
     pub adj_deletes: Vec<(NodeId, EdgeType, NodeId, TxId)>,
     pub vector_inserts: Vec<VectorEntry>,
     pub vector_deletes: Vec<(VectorIndexRef, RowId, TxId)>,
     pub vector_moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
     pub commit_lsn: Option<Lsn>,
+    pub relational_insert_source_lsns: HashMap<TableName, HashMap<RowId, Lsn>>,
+    pub visibility_floor: Option<TxId>,
     pub propagation_in_progress: bool,
 }
 
@@ -43,15 +53,107 @@ impl WriteSet {
             entry.lsn = lsn;
         }
     }
+
+    pub fn canonicalize_final_state(&mut self) {
+        if self.relational_inserts.len() > 1 {
+            let mut seen = HashSet::new();
+            let mut inserts = self
+                .relational_inserts
+                .drain(..)
+                .rev()
+                .filter(|(table, row)| seen.insert((table.clone(), row.row_id)))
+                .collect::<Vec<_>>();
+            inserts.reverse();
+            self.relational_inserts = inserts;
+        }
+    }
+
+    pub fn reassign_tx(&mut self, from: TxId, to: TxId) {
+        if from == to {
+            return;
+        }
+
+        for (_, row) in &mut self.relational_inserts {
+            if row.created_tx == from {
+                row.created_tx = to;
+            }
+            if row.deleted_tx == Some(from) {
+                row.deleted_tx = Some(to);
+            }
+        }
+        for (_, _, deleted_tx) in &mut self.relational_deletes {
+            if *deleted_tx == from {
+                *deleted_tx = to;
+            }
+        }
+        for entry in &mut self.adj_inserts {
+            if entry.created_tx == from {
+                entry.created_tx = to;
+            }
+            if entry.deleted_tx == Some(from) {
+                entry.deleted_tx = Some(to);
+            }
+        }
+        for (_, _, _, deleted_tx) in &mut self.adj_deletes {
+            if *deleted_tx == from {
+                *deleted_tx = to;
+            }
+        }
+        for entry in &mut self.vector_inserts {
+            if entry.created_tx == from {
+                entry.created_tx = to;
+            }
+            if entry.deleted_tx == Some(from) {
+                entry.deleted_tx = Some(to);
+            }
+        }
+        for (_, _, deleted_tx) in &mut self.vector_deletes {
+            if *deleted_tx == from {
+                *deleted_tx = to;
+            }
+        }
+        for (_, _, _, tx) in &mut self.vector_moves {
+            if *tx == from {
+                *tx = to;
+            }
+        }
+    }
+
+    pub fn set_relational_insert_source_lsn(
+        &mut self,
+        table: impl Into<TableName>,
+        row_id: RowId,
+        lsn: Lsn,
+    ) {
+        self.relational_insert_source_lsns
+            .entry(table.into())
+            .or_default()
+            .insert(row_id, lsn);
+    }
+}
+
+pub fn row_matches_delete_predicates(
+    predicates: &[RelationalDeletePredicate],
+    table: &str,
+    row: &VersionedRow,
+) -> bool {
+    predicates.iter().any(|predicate| {
+        predicate.table == table
+            && !predicate.predicates.is_empty()
+            && predicate
+                .predicates
+                .iter()
+                .all(|(column, value)| row.values.get(column) == Some(value))
+    })
 }
 
 pub trait WriteSetApplicator: Send + Sync {
-    fn apply(&self, ws: WriteSet) -> Result<()>;
+    fn apply(&self, ws: &WriteSet) -> Result<()>;
     fn new_row_id(&self) -> RowId;
 }
 
 impl WriteSetApplicator for Box<dyn WriteSetApplicator> {
-    fn apply(&self, ws: WriteSet) -> Result<()> {
+    fn apply(&self, ws: &WriteSet) -> Result<()> {
         (**self).apply(ws)
     }
 

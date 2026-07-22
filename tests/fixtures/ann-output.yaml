@@ -1,13 +1,10 @@
 ---
 fixture_basis: hypothetical
 source: "ANN search expected output with hand-computed cosine similarities for 4-dim vectors, top-3 results by similarity"
-status: draft
-owner: claude
-last_updated: 2026-03-07
 ---
 
 # ANN Search — Expected Output Fixture
-# NOTE: hypothetical fixture — pay 2x attention during spike validation
+# NOTE: hand-computed / hypothetical values
 
 # Query vector: [1.0, 0.0, 0.0, 0.0]
 # Cosine similarity = dot(a,b) / (|a| * |b|)

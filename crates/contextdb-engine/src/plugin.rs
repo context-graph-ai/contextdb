@@ -1,5 +1,5 @@
 use crate::sync_types::{ChangeSet, DdlChange};
-use contextdb_core::{Lsn, Result};
+use contextdb_core::{Error, Lsn, Result};
 use contextdb_tx::WriteSet;
 use std::time::Duration;
 
@@ -33,6 +33,7 @@ pub trait DatabasePlugin: Send + Sync {
         Ok(())
     }
     fn post_commit(&self, _ws: &WriteSet, _source: CommitSource) {}
+    fn commit_failed(&self, _ws: &WriteSet, _source: CommitSource, _error: &Error) {}
     fn on_open(&self) -> Result<()> {
         Ok(())
     }

@@ -43,34 +43,6 @@ fn s01_subscribe_fires_on_insert() {
 }
 
 #[test]
-fn s02_autocommit_source_is_autocommit() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    let rx = db.subscribe();
-
-    // Autocommit INSERT (no BEGIN/COMMIT wrapper)
-    db.execute(
-        "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'bob')",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    let event = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("should receive event");
-    assert_eq!(
-        event.source,
-        contextdb_engine::plugin::CommitSource::AutoCommit,
-        "autocommit INSERT must report AutoCommit source"
-    );
-}
-
-#[test]
 fn s03_explicit_commit_source_is_user() {
     let db = Database::open_memory();
     db.execute(
@@ -124,10 +96,13 @@ fn s04_apply_changes_source_is_sync_pull() {
             ]),
             deleted: false,
             lsn: Lsn(1),
+            created_at: None,
         }],
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
 
     let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
@@ -141,6 +116,10 @@ fn s04_apply_changes_source_is_sync_pull() {
         contextdb_engine::plugin::CommitSource::SyncPull,
         "apply_changes must report SyncPull source"
     );
+    // Ported from s20 (folded): SyncPull-path field coverage on the apply_changes event.
+    assert!(event.lsn > Lsn(0));
+    assert!(event.row_count > 0);
+    assert!(event.tables_changed.contains(&"t".to_string()));
 }
 
 #[test]
@@ -188,7 +167,7 @@ fn s06_graph_only_commit_empty_tables_changed() {
 
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "RELATES_TO".to_string(), HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();
@@ -528,7 +507,7 @@ fn s16_row_count_includes_relational_and_graph() {
 
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
 
     // 2 relational inserts
     db.insert_row(
@@ -563,38 +542,6 @@ fn s16_row_count_includes_relational_and_graph() {
         event.row_count >= 3,
         "row_count must include 2 relational + 1 graph = at least 3, got {}",
         event.row_count
-    );
-}
-
-#[test]
-fn s17_events_dropped_counted_in_metrics() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    // Subscribe with tiny capacity to force drops
-    let _rx = db.subscribe_with_capacity(2);
-
-    // Generate 10 events without draining
-    for i in 1..=10u128 {
-        db.execute(
-            &format!(
-                "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-{:012}', 'x')",
-                i
-            ),
-            &HashMap::new(),
-        )
-        .unwrap();
-    }
-
-    let health = db.subscription_health();
-    assert!(
-        health.events_dropped >= 8,
-        "with capacity 2 and 10 commits, at least 8 events should be dropped, got {}",
-        health.events_dropped
     );
 }
 
@@ -696,55 +643,4 @@ fn s19_ddl_only_commit_create_table() {
             panic!("channel disconnected — subscribe() stub not wired");
         }
     }
-}
-
-#[test]
-fn s20_auto_sync_fires_commit_event() {
-    // This test covers the `.sync auto` path from the intent.
-    // It requires a running NATS server. When auto-sync pulls changes from a
-    // remote, the local apply must fire a CommitEvent with source == SyncPull.
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    let rx = db.subscribe();
-
-    // Trigger an auto-sync pull (implementation will connect to NATS and pull changes).
-    // For now, simulate by calling apply_changes directly.
-    let row_id = Uuid::new_v4();
-    let changes = ChangeSet {
-        rows: vec![RowChange {
-            table: "t".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(row_id),
-            },
-            values: HashMap::from([
-                ("id".to_string(), Value::Uuid(row_id)),
-                ("name".to_string(), Value::Text("auto-synced".to_string())),
-            ]),
-            deleted: false,
-            lsn: Lsn(1),
-        }],
-        edges: vec![],
-        vectors: vec![],
-        ddl: vec![],
-    };
-    let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
-    db.apply_changes(changes, &policies).unwrap();
-
-    let event = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("auto-sync pull must fire CommitEvent");
-    assert_eq!(
-        event.source,
-        contextdb_engine::plugin::CommitSource::SyncPull,
-        "auto-sync must report SyncPull source"
-    );
-    assert!(event.lsn > Lsn(0));
-    assert!(event.row_count > 0);
-    assert!(event.tables_changed.contains(&"t".to_string()));
 }

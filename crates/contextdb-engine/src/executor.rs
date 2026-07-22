@@ -1,15 +1,19 @@
-use crate::database::{Database, InsertRowResult, QueryResult, QueryTrace, rank_index_name};
+use crate::database::{
+    Database, InsertRowResult, QueryResult, QueryTrace, UpdateReplacementContext,
+    UpsertIntentDetails, rank_index_name,
+};
 use crate::rank_formula::RankFormula;
 use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
 use contextdb_parser::ast::{
-    AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
-    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
+    AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, RetainedSyncDirection,
+    SelectStatement, SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
 };
 use contextdb_planner::{
     DeletePlan, GraphStepPlan, InsertPlan, OnConflictPlan, PhysicalPlan, UpdatePlan, plan,
 };
 use roaring::RoaringTreemap;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -25,19 +29,29 @@ pub(crate) fn execute_plan(
 ) -> Result<QueryResult> {
     match plan {
         PhysicalPlan::CreateTable(p) => {
+            require_admin_for_create_table(db)?;
             db.check_disk_budget("CREATE TABLE")?;
+            if p.name.eq_ignore_ascii_case("acl_grants")
+                && p.columns.iter().any(|column| column.acl_ref.is_some())
+            {
+                return Err(Error::SchemaInvalid {
+                    reason: "acl_grants cannot itself declare ACL-protected columns".to_string(),
+                });
+            }
+            // A retained table is refused before anything is created, so a
+            // rejected declaration never leaves a half-made table behind.
+            refuse_two_way_retained_table(
+                p.retain
+                    .as_ref()
+                    .and_then(|retain| retain.declared_sync_direction),
+            )?;
             let expires_column = expires_column_name(&p.columns)?;
             // Auto-generate implicit indexes for PK / UNIQUE columns and
             // composite UNIQUE constraints, so constraint probes run at
             // O(log n) instead of O(n) per insert.
             let mut auto_indexes: Vec<contextdb_core::IndexDecl> = Vec::new();
             for c in &p.columns {
-                if c.primary_key
-                    && !matches!(
-                        map_column_type(&c.data_type),
-                        ColumnType::Json | ColumnType::Vector(_)
-                    )
-                {
+                if c.primary_key && exact_constraint_key_indexable(&map_column_type(&c.data_type)) {
                     auto_indexes.push(contextdb_core::IndexDecl {
                         name: format!("__pk_{}", c.name),
                         columns: vec![(c.name.clone(), contextdb_core::SortDirection::Asc)],
@@ -46,10 +60,7 @@ pub(crate) fn execute_plan(
                 }
                 if c.unique
                     && !c.primary_key
-                    && !matches!(
-                        map_column_type(&c.data_type),
-                        ColumnType::Json | ColumnType::Vector(_)
-                    )
+                    && exact_constraint_key_indexable(&map_column_type(&c.data_type))
                 {
                     auto_indexes.push(contextdb_core::IndexDecl {
                         name: format!("__unique_{}", c.name),
@@ -65,12 +76,7 @@ pub(crate) fn execute_plan(
                     p.columns
                         .iter()
                         .find(|c| c.name == *col_name)
-                        .map(|c| {
-                            !matches!(
-                                map_column_type(&c.data_type),
-                                ColumnType::Json | ColumnType::Vector(_)
-                            )
-                        })
+                        .map(|c| exact_constraint_key_indexable(&map_column_type(&c.data_type)))
                         .unwrap_or(false)
                 });
                 if !all_indexable || uc.is_empty() {
@@ -87,6 +93,16 @@ pub(crate) fn execute_plan(
                     kind: contextdb_core::IndexKind::Auto,
                 });
             }
+            let composite_foreign_keys = p
+                .composite_foreign_keys
+                .iter()
+                .map(|fk| contextdb_core::CompositeForeignKey {
+                    child_columns: fk.child_columns.clone(),
+                    parent_table: fk.parent_table.clone(),
+                    parent_columns: fk.parent_columns.clone(),
+                })
+                .collect::<Vec<_>>();
+
             let mut resolved_policies = HashMap::<String, ResolvedRankPolicy>::new();
             for column in &p.columns {
                 if let Some(resolved) =
@@ -95,7 +111,7 @@ pub(crate) fn execute_plan(
                     resolved_policies.insert(column.name.clone(), resolved);
                 }
             }
-            let meta = TableMeta {
+            let mut meta = TableMeta {
                 columns: p
                     .columns
                     .iter()
@@ -131,7 +147,29 @@ pub(crate) fn execute_plan(
                 // keeps them in `EXPLAIN <query>` so agents can assert
                 // routing programmatically.
                 indexes: auto_indexes.clone(),
+                composite_foreign_keys,
+                retained_sync_policy: p.retain.as_ref().map(|_| RetainedSyncPolicy::PushOnly),
+                retain_declared_unit: p.retain.as_ref().map(|retain| retain.declared_unit),
             };
+            refuse_sync_safe_without_key(&p.name, &meta)?;
+            let candidate_meta = meta.clone();
+            validate_exact_constraint_keys_for_meta(&p.name, &meta)?;
+            validate_single_column_foreign_keys_for_meta(&p.name, &meta, |parent| {
+                if parent == p.name {
+                    Some(candidate_meta.clone())
+                } else {
+                    db.table_meta(parent)
+                }
+            })?;
+            validate_composite_foreign_keys_for_meta(&p.name, &meta, |parent| {
+                if parent == p.name {
+                    Some(candidate_meta.clone())
+                } else {
+                    db.table_meta(parent)
+                }
+            })?;
+            meta.indexes = auto_indexes_for_table_meta(&meta);
+            auto_indexes = meta.indexes.clone();
             let metadata_bytes = meta.estimated_bytes();
             db.accountant().try_allocate_for(
                 metadata_bytes,
@@ -139,45 +177,84 @@ pub(crate) fn execute_plan(
                 "create_table",
                 "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
             )?;
-            db.relational_store().create_table(&p.name, meta);
-            for idx in &auto_indexes {
-                db.relational_store()
-                    .create_index_storage(&p.name, &idx.name, idx.columns.clone());
-            }
-            if let Some(table_meta) = db.table_meta(&p.name) {
-                for column in &table_meta.columns {
-                    db.register_vector_index_for_column(&p.name, column);
-                }
-            }
-            for (column, resolved) in resolved_policies {
-                db.register_rank_formula(&p.name, &column, resolved.formula);
-            }
-            if let Some(table_meta) = db.table_meta(&p.name) {
-                db.persist_table_meta(&p.name, &table_meta)?;
-                db.allocate_ddl_lsn(|lsn| db.log_create_table_ddl(&p.name, &table_meta, lsn))?;
+            let has_vector_columns = meta
+                .columns
+                .iter()
+                .any(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)));
+            if has_vector_columns {
+                let vector_schema_refs = meta
+                    .columns
+                    .iter()
+                    .filter(|column| {
+                        matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+                    })
+                    .map(|column| VectorIndexRef::new(&p.name, column.name.clone()));
+                let _vector_schema = db.vector_schema_write_many(vector_schema_refs);
+                db.allocate_ddl_lsn(|lsn| {
+                    db.relational_store().create_table(&p.name, meta);
+                    for idx in &auto_indexes {
+                        db.relational_store().create_exact_index_storage(
+                            &p.name,
+                            &idx.name,
+                            idx.columns.clone(),
+                        );
+                    }
+                    if let Some(table_meta) = db.table_meta(&p.name) {
+                        for column in &table_meta.columns {
+                            db.register_vector_index_for_column(&p.name, column);
+                        }
+                    }
+                    for (column, resolved) in resolved_policies {
+                        db.register_rank_formula(&p.name, &column, resolved.formula);
+                    }
+                    if let Some(table_meta) = db.table_meta(&p.name) {
+                        db.persist_table_meta(&p.name, &table_meta)?;
+                        db.log_create_table_ddl(&p.name, &table_meta, lsn)?;
+                    }
+                    Ok(())
+                })?;
+                db.clear_statement_cache();
+                db.start_maintenance_if_eligible();
+                return Ok(QueryResult::empty_with_affected(0));
+            } else {
+                db.allocate_ddl_lsn(|lsn| {
+                    db.relational_store().create_table(&p.name, meta);
+                    for idx in &auto_indexes {
+                        db.relational_store().create_exact_index_storage(
+                            &p.name,
+                            &idx.name,
+                            idx.columns.clone(),
+                        );
+                    }
+                    if let Some(table_meta) = db.table_meta(&p.name) {
+                        db.persist_table_meta(&p.name, &table_meta)?;
+                        db.log_create_table_ddl(&p.name, &table_meta, lsn)?;
+                    }
+                    Ok(())
+                })?;
             }
             db.clear_statement_cache();
+            db.start_maintenance_if_eligible();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::DropTable(name) => {
+            require_admin_for_ddl(db)?;
             if let Some(block) = rank_policy_drop_table_blocker(db, name) {
                 return Err(block);
             }
+            validate_projected_foreign_keys_after_drop_table(db, name)?;
             let bytes_to_release = estimate_drop_table_bytes(db, name);
-            db.drop_table_aux_state(name);
-            db.remove_rank_formulas_for_table(name);
-            db.vector_store_deregister_table(name);
-            db.relational_store().drop_table(name);
-            db.remove_persisted_table(name)?;
-            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl(name, lsn))?;
+            db.drain_vector_table_maintenance_for_ddl(name);
+            let _vector_schema = db.vector_schema_write_table(name);
+            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl_and_remove_triggers(name, lsn))?;
             db.accountant().release(bytes_to_release);
             db.clear_statement_cache();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::AlterTable(p) => {
+            require_admin_for_ddl(db)?;
             db.check_disk_budget("ALTER TABLE")?;
             let store = db.relational_store();
-            let mut rewrite_vectors_after_alter = false;
             match &p.action {
                 AlterAction::AddColumn(col) => {
                     if col.primary_key {
@@ -237,27 +314,81 @@ pub(crate) fn execute_plan(
                             .as_ref()
                             .map(|resolved| resolved.policy.clone()),
                     );
-                    store
-                        .alter_table_add_column(&p.table, core_col)
-                        .map_err(Error::Other)?;
-                    if let Some(table_meta) = db.table_meta(&p.table)
-                        && let Some(column) = table_meta
-                            .columns
-                            .iter()
-                            .find(|column| column.name == col.name)
-                    {
-                        db.register_vector_index_for_column(&p.table, column);
+                    if let Some(existing_meta) = db.table_meta(&p.table) {
+                        let mut candidate_meta = existing_meta;
+                        candidate_meta.columns.push(core_col.clone());
+                        let candidate_lookup = candidate_meta.clone();
+                        validate_exact_constraint_keys_for_meta(&p.table, &candidate_meta)?;
+                        validate_single_column_foreign_keys_for_meta(
+                            &p.table,
+                            &candidate_meta,
+                            |parent| {
+                                if parent == p.table {
+                                    Some(candidate_lookup.clone())
+                                } else {
+                                    db.table_meta(parent)
+                                }
+                            },
+                        )?;
                     }
-                    if col.expires {
-                        let mut meta = store.table_meta.write();
-                        let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
-                            Error::Other(format!("table '{}' not found", p.table))
+                    if matches!(col.data_type, DataType::Vector(_)) {
+                        let index = VectorIndexRef::new(&p.table, col.name.clone());
+                        let _vector_schema = db.vector_schema_write(&index);
+                        db.allocate_ddl_lsn(|lsn| {
+                            store
+                                .alter_table_add_column(&p.table, core_col)
+                                .map_err(Error::Other)?;
+                            if let Some(table_meta) = db.table_meta(&p.table)
+                                && let Some(column) = table_meta
+                                    .columns
+                                    .iter()
+                                    .find(|column| column.name == col.name)
+                            {
+                                db.register_vector_index_for_column(&p.table, column);
+                            }
+                            if col.expires {
+                                let mut meta = store.table_meta.write();
+                                let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
+                                    Error::Other(format!("table '{}' not found", p.table))
+                                })?;
+                                table_meta.expires_column = Some(col.name.clone());
+                            }
+                            if let Some(resolved) = resolved_policy {
+                                db.register_rank_formula(&p.table, &col.name, resolved.formula);
+                            }
+                            refresh_auto_indexes_for_table(db, &p.table)?;
+                            if let Some(table_meta) = db.table_meta(&p.table) {
+                                db.persist_table_meta(&p.table, &table_meta)?;
+                                db.log_alter_table_ddl(&p.table, &table_meta, lsn)?;
+                            }
+                            Ok(())
                         })?;
-                        table_meta.expires_column = Some(col.name.clone());
+                        db.clear_statement_cache();
+                        return Ok(QueryResult::empty_with_affected(0));
                     }
-                    if let Some(resolved) = resolved_policy {
-                        db.register_rank_formula(&p.table, &col.name, resolved.formula);
-                    }
+                    db.allocate_ddl_lsn(|lsn| {
+                        store
+                            .alter_table_add_column(&p.table, core_col)
+                            .map_err(Error::Other)?;
+                        if col.expires {
+                            let mut meta = store.table_meta.write();
+                            let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
+                                Error::Other(format!("table '{}' not found", p.table))
+                            })?;
+                            table_meta.expires_column = Some(col.name.clone());
+                        }
+                        if let Some(resolved) = resolved_policy {
+                            db.register_rank_formula(&p.table, &col.name, resolved.formula);
+                        }
+                        refresh_auto_indexes_for_table(db, &p.table)?;
+                        if let Some(table_meta) = db.table_meta(&p.table) {
+                            db.persist_table_meta(&p.table, &table_meta)?;
+                            db.log_alter_table_ddl(&p.table, &table_meta, lsn)?;
+                        }
+                        Ok(())
+                    })?;
+                    db.clear_statement_cache();
+                    return Ok(QueryResult::empty_with_affected(0));
                 }
                 AlterAction::DropColumn {
                     column: name,
@@ -296,6 +427,7 @@ pub(crate) fn execute_plan(
                             p.table, name
                         )));
                     }
+                    validate_projected_foreign_keys_after_drop_column(db, &p.table, name)?;
                     // RESTRICT / CASCADE on indexed columns. Only user-declared
                     // indexes gate the RESTRICT path — auto-indexes dissolve
                     // naturally when their defining column leaves.
@@ -329,42 +461,86 @@ pub(crate) fn execute_plan(
                             index: dependent_user_indexes[0].clone(),
                         });
                     }
-                    store
-                        .alter_table_drop_column(&p.table, name)
-                        .map_err(Error::Other)?;
-                    db.remove_rank_formula(&p.table, name);
-                    db.deregister_vector_index(&p.table, name);
-                    rewrite_vectors_after_alter = dropped_vector_column;
-                    if *cascade {
-                        // Remove IndexDecls referencing `name`, release storage.
-                        {
-                            let mut metas = store.table_meta.write();
-                            if let Some(m) = metas.get_mut(&p.table) {
-                                m.indexes
-                                    .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
+                    if dropped_vector_column {
+                        let index = VectorIndexRef::new(&p.table, name.clone());
+                        db.drain_vector_index_maintenance_for_ddl(&index);
+                        let _vector_schema = db.vector_schema_write(&index);
+                        db.allocate_ddl_lsn(|lsn| {
+                            store
+                                .alter_table_drop_column(&p.table, name)
+                                .map_err(Error::Other)?;
+                            db.remove_rank_formula(&p.table, name);
+                            if *cascade {
+                                {
+                                    let mut metas = store.table_meta.write();
+                                    if let Some(m) = metas.get_mut(&p.table) {
+                                        m.indexes
+                                            .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
+                                    }
+                                }
+                                for idx in &dependent_indexes {
+                                    store.drop_index_storage(&p.table, idx);
+                                    if dependent_user_indexes.iter().any(|name| name == idx) {
+                                        db.log_drop_index_ddl(&p.table, idx, lsn)?;
+                                    }
+                                }
+                            }
+                            let mut meta = store.table_meta.write();
+                            if let Some(table_meta) = meta.get_mut(&p.table)
+                                && table_meta.expires_column.as_deref() == Some(name.as_str())
+                            {
+                                table_meta.expires_column = None;
+                            }
+                            drop(meta);
+                            db.deregister_vector_index(&p.table, name);
+                            refresh_auto_indexes_for_table(db, &p.table)?;
+                            if let Some(table_meta) = db.table_meta(&p.table) {
+                                db.persist_table_meta_rows_vectors_and_log_alter_table_ddl(
+                                    &p.table,
+                                    &table_meta,
+                                    lsn,
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                    } else {
+                        store
+                            .alter_table_drop_column(&p.table, name)
+                            .map_err(Error::Other)?;
+                        db.remove_rank_formula(&p.table, name);
+                        if *cascade {
+                            // Remove IndexDecls referencing `name`, release storage.
+                            {
+                                let mut metas = store.table_meta.write();
+                                if let Some(m) = metas.get_mut(&p.table) {
+                                    m.indexes
+                                        .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
+                                }
+                            }
+                            for idx in &dependent_indexes {
+                                store.drop_index_storage(&p.table, idx);
+                                if dependent_user_indexes.iter().any(|name| name == idx) {
+                                    db.allocate_ddl_lsn(|lsn| {
+                                        db.log_drop_index_ddl(&p.table, idx, lsn)
+                                    })?;
+                                }
                             }
                         }
-                        for idx in &dependent_indexes {
-                            store.drop_index_storage(&p.table, idx);
-                            db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&p.table, idx, lsn))?;
+                        let mut meta = store.table_meta.write();
+                        if let Some(table_meta) = meta.get_mut(&p.table)
+                            && table_meta.expires_column.as_deref() == Some(name.as_str())
+                        {
+                            table_meta.expires_column = None;
                         }
-                    }
-                    let mut meta = store.table_meta.write();
-                    if let Some(table_meta) = meta.get_mut(&p.table)
-                        && table_meta.expires_column.as_deref() == Some(name.as_str())
-                    {
-                        table_meta.expires_column = None;
-                    }
-                    drop(meta);
-                    if let Some(table_meta) = db.table_meta(&p.table) {
-                        db.persist_table_meta(&p.table, &table_meta)?;
-                        db.persist_table_rows(&p.table)?;
-                        if rewrite_vectors_after_alter {
-                            db.persist_vectors()?;
+                        drop(meta);
+                        refresh_auto_indexes_for_table(db, &p.table)?;
+                        if let Some(table_meta) = db.table_meta(&p.table) {
+                            db.persist_table_meta(&p.table, &table_meta)?;
+                            db.persist_table_rows(&p.table)?;
+                            db.allocate_ddl_lsn(|lsn| {
+                                db.log_alter_table_ddl(&p.table, &table_meta, lsn)
+                            })?;
                         }
-                        db.allocate_ddl_lsn(|lsn| {
-                            db.log_alter_table_ddl(&p.table, &table_meta, lsn)
-                        })?;
                     }
                     db.clear_statement_cache();
                     return Ok(QueryResult {
@@ -402,12 +578,62 @@ pub(crate) fn execute_plan(
                             column: from.clone(),
                         });
                     }
-                    store
-                        .alter_table_rename_column(&p.table, from, to)
-                        .map_err(Error::Other)?;
+                    if let Some(existing_meta) = db.table_meta(&p.table)
+                        && let Some(col) = existing_meta.columns.iter().find(|c| c.name == *from)
+                        && col.primary_key
+                    {
+                        return Err(Error::Other(format!(
+                            "cannot rename primary key column '{}'",
+                            from
+                        )));
+                    }
+                    validate_projected_foreign_keys_after_rename_column(db, &p.table, from, to)?;
+                    if renamed_vector_column
+                        && db
+                            .table_meta(&p.table)
+                            .is_some_and(|meta| meta.columns.iter().any(|c| c.name == *to))
+                    {
+                        return Err(Error::Other(format!(
+                            "column '{}' already exists in table '{}'",
+                            to, p.table
+                        )));
+                    }
                     if renamed_vector_column {
-                        db.rename_vector_index(&p.table, from, to)?;
-                        rewrite_vectors_after_alter = true;
+                        let old_index = VectorIndexRef::new(&p.table, from.clone());
+                        let new_index = VectorIndexRef::new(&p.table, to.clone());
+                        db.drain_vector_index_maintenance_for_ddl(&old_index);
+                        let _vector_schema =
+                            db.vector_schema_write_many([old_index.clone(), new_index]);
+                        db.allocate_ddl_lsn(|lsn| {
+                            store
+                                .alter_table_rename_column(&p.table, from, to)
+                                .map_err(Error::Other)?;
+                            let mut meta = store.table_meta.write();
+                            if let Some(table_meta) = meta.get_mut(&p.table)
+                                && table_meta.expires_column.as_deref() == Some(from.as_str())
+                            {
+                                table_meta.expires_column = Some(to.clone());
+                            }
+                            drop(meta);
+                            db.rename_vector_index(&p.table, from, to)?;
+                            refresh_auto_indexes_for_table(db, &p.table)?;
+                            if let Some(table_meta) = db.table_meta(&p.table) {
+                                db.persist_table_meta_rows_vectors_and_log_alter_table_ddl_with_vector_rename(
+                                    &p.table,
+                                    &table_meta,
+                                    from,
+                                    to,
+                                    lsn,
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                        db.clear_statement_cache();
+                        return Ok(QueryResult::empty_with_affected(0));
+                    } else {
+                        store
+                            .alter_table_rename_column(&p.table, from, to)
+                            .map_err(Error::Other)?;
                     }
                     let mut meta = store.table_meta.write();
                     if let Some(table_meta) = meta.get_mut(&p.table)
@@ -415,11 +641,25 @@ pub(crate) fn execute_plan(
                     {
                         table_meta.expires_column = Some(to.clone());
                     }
+                    drop(meta);
+                    refresh_auto_indexes_for_table(db, &p.table)?;
                 }
                 AlterAction::SetRetain {
                     duration_seconds,
                     sync_safe,
+                    declared_sync_direction,
+                    declared_unit,
                 } => {
+                    // Refused before the write lock is taken, so a rejected
+                    // ALTER applies no part of itself — not the direction, not
+                    // the new window, not the SYNC SAFE flag.
+                    refuse_two_way_retained_table(*declared_sync_direction)?;
+                    if *sync_safe {
+                        let existing = db.table_meta(&p.table).ok_or_else(|| {
+                            Error::Other(format!("table '{}' not found", p.table))
+                        })?;
+                        refuse_sync_safe_without_key_for(&p.table, &existing)?;
+                    }
                     let mut meta = store.table_meta.write();
                     let table_meta = meta
                         .get_mut(&p.table)
@@ -431,6 +671,8 @@ pub(crate) fn execute_plan(
                     }
                     table_meta.default_ttl_seconds = Some(*duration_seconds);
                     table_meta.sync_safe = *sync_safe;
+                    table_meta.retained_sync_policy = Some(RetainedSyncPolicy::PushOnly);
+                    table_meta.retain_declared_unit = Some(*declared_unit);
                 }
                 AlterAction::DropRetain => {
                     let mut meta = store.table_meta.write();
@@ -439,6 +681,8 @@ pub(crate) fn execute_plan(
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     table_meta.default_ttl_seconds = None;
                     table_meta.sync_safe = false;
+                    table_meta.retained_sync_policy = None;
+                    table_meta.retain_declared_unit = None;
                 }
                 AlterAction::SetSyncConflictPolicy(policy) => {
                     let cp = parse_conflict_policy(policy)?;
@@ -460,12 +704,10 @@ pub(crate) fn execute_plan(
                 ) {
                     db.persist_table_rows(&p.table)?;
                 }
-                if rewrite_vectors_after_alter {
-                    db.persist_vectors()?;
-                }
                 db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn))?;
             }
             db.clear_statement_cache();
+            db.start_maintenance_if_eligible();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
@@ -509,7 +751,16 @@ pub(crate) fn execute_plan(
             if let Some(a) = analysis {
                 if let Some(pick) = a.pick {
                     // IndexScan path. Fetch by BTree range; apply residual filter.
-                    let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
+                    let (rows, examined) = execute_index_scan(
+                        db,
+                        table,
+                        &pick,
+                        snapshot,
+                        tx,
+                        IndexScanAccessMode::Select,
+                        resolved_filter.as_ref(),
+                        params,
+                    )?;
                     db.__bump_rows_examined(examined);
                     let mut result = materialize_rows(
                         rows,
@@ -519,7 +770,12 @@ pub(crate) fn execute_plan(
                     )?;
                     let mut pushed: smallvec::SmallVec<[std::borrow::Cow<'static, str>; 4]> =
                         smallvec::SmallVec::new();
-                    pushed.push(std::borrow::Cow::Owned(pick.pushed_column.clone()));
+                    pushed.extend(
+                        pick.pushed_columns
+                            .iter()
+                            .cloned()
+                            .map(std::borrow::Cow::Owned),
+                    );
                     let considered: smallvec::SmallVec<[crate::database::IndexCandidate; 4]> = a
                         .considered
                         .iter()
@@ -532,11 +788,12 @@ pub(crate) fn execute_plan(
                         predicates_pushed: pushed,
                         indexes_considered: considered,
                         sort_elided: false,
+                        query_vector_source: None,
                     };
                     return Ok(result);
                 } else {
                     // Scan with rejection trace.
-                    let rows = db.scan(table, snapshot)?;
+                    let rows = scan_rows_for_select(db, table, snapshot, tx)?;
                     db.__bump_rows_examined(rows.len() as u64);
                     let mut result = materialize_rows(
                         rows,
@@ -552,12 +809,13 @@ pub(crate) fn execute_plan(
                         predicates_pushed: Default::default(),
                         indexes_considered: considered,
                         sort_elided: false,
+                        query_vector_source: None,
                     };
                     return Ok(result);
                 }
             }
 
-            let rows = db.scan(table, snapshot)?;
+            let rows = scan_rows_for_select(db, table, snapshot, tx)?;
             db.__bump_rows_examined(rows.len() as u64);
             let mut result = materialize_rows(
                 rows,
@@ -572,11 +830,41 @@ pub(crate) fn execute_plan(
             start_alias,
             start_expr,
             start_candidates,
+            filter_ctes,
             steps,
             filter,
         } => {
+            // GRAPH_TABLE must use this captured read snapshot throughout this arm.
+            // Calling db.snapshot() from here would leak live graph state into execute_at_snapshot.
+            let snapshot = db.snapshot_for_read();
+            let mut predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]> =
+                smallvec::SmallVec::new();
+            let mut unpinned_start = false;
+            let first_step = steps
+                .first()
+                .ok_or_else(|| Error::PlanError("graph plan missing traversal step".to_string()))?;
+            let single_step =
+                steps.len() == 1 && first_step.min_depth == 1 && first_step.max_depth == 1;
+            let resolved_filter = filter
+                .as_ref()
+                .map(|filter_expr| {
+                    resolve_graph_filter_at_snapshot(
+                        db,
+                        filter_expr,
+                        params,
+                        tx,
+                        snapshot,
+                        filter_ctes,
+                    )
+                })
+                .transpose()?;
             let start_uuids = match resolve_uuid(start_expr, params) {
-                Ok(start) => vec![start],
+                Ok(start) => {
+                    let starts = vec![start];
+                    db.assert_graph_anchor_nodes_readable_in_tx(tx, &starts, snapshot)?;
+                    predicates_pushed.push(Cow::Owned(format!("{start_alias}.id")));
+                    starts
+                }
                 Err(Error::PlanError(_))
                     if matches!(
                         start_expr,
@@ -585,26 +873,241 @@ pub(crate) fn execute_plan(
                 {
                     // Start node not directly specified — check if a subquery or filter can help
                     if let Some(candidate_plan) = start_candidates {
-                        resolve_graph_start_nodes_from_plan(db, candidate_plan, params, tx)?
-                    } else if let Some(filter_expr) = filter {
-                        let resolved_filter = resolve_in_subqueries(db, filter_expr, params, tx)?;
-                        resolve_graph_start_nodes_from_filter(db, &resolved_filter, params)?
+                        predicates_pushed.push(Cow::Owned(format!("{start_alias}.id")));
+                        let starts = resolve_graph_start_nodes_from_plan(
+                            db,
+                            candidate_plan,
+                            params,
+                            tx,
+                            snapshot,
+                        )?;
+                        db.assert_graph_anchor_nodes_readable_in_tx(tx, &starts, snapshot)?;
+                        starts
+                    } else if let Some(resolved_filter) = resolved_filter.as_ref() {
+                        let resolution = resolve_graph_start_nodes_from_filter(
+                            db,
+                            resolved_filter,
+                            params,
+                            tx,
+                            snapshot,
+                            start_alias,
+                        )?;
+                        predicates_pushed.extend(resolution.predicates_pushed);
+                        if resolution.pinned {
+                            resolution.ids
+                        } else {
+                            unpinned_start = true;
+                            let edge_types_ref = if first_step.edge_types.is_empty() {
+                                None
+                            } else {
+                                Some(first_step.edge_types.as_slice())
+                            };
+                            if single_step {
+                                Vec::new()
+                            } else {
+                                let (starts, examined) = db.graph_start_nodes_for_match_counted(
+                                    tx,
+                                    edge_types_ref,
+                                    first_step.direction,
+                                    snapshot,
+                                )?;
+                                db.__bump_rows_examined(examined);
+                                starts
+                            }
+                        }
                     } else {
-                        vec![]
+                        unpinned_start = true;
+                        let edge_types_ref = if first_step.edge_types.is_empty() {
+                            None
+                        } else {
+                            Some(first_step.edge_types.as_slice())
+                        };
+                        if single_step {
+                            Vec::new()
+                        } else {
+                            let (starts, examined) = db.graph_start_nodes_for_match_counted(
+                                tx,
+                                edge_types_ref,
+                                first_step.direction,
+                                snapshot,
+                            )?;
+                            db.__bump_rows_examined(examined);
+                            starts
+                        }
                     }
                 }
                 Err(err) => return Err(err),
             };
+            let target_residual = if single_step {
+                resolved_filter
+                    .as_ref()
+                    .map(|expr| {
+                        resolve_graph_target_id_residual(expr, params, &steps[0].target_alias)
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let target_probe_direction =
+                if single_step && unpinned_start && target_residual.is_some() {
+                    Some(reverse_graph_probe_direction(first_step.direction))
+                } else {
+                    None
+                };
+            let trace_shape = if let Some(direction) = target_probe_direction {
+                GraphTraceShape::AdjacencyProbe {
+                    index: graph_adjacency_index_label(direction),
+                }
+            } else {
+                graph_trace_shape(
+                    single_step,
+                    unpinned_start,
+                    steps.first().map(|step| step.direction),
+                )
+            };
+            let start_id_predicate = format!("{start_alias}.id");
+            if target_residual.is_some()
+                && predicates_pushed
+                    .iter()
+                    .any(|predicate| predicate.as_ref() == start_id_predicate)
+            {
+                predicates_pushed.push(Cow::Owned(format!("{}.id", steps[0].target_alias)));
+            }
+            if let (Some(target_id), Some(direction)) = (target_residual, target_probe_direction) {
+                predicates_pushed.push(Cow::Owned(format!("{}.id", first_step.target_alias)));
+                let edge_types_ref = if first_step.edge_types.is_empty() {
+                    None
+                } else {
+                    Some(first_step.edge_types.as_slice())
+                };
+                let (res, examined) = db.graph_adjacency_probe_counted(
+                    tx,
+                    target_id,
+                    edge_types_ref,
+                    direction,
+                    snapshot,
+                )?;
+                db.__bump_rows_examined(examined);
+                let mut frontier = Vec::with_capacity(res.nodes.len());
+                for node in res.nodes {
+                    frontier.push((
+                        HashMap::from([
+                            (start_alias.clone(), node.id),
+                            (first_step.target_alias.clone(), target_id),
+                        ]),
+                        target_id,
+                        1_u32,
+                    ));
+                }
+                let frontier = filter_graph_frontier(
+                    db,
+                    dedupe_graph_frontier(frontier, steps),
+                    resolved_filter.as_ref(),
+                    params,
+                    tx,
+                    snapshot,
+                )?;
+                let bfs_bytes = estimate_bfs_working_bytes(&frontier, steps);
+                db.accountant().try_allocate_for(
+                    bfs_bytes,
+                    "bfs_frontier",
+                    "graph_bfs",
+                    "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
+                )?;
+                let rows = project_graph_frontier_rows(frontier, start_alias, steps);
+                db.accountant().release(bfs_bytes);
+                let mut columns =
+                    steps
+                        .iter()
+                        .fold(vec![format!("{start_alias}.id")], |mut cols, step| {
+                            cols.push(format!("{}.id", step.target_alias));
+                            cols
+                        });
+                columns.push("id".to_string());
+                columns.push("depth".to_string());
+                return Ok(QueryResult {
+                    columns,
+                    rows: rows?,
+                    rows_affected: 0,
+                    trace: graph_query_trace(trace_shape, predicates_pushed),
+                    cascade: None,
+                });
+            }
+            if single_step && unpinned_start {
+                let edge_types_ref = if first_step.edge_types.is_empty() {
+                    None
+                } else {
+                    Some(first_step.edge_types.as_slice())
+                };
+                let (mut edges, examined) = db.graph_edges_scan_counted(
+                    tx,
+                    edge_types_ref,
+                    first_step.direction,
+                    snapshot,
+                )?;
+                db.__bump_rows_examined(examined);
+                edges.sort_unstable();
+                let mut frontier = Vec::with_capacity(edges.len());
+                for (start, target) in edges {
+                    if let Some(target_id) = target_residual
+                        && target != target_id
+                    {
+                        continue;
+                    }
+                    frontier.push((
+                        HashMap::from([
+                            (start_alias.clone(), start),
+                            (first_step.target_alias.clone(), target),
+                        ]),
+                        target,
+                        1_u32,
+                    ));
+                }
+                let frontier = filter_graph_frontier(
+                    db,
+                    dedupe_graph_frontier(frontier, steps),
+                    resolved_filter.as_ref(),
+                    params,
+                    tx,
+                    snapshot,
+                )?;
+                let bfs_bytes = estimate_bfs_working_bytes(&frontier, steps);
+                db.accountant().try_allocate_for(
+                    bfs_bytes,
+                    "bfs_frontier",
+                    "graph_bfs",
+                    "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
+                )?;
+                let rows = project_graph_frontier_rows(frontier, start_alias, steps);
+                db.accountant().release(bfs_bytes);
+                let mut columns =
+                    steps
+                        .iter()
+                        .fold(vec![format!("{start_alias}.id")], |mut cols, step| {
+                            cols.push(format!("{}.id", step.target_alias));
+                            cols
+                        });
+                columns.push("id".to_string());
+                columns.push("depth".to_string());
+                return Ok(QueryResult {
+                    columns,
+                    rows: rows?,
+                    rows_affected: 0,
+                    trace: graph_query_trace(trace_shape, predicates_pushed),
+                    cascade: None,
+                });
+            }
             if start_uuids.is_empty() {
+                db.__bump_rows_examined(0);
                 return Ok(QueryResult {
                     columns: vec!["id".to_string(), "depth".to_string()],
                     rows: vec![],
                     rows_affected: 0,
-                    trace: crate::database::QueryTrace::scan(),
+                    trace: graph_query_trace(trace_shape, predicates_pushed),
                     cascade: None,
                 });
             }
-            let snapshot = db.snapshot();
             let mut frontier = start_uuids
                 .into_iter()
                 .map(|id| (HashMap::from([(start_alias.clone(), id)]), id, 0_u32))
@@ -617,26 +1120,42 @@ pub(crate) fn execute_plan(
                 "Reduce traversal depth/fan-out or raise MEMORY_LIMIT before running BFS.",
             )?;
 
-            let result = (|| {
+            let result: Result<QueryResult> = (|| {
                 for step in steps {
                     let edge_types_ref = if step.edge_types.is_empty() {
                         None
                     } else {
                         Some(step.edge_types.as_slice())
                     };
-                    let mut next = Vec::new();
+                    let mut next: Vec<(HashMap<String, uuid::Uuid>, uuid::Uuid, u32)> = Vec::new();
 
                     for (bindings, start, base_depth) in &frontier {
-                        let res = db.graph().bfs(
-                            *start,
-                            edge_types_ref,
-                            step.direction,
-                            step.min_depth,
-                            step.max_depth,
-                            snapshot,
-                        )?;
+                        let (res, examined) = if single_step {
+                            db.graph_adjacency_probe_counted(
+                                tx,
+                                *start,
+                                edge_types_ref,
+                                step.direction,
+                                snapshot,
+                            )?
+                        } else {
+                            db.graph_bfs_counted(
+                                tx,
+                                *start,
+                                edge_types_ref,
+                                step.direction,
+                                step.min_depth..=step.max_depth,
+                                snapshot,
+                            )?
+                        };
+                        db.__bump_rows_examined(examined);
                         for node in res.nodes {
-                            let total_depth = base_depth.saturating_add(node.depth);
+                            if let Some(target_id) = target_residual
+                                && node.id != target_id
+                            {
+                                continue;
+                            }
+                            let total_depth = (*base_depth).saturating_add(node.depth);
                             let mut next_bindings = bindings.clone();
                             next_bindings.insert(step.target_alias.clone(), node.id);
                             next.push((next_bindings, node.id, total_depth));
@@ -659,11 +1178,20 @@ pub(crate) fn execute_plan(
                 columns.push("id".to_string());
                 columns.push("depth".to_string());
 
+                let frontier = filter_graph_frontier(
+                    db,
+                    frontier,
+                    resolved_filter.as_ref(),
+                    params,
+                    tx,
+                    snapshot,
+                )?;
+
                 Ok(QueryResult {
                     columns,
                     rows: project_graph_frontier_rows(frontier, start_alias, steps)?,
                     rows_affected: 0,
-                    trace: crate::database::QueryTrace::scan(),
+                    trace: graph_query_trace(trace_shape, predicates_pushed),
                     cascade: None,
                 })
             })();
@@ -689,11 +1217,19 @@ pub(crate) fn execute_plan(
             sort_key,
             ..
         } => {
-            let query_vec = resolve_vector_from_expr(query_expr, params)?;
-            let snapshot = db.snapshot();
+            let snapshot = db.snapshot_for_read();
+            let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
             let mut candidate_trace = None;
-            let candidate_bitmap = if let Some(cands_plan) = candidates {
-                let qr = execute_plan(db, cands_plan, params, tx)?;
+            let unrestricted_scan_candidates = candidates
+                .as_deref()
+                .is_some_and(|plan| is_unrestricted_scan_for_table(plan, table));
+            let candidate_bitmap = if unrestricted_scan_candidates {
+                candidate_trace = Some(QueryTrace::scan());
+                None
+            } else if let Some(cands_plan) = candidates {
+                let qr = db.with_snapshot_override(snapshot, || {
+                    execute_plan(db, cands_plan, params, tx)
+                })?;
                 candidate_trace = Some(qr.trace.clone());
                 let mut bm = RoaringTreemap::new();
                 let row_id_idx = qr.columns.iter().position(|column| {
@@ -711,7 +1247,7 @@ pub(crate) fn execute_plan(
                         }
                     }
                 } else if let Some(idx) = id_idx {
-                    let uuid_to_row_id = uuid_to_row_id_map(db, table, snapshot)?;
+                    let uuid_to_row_id = uuid_to_row_id_map(db, table, snapshot, tx)?;
                     for row in qr.rows {
                         if let Some(Value::Uuid(uuid)) = row.get(idx)
                             && let Some(row_id) = uuid_to_row_id.get(uuid)
@@ -725,6 +1261,14 @@ pub(crate) fn execute_plan(
                 None
             };
 
+            let mut vector_schema_refs = vec![index.clone()];
+            if let Some(source) = row_vector_source_ref(query_expr) {
+                vector_schema_refs.push(source);
+            }
+            let _vector_schema = db.vector_schema_read_many(vector_schema_refs);
+            db.assert_vector_index_exists_under_schema_read(&index)?;
+            let (query_vec, query_vector_source) =
+                resolve_query_vector_from_expr(db, query_expr, params, tx, snapshot)?;
             let vector_bytes = estimate_vector_search_bytes(query_vec.len(), *k as usize);
             db.accountant().try_allocate_for(
                 vector_bytes,
@@ -740,9 +1284,15 @@ pub(crate) fn execute_plan(
                     *k as usize,
                 );
                 semantic_query.sort_key = Some(sort_key.clone());
-                let res = db.semantic_search_with_candidates(semantic_query, candidate_bitmap);
+                let res = db.with_snapshot_override(snapshot, || {
+                    db.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
+                        tx,
+                        semantic_query,
+                        candidate_bitmap,
+                    )
+                });
                 db.accountant().release(vector_bytes);
-                let results = res?;
+                let (results, used_hnsw) = res?;
                 let schema_columns = db.table_meta(table).map(|meta| {
                     meta.columns
                         .into_iter()
@@ -776,23 +1326,32 @@ pub(crate) fn execute_plan(
                     columns,
                     rows,
                     rows_affected: 0,
-                    trace: vector_search_trace("VectorSearch", candidate_trace),
+                    trace: vector_search_trace_with_source(
+                        if used_hnsw {
+                            "HNSWSearch"
+                        } else {
+                            "VectorSearch"
+                        },
+                        candidate_trace,
+                        query_vector_source,
+                    ),
                     cascade: None,
                 });
             }
-            let res = db.query_vector_strict(
-                contextdb_core::VectorIndexRef::new(table.clone(), column.clone()),
+            let res = db.query_vector_strict_in_tx_with_strategy(
+                tx,
+                index.clone(),
                 &query_vec,
                 *k as usize,
                 candidate_bitmap.as_ref(),
-                db.snapshot(),
+                snapshot,
             );
             db.accountant().release(vector_bytes);
-            let res = res?;
+            let (res, used_hnsw) = res?;
 
             // Re-materialize: look up actual rows by row_id so SELECT * returns user columns
             let result_row_ids = res.iter().map(|(rid, _)| *rid).collect::<Vec<_>>();
-            let result_rows = rows_by_row_id(db, table, &result_row_ids, snapshot)?;
+            let result_rows = rows_by_row_id(db, table, &result_row_ids, snapshot, tx)?;
             let schema_columns = db.table_meta(table).map(|meta| {
                 meta.columns
                     .into_iter()
@@ -836,19 +1395,14 @@ pub(crate) fn execute_plan(
                 columns,
                 rows,
                 rows_affected: 0,
-                trace: vector_search_trace(
-                    if db
-                        .__debug_vector_hnsw_len(contextdb_core::VectorIndexRef::new(
-                            table.clone(),
-                            column.clone(),
-                        ))
-                        .is_some()
-                    {
+                trace: vector_search_trace_with_source(
+                    if used_hnsw {
                         "HNSWSearch"
                     } else {
                         "VectorSearch"
                     },
                     candidate_trace,
+                    query_vector_source,
                 ),
                 cascade: None,
             })
@@ -1010,12 +1564,10 @@ pub(crate) fn execute_plan(
                 }
                 Ordering::Equal
             });
-            // Preserve the child's physical_plan when it was an IndexScan:
-            // the trace reports the data-source strategy, and Sort is
-            // represented by `sort_elided = false` rather than overriding the
-            // plan label. A plain `Scan` child gets relabeled to `Sort` to
-            // match the plan's ORDER BY-without-index expectations.
-            if input_result.trace.physical_plan != "IndexScan" {
+            // Preserve data-source trace labels through the post-read sort.
+            // A plain `Scan` child gets relabeled to `Sort` to match the
+            // plan's ORDER BY-without-index expectations.
+            if !trace_label_survives_sort(input_result.trace.physical_plan) {
                 input_result.trace.physical_plan = "Sort";
             }
             input_result.trace.sort_elided = false;
@@ -1114,8 +1666,14 @@ pub(crate) fn execute_plan(
                 cascade: None,
             })
         }
-        PhysicalPlan::CreateIndex(p) => exec_create_index(db, p),
-        PhysicalPlan::DropIndex(p) => exec_drop_index(db, p),
+        PhysicalPlan::CreateIndex(p) => {
+            require_admin_for_ddl(db)?;
+            exec_create_index(db, p)
+        }
+        PhysicalPlan::DropIndex(p) => {
+            require_admin_for_ddl(db)?;
+            exec_drop_index(db, p)
+        }
         PhysicalPlan::IndexScan {
             table,
             index,
@@ -1388,6 +1946,24 @@ fn eval_query_result_expr(
     }
 }
 
+fn require_admin_for_create_table(db: &Database) -> Result<()> {
+    if db.has_context_or_principal_constraints() {
+        return Err(Error::Other(
+            "DDL requires an admin database handle".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_admin_for_ddl(db: &Database) -> Result<()> {
+    if db.has_access_constraints_for_query() {
+        return Err(Error::Other(
+            "DDL requires an admin database handle".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn exec_insert(
     db: &Database,
     p: &InsertPlan,
@@ -1397,9 +1973,19 @@ fn exec_insert(
     db.check_disk_budget("INSERT")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for insert".to_string()))?;
 
-    let insert_meta = db
+    let mut insert_meta = db
         .table_meta(&p.table)
         .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+    let _vector_schema = if !vector_columns_for_meta(&insert_meta).is_empty() {
+        let refs = vector_refs_for_meta(&p.table, &insert_meta);
+        let guard = db.vector_schema_read_many(refs);
+        insert_meta = db
+            .table_meta(&p.table)
+            .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+        Some(guard)
+    } else {
+        None
+    };
     // When no column list is provided (INSERT INTO t VALUES (...)),
     // infer column names from table metadata in declaration order.
     let columns: Vec<String> = if p.columns.is_empty() {
@@ -1410,13 +1996,12 @@ fn exec_insert(
 
     // Statement-scoped snapshot of the committed TxId watermark for TXID bound checks.
     let current_tx_max = Some(db.committed_watermark());
-    let route_inserts_to_graph =
-        p.table.eq_ignore_ascii_case("edges") || !insert_meta.dag_edge_types.is_empty();
+    let route_inserts_to_graph = has_edge_columns(&insert_meta);
     let vector_columns = vector_columns_for_meta(&insert_meta);
-    let has_column_defaults = insert_meta
-        .columns
-        .iter()
-        .any(|column| column.default.is_some());
+    let has_insert_completion = insert_meta.columns.iter().any(|column| {
+        column.default.is_some()
+            || (!column.nullable && matches!(column.column_type, ColumnType::TxId))
+    });
 
     if !vector_columns.is_empty() {
         for row in &p.values {
@@ -1428,7 +2013,7 @@ fn exec_insert(
                 let v = resolve_expr(expr, params)?;
                 values.insert(
                     col.clone(),
-                    coerce_value_for_column_with_meta(
+                    coerce_insert_value_for_column_with_meta(
                         &p.table,
                         &insert_meta,
                         col,
@@ -1438,9 +2023,10 @@ fn exec_insert(
                     )?,
                 );
             }
-            if has_column_defaults {
+            if has_insert_completion {
                 apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
             }
+            db.complete_insert_access_values(&p.table, &mut values)?;
             validate_vector_columns(db, &p.table, &values)?;
         }
     }
@@ -1455,7 +2041,7 @@ fn exec_insert(
             let v = resolve_expr(expr, params)?;
             values.insert(
                 col.clone(),
-                coerce_value_for_column_with_meta(
+                coerce_insert_value_for_column_with_meta(
                     &p.table,
                     &insert_meta,
                     col,
@@ -1466,9 +2052,10 @@ fn exec_insert(
             );
         }
 
-        if has_column_defaults {
+        if has_insert_completion {
             apply_missing_column_defaults(db, &p.table, &mut values, Some(txid))?;
         }
+        db.complete_insert_access_values(&p.table, &mut values)?;
 
         if !vector_columns.is_empty() {
             validate_vector_columns(db, &p.table, &values)?;
@@ -1501,16 +2088,44 @@ fn exec_insert(
         let vector_values = vector_values_for_table(db, &p.table, &values);
 
         let row_id = if let Some(on_conflict) = &p.on_conflict {
-            let conflict_col = &on_conflict.columns[0];
-            let conflict_value = values
-                .get(conflict_col)
-                .ok_or_else(|| Error::Other("conflict column not in values".to_string()))?;
-            let existing =
-                db.point_lookup(&p.table, conflict_col, conflict_value, db.snapshot())?;
-            let existing_row_id = existing.as_ref().map(|row| row.row_id);
-            let existing_has_vector = existing
-                .as_ref()
-                .is_some_and(|row| db.has_live_vector(row.row_id, db.snapshot()));
+            if on_conflict.columns.is_empty() {
+                db.accountant().release(row_bytes);
+                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                return Err(Error::Other(
+                    "ON CONFLICT target must include at least one column".to_string(),
+                ));
+            }
+            let conflict_values = match on_conflict
+                .columns
+                .iter()
+                .map(|column| {
+                    values.get(column).cloned().ok_or_else(|| {
+                        Error::Other(format!("conflict column {column} not in values"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(values) => values,
+                Err(err) => {
+                    db.accountant().release(row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            };
+            let existing = match db.conflict_lookup_in_tx(
+                txid,
+                &p.table,
+                &on_conflict.columns,
+                &conflict_values,
+                db.snapshot_for_read(),
+            ) {
+                Ok(existing) => existing,
+                Err(err) => {
+                    db.accountant().release(row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            };
             let upsert_values = if let Some(existing_row) = existing.as_ref() {
                 match apply_on_conflict_updates(
                     db,
@@ -1531,55 +2146,110 @@ fn exec_insert(
             } else {
                 values.clone()
             };
-
-            match db.upsert_row(txid, &p.table, conflict_col, upsert_values) {
-                Ok(UpsertResult::Inserted) => {
-                    db.point_lookup_in_tx(
-                        txid,
-                        &p.table,
-                        conflict_col,
-                        conflict_value,
-                        db.snapshot(),
-                    )?
-                    .ok_or_else(|| {
-                        Error::Other("inserted upsert row not visible in tx".to_string())
-                    })?
-                    .row_id
-                }
-                Ok(UpsertResult::Updated) => {
-                    if existing_has_vector && let Some(existing_row_id) = existing_row_id {
-                        for index in vector_indexes_for_table(db, &p.table) {
-                            if db
-                                .vector_store_live_entry_for_row(
-                                    &index,
-                                    existing_row_id,
-                                    db.snapshot(),
-                                )
-                                .is_some()
-                            {
-                                db.delete_vector(txid, index, existing_row_id)?;
+            match existing {
+                None => {
+                    let intent_insert_values = upsert_values.clone();
+                    match db.insert_row(txid, &p.table, upsert_values) {
+                        Ok(row_id) => {
+                            if let Err(err) = db.record_upsert_intent(
+                                txid,
+                                p.table.clone(),
+                                row_id,
+                                UpsertIntentDetails {
+                                    insert_values: intent_insert_values,
+                                    conflict_columns: on_conflict.columns.clone(),
+                                    update_columns: on_conflict.update_columns.clone(),
+                                    params: params.clone(),
+                                },
+                            ) {
+                                db.accountant().release(row_bytes);
+                                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                                return Err(err);
                             }
+                            row_id
+                        }
+                        Err(err) => {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
                         }
                     }
-                    db.point_lookup_in_tx(
-                        txid,
-                        &p.table,
-                        conflict_col,
-                        conflict_value,
-                        db.snapshot(),
-                    )?
-                    .ok_or_else(|| {
-                        Error::Other("updated upsert row not visible in tx".to_string())
-                    })?
-                    .row_id
                 }
-                Ok(UpsertResult::NoOp) => {
-                    db.accountant().release(row_bytes);
-                    RowId(0)
-                }
-                Err(err) => {
-                    db.accountant().release(row_bytes);
-                    return Err(err);
+                Some(existing_row) => {
+                    let changed = upsert_values
+                        .iter()
+                        .any(|(k, v)| existing_row.values.get(k) != Some(v));
+                    if !changed {
+                        db.accountant().release(row_bytes);
+                        RowId(0)
+                    } else {
+                        if let Err(err) = validate_update_state_transition(
+                            db,
+                            &p.table,
+                            &existing_row,
+                            &upsert_values,
+                        ) {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
+                        }
+                        if db.has_live_vector(existing_row.row_id, db.snapshot_for_read()) {
+                            for index in vector_indexes_for_table(db, &p.table) {
+                                if db
+                                    .vector_store_live_entry_for_row(
+                                        &index,
+                                        existing_row.row_id,
+                                        db.snapshot_for_read(),
+                                    )
+                                    .is_some()
+                                    && let Err(err) =
+                                        db.delete_vector(txid, index, existing_row.row_id)
+                                {
+                                    db.accountant().release(row_bytes);
+                                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        if let Err(err) = db.delete_row(txid, &p.table, existing_row.row_id) {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
+                        }
+                        let row_uuid = upsert_values.get("id").and_then(Value::as_uuid).copied();
+                        let new_state = db
+                            .table_meta(&p.table)
+                            .and_then(|meta| meta.state_machine)
+                            .and_then(|sm| upsert_values.get(&sm.column))
+                            .and_then(Value::as_text)
+                            .map(std::borrow::ToOwned::to_owned);
+                        let row_id = match db.insert_row_replacing(
+                            txid,
+                            &p.table,
+                            upsert_values,
+                            existing_row.row_id,
+                        ) {
+                            Ok(row_id) => row_id,
+                            Err(err) => {
+                                db.accountant().release(row_bytes);
+                                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                                return Err(err);
+                            }
+                        };
+                        if let (Some(uuid), Some(state)) = (row_uuid, new_state.as_deref())
+                            && let Err(err) = db.propagate_state_change_if_needed(
+                                txid,
+                                &p.table,
+                                Some(uuid),
+                                Some(state),
+                            )
+                        {
+                            db.accountant().release(row_bytes);
+                            let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                            return Err(err);
+                        }
+                        row_id
+                    }
                 }
             }
         } else {
@@ -1639,13 +2309,20 @@ fn exec_delete(
     tx: Option<TxId>,
 ) -> Result<QueryResult> {
     let txid = tx.ok_or_else(|| Error::Other("missing tx for delete".to_string()))?;
-    let snapshot = db.snapshot();
-    let rows = db.scan(&p.table, snapshot)?;
+    let _vector_schema = db.vector_schema_read_table(&p.table);
+    let snapshot = db.snapshot_for_read();
+    let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
+    let rows = db.filter_rows_for_read(&p.table, rows, snapshot)?;
     let resolved_where = p
         .where_clause
         .as_ref()
         .map(|expr| resolve_in_subqueries(db, expr, params, tx))
         .transpose()?;
+    let delete_predicates = resolved_where
+        .as_ref()
+        .map(|expr| collect_simple_equality_predicates(expr, params, false))
+        .transpose()?
+        .flatten();
     let matched: Vec<_> = rows
         .into_iter()
         .filter(|r| {
@@ -1654,6 +2331,10 @@ fn exec_delete(
                 .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
         })
         .collect();
+
+    for row in &matched {
+        db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+    }
 
     for row in &matched {
         for index in vector_indexes_for_table(db, &p.table) {
@@ -1666,8 +2347,137 @@ fn exec_delete(
         }
         db.delete_row(txid, &p.table, row.row_id)?;
     }
+    if !matched.is_empty()
+        && let Some(predicates) = delete_predicates
+    {
+        db.record_relational_delete_predicate(txid, p.table.clone(), predicates)?;
+    }
 
     Ok(QueryResult::empty_with_affected(matched.len() as u64))
+}
+
+fn collect_conditional_update_predicates(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+) -> Result<Option<Vec<(String, Value)>>> {
+    collect_simple_equality_predicates(expr, params, true)
+}
+
+fn collect_simple_equality_predicates(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    require_non_id: bool,
+) -> Result<Option<Vec<(String, Value)>>> {
+    fn collect_into(
+        expr: &Expr,
+        params: &HashMap<String, Value>,
+        out: &mut Vec<(String, Value)>,
+    ) -> Result<bool> {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => Ok(collect_into(left, params, out)? && collect_into(right, params, out)?),
+            Expr::BinaryOp {
+                left,
+                op: BinOp::Eq,
+                right,
+            } => {
+                if let Expr::Column(column) = left.as_ref()
+                    && matches!(right.as_ref(), Expr::Literal(_) | Expr::Parameter(_))
+                {
+                    out.push((column.column.clone(), resolve_expr(right, params)?));
+                    return Ok(true);
+                }
+                if let Expr::Column(column) = right.as_ref()
+                    && matches!(left.as_ref(), Expr::Literal(_) | Expr::Parameter(_))
+                {
+                    out.push((column.column.clone(), resolve_expr(left, params)?));
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    let mut predicates = Vec::new();
+    if collect_into(expr, params, &mut predicates)?
+        && (!require_non_id || predicates.iter().any(|(column, _)| column != "id"))
+    {
+        Ok(Some(predicates))
+    } else {
+        Ok(None)
+    }
+}
+
+fn unique_update_lookup_from_predicates(
+    meta: &TableMeta,
+    predicates: &[(String, Value)],
+) -> Option<(Vec<String>, Vec<Value>)> {
+    let predicate_value = |wanted: &str| {
+        predicates
+            .iter()
+            .rev()
+            .find_map(|(column, value)| (column == wanted).then_some(value))
+    };
+
+    for column in &meta.columns {
+        if !(column.primary_key || column.unique) {
+            continue;
+        }
+        if let Some(value) = predicate_value(&column.name) {
+            return Some((vec![column.name.clone()], vec![value.clone()]));
+        }
+    }
+
+    for columns in &meta.unique_constraints {
+        if columns.is_empty() {
+            continue;
+        }
+        let Some(values) = columns
+            .iter()
+            .map(|column| predicate_value(column).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        return Some((columns.clone(), values));
+    }
+
+    None
+}
+
+struct TriggerUniqueUpdateLookup<'a> {
+    table: &'a str,
+    table_meta: Option<&'a TableMeta>,
+    snapshot: SnapshotId,
+    resolved_where: Option<&'a Expr>,
+    conditional_predicates: Option<&'a [(String, Value)]>,
+}
+
+fn trigger_bound_unique_update_rows(
+    db: &Database,
+    txid: TxId,
+    lookup: TriggerUniqueUpdateLookup<'_>,
+) -> Result<Option<Vec<VersionedRow>>> {
+    let (Some(meta), Some(_where_clause), Some(predicates)) = (
+        lookup.table_meta,
+        lookup.resolved_where,
+        lookup.conditional_predicates,
+    ) else {
+        return Ok(None);
+    };
+    let Some((columns, values)) = unique_update_lookup_from_predicates(meta, predicates) else {
+        return Ok(None);
+    };
+    let Some(row) =
+        db.unique_row_lookup_in_tx(txid, lookup.table, &columns, &values, lookup.snapshot)?
+    else {
+        return Ok(Some(Vec::new()));
+    };
+    Ok(Some(vec![row]))
 }
 
 fn exec_update(
@@ -1678,27 +2488,267 @@ fn exec_update(
 ) -> Result<QueryResult> {
     db.check_disk_budget("UPDATE")?;
     let txid = tx.ok_or_else(|| Error::Other("missing tx for update".to_string()))?;
-    let snapshot = db.snapshot();
-    // Use in-tx scan so prior statements in a BEGIN/COMMIT block are visible:
-    // the old row must not shadow a previously-updated in-tx row.
-    let rows = db.scan_in_tx(txid, &p.table, snapshot)?;
+    let table_meta = db.table_meta(&p.table);
+    let vector_indexes = table_meta
+        .as_ref()
+        .map(|meta| vector_refs_for_meta(&p.table, meta))
+        .unwrap_or_default();
+    let _vector_schema =
+        (!vector_indexes.is_empty()).then(|| db.vector_schema_read_many(vector_indexes.clone()));
+    let vector_columns = table_meta
+        .as_ref()
+        .map(|meta| {
+            vector_columns_for_meta(meta)
+                .into_iter()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let has_vector_columns = !vector_columns.is_empty();
+    let snapshot = db.snapshot_for_read();
     let resolved_where = p
         .where_clause
         .as_ref()
         .map(|expr| resolve_in_subqueries(db, expr, params, tx))
         .transpose()?;
-    let matched: Vec<_> = rows
-        .into_iter()
-        .filter(|r| {
-            resolved_where
-                .as_ref()
-                .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
-        })
-        .collect();
-
     let current_tx_max = Some(db.committed_watermark());
+    let conditional_predicates = resolved_where
+        .as_ref()
+        .map(|expr| collect_conditional_update_predicates(expr, params))
+        .transpose()?
+        .flatten()
+        .map(|predicates| {
+            predicates
+                .into_iter()
+                .map(|(column, value)| {
+                    Ok((
+                        column.clone(),
+                        coerce_value_for_column(
+                            db,
+                            &p.table,
+                            &column,
+                            value,
+                            current_tx_max,
+                            Some(txid),
+                        )?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let trigger_callback_bound = db.trigger_callback_tx_bound_matches(txid);
+    let skip_trigger_access_checks =
+        trigger_callback_bound && !db.has_access_constraints_for_query();
+    let direct_rows = if trigger_callback_bound && !has_vector_columns {
+        trigger_bound_unique_update_rows(
+            db,
+            txid,
+            TriggerUniqueUpdateLookup {
+                table: &p.table,
+                table_meta: table_meta.as_ref(),
+                snapshot,
+                resolved_where: resolved_where.as_ref(),
+                conditional_predicates: conditional_predicates.as_deref(),
+            },
+        )?
+    } else {
+        None
+    };
+    let direct_unique_update = direct_rows.is_some();
+    let direct_unique_lookup_exhausts_where = direct_unique_update
+        && table_meta
+            .as_ref()
+            .zip(conditional_predicates.as_ref())
+            .and_then(|(meta, predicates)| {
+                unique_update_lookup_from_predicates(meta, predicates)
+                    .map(|(columns, _)| columns.len() == predicates.len())
+            })
+            .unwrap_or(false);
+    let state_machine_column = table_meta
+        .as_ref()
+        .and_then(|meta| meta.state_machine.as_ref())
+        .map(|sm| sm.column.clone());
+    let state_column_assigned = state_machine_column
+        .as_ref()
+        .is_some_and(|column| p.assignments.iter().any(|(assigned, _)| assigned == column));
+    // Use the same IndexScan candidate selection as SELECT when the UPDATE
+    // predicate can narrow by an indexed first column. The residual WHERE is
+    // still evaluated below, so this only reduces the candidate set.
+    let rows = if let Some(rows) = direct_rows {
+        rows
+    } else if let Some(where_clause) = resolved_where.as_ref() {
+        let indexed_rows = table_meta
+            .as_ref()
+            .and_then(|meta| analyze_filter_for_index(where_clause, &meta.indexes, params).pick)
+            .map(|pick| {
+                execute_index_scan(
+                    db,
+                    &p.table,
+                    &pick,
+                    snapshot,
+                    Some(txid),
+                    IndexScanAccessMode::Predicate,
+                    resolved_where.as_ref(),
+                    params,
+                )
+            })
+            .transpose()?;
+        if let Some((rows, examined)) = indexed_rows {
+            db.__bump_rows_examined(examined);
+            rows
+        } else {
+            // Use in-tx scan so prior statements in a BEGIN/COMMIT block are
+            // visible: the old row must not shadow a previously-updated row.
+            let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
+            db.filter_rows_for_read(&p.table, rows, snapshot)?
+        }
+    } else {
+        let rows = db.scan_in_tx_raw(txid, &p.table, snapshot)?;
+        db.filter_rows_for_read(&p.table, rows, snapshot)?
+    };
+    let matched: Vec<_> = if direct_unique_lookup_exhausts_where {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| {
+                resolved_where
+                    .as_ref()
+                    .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
+            })
+            .collect()
+    };
 
+    if direct_unique_update && trigger_callback_bound && !has_vector_columns {
+        let mut affected = 0_u64;
+        for row in matched {
+            if !skip_trigger_access_checks {
+                db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+            }
+            let mut values = row.values.clone();
+            for (k, vexpr) in &p.assignments {
+                let value = eval_assignment_expr(vexpr, &row.values, params)?;
+                values.insert(
+                    k.clone(),
+                    coerce_value_for_column(db, &p.table, k, value, current_tx_max, Some(txid))?,
+                );
+            }
+            if state_column_assigned {
+                validate_update_state_transition(db, &p.table, &row, &values)?;
+            }
+            let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
+            let new_state = table_meta
+                .as_ref()
+                .and_then(|meta| meta.state_machine.as_ref())
+                .and_then(|sm| values.get(&sm.column))
+                .and_then(Value::as_text)
+                .map(std::borrow::ToOwned::to_owned);
+            if !skip_trigger_access_checks {
+                db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
+            }
+            let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
+            db.accountant().try_allocate_for(
+                new_row_bytes,
+                "update",
+                "row_replace",
+                "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
+            )?;
+            let propagation_possible = row_uuid.is_some()
+                && new_state
+                    .as_deref()
+                    .is_some_and(|state| db.propagation_rules_can_react(&p.table, state));
+            if !propagation_possible {
+                let Some(meta) = table_meta.as_ref() else {
+                    return Err(Error::TableNotFound(p.table.clone()));
+                };
+                let committed_row_exists = row.created_tx != txid
+                    || db
+                        .relational_store()
+                        .row_by_id(&p.table, row.row_id, SnapshotId::from_raw_wire(u64::MAX))
+                        .is_some();
+                let (new_row_id, before_counts, after_counts) = match db
+                    .replace_row_after_update_validation_counted(
+                        txid,
+                        &p.table,
+                        row.row_id,
+                        values,
+                        UpdateReplacementContext {
+                            meta,
+                            committed_row_exists,
+                            created_at: db.trigger_callback_wallclock(),
+                        },
+                    ) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        db.accountant().release(new_row_bytes);
+                        return Err(err);
+                    }
+                };
+                let _ = new_row_id;
+                if let Some(predicates) = conditional_predicates.clone() {
+                    db.record_conditional_update_guard(
+                        txid,
+                        p.table.clone(),
+                        row.row_id,
+                        predicates,
+                        before_counts,
+                        after_counts,
+                        false,
+                    )?;
+                }
+                affected = affected.saturating_add(1);
+                continue;
+            }
+            let checkpoint = db.write_set_checkpoint(txid)?;
+            let before_counts = db.write_set_counts(txid)?;
+            let new_row_id = match db
+                .replace_row_after_update_validation(txid, &p.table, row.row_id, values, snapshot)
+            {
+                Ok(row_id) => row_id,
+                Err(err) => {
+                    db.accountant().release(new_row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            };
+            if let Err(err) =
+                db.propagate_state_change_if_needed(txid, &p.table, row_uuid, new_state.as_deref())
+            {
+                db.accountant().release(new_row_bytes);
+                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                return Err(err);
+            }
+            let _ = new_row_id;
+            if let Some(predicates) = conditional_predicates.clone() {
+                let after_counts = db.write_set_counts(txid)?;
+                db.record_conditional_update_guard(
+                    txid,
+                    p.table.clone(),
+                    row.row_id,
+                    predicates,
+                    before_counts,
+                    after_counts,
+                    false,
+                )?;
+            }
+            affected = affected.saturating_add(1);
+        }
+        return Ok(QueryResult::empty_with_affected(affected));
+    }
+
+    struct PlannedUpdate {
+        row: VersionedRow,
+        values: HashMap<String, Value>,
+        row_uuid: Option<uuid::Uuid>,
+        new_state: Option<String>,
+        assigned_vector_values: Vec<(String, Vec<f32>)>,
+        assigned_vector_columns: HashSet<String>,
+        conditional_predicates: Option<Vec<(String, Value)>>,
+    }
+
+    let mut planned = Vec::with_capacity(matched.len());
     for row in &matched {
+        if !skip_trigger_access_checks {
+            db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+        }
         let mut values = row.values.clone();
         for (k, vexpr) in &p.assignments {
             let value = eval_assignment_expr(vexpr, &row.values, params)?;
@@ -1707,29 +2757,63 @@ fn exec_update(
                 coerce_value_for_column(db, &p.table, k, value, current_tx_max, Some(txid))?,
             );
         }
-        validate_update_state_transition(db, &p.table, row, &values)?;
+        if state_column_assigned {
+            validate_update_state_transition(db, &p.table, row, &values)?;
+        }
         let row_uuid = values.get("id").and_then(Value::as_uuid).copied();
-        let new_state = db
-            .table_meta(&p.table)
+        let new_state = table_meta
             .as_ref()
             .and_then(|meta| meta.state_machine.as_ref())
             .and_then(|sm| values.get(&sm.column))
             .and_then(Value::as_text)
             .map(std::borrow::ToOwned::to_owned);
 
-        validate_vector_columns(db, &p.table, &values)?;
-        let assigned_vector_values: Vec<(String, Vec<f32>)> = p
-            .assignments
-            .iter()
-            .filter_map(|(column, _)| match values.get(column) {
-                Some(Value::Vector(vector)) => Some((column.clone(), vector.clone())),
-                _ => None,
-            })
-            .collect();
-        let assigned_vector_columns: HashSet<String> = assigned_vector_values
-            .iter()
-            .map(|(column, _)| column.clone())
-            .collect();
+        if has_vector_columns {
+            validate_vector_columns(db, &p.table, &values)?;
+        }
+        if !skip_trigger_access_checks {
+            db.assert_row_write_allowed(&p.table, row.row_id, &values, snapshot)?;
+        }
+        let assigned_vector_columns: HashSet<String> = if has_vector_columns {
+            p.assignments
+                .iter()
+                .filter_map(|(column, _)| vector_columns.contains(column).then_some(column.clone()))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let assigned_vector_values: Vec<(String, Vec<f32>)> = if has_vector_columns {
+            p.assignments
+                .iter()
+                .filter_map(|(column, _)| match values.get(column) {
+                    Some(Value::Vector(vector)) if assigned_vector_columns.contains(column) => {
+                        Some((column.clone(), vector.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        planned.push(PlannedUpdate {
+            row: row.clone(),
+            values,
+            row_uuid,
+            new_state,
+            assigned_vector_values,
+            assigned_vector_columns,
+            conditional_predicates: conditional_predicates.clone(),
+        });
+    }
+
+    for plan in planned {
+        let row = plan.row;
+        let values = plan.values;
+        let row_uuid = plan.row_uuid;
+        let new_state = plan.new_state;
+        let assigned_vector_values = plan.assigned_vector_values;
+        let assigned_vector_columns = plan.assigned_vector_columns;
+        let conditional_predicates = plan.conditional_predicates;
         let new_row_bytes = estimate_table_row_bytes(db, &p.table, &values)?;
         db.accountant().try_allocate_for(
             new_row_bytes,
@@ -1738,46 +2822,60 @@ fn exec_update(
             "Reduce row growth or raise MEMORY_LIMIT before updating this row.",
         )?;
         let checkpoint = db.write_set_checkpoint(txid)?;
+        let before_counts = db.write_set_counts(txid)?;
         let mut vector_allocations = Vec::new();
 
-        if let Err(err) = db.delete_row(txid, &p.table, row.row_id) {
-            db.accountant().release(new_row_bytes);
-            return Err(err);
-        }
-        for column in &assigned_vector_columns {
-            if let Err(err) = db.delete_vector(
-                txid,
-                contextdb_core::VectorIndexRef::new(&p.table, column.clone()),
-                row.row_id,
-            ) {
-                db.accountant().release(new_row_bytes);
-                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                return Err(err);
-            }
-        }
-
-        let new_row_id = match db.insert_row_replacing(txid, &p.table, values, row.row_id) {
-            Ok(row_id) => row_id,
-            Err(err) => {
-                db.accountant().release(new_row_bytes);
-                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
-                return Err(err);
-            }
-        };
-        for index in vector_indexes_for_table(db, &p.table) {
-            if assigned_vector_columns.contains(&index.column) {
-                continue;
-            }
-            if let Some(old_entry) =
-                db.vector_store_live_entry_for_row(&index, row.row_id, snapshot)
-                && old_entry.deleted_tx.is_none()
-                && let Err(err) = db.move_vector(txid, index, row.row_id, new_row_id)
+        let vector_free_trigger_update = trigger_callback_bound
+            && assigned_vector_columns.is_empty()
+            && vector_indexes.is_empty();
+        let new_row_id = if vector_free_trigger_update {
+            match db
+                .replace_row_after_update_validation(txid, &p.table, row.row_id, values, snapshot)
             {
+                Ok(row_id) => row_id,
+                Err(err) => {
+                    db.accountant().release(new_row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            }
+        } else {
+            for column in &assigned_vector_columns {
+                if let Err(err) = db.delete_vector(
+                    txid,
+                    contextdb_core::VectorIndexRef::new(&p.table, column.clone()),
+                    row.row_id,
+                ) {
+                    db.accountant().release(new_row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            }
+            if let Err(err) = db.delete_row(txid, &p.table, row.row_id) {
                 db.accountant().release(new_row_bytes);
-                let _ = db.restore_write_set_checkpoint(txid, checkpoint);
                 return Err(err);
             }
-        }
+
+            let new_row_id = match db.insert_row_replacing(txid, &p.table, values, row.row_id) {
+                Ok(row_id) => row_id,
+                Err(err) => {
+                    db.accountant().release(new_row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            };
+            for index in &vector_indexes {
+                if assigned_vector_columns.contains(&index.column) {
+                    continue;
+                }
+                if let Err(err) = db.move_vector(txid, index.clone(), row.row_id, new_row_id) {
+                    db.accountant().release(new_row_bytes);
+                    let _ = db.restore_write_set_checkpoint(txid, checkpoint);
+                    return Err(err);
+                }
+            }
+            new_row_id
+        };
         for (column, vector) in assigned_vector_values {
             let index = contextdb_core::VectorIndexRef::new(&p.table, column);
             let vector_bytes = db.vector_insert_accounted_bytes(&index, vector.len());
@@ -1797,6 +2895,18 @@ fn exec_update(
             let _ = db.restore_write_set_checkpoint(txid, checkpoint);
             return Err(err);
         }
+        if let Some(predicates) = conditional_predicates {
+            let after_counts = db.write_set_counts(txid)?;
+            db.record_conditional_update_guard(
+                txid,
+                p.table.clone(),
+                row.row_id,
+                predicates,
+                before_counts,
+                after_counts,
+                false,
+            )?;
+        }
     }
 
     Ok(QueryResult::empty_with_affected(matched.len() as u64))
@@ -1808,17 +2918,15 @@ fn exec_create_index(
 ) -> Result<QueryResult> {
     // Reserved-prefix guard: user-declared indexes must not collide with the
     // auto-index namespace used for PRIMARY KEY / UNIQUE backing indexes.
-    for prefix in ["__pk_", "__unique_"] {
-        if plan.name.starts_with(prefix) {
-            return Err(Error::ReservedIndexName {
-                table: plan.table.clone(),
-                name: plan.name.clone(),
-                prefix: prefix.to_string(),
-            });
-        }
+    if let Some(prefix) = reserved_index_prefix(&plan.name) {
+        return Err(Error::ReservedIndexName {
+            table: plan.table.clone(),
+            name: plan.name.clone(),
+            prefix: prefix.to_string(),
+        });
     }
 
-    // Error precedence (plan §Error precedence): TableNotFound > ColumnNotFound
+    // Error precedence: TableNotFound > ColumnNotFound
     // > ColumnNotIndexable > DuplicateIndex. Check in that exact order so
     // "structural" bugs surface before "naming" bugs.
     let meta = db
@@ -1842,7 +2950,7 @@ fn exec_create_index(
             .iter()
             .find(|c| c.name == *col_name)
             .expect("column existence verified above");
-        if matches!(col.column_type, ColumnType::Json | ColumnType::Vector(_)) {
+        if !btree_indexable(&col.column_type) {
             return Err(Error::ColumnNotIndexable {
                 table: plan.table.clone(),
                 column: col_name.clone(),
@@ -1859,29 +2967,29 @@ fn exec_create_index(
         });
     }
 
-    // All validations passed. Persist the IndexDecl into TableMeta.indexes,
-    // register the IndexStorage, rebuild it over existing rows, flush meta.
-    {
-        let store = db.relational_store();
-        let mut metas = store.table_meta.write();
-        let m = metas
-            .get_mut(&plan.table)
-            .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
-        m.indexes.push(contextdb_core::IndexDecl {
-            name: plan.name.clone(),
-            columns: plan.columns.clone(),
-            kind: contextdb_core::IndexKind::UserDeclared,
-        });
-    }
-    db.relational_store()
-        .create_index_storage(&plan.table, &plan.name, plan.columns.clone());
-    db.relational_store().rebuild_index(&plan.table, &plan.name);
-
-    if let Some(table_meta) = db.table_meta(&plan.table) {
-        db.persist_table_meta(&plan.table, &table_meta)?;
-    }
-
+    // All validations passed. Reserve the DDL LSN before publishing the
+    // IndexDecl/storage so concurrent DML cannot appear before the index DDL
+    // in changes_since().
     db.allocate_ddl_lsn(|lsn| {
+        {
+            let store = db.relational_store();
+            let mut metas = store.table_meta.write();
+            let m = metas
+                .get_mut(&plan.table)
+                .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
+            m.indexes.push(contextdb_core::IndexDecl {
+                name: plan.name.clone(),
+                columns: plan.columns.clone(),
+                kind: contextdb_core::IndexKind::UserDeclared,
+            });
+        }
+        db.relational_store()
+            .create_index_storage(&plan.table, &plan.name, plan.columns.clone());
+        db.relational_store().rebuild_index(&plan.table, &plan.name);
+
+        if let Some(table_meta) = db.table_meta(&plan.table) {
+            db.persist_table_meta(&plan.table, &table_meta)?;
+        }
         db.log_create_index_ddl(&plan.table, &plan.name, &plan.columns, lsn)
     })?;
 
@@ -1903,6 +3011,13 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
             index: plan.name.clone(),
         });
     }
+    if let Some(prefix) = reserved_index_prefix(&plan.name) {
+        return Err(Error::ReservedIndexName {
+            table: plan.table.clone(),
+            name: plan.name.clone(),
+            prefix: prefix.to_string(),
+        });
+    }
     if let Some(block) = rank_policy_drop_index_blocker(db, &plan.table, &plan.name) {
         return Err(block);
     }
@@ -1921,6 +3036,20 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
     db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&plan.table, &plan.name, lsn))?;
     db.clear_statement_cache();
     Ok(QueryResult::empty_with_affected(0))
+}
+
+pub(crate) fn reserved_index_prefix(name: &str) -> Option<&'static str> {
+    ["__pk_", "__unique_", "__fk_", "__graph_edge_"]
+        .into_iter()
+        .find(|prefix| name.starts_with(prefix))
+}
+
+fn refresh_auto_indexes_for_table(db: &Database, table: &str) -> Result<()> {
+    let Some(meta) = db.table_meta(table) else {
+        return Err(Error::TableNotFound(table.to_string()));
+    };
+    db.replace_table_meta_and_refresh_auto_indexes(table, &meta.clone(), meta)?;
+    Ok(())
 }
 
 fn estimate_table_row_bytes(
@@ -1971,6 +3100,37 @@ struct IndexPick {
     shape: IndexPredicateShape,
     /// Pushed column name (engine column name) for trace.
     pushed_column: String,
+    /// Full pushed prefix in index-column order.
+    pushed_columns: Vec<String>,
+    /// Equality values for pushed suffix columns, aligned with
+    /// `pushed_columns[1..]`.
+    suffix_values: Vec<Value>,
+    /// The prefix is provably empty before touching the index tree
+    /// (contradictory suffix constants, NULL/NaN suffix binds, or an
+    /// incoercible leading equality/range value).
+    prefix_empty: bool,
+}
+
+#[derive(Debug, Clone)]
+struct IndexCandidatePlan {
+    pick: IndexPick,
+    match_count: usize,
+    tier: u8,
+    creation_index: usize,
+}
+
+fn auto_exact_index_supports_pick(
+    decl: &contextdb_core::IndexDecl,
+    shape: &IndexPredicateShape,
+    pushed_columns: usize,
+) -> bool {
+    decl.kind != contextdb_core::IndexKind::Auto
+        || (matches!(
+            shape,
+            IndexPredicateShape::Equality(_)
+                | IndexPredicateShape::InList(_)
+                | IndexPredicateShape::IsNull
+        ) && pushed_columns == decl.columns.len())
 }
 
 /// Top-level decision: did we rewrite to IndexScan?
@@ -1978,6 +3138,12 @@ struct IndexPick {
 struct IndexAnalysis {
     pick: Option<IndexPick>,
     considered: Vec<crate::database::IndexCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexScanAccessMode {
+    Select,
+    Predicate,
 }
 
 /// Coerce every literal value inside `pick.shape` to `pick.pushed_column`'s
@@ -1993,38 +3159,136 @@ fn coerce_pick_shape_to_column_type(
 ) -> Result<IndexPick> {
     use std::ops::Bound;
     let col = &pick.pushed_column;
-    let coerce = |v: Value| coerce_value_for_column(db, table, col, v, None, None);
+    let coerce = |column: &str, v: Value| coerce_index_probe_value(db, table, column, v);
+    let mut prefix_empty = pick.prefix_empty;
     let new_shape = match &pick.shape {
-        IndexPredicateShape::Equality(v) => IndexPredicateShape::Equality(coerce(v.clone())?),
-        IndexPredicateShape::InList(vs) => IndexPredicateShape::InList(
-            vs.iter()
-                .cloned()
-                .map(&coerce)
-                .collect::<Result<Vec<_>>>()?,
-        ),
+        IndexPredicateShape::Equality(v) => match coerce(col, v.clone()) {
+            Some(v) => IndexPredicateShape::Equality(v),
+            None => {
+                prefix_empty = true;
+                IndexPredicateShape::Equality(Value::Null)
+            }
+        },
+        IndexPredicateShape::InList(vs) => {
+            let coerced = vs.iter().cloned().filter_map(|v| coerce(col, v)).collect();
+            IndexPredicateShape::InList(coerced)
+        }
         IndexPredicateShape::Range { lower, upper } => {
             let lower = match lower {
-                Bound::Included(v) => Bound::Included(coerce(v.clone())?),
-                Bound::Excluded(v) => Bound::Excluded(coerce(v.clone())?),
+                Bound::Included(v) => match coerce(col, v.clone()) {
+                    Some(v) => Bound::Included(v),
+                    None => {
+                        prefix_empty = true;
+                        Bound::Unbounded
+                    }
+                },
+                Bound::Excluded(v) => match coerce(col, v.clone()) {
+                    Some(v) => Bound::Excluded(v),
+                    None => {
+                        prefix_empty = true;
+                        Bound::Unbounded
+                    }
+                },
                 Bound::Unbounded => Bound::Unbounded,
             };
             let upper = match upper {
-                Bound::Included(v) => Bound::Included(coerce(v.clone())?),
-                Bound::Excluded(v) => Bound::Excluded(coerce(v.clone())?),
+                Bound::Included(v) => match coerce(col, v.clone()) {
+                    Some(v) => Bound::Included(v),
+                    None => {
+                        prefix_empty = true;
+                        Bound::Unbounded
+                    }
+                },
+                Bound::Excluded(v) => match coerce(col, v.clone()) {
+                    Some(v) => Bound::Excluded(v),
+                    None => {
+                        prefix_empty = true;
+                        Bound::Unbounded
+                    }
+                },
                 Bound::Unbounded => Bound::Unbounded,
             };
             IndexPredicateShape::Range { lower, upper }
         }
-        IndexPredicateShape::NotEqual(v) => IndexPredicateShape::NotEqual(coerce(v.clone())?),
+        IndexPredicateShape::NotEqual(v) => match coerce(col, v.clone()) {
+            Some(v) => IndexPredicateShape::NotEqual(v),
+            None => {
+                prefix_empty = true;
+                IndexPredicateShape::NotEqual(Value::Null)
+            }
+        },
         IndexPredicateShape::IsNull => IndexPredicateShape::IsNull,
         IndexPredicateShape::IsNotNull => IndexPredicateShape::IsNotNull,
     };
+    let mut suffix_values = Vec::with_capacity(pick.suffix_values.len());
+    for ((column, _), value) in pick.columns.iter().skip(1).zip(pick.suffix_values.iter()) {
+        match coerce(column, value.clone()) {
+            Some(Value::Null) => {
+                prefix_empty = true;
+                suffix_values.push(Value::Null);
+            }
+            Some(Value::Float64(f)) if f.is_nan() => {
+                prefix_empty = true;
+                suffix_values.push(Value::Float64(f));
+            }
+            Some(value) => suffix_values.push(value),
+            None => {
+                prefix_empty = true;
+                suffix_values.push(Value::Null);
+            }
+        }
+    }
     Ok(IndexPick {
         name: pick.name.clone(),
         columns: pick.columns.clone(),
         shape: new_shape,
         pushed_column: pick.pushed_column.clone(),
+        pushed_columns: pick.pushed_columns.clone(),
+        suffix_values,
+        prefix_empty,
     })
+}
+
+fn coerce_index_probe_value(
+    db: &Database,
+    table: &str,
+    column: &str,
+    value: Value,
+) -> Option<Value> {
+    let coerced = coerce_value_for_column(db, table, column, value, None, None).ok()?;
+    let Some(meta) = db.table_meta(table) else {
+        return Some(coerced);
+    };
+    let Some(column_def) = meta
+        .columns
+        .iter()
+        .find(|candidate| candidate.name == column)
+    else {
+        return Some(coerced);
+    };
+    match (&column_def.column_type, coerced) {
+        (_, Value::Null) => Some(Value::Null),
+        (ColumnType::Integer, Value::Int64(v)) => Some(Value::Int64(v)),
+        (ColumnType::Integer, Value::Float64(v)) => exact_i64_from_float(v).map(Value::Int64),
+        (ColumnType::Real, Value::Float64(v)) => Some(Value::Float64(v)),
+        (ColumnType::Real, Value::Int64(v)) => Some(Value::Float64(v as f64)),
+        (ColumnType::Text, Value::Text(v)) => Some(Value::Text(v)),
+        (ColumnType::Boolean, Value::Bool(v)) => Some(Value::Bool(v)),
+        (ColumnType::Uuid, Value::Uuid(v)) => Some(Value::Uuid(v)),
+        (ColumnType::Timestamp, Value::Timestamp(v)) => Some(Value::Timestamp(v)),
+        (ColumnType::Timestamp, Value::Int64(v)) => Some(Value::Timestamp(v)),
+        (ColumnType::TxId, Value::TxId(v)) => Some(Value::TxId(v)),
+        _ => None,
+    }
+}
+
+fn exact_i64_from_float(value: f64) -> Option<i64> {
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    let candidate = value as i64;
+    (compare_values(&Value::Int64(candidate), &Value::Float64(value)) == Some(Ordering::Equal))
+        .then_some(candidate)
 }
 
 /// Inspect `filter` looking for an eligible predicate on the first column of
@@ -2035,28 +3299,32 @@ fn analyze_filter_for_index(
     params: &HashMap<String, Value>,
 ) -> IndexAnalysis {
     use std::borrow::Cow;
+    const EXACT_AUTO_REASON: &str = "auto index supports exact full-key probes only";
+    const FEWER_COLUMNS_REASON: &str = "fewer predicate columns matched than chosen index";
+
     let mut considered: Vec<crate::database::IndexCandidate> = Vec::new();
 
     // Find each conjunct (split on AND) and map to (column, shape).
     let conjuncts = split_conjuncts(filter);
-    let mut conjunct_shapes: Vec<(String, IndexPredicateShape)> = Vec::new();
-    for conjunct in &conjuncts {
+    let mut conjunct_shapes: Vec<(usize, String, IndexPredicateShape)> = Vec::new();
+    for (order, conjunct) in conjuncts.iter().enumerate() {
         if let Some((col, shape)) = classify_index_predicate(conjunct, params) {
-            conjunct_shapes.push((col, shape));
+            conjunct_shapes.push((order, col, shape));
         }
     }
 
     // Annotate rejections on indexes that can't apply, for the trace.
-    let mut candidates: Vec<(IndexPick, u8, usize)> = Vec::new();
+    let mut candidates: Vec<IndexCandidatePlan> = Vec::new();
+    let mut deferred_exact_auto_rejections: Vec<IndexCandidatePlan> = Vec::new();
     for (i_idx, decl) in indexes.iter().enumerate() {
         let first_col = match decl.columns.first() {
             Some((c, _)) => c.clone(),
             None => continue,
         };
         // Find the most-selective matching conjunct on the first column.
-        let matching: Vec<&(String, IndexPredicateShape)> = conjunct_shapes
+        let matching: Vec<&(usize, String, IndexPredicateShape)> = conjunct_shapes
             .iter()
-            .filter(|(c, _)| c == &first_col)
+            .filter(|(_, c, _)| c == &first_col)
             .collect();
         if matching.is_empty() {
             // Check whether the filter mentions first_col in an un-usable way
@@ -2069,28 +3337,225 @@ fn analyze_filter_for_index(
             });
             continue;
         }
-        // Combine range conjuncts on the same column (BETWEEN = `>= X AND <= Y`).
-        let shape = combine_shapes(matching.iter().map(|(_, s)| s.clone()).collect());
+        let shape = choose_driving_shape(&matching);
         let tier = shape.selectivity_tier();
-        candidates.push((
-            IndexPick {
+        let mut pushed_columns = vec![first_col.clone()];
+        let mut suffix_values = Vec::new();
+        let mut prefix_empty = false;
+        if matches!(
+            shape,
+            IndexPredicateShape::Equality(_)
+                | IndexPredicateShape::InList(_)
+                | IndexPredicateShape::IsNull
+        ) {
+            for (column, _) in decl.columns.iter().skip(1) {
+                match suffix_equality_value(&conjunct_shapes, column) {
+                    SuffixEquality::Absent => break,
+                    SuffixEquality::Value(value) => {
+                        pushed_columns.push(column.clone());
+                        suffix_values.push(value);
+                    }
+                    SuffixEquality::Contradictory(value) => {
+                        pushed_columns.push(column.clone());
+                        suffix_values.push(value);
+                        prefix_empty = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let match_count = pushed_columns.len();
+        let exact_auto_supported = auto_exact_index_supports_pick(decl, &shape, match_count);
+        let plan = IndexCandidatePlan {
+            pick: IndexPick {
                 name: decl.name.clone(),
                 columns: decl.columns.clone(),
                 shape,
                 pushed_column: first_col.clone(),
+                pushed_columns,
+                suffix_values,
+                prefix_empty,
             },
+            match_count,
             tier,
-            i_idx,
-        ));
+            creation_index: i_idx,
+        };
+        if !exact_auto_supported {
+            deferred_exact_auto_rejections.push(plan);
+            continue;
+        }
+        candidates.push(plan);
     }
 
-    // Selection: most-selective tier wins; tie-break by creation order (index i).
-    let pick = candidates
-        .into_iter()
-        .min_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)))
-        .map(|(p, _, _)| p);
+    // Selection: deepest matched prefix wins; ties break by leading
+    // selectivity tier, then declaration/creation order.
+    let winner = candidates
+        .iter()
+        .min_by(|a, b| {
+            b.match_count
+                .cmp(&a.match_count)
+                .then(a.tier.cmp(&b.tier))
+                .then(a.creation_index.cmp(&b.creation_index))
+        })
+        .cloned();
 
-    IndexAnalysis { pick, considered }
+    if let Some(winner) = &winner {
+        for candidate in &candidates {
+            if candidate.pick.name == winner.pick.name {
+                continue;
+            }
+            let reason = if candidate.match_count < winner.match_count {
+                "fewer predicate columns matched than chosen index"
+            } else if candidate.tier > winner.tier {
+                "lower selectivity than chosen index"
+            } else {
+                "tied with chosen index; lost by creation order"
+            };
+            considered.push(crate::database::IndexCandidate {
+                name: candidate.pick.name.clone(),
+                rejected_reason: Cow::Borrowed(reason),
+            });
+        }
+        for candidate in deferred_exact_auto_rejections {
+            let reason = if candidate.match_count < winner.match_count {
+                FEWER_COLUMNS_REASON
+            } else {
+                EXACT_AUTO_REASON
+            };
+            considered.push(crate::database::IndexCandidate {
+                name: candidate.pick.name,
+                rejected_reason: Cow::Borrowed(reason),
+            });
+        }
+    } else {
+        for candidate in deferred_exact_auto_rejections {
+            considered.push(crate::database::IndexCandidate {
+                name: candidate.pick.name,
+                rejected_reason: Cow::Borrowed(EXACT_AUTO_REASON),
+            });
+        }
+    }
+
+    IndexAnalysis {
+        pick: winner.map(|winner| winner.pick),
+        considered,
+    }
+}
+
+fn choose_driving_shape(matching: &[&(usize, String, IndexPredicateShape)]) -> IndexPredicateShape {
+    let Some((first_order, _, first_shape)) = matching
+        .iter()
+        .min_by_key(|(order, _, shape)| (shape.selectivity_tier(), *order))
+        .copied()
+    else {
+        unreachable!("choose_driving_shape requires at least one match");
+    };
+    if matches!(first_shape, IndexPredicateShape::Range { .. }) {
+        let mut range_shapes: Vec<IndexPredicateShape> = matching
+            .iter()
+            .filter_map(|(_, _, shape)| {
+                if matches!(shape, IndexPredicateShape::Range { .. }) {
+                    Some(shape.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !range_shapes.is_empty() {
+            return combine_shapes(std::mem::take(&mut range_shapes));
+        }
+    }
+    let _ = first_order;
+    first_shape.clone()
+}
+
+enum SuffixEquality {
+    Absent,
+    Value(Value),
+    Contradictory(Value),
+}
+
+fn suffix_equality_value(
+    conjunct_shapes: &[(usize, String, IndexPredicateShape)],
+    column: &str,
+) -> SuffixEquality {
+    let mut value: Option<Value> = None;
+    for (_, col, shape) in conjunct_shapes {
+        if col != column {
+            continue;
+        }
+        let IndexPredicateShape::Equality(candidate) = shape else {
+            return SuffixEquality::Absent;
+        };
+        match &value {
+            None => value = Some(candidate.clone()),
+            Some(existing) if values_constraint_equal(existing, candidate) => {}
+            Some(existing) => return SuffixEquality::Contradictory(existing.clone()),
+        }
+    }
+    value.map_or(SuffixEquality::Absent, SuffixEquality::Value)
+}
+
+fn values_constraint_equal(left: &Value, right: &Value) -> bool {
+    left == right || compare_values(left, right).is_some_and(|ord| ord == Ordering::Equal)
+}
+
+fn is_anchor_shape_index_pick(
+    db: &Database,
+    table: &str,
+    pick: &IndexPick,
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+) -> bool {
+    if !matches!(pick.shape, IndexPredicateShape::Equality(_)) {
+        return false;
+    }
+    let Some(meta) = db.table_meta(table) else {
+        return false;
+    };
+    let pick_cols: Vec<&str> = pick.columns.iter().map(|(col, _)| col.as_str()).collect();
+    let Some(anchor_cols) = unique_anchor_columns_for_pick(&meta, &pick_cols) else {
+        return false;
+    };
+    filter_has_equality_for_columns(filter, params, &anchor_cols)
+}
+
+fn unique_anchor_columns_for_pick(meta: &TableMeta, pick_cols: &[&str]) -> Option<Vec<String>> {
+    if pick_cols.len() == 1 {
+        let column = meta
+            .columns
+            .iter()
+            .find(|column| column.name == pick_cols[0])?;
+        if column.primary_key || column.unique {
+            return Some(vec![column.name.clone()]);
+        }
+    }
+    for unique in &meta.unique_constraints {
+        if unique.len() == pick_cols.len()
+            && unique.iter().zip(pick_cols.iter()).all(|(a, b)| a == b)
+        {
+            return Some(unique.clone());
+        }
+    }
+    None
+}
+
+fn filter_has_equality_for_columns(
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+    required_columns: &[String],
+) -> bool {
+    let mut equality_columns = HashSet::new();
+    for conjunct in split_conjuncts(filter) {
+        if let Some((column, IndexPredicateShape::Equality(_))) =
+            classify_index_predicate(&conjunct, params)
+        {
+            equality_columns.insert(column);
+        }
+    }
+    required_columns
+        .iter()
+        .all(|column| equality_columns.contains(column))
 }
 
 /// Combine multiple index-shapes on the same column into the most-selective
@@ -2443,6 +3908,9 @@ fn execute_index_scan(
     pick: &IndexPick,
     snapshot: contextdb_core::SnapshotId,
     tx: Option<TxId>,
+    access_mode: IndexScanAccessMode,
+    residual_filter: Option<&Expr>,
+    params: &HashMap<String, Value>,
 ) -> Result<(Vec<VersionedRow>, u64)> {
     use contextdb_core::{DirectedValue, SortDirection, TotalOrdAsc, TotalOrdDesc};
     use std::ops::Bound;
@@ -2472,28 +3940,39 @@ fn execute_index_scan(
         Err(_) => return Ok((Vec::new(), 0)),
     };
     let pick = &pick;
+    if pick.prefix_empty {
+        return Ok((Vec::new(), 0));
+    }
 
     let indexes = db.relational_store().indexes.read();
-    let storage = match indexes.get(&(table.to_string(), pick.name.clone())) {
+    let storage = match indexes
+        .get(table)
+        .and_then(|table_indexes| table_indexes.get(&pick.name))
+    {
         Some(s) => s,
         None => return Ok((Vec::new(), 0)),
     };
 
-    // Build bound keys as single-column IndexKey prefixes. Composite indexes:
-    // we walk the entire range for the first-col match and rely on residual
-    // filter for subsequent columns.
     let first_dir = pick
         .columns
         .first()
         .map(|(_, d)| *d)
         .unwrap_or(SortDirection::Asc);
 
-    let wrap = |v: Value| -> DirectedValue {
-        match first_dir {
+    let wrap_with_dir = |direction: SortDirection, v: Value| -> DirectedValue {
+        match direction {
             SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(v)),
             SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(v)),
         }
     };
+    let wrap = |v: Value| -> DirectedValue { wrap_with_dir(first_dir, v) };
+
+    let suffix_prefix: Vec<DirectedValue> = pick
+        .suffix_values
+        .iter()
+        .zip(pick.columns.iter().skip(1))
+        .map(|(value, (_, direction))| wrap_with_dir(*direction, value.clone()))
+        .collect();
 
     // Collect matching postings then filter by MVCC visibility.
     let mut postings: Vec<contextdb_relational::IndexEntry> = Vec::new();
@@ -2513,46 +3992,133 @@ fn execute_index_scan(
         }
     };
 
-    // For composite indexes, a first-column equality must walk ALL keys
-    // whose first component equals the target (i.e. the prefix range). We
-    // iterate the whole tree and filter by first-component match to cover
-    // both single-column and composite shapes uniformly.
     let is_composite = pick.columns.len() > 1;
-
-    match &pick.shape {
-        IndexPredicateShape::Equality(v) => {
-            if is_composite {
-                // Walk every posting whose first component equals `v`.
-                let want = wrap(v.clone());
-                for (key, entries) in storage.tree.iter() {
-                    if key.first() != Some(&want) {
-                        continue;
-                    }
-                    for e in entries {
-                        rows_examined += 1;
-                        if e.visible_at(snapshot) {
-                            postings.push(e.clone());
-                        }
-                    }
+    let collect_prefix = |postings: &mut Vec<contextdb_relational::IndexEntry>,
+                          examined: &mut u64,
+                          prefix: &[DirectedValue]| {
+        for (key, entries) in storage
+            .tree
+            .range::<[DirectedValue], _>((Bound::Included(prefix), Bound::Unbounded))
+        {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            for e in entries {
+                *examined += 1;
+                if e.visible_at(snapshot) {
+                    postings.push(e.clone());
                 }
-            } else {
-                let lower = vec![wrap(v.clone())];
-                let upper = lower.clone();
-                collect_range(
-                    &mut postings,
-                    &mut rows_examined,
-                    Bound::Included(lower),
-                    Bound::Included(upper),
-                );
             }
         }
-        IndexPredicateShape::InList(vs) => {
-            for v in vs {
+    };
+    let make_probe_prefix = |leading: Value, probe_prefix: &mut Vec<DirectedValue>| {
+        probe_prefix.clear();
+        probe_prefix.push(wrap(leading));
+        probe_prefix.extend(suffix_prefix.iter().cloned());
+    };
+
+    if storage.exact_only() {
+        let exact_key_complete = 1 + suffix_prefix.len() == storage.columns.len();
+        let collect_exact_key = |postings: &mut Vec<contextdb_relational::IndexEntry>,
+                                 examined: &mut u64,
+                                 key: &[DirectedValue]| {
+            let key = key.to_vec();
+            if let Some(entries) = storage.exact_postings(&key) {
+                for e in entries {
+                    *examined += 1;
+                    if e.visible_at(snapshot) {
+                        postings.push(e.clone());
+                    }
+                }
+            }
+        };
+        match &pick.shape {
+            IndexPredicateShape::Equality(v) if exact_key_complete => {
+                let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
+                make_probe_prefix(v.clone(), &mut probe_prefix);
+                collect_exact_key(&mut postings, &mut rows_examined, &probe_prefix);
+            }
+            IndexPredicateShape::InList(vs) if exact_key_complete => {
+                let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
+                for v in vs {
+                    make_probe_prefix(v.clone(), &mut probe_prefix);
+                    collect_exact_key(&mut postings, &mut rows_examined, &probe_prefix);
+                }
+            }
+            IndexPredicateShape::IsNull if exact_key_complete => {
+                let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
+                make_probe_prefix(Value::Null, &mut probe_prefix);
+                collect_exact_key(&mut postings, &mut rows_examined, &probe_prefix);
+            }
+            _ => {
+                drop(indexes);
+                let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+                let rows_examined = rows.len() as u64;
+                return Ok((rows, rows_examined));
+            }
+        }
+    } else {
+        match &pick.shape {
+            IndexPredicateShape::Equality(v) => {
                 if is_composite {
-                    let want = wrap(v.clone());
-                    for (key, entries) in storage.tree.iter() {
-                        if key.first() != Some(&want) {
+                    let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
+                    make_probe_prefix(v.clone(), &mut probe_prefix);
+                    collect_prefix(&mut postings, &mut rows_examined, &probe_prefix);
+                } else {
+                    let lower = vec![wrap(v.clone())];
+                    let upper = lower.clone();
+                    collect_range(
+                        &mut postings,
+                        &mut rows_examined,
+                        Bound::Included(lower),
+                        Bound::Included(upper),
+                    );
+                }
+            }
+            IndexPredicateShape::InList(vs) => {
+                let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
+                for v in vs {
+                    if is_composite {
+                        make_probe_prefix(v.clone(), &mut probe_prefix);
+                        collect_prefix(&mut postings, &mut rows_examined, &probe_prefix);
+                    } else {
+                        let k = vec![wrap(v.clone())];
+                        collect_range(
+                            &mut postings,
+                            &mut rows_examined,
+                            Bound::Included(k.clone()),
+                            Bound::Included(k),
+                        );
+                    }
+                }
+            }
+            IndexPredicateShape::Range { lower, upper } => {
+                if is_composite {
+                    let lower_key = match lower {
+                        Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
+                        Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
+                        Bound::Unbounded => Bound::Unbounded,
+                    };
+                    // Composite + range on the leading column cannot push suffix
+                    // equalities; walk the ordered leading range and stop once
+                    // the first component is beyond the upper bound.
+                    for (key, entries) in storage.tree.range((lower_key, Bound::Unbounded)) {
+                        let Some(first) = key.first() else { continue };
+                        let in_lower = match lower {
+                            Bound::Unbounded => true,
+                            Bound::Included(v) => first >= &wrap(v.clone()),
+                            Bound::Excluded(v) => first > &wrap(v.clone()),
+                        };
+                        if !in_lower {
                             continue;
+                        }
+                        let in_upper = match upper {
+                            Bound::Unbounded => true,
+                            Bound::Included(v) => first <= &wrap(v.clone()),
+                            Bound::Excluded(v) => first < &wrap(v.clone()),
+                        };
+                        if !in_upper {
+                            break;
                         }
                         for e in entries {
                             rows_examined += 1;
@@ -2562,33 +4128,25 @@ fn execute_index_scan(
                         }
                     }
                 } else {
-                    let k = vec![wrap(v.clone())];
-                    collect_range(
-                        &mut postings,
-                        &mut rows_examined,
-                        Bound::Included(k.clone()),
-                        Bound::Included(k),
-                    );
+                    let l = match lower {
+                        Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
+                        Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
+                        Bound::Unbounded => Bound::Unbounded,
+                    };
+                    let u = match upper {
+                        Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
+                        Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
+                        Bound::Unbounded => Bound::Unbounded,
+                    };
+                    collect_range(&mut postings, &mut rows_examined, l, u);
                 }
             }
-        }
-        IndexPredicateShape::Range { lower, upper } => {
-            if is_composite {
-                // Composite + range on first column: walk entries whose first
-                // component falls in the range.
-                for (key, entries) in storage.tree.iter() {
-                    let Some(first) = key.first() else { continue };
-                    let in_lower = match lower {
-                        Bound::Unbounded => true,
-                        Bound::Included(v) => first >= &wrap(v.clone()),
-                        Bound::Excluded(v) => first > &wrap(v.clone()),
-                    };
-                    let in_upper = match upper {
-                        Bound::Unbounded => true,
-                        Bound::Included(v) => first <= &wrap(v.clone()),
-                        Bound::Excluded(v) => first < &wrap(v.clone()),
-                    };
-                    if !(in_lower && in_upper) {
+            IndexPredicateShape::NotEqual(v) => {
+                // Full walk; skip exact key. For IndexScan-trace we still attribute
+                // all postings touched to __rows_examined (trace counts postings).
+                let except_key = vec![wrap(v.clone())];
+                for (k, entries) in storage.tree.iter() {
+                    if *k == except_key {
                         continue;
                     }
                     for e in entries {
@@ -2598,56 +4156,34 @@ fn execute_index_scan(
                         }
                     }
                 }
-            } else {
-                let l = match lower {
-                    Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
-                    Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
-                    Bound::Unbounded => Bound::Unbounded,
-                };
-                let u = match upper {
-                    Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
-                    Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
-                    Bound::Unbounded => Bound::Unbounded,
-                };
-                collect_range(&mut postings, &mut rows_examined, l, u);
             }
-        }
-        IndexPredicateShape::NotEqual(v) => {
-            // Full walk; skip exact key. For IndexScan-trace we still attribute
-            // all postings touched to __rows_examined (trace counts postings).
-            let except_key = vec![wrap(v.clone())];
-            for (k, entries) in storage.tree.iter() {
-                if *k == except_key {
-                    continue;
+            IndexPredicateShape::IsNull => {
+                if is_composite {
+                    let mut probe_prefix = Vec::with_capacity(1 + suffix_prefix.len());
+                    make_probe_prefix(Value::Null, &mut probe_prefix);
+                    collect_prefix(&mut postings, &mut rows_examined, &probe_prefix);
+                } else {
+                    let k = vec![wrap(Value::Null)];
+                    collect_range(
+                        &mut postings,
+                        &mut rows_examined,
+                        Bound::Included(k.clone()),
+                        Bound::Included(k),
+                    );
                 }
-                for e in entries {
-                    rows_examined += 1;
-                    if e.visible_at(snapshot) {
-                        postings.push(e.clone());
+            }
+            IndexPredicateShape::IsNotNull => {
+                // Everything except NULL partition.
+                let null_key = vec![wrap(Value::Null)];
+                for (k, entries) in storage.tree.iter() {
+                    if *k == null_key {
+                        continue;
                     }
-                }
-            }
-        }
-        IndexPredicateShape::IsNull => {
-            let k = vec![wrap(Value::Null)];
-            collect_range(
-                &mut postings,
-                &mut rows_examined,
-                Bound::Included(k.clone()),
-                Bound::Included(k),
-            );
-        }
-        IndexPredicateShape::IsNotNull => {
-            // Everything except NULL partition.
-            let null_key = vec![wrap(Value::Null)];
-            for (k, entries) in storage.tree.iter() {
-                if *k == null_key {
-                    continue;
-                }
-                for e in entries {
-                    rows_examined += 1;
-                    if e.visible_at(snapshot) {
-                        postings.push(e.clone());
+                    for e in entries {
+                        rows_examined += 1;
+                        if e.visible_at(snapshot) {
+                            postings.push(e.clone());
+                        }
                     }
                 }
             }
@@ -2658,32 +4194,33 @@ fn execute_index_scan(
     // already enumerates postings in index sort order; rows[] preserve it.
     drop(indexes);
     let row_ids: Vec<RowId> = postings.iter().map(|p| p.row_id).collect();
-    if row_ids.is_empty() {
-        return Ok((Vec::new(), rows_examined));
-    }
-    let tables = db.relational_store().tables.read();
-    let rows_slice = tables.get(table);
     let mut out: Vec<VersionedRow> = Vec::with_capacity(row_ids.len());
-    if let Some(rows) = rows_slice {
-        let by_id: HashMap<RowId, &VersionedRow> = rows.iter().map(|r| (r.row_id, r)).collect();
+    if !row_ids.is_empty() {
         for rid in &row_ids {
-            if let Some(r) = by_id.get(rid) {
-                // Layered-visibility check: apply same rule as scan_with_tx so
-                // deletes/inserts from the active tx are honored.
-                if (*r).visible_at(snapshot) {
-                    out.push((**r).clone());
-                }
+            if let Some(row) = db.relational_store().row_by_id(table, *rid, snapshot) {
+                out.push(row);
             }
         }
     }
     // Layer tx-scoped inserts / deletes on top, matching the semantics of
     // scan_with_tx.
-    drop(tables);
     if let Some(tx_id) = tx {
         let overlay = db.index_scan_tx_overlay(tx_id, table, &pick.pushed_column, &pick.shape)?;
         let deleted_row_ids = overlay.deleted_row_ids;
         out.retain(|row| !deleted_row_ids.contains(&row.row_id));
         out.extend(overlay.matching_inserts);
+    }
+    let anchor_shape = access_mode == IndexScanAccessMode::Select
+        && residual_filter
+            .map(|filter| is_anchor_shape_index_pick(db, table, pick, filter, params))
+            .unwrap_or(false);
+    if anchor_shape {
+        if let Some(filter) = residual_filter {
+            out.retain(|row| row_matches(row, filter, params).unwrap_or(false));
+        }
+        out = db.filter_rows_for_anchor_read_in_tx(tx, table, out, snapshot)?;
+    } else {
+        out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot)?;
     }
     Ok((out, rows_examined))
 }
@@ -2764,6 +4301,9 @@ fn try_elide_sort(
         None => return Ok(None),
     };
     let matching_index = meta.indexes.iter().find(|decl| {
+        if decl.kind == contextdb_core::IndexKind::Auto {
+            return false;
+        }
         if decl.columns.len() < key_cols.len() {
             return false;
         }
@@ -2811,8 +4351,20 @@ fn run_index_scan_with_order(
             upper: std::ops::Bound::Unbounded,
         },
         pushed_column: decl.columns[0].0.clone(),
+        pushed_columns: vec![decl.columns[0].0.clone()],
+        suffix_values: Vec::new(),
+        prefix_empty: false,
     };
-    let (rows, examined) = execute_index_scan(db, table, &pick, snapshot, tx)?;
+    let (rows, examined) = execute_index_scan(
+        db,
+        table,
+        &pick,
+        snapshot,
+        tx,
+        IndexScanAccessMode::Select,
+        resolved_filter.as_ref(),
+        params,
+    )?;
     db.__bump_rows_examined(examined);
     let mut result = materialize_rows(
         rows,
@@ -2828,6 +4380,7 @@ fn run_index_scan_with_order(
         predicates_pushed: pushed,
         indexes_considered: Default::default(),
         sort_elided: true,
+        query_vector_source: None,
     };
     Ok(Some(result))
 }
@@ -2860,32 +4413,36 @@ fn sort_keys_match_index_prefix(
     let Some(decl) = decl else {
         return false;
     };
+    if decl.kind == contextdb_core::IndexKind::Auto {
+        return false;
+    }
     // Shape guard: IndexScan with InList or NotEqual shape on the leading
     // indexed column walks fragmented posting-list ranges, so rows are
     // emitted per-value, not globally sorted. Refuse sort elision for those
-    // shapes — the Sort node must run.
+    // shapes even when values are bound parameters.
     if let Some(filter_expr) = filter.as_ref()
         && let Some(leading_col) = decl.columns.first().map(|(c, _)| c.as_str())
+        && leading_filter_has_fragmented_order_shape(filter_expr, leading_col)
     {
-        let conjuncts = split_conjuncts(filter_expr);
-        let empty_params = HashMap::new();
-        for conjunct in &conjuncts {
-            if let Some((col, shape)) = classify_index_predicate(conjunct, &empty_params)
-                && col == leading_col
-                && matches!(
-                    shape,
-                    IndexPredicateShape::InList(_) | IndexPredicateShape::NotEqual(_)
-                )
-            {
-                return false;
-            }
-        }
+        return false;
     }
     // Determine how many leading index columns the WHERE filter pins to a
     // single equality. Those columns are effectively "used up" by the
     // IndexScan's range; subsequent ORDER BY keys matching the remaining
     // index columns still elide the Sort.
     let pinned_prefix_len = count_equality_prefix(filter.as_ref(), &decl.columns);
+    if decl.columns.len() >= keys.len()
+        && decl
+            .columns
+            .iter()
+            .zip(keys.iter())
+            .all(|((col, dir), k)| match &k.expr {
+                Expr::Column(r) => r.column == *col && core_dir_matches_ast(*dir, k.direction),
+                _ => false,
+            })
+    {
+        return true;
+    }
     let remaining_index_cols = &decl.columns[pinned_prefix_len..];
     if remaining_index_cols.len() < keys.len() {
         return false;
@@ -2895,6 +4452,24 @@ fn sort_keys_match_index_prefix(
         .zip(keys.iter())
         .all(|((col, dir), k)| match &k.expr {
             Expr::Column(r) => r.column == *col && core_dir_matches_ast(*dir, k.direction),
+            _ => false,
+        })
+}
+
+fn leading_filter_has_fragmented_order_shape(filter: &Expr, leading_col: &str) -> bool {
+    split_conjuncts(filter)
+        .iter()
+        .any(|conjunct| match conjunct {
+            Expr::InList {
+                expr,
+                negated: false,
+                ..
+            } => extract_simple_col_ref(expr).as_deref() == Some(leading_col),
+            Expr::BinaryOp {
+                left,
+                op: BinOp::Neq,
+                ..
+            } => extract_simple_col_ref(left).as_deref() == Some(leading_col),
             _ => false,
         })
 }
@@ -2974,14 +4549,12 @@ fn validate_update_state_transition(
         return Ok(());
     };
 
-    if old_state == new_state
-        || db.relational_store().validate_state_transition(
-            table,
-            &state_machine.column,
-            old_state,
-            new_state,
-        )
-    {
+    if db.relational_store().validate_state_transition(
+        table,
+        &state_machine.column,
+        old_state,
+        new_state,
+    ) {
         return Ok(());
     }
 
@@ -3054,7 +4627,7 @@ fn dedupe_graph_frontier(
     best.into_values().collect()
 }
 
-fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
+pub(crate) fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
     let meta = db.table_meta(table);
     let metadata_bytes = meta.as_ref().map(TableMeta::estimated_bytes).unwrap_or(0);
     let snapshot = db.snapshot();
@@ -3071,18 +4644,23 @@ fn estimate_drop_table_bytes(db: &Database, table: &str) -> usize {
         .fold(0usize, |acc, entry| {
             acc.saturating_add(entry.estimated_bytes())
         });
-    let edge_bytes = rows.iter().fold(0usize, |acc, row| {
-        match (
-            row.values.get("source_id").and_then(Value::as_uuid),
-            row.values.get("target_id").and_then(Value::as_uuid),
-            row.values.get("edge_type").and_then(Value::as_text),
-        ) {
-            (Some(_), Some(_), Some(edge_type)) => acc.saturating_add(
-                96 + edge_type.len().saturating_mul(16) + estimate_row_value_bytes(&HashMap::new()),
-            ),
-            _ => acc,
-        }
-    });
+    let edge_bytes = if meta.as_ref().is_some_and(has_edge_columns) {
+        rows.iter().fold(0usize, |acc, row| {
+            match (
+                row.values.get("source_id").and_then(Value::as_uuid),
+                row.values.get("target_id").and_then(Value::as_uuid),
+                row.values.get("edge_type").and_then(Value::as_text),
+            ) {
+                (Some(_), Some(_), Some(edge_type)) => acc.saturating_add(
+                    96 + edge_type.len().saturating_mul(16)
+                        + estimate_row_value_bytes(&HashMap::new()),
+                ),
+                _ => acc,
+            }
+        })
+    } else {
+        0
+    };
     metadata_bytes
         .saturating_add(row_bytes)
         .saturating_add(vector_bytes)
@@ -3135,49 +4713,49 @@ fn materialize_rows(
     })
 }
 
+fn scan_rows_for_select(
+    db: &Database,
+    table: &str,
+    snapshot: SnapshotId,
+    tx: Option<TxId>,
+) -> Result<Vec<VersionedRow>> {
+    if let Some(tx) = tx {
+        let rows = db.scan_in_tx_raw(tx, table, snapshot)?;
+        db.filter_rows_for_read_in_tx(Some(tx), table, rows, snapshot)
+    } else {
+        db.scan(table, snapshot)
+    }
+}
+
 fn rows_by_row_id(
     db: &Database,
     table: &str,
     row_ids: &[RowId],
     snapshot: SnapshotId,
+    tx: Option<TxId>,
 ) -> Result<Vec<VersionedRow>> {
     if row_ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let wanted = row_ids.iter().copied().collect::<HashSet<_>>();
-    let tables = db.relational_store().tables.read();
-    let rows = tables
-        .get(table)
-        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
-    let mut found = HashMap::with_capacity(wanted.len());
-    for row in rows {
-        if wanted.contains(&row.row_id) && row.visible_at(snapshot) {
-            found.insert(row.row_id, row.clone());
-            if found.len() == wanted.len() {
-                break;
-            }
+    let mut rows = Vec::with_capacity(row_ids.len());
+    for row_id in row_ids {
+        if let Ok(row) = db.find_row_by_id_in_tx(tx, table, *row_id, snapshot) {
+            rows.push(row);
         }
     }
-
-    Ok(row_ids
-        .iter()
-        .filter_map(|row_id| found.remove(row_id))
-        .collect())
+    Ok(rows)
 }
 
 fn uuid_to_row_id_map(
     db: &Database,
     table: &str,
     snapshot: SnapshotId,
+    tx: Option<TxId>,
 ) -> Result<HashMap<uuid::Uuid, RowId>> {
-    let tables = db.relational_store().tables.read();
-    let rows = tables
-        .get(table)
-        .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+    let rows = scan_rows_for_select(db, table, snapshot, tx)?;
     Ok(rows
         .iter()
-        .filter(|row| row.visible_at(snapshot))
         .filter_map(|row| match row.values.get("id") {
             Some(Value::Uuid(uuid)) => Some((*uuid, row.row_id)),
             _ => None,
@@ -3203,6 +4781,44 @@ fn vector_search_trace(operator: &'static str, candidate_trace: Option<QueryTrac
     };
     trace.sort_elided = false;
     trace
+}
+
+fn trace_label_survives_sort(physical_plan: &str) -> bool {
+    matches!(
+        physical_plan,
+        "IndexScan" | "AdjacencyProbe" | "EdgesScan" | "GraphBfs"
+    )
+}
+
+fn vector_search_trace_with_source(
+    operator: &'static str,
+    candidate_trace: Option<QueryTrace>,
+    query_vector_source: Option<contextdb_core::VectorIndexRef>,
+) -> QueryTrace {
+    let mut trace = vector_search_trace(operator, candidate_trace);
+    trace.query_vector_source = query_vector_source;
+    trace
+}
+
+fn row_vector_source_ref(expr: &Expr) -> Option<contextdb_core::VectorIndexRef> {
+    match expr {
+        Expr::RowVectorSource { table, column, .. } => Some(contextdb_core::VectorIndexRef::new(
+            table.clone(),
+            column.clone(),
+        )),
+        _ => None,
+    }
+}
+
+fn is_unrestricted_scan_for_table(plan: &PhysicalPlan, table: &str) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::Scan {
+            table: scan_table,
+            filter: None,
+            ..
+        } if scan_table == table
+    )
 }
 
 pub(crate) fn row_matches(
@@ -3608,7 +5224,7 @@ fn eval_assignment_expr(
     }
 }
 
-fn apply_on_conflict_updates(
+pub(crate) fn apply_on_conflict_updates(
     db: &Database,
     table: &str,
     mut insert_values: HashMap<String, Value>,
@@ -3619,6 +5235,10 @@ fn apply_on_conflict_updates(
 ) -> Result<HashMap<String, Value>> {
     if on_conflict.update_columns.is_empty() {
         return Ok(insert_values);
+    }
+
+    if db.table_meta(table).is_some_and(|meta| meta.immutable) {
+        return Err(Error::ImmutableTable(table.to_string()));
     }
 
     // Reject column-level IMMUTABLE updates at the ON CONFLICT DO UPDATE merge
@@ -3783,6 +5403,19 @@ fn resolve_in_subqueries(
     resolve_in_subqueries_with_ctes(db, expr, params, tx, &[])
 }
 
+fn resolve_graph_filter_at_snapshot(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: SnapshotId,
+    ctes: &[Cte],
+) -> Result<Expr> {
+    db.with_snapshot_override(snapshot, || {
+        resolve_in_subqueries_with_ctes(db, expr, params, tx, ctes)
+    })
+}
+
 pub(crate) fn resolve_in_subqueries_with_ctes(
     db: &Database,
     expr: &Expr,
@@ -3801,7 +5434,9 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
                 .from
                 .iter()
                 .filter_map(|item| match item {
-                    contextdb_parser::ast::FromItem::Table { name, .. } => Some(name.clone()),
+                    contextdb_parser::ast::FromItem::Table { name, alias } => {
+                        Some(alias.clone().unwrap_or_else(|| name.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -4203,58 +5838,190 @@ fn resolve_uuid(expr: &Expr, params: &HashMap<String, Value>) -> Result<uuid::Uu
     }
 }
 
-/// Resolve start nodes for a graph BFS from a WHERE filter like `a.name = 'entity-0'`.
-/// Scans all relational tables for rows matching the filter condition.
+#[derive(Clone, Copy)]
+enum GraphTraceShape {
+    AdjacencyProbe { index: &'static str },
+    EdgesScan { rejected_index: &'static str },
+    GraphBfs,
+}
+
+struct GraphStartResolution {
+    ids: Vec<uuid::Uuid>,
+    predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]>,
+    pinned: bool,
+}
+
+type GraphFrontierRow = (HashMap<String, uuid::Uuid>, uuid::Uuid, u32);
+
+fn graph_trace_shape(
+    single_step: bool,
+    unpinned_start: bool,
+    direction: Option<Direction>,
+) -> GraphTraceShape {
+    if !single_step {
+        return GraphTraceShape::GraphBfs;
+    }
+    let index = graph_adjacency_index_label(direction.unwrap_or(Direction::Outgoing));
+    if unpinned_start {
+        GraphTraceShape::EdgesScan {
+            rejected_index: index,
+        }
+    } else {
+        GraphTraceShape::AdjacencyProbe { index }
+    }
+}
+
+fn graph_adjacency_index_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Outgoing | Direction::Both => "forward_adj",
+        Direction::Incoming => "reverse_adj",
+    }
+}
+
+fn reverse_graph_probe_direction(direction: Direction) -> Direction {
+    match direction {
+        Direction::Outgoing => Direction::Incoming,
+        Direction::Incoming => Direction::Outgoing,
+        Direction::Both => Direction::Both,
+    }
+}
+
+fn graph_query_trace(
+    shape: GraphTraceShape,
+    predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]>,
+) -> QueryTrace {
+    match shape {
+        GraphTraceShape::AdjacencyProbe { index } => QueryTrace {
+            physical_plan: "AdjacencyProbe",
+            index_used: Some(index.to_string()),
+            predicates_pushed,
+            ..Default::default()
+        },
+        GraphTraceShape::EdgesScan { rejected_index } => {
+            let mut indexes_considered: smallvec::SmallVec<[crate::database::IndexCandidate; 4]> =
+                smallvec::SmallVec::new();
+            indexes_considered.push(crate::database::IndexCandidate {
+                name: rejected_index.to_string(),
+                rejected_reason: Cow::Borrowed("no pinned vertex"),
+            });
+            QueryTrace {
+                physical_plan: "EdgesScan",
+                indexes_considered,
+                ..Default::default()
+            }
+        }
+        GraphTraceShape::GraphBfs => QueryTrace {
+            physical_plan: "GraphBfs",
+            predicates_pushed,
+            ..Default::default()
+        },
+    }
+}
+
+/// Resolve start nodes for a graph traversal from a WHERE filter like
+/// `a.name = 'entity-0'`. Uses a matching relational index when one exists and
+/// otherwise reports the full row scan needed to resolve the start vertices.
 fn resolve_graph_start_nodes_from_filter(
     db: &Database,
     filter: &Expr,
     params: &HashMap<String, Value>,
-) -> Result<Vec<uuid::Uuid>> {
-    if let Some(ids) = resolve_graph_start_ids_from_filter(filter, params)? {
-        return Ok(ids);
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    start_alias: &str,
+) -> Result<GraphStartResolution> {
+    let mut predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]> =
+        smallvec::SmallVec::new();
+
+    let Some(start_filter) = graph_start_resolution_filter(filter, start_alias) else {
+        return Ok(GraphStartResolution {
+            ids: Vec::new(),
+            predicates_pushed,
+            pinned: false,
+        });
+    };
+    if let Some(ids) =
+        resolve_graph_start_ids_from_filter(db, &start_filter, params, tx, snapshot, start_alias)?
+    {
+        predicates_pushed.push(Cow::Owned(format!("{start_alias}.id")));
+        return Ok(GraphStartResolution {
+            ids,
+            predicates_pushed,
+            pinned: true,
+        });
     }
 
-    // Extract column name and expected value from the filter (e.g., a.name = 'entity-0')
-    let (col_name, expected_value) = match filter {
-        Expr::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } => {
-            if let Some(col) = extract_column_name(left) {
-                (col, resolve_expr(right, params)?)
-            } else if let Some(col) = extract_column_name(right) {
-                (col, resolve_expr(left, params)?)
-            } else {
-                return Ok(vec![]);
-            }
-        }
-        _ => return Ok(vec![]),
-    };
+    let start_columns = graph_start_columns(&start_filter, start_alias);
+    if start_columns.is_empty() {
+        return Ok(GraphStartResolution {
+            ids: Vec::new(),
+            predicates_pushed,
+            pinned: false,
+        });
+    }
+    if graph_start_filter_needs_unpinned_null_semantics(&start_filter, start_alias) {
+        return Ok(GraphStartResolution {
+            ids: Vec::new(),
+            predicates_pushed,
+            pinned: false,
+        });
+    }
+    for column in &start_columns {
+        predicates_pushed.push(Cow::Owned(format!("{start_alias}.{column}")));
+    }
 
-    let snapshot = db.snapshot();
-    let mut uuids = Vec::new();
+    let mut candidate_ids = BTreeSet::new();
     for table_name in db.table_names() {
         let meta = match db.table_meta(&table_name) {
             Some(m) => m,
             None => continue,
         };
-        // Only scan tables that have the referenced column and an id column
-        let has_col = meta.columns.iter().any(|c| c.name == col_name);
-        let has_id = meta.columns.iter().any(|c| c.name == "id");
-        if !has_col || !has_id {
+        let has_start_col = meta.columns.iter().any(|c| start_columns.contains(&c.name));
+        let has_id = has_exact_column_type(&meta, "id", &ColumnType::Uuid);
+        if !has_start_col || !has_id {
             continue;
         }
-        let rows = db.scan_filter(&table_name, snapshot, &|row| {
-            row.values.get(&col_name) == Some(&expected_value)
-        })?;
-        for row in rows {
-            if let Some(Value::Uuid(id)) = row.values.get("id") {
-                uuids.push(*id);
+
+        let analysis = analyze_filter_for_index(&start_filter, &meta.indexes, params);
+        if let Some(pick) = analysis.pick.as_ref() {
+            let (rows, examined) = execute_index_scan(
+                db,
+                &table_name,
+                pick,
+                snapshot,
+                tx,
+                IndexScanAccessMode::Select,
+                None,
+                params,
+            )?;
+            db.__bump_rows_examined(examined);
+            for row in rows {
+                if let Some(Value::Uuid(id)) = row.values.get("id") {
+                    candidate_ids.insert(*id);
+                }
+            }
+        } else {
+            let rows = scan_rows_for_select(db, &table_name, snapshot, tx)?;
+            db.__bump_rows_examined(rows.len() as u64);
+            for row in rows {
+                if let Some(Value::Uuid(id)) = row.values.get("id") {
+                    candidate_ids.insert(*id);
+                }
             }
         }
     }
-    Ok(uuids)
+    let mut ids = Vec::new();
+    for id in candidate_ids {
+        let bindings = HashMap::from([(start_alias.to_string(), id)]);
+        if graph_filter_matches_bindings(db, &start_filter, params, tx, snapshot, &bindings)? {
+            ids.push(id);
+        }
+    }
+    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+    Ok(GraphStartResolution {
+        ids,
+        predicates_pushed,
+        pinned: true,
+    })
 }
 
 fn resolve_graph_start_nodes_from_plan(
@@ -4262,8 +6029,9 @@ fn resolve_graph_start_nodes_from_plan(
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
 ) -> Result<Vec<uuid::Uuid>> {
-    let result = execute_plan(db, plan, params, tx)?;
+    let result = db.with_snapshot_override(snapshot, || execute_plan(db, plan, params, tx))?;
     result
         .rows
         .into_iter()
@@ -4280,73 +6048,659 @@ fn resolve_graph_start_nodes_from_plan(
 }
 
 fn resolve_graph_start_ids_from_filter(
+    db: &Database,
     filter: &Expr,
     params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    start_alias: &str,
 ) -> Result<Option<Vec<uuid::Uuid>>> {
     match filter {
         Expr::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
-        } if is_graph_id_ref(left) || is_graph_id_ref(right) => {
-            let value = if is_graph_id_ref(left) {
-                resolve_expr(right, params)?
+        } if is_graph_start_column_ref(left, start_alias, "id")
+            || is_graph_start_column_ref(right, start_alias, "id") =>
+        {
+            let id = if is_graph_start_column_ref(left, start_alias, "id") {
+                resolve_graph_static_uuid_expr(right, params, "graph start identifier in filter")?
             } else {
-                resolve_expr(left, params)?
+                resolve_graph_static_uuid_expr(left, params, "graph start identifier in filter")?
             };
-            let id = match value {
-                Value::Uuid(id) => id,
-                Value::Text(text) => uuid::Uuid::parse_str(&text).map_err(|_| {
-                    Error::PlanError(format!("invalid UUID in graph filter: {text}"))
-                })?,
-                other => {
-                    return Err(Error::PlanError(format!(
-                        "invalid graph start identifier in filter: {other:?}"
-                    )));
-                }
+            let Some(id) = id else {
+                return Ok(None);
             };
-            Ok(Some(vec![id]))
-        }
-        Expr::InList { expr, list, .. } if is_graph_id_ref(expr) => {
-            let ids = list
-                .iter()
-                .map(|item| resolve_expr(item, params))
-                .map(|value| match value? {
-                    Value::Uuid(id) => Ok(id),
-                    Value::Text(text) => uuid::Uuid::parse_str(&text).map_err(|_| {
-                        Error::PlanError(format!("invalid UUID in graph filter: {text}"))
-                    }),
-                    other => Err(Error::PlanError(format!(
-                        "invalid graph start identifier in filter: {other:?}"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let ids = vec![id];
+            db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
             Ok(Some(ids))
         }
-        Expr::BinaryOp { left, right, .. } => {
-            if let Some(ids) = resolve_graph_start_ids_from_filter(left, params)? {
-                return Ok(Some(ids));
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if is_graph_start_column_ref(expr, start_alias, "id") => {
+            let mut ids = Vec::with_capacity(list.len());
+            for item in list {
+                let Some(id) = resolve_graph_static_uuid_expr(
+                    item,
+                    params,
+                    "graph start identifier in filter",
+                )?
+                else {
+                    return Ok(None);
+                };
+                ids.push(id);
             }
-            resolve_graph_start_ids_from_filter(right, params)
+            db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+            Ok(Some(ids))
         }
-        Expr::UnaryOp { operand, .. } => resolve_graph_start_ids_from_filter(operand, params),
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let left_ids =
+                resolve_graph_start_ids_from_filter(db, left, params, tx, snapshot, start_alias)?;
+            let right_ids =
+                resolve_graph_start_ids_from_filter(db, right, params, tx, snapshot, start_alias)?;
+            match (left_ids, right_ids) {
+                (Some(left_ids), Some(right_ids)) => {
+                    let right_ids = right_ids.into_iter().collect::<BTreeSet<_>>();
+                    let ids = left_ids
+                        .into_iter()
+                        .filter(|id| right_ids.contains(id))
+                        .collect::<Vec<_>>();
+                    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+                    Ok(Some(ids))
+                }
+                (Some(_), None) | (None, Some(_)) | (None, None) => Ok(None),
+            }
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+        } => {
+            let left_ids =
+                resolve_graph_start_ids_from_filter(db, left, params, tx, snapshot, start_alias)?;
+            let right_ids =
+                resolve_graph_start_ids_from_filter(db, right, params, tx, snapshot, start_alias)?;
+            match (left_ids, right_ids) {
+                (Some(left_ids), Some(right_ids)) => {
+                    let ids = left_ids
+                        .into_iter()
+                        .chain(right_ids)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    db.assert_graph_anchor_nodes_readable_in_tx(tx, &ids, snapshot)?;
+                    Ok(Some(ids))
+                }
+                (Some(_), None) | (None, Some(_)) | (None, None) => Ok(None),
+            }
+        }
+        Expr::UnaryOp { .. } => Ok(None),
         _ => Ok(None),
     }
 }
 
-fn is_graph_id_ref(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Column(contextdb_parser::ast::ColumnRef { column, .. }) if column == "id"
+fn resolve_graph_target_id_residual(
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+    target_alias: &str,
+) -> Result<Option<uuid::Uuid>> {
+    for conjunct in split_conjuncts(filter) {
+        if let Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } = conjunct
+        {
+            if is_graph_alias_column_ref(&left, target_alias, "id") {
+                return resolve_graph_static_uuid_expr(
+                    &right,
+                    params,
+                    "graph target identifier in filter",
+                );
+            }
+            if is_graph_alias_column_ref(&right, target_alias, "id") {
+                return resolve_graph_static_uuid_expr(
+                    &left,
+                    params,
+                    "graph target identifier in filter",
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn filter_graph_frontier(
+    db: &Database,
+    frontier: Vec<GraphFrontierRow>,
+    filter: Option<&Expr>,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+) -> Result<Vec<GraphFrontierRow>> {
+    let Some(filter) = filter else {
+        return Ok(frontier);
+    };
+
+    let mut filtered = Vec::with_capacity(frontier.len());
+    let mut cache = HashMap::new();
+    for (bindings, current, depth) in frontier {
+        if graph_eval_bool_expr(db, filter, params, tx, snapshot, &bindings, &mut cache)?
+            .unwrap_or(false)
+        {
+            filtered.push((bindings, current, depth));
+        }
+    }
+    Ok(filtered)
+}
+
+fn graph_filter_matches_bindings(
+    db: &Database,
+    filter: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    bindings: &HashMap<String, uuid::Uuid>,
+) -> Result<bool> {
+    let mut cache = HashMap::new();
+    Ok(
+        graph_eval_bool_expr(db, filter, params, tx, snapshot, bindings, &mut cache)?
+            .unwrap_or(false),
     )
 }
 
-/// Extract a bare column name from an Expr::Column, ignoring table alias.
-fn extract_column_name(expr: &Expr) -> Option<String> {
+fn graph_eval_bool_expr(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    bindings: &HashMap<String, uuid::Uuid>,
+    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+) -> Result<Option<bool>> {
     match expr {
-        Expr::Column(contextdb_parser::ast::ColumnRef { column, .. }) => Some(column.clone()),
-        _ => None,
+        Expr::BinaryOp { left, op, right } => match op {
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
+                let left = graph_eval_values(db, left, params, tx, snapshot, bindings, cache)?;
+                let right = graph_eval_values(db, right, params, tx, snapshot, bindings, cache)?;
+                graph_compare_any(&left, &right, *op)
+            }
+            BinOp::And => {
+                let left = graph_eval_bool_expr(db, left, params, tx, snapshot, bindings, cache)?;
+                if left == Some(false) {
+                    return Ok(Some(false));
+                }
+                let right = graph_eval_bool_expr(db, right, params, tx, snapshot, bindings, cache)?;
+                Ok(match (left, right) {
+                    (Some(true), Some(true)) => Some(true),
+                    (Some(true), other) => other,
+                    (None, Some(false)) => Some(false),
+                    (None, Some(true)) | (None, None) => None,
+                    (Some(false), _) => Some(false),
+                })
+            }
+            BinOp::Or => {
+                let left = graph_eval_bool_expr(db, left, params, tx, snapshot, bindings, cache)?;
+                if left == Some(true) {
+                    return Ok(Some(true));
+                }
+                let right = graph_eval_bool_expr(db, right, params, tx, snapshot, bindings, cache)?;
+                Ok(match (left, right) {
+                    (Some(false), Some(false)) => Some(false),
+                    (Some(false), other) => other,
+                    (None, Some(true)) => Some(true),
+                    (None, Some(false)) | (None, None) => None,
+                    (Some(true), _) => Some(true),
+                })
+            }
+        },
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            operand,
+        } => Ok(
+            graph_eval_bool_expr(db, operand, params, tx, snapshot, bindings, cache)?
+                .map(|value| !value),
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needles = graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?;
+            let mut candidates = Vec::new();
+            for item in list {
+                candidates.extend(graph_eval_values(
+                    db, item, params, tx, snapshot, bindings, cache,
+                )?);
+            }
+            let matched = needles.iter().any(|needle| {
+                *needle != Value::Null
+                    && candidates.iter().any(|candidate| {
+                        *candidate != Value::Null
+                            && (matches!(compare_values(needle, candidate), Some(Ordering::Equal))
+                                || needle == candidate)
+                    })
+            });
+            Ok(Some(if *negated { !matched } else { matched }))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let values = graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?;
+            let patterns = graph_eval_values(db, pattern, params, tx, snapshot, bindings, cache)?;
+            let matched = values.iter().any(|value| {
+                patterns.iter().any(|pattern| match (value, pattern) {
+                    (Value::Text(value), Value::Text(pattern)) => like_matches(value, pattern),
+                    _ => false,
+                })
+            });
+            Ok(Some(if *negated { !matched } else { matched }))
+        }
+        Expr::IsNull { expr, negated } => {
+            let values = graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?;
+            let is_null = values.iter().all(|value| *value == Value::Null);
+            Ok(Some(if *negated { !is_null } else { is_null }))
+        }
+        Expr::FunctionCall { .. } => {
+            match graph_eval_values(db, expr, params, tx, snapshot, bindings, cache)?
+                .into_iter()
+                .next()
+                .unwrap_or(Value::Null)
+            {
+                Value::Bool(value) => Ok(Some(value)),
+                Value::Null => Ok(None),
+                _ => Err(Error::PlanError(format!(
+                    "unsupported graph WHERE expression: {:?}",
+                    expr
+                ))),
+            }
+        }
+        Expr::InSubquery { .. } => Err(Error::PlanError(
+            "IN (subquery) must be resolved before graph execution".to_string(),
+        )),
+        _ => Err(Error::PlanError(format!(
+            "unsupported graph WHERE expression: {:?}",
+            expr
+        ))),
     }
+}
+
+fn graph_eval_values(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    bindings: &HashMap<String, uuid::Uuid>,
+    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+) -> Result<Vec<Value>> {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => Ok(vec![resolve_expr(expr, params)?]),
+        Expr::Column(column) => graph_column_values(db, column, tx, snapshot, bindings, cache),
+        Expr::BinaryOp { left, op, right } => {
+            let left = graph_eval_values(db, left, params, tx, snapshot, bindings, cache)?;
+            let right = graph_eval_values(db, right, params, tx, snapshot, bindings, cache)?;
+            let mut values = Vec::new();
+            for left in &left {
+                for right in &right {
+                    values.push(eval_binary_op(op, left, right)?);
+                }
+            }
+            Ok(if values.is_empty() {
+                vec![Value::Null]
+            } else {
+                values
+            })
+        }
+        Expr::UnaryOp { op, operand } => {
+            let values = graph_eval_values(db, operand, params, tx, snapshot, bindings, cache)?;
+            values
+                .into_iter()
+                .map(|value| match op {
+                    UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
+                    UnaryOp::Neg => match value {
+                        Value::Int64(v) => Ok(Value::Int64(-v)),
+                        Value::Float64(v) => Ok(Value::Float64(-v)),
+                        _ => Err(Error::PlanError(
+                            "cannot negate non-numeric graph value".to_string(),
+                        )),
+                    },
+                })
+                .collect()
+        }
+        Expr::FunctionCall { name, args } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                let mut arg_values =
+                    graph_eval_values(db, arg, params, tx, snapshot, bindings, cache)?;
+                values.push(arg_values.pop().unwrap_or(Value::Null));
+            }
+            Ok(vec![eval_function(name, &values)?])
+        }
+        Expr::InList { .. } | Expr::Like { .. } | Expr::IsNull { .. } => Ok(vec![Value::Bool(
+            graph_eval_bool_expr(db, expr, params, tx, snapshot, bindings, cache)?.unwrap_or(false),
+        )]),
+        Expr::InSubquery { .. } => Err(Error::PlanError(
+            "IN (subquery) must be resolved before graph execution".to_string(),
+        )),
+        Expr::CosineDistance { .. } | Expr::RowVectorSource { .. } => Err(Error::PlanError(
+            format!("unsupported graph WHERE value expression: {:?}", expr),
+        )),
+    }
+}
+
+fn graph_column_values(
+    db: &Database,
+    column: &ColumnRef,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    bindings: &HashMap<String, uuid::Uuid>,
+    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+) -> Result<Vec<Value>> {
+    if let Some(alias) = column.table.as_ref() {
+        let Some(node) = bindings.get(alias) else {
+            return Ok(vec![Value::Null]);
+        };
+        return graph_node_column_values(db, *node, &column.column, tx, snapshot, cache);
+    }
+
+    if column.column == "id" {
+        let values = bindings
+            .values()
+            .copied()
+            .map(Value::Uuid)
+            .collect::<Vec<_>>();
+        return Ok(if values.is_empty() {
+            vec![Value::Null]
+        } else {
+            values
+        });
+    }
+
+    if bindings.len() == 1 {
+        let node = *bindings.values().next().expect("length checked above");
+        return graph_node_column_values(db, node, &column.column, tx, snapshot, cache);
+    }
+
+    Ok(vec![Value::Null])
+}
+
+fn graph_node_column_values(
+    db: &Database,
+    node: uuid::Uuid,
+    column: &str,
+    tx: Option<TxId>,
+    snapshot: contextdb_core::SnapshotId,
+    cache: &mut HashMap<(uuid::Uuid, String), Vec<Value>>,
+) -> Result<Vec<Value>> {
+    if column == "id" {
+        return Ok(vec![Value::Uuid(node)]);
+    }
+
+    let key = (node, column.to_string());
+    if let Some(values) = cache.get(&key) {
+        return Ok(values.clone());
+    }
+
+    let values = db.readable_graph_node_column_values(tx, node, column, snapshot)?;
+    let values = if values.is_empty() {
+        vec![Value::Null]
+    } else {
+        values
+    };
+    cache.insert(key, values.clone());
+    Ok(values)
+}
+
+fn graph_compare_any(left: &[Value], right: &[Value], op: BinOp) -> Result<Option<bool>> {
+    let mut saw_unknown = false;
+    for left in left {
+        for right in right {
+            if *left == Value::Null || *right == Value::Null {
+                saw_unknown = true;
+                continue;
+            }
+            let matched = match op {
+                BinOp::Eq => compare_values(left, right) == Some(Ordering::Equal) || left == right,
+                BinOp::Neq => {
+                    !(compare_values(left, right) == Some(Ordering::Equal) || left == right)
+                }
+                BinOp::Lt => compare_values(left, right) == Some(Ordering::Less),
+                BinOp::Lte => matches!(
+                    compare_values(left, right),
+                    Some(Ordering::Less | Ordering::Equal)
+                ),
+                BinOp::Gt => compare_values(left, right) == Some(Ordering::Greater),
+                BinOp::Gte => matches!(
+                    compare_values(left, right),
+                    Some(Ordering::Greater | Ordering::Equal)
+                ),
+                BinOp::And | BinOp::Or => unreachable!(),
+            };
+            if matched {
+                return Ok(Some(true));
+            }
+        }
+    }
+    Ok(if saw_unknown { None } else { Some(false) })
+}
+
+fn graph_uuid_from_value(value: Value, context: &str) -> Result<uuid::Uuid> {
+    match value {
+        Value::Uuid(id) => Ok(id),
+        Value::Text(text) => uuid::Uuid::parse_str(&text)
+            .map_err(|_| Error::PlanError(format!("invalid UUID in {context}: {text}"))),
+        other => Err(Error::PlanError(format!("invalid {context}: {other:?}"))),
+    }
+}
+
+fn resolve_graph_static_uuid_expr(
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    context: &str,
+) -> Result<Option<uuid::Uuid>> {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => {
+            graph_uuid_from_value(resolve_expr(expr, params)?, context).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_graph_alias_column_ref(expr: &Expr, alias: &str, column: &str) -> bool {
+    matches!(
+        expr,
+        Expr::Column(contextdb_parser::ast::ColumnRef {
+            table: Some(table),
+            column: col,
+        }) if table == alias && col == column
+    )
+}
+
+fn is_graph_start_column_ref(expr: &Expr, alias: &str, column: &str) -> bool {
+    matches!(
+        expr,
+        Expr::Column(contextdb_parser::ast::ColumnRef {
+            table: Some(table),
+            column: col,
+        }) if table == alias && col == column
+    ) || matches!(
+        expr,
+        Expr::Column(contextdb_parser::ast::ColumnRef {
+            table: None,
+            column: col,
+        }) if col == column
+    )
+}
+
+fn graph_start_resolution_filter(filter: &Expr, start_alias: &str) -> Option<Expr> {
+    let conjuncts = split_conjuncts(filter)
+        .into_iter()
+        .filter(|conjunct| graph_expr_refs_only_start_alias(conjunct, start_alias))
+        .collect::<Vec<_>>();
+    combine_conjuncts(conjuncts)
+}
+
+fn graph_start_columns(expr: &Expr, start_alias: &str) -> BTreeSet<String> {
+    fn walk(expr: &Expr, start_alias: &str, columns: &mut BTreeSet<String>) {
+        match expr {
+            Expr::Column(contextdb_parser::ast::ColumnRef {
+                table: Some(table),
+                column,
+            }) if table == start_alias => {
+                columns.insert(column.clone());
+            }
+            Expr::Column(contextdb_parser::ast::ColumnRef {
+                table: None,
+                column,
+            }) if column == "id" => {
+                columns.insert(column.clone());
+            }
+            Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+                walk(left, start_alias, columns);
+                walk(right, start_alias, columns);
+            }
+            Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+                walk(operand, start_alias, columns);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    walk(arg, start_alias, columns);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                walk(expr, start_alias, columns);
+                for item in list {
+                    walk(item, start_alias, columns);
+                }
+            }
+            Expr::Like { expr, pattern, .. } => {
+                walk(expr, start_alias, columns);
+                walk(pattern, start_alias, columns);
+            }
+            Expr::InSubquery { expr, .. } => walk(expr, start_alias, columns),
+            Expr::Column(_)
+            | Expr::Literal(_)
+            | Expr::Parameter(_)
+            | Expr::RowVectorSource { .. } => {}
+        }
+    }
+
+    let mut columns = BTreeSet::new();
+    walk(expr, start_alias, &mut columns);
+    columns
+}
+
+fn graph_start_filter_needs_unpinned_null_semantics(expr: &Expr, start_alias: &str) -> bool {
+    fn walk(expr: &Expr, start_alias: &str, not_parity: bool) -> bool {
+        match expr {
+            Expr::IsNull { expr, negated } => {
+                let matches_missing_metadata = !(*negated ^ not_parity);
+                matches_missing_metadata
+                    && graph_start_columns(expr, start_alias)
+                        .into_iter()
+                        .any(|column| column != "id")
+            }
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                operand,
+            } => walk(operand, start_alias, !not_parity),
+            Expr::UnaryOp { operand, .. } => walk(operand, start_alias, not_parity),
+            Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+                walk(left, start_alias, not_parity) || walk(right, start_alias, not_parity)
+            }
+            Expr::FunctionCall { args, .. } => {
+                args.iter().any(|arg| walk(arg, start_alias, not_parity))
+            }
+            Expr::InList { expr, list, .. } => {
+                walk(expr, start_alias, not_parity)
+                    || list.iter().any(|item| walk(item, start_alias, not_parity))
+            }
+            Expr::Like { expr, pattern, .. } => {
+                walk(expr, start_alias, not_parity) || walk(pattern, start_alias, not_parity)
+            }
+            Expr::InSubquery { expr, .. } => walk(expr, start_alias, not_parity),
+            Expr::Column(_)
+            | Expr::Literal(_)
+            | Expr::Parameter(_)
+            | Expr::RowVectorSource { .. } => false,
+        }
+    }
+
+    walk(expr, start_alias, false)
+}
+
+fn graph_expr_refs_only_start_alias(expr: &Expr, start_alias: &str) -> bool {
+    fn walk(expr: &Expr, start_alias: &str, saw_start: &mut bool, saw_other: &mut bool) {
+        match expr {
+            Expr::Column(contextdb_parser::ast::ColumnRef { table, .. }) => {
+                match table.as_deref() {
+                    Some(alias) if alias == start_alias => *saw_start = true,
+                    None => {
+                        if let Expr::Column(contextdb_parser::ast::ColumnRef { column, .. }) = expr
+                            && column == "id"
+                        {
+                            *saw_start = true;
+                        } else {
+                            *saw_other = true;
+                        }
+                    }
+                    _ => *saw_other = true,
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                walk(left, start_alias, saw_start, saw_other);
+                walk(right, start_alias, saw_start, saw_other);
+            }
+            Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+                walk(operand, start_alias, saw_start, saw_other);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args {
+                    walk(arg, start_alias, saw_start, saw_other);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                walk(expr, start_alias, saw_start, saw_other);
+                for item in list {
+                    walk(item, start_alias, saw_start, saw_other);
+                }
+            }
+            Expr::Like { expr, pattern, .. } => {
+                walk(expr, start_alias, saw_start, saw_other);
+                walk(pattern, start_alias, saw_start, saw_other);
+            }
+            Expr::InSubquery { expr, .. } | Expr::CosineDistance { left: expr, .. } => {
+                walk(expr, start_alias, saw_start, saw_other);
+                *saw_other = true;
+            }
+            Expr::RowVectorSource { .. } => *saw_other = true,
+            Expr::Literal(_) | Expr::Parameter(_) => {}
+        }
+    }
+
+    let mut saw_start = false;
+    let mut saw_other = false;
+    walk(expr, start_alias, &mut saw_start, &mut saw_other);
+    saw_start && !saw_other
+}
+
+fn combine_conjuncts(conjuncts: Vec<Expr>) -> Option<Expr> {
+    let mut iter = conjuncts.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinOp::And,
+        right: Box::new(right),
+    }))
 }
 
 fn resolve_vector_from_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Vec<f32>> {
@@ -4360,6 +6714,103 @@ fn resolve_vector_from_expr(expr: &Expr, params: &HashMap<String, Value>) -> Res
         _ => Err(Error::PlanError(
             "invalid vector query expression".to_string(),
         )),
+    }
+}
+
+fn resolve_query_vector_from_expr(
+    db: &Database,
+    expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: SnapshotId,
+) -> Result<(Vec<f32>, Option<contextdb_core::VectorIndexRef>)> {
+    match expr {
+        Expr::RowVectorSource { table, column, key } => {
+            let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
+            let vector = resolve_row_vector_source(db, &index, key, params, tx, snapshot)?;
+            Ok((vector, Some(index)))
+        }
+        _ => Ok((resolve_vector_from_expr(expr, params)?, None)),
+    }
+}
+
+fn resolve_row_vector_source(
+    db: &Database,
+    index: &contextdb_core::VectorIndexRef,
+    key_expr: &Expr,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: SnapshotId,
+) -> Result<Vec<f32>> {
+    let meta = db
+        .table_meta(&index.table)
+        .ok_or_else(|| Error::TableNotFound(index.table.clone()))?;
+    db.assert_table_read_allowed(&index.table)?;
+    if !meta.columns.iter().any(|column| {
+        column.name == index.column
+            && matches!(column.column_type, contextdb_core::ColumnType::Vector(_))
+    }) {
+        return Err(Error::UnknownVectorIndex {
+            index: index.clone(),
+        });
+    }
+    db.assert_vector_index_exists_under_schema_read(index)?;
+
+    let raw_key = resolve_expr(key_expr, params)?;
+    if matches!(raw_key, Value::Null) {
+        return Err(Error::PlanError(
+            "ROW_VECTOR key cannot be NULL".to_string(),
+        ));
+    }
+    if matches!(raw_key, Value::Vector(_)) {
+        return Err(Error::PlanError(
+            "ROW_VECTOR key cannot be a vector".to_string(),
+        ));
+    }
+
+    let key_column = db.natural_key_column_for_table(&index.table)?;
+    let key =
+        coerce_into_column(db, &index.table, &key_column, raw_key, None, tx).map_err(|err| {
+            Error::PlanError(format!(
+                "ROW_VECTOR argument 3 key cannot be coerced to `{}`.`{}` natural key: {err}",
+                index.table, key_column
+            ))
+        })?;
+    if matches!(key, Value::Null) {
+        return Err(Error::PlanError(
+            "ROW_VECTOR key cannot be NULL".to_string(),
+        ));
+    }
+    let key_label = row_vector_key_label(&key);
+    let row_id = db
+        .row_id_for_natural_key_in_tx(tx, &index.table, &key_column, &key, snapshot)?
+        .ok_or_else(|| Error::PersistedRowVectorRowMissing {
+            index: index.clone(),
+            key: key_label.clone(),
+        })?;
+    db.assert_row_id_read_allowed_for_change(tx, &index.table, row_id, snapshot)?;
+    let entry = db
+        .vector_entry_for_row_in_tx(tx, index, row_id, snapshot)?
+        .ok_or_else(|| Error::PersistedRowVectorCellNull {
+            index: index.clone(),
+            key: key_label,
+        })?;
+    db.validate_vector_under_schema_read(index, entry.vector.len())?;
+    Ok(entry.vector)
+}
+
+fn row_vector_key_label(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Int64(value) => value.to_string(),
+        Value::Float64(value) => value.to_string(),
+        Value::Text(value) => value.clone(),
+        Value::Uuid(value) => value.to_string(),
+        Value::Timestamp(value) => value.to_string(),
+        Value::Json(value) => value.to_string(),
+        Value::Vector(_) => "<vector>".to_string(),
+        Value::TxId(value) => value.to_string(),
     }
 }
 
@@ -4392,6 +6843,30 @@ fn vector_columns_for_meta(meta: &TableMeta) -> Vec<String> {
         .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
         .map(|column| column.name.clone())
         .collect()
+}
+
+fn vector_refs_for_meta(table: &str, meta: &TableMeta) -> Vec<contextdb_core::VectorIndexRef> {
+    meta.columns
+        .iter()
+        .filter(|column| matches!(column.column_type, contextdb_core::ColumnType::Vector(_)))
+        .map(|column| contextdb_core::VectorIndexRef::new(table, column.name.clone()))
+        .collect()
+}
+
+fn has_edge_columns(meta: &TableMeta) -> bool {
+    [
+        ("source_id", ColumnType::Uuid),
+        ("target_id", ColumnType::Uuid),
+        ("edge_type", ColumnType::Text),
+    ]
+    .into_iter()
+    .all(|(name, column_type)| has_exact_column_type(meta, name, &column_type))
+}
+
+fn has_exact_column_type(meta: &TableMeta, name: &str, column_type: &ColumnType) -> bool {
+    let mut columns = meta.columns.iter().filter(|column| column.name == name);
+    matches!(columns.next(), Some(column) if &column.column_type == column_type)
+        && columns.next().is_none()
 }
 
 fn vector_values_for_table(
@@ -4438,6 +6913,17 @@ pub(crate) fn coerce_into_column(
     active_tx: Option<TxId>,
 ) -> Result<Value> {
     coerce_value_for_column(db, table, col, v, current_tx_max, active_tx)
+}
+
+pub(crate) fn coerce_into_column_with_meta(
+    table: &str,
+    meta: &TableMeta,
+    col: &str,
+    v: Value,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
+    coerce_value_for_column_with_meta(table, meta, col, v, current_tx_max, active_tx)
 }
 
 fn coerce_value_for_column(
@@ -4536,7 +7022,12 @@ fn coerce_value_for_column_with_meta(
                 expected: "TEXT",
                 actual: "TxId",
             }),
-            other => Ok(coerce_uuid_if_needed(col_name, other)),
+            // A column DECLARED `TEXT` preserves its text — including a value that happens to parse
+            // as a UUID. The id-name heuristic in `coerce_uuid_if_needed` is for untyped/UUID
+            // columns; applying it to a declared-TEXT column would silently convert a TEXT id (e.g.
+            // a `cg_skill_firing_trace.id` string) into a `Value::Uuid`, which then mismatches the
+            // `(Text, Text)` probe arm and reads back as the wrong value type.
+            other => Ok(other),
         },
         contextdb_core::ColumnType::Boolean => match v {
             Value::TxId(_) => Err(Error::ColumnTypeMismatch {
@@ -4560,6 +7051,31 @@ fn coerce_value_for_column_with_meta(
             coerce_txid_value(table, col_name, v, col.nullable, current_tx_max, active_tx)
         }
     }
+}
+
+fn coerce_insert_value_for_column_with_meta(
+    table: &str,
+    meta: &TableMeta,
+    col_name: &str,
+    v: Value,
+    current_tx_max: Option<TxId>,
+    active_tx: Option<TxId>,
+) -> Result<Value> {
+    let should_auto_stamp_null = meta
+        .columns
+        .iter()
+        .find(|column| column.name == col_name)
+        .is_some_and(|column| {
+            !column.nullable
+                && matches!(column.column_type, contextdb_core::ColumnType::TxId)
+                && matches!(&v, Value::Null)
+        });
+    if should_auto_stamp_null {
+        let tx = active_tx.ok_or_else(|| Error::Other("missing active tx".to_string()))?;
+        return Ok(Value::TxId(tx));
+    }
+
+    coerce_value_for_column_with_meta(table, meta, col_name, v, current_tx_max, active_tx)
 }
 
 fn format_vector_type(dim: usize) -> &'static str {
@@ -4752,6 +7268,14 @@ fn apply_missing_column_defaults(
     let current_tx_max = Some(db.committed_watermark());
 
     for column in &meta.columns {
+        if !column.nullable && matches!(column.column_type, ColumnType::TxId) {
+            if matches!(values.get(&column.name), None | Some(Value::Null)) {
+                let tx = active_tx.ok_or_else(|| Error::Other("missing active tx".to_string()))?;
+                values.insert(column.name.clone(), Value::TxId(tx));
+            }
+            continue;
+        }
+
         if values.contains_key(&column.name) {
             continue;
         }
@@ -4859,6 +7383,55 @@ fn validate_expires_column(col: &contextdb_parser::ast::ColumnDef) -> Result<()>
     Ok(())
 }
 
+/// A retained table travels one way only — edge to hub — because its rows are
+/// deleted locally once delivered, and a hub that sent them back would replant
+/// exactly what the edge aged out. The `TWO WAY` spelling is therefore refused
+/// wherever it is declared (CREATE and ALTER alike), before any part of the
+/// statement is applied.
+fn refuse_two_way_retained_table(declared: Option<RetainedSyncDirection>) -> Result<()> {
+    if declared == Some(RetainedSyncDirection::TwoWay) {
+        return Err(Error::SchemaInvalid {
+            reason: "a RETAIN table is delivered one way (edge -> hub), so TWO WAY is not \
+                     supported on a retained table: declare PUSH ONLY, or drop the retention"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `SYNC SAFE` promises delete-only-AFTER-DELIVERY, and delivery needs a key
+/// the hub can identify the row by: `changes_since` builds a changeset row from
+/// the table's natural key, so a table with none never gets its rows onto the
+/// wire at all — while the push still reports success and advances the
+/// watermark past their LSNs. The gate would then open on rows the hub never
+/// received and retention would delete them. So the promise is refused wherever
+/// it is declared on a table that cannot keep it. Plain `RETAIN` is untouched:
+/// it prunes locally and promises no delivery.
+pub(crate) fn refuse_sync_safe_without_key(table: &str, meta: &TableMeta) -> Result<()> {
+    if !meta.sync_safe {
+        return Ok(());
+    }
+    refuse_sync_safe_without_key_for(table, meta)
+}
+
+/// The key check itself, for callers that know `SYNC SAFE` is being declared.
+pub(crate) fn refuse_sync_safe_without_key_for(table: &str, meta: &TableMeta) -> Result<()> {
+    if crate::sync_types::natural_key_column_for_meta(meta).is_some() {
+        return Ok(());
+    }
+    Err(Error::SchemaInvalid {
+        reason: format!(
+            "SYNC SAFE on table '{table}' requires a PRIMARY KEY: a row with no key never \
+             enters a pushed changeset, so the delete-after-delivery gate would open on rows \
+             the hub never received and retention would delete them undelivered. Declare a \
+             PRIMARY KEY whose values are unique across every NODE that writes this table — \
+             include an origin identifier, or use globally unique ids — since two edges \
+             pushing the same key collide at the hub. Plain RETAIN without SYNC SAFE needs \
+             no key."
+        ),
+    })
+}
+
 fn expires_column_name(columns: &[contextdb_parser::ast::ColumnDef]) -> Result<Option<String>> {
     let mut expires_column = None;
     for col in columns {
@@ -4873,6 +7446,469 @@ fn expires_column_name(columns: &[contextdb_parser::ast::ColumnDef]) -> Result<O
         }
     }
     Ok(expires_column)
+}
+
+fn validate_projected_foreign_keys_after_drop_table(db: &Database, table: &str) -> Result<()> {
+    let mut projected = db.relational_store().table_meta.read().clone();
+    if projected.remove(table).is_some() {
+        Database::validate_projected_foreign_key_schema(&projected)?;
+    }
+    Ok(())
+}
+
+fn validate_projected_foreign_keys_after_drop_column(
+    db: &Database,
+    table: &str,
+    column: &str,
+) -> Result<()> {
+    let mut projected = db.relational_store().table_meta.read().clone();
+    if let Some(meta) = projected.get_mut(table)
+        && let Some(pos) = meta.columns.iter().position(|c| c.name == column)
+    {
+        meta.columns.remove(pos);
+        if meta.expires_column.as_deref() == Some(column) {
+            meta.expires_column = None;
+        }
+    }
+    Database::validate_projected_foreign_key_schema(&projected)
+}
+
+fn validate_projected_foreign_keys_after_rename_column(
+    db: &Database,
+    table: &str,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let mut projected = db.relational_store().table_meta.read().clone();
+    if let Some(meta) = projected.get_mut(table) {
+        if meta.columns.iter().any(|c| c.name == to) {
+            return Ok(());
+        }
+        if let Some(column) = meta.columns.iter_mut().find(|c| c.name == from) {
+            column.name = to.to_string();
+            if meta.expires_column.as_deref() == Some(from) {
+                meta.expires_column = Some(to.to_string());
+            }
+        }
+    }
+    Database::validate_projected_foreign_key_schema(&projected)
+}
+
+pub(crate) fn btree_indexable(column_type: &ColumnType) -> bool {
+    !matches!(column_type, ColumnType::Json | ColumnType::Vector(_))
+}
+
+fn exact_constraint_key_indexable(column_type: &ColumnType) -> bool {
+    !matches!(
+        column_type,
+        ColumnType::Real | ColumnType::Json | ColumnType::Vector(_)
+    )
+}
+
+pub(crate) fn validate_exact_constraint_keys_for_meta(table: &str, meta: &TableMeta) -> Result<()> {
+    for column in &meta.columns {
+        if (column.primary_key || column.unique)
+            && !exact_constraint_key_indexable(&column.column_type)
+        {
+            return Err(Error::ColumnNotIndexable {
+                table: table.to_string(),
+                column: column.name.clone(),
+                column_type: column.column_type.clone(),
+            });
+        }
+    }
+
+    for unique_constraint in &meta.unique_constraints {
+        if unique_constraint.is_empty() {
+            return Err(Error::SchemaInvalid {
+                reason: format!("UNIQUE constraint on {table} must include at least one column"),
+            });
+        }
+        for column_name in unique_constraint {
+            let Some(column) = meta
+                .columns
+                .iter()
+                .find(|candidate| candidate.name == *column_name)
+            else {
+                return Err(Error::ColumnNotFound {
+                    table: table.to_string(),
+                    column: column_name.clone(),
+                });
+            };
+            if !exact_constraint_key_indexable(&column.column_type) {
+                return Err(Error::ColumnNotIndexable {
+                    table: table.to_string(),
+                    column: column_name.clone(),
+                    column_type: column.column_type.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn auto_indexes_for_table_meta(meta: &TableMeta) -> Vec<contextdb_core::IndexDecl> {
+    let mut meta_with_indexes = meta.clone();
+    meta_with_indexes.indexes.clear();
+    for column in &meta.columns {
+        if column.primary_key && exact_constraint_key_indexable(&column.column_type) {
+            let columns = vec![(column.name.clone(), contextdb_core::SortDirection::Asc)];
+            if !auto_index_with_columns_exists(&meta_with_indexes, &columns) {
+                let name =
+                    unique_auto_index_name(&meta_with_indexes, format!("__pk_{}", column.name));
+                meta_with_indexes.indexes.push(contextdb_core::IndexDecl {
+                    name,
+                    columns,
+                    kind: contextdb_core::IndexKind::Auto,
+                });
+            }
+        }
+        if column.unique
+            && !column.primary_key
+            && exact_constraint_key_indexable(&column.column_type)
+        {
+            let columns = vec![(column.name.clone(), contextdb_core::SortDirection::Asc)];
+            if !auto_index_with_columns_exists(&meta_with_indexes, &columns) {
+                let name =
+                    unique_auto_index_name(&meta_with_indexes, format!("__unique_{}", column.name));
+                meta_with_indexes.indexes.push(contextdb_core::IndexDecl {
+                    name,
+                    columns,
+                    kind: contextdb_core::IndexKind::Auto,
+                });
+            }
+        }
+    }
+    for unique_constraint in &meta.unique_constraints {
+        if unique_constraint.is_empty()
+            || !unique_constraint.iter().all(|column_name| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == *column_name)
+                    .is_some_and(|column| exact_constraint_key_indexable(&column.column_type))
+            })
+        {
+            continue;
+        }
+        let columns = unique_constraint
+            .iter()
+            .map(|column| (column.clone(), contextdb_core::SortDirection::Asc))
+            .collect::<Vec<_>>();
+        if auto_index_with_columns_exists(&meta_with_indexes, &columns) {
+            continue;
+        }
+        let name = unique_auto_index_name(
+            &meta_with_indexes,
+            format!("__unique_{}", unique_constraint.join("_")),
+        );
+        meta_with_indexes.indexes.push(contextdb_core::IndexDecl {
+            name,
+            columns,
+            kind: contextdb_core::IndexKind::Auto,
+        });
+    }
+    append_single_column_fk_auto_indexes(&mut meta_with_indexes);
+    append_composite_fk_auto_indexes(&mut meta_with_indexes);
+    append_graph_edge_auto_index(&mut meta_with_indexes);
+    meta_with_indexes.indexes
+}
+
+fn auto_index_with_columns_exists(
+    meta: &TableMeta,
+    columns: &[(String, contextdb_core::SortDirection)],
+) -> bool {
+    meta.indexes
+        .iter()
+        .any(|index| index.kind == contextdb_core::IndexKind::Auto && index.columns == columns)
+}
+
+fn append_single_column_fk_auto_indexes(meta: &mut TableMeta) {
+    for column in &meta.columns {
+        let Some(reference) = &column.references else {
+            continue;
+        };
+        if !exact_constraint_key_indexable(&column.column_type) {
+            continue;
+        }
+        let columns = vec![(column.name.clone(), contextdb_core::SortDirection::Asc)];
+        if meta.indexes.iter().any(|index| index.columns == columns) {
+            continue;
+        }
+        let name = unique_auto_index_name(
+            meta,
+            single_column_fk_auto_index_name(&column.name, reference),
+        );
+        meta.indexes.push(contextdb_core::IndexDecl {
+            name,
+            columns,
+            kind: contextdb_core::IndexKind::Auto,
+        });
+    }
+}
+
+pub(crate) fn append_composite_fk_auto_indexes(meta: &mut TableMeta) {
+    for fk in &meta.composite_foreign_keys {
+        if fk.child_columns.is_empty()
+            || !fk.child_columns.iter().all(|column_name| {
+                meta.columns
+                    .iter()
+                    .find(|column| column.name == *column_name)
+                    .is_some_and(|column| exact_constraint_key_indexable(&column.column_type))
+            })
+        {
+            continue;
+        }
+        let columns = fk
+            .child_columns
+            .iter()
+            .map(|column| (column.clone(), contextdb_core::SortDirection::Asc))
+            .collect::<Vec<_>>();
+        if meta.indexes.iter().any(|index| index.columns == columns) {
+            continue;
+        }
+        let name = unique_auto_index_name(meta, composite_fk_auto_index_name(fk));
+        meta.indexes.push(contextdb_core::IndexDecl {
+            name,
+            columns,
+            kind: contextdb_core::IndexKind::Auto,
+        });
+    }
+}
+
+fn append_graph_edge_auto_index(meta: &mut TableMeta) {
+    let graph_edge_columns = [
+        ("source_id", ColumnType::Uuid),
+        ("target_id", ColumnType::Uuid),
+        ("edge_type", ColumnType::Text),
+    ];
+    if !graph_edge_columns
+        .iter()
+        .all(|(column_name, column_type)| has_exact_column_type(meta, column_name, column_type))
+    {
+        return;
+    }
+    let name = "__graph_edge_source_target_type".to_string();
+    if meta.indexes.iter().any(|index| index.name == name) {
+        return;
+    }
+    meta.indexes.push(contextdb_core::IndexDecl {
+        name,
+        columns: graph_edge_columns
+            .iter()
+            .map(|(column, _)| ((*column).to_string(), contextdb_core::SortDirection::Asc))
+            .collect(),
+        kind: contextdb_core::IndexKind::Auto,
+    });
+}
+
+fn single_column_fk_auto_index_name(
+    column: &str,
+    reference: &contextdb_core::ForeignKeyReference,
+) -> String {
+    encoded_auto_index_name("__fk", [column, &reference.table, &reference.column])
+}
+
+fn composite_fk_auto_index_name(fk: &contextdb_core::CompositeForeignKey) -> String {
+    let mut parts = Vec::with_capacity(fk.child_columns.len() + fk.parent_columns.len() + 1);
+    parts.extend(fk.child_columns.iter().map(String::as_str));
+    parts.push(fk.parent_table.as_str());
+    parts.extend(fk.parent_columns.iter().map(String::as_str));
+    encoded_auto_index_name("__fk", parts)
+}
+
+fn encoded_auto_index_name<'a, I>(prefix: &str, parts: I) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut name = prefix.to_string();
+    for part in parts {
+        name.push('_');
+        name.push_str(&part.len().to_string());
+        name.push(':');
+        name.push_str(part);
+    }
+    name
+}
+
+fn unique_auto_index_name(meta: &TableMeta, base: String) -> String {
+    if meta.indexes.iter().all(|index| index.name != base) {
+        return base;
+    }
+
+    for suffix in 1usize.. {
+        let candidate = format!("{base}__{suffix}");
+        if meta.indexes.iter().all(|index| index.name != candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded suffix search must find a unique auto-index name")
+}
+
+pub(crate) fn validate_composite_foreign_keys_for_meta<F>(
+    table: &str,
+    meta: &TableMeta,
+    mut parent_lookup: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Option<TableMeta>,
+{
+    let child_columns = meta
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect::<HashMap<_, _>>();
+
+    for fk in &meta.composite_foreign_keys {
+        if fk.child_columns.is_empty()
+            || fk.child_columns.len() != fk.parent_columns.len()
+            || fk.parent_table.is_empty()
+        {
+            return Err(Error::SchemaInvalid {
+                reason: format!(
+                    "composite foreign key on {table} must have matching non-empty child and parent columns"
+                ),
+            });
+        }
+        reject_duplicate_columns(table, &fk.child_columns, "FOREIGN KEY child columns")?;
+        reject_duplicate_columns(
+            &fk.parent_table,
+            &fk.parent_columns,
+            "FOREIGN KEY parent columns",
+        )?;
+
+        for column in &fk.child_columns {
+            let Some(column_meta) = child_columns.get(column.as_str()) else {
+                return Err(Error::ColumnNotFound {
+                    table: table.to_string(),
+                    column: column.clone(),
+                });
+            };
+            if !exact_constraint_key_indexable(&column_meta.column_type) {
+                return Err(Error::ColumnNotIndexable {
+                    table: table.to_string(),
+                    column: column.clone(),
+                    column_type: column_meta.column_type.clone(),
+                });
+            }
+        }
+
+        let Some(parent_meta) = parent_lookup(&fk.parent_table) else {
+            return Err(Error::TableNotFound(fk.parent_table.clone()));
+        };
+        for column in &fk.parent_columns {
+            let Some(parent_column) = parent_meta.columns.iter().find(|c| c.name == *column) else {
+                return Err(Error::ColumnNotFound {
+                    table: fk.parent_table.clone(),
+                    column: column.clone(),
+                });
+            };
+            if !exact_constraint_key_indexable(&parent_column.column_type) {
+                return Err(Error::ColumnNotIndexable {
+                    table: fk.parent_table.clone(),
+                    column: column.clone(),
+                    column_type: parent_column.column_type.clone(),
+                });
+            }
+        }
+        if !parent_tuple_is_key_covered(&parent_meta, &fk.parent_columns) {
+            return Err(Error::SchemaInvalid {
+                reason: format!(
+                    "composite foreign key on {table} references {}({}) without an ordered PRIMARY KEY or UNIQUE constraint",
+                    fk.parent_table,
+                    fk.parent_columns.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_single_column_foreign_keys_for_meta<F>(
+    table: &str,
+    meta: &TableMeta,
+    mut parent_lookup: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Option<TableMeta>,
+{
+    for column in &meta.columns {
+        let Some(reference) = &column.references else {
+            continue;
+        };
+        if !exact_constraint_key_indexable(&column.column_type) {
+            return Err(Error::ColumnNotIndexable {
+                table: table.to_string(),
+                column: column.name.clone(),
+                column_type: column.column_type.clone(),
+            });
+        }
+
+        let Some(parent_meta) = parent_lookup(&reference.table) else {
+            return Err(Error::TableNotFound(reference.table.clone()));
+        };
+        let Some(parent_column) = parent_meta
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == reference.column)
+        else {
+            return Err(Error::ColumnNotFound {
+                table: reference.table.clone(),
+                column: reference.column.clone(),
+            });
+        };
+        if !exact_constraint_key_indexable(&parent_column.column_type) {
+            return Err(Error::ColumnNotIndexable {
+                table: reference.table.clone(),
+                column: reference.column.clone(),
+                column_type: parent_column.column_type.clone(),
+            });
+        }
+
+        if !parent_tuple_is_key_covered(&parent_meta, std::slice::from_ref(&reference.column)) {
+            return Err(Error::SchemaInvalid {
+                reason: format!(
+                    "foreign key on {table}.{} references {}({}) without a PRIMARY KEY or UNIQUE constraint",
+                    column.name, reference.table, reference.column
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn reject_duplicate_columns(table: &str, columns: &[String], label: &str) -> Result<()> {
+    let mut seen = HashSet::new();
+    for column in columns {
+        if !seen.insert(column) {
+            return Err(Error::SchemaInvalid {
+                reason: format!("{label} on {table} contain duplicate column '{column}'"),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parent_tuple_is_key_covered(
+    parent_meta: &TableMeta,
+    parent_columns: &[String],
+) -> bool {
+    if parent_columns.len() == 1
+        && parent_meta
+            .columns
+            .iter()
+            .any(|column| column.name == parent_columns[0] && (column.primary_key || column.unique))
+    {
+        return true;
+    }
+
+    parent_meta
+        .unique_constraints
+        .iter()
+        .any(|unique| unique == parent_columns)
 }
 
 pub(crate) fn map_column_type(dtype: &DataType) -> contextdb_core::ColumnType {
@@ -4929,6 +7965,24 @@ fn core_column_from_ast(
         immutable: col.immutable,
         quantization: map_vector_quantization(col.quantization),
         rank_policy,
+        context_id: col.context_id,
+        scope_label: col.scope_label.as_deref().map(|scope| match scope {
+            contextdb_parser::ast::ScopeLabelConstraint::Simple { labels } => {
+                contextdb_core::ScopeLabelKind::Simple {
+                    write_labels: labels.clone(),
+                }
+            }
+            contextdb_parser::ast::ScopeLabelConstraint::Split { read, write } => {
+                contextdb_core::ScopeLabelKind::Split {
+                    read_labels: read.clone(),
+                    write_labels: write.clone(),
+                }
+            }
+        }),
+        acl_ref: col.acl_ref.as_ref().map(|acl| contextdb_core::AclRef {
+            ref_table: acl.ref_table.clone(),
+            ref_column: acl.ref_column.clone(),
+        }),
     }
 }
 
@@ -4965,6 +8019,9 @@ fn ast_column_from_core(col: contextdb_core::ColumnDef) -> contextdb_parser::ast
             }
         },
         rank_policy: None,
+        context_id: col.context_id,
+        scope_label: None,
+        acl_ref: None,
     }
 }
 
@@ -5483,6 +8540,64 @@ mod tests {
         assert!(
             matches!(target_result, Err(Error::PlanError(_))),
             "graph frontier projection should return a plan error on missing target alias binding, got {target_result:?}"
+        );
+    }
+
+    #[test]
+    fn graph_02_filter_subqueries_resolve_at_graph_snapshot_without_outer_override() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE seeds (id UUID PRIMARY KEY, node_id UUID)",
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let pre_pin_seed = Uuid::from_u128(1);
+        let post_pin_seed = Uuid::from_u128(2);
+        db.execute(
+            "INSERT INTO seeds (id, node_id) VALUES ($id, $node_id)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(Uuid::from_u128(10))),
+                ("node_id".to_string(), Value::Uuid(pre_pin_seed)),
+            ]),
+        )
+        .unwrap();
+        let snapshot = db.snapshot();
+        db.execute(
+            "INSERT INTO seeds (id, node_id) VALUES ($id, $node_id)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(Uuid::from_u128(11))),
+                ("node_id".to_string(), Value::Uuid(post_pin_seed)),
+            ]),
+        )
+        .unwrap();
+
+        let stmt =
+            contextdb_parser::parse("SELECT id FROM nodes WHERE id IN (SELECT node_id FROM seeds)")
+                .unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
+        let filter = select.body.where_clause.expect("expected WHERE filter");
+
+        let resolved =
+            resolve_graph_filter_at_snapshot(&db, &filter, &HashMap::new(), None, snapshot, &[])
+                .unwrap();
+        let Expr::InList { list, .. } = resolved else {
+            panic!("expected resolved IN list");
+        };
+        let resolved_ids = list
+            .into_iter()
+            .map(|expr| match expr {
+                Expr::Literal(Literal::Text(value)) => Uuid::parse_str(&value).unwrap(),
+                other => panic!("expected UUID text literal, got {other:?}"),
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(resolved_ids, BTreeSet::from([pre_pin_seed]));
+        assert!(
+            !resolved_ids.contains(&post_pin_seed),
+            "post-pin seed leaked into graph filter subquery resolution"
         );
     }
 }

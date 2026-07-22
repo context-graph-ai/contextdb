@@ -6,6 +6,10 @@ use std::path::PathBuf;
 use regex::Regex;
 use walkdir::WalkDir;
 
+#[path = "audit_support/mod.rs"]
+mod audit_support;
+use audit_support::workspace_root;
+
 const SCOPED_CRATES: &[&str] = &[
     "contextdb-core",
     "contextdb-tx",
@@ -14,12 +18,6 @@ const SCOPED_CRATES: &[&str] = &[
     "contextdb-graph",
     "contextdb-relational",
 ];
-
-fn workspace_root() -> PathBuf {
-    // tests run with CARGO_MANIFEST_DIR = crates/contextdb-core; go two up.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().unwrap().parent().unwrap().to_path_buf()
-}
 
 fn scoped_src_files() -> Vec<PathBuf> {
     let root = workspace_root();

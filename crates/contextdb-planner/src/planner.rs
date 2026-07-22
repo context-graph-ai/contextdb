@@ -1,8 +1,7 @@
 use crate::plan::*;
 use contextdb_core::{Direction, Error, PropagationRule, Result};
 use contextdb_parser::ast::{
-    AstPropagationRule, BinOp, Cte, Expr, FromItem, MatchClause, SelectBody, SelectStatement,
-    SortDirection, Statement,
+    AstPropagationRule, Cte, Expr, FromItem, SelectBody, SelectStatement, SortDirection, Statement,
 };
 use std::collections::HashMap;
 
@@ -16,6 +15,7 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             name: ct.name.clone(),
             columns: ct.columns.clone(),
             unique_constraints: ct.unique_constraints.clone(),
+            composite_foreign_keys: ct.composite_foreign_keys.clone(),
             immutable: ct.immutable,
             state_machine: ct.state_machine.clone(),
             dag_edge_types: ct.dag_edge_types.clone(),
@@ -68,6 +68,14 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         }
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
+        Statement::CreateSchedule { .. }
+        | Statement::DropSchedule { .. }
+        | Statement::CreateTrigger { .. }
+        | Statement::DropTrigger { .. }
+        | Statement::CreateEventType { .. }
+        | Statement::CreateSink { .. }
+        | Statement::CreateRoute { .. }
+        | Statement::DropRoute { .. } => Ok(PhysicalPlan::Pipeline(vec![])),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Ok(PhysicalPlan::Pipeline(vec![]))
         }
@@ -147,24 +155,33 @@ fn extract_propagation_rules(
 
 fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     let mut cte_env = HashMap::new();
+    let mut visible_ctes = Vec::new();
 
     for cte in &sel.ctes {
         match cte {
             Cte::MatchCte { name, match_clause } => {
-                cte_env.insert(name.clone(), graph_bfs_from_match(match_clause, &cte_env)?);
+                cte_env.insert(
+                    name.clone(),
+                    graph_bfs_from_match(match_clause, &visible_ctes)?,
+                );
             }
             Cte::SqlCte { name, query } => {
-                cte_env.insert(name.clone(), plan_select_body(query, &cte_env)?);
+                cte_env.insert(
+                    name.clone(),
+                    plan_select_body(query, &cte_env, &visible_ctes)?,
+                );
             }
         }
+        visible_ctes.push(cte.clone());
     }
 
-    plan_select_body(&sel.body, &cte_env)
+    plan_select_body(&sel.body, &cte_env, &visible_ctes)
 }
 
 fn plan_select_body(
     body: &SelectBody,
     cte_env: &HashMap<String, PhysicalPlan>,
+    visible_ctes: &[Cte],
 ) -> Result<PhysicalPlan> {
     let graph_from = body
         .from
@@ -172,7 +189,7 @@ fn plan_select_body(
         .find(|f| matches!(f, FromItem::GraphTable { .. }));
 
     let mut current = if let Some(from_item) = graph_from {
-        graph_plan_from_from_item(from_item, cte_env)?
+        graph_plan_from_from_item(from_item, visible_ctes)?
     } else {
         let from_item = body.from.iter().find_map(|item| match item {
             FromItem::Table { name, alias } => Some((name.clone(), alias.clone())),
@@ -247,6 +264,28 @@ fn plan_select_body(
                 input: Box::new(current),
                 predicate: where_clause.clone(),
             };
+        }
+    }
+
+    let row_vector_order_count = body
+        .order_by
+        .iter()
+        .filter(|order| expr_contains_row_vector_source(&order.expr))
+        .count();
+    if row_vector_order_count > 0 {
+        let supported_row_vector_order = body.order_by.len() == 1
+            && body.order_by.first().is_some_and(|order| {
+                matches!(order.direction, SortDirection::CosineDistance)
+                    && matches!(
+                        &order.expr,
+                        Expr::CosineDistance { right, .. }
+                            if matches!(right.as_ref(), Expr::RowVectorSource { .. })
+                    )
+            });
+        if !supported_row_vector_order {
+            return Err(Error::PlanError(
+                "ROW_VECTOR cosine distance must be the only ORDER BY item".to_string(),
+            ));
         }
     }
 
@@ -350,6 +389,45 @@ fn vector_search_parts(expr: &Expr) -> Result<(String, Expr)> {
     }
 }
 
+fn expr_contains_row_vector_source(expr: &Expr) -> bool {
+    match expr {
+        Expr::RowVectorSource { .. } => true,
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            expr_contains_row_vector_source(left) || expr_contains_row_vector_source(right)
+        }
+        Expr::UnaryOp { operand, .. } | Expr::IsNull { expr: operand, .. } => {
+            expr_contains_row_vector_source(operand)
+        }
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_row_vector_source),
+        Expr::InList { expr, list, .. } => {
+            expr_contains_row_vector_source(expr)
+                || list.iter().any(expr_contains_row_vector_source)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_contains_row_vector_source(expr) || expr_contains_row_vector_source(pattern)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_contains_row_vector_source(expr)
+                || select_body_contains_row_vector_source(subquery)
+        }
+        Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => false,
+    }
+}
+
+fn select_body_contains_row_vector_source(body: &SelectBody) -> bool {
+    body.columns
+        .iter()
+        .any(|column| expr_contains_row_vector_source(&column.expr))
+        || body
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_contains_row_vector_source)
+        || body
+            .order_by
+            .iter()
+            .any(|order| expr_contains_row_vector_source(&order.expr))
+}
+
 fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {
     match plan {
         PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
@@ -388,17 +466,14 @@ fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {
     }
 }
 
-fn graph_plan_from_from_item(
-    from_item: &FromItem,
-    cte_env: &HashMap<String, PhysicalPlan>,
-) -> Result<PhysicalPlan> {
+fn graph_plan_from_from_item(from_item: &FromItem, visible_ctes: &[Cte]) -> Result<PhysicalPlan> {
     match from_item {
         FromItem::GraphTable {
             match_clause,
             columns,
             ..
         } => {
-            let bfs = graph_bfs_from_match(match_clause, cte_env)?;
+            let bfs = graph_bfs_from_match(match_clause, visible_ctes)?;
             if columns.is_empty() {
                 Ok(bfs)
             } else {
@@ -424,7 +499,7 @@ fn graph_plan_from_from_item(
 
 fn graph_bfs_from_match(
     match_clause: &contextdb_parser::ast::MatchClause,
-    cte_env: &HashMap<String, PhysicalPlan>,
+    visible_ctes: &[Cte],
 ) -> Result<PhysicalPlan> {
     let steps = match_clause
         .pattern
@@ -461,87 +536,15 @@ fn graph_bfs_from_match(
 
     Ok(PhysicalPlan::GraphBfs {
         start_alias: match_clause.pattern.start.alias.clone(),
-        start_expr: extract_graph_start_expr(match_clause)?,
-        start_candidates: extract_graph_start_candidates(match_clause, cte_env)?,
+        start_expr: Expr::Column(contextdb_parser::ast::ColumnRef {
+            table: None,
+            column: match_clause.pattern.start.alias.clone(),
+        }),
+        start_candidates: None,
+        filter_ctes: visible_ctes.to_vec(),
         steps,
         filter: match_clause.where_clause.clone(),
     })
-}
-
-fn extract_graph_start_candidates(
-    match_clause: &MatchClause,
-    cte_env: &HashMap<String, PhysicalPlan>,
-) -> Result<Option<Box<PhysicalPlan>>> {
-    let Some(where_clause) = &match_clause.where_clause else {
-        return Ok(None);
-    };
-    find_graph_start_candidates(where_clause, &match_clause.pattern.start.alias, cte_env)
-}
-
-fn find_graph_start_candidates(
-    expr: &Expr,
-    start_alias: &str,
-    cte_env: &HashMap<String, PhysicalPlan>,
-) -> Result<Option<Box<PhysicalPlan>>> {
-    match expr {
-        Expr::InSubquery { expr, subquery, .. } if is_graph_start_id_ref(expr, start_alias) => {
-            Ok(Some(Box::new(plan_select_body(subquery, cte_env)?)))
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            if let Some(plan) = find_graph_start_candidates(left, start_alias, cte_env)? {
-                return Ok(Some(plan));
-            }
-            find_graph_start_candidates(right, start_alias, cte_env)
-        }
-        Expr::UnaryOp { operand, .. } => find_graph_start_candidates(operand, start_alias, cte_env),
-        _ => Ok(None),
-    }
-}
-
-fn extract_graph_start_expr(match_clause: &MatchClause) -> Result<Expr> {
-    let start_alias = &match_clause.pattern.start.alias;
-    if let Some(where_clause) = &match_clause.where_clause
-        && let Some(expr) = find_graph_start_expr(where_clause, start_alias)
-    {
-        return Ok(expr);
-    }
-
-    Ok(Expr::Column(contextdb_parser::ast::ColumnRef {
-        table: None,
-        column: start_alias.clone(),
-    }))
-}
-
-fn find_graph_start_expr(expr: &Expr, start_alias: &str) -> Option<Expr> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } => {
-            if is_graph_start_id_ref(left, start_alias) {
-                Some((**right).clone())
-            } else if is_graph_start_id_ref(right, start_alias) {
-                Some((**left).clone())
-            } else {
-                None
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => find_graph_start_expr(left, start_alias)
-            .or_else(|| find_graph_start_expr(right, start_alias)),
-        Expr::UnaryOp { operand, .. } => find_graph_start_expr(operand, start_alias),
-        _ => None,
-    }
-}
-
-fn is_graph_start_id_ref(expr: &Expr, start_alias: &str) -> bool {
-    matches!(
-        expr,
-        Expr::Column(contextdb_parser::ast::ColumnRef {
-            table: Some(table),
-            column
-        }) if table == start_alias && column == "id"
-    )
 }
 
 /// Stub bridge from parser-AST `SortDirection` (Asc/Desc/CosineDistance) to

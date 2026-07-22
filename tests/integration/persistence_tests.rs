@@ -1,25 +1,45 @@
+use crate::cli_spawn::{cli_bin, spawn_cli, spawn_cli_no_stdin};
 use contextdb_core::*;
 use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, NaturalKey, RowChange};
+#[cfg(feature = "nats-tests")]
 use contextdb_server::{SyncClient, SyncServer};
+use serial_test::serial;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::io::Write;
-use std::mem::forget;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command};
+#[cfg(feature = "nats-tests")]
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+#[cfg(feature = "nats-tests")]
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+#[cfg(feature = "nats-tests")]
 use testcontainers::runners::AsyncRunner;
+#[cfg(feature = "nats-tests")]
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
+const CLI_BAD_PATH: &str = "/nonexistent/deeply/nested/path/test.db";
+const CLI_SPAWN_STABILITY_WORKERS: usize = 16;
+const CLI_SPAWN_STABILITY_OUTER_ITERATIONS: usize = 3;
+
+#[cfg(feature = "nats-tests")]
 struct NatsFixture {
     _container: ContainerAsync<GenericImage>,
     nats_url: String,
 }
+
+type BadPathCliOutput = (usize, std::result::Result<std::process::Output, String>);
+type MemoryModeCliOutput = (
+    usize,
+    Uuid,
+    std::result::Result<(std::process::Output, std::process::Output), String>,
+);
 
 fn values(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
@@ -75,6 +95,264 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+fn run_bad_path_cli_workers() -> Vec<BadPathCliOutput> {
+    let (tx, rx) = mpsc::channel();
+    let handles: Vec<_> = (0..CLI_SPAWN_STABILITY_WORKERS)
+        .map(|child_index| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let child = spawn_cli_no_stdin(CLI_BAD_PATH, &[]);
+                let output = child.wait_with_output().expect("CLI should finish");
+                let _ = tx.send((child_index, Ok(output)));
+            })
+        })
+        .collect();
+    drop(tx);
+
+    for handle in handles {
+        handle.join().expect("bad-path CLI worker should not panic");
+    }
+    let mut outputs = rx.try_iter().collect::<Vec<_>>();
+    outputs.sort_by_key(|(child_index, _)| *child_index);
+    outputs
+}
+
+fn expected_cli_bin() -> std::path::PathBuf {
+    cli_bin()
+}
+
+fn run_memory_mode_cli_workers() -> Vec<MemoryModeCliOutput> {
+    let (tx, rx) = mpsc::channel();
+    let handles: Vec<_> = (0..CLI_SPAWN_STABILITY_WORKERS)
+        .map(|worker_index| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let id = Uuid::new_v4();
+                let script1 = format!(
+                    "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)\n\
+                     INSERT INTO t (id, v) VALUES ('{id}', 'memory_val')\n\
+                     SELECT * FROM t\n\
+                     .quit\n"
+                );
+                let result = run_live_cli_script(":memory:", &script1).and_then(|output1| {
+                    run_live_cli_script(":memory:", "SELECT * FROM t\n.quit\n")
+                        .map(|output2| (output1, output2))
+                });
+                let _ = tx.send((worker_index, id, result));
+            })
+        })
+        .collect();
+    drop(tx);
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("memory-mode CLI worker should not panic");
+    }
+    let mut outputs = rx.try_iter().collect::<Vec<_>>();
+    outputs.sort_by_key(|(worker_index, _, _)| *worker_index);
+    outputs
+}
+
+fn run_live_cli_script(
+    db_path: &str,
+    script: &str,
+) -> std::result::Result<std::process::Output, String> {
+    let mut child = spawn_cli(db_path, &[]);
+    match child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(script.as_bytes())
+    {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("write script to CLI: {err}"),
+    }
+    Ok(child.wait_with_output().expect("CLI should finish"))
+}
+
+fn assert_spawn_helper_targets_cli_binary_directly() {
+    let expected = expected_cli_bin();
+    assert_eq!(
+        cli_bin(),
+        expected,
+        "CLI spawn helper must expose the contextdb-cli binary path"
+    );
+
+    let mut child = spawn_cli(":memory:", &[]);
+    assert_child_is_cli_binary(&mut child, &expected);
+    {
+        let stdin = child.stdin.as_mut().expect("stdin pipe");
+        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
+        writeln!(
+            stdin,
+            "INSERT INTO t (id, v) VALUES ('{}', 'identity_probe')",
+            Uuid::new_v4()
+        )
+        .unwrap();
+        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, ".quit").unwrap();
+    }
+    let output = child.wait_with_output().expect("CLI should finish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "CLI identity probe should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("identity_probe"),
+        "CLI identity probe should execute the scripted SELECT, got stdout:\n{stdout}"
+    );
+}
+
+fn assert_cli_spawn_helper_does_not_invoke_cargo() {
+    let source = fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("tests")
+            .join("integration")
+            .join("cli_spawn.rs"),
+    )
+    .expect("cli_spawn helper source should be readable");
+    assert!(
+        !source.contains("Command::new(\"cargo\")")
+            && !source.contains("\"cargo\"")
+            && !source.contains("\"run\"")
+            && !source.contains("\"build\""),
+        "CLI spawn helper must not invoke Cargo from inside integration tests"
+    );
+}
+
+fn assert_file_backed_cli_persistence_through_spawn_helper() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("cli-helper-persistence.db");
+    let id = Uuid::new_v4();
+    let script1 = format!(
+        "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)\n\
+         INSERT INTO t (id, v) VALUES ('{id}', 'alpha')\n\
+         .quit\n"
+    );
+    let output1 = run_live_cli_script(path.to_str().unwrap(), &script1)
+        .expect("file-backed CLI session 1 should spawn release binary");
+    let stdout1 = String::from_utf8_lossy(&output1.stdout);
+    let stderr1 = String::from_utf8_lossy(&output1.stderr);
+    assert!(
+        output1.status.success(),
+        "file-backed CLI session 1 should succeed\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
+    );
+
+    let output2 = run_live_cli_script(path.to_str().unwrap(), "SELECT * FROM t\n.quit\n")
+        .expect("file-backed CLI session 2 should spawn release binary");
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+    assert!(
+        output2.status.success(),
+        "file-backed CLI session 2 should succeed\nstdout:\n{stdout2}\nstderr:\n{stderr2}"
+    );
+    assert!(
+        stdout2.contains("alpha"),
+        "file-backed CLI session 2 should read persisted value, got stdout:\n{stdout2}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_child_is_cli_binary(child: &mut Child, expected: &std::path::Path) {
+    if let Err(err) = verify_child_is_cli_binary(child, expected) {
+        panic!("{err}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_child_is_cli_binary(
+    child: &mut Child,
+    expected: &std::path::Path,
+) -> std::result::Result<(), String> {
+    let expected = match fs::canonicalize(expected) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "CLI binary should exist before identity probe at {}: {err}",
+                expected.display()
+            ));
+        }
+    };
+    let exe_link = format!("/proc/{}/exe", child.id());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_actual = None;
+    let mut last_error = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "spawned CLI child exited before identity probe matched {}; status={status:?}; last_actual={}; last_error={}",
+                    expected.display(),
+                    last_actual
+                        .as_ref()
+                        .map(|path: &std::path::PathBuf| path.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    last_error.unwrap_or_else(|| "<none>".to_string())
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to poll spawned CLI child status: {err}"));
+            }
+        }
+
+        match fs::read_link(&exe_link) {
+            Ok(actual) if actual == expected => return Ok(()),
+            Ok(actual) => last_actual = Some(actual),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(actual) = last_actual {
+                return Err(format!(
+                    "CLI spawn helper must spawn contextdb-cli directly, expected {}, got {}",
+                    expected.display(),
+                    actual.display()
+                ));
+            }
+            return Err(format!(
+                "spawned CLI child executable should be inspectable via {exe_link}: {}",
+                last_error.unwrap_or_else(|| "<no read attempt>".to_string())
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn assert_child_is_cli_binary(_child: &mut Child, expected: &std::path::Path) {
+    if let Err(err) = verify_child_is_cli_binary(_child, expected) {
+        panic!("{err}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_child_is_cli_binary(
+    _child: &mut Child,
+    expected: &std::path::Path,
+) -> std::result::Result<(), String> {
+    if !expected.exists() {
+        return Err(format!(
+            "CLI binary should exist before identity probe at {}",
+            expected.display()
+        ));
+    }
+    Ok(())
+}
+
 fn brute_force_top_k(vectors: &[(RowId, Vec<f32>)], query: &[f32], k: usize) -> Vec<RowId> {
     let mut scored = vectors
         .iter()
@@ -84,10 +362,12 @@ fn brute_force_top_k(vectors: &[(RowId, Vec<f32>)], query: &[f32], k: usize) -> 
     scored.into_iter().take(k).map(|(rid, _)| rid).collect()
 }
 
+#[cfg(feature = "nats-tests")]
 fn setup_nats_conf() -> String {
     format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(feature = "nats-tests")]
 async fn start_nats() -> NatsFixture {
     let image = GenericImage::new("nats", "latest")
         .with_exposed_port(4222.tcp())
@@ -113,7 +393,7 @@ fn p01_relational_rows_survive_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
     db.insert_row(
@@ -156,6 +436,68 @@ fn p01_relational_rows_survive_reopen() {
 }
 
 #[test]
+fn p01b_legacy_u64_relational_table_migrates_to_versioned_keys() {
+    use redb::{ReadableDatabase, ReadableTable};
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("legacy-relational.db");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO items (id, name) VALUES ($id, 'legacy')",
+        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    let redb_db = redb::Database::open(&path).unwrap();
+    let write_txn = redb_db.begin_write().unwrap();
+    let versioned_def: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("rel_items");
+    let legacy_def: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("rel_items");
+    let mut legacy_rows = Vec::new();
+    {
+        let versioned = write_txn.open_table(versioned_def).unwrap();
+        for entry in versioned.iter().unwrap() {
+            let (key, value) = entry.unwrap();
+            let row_id = u64::from_be_bytes(key.value()[..8].try_into().unwrap());
+            legacy_rows.push((row_id, value.value().to_vec()));
+        }
+    }
+    write_txn.delete_table(versioned_def).unwrap();
+    {
+        let mut legacy = write_txn.open_table(legacy_def).unwrap();
+        for (row_id, bytes) in &legacy_rows {
+            legacy.insert(*row_id, bytes.as_slice()).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+    drop(redb_db);
+
+    let reopened = Database::open(&path).unwrap();
+    let row = reopened
+        .point_lookup("items", "id", &Value::Uuid(id), reopened.snapshot())
+        .unwrap()
+        .expect("legacy row must load after migration");
+    assert_eq!(text(&row, "name"), "legacy");
+    reopened.close().unwrap();
+
+    let redb_db = redb::Database::open(&path).unwrap();
+    let read_txn = redb_db.begin_read().unwrap();
+    assert!(read_txn.open_table(versioned_def).is_ok());
+    assert!(matches!(
+        read_txn.open_table(legacy_def),
+        Err(redb::TableError::TableTypeMismatch { .. })
+            | Err(redb::TableError::TableDoesNotExist(_))
+    ));
+}
+
+#[test]
 fn p02_ddl_schema_survives_reopen() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("ddl.db");
@@ -170,7 +512,7 @@ fn p02_ddl_schema_survives_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let uuid1 = Uuid::new_v4();
     db.insert_row(
         tx,
@@ -185,7 +527,7 @@ fn p02_ddl_schema_survives_reopen() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     db2.insert_row(
         tx2,
         "events",
@@ -203,7 +545,7 @@ fn p02_ddl_schema_survives_reopen() {
         &HashMap::from([("id".to_string(), Value::Uuid(uuid1))]),
     );
     assert!(update.is_err());
-    let tx3 = db2.begin();
+    let tx3 = db2.begin_or_panic();
     let uuid3 = Uuid::new_v4();
     db2.insert_row(
         tx3,
@@ -232,7 +574,7 @@ fn p03_graph_edges_with_properties_survive_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let ids = [
         Uuid::new_v4(),
         Uuid::new_v4(),
@@ -304,7 +646,7 @@ fn p04_vectors_survive_reopen_and_ann_works() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let r1 = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
@@ -363,7 +705,7 @@ fn p05_hnsw_recall_stable_across_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in 0..200u64 {
         let rid = db
             .insert_row(
@@ -423,7 +765,7 @@ fn p06_cross_subsystem_atomic_persistence() {
     .unwrap();
     db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let dec_id = Uuid::new_v4();
     let node_id = Uuid::new_v4();
     let r1 = db
@@ -490,7 +832,7 @@ fn p07_counter_reconstruction_no_id_collisions() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     for i in 0..5 {
         db.insert_row(
             tx1,
@@ -510,7 +852,7 @@ fn p07_counter_reconstruction_no_id_collisions() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     let post_row_id = db2
         .insert_row(
             tx2,
@@ -539,7 +881,7 @@ fn p08_multi_commit_accumulation() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let id_a = Uuid::new_v4();
     db.insert_row(
         tx1,
@@ -551,7 +893,7 @@ fn p08_multi_commit_accumulation() {
     )
     .unwrap();
     db.commit(tx1).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let id_b = Uuid::new_v4();
     db.insert_row(
         tx2,
@@ -589,7 +931,7 @@ fn p09_committed_data_survives_ungraceful_shutdown() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id1 = Uuid::new_v4();
     db.insert_row(
         tx,
@@ -621,7 +963,7 @@ fn p10_uncommitted_data_lost_after_crash() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let committed_id = Uuid::new_v4();
     db.insert_row(
         tx1,
@@ -633,7 +975,7 @@ fn p10_uncommitted_data_lost_after_crash() {
     )
     .unwrap();
     db.commit(tx1).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let uncommitted_id = Uuid::new_v4();
     db.insert_row(
         tx2,
@@ -664,7 +1006,7 @@ fn p11_change_log_survives_reopen() {
     let db = Database::open(&path).unwrap();
     db.execute("CREATE TABLE items (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "items",
@@ -690,7 +1032,7 @@ fn p12_open_memory_still_works() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
     let rid = db
@@ -760,7 +1102,7 @@ fn p13_single_file_operation() {
     let db = Database::open(&path).unwrap();
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(tx, "t", values(vec![("id", Value::Uuid(the_uuid))]))
         .unwrap();
     db.commit(tx).unwrap();
@@ -787,7 +1129,7 @@ fn p14_hnsw_recall_at_10_meets_threshold() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut vectors = Vec::new();
     for i in 0..1000u64 {
         let rid = db
@@ -836,7 +1178,7 @@ fn p15_snapshot_query_sees_only_vectors_committed_before_snapshot() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let r1 = db
         .insert_row(
             tx1,
@@ -882,7 +1224,7 @@ fn p15_snapshot_query_sees_only_vectors_committed_before_snapshot() {
     db.commit(tx1).unwrap();
     let old_snap = db.snapshot();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     let r4 = db
         .insert_row(
             tx2,
@@ -957,7 +1299,7 @@ fn p16_state_propagation_survives_restart() {
 
     let intention_id = Uuid::new_v4();
     let decision_id = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "intentions",
@@ -980,7 +1322,7 @@ fn p16_state_propagation_survives_restart() {
     )
     .unwrap();
     db.commit(tx).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "intentions",
@@ -1003,6 +1345,7 @@ fn p16_state_propagation_survives_restart() {
     assert_eq!(text(&row, "status"), "invalidated");
 }
 
+#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn p17_edge_pushes_to_server_both_survive_restart() {
     let nats = start_nats().await;
@@ -1024,7 +1367,7 @@ async fn p17_edge_pushes_to_server_both_survive_restart() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "p17",
+        contextdb_core::TenantId::from("p17"),
         policies.clone(),
     ));
     let handle = tokio::spawn({
@@ -1043,11 +1386,17 @@ async fn p17_edge_pushes_to_server_both_survive_restart() {
             ]),
         )
         .unwrap();
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "p17");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("p17"),
+    );
     client.push().await.unwrap();
 
     handle.abort();
+    let _ = handle.await;
     drop(client);
+    drop(server);
     drop(edge_db);
     drop(server_db);
 
@@ -1074,12 +1423,12 @@ fn p18_deleted_rows_stay_deleted_after_restart() {
     let db = Database::open(&path).unwrap();
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
         .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, "t", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
     db.commit(tx).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "t", row_id).unwrap();
     db.commit(tx2).unwrap();
     db.close().unwrap();
@@ -1107,11 +1456,11 @@ fn p19_data_integrity_at_scale() {
     let mut edge_nodes = Vec::new();
     let mut vector_row_ids = Vec::new();
     for batch in 0..100 {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         for i in 0..100 {
             let seq = batch * 100 + i;
             let id = Uuid::new_v4();
-            let row_id = db
+            let _row_id = db
                 .insert_row(
                     tx,
                     "rows_t",
@@ -1136,20 +1485,21 @@ fn p19_data_integrity_at_scale() {
                     .unwrap();
                 }
                 let angle = seq as f32 * 0.01;
-                db.insert_row(
-                    tx,
-                    "vec_t",
-                    values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
-                )
-                .unwrap();
+                let vector_row_id = db
+                    .insert_row(
+                        tx,
+                        "vec_t",
+                        values(vec![("id", Value::Uuid(Uuid::new_v4()))]),
+                    )
+                    .unwrap();
                 db.insert_vector(
                     tx,
                     contextdb_core::VectorIndexRef::new("vec_t", "embedding"),
-                    row_id,
+                    vector_row_id,
                     vec![angle.cos(), angle.sin(), 0.0],
                 )
                 .unwrap();
-                vector_row_ids.push(row_id);
+                vector_row_ids.push(vector_row_id);
             }
         }
         db.commit(tx).unwrap();
@@ -1198,7 +1548,7 @@ fn p20_dimension_mismatch_rejected_after_restart() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
@@ -1213,7 +1563,7 @@ fn p20_dimension_mismatch_rejected_after_restart() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     let rid2 = db2
         .insert_row(
             tx2,
@@ -1231,17 +1581,11 @@ fn p20_dimension_mismatch_rejected_after_restart() {
 }
 
 #[test]
+#[serial(cli_spawn_helper)]
 fn p21_cli_persists_across_sessions() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("cli.db");
-    let mut child1 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", path.to_str().unwrap()])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child1 = spawn_cli(path.to_str().unwrap(), &[]);
     {
         let stdin = child1.stdin.as_mut().unwrap();
         writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
@@ -1256,14 +1600,7 @@ fn p21_cli_persists_across_sessions() {
     let output1 = child1.wait_with_output().unwrap();
     assert!(output1.status.success());
 
-    let mut child2 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", path.to_str().unwrap()])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child2 = spawn_cli(path.to_str().unwrap(), &[]);
     {
         let stdin = child2.stdin.as_mut().unwrap();
         writeln!(stdin, "SELECT * FROM t").unwrap();
@@ -1276,27 +1613,87 @@ fn p21_cli_persists_across_sessions() {
 }
 
 #[test]
+#[serial(cli_spawn_helper)]
 fn p22_cli_bad_path_prints_clear_error() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            "contextdb-cli",
-            "--",
-            "/nonexistent/deeply/nested/path/test.db",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    let output = spawn_cli_no_stdin(CLI_BAD_PATH, &[])
+        .wait_with_output()
+        .expect("CLI should finish");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1));
     assert!(!stderr.is_empty());
     assert!(stderr.contains("path") || stderr.contains("open") || stderr.contains("writable"));
 }
 
+#[test]
+#[serial(cli_spawn_helper)]
+fn cli_child_process_spawn_stability_under_simulated_workspace_parallel_load() {
+    assert_cli_spawn_helper_does_not_invoke_cargo();
+    assert_spawn_helper_targets_cli_binary_directly();
+    assert_file_backed_cli_persistence_through_spawn_helper();
+
+    for iteration in 0..CLI_SPAWN_STABILITY_OUTER_ITERATIONS {
+        let outputs = run_bad_path_cli_workers();
+        assert_eq!(
+            outputs.len(),
+            CLI_SPAWN_STABILITY_WORKERS,
+            "iteration {iteration}: every bad-path CLI worker should report a result"
+        );
+        for (child_index, output) in &outputs {
+            let output = output
+                .as_ref()
+                .unwrap_or_else(|err| panic!("iteration {iteration}, child {child_index}: {err}"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.code() == Some(1),
+                "iteration {iteration}, child {child_index}: expected bad-path exit 1, got {:?}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+            assert!(
+                !stderr.is_empty(),
+                "iteration {iteration}, child {child_index}: expected non-empty bad-path stderr, got exit {:?}",
+                output.status.code()
+            );
+        }
+    }
+}
+
+#[test]
+#[serial(cli_spawn_helper)]
+fn cli_bad_path_exit_code_is_deterministic_under_concurrent_load() {
+    assert_cli_spawn_helper_does_not_invoke_cargo();
+    for iteration in 0..CLI_SPAWN_STABILITY_OUTER_ITERATIONS {
+        let outputs = run_bad_path_cli_workers();
+        assert_eq!(
+            outputs.len(),
+            CLI_SPAWN_STABILITY_WORKERS,
+            "iteration {iteration}: every bad-path CLI worker should report a result"
+        );
+        for (child_index, output) in &outputs {
+            let output = output
+                .as_ref()
+                .unwrap_or_else(|err| panic!("iteration {iteration}, child {child_index}: {err}"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "iteration {iteration}, child {child_index}: observed exit {:?}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+            assert!(
+                !stderr.is_empty(),
+                "iteration {iteration}, child {child_index}: observed exit {:?}",
+                output.status.code()
+            );
+            assert!(
+                stderr.contains("path") || stderr.contains("open") || stderr.contains("writable"),
+                "iteration {iteration}, child {child_index}: observed exit {:?}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+        }
+    }
+}
+
+#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn p23_server_started_with_db_path_survives_restart() {
     let _ = start_nats().await;
@@ -1307,7 +1704,7 @@ fn p24_graph_edges_survive_process_crash_without_close() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("graph-crash.db");
     let db = Database::open(&path).unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
@@ -1337,7 +1734,7 @@ fn p25_vectors_survive_process_crash_without_close() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let rid = db
         .insert_row(tx, "obs", values(vec![("id", Value::Uuid(Uuid::new_v4()))]))
         .unwrap();
@@ -1367,33 +1764,51 @@ fn p25_vectors_survive_process_crash_without_close() {
 
 #[test]
 fn p26_flush_on_commit_proven_when_drop_is_skipped() {
+    if let Ok(path) = env::var("CONTEXTDB_P26_CHILD_PATH") {
+        let path = std::path::PathBuf::from(path);
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE items (id UUID PRIMARY KEY, embedding VECTOR(3))",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let tx = db.begin_or_panic();
+        let item_id = Uuid::from_u128(1);
+        let node_id = Uuid::from_u128(2);
+        let rid = db
+            .insert_row(tx, "items", values(vec![("id", Value::Uuid(item_id))]))
+            .unwrap();
+        db.insert_edge(tx, item_id, node_id, "SERVES".to_string(), HashMap::new())
+            .unwrap();
+        db.insert_vector(
+            tx,
+            contextdb_core::VectorIndexRef::new("items", "embedding"),
+            rid,
+            vec![1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        db.commit(tx).unwrap();
+        std::process::exit(0);
+    }
+
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("forget.db");
-    let db = Database::open(&path).unwrap();
-    db.execute(
-        "CREATE TABLE items (id UUID PRIMARY KEY, embedding VECTOR(3))",
-        &HashMap::new(),
-    )
-    .unwrap();
-    let tx = db.begin();
     let item_id = Uuid::from_u128(1);
     let node_id = Uuid::from_u128(2);
-    let rid = db
-        .insert_row(tx, "items", values(vec![("id", Value::Uuid(item_id))]))
+    let child = Command::new(env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("persistence_tests::p26_flush_on_commit_proven_when_drop_is_skipped")
+        .arg("--nocapture")
+        .env("CONTEXTDB_P26_CHILD_PATH", &path)
+        .status()
         .unwrap();
-    db.insert_edge(tx, item_id, node_id, "SERVES".to_string(), HashMap::new())
-        .unwrap();
-    db.insert_vector(
-        tx,
-        contextdb_core::VectorIndexRef::new("items", "embedding"),
-        rid,
-        vec![1.0, 0.0, 0.0],
-    )
-    .unwrap();
-    db.commit(tx).unwrap();
-    forget(db);
+    assert!(
+        child.success(),
+        "child process should commit then exit without running Database::drop"
+    );
 
     let db2 = Database::open(&path).unwrap();
+    let rid = db2.scan("items", db2.snapshot()).unwrap()[0].row_id;
     assert!(
         db2.point_lookup("items", "id", &Value::Uuid(item_id), db2.snapshot())
             .unwrap()
@@ -1431,7 +1846,7 @@ fn p27_upsert_result_survives_reopen() {
     )
     .unwrap();
     let id = Uuid::new_v4();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     db.insert_row(
         tx1,
         "t",
@@ -1442,7 +1857,7 @@ fn p27_upsert_result_survives_reopen() {
     )
     .unwrap();
     db.commit(tx1).unwrap();
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.upsert_row(
         tx2,
         "t",
@@ -1474,7 +1889,7 @@ fn p28_dag_modifier_enforced_after_reopen() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     db.insert_edge(tx1, a, b, "BASED_ON".to_string(), HashMap::new())
@@ -1483,7 +1898,7 @@ fn p28_dag_modifier_enforced_after_reopen() {
     db.close().unwrap();
 
     let db2 = Database::open(&path).unwrap();
-    let tx2 = db2.begin();
+    let tx2 = db2.begin_or_panic();
     let result = db2.insert_edge(tx2, b, a, "BASED_ON".to_string(), HashMap::new());
     assert!(
         result.is_err(),
@@ -1502,7 +1917,7 @@ fn p29_temporal_query_works_after_reopen() {
     )
     .unwrap();
     let entity_id = Uuid::new_v4();
-    let tx1 = db.begin();
+    let tx1 = db.begin_or_panic();
     db.insert_row(
         tx1,
         "entities",
@@ -1521,7 +1936,7 @@ fn p29_temporal_query_works_after_reopen() {
         .unwrap();
     let rid = row1.row_id;
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "entities", rid).unwrap();
     db.insert_row(
         tx2,
@@ -1540,7 +1955,7 @@ fn p29_temporal_query_works_after_reopen() {
         .unwrap()
         .unwrap()
         .row_id;
-    let tx3 = db.begin();
+    let tx3 = db.begin_or_panic();
     db.delete_row(tx3, "entities", rid2).unwrap();
     db.insert_row(
         tx3,
@@ -1586,11 +2001,11 @@ fn p30_two_paths_are_independent() {
         .unwrap();
     let id_a = Uuid::new_v4();
     let id_b = Uuid::new_v4();
-    let tx_a = db_a.begin();
+    let tx_a = db_a.begin_or_panic();
     db_a.insert_row(tx_a, "t", values(vec![("id", Value::Uuid(id_a))]))
         .unwrap();
     db_a.commit(tx_a).unwrap();
-    let tx_b = db_b.begin();
+    let tx_b = db_b.begin_or_panic();
     db_b.insert_row(tx_b, "t", values(vec![("id", Value::Uuid(id_b))]))
         .unwrap();
     db_b.commit(tx_b).unwrap();
@@ -1683,7 +2098,7 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
     )
     .unwrap();
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row_ids = Vec::new();
     let vectors: Vec<Vec<f32>> = vec![
         vec![1.0, 0.0, 0.0],
@@ -1707,7 +2122,7 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
     }
     db.commit(tx).unwrap();
 
-    let tx2 = db.begin();
+    let tx2 = db.begin_or_panic();
     db.delete_row(tx2, "obs", row_ids[0]).unwrap();
     db.delete_vector(
         tx2,
@@ -1765,6 +2180,7 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
     assert_eq!(db2.scan("obs", db2.snapshot()).unwrap().len(), 3);
 }
 
+#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn p33_bidirectional_sync_with_persistence() {
     let nats = start_nats().await;
@@ -1827,7 +2243,7 @@ async fn p33_bidirectional_sync_with_persistence() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "p33",
+        contextdb_core::TenantId::from("p33"),
         policies.clone(),
     ));
     let handle = tokio::spawn({
@@ -1836,7 +2252,11 @@ async fn p33_bidirectional_sync_with_persistence() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "p33");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("p33"),
+    );
     client.push().await.unwrap();
     client.pull(&policies).await.unwrap();
 
@@ -1996,7 +2416,7 @@ async fn p33_bidirectional_sync_with_persistence() {
     let server2 = Arc::new(SyncServer::new(
         server_db2.clone(),
         &nats.nats_url,
-        "p33",
+        contextdb_core::TenantId::from("p33"),
         policies.clone(),
     ));
     let handle2 = tokio::spawn({
@@ -2005,7 +2425,11 @@ async fn p33_bidirectional_sync_with_persistence() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let client2 = SyncClient::new(edge_db2.clone(), &nats.nats_url, "p33");
+    let client2 = SyncClient::new(
+        edge_db2.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("p33"),
+    );
     client2.push().await.unwrap();
     client2.pull(&policies).await.unwrap();
 
@@ -2061,16 +2485,10 @@ async fn p33_bidirectional_sync_with_persistence() {
 }
 
 #[test]
+#[serial(cli_spawn_helper)]
 fn p34_cli_memory_mode_smoke_test() {
     let id = Uuid::new_v4();
-    let mut child1 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", ":memory:"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child1 = spawn_cli(":memory:", &[]);
     {
         let stdin = child1.stdin.as_mut().unwrap();
         writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
@@ -2098,14 +2516,7 @@ fn p34_cli_memory_mode_smoke_test() {
         "SELECT output should contain inserted UUID, got: {stdout1}"
     );
 
-    let mut child2 = Command::new("cargo")
-        .args(["run", "-p", "contextdb-cli", "--", ":memory:"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child2 = spawn_cli(":memory:", &[]);
     {
         let stdin = child2.stdin.as_mut().unwrap();
         writeln!(stdin, "SELECT * FROM t").unwrap();
@@ -2127,4 +2538,147 @@ fn p34_cli_memory_mode_smoke_test() {
         !stdout2.contains("memory_val"),
         "memory_val should not persist across :memory: sessions, stdout: {stdout2}"
     );
+}
+
+#[test]
+#[serial(cli_spawn_helper)]
+fn cli_memory_mode_smoke_session_completes_under_concurrent_load() {
+    assert_cli_spawn_helper_does_not_invoke_cargo();
+    for iteration in 0..CLI_SPAWN_STABILITY_OUTER_ITERATIONS {
+        let outputs = run_memory_mode_cli_workers();
+        assert_eq!(
+            outputs.len(),
+            CLI_SPAWN_STABILITY_WORKERS,
+            "iteration {iteration}: every memory-mode CLI worker should report a result"
+        );
+
+        for (worker_index, id, result) in outputs {
+            let (output1, output2) = result.unwrap_or_else(|err| {
+                panic!("iteration {iteration}, worker {worker_index}: {err}")
+            });
+            assert!(
+                output1.status.success(),
+                "iteration {iteration}, worker {worker_index}: CLI session 1 exited with non-zero status"
+            );
+            let stdout1 = String::from_utf8_lossy(&output1.stdout);
+            assert!(
+                stdout1.contains("memory_val"),
+                "iteration {iteration}, worker {worker_index}: SELECT output should contain inserted value, got: {stdout1}"
+            );
+            assert!(
+                stdout1.contains(&id.to_string()),
+                "iteration {iteration}, worker {worker_index}: SELECT output should contain inserted UUID, got: {stdout1}"
+            );
+
+            let stdout2 = String::from_utf8_lossy(&output2.stdout);
+            let stderr2 = String::from_utf8_lossy(&output2.stderr);
+            assert!(
+                !stdout2.is_empty() || !stderr2.is_empty(),
+                "iteration {iteration}, worker {worker_index}: CLI session 2 produced no output at all - process may not have started"
+            );
+            assert!(
+                !stdout2.contains(&id.to_string()),
+                "iteration {iteration}, worker {worker_index}: UUID from session 1 should not appear in session 2, stdout: {stdout2}"
+            );
+            assert!(
+                !stdout2.contains("memory_val"),
+                "iteration {iteration}, worker {worker_index}: memory_val should not persist across :memory: sessions, stdout: {stdout2}"
+            );
+        }
+    }
+}
+
+#[test]
+fn p35_ddl_only_lsn_survives_reopen_before_next_data_commit() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("ddl-lsn.db");
+    let id = Uuid::from_u128(0x3500);
+
+    let ddl_lsn = {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let ddl_lsn = db.current_lsn();
+        assert!(
+            ddl_lsn.0 > 0,
+            "DDL-only database must expose a committed LSN"
+        );
+        db.close().unwrap();
+        ddl_lsn
+    };
+
+    let db = Database::open(&path).unwrap();
+    assert!(
+        db.current_lsn().0 >= ddl_lsn.0,
+        "reopen must preserve DDL-only LSN watermark"
+    );
+    db.execute(
+        "INSERT INTO t (id, v) VALUES ($id, 'after-reopen')",
+        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+    )
+    .unwrap();
+    assert!(
+        db.current_lsn().0 > ddl_lsn.0,
+        "post-reopen data commit must not reuse the DDL LSN"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn p36_noop_sync_commit_does_not_reuse_lsn_after_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("noop-sync-lsn.db");
+    let id = Uuid::from_u128(0x3600);
+
+    let before_lsn = {
+        let db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let before_lsn = db.current_lsn();
+        db.apply_changes(
+            contextdb_engine::sync_types::ChangeSet {
+                rows: vec![RowChange {
+                    table: "t".to_string(),
+                    natural_key: NaturalKey {
+                        column: "id".to_string(),
+                        value: Value::Uuid(id),
+                    },
+                    values: HashMap::new(),
+                    deleted: false,
+                    lsn: Lsn(100),
+                    created_at: None,
+                }],
+                edges: vec![],
+                vectors: vec![],
+                ddl: vec![],
+
+                ddl_lsn: Vec::new(),
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+        assert_eq!(
+            db.current_lsn(),
+            before_lsn,
+            "fully skipped sync apply must not allocate a durable-invisible LSN"
+        );
+        db.close().unwrap();
+        before_lsn
+    };
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.current_lsn(), before_lsn);
+    db.execute(
+        "INSERT INTO t (id, v) VALUES ($id, 'after-noop')",
+        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+    )
+    .unwrap();
+    assert!(db.current_lsn().0 > before_lsn.0);
+    db.close().unwrap();
 }

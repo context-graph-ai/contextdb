@@ -48,7 +48,7 @@ async fn start_nats() -> NatsFixture {
 
 async fn wait_for_server_ready(edge_url: &str, tenant: &str, policies: &ConflictPolicies) {
     let probe_db = Arc::new(Database::open_memory());
-    let probe_client = SyncClient::new(probe_db, edge_url, tenant);
+    let probe_client = SyncClient::new(probe_db, edge_url, contextdb_core::TenantId::from(tenant));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match probe_client.pull(policies).await {
@@ -108,7 +108,7 @@ fn setup_chunked_mixed_push(
     create_observation_tables(&server_db);
 
     let known_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
-    let tx = edge_db.begin();
+    let tx = edge_db.begin_or_panic();
     for i in 0..400usize {
         let uuid = Uuid::new_v4();
         let vec: Vec<f32> = if i == 0 {
@@ -143,7 +143,7 @@ fn setup_chunked_mixed_push(
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         nats_url,
-        &tenant,
+        contextdb_core::TenantId::from(&tenant),
         policies.clone(),
     ));
     let server_handle = rt.spawn({
@@ -153,7 +153,7 @@ fn setup_chunked_mixed_push(
     rt.block_on(wait_for_server_ready(edge_url, &tenant, &policies));
 
     PushFixture {
-        client: SyncClient::new(edge_db, edge_url, &tenant),
+        client: SyncClient::new(edge_db, edge_url, contextdb_core::TenantId::from(&tenant)),
         server_db,
         server_task: server_handle,
     }
@@ -167,7 +167,7 @@ fn setup_chunked_large_pull(
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     create_observation_tables(&server_db);
-    let tx = server_db.begin();
+    let tx = server_db.begin_or_panic();
     for _ in 0..600usize {
         server_db
             .insert_row(
@@ -187,7 +187,7 @@ fn setup_chunked_large_pull(
     let server = Arc::new(SyncServer::new(
         server_db,
         nats_url,
-        &tenant,
+        contextdb_core::TenantId::from(&tenant),
         policies.clone(),
     ));
     let server_handle = rt.spawn({
@@ -197,7 +197,11 @@ fn setup_chunked_large_pull(
     rt.block_on(wait_for_server_ready(edge_url, &tenant, &policies));
 
     PullFixture {
-        client: SyncClient::new(edge_db.clone(), edge_url, &tenant),
+        client: SyncClient::new(
+            edge_db.clone(),
+            edge_url,
+            contextdb_core::TenantId::from(&tenant),
+        ),
         edge_db,
         server_task: server_handle,
     }
@@ -216,7 +220,7 @@ fn setup_multi_edge_converge(
     create_items_table(&edge_b_db);
     create_items_table(&server_db);
 
-    let tx_a = edge_a_db.begin();
+    let tx_a = edge_a_db.begin_or_panic();
     for i in 0..100usize {
         edge_a_db
             .insert_row(
@@ -231,7 +235,7 @@ fn setup_multi_edge_converge(
     }
     edge_a_db.commit(tx_a).unwrap();
 
-    let tx_b = edge_b_db.begin();
+    let tx_b = edge_b_db.begin_or_panic();
     for i in 0..100usize {
         edge_b_db
             .insert_row(
@@ -251,7 +255,7 @@ fn setup_multi_edge_converge(
     let server = Arc::new(SyncServer::new(
         server_db,
         nats_url,
-        &tenant,
+        contextdb_core::TenantId::from(&tenant),
         policies.clone(),
     ));
     let server_handle = rt.spawn({
@@ -261,9 +265,13 @@ fn setup_multi_edge_converge(
     rt.block_on(wait_for_server_ready(edge_url, &tenant, &policies));
 
     MultiEdgeFixture {
-        edge_a: SyncClient::new(edge_a_db, edge_url, &tenant),
-        edge_b: SyncClient::new(edge_b_db, edge_url, &tenant),
-        verifier: SyncClient::new(verifier_db.clone(), edge_url, &tenant),
+        edge_a: SyncClient::new(edge_a_db, edge_url, contextdb_core::TenantId::from(&tenant)),
+        edge_b: SyncClient::new(edge_b_db, edge_url, contextdb_core::TenantId::from(&tenant)),
+        verifier: SyncClient::new(
+            verifier_db.clone(),
+            edge_url,
+            contextdb_core::TenantId::from(&tenant),
+        ),
         verifier_db,
         server_task: server_handle,
     }

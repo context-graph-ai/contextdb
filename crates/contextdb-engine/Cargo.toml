@@ -8,6 +8,17 @@ repository.workspace = true
 readme = "../../README.md"
 description = "Embedded database engine for agentic memory — relational, graph, and vector under unified MVCC transactions"
 
+[features]
+test-seams = ["contextdb-vector/test-seams"]
+# Marker for the demoted broker-bound test modules: the deprecated NATS
+# transport suites build and run only under `--features nats-tests` (with a
+# Docker daemon). The default `cargo test --workspace` gate needs no broker.
+nats-tests = ["contextdb-server/nats"]
+# Marker for the nightly test tier: stress/journey tests too heavy for the
+# default gate build and run only under `--features nightly-tests`, executed
+# by .github/workflows/nightly.yml on a daily schedule.
+nightly-tests = []
+
 [dependencies]
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
 contextdb-tx = { path = "../contextdb-tx", version = "1.0" }
@@ -27,17 +38,21 @@ redb = { workspace = true }
 bincode = { workspace = true }
 smallvec = "1"
 time.workspace = true
+fs2 = "0.4"
+blake3 = "1"
 
 [dev-dependencies]
 contextdb-server = { path = "../contextdb-server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
-async-nats = "0.46"
+async-nats.workspace = true
 testcontainers = "0.27"
 tempfile = "3"
+num_cpus = "1.16"
 criterion = { version = "0.8", features = ["html_reports"] }
 regex = "1"
 tracing-subscriber = "0.3"
+serial_test = "3"
 
 [[test]]
 name = "integration"
@@ -88,14 +103,19 @@ harness = false
 path = "../../benches/indexed_scan_filter_in_memory_pk_inserts.rs"
 
 [[bench]]
-name = "indexed_scan_filter_cg_entity_list"
+name = "indexed_scan_filter_entity_list"
 harness = false
-path = "../../benches/indexed_scan_filter_cg_entity_list.rs"
+path = "../../benches/indexed_scan_filter_entity_list.rs"
 
 [[bench]]
 name = "indexed_scan_filter_non_id_pk_inserts"
 harness = false
 path = "../../benches/indexed_scan_filter_non_id_pk_inserts.rs"
+
+[[bench]]
+name = "storage_scale_hardening"
+harness = false
+path = "../../benches/storage_scale_hardening.rs"
 
 [[bench]]
 name = "acceptance_three_paradigm_query"
@@ -106,3 +126,69 @@ path = "../../benches/acceptance_three_paradigm_query.rs"
 name = "sql_surface_distinct"
 harness = false
 path = "../../benches/sql_surface_distinct.rs"
+
+[[bench]]
+name = "graph_adjacency_probe"
+harness = false
+path = "../../benches/graph_adjacency_probe.rs"
+
+[[bench]]
+name = "composite_index_routing"
+harness = false
+path = "../../benches/composite_index_routing.rs"
+
+[[bench]]
+name = "tier1_atomic_visibility_under_contention"
+harness = false
+path = "../../benches/tier1_atomic_visibility_under_contention.rs"
+
+[[bench]]
+name = "tier1_event_bus_throughput"
+harness = false
+path = "../../benches/tier1_event_bus_throughput.rs"
+
+[[bench]]
+name = "tier1_context_guard_overhead"
+harness = false
+path = "../../benches/tier1_context_guard_overhead.rs"
+
+[[bench]]
+name = "tier1_scope_label_overhead"
+harness = false
+path = "../../benches/tier1_scope_label_overhead.rs"
+
+[[bench]]
+name = "tier1_acl_overhead"
+harness = false
+path = "../../benches/tier1_acl_overhead.rs"
+
+[[bench]]
+name = "tier2_commit_validate_overhead"
+harness = false
+path = "../../benches/tier2_commit_validate_overhead.rs"
+
+[[bench]]
+name = "tier2_fk_revalidation_overhead"
+harness = false
+path = "../../benches/tier2_fk_revalidation_overhead.rs"
+
+[[bench]]
+name = "tier2_state_machine_overhead"
+harness = false
+path = "../../benches/tier2_state_machine_overhead.rs"
+
+[[bench]]
+name = "commit_write_volume_scaling"
+harness = false
+path = "../../benches/commit_write_volume_scaling.rs"
+
+[[bench]]
+name = "sigterm_drain_in_flight_persistence"
+required-features = ["nats-tests"]
+harness = false
+path = "../../benches/sigterm_drain_in_flight_persistence.rs"
+
+[[bench]]
+name = "trigger_throughput"
+harness = false
+path = "../../benches/trigger_throughput.rs"

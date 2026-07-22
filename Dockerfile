@@ -20,6 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /src/target/release/contextdb-server /usr/local/bin/contextdb-server
 
-EXPOSE 4222
+EXPOSE 4433/udp
 
 ENTRYPOINT ["contextdb-server"]

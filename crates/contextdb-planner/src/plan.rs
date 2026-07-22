@@ -1,7 +1,7 @@
 use contextdb_core::{Direction, PropagationRule};
 use contextdb_parser::ast::{
-    AlterAction, ColumnDef, Expr, OnConflict, RetainOption, SetDiskLimitValue, SetMemoryLimitValue,
-    SortDirection, StateMachineDef,
+    AlterAction, ColumnDef, CompositeForeignKey, Cte, Expr, OnConflict, RetainOption,
+    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, StateMachineDef,
 };
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,7 @@ pub enum PhysicalPlan {
         start_alias: String,
         start_expr: Expr,
         start_candidates: Option<Box<PhysicalPlan>>,
+        filter_ctes: Vec<Cte>,
         steps: Vec<GraphStepPlan>,
         filter: Option<Expr>,
     },
@@ -112,14 +113,36 @@ impl PhysicalPlan {
                 )
             }
             PhysicalPlan::VectorSearch {
-                table, column, k, ..
+                table,
+                column,
+                query_expr,
+                k,
+                ..
             } => {
-                format!("VectorSearch(table={}, column={}, k={})", table, column, k)
+                format!(
+                    "VectorSearch(table={}, column={}, k={}{}{})",
+                    table,
+                    column,
+                    k,
+                    query_source_prefix(query_expr),
+                    query_source_suffix(query_expr)
+                )
             }
             PhysicalPlan::HnswSearch {
-                table, column, k, ..
+                table,
+                column,
+                query_expr,
+                k,
+                ..
             } => {
-                format!("HNSWSearch(table={}, column={}, k={})", table, column, k)
+                format!(
+                    "HNSWSearch(table={}, column={}, k={}{}{})",
+                    table,
+                    column,
+                    k,
+                    query_source_prefix(query_expr),
+                    query_source_suffix(query_expr)
+                )
             }
             PhysicalPlan::Scan { table, .. } => format!("Scan(table={})", table),
             PhysicalPlan::AlterTable(p) => format!("AlterTable(table={})", p.table),
@@ -131,8 +154,45 @@ impl PhysicalPlan {
                 .map(Self::explain)
                 .collect::<Vec<_>>()
                 .join(" -> "),
+            PhysicalPlan::Project { input, .. } => {
+                format!("Project -> {}", input.explain())
+            }
             _ => format!("{:?}", self),
         }
+    }
+}
+
+fn query_source_prefix(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::RowVectorSource { .. } => ", query_source=",
+        _ => "",
+    }
+}
+
+fn query_source_suffix(expr: &Expr) -> String {
+    match expr {
+        Expr::RowVectorSource { table, column, key } => {
+            format!(
+                "RowVectorSource(table={}, column={}, key={})",
+                table,
+                column,
+                row_vector_key_for_explain(key)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn row_vector_key_for_explain(expr: &Expr) -> String {
+    match expr {
+        Expr::Literal(contextdb_parser::ast::Literal::Null) => "NULL".to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Bool(value)) => value.to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Integer(value)) => value.to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Real(value)) => value.to_string(),
+        Expr::Literal(contextdb_parser::ast::Literal::Text(value)) => value.clone(),
+        Expr::Literal(contextdb_parser::ast::Literal::Vector(_)) => "<vector>".to_string(),
+        Expr::Parameter(name) => format!("${name}"),
+        _ => "<expr>".to_string(),
     }
 }
 
@@ -150,6 +210,7 @@ pub struct CreateTablePlan {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub unique_constraints: Vec<Vec<String>>,
+    pub composite_foreign_keys: Vec<CompositeForeignKey>,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,

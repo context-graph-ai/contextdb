@@ -1,65 +1,19 @@
 use contextdb_core::{
-    AdjEntry, Lsn, MemoryAccountant, RowId, SnapshotId, TxId, Value, VectorEntry, VectorIndexRef,
-    VersionedRow,
+    AdjEntry, Lsn, RowId, SnapshotId, TxId, Value, VectorEntry, VectorIndexRef, VersionedRow,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Barrier};
-use std::thread;
 use uuid::Uuid;
 
-// RACE: this exercises the current two-atomic budget representation. The bug
-// window is small, so the loop count is intentionally high to make the failure
-// observable without turning the test into a hard blocker if the scheduler does
-// not hit the interleaving on a given machine.
-#[test]
-fn mem_01_set_budget_none_concurrent_allocate() {
-    let mut saw_spurious_failure = false;
-
-    for _ in 0..200 {
-        let accountant = Arc::new(MemoryAccountant::no_limit());
-        accountant
-            .set_budget(Some(1024))
-            .expect("test setup should allow adding a removable runtime budget");
-        let barrier = Arc::new(Barrier::new(2));
-
-        let alloc_acc = accountant.clone();
-        let alloc_barrier = barrier.clone();
-        let allocator = thread::spawn(move || {
-            alloc_barrier.wait();
-            let mut failures = 0usize;
-            let mut observed_unbounded = false;
-            for _ in 0..20_000 {
-                if alloc_acc.usage().limit.is_none() {
-                    observed_unbounded = true;
-                }
-                if observed_unbounded && alloc_acc.try_allocate(1).is_err() {
-                    failures += 1;
-                }
-            }
-            failures
-        });
-
-        let budget_acc = accountant.clone();
-        let toggler = thread::spawn(move || {
-            barrier.wait();
-            budget_acc
-                .set_budget(None)
-                .expect("removing the budget should succeed");
-        });
-
-        toggler.join().expect("budget thread must finish");
-        let failures = allocator.join().expect("allocator thread must finish");
-        if failures > 0 {
-            saw_spurious_failure = true;
-            break;
-        }
-    }
-
-    assert!(
-        !saw_spurious_failure,
-        "allocator observed MemoryBudgetExceeded after set_budget(None)"
-    );
-}
+// The `set_budget(None)`-races-`try_allocate` TOCTOU repro that used to live
+// here (`mem_01_set_budget_none_concurrent_allocate`) was a scheduler-race that
+// could not actually fail: it only allocated after the limit was already
+// removed, so `used` stayed 0, the over-budget branch was never entered, and
+// the re-check guard it claimed to test was never exercised. Its deterministic
+// replacement is the unit test
+// `memory::tests::set_budget_none_racing_allocate_never_spuriously_fails`,
+// which forces the exact interleaving via a `#[cfg(test)]`-gated hook (an
+// integration test cannot reach such a hook, since it compiles the crate
+// without `cfg(test)`).
 
 #[test]
 fn mem_02_visible_at_uses_option_combinator() {

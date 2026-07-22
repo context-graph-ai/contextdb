@@ -1,4 +1,79 @@
-use crate::types::{TxId, VectorIndexRef};
+use crate::types::{ContextId, Principal, RowId, ScopeLabel, TxId, VectorIndexRef};
+use std::collections::BTreeSet;
+
+/// Distinguishes which callback context produced a callback-active error.
+///
+/// Contract: final `Display` for callback-active errors must be alloc-free
+/// (inline `&'static str` templates, never `kind.to_string()`). The RED stub
+/// commit intentionally allocates in this `Display` impl so the allocator probe
+/// fails until the implementation commit replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackKind {
+    Trigger,
+    Cron,
+}
+
+impl std::fmt::Display for CallbackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CallbackKind::Trigger => "trigger",
+            CallbackKind::Cron => "cron",
+        })
+    }
+}
+
+fn format_context_set(values: &BTreeSet<ContextId>) -> String {
+    let body = values
+        .iter()
+        .map(|context| context.0.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{body}}}")
+}
+
+fn format_scope_label_set(values: &BTreeSet<ScopeLabel>) -> String {
+    let body = values
+        .iter()
+        .map(|label| label.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{body}}}")
+}
+
+fn format_principal(principal: &Principal) -> String {
+    match principal {
+        Principal::System => "system".to_string(),
+        Principal::Agent(id) => format!("agent:{id}"),
+        Principal::Human(id) => format!("human:{id}"),
+    }
+}
+
+fn context_scope_violation_display(requested: &ContextId, allowed: &BTreeSet<ContextId>) -> String {
+    let requested = if requested.0 == uuid::Uuid::from_u128(u128::MAX) {
+        "row has no context".to_string()
+    } else {
+        format!("context {}", requested.0)
+    };
+    format!(
+        "row hidden by context scope: requested {requested}, allowed {}",
+        format_context_set(allowed)
+    )
+}
+
+fn scope_label_violation_display(requested: &ScopeLabel, allowed: &BTreeSet<ScopeLabel>) -> String {
+    format!(
+        "row hidden by scope label: requested {}, allowed {}",
+        requested.0,
+        format_scope_label_set(allowed)
+    )
+}
+
+fn acl_denied_display(table: &str, row_id: &RowId, principal: &Principal) -> String {
+    format!(
+        "row hidden by ACL on table `{table}` row {row_id} for principal {}",
+        format_principal(principal)
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -10,6 +85,8 @@ pub enum Error {
     ImmutableColumn { table: String, column: String },
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
+    #[error("conditional update conflict: {count} staged update(s) no longer matched at commit")]
+    ConditionalUpdateConflict { count: u64 },
     #[error("propagation aborted: {table}.{column} transition {from} -> {to} is invalid")]
     PropagationAborted {
         table: String,
@@ -29,6 +106,10 @@ pub enum Error {
     },
     #[error("unknown vector index {index:?}")]
     UnknownVectorIndex { index: VectorIndexRef },
+    #[error("persisted row vector source row missing on {index:?}: key {key}")]
+    PersistedRowVectorRowMissing { index: VectorIndexRef, key: String },
+    #[error("persisted row vector source cell is NULL on {index:?}: key {key}")]
+    PersistedRowVectorCellNull { index: VectorIndexRef, key: String },
     #[error("rank policy on index `{index}` references unknown column `{column}`")]
     RankPolicyColumnUnknown { index: String, column: String },
     #[error(
@@ -110,11 +191,15 @@ pub enum Error {
     TxNotFound(TxId),
     #[error("unique constraint violation: {table}.{column}")]
     UniqueViolation { table: String, column: String },
-    #[error("foreign key violation: {table}.{column} references {ref_table}")]
+    #[error(
+        "{}",
+        foreign_key_violation_display(child_table, child_columns, parent_table, parent_columns)
+    )]
     ForeignKeyViolation {
-        table: String,
-        column: String,
-        ref_table: String,
+        child_table: String,
+        child_columns: Vec<String>,
+        parent_table: String,
+        parent_columns: Vec<String>,
     },
     #[error("recursive CTEs are not supported")]
     RecursiveCteNotSupported,
@@ -210,6 +295,108 @@ pub enum Error {
     },
     #[error("column not found: {table}.{column}")]
     ColumnNotFound { table: String, column: String },
+    #[error("database is locked: another process (pid {holder_pid}) holds {path:?}")]
+    DatabaseLocked {
+        holder_pid: u32,
+        path: std::path::PathBuf,
+    },
+    #[error("{}", context_scope_violation_display(requested, allowed))]
+    ContextScopeViolation {
+        requested: crate::types::ContextId,
+        allowed: std::collections::BTreeSet<crate::types::ContextId>,
+    },
+    #[error("{}", scope_label_violation_display(requested, allowed))]
+    ScopeLabelViolation {
+        requested: crate::types::ScopeLabel,
+        allowed: std::collections::BTreeSet<crate::types::ScopeLabel>,
+    },
+    #[error("principal required for read on table `{table}`")]
+    PrincipalRequired { table: String },
+    #[error("{}", acl_denied_display(table, row_id, principal))]
+    AclDenied {
+        table: String,
+        row_id: RowId,
+        principal: Principal,
+    },
+    #[error("missed cron ticks exceeded policy: {ticks} ticks missed under '{policy}'")]
+    MissedTicksExceeded { ticks: u32, policy: String },
+    #[error("database is not initialized: trigger callbacks must be registered before {operation}")]
+    EngineNotInitialized { operation: String },
+    #[error("trigger callback missing: {trigger_name}")]
+    TriggerCallbackMissing { trigger_name: String },
+    #[error("trigger not declared: {trigger_name}")]
+    TriggerNotDeclared { trigger_name: String },
+    #[error("trigger callback already registered: {trigger_name}")]
+    TriggerAlreadyRegistered { trigger_name: String },
+    #[error("trigger cascade depth exceeded for {trigger_name}: depth {depth}")]
+    TriggerCascadeDepthExceeded { trigger_name: String, depth: u32 },
+    #[error("trigger event is not supported: {event}")]
+    TriggerEventUnsupported { event: String },
+    #[error("trigger callback failed for {trigger_name}: {reason}")]
+    TriggerCallbackFailed {
+        trigger_name: String,
+        reason: String,
+    },
+    #[error("trigger operation requires an admin database handle: {operation}")]
+    TriggerRequiresAdmin { operation: String },
+    #[error("schema invalid: {reason}")]
+    SchemaInvalid { reason: String },
+    /// Cross-thread retry-safe contention. Post-TriggerActiveSameDBProgress,
+    /// ordinary same-DB cross-thread trigger contention waits inside the engine
+    /// and proceeds as `Ok`; unrelated cross-DB writers proceed independently.
+    /// This typed error remains for cron same-DB contention, callback tx-bound
+    /// handles used from the wrong thread, and bounded trigger deadlock-guard
+    /// timeouts.
+    ///
+    /// Canonical callback contract: same-DB trigger Class B waits and
+    /// proceeds; unrelated DBs are independent; Class A callback-thread reentry
+    /// returns [`Error::CallbackReentry`]; cron same-DB Class B returns this
+    /// typed error immediately; if a same-DB trigger wait exceeds
+    /// `CONTEXTDB_TRIGGER_DEADLOCK_TIMEOUT_MS` (default 60 seconds, no enforced
+    /// minimum), the engine returns this typed error and emits exactly one
+    /// `tracing::warn!` with `trigger_name`, `waited_ms`, and `surface`.
+    ///
+    /// Greppable cross-process substring (sync-wire, log scrapers): the Display
+    /// string contains `"callback active on another thread"` for both kinds.
+    // MAINTAINER: there are no em-dashes in the CallbackActiveCrossThread template,
+    // but see the CallbackReentry template below -- the em-dash character `—` is
+    // U+2014 (NOT ASCII hyphen `-`). The public-API string contract pins exact
+    // bytes (cross-process consumers may grep for these strings); preserve every
+    // em-dash on any future edit and never substitute `--` or `-`.
+    #[error("{kind} callback active on another thread; retry once the callback completes")]
+    CallbackActiveCrossThread { kind: CallbackKind },
+
+    /// API misuse. The caller is inside its own callback body. Tx-control from
+    /// any `Database` handle is forbidden, and write-control is allowed only
+    /// through the supplied tx-bound callback handle. Retrying cannot recover.
+    /// See [`Error::CallbackActiveCrossThread`] for the complementary Class B
+    /// contract: same-DB trigger contention waits, unrelated DBs proceed
+    /// independently, cron B1 remains immediate, and timeouts emit an operator
+    /// `tracing::warn!`.
+    ///
+    /// Greppable substring: the Display string contains `"operation not allowed inside"`
+    /// for both kinds.
+    // MAINTAINER: the em-dash character `—` below is U+2014 (NOT ASCII hyphen `-`).
+    // Public-API string contract pins exact bytes -- preserve the em-dash on any
+    // future edit and never substitute `--` or `-`.
+    #[error("operation not allowed inside a {kind} callback (API misuse — fix the call site)")]
+    CallbackReentry { kind: CallbackKind },
+    #[error("export destination already exists: {path:?}")]
+    ExportDestinationExists { path: std::path::PathBuf },
+    #[error("export I/O failure at {path:?}: {reason}")]
+    ExportIo {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    #[error("work ledger: input of job {job_id} is a blob_ref; route it to the blob resolver")]
+    InputRequiresBlobResolver { job_id: String },
+    /// A push was interrupted after its batch left the edge, and the hub could
+    /// not be reached to confirm whether the batch landed. The outcome is
+    /// INDETERMINATE — the data may or may not have committed on the hub — so
+    /// this is distinct from a definitive [`Error::SyncError`] failure. The
+    /// push watermark is left unadvanced; a later push reconciles idempotently.
+    #[error("sync push unconfirmed: {detail}")]
+    SyncPushUnconfirmed { detail: String },
     #[error("{0}")]
     Other(String),
 }
@@ -234,6 +421,21 @@ fn drop_blocked_rank_policy_display(
     }
     format!(
         "cannot drop table `{table}`: rank policy `{sort_key}` on `{policy_table}.{policy_column}` depends on it"
+    )
+}
+
+fn foreign_key_violation_display(
+    child_table: &str,
+    child_columns: &[String],
+    parent_table: &str,
+    parent_columns: &[String],
+) -> String {
+    format!(
+        "foreign key violation: {}({}) references {}({})",
+        child_table,
+        child_columns.join(", "),
+        parent_table,
+        parent_columns.join(", ")
     )
 }
 

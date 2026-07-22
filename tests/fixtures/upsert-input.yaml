@@ -1,9 +1,6 @@
 ---
 fixture_basis: empirical
 source: "Deterministic upsert input validating insert, conflict-update, and idempotent conflict scenarios per ON CONFLICT DO UPDATE semantics"
-status: draft
-owner: claude
-last_updated: 2026-03-07
 ---
 
 # Deterministic Upsert — Input Fixture

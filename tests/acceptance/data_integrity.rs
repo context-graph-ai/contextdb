@@ -298,7 +298,7 @@ fn f35c_graph_structure_atomicity_in_transactions() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",

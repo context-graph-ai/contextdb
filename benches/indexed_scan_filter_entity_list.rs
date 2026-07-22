@@ -85,9 +85,9 @@ fn timed_queries_and_assert(db: &Database) {
     );
 }
 
-fn bench_cg02_entity_list_filter_under_budget(c: &mut Criterion) {
+fn bench_entity_list_filter_under_budget(c: &mut Criterion) {
     seed_and_assert();
-    c.bench_function("cg02_entity_list_filter_under_budget", |b| {
+    c.bench_function("entity_list_filter_under_budget", |b| {
         b.iter_batched(
             seed_entities,
             |db| timed_queries_and_assert(&db),
@@ -96,5 +96,5 @@ fn bench_cg02_entity_list_filter_under_budget(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_cg02_entity_list_filter_under_budget);
+criterion_group!(benches, bench_entity_list_filter_under_budget);
 criterion_main!(benches);

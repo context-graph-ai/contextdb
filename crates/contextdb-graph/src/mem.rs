@@ -4,13 +4,21 @@ use contextdb_tx::{TxManager, WriteSetApplicator};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-const MAX_VISITED: usize = 100_000;
+/// Production BFS visited-node ceiling. Public so the boundary test can
+/// assert the shipped constant while exercising the refusal itself through
+/// the small test-only cap seam below.
+pub const MAX_VISITED: usize = 100_000;
 type AdjPair = (NodeId, NodeId);
 
 pub struct MemGraphExecutor<S: WriteSetApplicator> {
     store: Arc<GraphStore>,
     tx_mgr: Arc<TxManager<S>>,
     dag_edge_types: parking_lot::RwLock<HashSet<String>>,
+    // The active BFS visited cap. Production value is always `MAX_VISITED`;
+    // only the #[doc(hidden)] test seam below ever lowers it, so the boundary
+    // refusal is testable without building 100k edges. Cost: one relaxed
+    // atomic load per newly-visited node (declared always-on).
+    bfs_visited_cap: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: WriteSetApplicator> MemGraphExecutor<S> {
@@ -19,7 +27,17 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             store,
             tx_mgr,
             dag_edge_types: parking_lot::RwLock::new(HashSet::new()),
+            bfs_visited_cap: std::sync::atomic::AtomicUsize::new(MAX_VISITED),
         }
+    }
+
+    /// Test-only: lower the BFS visited cap so the `BfsVisitedExceeded`
+    /// boundary is exercisable without a 100k-edge build. No shipped surface
+    /// calls this; production always runs at [`MAX_VISITED`].
+    #[doc(hidden)]
+    pub fn __set_bfs_visited_cap_for_test(&self, cap: usize) {
+        self.bfs_visited_cap
+            .store(cap, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn register_dag_edge_types(&self, types: &[String]) {
@@ -146,8 +164,11 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
                 }
                 visited.insert(neighbor_id);
 
-                if visited.len() > MAX_VISITED {
-                    return Err(Error::BfsVisitedExceeded(MAX_VISITED));
+                let cap = self
+                    .bfs_visited_cap
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if visited.len() > cap {
+                    return Err(Error::BfsVisitedExceeded(cap));
                 }
 
                 let mut new_path = path.clone();
@@ -234,11 +255,9 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         }
 
         let duplicate_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
-            let inserted = ws
-                .adj_inserts
+            ws.adj_inserts
                 .iter()
-                .any(|e| e.source == source && e.target == target && e.edge_type == edge_type);
-            inserted && !deleted_in_ws
+                .any(|e| e.source == source && e.target == target && e.edge_type == edge_type)
         })?;
         if duplicate_in_ws {
             return Ok(false);
@@ -280,9 +299,31 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
     }
 
     fn delete_edge(&self, tx: TxId, source: NodeId, target: NodeId, edge_type: &str) -> Result<()> {
+        let committed_edge_exists = {
+            let fwd = self.store.forward_adj.read();
+            fwd.get(&source).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.target == target
+                        && entry.edge_type == edge_type
+                        && entry.deleted_tx.is_none()
+                })
+            })
+        };
+
         self.tx_mgr.with_write_set(tx, |ws| {
-            ws.adj_deletes
-                .push((source, edge_type.to_string(), target, tx));
+            ws.adj_inserts.retain(|entry| {
+                !(entry.source == source && entry.target == target && entry.edge_type == edge_type)
+            });
+
+            if committed_edge_exists
+                && !ws
+                    .adj_deletes
+                    .iter()
+                    .any(|(s, et, t, _)| *s == source && *t == target && et == edge_type)
+            {
+                ws.adj_deletes
+                    .push((source, edge_type.to_string(), target, tx));
+            }
         })?;
         Ok(())
     }

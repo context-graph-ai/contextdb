@@ -1,8 +1,6 @@
 use contextdb_core::Value;
 use contextdb_engine::Database;
 use std::collections::HashMap;
-use std::thread;
-use std::time::Duration;
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -30,6 +28,17 @@ fn a_rt1_create_table_retain_parses() {
 // ---------------------------------------------------------------------------
 #[test]
 fn a_rt2_rows_disappear_after_ttl() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT) RETAIN 1 SECONDS",
@@ -38,7 +47,8 @@ fn a_rt2_rows_disappear_after_ttl() {
     .unwrap();
     db.execute("INSERT INTO logs (id, msg) VALUES (1, 'old')", &p())
         .unwrap();
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the old row's stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
     db.execute("INSERT INTO logs (id, msg) VALUES (2, 'new')", &p())
         .unwrap();
     db.run_pruning_cycle();
@@ -51,6 +61,17 @@ fn a_rt2_rows_disappear_after_ttl() {
 // ---------------------------------------------------------------------------
 #[test]
 fn a_rt3_alter_table_set_retain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT)", &p())
         .unwrap();
@@ -58,7 +79,8 @@ fn a_rt3_alter_table_set_retain() {
         .unwrap();
     db.execute("ALTER TABLE logs SET RETAIN 1 SECONDS", &p())
         .unwrap();
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the row's stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
     db.run_pruning_cycle();
     assert_eq!(
         db.execute("SELECT * FROM logs", &p()).unwrap().rows.len(),
@@ -71,6 +93,17 @@ fn a_rt3_alter_table_set_retain() {
 // ---------------------------------------------------------------------------
 #[test]
 fn a_rt4_alter_table_drop_retain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT) RETAIN 1 SECONDS",
@@ -80,7 +113,8 @@ fn a_rt4_alter_table_drop_retain() {
     db.execute("ALTER TABLE logs DROP RETAIN", &p()).unwrap();
     db.execute("INSERT INTO logs (id, msg) VALUES (1, 'a')", &p())
         .unwrap();
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the row's stamped time — the DROP means it must survive anyway.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
     db.run_pruning_cycle();
     assert_eq!(
         db.execute("SELECT * FROM logs", &p()).unwrap().rows.len(),

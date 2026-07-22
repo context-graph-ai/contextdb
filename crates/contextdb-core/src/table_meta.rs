@@ -2,6 +2,64 @@ use crate::Direction;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CompositeForeignKey {
+    pub child_columns: Vec<String>,
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SingleColumnForeignKey {
+    pub child_column: String,
+    pub parent_table: String,
+    pub parent_column: String,
+}
+
+/// The time unit a `RETAIN` window was DECLARED in. The engine stores the
+/// window in seconds; keeping the declared unit alongside lets the operator-
+/// facing `.schema` render give the declaration back verbatim instead of
+/// re-spelling `48 HOURS` as `2 DAYS`. Sync DDL stays on the normalized
+/// spelling, so two edges declaring the same window in different units still
+/// agree on schema shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetainUnit {
+    Seconds,
+    Minutes,
+    Hours,
+    Days,
+}
+
+impl RetainUnit {
+    pub fn seconds_multiplier(self) -> u64 {
+        match self {
+            RetainUnit::Seconds => 1,
+            RetainUnit::Minutes => 60,
+            RetainUnit::Hours => 60 * 60,
+            RetainUnit::Days => 24 * 60 * 60,
+        }
+    }
+
+    pub fn sql(self) -> &'static str {
+        match self {
+            RetainUnit::Seconds => "SECONDS",
+            RetainUnit::Minutes => "MINUTES",
+            RetainUnit::Hours => "HOURS",
+            RetainUnit::Days => "DAYS",
+        }
+    }
+}
+
+/// How a RETAINED table is allowed to move under sync. A retained table is
+/// delivered one way — edge to hub — because its rows are deleted locally once
+/// delivered; a hub that sent them back would replant what the edge just aged
+/// out. `PushOnly` is the only supported contract, so the enum has one arm and
+/// the absence of a policy (`None`) means the table declares no retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetainedSyncPolicy {
+    PushOnly,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
@@ -22,6 +80,15 @@ pub struct TableMeta {
     pub expires_column: Option<String>,
     #[serde(default)]
     pub indexes: Vec<IndexDecl>,
+    #[serde(default)]
+    pub composite_foreign_keys: Vec<CompositeForeignKey>,
+    /// Set on every table that declares RETAIN; `None` on every other table.
+    #[serde(default)]
+    pub retained_sync_policy: Option<RetainedSyncPolicy>,
+    /// The unit the RETAIN window was declared in, so `.schema` renders the
+    /// declaration back as it was written.
+    #[serde(default)]
+    pub retain_declared_unit: Option<RetainUnit>,
 }
 
 // Custom `Deserialize` that tolerates prior on-disk `TableMeta` encoded
@@ -72,6 +139,15 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 // default.
                 let expires_column = seq.next_element::<Option<String>>()?.unwrap_or_default();
                 let indexes = seq.next_element::<Vec<IndexDecl>>()?.unwrap_or_default();
+                let composite_foreign_keys = seq
+                    .next_element::<Vec<CompositeForeignKey>>()?
+                    .unwrap_or_default();
+                let retained_sync_policy = seq
+                    .next_element::<Option<RetainedSyncPolicy>>()?
+                    .unwrap_or_default();
+                let retain_declared_unit = seq
+                    .next_element::<Option<RetainUnit>>()?
+                    .unwrap_or_default();
                 Ok(TableMeta {
                     columns,
                     immutable,
@@ -84,6 +160,9 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     sync_safe,
                     expires_column,
                     indexes,
+                    composite_foreign_keys,
+                    retained_sync_policy,
+                    retain_declared_unit,
                 })
             }
 
@@ -102,6 +181,9 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let mut sync_safe: Option<bool> = None;
                 let mut expires_column: Option<Option<String>> = None;
                 let mut indexes: Option<Vec<IndexDecl>> = None;
+                let mut composite_foreign_keys: Option<Vec<CompositeForeignKey>> = None;
+                let mut retained_sync_policy: Option<Option<RetainedSyncPolicy>> = None;
+                let mut retain_declared_unit: Option<Option<RetainUnit>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -116,6 +198,11 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                         "sync_safe" => sync_safe = Some(map.next_value()?),
                         "expires_column" => expires_column = Some(map.next_value()?),
                         "indexes" => indexes = Some(map.next_value()?),
+                        "composite_foreign_keys" => {
+                            composite_foreign_keys = Some(map.next_value()?)
+                        }
+                        "retained_sync_policy" => retained_sync_policy = Some(map.next_value()?),
+                        "retain_declared_unit" => retain_declared_unit = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -135,6 +222,9 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     sync_safe: sync_safe.unwrap_or_default(),
                     expires_column: expires_column.unwrap_or_default(),
                     indexes: indexes.unwrap_or_default(),
+                    composite_foreign_keys: composite_foreign_keys.unwrap_or_default(),
+                    retained_sync_policy: retained_sync_policy.unwrap_or_default(),
+                    retain_declared_unit: retain_declared_unit.unwrap_or_default(),
                 })
             }
         }
@@ -151,6 +241,9 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
             "sync_safe",
             "expires_column",
             "indexes",
+            "composite_foreign_keys",
+            "retained_sync_policy",
+            "retain_declared_unit",
         ];
         deserializer.deserialize_struct("TableMeta", FIELDS, TableMetaVisitor)
     }
@@ -227,6 +320,23 @@ pub struct StateMachineConstraint {
     pub transitions: HashMap<String, Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScopeLabelKind {
+    Simple {
+        write_labels: Vec<String>,
+    },
+    Split {
+        read_labels: Vec<String>,
+        write_labels: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AclRef {
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnDef {
     pub name: String,
@@ -247,6 +357,12 @@ pub struct ColumnDef {
     pub quantization: VectorQuantization,
     #[serde(default)]
     pub rank_policy: Option<RankPolicy>,
+    #[serde(default)]
+    pub context_id: bool,
+    #[serde(default)]
+    pub scope_label: Option<ScopeLabelKind>,
+    #[serde(default)]
+    pub acl_ref: Option<AclRef>,
 }
 
 // Custom `Deserialize` that tolerates prior on-disk schemas missing the
@@ -303,6 +419,11 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let rank_policy = seq
                     .next_element::<Option<RankPolicy>>()?
                     .unwrap_or_default();
+                let context_id = seq.next_element::<bool>()?.unwrap_or_default();
+                let scope_label = seq
+                    .next_element::<Option<ScopeLabelKind>>()?
+                    .unwrap_or_default();
+                let acl_ref = seq.next_element::<Option<AclRef>>()?.unwrap_or_default();
                 Ok(ColumnDef {
                     name,
                     column_type,
@@ -315,6 +436,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     immutable,
                     quantization,
                     rank_policy,
+                    context_id,
+                    scope_label,
+                    acl_ref,
                 })
             }
 
@@ -333,6 +457,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let mut immutable: Option<bool> = None;
                 let mut quantization: Option<VectorQuantization> = None;
                 let mut rank_policy: Option<Option<RankPolicy>> = None;
+                let mut context_id: Option<bool> = None;
+                let mut scope_label: Option<Option<ScopeLabelKind>> = None;
+                let mut acl_ref: Option<Option<AclRef>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -347,6 +474,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                         "immutable" => immutable = Some(map.next_value()?),
                         "quantization" => quantization = Some(map.next_value()?),
                         "rank_policy" => rank_policy = Some(map.next_value()?),
+                        "context_id" => context_id = Some(map.next_value()?),
+                        "scope_label" => scope_label = Some(map.next_value()?),
+                        "acl_ref" => acl_ref = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -368,6 +498,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                     immutable: immutable.unwrap_or_default(),
                     quantization: quantization.unwrap_or_default(),
                     rank_policy: rank_policy.unwrap_or_default(),
+                    context_id: context_id.unwrap_or_default(),
+                    scope_label: scope_label.unwrap_or_default(),
+                    acl_ref: acl_ref.unwrap_or_default(),
                 })
             }
         }
@@ -384,6 +517,9 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
             "immutable",
             "quantization",
             "rank_policy",
+            "context_id",
+            "scope_label",
+            "acl_ref",
         ];
         deserializer.deserialize_struct("ColumnDef", FIELDS, ColumnDefVisitor)
     }
@@ -484,6 +620,10 @@ impl TableMeta {
             .indexes
             .iter()
             .fold(0usize, |acc, i| acc.saturating_add(i.estimated_bytes()));
+        let composite_foreign_key_bytes = self
+            .composite_foreign_keys
+            .iter()
+            .fold(0usize, |acc, fk| acc.saturating_add(fk.estimated_bytes()));
 
         16 + columns_bytes
             + state_machine_bytes
@@ -493,8 +633,21 @@ impl TableMeta {
             + propagation_bytes
             + expires_bytes
             + indexes_bytes
+            + composite_foreign_key_bytes
             + self.default_ttl_seconds.map(|_| 8).unwrap_or(0)
             + 8
+    }
+}
+
+impl CompositeForeignKey {
+    fn estimated_bytes(&self) -> usize {
+        40 + self.parent_table.len() * 16
+            + self.child_columns.iter().fold(0usize, |acc, column| {
+                acc.saturating_add(16 + column.len() * 16)
+            })
+            + self.parent_columns.iter().fold(0usize, |acc, column| {
+                acc.saturating_add(16 + column.len() * 16)
+            })
     }
 }
 
@@ -561,11 +714,40 @@ impl ColumnDef {
                     + policy.protected_index.len() * 16
             })
             .unwrap_or(0);
+        let scope_label_bytes = self
+            .scope_label
+            .as_ref()
+            .map(|kind| match kind {
+                ScopeLabelKind::Simple { write_labels } => {
+                    24 + write_labels
+                        .iter()
+                        .map(|s| 16 + s.len() * 16)
+                        .sum::<usize>()
+                }
+                ScopeLabelKind::Split {
+                    read_labels,
+                    write_labels,
+                } => {
+                    40 + read_labels.iter().map(|s| 16 + s.len() * 16).sum::<usize>()
+                        + write_labels
+                            .iter()
+                            .map(|s| 16 + s.len() * 16)
+                            .sum::<usize>()
+                }
+            })
+            .unwrap_or(0);
+        let acl_ref_bytes = self
+            .acl_ref
+            .as_ref()
+            .map(|acl| 32 + acl.ref_table.len() * 16 + acl.ref_column.len() * 16)
+            .unwrap_or(0);
         8 + self.name.len() * 16
             + self.column_type.estimated_bytes()
             + default_bytes
             + reference_bytes
             + rank_policy_bytes
+            + scope_label_bytes
+            + acl_ref_bytes
             + 8
     }
 }

@@ -1,9 +1,6 @@
 ---
 fixture_basis: empirical
 source: "Bounded BFS input validating depth-limited graph traversal with BASED_ON edges and max depth 3"
-status: draft
-owner: claude
-last_updated: 2026-03-07
 ---
 
 # Bounded BFS — Input Fixture

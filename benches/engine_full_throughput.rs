@@ -16,7 +16,7 @@ fn batched_insert_throughput(c: &mut Criterion) {
                     &HashMap::new(),
                 )
                 .unwrap();
-                let tx = db.begin();
+                let tx = db.begin_or_panic();
                 for i in 0..count {
                     db.insert_row(
                         tx,
@@ -47,7 +47,7 @@ fn persist_and_reopen(c: &mut Criterion) {
             )
             .unwrap();
             for batch in 0..100 {
-                let tx = db.begin();
+                let tx = db.begin_or_panic();
                 for i in 0..100 {
                     db.insert_row(
                         tx,
@@ -83,7 +83,7 @@ fn mixed_workflow_latency(c: &mut Criterion) {
 
     let root = Uuid::new_v4();
     let neighbors: Vec<Uuid> = (0..32).map(|_| Uuid::new_v4()).collect();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(
         tx,
         "entities",

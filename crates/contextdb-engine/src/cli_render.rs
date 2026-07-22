@@ -1,8 +1,9 @@
 //! Public rendering helpers used by both the CLI binary and the test suite.
 
 use crate::Database;
+use crate::database::QueryTrace;
 use contextdb_core::Value;
-use contextdb_core::table_meta::{ColumnType, TableMeta, VectorQuantization};
+use contextdb_core::table_meta::{ColumnType, TableMeta};
 use std::fmt::Write;
 
 /// Render a column type as a DDL token.
@@ -43,31 +44,11 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
             buf.push_str(",\n");
         }
         first = false;
-        let mut ty = render_column_type(&col.column_type);
-        if !matches!(col.quantization, VectorQuantization::F32) {
-            ty.push_str(&format!(
-                " WITH (quantization = '{}')",
-                col.quantization.as_str()
-            ));
-        }
-        if !col.nullable && !col.primary_key {
-            ty.push_str(" NOT NULL");
-        }
-        if col.primary_key {
-            ty.push_str(" PRIMARY KEY");
-        }
-        if col.immutable {
-            ty.push_str(" IMMUTABLE");
-        }
-        if let Some(policy) = &col.rank_policy {
-            ty.push_str(&format!(
-                " RANK_POLICY (JOIN {} ON {}, FORMULA '{}', SORT_KEY {})",
-                policy.joined_table,
-                policy.joined_column,
-                policy.formula.replace('\'', "''"),
-                policy.sort_key
-            ));
-        }
+        // Reuse the canonical column renderer so `.schema` renders the full
+        // declared column contract (foreign-key REFERENCES and its ON STATE
+        // PROPAGATE SET form, UNIQUE, EXPIRES, quantization, immutability, rank
+        // policy) identically to the sync DDL emitter — author once.
+        let ty = crate::database::sql_type_for_meta_column(col, &meta.propagation_rules);
         write!(&mut buf, "  {} {}", col.name, ty).unwrap();
     }
     buf.push_str("\n)");
@@ -97,6 +78,9 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
             .collect::<Vec<_>>()
             .join(", ");
         write!(&mut buf, " DAG({edge_types})").unwrap();
+    }
+    for clause in crate::database::retain_and_propagate_clauses_from_meta(meta) {
+        write!(&mut buf, " {clause}").unwrap();
     }
     buf.push_str(";\n");
     for decl in &meta.indexes {
@@ -164,6 +148,25 @@ pub fn render_explain(
         out.push_str("  sort_elided: true\n");
     }
     Ok(out)
+}
+
+pub fn render_query_trace(trace: &QueryTrace, rows_examined: u64) -> String {
+    let mut out = format!("trace: {}", trace.physical_plan);
+    if let Some(index) = &trace.index_used {
+        out.push_str(&format!(" index={index}"));
+    }
+    if !trace.predicates_pushed.is_empty() {
+        out.push_str(" pushed=[");
+        for (idx, predicate) in trace.predicates_pushed.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(predicate.as_ref());
+        }
+        out.push(']');
+    }
+    out.push_str(&format!(" rows_examined={rows_examined}"));
+    out
 }
 
 /// Render a single `Value` as the CLI displays it in SELECT output.

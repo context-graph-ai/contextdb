@@ -46,6 +46,7 @@ contextdb-cli :memory:
 Try the state machine — the feature that makes contextdb different from plain SQL:
 
 ```sql
+-- `decisions` is an example table you define - contextdb ships no built-in schema.
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
   status TEXT NOT NULL,
@@ -100,6 +101,7 @@ sub-100ms filtered retrieval. Indexes accelerate filtered scans so a
 milliseconds.
 
 ```sql
+-- `observations` is an example table you define - no built-in schema ships with contextdb.
 CREATE TABLE observations (
   id UUID PRIMARY KEY,
   tag TEXT,
@@ -114,8 +116,17 @@ VALUES ('650e8400-e29b-41d4-a716-446655440010', 'pay', 1);
 SELECT value FROM observations WHERE tag = 'pay';
 ```
 
-`.explain` shows which plan ran — `IndexScan` for the filtered select above,
-`Scan` for a query whose WHERE clause does not match a declared index.
+Composite indexes push a matched leading prefix, not just the first column:
+
+```sql
+CREATE INDEX idx_observation_route ON observations (tag, value, id);
+
+.explain SELECT id FROM observations WHERE tag = 'pay' AND value = 1;
+```
+
+The explanation reports `IndexScan { index: idx_observation_route }` with
+`predicates_pushed: [tag, value]`. A query whose `WHERE` clause does not match
+the first column of any declared or auto-index reports `Scan`.
 
 ## Rank Vector Search by Outcomes
 
@@ -242,6 +253,82 @@ Add to your `Cargo.toml`:
 contextdb-engine = "1.0.0"
 contextdb-core = "1.0.0"
 ```
+
+## Sync Across Two Machines
+
+contextdb syncs by dialing a key, not by connecting to a broker. One machine runs a hub; any number of edges dial it directly using a ticket the hub prints — no message broker, no port-forwarding, and (on a LAN) no external infrastructure at all.
+
+### Start the hub
+
+On machine A, run a sync hub — a `contextdb-server` process the edges dial into:
+
+```bash
+contextdb-server --db-path hub.db --tenant-id demo
+```
+
+On startup it prints an enrollment ticket and the exact command an edge runs to connect (substitute your own database path for `<client-db-path>`):
+
+```text
+enrollment ticket: <ticket>
+To connect a client, run:
+  contextdb-cli <client-db-path> --sync-endpoint <ticket> --tenant-id demo
+```
+
+The ticket *is* the hub's cryptographic identity — dial-by-key. Whoever holds it can dial the hub directly, wherever it is, including from behind NAT (the edge dials out; nothing needs to be reachable on machine A). The hub only serves — you don't type SQL at it; your data lives on the edges that dial in. For scripting, three flags skip the banner: `--show-ticket` prints the bare ticket and exits, `--ticket-file <path>` writes it to a file, and `--json` emits a JSON object with `enrollment_ticket`, `dial_command`, `endpoint`, and `tenant_id`.
+
+### Connect two edges
+
+On each edge machine, paste the ticket, giving each its own database file:
+
+```bash
+# machine B
+contextdb-cli edge-1.db --sync-endpoint <ticket> --tenant-id demo
+# machine C
+contextdb-cli edge-2.db --sync-endpoint <ticket> --tenant-id demo
+```
+
+The ticket is pinned to each edge's identity key on first connect, so later reconnects are authenticated the same way. Two machines on one LAN sync with nothing running in the middle — no NATS, no cloud relay, no third party.
+
+### Converge in both directions
+
+Sync is push/pull, driven from the REPL with `.sync` meta-commands. On edge 1, create a small example table (`decisions` is a table you define — contextdb ships no built-in schema), insert a row, and push:
+
+```sql
+-- on machine B (edge 1)
+CREATE TABLE decisions (id UUID PRIMARY KEY, status TEXT NOT NULL, reasoning TEXT);
+INSERT INTO decisions (id, status, reasoning) VALUES ('750e8400-e29b-41d4-a716-446655440020', 'active', 'captured on edge 1');
+.sync push
+```
+
+On edge 2, pull and read it back — the schema and the row both arrive:
+
+```sql
+-- on machine C (edge 2)
+.sync pull
+SELECT * FROM decisions WHERE id = '750e8400-e29b-41d4-a716-446655440020';
+-- returns the row captured on edge 1
+```
+
+Now the other direction. Insert a row on edge 2, push, and pull it onto edge 1:
+
+```sql
+-- on machine C (edge 2)
+INSERT INTO decisions (id, status, reasoning) VALUES ('850e8400-e29b-41d4-a716-446655440030', 'active', 'captured on edge 2');
+.sync push
+```
+
+```sql
+-- on machine B (edge 1)
+.sync pull
+SELECT * FROM decisions WHERE id = '850e8400-e29b-41d4-a716-446655440030';
+-- returns the row captured on edge 2
+```
+
+Both edges now hold the same two rows, converged through the hub. `.sync status` reports what's pending in each direction before you push or pull. The full sync command surface — the `.sync` meta-commands, per-table direction and conflict policy, and auto-sync — is in the [CLI Reference](cli.md); the wire protocol is covered in the Architecture doc's Sync section.
+
+### Restart durability
+
+The hub keeps its identity in `<db-path>.fabric-identity.key` next to the database file (here, `hub.db.fabric-identity.key`). Restarting the hub reuses that key, so the same ticket — and every edge already pinned to it — keeps working. Back this file up like a credential; never commit it to source control.
 
 ## What's Next
 

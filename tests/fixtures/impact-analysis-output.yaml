@@ -1,9 +1,6 @@
 ---
 fixture_basis: empirical
 source: "Impact analysis expected output: [GO-01] 8 assertions + [CASCADE] 2 assertions validating severity computation and cascade propagation"
-status: draft
-owner: claude
-last_updated: 2026-03-07
 ---
 
 # Impact Analysis — Expected Output Fixture

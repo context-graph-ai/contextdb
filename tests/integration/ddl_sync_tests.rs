@@ -1,7 +1,8 @@
-use contextdb_core::Lsn;
-use contextdb_core::Value;
+use contextdb_core::{Error, Lsn, SingleColumnForeignKey, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
+use contextdb_engine::sync_types::{
+    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,
+};
 use std::collections::HashMap;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -10,22 +11,34 @@ fn vals(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
+/// Open a fresh on-disk database, run `populate`, close it, reopen from the same
+/// path, and return the full changeset since `Lsn(0)`. The reopen-and-diff
+/// scaffold is identical across the ds01/02/03/04/11/12/13 tests; each supplies
+/// only its populate closure and asserts on the returned changeset.
+fn persist_and_reopen_changeset(db_name: &str, populate: impl FnOnce(&Database)) -> ChangeSet {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join(db_name);
+    {
+        let db = Database::open(&path).unwrap();
+        populate(&db);
+        db.close().unwrap();
+    }
+    let db2 = Database::open(&path).unwrap();
+    db2.changes_since(Lsn(0))
+}
+
 #[test]
 fn ds01_rows_available_after_reopen() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("ds01.db");
-
     let alice_id = Uuid::new_v4();
     let bob_id = Uuid::new_v4();
 
-    {
-        let db = Database::open(&path).unwrap();
+    let cs = persist_and_reopen_changeset("ds01.db", |db| {
         db.execute(
             "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT, score REAL)",
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "items",
@@ -47,11 +60,7 @@ fn ds01_rows_available_after_reopen() {
         )
         .unwrap();
         db.commit(tx).unwrap();
-        db.close().unwrap();
-    }
-
-    let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(Lsn(0));
+    });
 
     assert_eq!(
         cs.rows.len(),
@@ -76,11 +85,7 @@ fn ds01_rows_available_after_reopen() {
 
 #[test]
 fn ds02_ddl_in_changeset_after_reopen() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("ds02.db");
-
-    {
-        let db = Database::open(&path).unwrap();
+    let cs = persist_and_reopen_changeset("ds02.db", |db| {
         db.execute(
             "CREATE TABLE events (id UUID PRIMARY KEY, data TEXT) IMMUTABLE",
             &HashMap::new(),
@@ -91,11 +96,7 @@ fn ds02_ddl_in_changeset_after_reopen() {
             &HashMap::new(),
         )
         .unwrap();
-        db.close().unwrap();
-    }
-
-    let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(Lsn(0));
+    });
 
     assert_eq!(cs.ddl.len(), 2, "expected 2 DDL entries after reopen");
     let events_ddl = cs
@@ -128,7 +129,14 @@ fn ds02_ddl_in_changeset_after_reopen() {
         }
         DdlChange::DropTable { .. } => unreachable!(),
         DdlChange::AlterTable { .. } => unreachable!(),
-        DdlChange::CreateIndex { .. } | DdlChange::DropIndex { .. } => unreachable!(),
+        DdlChange::CreateIndex { .. }
+        | DdlChange::DropIndex { .. }
+        | DdlChange::CreateTrigger { .. }
+        | DdlChange::DropTrigger { .. }
+        | DdlChange::CreateEventType { .. }
+        | DdlChange::CreateSink { .. }
+        | DdlChange::CreateRoute { .. }
+        | DdlChange::DropRoute { .. } => unreachable!(),
     }
     let workflows_ddl = cs
         .ddl
@@ -152,25 +160,29 @@ fn ds02_ddl_in_changeset_after_reopen() {
         }
         DdlChange::DropTable { .. } => unreachable!(),
         DdlChange::AlterTable { .. } => unreachable!(),
-        DdlChange::CreateIndex { .. } | DdlChange::DropIndex { .. } => unreachable!(),
+        DdlChange::CreateIndex { .. }
+        | DdlChange::DropIndex { .. }
+        | DdlChange::CreateTrigger { .. }
+        | DdlChange::DropTrigger { .. }
+        | DdlChange::CreateEventType { .. }
+        | DdlChange::CreateSink { .. }
+        | DdlChange::CreateRoute { .. }
+        | DdlChange::DropRoute { .. } => unreachable!(),
     }
 }
 
 #[test]
 fn ds03_edges_available_after_reopen() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("ds03.db");
     let node_a = Uuid::new_v4();
     let node_b = Uuid::new_v4();
 
-    {
-        let db = Database::open(&path).unwrap();
+    let cs = persist_and_reopen_changeset("ds03.db", |db| {
         db.execute(
             "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT)",
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "nodes",
@@ -198,11 +210,7 @@ fn ds03_edges_available_after_reopen() {
         )
         .unwrap();
         db.commit(tx).unwrap();
-        db.close().unwrap();
-    }
-
-    let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(Lsn(0));
+    });
 
     assert_eq!(
         cs.edges.len(),
@@ -220,17 +228,13 @@ fn ds03_edges_available_after_reopen() {
 
 #[test]
 fn ds04_vectors_available_after_reopen() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("ds04.db");
-
-    {
-        let db = Database::open(&path).unwrap();
+    let cs = persist_and_reopen_changeset("ds04.db", |db| {
         db.execute(
             "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3))",
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let row_id = db
             .insert_row(
                 tx,
@@ -249,11 +253,7 @@ fn ds04_vectors_available_after_reopen() {
         )
         .unwrap();
         db.commit(tx).unwrap();
-        db.close().unwrap();
-    }
-
-    let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(Lsn(0));
+    });
 
     assert_eq!(
         cs.vectors.len(),
@@ -277,7 +277,7 @@ fn ds05_edge_restart_push_full_dataset() {
                 &HashMap::new(),
             )
             .unwrap();
-        let tx = edge_db.begin();
+        let tx = edge_db.begin_or_panic();
         edge_db
             .insert_row(
                 tx,
@@ -325,7 +325,7 @@ fn ds06_idempotent_row_reapply() {
         )
         .unwrap();
     let known_id = Uuid::new_v4();
-    let tx = source.begin();
+    let tx = source.begin_or_panic();
     source
         .insert_row(
             tx,
@@ -369,7 +369,7 @@ fn ds07_idempotent_edge_reapply() {
         .unwrap();
     let src_id = Uuid::new_v4();
     let tgt_id = Uuid::new_v4();
-    let tx = source.begin();
+    let tx = source.begin_or_panic();
     source
         .insert_row(
             tx,
@@ -435,7 +435,7 @@ fn ds08_idempotent_vector_reapply() {
         )
         .unwrap();
     let obs_id = Uuid::new_v4();
-    let tx = source.begin();
+    let tx = source.begin_or_panic();
     let row_id = source
         .insert_row(tx, "obs", vals(vec![("id", Value::Uuid(obs_id))]))
         .unwrap();
@@ -489,7 +489,7 @@ fn ds09_future_watermark_returns_empty() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "items",
@@ -544,7 +544,12 @@ fn ds10_schema_divergence_detected() {
                 ("unit".into(), "TEXT".into()),
             ],
             constraints: vec![],
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
         }],
+
+        ddl_lsn: vec![Lsn(1)],
     };
 
     server
@@ -565,7 +570,7 @@ fn ds10_schema_divergence_detected() {
         "divergent column 'unit' must not appear in local schema"
     );
 
-    let tx = server.begin();
+    let tx = server.begin_or_panic();
     server
         .insert_row(
             tx,
@@ -586,17 +591,694 @@ fn ds10_schema_divergence_detected() {
 }
 
 #[test]
-fn ds11_empty_db_restart_no_crash() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("ds11.db");
+fn ds10b_public_apply_changes_rejects_ddl_without_matching_lsn() {
+    let db = Database::open_memory();
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::CreateTable {
+                    name: "missing_lsn".into(),
+                    columns: vec![("id".into(), "UUID PRIMARY KEY".into())],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: Vec::new(),
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .expect_err("public apply_changes must reject DDL without a matching ddl_lsn");
+    assert!(
+        matches!(err, Error::SyncError(ref message) if message.contains("ddl_lsn length")),
+        "unexpected missing ddl_lsn error: {err}"
+    );
+    assert!(
+        db.table_meta("missing_lsn").is_none(),
+        "invalid DDL envelope must not apply schema side effects"
+    );
+}
 
-    {
-        let db = Database::open(&path).unwrap();
-        db.close().unwrap();
+#[test]
+fn ds10c_apply_changes_rejects_scan_backed_exact_constraint_ddl() {
+    let db = Database::open_memory();
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::CreateTable {
+                    name: "bad_exact_key".into(),
+                    columns: vec![
+                        ("id".into(), "INTEGER PRIMARY KEY".into()),
+                        ("score".into(), "REAL UNIQUE".into()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(1)],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .expect_err("sync DDL must reject exact constraints without exact key semantics");
+    match err {
+        Error::ColumnNotIndexable { table, column, .. } => {
+            assert_eq!(table, "bad_exact_key");
+            assert_eq!(column, "score");
+        }
+        other => panic!("expected ColumnNotIndexable for sync DDL, got {other:?}"),
     }
+    assert!(
+        db.table_meta("bad_exact_key").is_none(),
+        "invalid sync DDL must not leave schema side effects"
+    );
+}
 
-    let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(Lsn(0));
+#[test]
+fn ds10d_sync_alter_unique_name_collision_rebuilds_auto_index_storage() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, a TEXT NOT NULL, \
+         b TEXT NOT NULL, embedding VECTOR(2), UNIQUE (a, b))",
+        &empty,
+    )
+    .unwrap();
+    db.execute("INSERT INTO p (id, a, b) VALUES (1, 'a-1', 'b-1')", &empty)
+        .unwrap();
+
+    db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::AlterTable {
+                name: "p".into(),
+                columns: vec![
+                    ("id".into(), "INTEGER PRIMARY KEY".into()),
+                    ("a_b".into(), "TEXT UNIQUE".into()),
+                    ("a".into(), "TEXT NOT NULL".into()),
+                    ("b".into(), "TEXT NOT NULL".into()),
+                    ("embedding".into(), "VECTOR(3)".into()),
+                ],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                composite_foreign_keys: Vec::new(),
+                composite_unique: Vec::new(),
+            }],
+            ddl_lsn: vec![Lsn(2)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+    )
+    .unwrap();
+
+    let meta = db.table_meta("p").unwrap();
+    assert!(
+        meta.indexes.iter().any(|index| {
+            index.name == "__unique_a_b" && index.columns.len() == 1 && index.columns[0].0 == "a_b"
+        }),
+        "sync ALTER must move the colliding auto-index name onto the new exact key"
+    );
+
+    db.execute("UPDATE p SET a_b = 'key-1' WHERE id = 1", &empty)
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_key TEXT REFERENCES p(a_b))",
+        &empty,
+    )
+    .unwrap();
+    db.__reset_commit_stage_stats();
+    let inserted = db
+        .execute("INSERT INTO c (id, p_key) VALUES (1, 'key-1')", &empty)
+        .unwrap();
+    assert_eq!(inserted.rows_affected, 1);
+    let stats = db.__commit_stage_stats();
+    assert!(
+        stats.indexed_probes >= 1,
+        "sync-altered FK parent key should use rebuilt exact index storage, got {}",
+        stats.indexed_probes
+    );
+    assert_eq!(
+        stats.scan_rows_touched, 0,
+        "sync-altered UNIQUE name collision must not fall back to committed row scans"
+    );
+}
+
+#[test]
+fn ds10e_sync_apply_exact_natural_keys_do_not_scan_visible_tables() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT UNIQUE, note TEXT)",
+        &empty,
+    )
+    .unwrap();
+
+    let tx = db.begin_or_panic();
+    for id in 0..512 {
+        db.insert_row(
+            tx,
+            "items",
+            vals(vec![
+                ("id", Value::Int64(id)),
+                ("code", Value::Text(format!("code-{id}"))),
+                ("note", Value::Text("seed".into())),
+            ]),
+        )
+        .unwrap();
+    }
+    db.commit(tx).unwrap();
+
+    db.__reset_relational_scan_rows_touched();
+    let result = db
+        .apply_changes(
+            ChangeSet {
+                rows: vec![
+                    RowChange {
+                        table: "items".into(),
+                        natural_key: NaturalKey {
+                            column: "id".into(),
+                            value: Value::Int64(7),
+                        },
+                        values: vals(vec![("id", Value::Int64(7))]),
+                        deleted: true,
+                        lsn: Lsn(100),
+                        created_at: None,
+                    },
+                    RowChange {
+                        table: "items".into(),
+                        natural_key: NaturalKey {
+                            column: "id".into(),
+                            value: Value::Int64(900),
+                        },
+                        values: vals(vec![
+                            ("id", Value::Int64(900)),
+                            ("code", Value::Text("code-200".into())),
+                            ("note", Value::Text("conflict".into())),
+                        ]),
+                        deleted: false,
+                        lsn: Lsn(101),
+                        created_at: None,
+                    },
+                    RowChange {
+                        table: "items".into(),
+                        natural_key: NaturalKey {
+                            column: "id".into(),
+                            value: Value::Int64(901),
+                        },
+                        values: vals(vec![
+                            ("id", Value::Int64(901)),
+                            ("code", Value::Text("remote-901".into())),
+                            ("note", Value::Text("fresh".into())),
+                        ]),
+                        deleted: false,
+                        lsn: Lsn(102),
+                        created_at: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(result.applied_rows, 3);
+    assert_eq!(result.skipped_rows, 0);
+    assert_eq!(
+        db.__relational_scan_rows_touched(),
+        0,
+        "sync apply exact-key lookups must not materialize visible table rows"
+    );
+}
+
+#[test]
+fn ds10f_sync_preflight_new_fk_column_parent_delete_does_not_scan_child_table() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", &empty)
+        .unwrap();
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY)", &empty)
+        .unwrap();
+    db.execute("INSERT INTO p (id) VALUES (1)", &empty).unwrap();
+
+    let tx = db.begin_or_panic();
+    for id in 0..512 {
+        db.insert_row(tx, "c", vals(vec![("id", Value::Int64(id))]))
+            .unwrap();
+    }
+    db.commit(tx).unwrap();
+
+    db.__reset_relational_scan_rows_touched();
+    let result = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::AlterTable {
+                    name: "c".into(),
+                    columns: vec![("p_id".into(), "INTEGER".into())],
+                    constraints: Vec::new(),
+                    foreign_keys: vec![SingleColumnForeignKey {
+                        child_column: "p_id".into(),
+                        parent_table: "p".into(),
+                        parent_column: "id".into(),
+                    }],
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+                rows: vec![RowChange {
+                    table: "p".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Int64(1),
+                    },
+                    values: vals(vec![("id", Value::Int64(1))]),
+                    deleted: true,
+                    lsn: Lsn(11),
+                    created_at: None,
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(result.applied_rows, 1);
+    assert_eq!(
+        db.__relational_scan_rows_touched(),
+        0,
+        "sync preflight for newly added FK columns must not scan committed child rows"
+    );
+}
+
+#[test]
+fn ds10g_sync_preflight_existing_column_new_fk_parent_delete_uses_existing_index() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", &empty)
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER)",
+        &empty,
+    )
+    .unwrap();
+    db.execute("CREATE INDEX c_p_id_idx ON c(p_id)", &empty)
+        .unwrap();
+    db.execute("INSERT INTO p (id) VALUES (1)", &empty).unwrap();
+
+    let tx = db.begin_or_panic();
+    for id in 0..512 {
+        db.insert_row(
+            tx,
+            "c",
+            vals(vec![("id", Value::Int64(id)), ("p_id", Value::Null)]),
+        )
+        .unwrap();
+    }
+    db.commit(tx).unwrap();
+
+    db.__reset_relational_scan_rows_touched();
+    let result = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::AlterTable {
+                    name: "c".into(),
+                    columns: vec![("p_id".into(), "INTEGER".into())],
+                    constraints: Vec::new(),
+                    foreign_keys: vec![SingleColumnForeignKey {
+                        child_column: "p_id".into(),
+                        parent_table: "p".into(),
+                        parent_column: "id".into(),
+                    }],
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+                rows: vec![RowChange {
+                    table: "p".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Int64(1),
+                    },
+                    values: vals(vec![("id", Value::Int64(1))]),
+                    deleted: true,
+                    lsn: Lsn(11),
+                    created_at: None,
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(result.applied_rows, 1);
+    let meta = db.table_meta("c").unwrap();
+    let p_id = meta
+        .columns
+        .iter()
+        .find(|column| column.name == "p_id")
+        .unwrap();
+    assert!(
+        p_id.references.is_some(),
+        "sync ALTER should install the FK on the existing child column"
+    );
+    assert_eq!(
+        db.__relational_scan_rows_touched(),
+        0,
+        "sync preflight for newly added FK relationships must not scan committed child rows"
+    );
+}
+
+#[test]
+fn ds10h_sync_preflight_existing_column_new_fk_parent_delete_without_index_rejects_before_schema() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", &empty)
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER)",
+        &empty,
+    )
+    .unwrap();
+    db.execute("INSERT INTO p (id) VALUES (1)", &empty).unwrap();
+    db.execute("INSERT INTO c (id, p_id) VALUES (10, 1)", &empty)
+        .unwrap();
+
+    db.__reset_relational_scan_rows_touched();
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![DdlChange::AlterTable {
+                    name: "c".into(),
+                    columns: vec![("p_id".into(), "INTEGER".into())],
+                    constraints: Vec::new(),
+                    foreign_keys: vec![SingleColumnForeignKey {
+                        child_column: "p_id".into(),
+                        parent_table: "p".into(),
+                        parent_column: "id".into(),
+                    }],
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                }],
+                ddl_lsn: vec![Lsn(10)],
+                rows: vec![RowChange {
+                    table: "p".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Int64(1),
+                    },
+                    values: vals(vec![("id", Value::Int64(1))]),
+                    deleted: true,
+                    lsn: Lsn(11),
+                    created_at: None,
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("no covering index"),
+        "expected no-covering-index preflight error, got {err}"
+    );
+    let meta = db.table_meta("c").unwrap();
+    let p_id = meta
+        .columns
+        .iter()
+        .find(|column| column.name == "p_id")
+        .unwrap();
+    assert!(
+        p_id.references.is_none(),
+        "failed sync preflight must not install the projected FK"
+    );
+    assert_eq!(
+        db.__relational_scan_rows_touched(),
+        0,
+        "sync preflight rejection must not fall back to scanning committed child rows"
+    );
+}
+
+#[test]
+fn ds10i_sync_preflight_projected_parent_unique_uses_existing_parent_index() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, code TEXT)", &empty)
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_code TEXT)",
+        &empty,
+    )
+    .unwrap();
+    db.execute("CREATE INDEX p_code_idx ON p(code)", &empty)
+        .unwrap();
+    db.execute("INSERT INTO p (id, code) VALUES (1, 'p1')", &empty)
+        .unwrap();
+
+    db.__reset_relational_scan_rows_touched();
+    let result = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![
+                    DdlChange::AlterTable {
+                        name: "p".into(),
+                        columns: vec![("code".into(), "TEXT UNIQUE".into())],
+                        constraints: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        composite_foreign_keys: Vec::new(),
+                        composite_unique: Vec::new(),
+                    },
+                    DdlChange::AlterTable {
+                        name: "c".into(),
+                        columns: vec![("p_code".into(), "TEXT REFERENCES p(code)".into())],
+                        constraints: Vec::new(),
+                        foreign_keys: vec![SingleColumnForeignKey {
+                            child_column: "p_code".into(),
+                            parent_table: "p".into(),
+                            parent_column: "code".into(),
+                        }],
+                        composite_foreign_keys: Vec::new(),
+                        composite_unique: Vec::new(),
+                    },
+                ],
+                ddl_lsn: vec![Lsn(10), Lsn(11)],
+                rows: vec![RowChange {
+                    table: "c".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Int64(10),
+                    },
+                    values: vals(vec![
+                        ("id", Value::Int64(10)),
+                        ("p_code", Value::Text("p1".into())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(12),
+                    created_at: None,
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(result.applied_rows, 1);
+    let parent_meta = db.table_meta("p").unwrap();
+    let code = parent_meta
+        .columns
+        .iter()
+        .find(|column| column.name == "code")
+        .unwrap();
+    assert!(code.unique, "sync ALTER should install projected UNIQUE");
+    assert_eq!(
+        db.__relational_scan_rows_touched(),
+        0,
+        "projected parent-key preflight must not use visible table scan APIs"
+    );
+}
+
+#[test]
+fn ds10j_sync_preflight_projected_parent_unique_without_index_rejects_before_schema() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, code TEXT)", &empty)
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_code TEXT)",
+        &empty,
+    )
+    .unwrap();
+    db.execute("INSERT INTO p (id, code) VALUES (1, 'p1')", &empty)
+        .unwrap();
+
+    db.__reset_relational_scan_rows_touched();
+    let err = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![
+                    DdlChange::AlterTable {
+                        name: "p".into(),
+                        columns: vec![("code".into(), "TEXT UNIQUE".into())],
+                        constraints: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        composite_foreign_keys: Vec::new(),
+                        composite_unique: Vec::new(),
+                    },
+                    DdlChange::AlterTable {
+                        name: "c".into(),
+                        columns: vec![("p_code".into(), "TEXT REFERENCES p(code)".into())],
+                        constraints: Vec::new(),
+                        foreign_keys: vec![SingleColumnForeignKey {
+                            child_column: "p_code".into(),
+                            parent_table: "p".into(),
+                            parent_column: "code".into(),
+                        }],
+                        composite_foreign_keys: Vec::new(),
+                        composite_unique: Vec::new(),
+                    },
+                ],
+                ddl_lsn: vec![Lsn(10), Lsn(11)],
+                rows: vec![RowChange {
+                    table: "c".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Int64(10),
+                    },
+                    values: vals(vec![
+                        ("id", Value::Int64(10)),
+                        ("p_code", Value::Text("p1".into())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(12),
+                    created_at: None,
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("no covering index"),
+        "expected no-covering-index preflight error, got {err}"
+    );
+    let parent_meta = db.table_meta("p").unwrap();
+    let code = parent_meta
+        .columns
+        .iter()
+        .find(|column| column.name == "code")
+        .unwrap();
+    assert!(
+        !code.unique,
+        "failed sync preflight must not install projected UNIQUE"
+    );
+    let child_meta = db.table_meta("c").unwrap();
+    let p_code = child_meta
+        .columns
+        .iter()
+        .find(|column| column.name == "p_code")
+        .unwrap();
+    assert!(
+        p_code.references.is_none(),
+        "failed sync preflight must not install projected FK"
+    );
+    assert_eq!(
+        db.__relational_scan_rows_touched(),
+        0,
+        "projected parent-key rejection must not fall back to scanning committed parent rows"
+    );
+}
+
+#[test]
+fn ds10k_sync_vector_shape_alter_preserves_projected_parent_unique_for_fk_preflight() {
+    let db = Database::open_memory();
+    let empty = HashMap::new();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, code TEXT, embedding VECTOR(2))",
+        &empty,
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_code TEXT)",
+        &empty,
+    )
+    .unwrap();
+    db.execute("CREATE INDEX p_code_idx ON p(code)", &empty)
+        .unwrap();
+    db.execute("INSERT INTO p (id, code) VALUES (1, 'p1')", &empty)
+        .unwrap();
+
+    db.__reset_relational_scan_rows_touched();
+    let result = db
+        .apply_changes(
+            ChangeSet {
+                ddl: vec![
+                    DdlChange::AlterTable {
+                        name: "p".into(),
+                        columns: vec![
+                            ("id".into(), "INTEGER PRIMARY KEY".into()),
+                            ("code".into(), "TEXT UNIQUE".into()),
+                            ("embedding".into(), "VECTOR(3)".into()),
+                        ],
+                        constraints: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        composite_foreign_keys: Vec::new(),
+                        composite_unique: Vec::new(),
+                    },
+                    DdlChange::AlterTable {
+                        name: "c".into(),
+                        columns: vec![("p_code".into(), "TEXT REFERENCES p(code)".into())],
+                        constraints: Vec::new(),
+                        foreign_keys: vec![SingleColumnForeignKey {
+                            child_column: "p_code".into(),
+                            parent_table: "p".into(),
+                            parent_column: "code".into(),
+                        }],
+                        composite_foreign_keys: Vec::new(),
+                        composite_unique: Vec::new(),
+                    },
+                ],
+                ddl_lsn: vec![Lsn(10), Lsn(11)],
+                rows: vec![RowChange {
+                    table: "c".into(),
+                    natural_key: NaturalKey {
+                        column: "id".into(),
+                        value: Value::Int64(10),
+                    },
+                    values: vals(vec![
+                        ("id", Value::Int64(10)),
+                        ("p_code", Value::Text("p1".into())),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(12),
+                    created_at: None,
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
+        .unwrap();
+
+    assert_eq!(result.applied_rows, 1);
+    let parent_meta = db.table_meta("p").unwrap();
+    let code = parent_meta
+        .columns
+        .iter()
+        .find(|column| column.name == "code")
+        .unwrap();
+    assert!(
+        code.unique,
+        "vector full-shape sync ALTER should install projected UNIQUE"
+    );
+    assert_eq!(
+        db.__relational_scan_rows_touched(),
+        0,
+        "vector full-shape projected parent-key preflight must stay indexed"
+    );
+}
+
+#[test]
+fn ds11_empty_db_restart_no_crash() {
+    let cs = persist_and_reopen_changeset("ds11.db", |_db| {});
 
     assert!(cs.rows.is_empty(), "empty DB must return empty rows");
     assert!(cs.edges.is_empty(), "empty DB must return empty edges");
@@ -606,20 +1288,17 @@ fn ds11_empty_db_restart_no_crash() {
 
 #[test]
 fn ds12_edge_only_db_after_reopen() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("ds12.db");
     let node_id = Uuid::new_v4();
     let target_a = Uuid::new_v4();
     let target_b = Uuid::new_v4();
 
-    {
-        let db = Database::open(&path).unwrap();
+    let cs = persist_and_reopen_changeset("ds12.db", |db| {
         db.execute(
             "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT)",
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "nodes",
@@ -634,11 +1313,7 @@ fn ds12_edge_only_db_after_reopen() {
         db.insert_edge(tx, node_id, target_b, "OBSERVED".into(), HashMap::new())
             .unwrap();
         db.commit(tx).unwrap();
-        db.close().unwrap();
-    }
-
-    let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(Lsn(0));
+    });
 
     assert_eq!(cs.edges.len(), 2, "expected 2 edges after reopen");
     assert!(
@@ -654,17 +1329,13 @@ fn ds12_edge_only_db_after_reopen() {
 
 #[test]
 fn ds13_vector_only_after_reopen() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("ds13.db");
-
-    {
-        let db = Database::open(&path).unwrap();
+    let cs = persist_and_reopen_changeset("ds13.db", |db| {
         db.execute(
             "CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(3))",
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let row_id = db
             .insert_row(
                 tx,
@@ -680,11 +1351,7 @@ fn ds13_vector_only_after_reopen() {
         )
         .unwrap();
         db.commit(tx).unwrap();
-        db.close().unwrap();
-    }
-
-    let db2 = Database::open(&path).unwrap();
-    let cs = db2.changes_since(Lsn(0));
+    });
 
     assert_eq!(
         cs.vectors.len(),
@@ -711,7 +1378,7 @@ fn ds14_both_sides_restart_bidirectional() {
                 &HashMap::new(),
             )
             .unwrap();
-        let tx = server.begin();
+        let tx = server.begin_or_panic();
         server
             .insert_row(
                 tx,
@@ -734,7 +1401,7 @@ fn ds14_both_sides_restart_bidirectional() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = edge.begin();
+        let tx = edge.begin_or_panic();
         edge.insert_row(
             tx,
             "config",
@@ -822,7 +1489,7 @@ fn ds15_drop_table_syncs() {
             &HashMap::new(),
         )
         .unwrap();
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_row(
             tx,
             "temp",
@@ -875,7 +1542,7 @@ fn ds16_deletion_tombstone_sync() {
         &HashMap::new(),
     )
     .unwrap();
-    let tx = edge.begin();
+    let tx = edge.begin_or_panic();
     for (id, name) in [(alice_id, "alice"), (bob_id, "bob"), (carol_id, "carol")] {
         edge.insert_row(
             tx,
@@ -900,7 +1567,7 @@ fn ds16_deletion_tombstone_sync() {
 
     let lsn_after_sync = edge.current_lsn();
 
-    let tx2 = edge.begin();
+    let tx2 = edge.begin_or_panic();
     let bob_row = edge
         .point_lookup("items", "id", &Value::Uuid(bob_id), edge.snapshot())
         .unwrap()
@@ -944,5 +1611,335 @@ fn ds16_deletion_tombstone_sync() {
             .unwrap()
             .is_some(),
         "alice must still exist on server"
+    );
+}
+
+fn assert_delete_tombstone_syncs_for_scalar_id(create_sql: &str, id: Value) {
+    let server = Database::open_memory();
+    let edge = Database::open_memory();
+
+    edge.execute(create_sql, &HashMap::new()).unwrap();
+    let tx = edge.begin_or_panic();
+    edge.insert_row(
+        tx,
+        "items",
+        vals(vec![
+            ("id", id.clone()),
+            ("name", Value::Text("delete-me".into())),
+        ]),
+    )
+    .unwrap();
+    edge.commit(tx).unwrap();
+
+    let initial = edge.changes_since(Lsn(0));
+    server
+        .apply_changes(
+            initial,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup("items", "id", &id, server.snapshot())
+            .unwrap()
+            .is_some(),
+        "initial sync must create the scalar-id row on the receiver"
+    );
+
+    let lsn_after_sync = edge.current_lsn();
+    let row = edge
+        .point_lookup("items", "id", &id, edge.snapshot())
+        .unwrap()
+        .expect("edge row must exist before delete");
+    let tx = edge.begin_or_panic();
+    edge.delete_row(tx, "items", row.row_id).unwrap();
+    edge.commit(tx).unwrap();
+
+    let delete_changes = edge.changes_since(lsn_after_sync);
+    assert!(
+        delete_changes.rows.iter().any(|row| {
+            row.deleted && row.natural_key.column == "id" && row.natural_key.value == id
+        }),
+        "delete changeset must carry the actual scalar id value"
+    );
+    server
+        .apply_changes(
+            delete_changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup("items", "id", &id, server.snapshot())
+            .unwrap()
+            .is_none(),
+        "delete tombstone must remove scalar-id row on receiver"
+    );
+}
+
+#[test]
+fn ds17_text_primary_key_delete_tombstone_sync() {
+    assert_delete_tombstone_syncs_for_scalar_id(
+        "CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT)",
+        Value::Text("item-1".into()),
+    );
+}
+
+#[test]
+fn ds18_integer_primary_key_delete_tombstone_sync() {
+    assert_delete_tombstone_syncs_for_scalar_id(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+        Value::Int64(42),
+    );
+}
+
+#[test]
+fn ds19_primary_key_wins_over_non_key_id_for_delete_tombstone_sync() {
+    let server = Database::open_memory();
+    let edge = Database::open_memory();
+
+    edge.execute(
+        "CREATE TABLE items (id TEXT, sku TEXT PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let tx = edge.begin_or_panic();
+    edge.insert_row(
+        tx,
+        "items",
+        vals(vec![
+            ("id", Value::Text("legacy-id".into())),
+            ("sku", Value::Text("sku-1".into())),
+            ("name", Value::Text("delete-me".into())),
+        ]),
+    )
+    .unwrap();
+    edge.commit(tx).unwrap();
+
+    let initial = edge.changes_since(Lsn(0));
+    server
+        .apply_changes(
+            initial,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let lsn_after_sync = edge.current_lsn();
+    let row = edge
+        .point_lookup(
+            "items",
+            "sku",
+            &Value::Text("sku-1".into()),
+            edge.snapshot(),
+        )
+        .unwrap()
+        .expect("edge row must exist before delete");
+    let tx = edge.begin_or_panic();
+    edge.delete_row(tx, "items", row.row_id).unwrap();
+    edge.commit(tx).unwrap();
+
+    let delete_changes = edge.changes_since(lsn_after_sync);
+    assert!(
+        delete_changes.rows.iter().any(|row| {
+            row.deleted
+                && row.natural_key.column == "sku"
+                && row.natural_key.value == Value::Text("sku-1".into())
+        }),
+        "delete changeset must prefer declared primary key over a non-key id column"
+    );
+    server
+        .apply_changes(
+            delete_changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-1".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_none(),
+        "delete tombstone must remove row by declared primary key on receiver"
+    );
+}
+
+#[test]
+fn ds20_delete_tombstone_uses_latest_primary_key_after_key_update() {
+    let server = Database::open_memory();
+    let edge = Database::open_memory();
+
+    edge.execute(
+        "CREATE TABLE items (sku TEXT PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let tx = edge.begin_or_panic();
+    edge.insert_row(
+        tx,
+        "items",
+        vals(vec![
+            ("sku", Value::Text("sku-a".into())),
+            ("name", Value::Text("delete-after-key-update".into())),
+        ]),
+    )
+    .unwrap();
+    edge.commit(tx).unwrap();
+
+    server
+        .apply_changes(
+            edge.changes_since(Lsn(0)),
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-a".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_some(),
+        "initial sync must create the original primary-key row"
+    );
+
+    let lsn_after_initial = edge.current_lsn();
+    edge.execute(
+        "UPDATE items SET sku = 'sku-b' WHERE sku = 'sku-a'",
+        &HashMap::new(),
+    )
+    .unwrap();
+    server
+        .apply_changes(
+            edge.changes_since(lsn_after_initial),
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-b".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_some(),
+        "update sync must move the receiver to the new primary key"
+    );
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-a".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_none(),
+        "old primary key must not remain live after update sync"
+    );
+
+    let lsn_after_update = edge.current_lsn();
+    let row = edge
+        .point_lookup(
+            "items",
+            "sku",
+            &Value::Text("sku-b".into()),
+            edge.snapshot(),
+        )
+        .unwrap()
+        .expect("edge row must exist with updated primary key before delete");
+    let tx = edge.begin_or_panic();
+    edge.delete_row(tx, "items", row.row_id).unwrap();
+    edge.commit(tx).unwrap();
+
+    let delete_changes = edge.changes_since(lsn_after_update);
+    assert!(
+        delete_changes.rows.iter().any(|row| {
+            row.deleted
+                && row.natural_key.column == "sku"
+                && row.natural_key.value == Value::Text("sku-b".into())
+        }),
+        "delete changeset must carry the latest primary-key value after key update"
+    );
+    assert!(
+        !delete_changes.rows.iter().any(|row| {
+            row.deleted
+                && row.natural_key.column == "sku"
+                && row.natural_key.value == Value::Text("sku-a".into())
+        }),
+        "delete changeset must not use the stale primary-key value"
+    );
+
+    server
+        .apply_changes(
+            delete_changes,
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+    assert!(
+        server
+            .point_lookup(
+                "items",
+                "sku",
+                &Value::Text("sku-b".into()),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_none(),
+        "delete tombstone must remove the row at the latest primary key on receiver"
+    );
+}
+
+#[test]
+fn ds21_single_column_fk_null_child_does_not_block_parent_delete_sync() {
+    let edge = Database::open_memory();
+    let server = Database::open_memory();
+    let empty = HashMap::new();
+
+    edge.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+        &empty,
+    )
+    .unwrap();
+    edge.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_code TEXT REFERENCES p(code))",
+        &empty,
+    )
+    .unwrap();
+    edge.execute("INSERT INTO p (id, code) VALUES (1, NULL)", &empty)
+        .unwrap();
+    edge.execute("INSERT INTO c (id, p_code) VALUES (1, NULL)", &empty)
+        .unwrap();
+
+    server
+        .apply_changes(
+            edge.changes_since(Lsn(0)),
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    let lsn_after_initial = edge.current_lsn();
+    edge.execute("DELETE FROM p WHERE id = 1", &empty).unwrap();
+
+    server
+        .apply_changes(
+            edge.changes_since(lsn_after_initial),
+            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        )
+        .unwrap();
+
+    assert!(
+        server
+            .point_lookup("p", "id", &Value::Int64(1), server.snapshot())
+            .unwrap()
+            .is_none(),
+        "sync preflight must not treat child NULL FKs as references"
     );
 }

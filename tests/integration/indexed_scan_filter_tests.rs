@@ -158,6 +158,25 @@ fn ep03_in_const_list_on_indexed_column_returns_exact_rows() {
     );
 }
 
+#[test]
+fn ep03b_in_real_literal_on_integer_index_matches_evaluator() {
+    let db = Database::open_memory();
+    seed_t_with_index(&db);
+    insert_row_t(&db, 1, 100, "one");
+    insert_row_t(&db, 2, 200, "two");
+    db.__reset_rows_examined();
+    let r = db
+        .execute("SELECT a, tag FROM t WHERE a IN (1.0)", &empty())
+        .expect("SELECT");
+    assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Int64(1), Value::Text("one".into())]]
+    );
+    assert_eq!(db.__rows_examined(), 1);
+}
+
 // ============================================================================
 // EP04 — RED — `!=` on indexed column still picks IndexScan; residual applied.
 // [I1, I2]
@@ -513,11 +532,11 @@ fn ep14_picker_prefers_equality_over_range() {
 }
 
 // ============================================================================
-// EP15 — RED — composite index (a, b): col1=X walks range, col2=Y is residual.
-// `predicates_pushed` lists only the pushed column (a), not b. [I2, I15]
+// EP15 — RED — composite index (a, b) with `a = X AND b = Y` pushes BOTH columns.
+// `predicates_pushed == ["a","b"]`; examined == exact full-key match count.
 // ============================================================================
 #[test]
-fn ep15_composite_index_pushes_only_leading_column() {
+fn ep15_composite_index_pushes_full_matched_prefix() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER, b INTEGER)",
@@ -553,15 +572,15 @@ fn ep15_composite_index_pushes_only_leading_column() {
         .execute("SELECT a, b FROM t WHERE a = 1 AND b = 20", &empty())
         .unwrap();
     assert_eq!(r.trace.physical_plan, "IndexScan");
+    assert_eq!(r.trace.index_used.as_deref(), Some("idx_ab"));
     let pushed: Vec<&str> = r
         .trace
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref())
         .collect();
-    assert_eq!(pushed, vec!["a"]);
-    // Trace-liar gate: composite walks range a=1 (2 rows), residual b=20 filters.
-    assert!(db.__rows_examined() <= 4, "got {}", db.__rows_examined());
+    assert_eq!(pushed, vec!["a", "b"]);
+    assert_eq!(db.__rows_examined(), 1);
     assert_eq!(r.rows, vec![vec![Value::Int64(1), Value::Int64(20)]]);
 }
 
@@ -758,6 +777,7 @@ fn mv05_sync_apply_batch_single_write_lock() {
             values: vals,
             deleted: false,
             lsn: Lsn(0),
+            created_at: None,
         });
     }
     let cs = ChangeSet {
@@ -2171,7 +2191,7 @@ fn pr01_index_survives_reopen() {
 
 // ============================================================================
 // PR02 — REGRESSION GUARD — legacy TableMeta without `indexes` field decodes
-// cleanly via `#[serde(default)]` on the new field. Once §4.2 stubs land,
+// cleanly via `#[serde(default)]` on the new field. Once the indexed-scan stubs land,
 // this test passes; it guards against a future removal of the serde default.
 // ============================================================================
 #[test]
@@ -2444,6 +2464,7 @@ fn sy01_create_index_replicates_through_sync() {
         .unwrap();
     let cs = ChangeSet {
         ddl: ddl.clone(),
+        ddl_lsn: vec![Lsn(1); ddl.len()],
         ..ChangeSet::default()
     };
     receiver
@@ -2501,6 +2522,7 @@ fn sy02_drop_index_replicates_through_sync() {
         .execute("CREATE INDEX idx ON t (a)", &empty())
         .unwrap();
     let cs = ChangeSet {
+        ddl_lsn: vec![Lsn(1); ddl.len()],
         ddl,
         ..ChangeSet::default()
     };
@@ -2542,6 +2564,7 @@ fn sy03_sync_apply_batch_single_index_write_lock() {
             values: vals,
             deleted: false,
             lsn: Lsn(0),
+            created_at: None,
         });
     }
     let cs = ChangeSet {
@@ -2848,6 +2871,7 @@ fn ba01_batch_apply_create_index_before_rows() {
             values: vals,
             deleted: false,
             lsn: Lsn(0),
+            created_at: None,
         });
     }
     let cs = ChangeSet {
@@ -2857,6 +2881,7 @@ fn ba01_batch_apply_create_index_before_rows() {
             name: "idx_a".into(),
             columns: vec![("a".into(), SortDirection::Asc)],
         }],
+        ddl_lsn: vec![Lsn(1)],
         ..ChangeSet::default()
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
@@ -2870,12 +2895,12 @@ fn ba01_batch_apply_create_index_before_rows() {
 }
 
 // ============================================================================
-// CG02 — RED — engine-side parallel of the cg acceptance test: filtered by
+// Engine-side parallel of a downstream consumer's acceptance test: filtered by
 // indexed `entity_type` + residual `name_contains` with trace populated.
 // The p95 wall-clock budget lives in the Criterion bench.
 // ============================================================================
 #[test]
-fn cg02_engine_side_entity_list_filter_under_budget() {
+fn engine_side_entity_list_filter_under_budget() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE entities (id UUID PRIMARY KEY, entity_type TEXT, name TEXT, created_at TIMESTAMP)",
@@ -3479,6 +3504,7 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
     let edge_b = Database::open_memory();
     // Replicate schema + index + rows to edge B.
     let cs = ChangeSet {
+        ddl_lsn: vec![Lsn(1); ddl.len()],
         ddl,
         rows: rows_changes,
         ..ChangeSet::default()
@@ -3530,6 +3556,7 @@ fn sy04_desc_direction_replicates_through_sync_ddl() {
         .apply_changes(
             ChangeSet {
                 ddl: ddl.clone(),
+                ddl_lsn: vec![Lsn(1); ddl.len()],
                 ..ChangeSet::default()
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
@@ -3607,6 +3634,7 @@ fn sy05_mixed_direction_composite_replicates_through_sync_ddl() {
     receiver
         .apply_changes(
             ChangeSet {
+                ddl_lsn: vec![Lsn(1); ddl.len()],
                 ddl,
                 ..ChangeSet::default()
             },
@@ -3971,6 +3999,7 @@ fn sync_createindex_missing_table_returns_tablenotfound() {
             name: "idx".into(),
             columns: vec![("a".into(), SortDirection::Asc)],
         }],
+        ddl_lsn: vec![Lsn(1)],
         ..ChangeSet::default()
     };
     let err = peer
@@ -4355,6 +4384,7 @@ fn sync_ddl_createtable_regenerates_auto_indexes_on_peer() {
     peer.apply_changes(
         ChangeSet {
             ddl: vec![create_ddl],
+            ddl_lsn: vec![Lsn(1)],
             ..ChangeSet::default()
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),

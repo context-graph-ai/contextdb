@@ -28,6 +28,20 @@ fn col_idx(result: &QueryResult, name: &str) -> usize {
 // ---------------------------------------------------------------------------
 #[test]
 fn r01_basic_age_pruning() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    // Thread-local mock clock (the T31/T32 idiom below): rows are stamped at the
+    // mock reading on insert, so advancing the mock past the TTL replaces the
+    // real 3 s sleep with no wall-clock dependence.
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 2 SECONDS",
@@ -41,9 +55,10 @@ fn r01_basic_age_pruning() {
 
     assert_eq!(row_count(&db, "obs"), 2);
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the rows' stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
 
-    // Insert a young row AFTER the sleep — must survive pruning
+    // Insert a young row AFTER the advance — must survive pruning
     db.execute("INSERT INTO obs (id, data) VALUES (3, 'young')", &p())
         .unwrap();
 
@@ -63,6 +78,17 @@ fn r01_basic_age_pruning() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r02_short_ttl_prunes_old_not_new() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 2 SECONDS",
@@ -72,7 +98,8 @@ fn r02_short_ttl_prunes_old_not_new() {
 
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'old')", &p())
         .unwrap();
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the old row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'new')", &p())
         .unwrap();
 
@@ -91,6 +118,17 @@ fn r02_short_ttl_prunes_old_not_new() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r03_sync_safe_unsynced_rows_survive() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 2 SECONDS SYNC SAFE",
@@ -100,7 +138,8 @@ fn r03_sync_safe_unsynced_rows_survive() {
 
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'a')", &p())
         .unwrap();
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
 
     // Sync watermark is 0 — no rows synced
     db.set_sync_watermark(Lsn(0));
@@ -119,6 +158,17 @@ fn r03_sync_safe_unsynced_rows_survive() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r04_sync_safe_synced_rows_pruned() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 2 SECONDS SYNC SAFE",
@@ -132,7 +182,8 @@ fn r04_sync_safe_synced_rows_pruned() {
     // Advance sync watermark past the row's LSN
     db.set_sync_watermark(Lsn(u64::MAX));
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
     let pruned = db.run_pruning_cycle();
 
     assert!(pruned > 0, "synced expired row must be pruned");
@@ -176,12 +227,52 @@ fn r05_expires_column_per_row_override() {
     assert_eq!(result.rows[0][idx], Value::Text("future".to_string()));
 }
 
+#[test]
+fn r05b_pruning_expired_history_keeps_newer_live_version() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT, expires_at TIMESTAMP EXPIRES) RETAIN 1000 DAYS",
+        &p(),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO obs (id, data, expires_at) VALUES (1, 'expired-version', '2020-01-01T00:00:00Z')",
+        &p(),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE obs SET data = 'live-version', expires_at = 'infinity' WHERE id = 1",
+        &p(),
+    )
+    .unwrap();
+
+    let pruned = db.run_pruning_cycle();
+    assert_eq!(pruned, 1, "only the expired historical version is pruned");
+    assert_eq!(row_count(&db, "obs"), 1, "newer live version must survive");
+
+    let result = db.execute("SELECT * FROM obs", &p()).unwrap();
+    let idx = col_idx(&result, "data");
+    assert_eq!(result.rows[0][idx], Value::Text("live-version".to_string()));
+}
+
 // ---------------------------------------------------------------------------
 // R06 — Infinity means never prune
 // RED: run_pruning_cycle is a no-op
 // ---------------------------------------------------------------------------
 #[test]
 fn r06_expires_infinity_never_pruned() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT, expires_at TIMESTAMP EXPIRES) RETAIN 1 SECONDS",
@@ -195,7 +286,8 @@ fn r06_expires_infinity_never_pruned() {
     )
     .unwrap();
 
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the row's stamped time — beyond the 1 s TTL (infinity ignores it).
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
     db.run_pruning_cycle();
 
     assert_eq!(
@@ -211,6 +303,17 @@ fn r06_expires_infinity_never_pruned() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r07_null_expires_uses_default_ttl() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT, expires_at TIMESTAMP EXPIRES) RETAIN 2 SECONDS",
@@ -225,7 +328,8 @@ fn r07_null_expires_uses_default_ttl() {
     )
     .unwrap();
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the row's stamped time — beyond the 2 s table TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
     let pruned = db.run_pruning_cycle();
 
     assert!(pruned > 0, "NULL expires row must be pruned by table TTL");
@@ -238,6 +342,17 @@ fn r07_null_expires_uses_default_ttl() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r08_alter_table_set_retain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute("CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)", &p())
         .unwrap();
@@ -252,9 +367,10 @@ fn r08_alter_table_set_retain() {
     db.execute("ALTER TABLE obs SET RETAIN 2 SECONDS", &p())
         .unwrap();
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the old row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
 
-    // Insert a young row AFTER the sleep — must survive
+    // Insert a young row AFTER the advance — must survive
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'young')", &p())
         .unwrap();
 
@@ -277,6 +393,17 @@ fn r08_alter_table_set_retain() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r09_alter_table_drop_retain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 2 SECONDS",
@@ -290,7 +417,8 @@ fn r09_alter_table_drop_retain() {
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'a')", &p())
         .unwrap();
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the row's stamped time — the DROP means it must survive anyway.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
     db.run_pruning_cycle();
 
     assert_eq!(
@@ -306,6 +434,17 @@ fn r09_alter_table_drop_retain() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r10_alter_table_set_retain_sync_safe() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute("CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)", &p())
         .unwrap();
@@ -316,7 +455,8 @@ fn r10_alter_table_set_retain_sync_safe() {
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'a')", &p())
         .unwrap();
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
 
     // Sync watermark at 0 — unsynced
     db.set_sync_watermark(Lsn(0));
@@ -544,6 +684,17 @@ fn r17_describe_shows_expires_column() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r18_pruning_removes_graph_edges() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT) RETAIN 2 SECONDS",
@@ -573,12 +724,13 @@ fn r18_pruning_removes_graph_edges() {
         .unwrap();
 
     // Insert edge between node1 and node2
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, id1, id2, "RELATES_TO".to_string(), HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the nodes' stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
     db.run_pruning_cycle();
 
     assert_eq!(row_count(&db, "nodes"), 0, "both nodes must be pruned");
@@ -599,6 +751,17 @@ fn r18_pruning_removes_graph_edges() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r19_pruning_removes_vector_entries() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) RETAIN 2 SECONDS",
@@ -633,7 +796,8 @@ fn r19_pruning_removes_vector_entries() {
         "vector search must find the row before pruning"
     );
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
     db.run_pruning_cycle();
 
     assert_eq!(row_count(&db, "obs"), 0, "row must be pruned");
@@ -720,6 +884,15 @@ fn r20_legacy_rows_without_created_at_survive() {
     );
 
     // --- Part B: integration test — ALTER TABLE SET RETAIN prunes old rows ---
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute("CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT)", &p())
         .unwrap();
@@ -731,7 +904,8 @@ fn r20_legacy_rows_without_created_at_survive() {
     db.execute("ALTER TABLE obs SET RETAIN 1 SECONDS", &p())
         .unwrap();
 
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the row's stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
     db.run_pruning_cycle();
 
     // The row was inserted by the engine, so it HAS created_at and IS old → pruned
@@ -748,6 +922,17 @@ fn r20_legacy_rows_without_created_at_survive() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r21_in_memory_retention_works() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 2 SECONDS",
@@ -757,9 +942,10 @@ fn r21_in_memory_retention_works() {
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'old')", &p())
         .unwrap();
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the old row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, AtomicOrdering::SeqCst);
 
-    // Insert a young row AFTER the sleep — must survive
+    // Insert a young row AFTER the advance — must survive
     db.execute("INSERT INTO obs (id, data) VALUES (2, 'young')", &p())
         .unwrap();
 
@@ -783,6 +969,14 @@ fn r21_in_memory_retention_works() {
 fn r22_pruning_does_not_fire_commit_event() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(Ordering::SeqCst))
+    };
 
     let commit_count = Arc::new(AtomicU64::new(0));
     let counter = commit_count.clone();
@@ -816,7 +1010,8 @@ fn r22_pruning_does_not_fire_commit_event() {
     // Record commit count after setup (CREATE TABLE + INSERT = 2 autocommits)
     let baseline = commit_count.load(Ordering::SeqCst);
 
-    thread::sleep(Duration::from_secs(3));
+    // Advance 3 s past the row's stamped time — beyond the 2 s TTL.
+    mock_now.fetch_add(3_000, Ordering::SeqCst);
     db.run_pruning_cycle();
 
     let after_prune = commit_count.load(Ordering::SeqCst);
@@ -899,6 +1094,19 @@ fn r24_alter_set_retain_overwrites() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r25_background_pruning_loop() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    // The background loop reads the REAL clock (engine-internal thread — the
+    // thread-local test clock cannot reach it). So instead of sleeping the
+    // row past its TTL, stamp it in the distant past via the mock clock on
+    // THIS thread: it is already expired the moment the loop first looks.
+    let mock_now = Arc::new(AtomicU64::new(1_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS",
@@ -906,22 +1114,24 @@ fn r25_background_pruning_loop() {
     )
     .unwrap();
 
-    // Set a short pruning interval for testing (100ms)
-    db.set_pruning_interval(Duration::from_millis(100));
-
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'auto-pruned')", &p())
         .unwrap();
     assert_eq!(row_count(&db, "obs"), 1);
 
-    // Wait long enough for TTL to expire AND the background loop to run
-    thread::sleep(Duration::from_secs(3));
+    // Start the background loop only after the seed assertion (the row is
+    // already expired, so starting it earlier would race that assertion).
+    db.set_pruning_interval(Duration::from_millis(100));
 
-    // Row should be gone WITHOUT manual run_pruning_cycle()
-    assert_eq!(
-        row_count(&db, "obs"),
-        0,
-        "background pruning loop must automatically prune expired rows"
-    );
+    // Bounded poll on the real condition — a failure ceiling, not a timing
+    // assertion. The row must vanish WITHOUT any manual run_pruning_cycle().
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while row_count(&db, "obs") != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background pruning loop must automatically prune expired rows"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1207,13 @@ fn r27_pruning_thread_stops_on_drop() {
 #[test]
 fn r28_concurrent_prune_and_insert() {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
 
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -1005,7 +1222,8 @@ fn r28_concurrent_prune_and_insert() {
     )
     .unwrap();
 
-    // Seed some rows
+    // Seed some rows at the mock epoch, then advance past the TTL — the old
+    // rows age without any real sleep.
     for i in 0..10 {
         db.execute(
             &format!("INSERT INTO obs (id, data) VALUES ({i}, 'row-{i}')"),
@@ -1014,11 +1232,18 @@ fn r28_concurrent_prune_and_insert() {
         .unwrap();
     }
 
-    thread::sleep(Duration::from_secs(2));
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
 
-    // Spawn a thread that inserts + selects while pruning runs
+    // Spawn a thread that inserts + selects while pruning runs. The inserter
+    // is TEST-owned, so it installs its own guard over the SAME mock clock —
+    // its rows are stamped at the advanced (young) time.
     let db2 = db.clone();
+    let inserter_clock = Arc::clone(&mock_now);
     let inserter = thread::spawn(move || {
+        let _clock = {
+            let c = Arc::clone(&inserter_clock);
+            Wallclock::test_clock_guard(move || c.load(AtomicOrdering::SeqCst))
+        };
         for i in 100..110 {
             db2.execute(
                 &format!("INSERT INTO obs (id, data) VALUES ({i}, 'new-{i}')"),
@@ -1050,6 +1275,17 @@ fn r28_concurrent_prune_and_insert() {
 // ---------------------------------------------------------------------------
 #[test]
 fn mr1_ann_accuracy_after_vector_pruning() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE docs (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(3)) RETAIN 1 SECONDS",
@@ -1074,9 +1310,10 @@ fn mr1_ann_accuracy_after_vector_pruning() {
         .unwrap();
     }
 
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the old vectors' stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
 
-    // Insert young vectors AFTER sleep — they survive pruning.
+    // Insert young vectors AFTER the advance — they survive pruning.
     let mut new_ids = Vec::new();
     for i in 0..5 {
         let id = uuid::Uuid::new_v4();
@@ -1139,6 +1376,17 @@ fn mr1_ann_accuracy_after_vector_pruning() {
 // ---------------------------------------------------------------------------
 #[test]
 fn mr2_graph_edge_cleanup_after_prune_reopen() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mr2.db");
 
@@ -1172,7 +1420,7 @@ fn mr2_graph_edge_cleanup_after_prune_reopen() {
         db.execute("INSERT INTO nodes (id, name) VALUES ($id, $name)", &params2)
             .unwrap();
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         db.insert_edge(tx, id1, id2, "LINKS".to_string(), HashMap::new())
             .unwrap();
         db.commit(tx).unwrap();
@@ -1182,7 +1430,8 @@ fn mr2_graph_edge_cleanup_after_prune_reopen() {
         let edge_count = db.edge_count(id1, "LINKS", snapshot).unwrap();
         assert_eq!(edge_count, 1, "edge must exist before pruning");
 
-        thread::sleep(Duration::from_secs(2));
+        // Advance 2 s past the nodes' stamped time — beyond the 1 s TTL.
+        mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
         let pruned = db.run_pruning_cycle();
         assert!(pruned > 0, "nodes must be pruned");
 
@@ -1215,6 +1464,17 @@ fn mr2_graph_edge_cleanup_after_prune_reopen() {
 // ---------------------------------------------------------------------------
 #[test]
 fn mr3_lsn_stamped_and_sync_safe_pruning() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE obs (id INTEGER PRIMARY KEY, data TEXT) RETAIN 1 SECONDS SYNC SAFE",
@@ -1225,7 +1485,8 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
     db.execute("INSERT INTO obs (id, data) VALUES (1, 'row1')", &p())
         .unwrap();
 
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the row's stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
 
     // With watermark at 0 and row lsn at 0, the row is "unsynced" (lsn >= watermark).
     // Sync-safe must NOT prune it.
@@ -1253,6 +1514,18 @@ fn mr3_lsn_stamped_and_sync_safe_pruning() {
 #[test]
 fn mr4_pruning_under_concurrent_read() {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    // The reader thread below only runs SELECTs (no row-stamp writes) and its own
+    // pacing sleep, so the thread-local mock clock on this test thread governs all
+    // row stamping and the synchronous prune drive.
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
 
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -1270,7 +1543,8 @@ fn mr4_pruning_under_concurrent_read() {
         .unwrap();
     }
 
-    thread::sleep(Duration::from_secs(2));
+    // Advance 2 s past the rows' stamped time — beyond the 1 s TTL.
+    mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
 
     // Spawn reader that does SELECT while pruning runs.
     let db2 = db.clone();
@@ -1306,6 +1580,17 @@ fn mr4_pruning_under_concurrent_read() {
 // ---------------------------------------------------------------------------
 #[test]
 fn mr5_persistence_round_trip_with_pruning() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use contextdb_core::Wallclock;
+
+    let mock_now = Arc::new(AtomicU64::new(1_000_000));
+    let _clock = {
+        let mock_now = Arc::clone(&mock_now);
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mr5.db");
 
@@ -1325,7 +1610,8 @@ fn mr5_persistence_round_trip_with_pruning() {
             .unwrap();
         }
 
-        thread::sleep(Duration::from_secs(2));
+        // Advance 2 s past the rows' stamped time — beyond the 1 s TTL.
+        mock_now.fetch_add(2_000, AtomicOrdering::SeqCst);
         let pruned = db.run_pruning_cycle();
         assert!(pruned > 0, "rows must be pruned");
         assert_eq!(row_count(&db, "obs"), 0, "all rows must be pruned");
@@ -1352,14 +1638,14 @@ fn retention_wallclock_now_hoisted_once_per_pass() {
     use contextdb_engine::Database;
 
     let counter = Arc::new(AtomicU64::new(0));
-    {
+    let _clock = {
         let counter = Arc::clone(&counter);
-        Wallclock::set_test_clock(move || {
+        Wallclock::test_clock_guard(move || {
             counter.fetch_add(1, AtomicOrdering::SeqCst);
             // Return a fixed "far future" wall-clock millis reading so every candidate is past the horizon.
             10_000_000_000u64
-        });
-    }
+        })
+    };
 
     let db = Database::open_memory();
     db.execute(
@@ -1371,7 +1657,7 @@ fn retention_wallclock_now_hoisted_once_per_pass() {
     // Insert 100 rows with created_at well before the mock clock's 10_000_000_000 reading
     // (arbitrary small millis — 1-second TTL is easily exceeded).
     for _ in 0..100 {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut row = std::collections::HashMap::new();
         row.insert("id".to_string(), Value::Uuid(uuid::Uuid::new_v4()));
         row.insert("created_at".to_string(), Value::Timestamp(1_000));
@@ -1390,8 +1676,6 @@ fn retention_wallclock_now_hoisted_once_per_pass() {
         reads, 1,
         "retention pass must read Wallclock::now() exactly once per pass; got {reads} reads across 100 candidate rows"
     );
-
-    Wallclock::reset_test_clock();
 }
 
 // ======== T32 ========
@@ -1404,10 +1688,10 @@ fn retention_tolerates_ntp_backward_jump() {
     use contextdb_engine::Database;
 
     let mock_now = Arc::new(AtomicU64::new(1000));
-    {
+    let _clock = {
         let mock_now = Arc::clone(&mock_now);
-        Wallclock::set_test_clock(move || mock_now.load(AtomicOrdering::SeqCst));
-    }
+        Wallclock::test_clock_guard(move || mock_now.load(AtomicOrdering::SeqCst))
+    };
 
     let db = Database::open_memory();
     db.execute(
@@ -1421,7 +1705,7 @@ fn retention_tolerates_ntp_backward_jump() {
     let mut row = std::collections::HashMap::new();
     row.insert("id".to_string(), Value::Uuid(id));
     row.insert("created_at".to_string(), Value::Timestamp(1_000));
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_row(tx, "t", row).expect("insert must succeed");
     db.commit(tx).expect("commit must succeed");
 
@@ -1442,6 +1726,4 @@ fn retention_tolerates_ntp_backward_jump() {
         Value::Int64(1),
         "row with created_at > now must survive pruning (saturating_sub semantics)"
     );
-
-    Wallclock::reset_test_clock();
 }

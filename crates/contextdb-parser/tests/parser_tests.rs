@@ -1404,3 +1404,19 @@ fn insert_without_column_list() {
     assert_eq!(ins.values.len(), 1);
     assert_eq!(ins.values[0].len(), 2);
 }
+
+#[test]
+fn ddl_reject_banned_features_inside_fk_clause() {
+    let cases = [
+        "CREATE TABLE child (c1 INTEGER, c2 INTEGER, FOREIGN KEY (lower(c1), c2) REFERENCES parent(a, b))",
+        "CREATE TABLE child (c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b) ON DELETE CASCADE)",
+        "CREATE TABLE child (c1 INTEGER, c2 INTEGER, FOREIGN KEY (c1, c2) REFERENCES parent(a, b) MATCH FULL)",
+    ];
+
+    for sql in cases {
+        assert!(
+            parse(sql).is_err(),
+            "parser must reject banned FK syntax: {sql}"
+        );
+    }
+}

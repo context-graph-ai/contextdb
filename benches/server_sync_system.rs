@@ -67,7 +67,7 @@ fn build_insert_script(count: usize) -> String {
 
 fn append_offline_rows(path: &Path, start: usize, count: usize) {
     let db = Database::open(path).expect("open edge db for offline backlog append");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for i in start..start + count {
         db.insert_row(
             tx,

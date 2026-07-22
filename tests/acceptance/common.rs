@@ -1,31 +1,43 @@
 #![allow(dead_code)]
 
-use contextdb_core::{Direction, Error, Lsn, Value, VectorIndexRef, VersionedRow};
+#[cfg(feature = "nats-tests")]
+use contextdb_core::Lsn;
+use contextdb_core::{Direction, Error, Value, VectorIndexRef, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
+#[cfg(feature = "nats-tests")]
 use contextdb_server::protocol::{
     MessageType, PullRequest, PullResponse, PushRequest, PushResponse, decode, encode,
 };
+#[cfg(feature = "nats-tests")]
 use contextdb_server::subjects::{pull_subject, push_subject};
+#[cfg(feature = "nats-tests")]
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, LazyLock, Once, mpsc};
+#[cfg(feature = "nats-tests")]
+use std::sync::LazyLock;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+#[cfg(feature = "nats-tests")]
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+#[cfg(feature = "nats-tests")]
 use testcontainers::runners::AsyncRunner;
+#[cfg(feature = "nats-tests")]
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+#[cfg(feature = "nats-tests")]
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
-static BUILD_RELEASE_BINARIES: Once = Once::new();
+#[cfg(feature = "nats-tests")]
 static NATS_TEST_LOCK: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
+#[cfg(feature = "nats-tests")]
 pub(crate) struct NatsFixture {
     _lock: OwnedSemaphorePermit,
     _container: ContainerAsync<GenericImage>,
@@ -41,45 +53,59 @@ pub(crate) fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn target_dir() -> PathBuf {
-    workspace_root().join("target").join("release")
-}
-
 pub(crate) fn cli_bin() -> PathBuf {
-    let mut path = target_dir().join("contextdb-cli");
-    if cfg!(windows) {
-        path.set_extension("exe");
+    if let Some(path) = option_env!("CARGO_BIN_EXE_contextdb-cli") {
+        return PathBuf::from(path);
     }
-    path
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb-cli") {
+        return PathBuf::from(path);
+    }
+    workspace_binary_path("contextdb-cli")
 }
 
 pub(crate) fn server_bin() -> PathBuf {
-    let mut path = target_dir().join("contextdb-server");
-    if cfg!(windows) {
-        path.set_extension("exe");
+    if let Some(path) = option_env!("CARGO_BIN_EXE_contextdb-server") {
+        return PathBuf::from(path);
     }
-    path
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb-server") {
+        return PathBuf::from(path);
+    }
+    workspace_binary_path("contextdb-server")
+}
+
+fn workspace_binary_path(binary: &str) -> PathBuf {
+    let binary = binary_name(binary);
+    let release = workspace_root()
+        .join("target")
+        .join("release")
+        .join(&binary);
+    if release.exists() {
+        return release;
+    }
+    let debug = workspace_root().join("target").join("debug").join(&binary);
+    if debug.exists() {
+        return debug;
+    }
+    release
+}
+
+fn binary_name(binary: &str) -> String {
+    if cfg!(windows) {
+        format!("{binary}.exe")
+    } else {
+        binary.to_string()
+    }
 }
 
 pub(crate) fn ensure_release_binaries() {
-    BUILD_RELEASE_BINARIES.call_once(|| {
-        let status = Command::new("cargo")
-            .current_dir(workspace_root())
-            .args([
-                "build",
-                "--release",
-                "-p",
-                "contextdb-cli",
-                "-p",
-                "contextdb-server",
-            ])
-            .status()
-            .expect("release build command should start");
-        assert!(
-            status.success(),
-            "release build for CLI/server should succeed"
-        );
-    });
+    let cli = cli_bin();
+    let server = server_bin();
+    assert!(
+        cli.exists() && server.exists(),
+        "contextdb CLI/server binaries must be built before acceptance tests run; looked for {} and {}. Run `cargo build --release -p contextdb-cli -p contextdb-server` before invoking CLI/server acceptance tests directly.",
+        cli.display(),
+        server.display()
+    );
 }
 
 pub(crate) fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -267,6 +293,7 @@ pub(crate) fn wait_for_child_stdout_contains(
     })
 }
 
+#[cfg(feature = "nats-tests")]
 pub(crate) async fn start_nats() -> NatsFixture {
     let lock = NATS_TEST_LOCK
         .clone()
@@ -302,6 +329,7 @@ pub(crate) async fn start_nats() -> NatsFixture {
     }
 }
 
+#[cfg(feature = "nats-tests")]
 pub(crate) async fn wait_for_sync_server_ready(
     nats_url: &str,
     tenant_id: &str,
@@ -396,6 +424,7 @@ pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context
     }
 }
 
+#[cfg(feature = "nats-tests")]
 async fn wait_for_path(path: &Path, timeout: Duration) {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -426,7 +455,7 @@ pub(crate) async fn push_change_through_server(
     )
     .expect("create edge schema");
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
         .expect("insert edge row");
@@ -439,10 +468,12 @@ pub(crate) async fn push_change_through_server(
     .expect("insert edge vector");
     db.commit(tx).expect("commit edge row");
 
-    let client = contextdb_server::SyncClient::new(db, nats_url, tenant_id);
+    let client =
+        contextdb_server::SyncClient::new(db, nats_url, contextdb_core::TenantId::from(tenant_id));
     client.push().await.expect("push change through server");
 }
 
+#[cfg(feature = "nats-tests")]
 pub(crate) async fn push_many_changes_through_server(
     nats_url: &str,
     tenant_id: &str,
@@ -461,7 +492,7 @@ pub(crate) async fn push_many_changes_through_server(
     )
     .expect("create edge schema");
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (offset, id) in ids.into_iter().enumerate() {
         let row_id = db
             .insert_row(tx, table, values(vec![("id", Value::Uuid(id))]))
@@ -507,7 +538,7 @@ pub(crate) async fn push_many_changes_through_server(
         let _ = started.send(());
     }
 
-    let msg = tokio::time::timeout(Duration::from_secs(15), inbox_sub.next())
+    let msg = tokio::time::timeout(Duration::from_secs(45), inbox_sub.next())
         .await
         .expect("direct push must respond after graceful drain")
         .expect("direct push inbox must stay open");
@@ -612,7 +643,7 @@ pub(crate) fn setup_graph_entities(db: &Database, ids: &[Uuid]) {
         &empty_params(),
     )
     .expect("create entities table");
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     for (index, id) in ids.iter().enumerate() {
         db.insert_row(
             tx,
@@ -636,7 +667,7 @@ pub(crate) fn setup_vector_table(db: &Database, dimension: usize) {
 }
 
 pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64 {
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let row_id = db
         .insert_row(tx, "embeddings", values(vec![("id", Value::Uuid(id))]))
         .expect("insert embedding row");

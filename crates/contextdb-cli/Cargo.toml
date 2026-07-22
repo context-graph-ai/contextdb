@@ -19,8 +19,9 @@ path = "src/main.rs"
 [dependencies]
 contextdb-engine = { path = "../contextdb-engine", version = "1.0" }
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
-contextdb-server = { path = "../contextdb-server", version = "1.0" }
+contextdb-server = { path = "../contextdb-server", version = "1.0", features = ["iroh"] }
 rustyline.workspace = true
+serde_json.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

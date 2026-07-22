@@ -22,6 +22,16 @@ impl StoredVectorEntry {
         }
     }
 
+    pub fn from_vector_entry_ref(entry: &VectorEntry, quantization: VectorQuantization) -> Self {
+        Self {
+            row_id: entry.row_id,
+            vector: StoredVector::from_f32(&entry.vector, quantization),
+            created_tx: entry.created_tx,
+            deleted_tx: entry.deleted_tx,
+            lsn: entry.lsn,
+        }
+    }
+
     pub fn to_vector_entry(&self, index: VectorIndexRef) -> VectorEntry {
         VectorEntry {
             index,

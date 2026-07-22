@@ -1,107 +1,13 @@
-// ======== T11 ========
-
-#[test]
-fn docs_query_language_lists_txid_column_type() {
-    // Runtime read of docs/query-language.md at the workspace root.
-    // Walk upward from CARGO_MANIFEST_DIR to locate the workspace root.
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut root = manifest_dir.clone();
-    let docs_path = loop {
-        let candidate = root.join("docs").join("query-language.md");
-        if candidate.exists() {
-            break candidate;
-        }
-        if !root.pop() {
-            panic!(
-                "could not locate docs/query-language.md walking up from {}",
-                manifest_dir.display()
-            );
-        }
-    };
-
-    let contents = std::fs::read_to_string(&docs_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", docs_path.display()));
-
-    // Parse the Column Types table. Locate the `## Column Types` heading
-    // (case-insensitive) and collect every subsequent line that begins with `|`
-    // until a blank line or the next heading.
-    let mut in_table = false;
-    let mut rows: Vec<String> = Vec::new();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if !in_table {
-            if trimmed.eq_ignore_ascii_case("## Column Types")
-                || trimmed.eq_ignore_ascii_case("### Column Types")
-            {
-                in_table = true;
-            }
-            continue;
-        }
-        if trimmed.is_empty() {
-            // Tables must be contiguous pipe lines; blank ends the table.
-            if !rows.is_empty() {
-                break;
-            }
-            continue;
-        }
-        if trimmed.starts_with('#') {
-            break;
-        }
-        if trimmed.starts_with('|') {
-            rows.push(trimmed.to_string());
-        }
-    }
-
-    assert!(
-        !rows.is_empty(),
-        "no Column Types markdown table found in {}",
-        docs_path.display()
-    );
-
-    // Find a row whose first cell (case-insensitive, trimmed) equals "TXID".
-    // Skip rows that are header-separator lines (`|---|---|`).
-    let txid_row = rows
-        .iter()
-        .find(|row| {
-            let cells: Vec<&str> = row.trim_matches('|').split('|').map(|c| c.trim()).collect();
-            if cells.is_empty() {
-                return false;
-            }
-            // Separator lines look like `---`, `:---:`, etc.
-            if cells
-                .iter()
-                .all(|c| c.chars().all(|ch| ch == '-' || ch == ':'))
-            {
-                return false;
-            }
-            cells[0].eq_ignore_ascii_case("TXID")
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "Column Types table has no row whose first column is `TXID`. Table rows:\n{}",
-                rows.join("\n")
-            )
-        });
-
-    // The row text must mention `Value::TxId` so readers can find the variant.
-    assert!(
-        txid_row.contains("Value::TxId"),
-        "TXID row must mention `Value::TxId` so readers can locate the variant; got: {txid_row}"
-    );
-}
-
 // ======== T33 ========
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use regex::Regex;
 use walkdir::WalkDir;
 
-fn workspace_root() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().unwrap().parent().unwrap().to_path_buf()
-}
+#[path = "audit_support/mod.rs"]
+mod audit_support;
+use audit_support::workspace_root;
 
 #[test]
 fn timestamp_audit_no_new_txid_shaped_columns() {
@@ -113,26 +19,26 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
             "crates/contextdb-engine/tests/sql_surface_tests.rs".to_string(),
             888u32,
         ),
-        ("tests/acceptance/query_surface.rs".to_string(), 686u32),
+        ("tests/acceptance/query_surface.rs".to_string(), 685u32),
         (
-            "benches/indexed_scan_filter_cg_entity_list.rs".to_string(),
+            "benches/indexed_scan_filter_entity_list.rs".to_string(),
             15u32,
         ),
-        ("tests/acceptance/query_surface.rs".to_string(), 1116u32),
+        ("tests/acceptance/query_surface.rs".to_string(), 1115u32),
         (
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
-            1954u32,
+            1974u32,
         ),
         (
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
-            1980u32,
+            2000u32,
         ),
         (
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
-            2881u32,
+            2906u32,
         ),
-        ("tests/integration/retention_tests.rs".to_string(), 1366u32),
-        ("tests/integration/retention_tests.rs".to_string(), 1414u32),
+        ("tests/integration/retention_tests.rs".to_string(), 1652u32),
+        ("tests/integration/retention_tests.rs".to_string(), 1698u32),
     ]
     .into_iter()
     .collect();

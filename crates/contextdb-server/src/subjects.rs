@@ -9,3 +9,7 @@ pub fn pull_subject(tenant_id: &str) -> String {
 pub fn command_subject(tenant_id: &str, command: &str) -> String {
     format!("sync.{tenant_id}.command.{command}")
 }
+
+pub fn status_subject(tenant_id: &str) -> String {
+    format!("sync.{tenant_id}.status")
+}

@@ -1,7 +1,6 @@
 // ======== T34 ========
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 // Forces a hard compile dependency on the wrappers existing publicly.
 // If A4 regresses and the wrappers are removed, this test file fails to compile.
@@ -11,10 +10,9 @@ use contextdb_core::{AtomicLsn, AtomicTxId};
 use regex::Regex;
 use walkdir::WalkDir;
 
-fn workspace_root() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().unwrap().parent().unwrap().to_path_buf()
-}
+#[path = "audit_support/mod.rs"]
+mod audit_support;
+use audit_support::workspace_root;
 
 #[test]
 fn atomic_wrapper_only_five_methods_used_on_typed_atomics() {

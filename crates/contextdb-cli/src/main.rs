@@ -7,18 +7,35 @@ use tracing::debug;
 use contextdb_cli::{auto_sync, repl};
 
 #[derive(Parser)]
-#[command(name = "contextdb-cli", version)]
+#[command(
+    name = "contextdb-cli",
+    version,
+    after_help = "EXAMPLES:\n  \
+        contextdb-cli mydata.db\n    \
+            Open (or create) a local database and start the interactive shell.\n\n  \
+        echo \"SELECT * FROM decisions LIMIT 5\" | contextdb-cli mydata.db\n    \
+            Pipe one or more SQL statements in non-interactively and exit.\n\n  \
+        contextdb-cli :memory:\n    \
+            Open a throwaway in-memory database.\n\n  \
+        contextdb-cli mydata.db --sync-endpoint <server-ticket> --tenant-id acme\n    \
+            Open the database and connect to a contextdb-server using the enrollment\n    \
+            ticket it printed (see `contextdb-server --help`).\n\n  \
+        In the shell: .help propagate\n    \
+            Show the PROPAGATE DDL grammar with a worked example."
+)]
 struct Args {
     /// Database path (:memory: for in-memory). Use `.help vector` for vector index syntax.
     path: String,
 
-    /// NATS URL for sync (WebSocket for edge)
-    #[arg(
-        long,
-        env = "CONTEXTDB_NATS_URL",
-        default_value = "ws://localhost:9222"
-    )]
-    nats_url: String,
+    /// Sync endpoint: the server's enrollment ticket (paste it verbatim).
+    #[arg(long, env = "CONTEXTDB_SYNC_ENDPOINT")]
+    sync_endpoint: Option<String>,
+
+    /// DEPRECATED: broker URL for the retained NATS adapter (requires a
+    /// contextdb-server build with the `nats` cargo feature). Use
+    /// --sync-endpoint instead.
+    #[arg(long, env = "CONTEXTDB_NATS_URL")]
+    nats_url: Option<String>,
 
     /// Tenant ID for sync
     #[arg(long, env = "CONTEXTDB_TENANT_ID")]
@@ -35,6 +52,17 @@ struct Args {
     /// Debounce interval for background auto-sync pushes.
     #[arg(long, env = "CONTEXTDB_SYNC_DEBOUNCE_MS", default_value_t = 500)]
     sync_debounce_ms: u64,
+
+    /// Emit query results as a JSON array of row objects (uncapped) instead of a
+    /// table, for scripts and agents. Non-query statements print a small JSON
+    /// status object.
+    #[arg(long)]
+    json: bool,
+
+    /// Print every row of a query result, disabling the default 100-row cap on
+    /// table output.
+    #[arg(long)]
+    all: bool,
 }
 
 fn main() {
@@ -125,10 +153,48 @@ fn main() {
             .enable_all()
             .build()
             .expect("failed to create tokio runtime");
+        let endpoint = args
+            .sync_endpoint
+            .clone()
+            .or_else(|| {
+                args.nats_url.as_ref().map(|url| {
+                    eprintln!(
+                        "Warning: --nats-url is deprecated; use --sync-endpoint with the server's ticket."
+                    );
+                    url.clone()
+                })
+            })
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "Error: --tenant-id needs a sync endpoint. Pass --sync-endpoint with the server's ticket."
+                );
+                std::process::exit(1);
+            });
+        // A bare ticket gets the edge's own fabric identity pinned to it
+        // (derived from the database path), so this machine dials as its
+        // enrolled identity instead of an ephemeral key. In-memory databases
+        // have no data root and stay ephemeral.
+        let endpoint = {
+            use contextdb_server::transport::iroh::EndpointSpec;
+            match EndpointSpec::parse(&endpoint) {
+                Some(spec)
+                    if spec.dial_ticket().is_some()
+                        && spec.identity_path().is_none()
+                        && args.path != ":memory:" =>
+                {
+                    format!(
+                        "iroh:?to={}&identity={}.fabric-identity.key",
+                        spec.dial_ticket().expect("checked above"),
+                        args.path
+                    )
+                }
+                _ => endpoint,
+            }
+        };
         let client = Arc::new(contextdb_server::SyncClient::new(
             db.clone(),
-            &args.nats_url,
-            tenant_id,
+            &endpoint,
+            contextdb_core::TenantId::from(tenant_id.as_str()),
         ));
         (rt, client)
     });
@@ -138,11 +204,22 @@ fn main() {
         None => (None, None),
     };
 
-    if !interactive && let (Some(rt), Some(client)) = (rt, sync_client) {
-        let _ = rt.block_on(async {
-            tokio::time::timeout(Duration::from_millis(750), client.ensure_connected()).await
-        });
-    }
+    let probe_handle = if !interactive && let (Some(rt), Some(client)) = (rt, sync_client) {
+        // Warm the sync connection in the background. Never wrap this in a
+        // timeout that abandons the future: dropping a mid-dial endpoint
+        // aborts it ungracefully (a scary transport ERROR on stderr). A down
+        // endpoint surfaces as one clear warning instead of silence. The
+        // handle is settled before shutdown so a late-finishing probe can
+        // never store an endpoint after the state was drained.
+        let probe = Arc::clone(client);
+        Some(rt.spawn(async move {
+            if let Err(err) = probe.ensure_connected().await {
+                eprintln!("Warning: sync endpoint unreachable: {err}");
+            }
+        }))
+    } else {
+        None
+    };
 
     // Spawn background debounced push task if sync is configured.
     let push_handle = if let (Some(rt_ref), Some(client), Some(rx)) = (rt, sync_client, push_rx) {
@@ -159,7 +236,23 @@ fn main() {
                 let client = client_clone.clone();
                 let plugin = plugin_clone.clone();
                 async move {
-                    let result = client.push().await.map_err(|err| err.to_string())?;
+                    let result = match client.push().await {
+                        Ok(result) => result,
+                        Err(contextdb_core::Error::SyncPushUnconfirmed { detail }) => {
+                            // Interrupted after the batch was sent: the data may
+                            // already have landed on the hub. This is NOT a
+                            // failure — auto-sync will re-push, which reconciles
+                            // idempotently whether or not the batch committed.
+                            eprintln!(
+                                "Background auto-sync push was interrupted before the hub acknowledged: {detail}. It will re-push to reconcile."
+                            );
+                            return Ok(auto_sync::PushOutcome {
+                                conflicts: Vec::new(),
+                                caught_up: false,
+                            });
+                        }
+                        Err(err) => return Err(err.to_string()),
+                    };
                     Ok(auto_sync::PushOutcome {
                         conflicts: result
                             .conflicts
@@ -176,16 +269,28 @@ fn main() {
         None
     };
 
-    let mut all_ok = repl::run(
+    // Process exit code: 0 = clean, 1 = definitive error, 3 = an interrupted
+    // push whose outcome the hub could not confirm (see
+    // `repl::EXIT_INTERRUPTED_PUSH_UNCONFIRMED`). A definitive error always
+    // dominates an unconfirmed push; an unconfirmed push never downgrades a 1.
+    let mut exit_code = repl::run(
         db.clone(),
         sync_client.map(|c| c.as_ref()),
         rt,
         sync_plugin_arc.as_deref(),
+        repl::OutputOptions {
+            json: args.json,
+            all: args.all,
+        },
     );
 
     // Graceful shutdown: stop background notifications, wait for any in-flight
     // auto-sync work to finish, then do one final flush before closing the DB.
     if let Some((rt, client)) = rt_and_client {
+        if let Err(err) = db.execute("ROLLBACK", &std::collections::HashMap::new()) {
+            eprintln!("Final transaction rollback failed: {err}");
+            exit_code = 1;
+        }
         if let Some(ref plugin) = sync_plugin_arc {
             plugin.shutdown();
         }
@@ -193,22 +298,44 @@ fn main() {
             && let Err(err) = rt.block_on(handle)
         {
             eprintln!("Auto-sync worker failed during shutdown: {err}");
-            all_ok = false;
+            exit_code = 1;
         }
         match client.has_pending_push_changes() {
-            Ok(true) => {
-                if let Err(err) = rt.block_on(client.push()) {
-                    eprintln!("Final sync push failed: {err}");
-                    all_ok = false;
+            Ok(true) => match rt.block_on(client.push()) {
+                Ok(_) => {}
+                Err(contextdb_core::Error::SyncPushUnconfirmed { detail }) => {
+                    // Interrupted after send: the data may already have landed.
+                    // Not a definitive failure, but the outcome is unknown, so
+                    // exit with the distinct unconfirmed code (without
+                    // downgrading a harder error) — a `push && shutdown` caller
+                    // must not read this as a clean success. The next push
+                    // reconciles idempotently.
+                    eprintln!(
+                        "Final sync push was interrupted before the hub acknowledged: {detail}. The data may already have landed; run `.sync push` on next start to reconcile."
+                    );
+                    if exit_code == 0 {
+                        exit_code = repl::EXIT_INTERRUPTED_PUSH_UNCONFIRMED;
+                    }
                 }
-            }
+                Err(err) => {
+                    eprintln!("Final sync push failed: {err}");
+                    exit_code = 1;
+                }
+            },
             Ok(false) => {}
             Err(err) => {
                 eprintln!("Final sync preflight failed: {err}");
-                all_ok = false;
+                exit_code = 1;
             }
         }
         rt.block_on(async {
+            // Settle the startup probe first, then close the sync connection
+            // and its endpoint gracefully so exit never aborts the transport
+            // mid-flight.
+            if let Some(handle) = probe_handle {
+                let _ = handle.await;
+            }
+            client.shutdown().await;
             drop(client);
         });
     }
@@ -218,8 +345,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    if !all_ok {
-        std::process::exit(1);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }
 

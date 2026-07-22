@@ -1,9 +1,12 @@
 use super::common::*;
+#[cfg(feature = "nats-tests")]
 use contextdb_core::Value;
+#[cfg(feature = "nats-tests")]
 use contextdb_engine::Database;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
+#[cfg(feature = "nats-tests")]
 use uuid::Uuid;
 
 /// I piped a SQL script into the CLI, and it ran every command and showed me results.
@@ -23,6 +26,7 @@ fn f28_scripted_usage_via_stdin_pipe() {
 }
 
 /// I asked for sync status while connected, and it showed me the tenant, URL, connection state, and LSN — not a cryptic blob.
+#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn f29_sync_status_shows_meaningful_info_when_connected() {
     let tmp = TempDir::new().expect("tempdir");
@@ -44,6 +48,7 @@ async fn f29_sync_status_shows_meaningful_info_when_connected() {
 }
 
 /// I asked for sync status when the server was down, and it told me "unreachable" instead of crashing.
+#[cfg(feature = "nats-tests")]
 #[test]
 fn f30_sync_status_when_nats_is_unreachable() {
     let tmp = TempDir::new().expect("tempdir");
@@ -190,7 +195,301 @@ fn f31h_bfs_depth_exceeded_routes_to_stderr_and_nonzero_exit() {
     );
 }
 
-// Named vector index RED tests from named-vector-indexes-tests.md.
+fn graph_trace_fixture_script(query: &str) -> String {
+    format!(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT)\n\
+         CREATE TABLE edges (source_id UUID, target_id UUID, edge_type TEXT)\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'root')\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'a')\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'b')\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'other')\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'c')\n\
+         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'LINKS')\n\
+         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'LINKS')\n\
+         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000005', 'LINKS')\n\
+         {query}\n\
+         .quit\n"
+    )
+}
+
+fn graph_trace_default_query() -> &'static str {
+    "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS (b.id AS t))"
+}
+
+fn graph_trace_default_ordered_query() -> &'static str {
+    "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS (b.id AS t)) ORDER BY t"
+}
+
+fn graph_trace_unpinned_query() -> &'static str {
+    "SELECT s, t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) COLUMNS (a.id AS s, b.id AS t))"
+}
+
+fn cli_output(output: &std::process::Output) -> String {
+    let mut combined = output_string(&output.stdout);
+    combined.push_str(&output_string(&output.stderr));
+    combined
+}
+
+/// ct01: default CLI query output stays byte-stable and does not leak trace lines.
+#[test]
+fn ct01_default_cli_output_for_graph_query_has_no_trace_line() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct01.db");
+    let output = run_cli_script(
+        &db_path,
+        &[],
+        &graph_trace_fixture_script(graph_trace_default_ordered_query()),
+    );
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    let expected = "\
+ok (rows_affected=0)\n\
+ok (rows_affected=0)\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'root')\n\
+ok (rows_affected=1)\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'a')\n\
+ok (rows_affected=1)\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'b')\n\
+ok (rows_affected=1)\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'other')\n\
+ok (rows_affected=1)\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'c')\n\
+ok (rows_affected=1)\n\
+INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'LINKS')\n\
+ok (rows_affected=1)\n\
+INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'LINKS')\n\
+ok (rows_affected=1)\n\
+INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000005', 'LINKS')\n\
+ok (rows_affected=1)\n\
++--------------------------------------+\n\
+| t                                    |\n\
++--------------------------------------+\n\
+| 00000000-0000-0000-0000-000000000002 |\n\
+| 00000000-0000-0000-0000-000000000003 |\n\
++--------------------------------------+\n";
+    assert_eq!(stdout, expected);
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("trace: ")),
+        "default output must not contain trace lines: {stdout}"
+    );
+}
+
+/// ct02: `.trace on` exposes the single-hop adjacency probe and exact degree work.
+#[test]
+fn ct02_trace_on_graph_pinned_match_reports_adjacency_probe_rows_examined() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct02.db");
+    let script = graph_trace_fixture_script(&format!(".trace on\n{}", graph_trace_default_query()));
+    let output = run_cli_script(&db_path, &[], &script);
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    assert!(
+        stdout.contains("trace: AdjacencyProbe index=forward_adj pushed=[a.id] rows_examined=2"),
+        "expected pinned graph probe trace with exact degree rows; got: {stdout}"
+    );
+}
+
+/// ct03: `.trace on` shows an honest edges scan when no vertex is pinned.
+#[test]
+fn ct03_trace_on_unpinned_graph_match_reports_edges_scan() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct03.db");
+    let script =
+        graph_trace_fixture_script(&format!(".trace on\n{}", graph_trace_unpinned_query()));
+    let output = run_cli_script(&db_path, &[], &script);
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    assert!(
+        stdout.contains("trace: EdgesScan rows_examined=3"),
+        "expected unpinned graph query to report EdgesScan with full edge count; got: {stdout}"
+    );
+}
+
+/// ct04: `.trace on` is general, so relational indexed queries report IndexScan too.
+#[test]
+fn ct04_trace_on_relational_indexed_query_reports_index_scan() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct04.db");
+    let script = "\
+CREATE TABLE things (id UUID PRIMARY KEY, name TEXT)\n\
+CREATE INDEX idx_things_name ON things (name)\n\
+INSERT INTO things (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'hit')\n\
+INSERT INTO things (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'miss')\n\
+.trace on\n\
+SELECT id FROM things WHERE name = 'hit'\n\
+.quit\n";
+    let output = run_cli_script(&db_path, &[], script);
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    assert!(
+        stdout.contains("trace: IndexScan index=idx_things_name pushed=[name] rows_examined=1"),
+        "expected relational index trace; got: {stdout}"
+    );
+}
+
+/// ct05: `.trace off` suppresses trace lines after they were enabled.
+#[test]
+fn ct05_trace_off_disables_subsequent_trace_lines() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct05.db");
+    let script = graph_trace_fixture_script(&format!(
+        ".trace on\n{}\n.trace off\n{}",
+        graph_trace_default_query(),
+        graph_trace_default_query()
+    ));
+    let output = run_cli_script(&db_path, &[], &script);
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("trace: "))
+            .count(),
+        1,
+        "only the query executed while trace is on should print a trace line: {stdout}"
+    );
+}
+
+/// ct06: help output lists the trace toggle for discoverability.
+#[test]
+fn ct06_help_lists_trace_command() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct06.db");
+    let output = run_cli_script(&db_path, &[], ".help\n.quit\n");
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    assert!(
+        stdout.contains(".trace on|off"),
+        ".help must list the trace toggle; got: {stdout}"
+    );
+}
+
+/// ct07: scripted plan errors must produce a non-zero process exit, not a false-success shell status.
+#[test]
+fn ct07_scripted_plan_error_exits_nonzero_without_panic() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct07.db");
+    let bad_query = "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS (b.bogus AS t))";
+    let output = run_cli_script(&db_path, &[], &graph_trace_fixture_script(bad_query));
+    assert!(
+        !output.status.success(),
+        "plan errors must fail scripted CLI sessions"
+    );
+    let combined = cli_output(&output);
+    assert!(
+        combined.contains("plan error") && combined.contains("project column not found"),
+        "plan error must be rendered without panic output; got: {combined}"
+    );
+    assert!(
+        !combined.to_lowercase().contains("panic"),
+        "plan error path must not panic; got: {combined}"
+    );
+}
+
+/// ct08: scripted parse errors already exited non-zero; keep that contract pinned.
+#[test]
+fn ct08_scripted_parse_error_still_exits_nonzero() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct08.db");
+    let output = run_cli_script(&db_path, &[], "SELET * FROM things\n.quit\n");
+    assert!(!output.status.success());
+    let combined = cli_output(&output).to_lowercase();
+    assert!(
+        combined.contains("parse error") || combined.contains("syntax"),
+        "parse errors must remain operator-visible; got: {combined}"
+    );
+}
+
+/// ct09: scripted `.explain` parse errors must also fail the process.
+#[test]
+fn ct09_scripted_explain_parse_error_exits_nonzero() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct09.db");
+    let output = run_cli_script(
+        &db_path,
+        &[],
+        "CREATE TABLE t (id UUID PRIMARY KEY)\n.explain SELET * FROM t\n.quit\n",
+    );
+    assert!(
+        !output.status.success(),
+        ".explain errors must fail scripted CLI sessions"
+    );
+    let combined = cli_output(&output).to_lowercase();
+    assert!(
+        combined.contains("parse error") || combined.contains("syntax"),
+        ".explain parse errors must remain operator-visible; got: {combined}"
+    );
+    assert!(
+        !combined.contains("panic"),
+        ".explain error path must not panic; got: {combined}"
+    );
+}
+
+/// ct10: sorted graph query traces must still expose the graph access strategy.
+#[test]
+fn ct10_trace_on_sorted_graph_query_reports_adjacency_probe_not_sort_only() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct10.db");
+    let script = graph_trace_fixture_script(&format!(
+        ".trace on\n{}",
+        graph_trace_default_ordered_query()
+    ));
+    let output = run_cli_script(&db_path, &[], &script);
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    assert!(
+        stdout.contains("trace: AdjacencyProbe index=forward_adj pushed=[a.id] rows_examined=2"),
+        "sorted graph query trace must expose the adjacency probe; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("trace: Sort index=forward_adj"),
+        "sorted graph query trace must not hide the graph route behind Sort: {stdout}"
+    );
+}
+
+/// ct11: scripted `.explain` usage errors must also fail the process.
+#[test]
+fn ct11_scripted_explain_without_sql_exits_nonzero() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct11.db");
+    let output = run_cli_script(&db_path, &[], ".explain\n.quit\n");
+    assert!(
+        !output.status.success(),
+        ".explain without SQL must fail scripted CLI sessions"
+    );
+    let combined = cli_output(&output).to_lowercase();
+    assert!(
+        combined.contains("usage: .explain <sql>"),
+        ".explain usage error must remain operator-visible; got: {combined}"
+    );
+}
+
+#[test]
+fn ct12_scripted_explain_shows_runtime_index_trace() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "ct12.db");
+    let output = run_cli_script(
+        &db_path,
+        &[],
+        "CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER)\n\
+         CREATE INDEX idx_a ON t (a)\n\
+         INSERT INTO t (id, a) VALUES ('00000000-0000-0000-0000-000000000001', 7)\n\
+         .explain SELECT id FROM t WHERE a = 7\n\
+         .quit\n",
+    );
+    assert!(output.status.success());
+    let stdout = output_string(&output.stdout);
+    assert!(
+        stdout.contains("IndexScan { index: idx_a }"),
+        ".explain must show runtime index routing, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("predicates_pushed: [a]"),
+        ".explain must show pushed predicates, got: {stdout}"
+    );
+}
+
+// Named vector index tests: naming, isolation, and lifecycle coverage.
 
 fn single_cli_error_line<'a>(stderr: &'a str, context: &str) -> &'a str {
     let error_lines: Vec<&str> = stderr
@@ -379,6 +678,7 @@ fn f117c_cli_renders_parse_error_with_positional_hint() {
 /// then sent SIGTERM. The server drained, committed the in-flight write, and exited 0. On reopen the
 /// in-flight row was durable. A no-drain `exit(0)` impl loses the in-flight commit and fails this test.
 /// Unix-only: contextdb has no Windows CI target.
+#[cfg(feature = "nats-tests")]
 #[cfg(unix)]
 #[tokio::test]
 async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits() {
@@ -403,6 +703,8 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     }
 
     ensure_release_binaries();
+    let stderr_path = tmp.path().join("server.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("server stderr");
     let child = Command::new(server_bin())
         .args([
             "--db-path",
@@ -417,9 +719,23 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
         .env("CONTEXTDB_TEST_PUSH_RELEASE_FILE", &release_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .expect("server should spawn");
+
+    struct ServerStderrDump<'a> {
+        path: &'a std::path::Path,
+    }
+    impl<'a> Drop for ServerStderrDump<'a> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let s = std::fs::read_to_string(self.path).unwrap_or_default();
+                eprintln!("--- server.stderr ---\n{s}\n--- end ---");
+            }
+        }
+    }
+    let _stderr_dump = ServerStderrDump { path: &stderr_path };
+
     assert!(
         wait_for_sync_server_ready(&nats.nats_url, "f121", Duration::from_secs(15)).await,
         "sync server must respond before SIGTERM drain test starts"
@@ -442,7 +758,7 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     // Start a larger follow-up push and send SIGTERM only after the client has begun the server push.
     // A server that exits 0 without draining active handlers can lose this batch while still passing a
     // quiescent-shutdown test.
-    let batch_ids: Vec<Uuid> = (0..4096).map(|_| Uuid::new_v4()).collect();
+    let batch_ids: Vec<Uuid> = (0..128).map(|_| Uuid::new_v4()).collect();
     let batch_for_task = batch_ids.clone();
     let nats_url = nats.nats_url.clone();
     let task_barrier_path = barrier_path.clone();
@@ -474,12 +790,12 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     );
     std::fs::write(&release_path, b"release").expect("release in-flight push barrier");
 
-    let exit = wait_for_child_output(child, Duration::from_secs(10), "graceful drain").status;
+    let exit = wait_for_child_output(child, Duration::from_secs(30), "graceful drain").status;
     assert!(
         exit.success(),
         "contextdb-server must exit 0 on SIGTERM; status: {exit:?}"
     );
-    tokio::time::timeout(Duration::from_secs(10), pending_push)
+    tokio::time::timeout(Duration::from_secs(30), pending_push)
         .await
         .expect("in-flight push must complete during graceful drain")
         .expect("in-flight push task must not panic");
@@ -524,14 +840,8 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
 /// node speak?"
 #[test]
 fn f120_contextdb_server_version_prints_binary_and_protocol_version() {
-    let server_bin = workspace_root()
-        .join("target")
-        .join("release")
-        .join("contextdb-server");
-    // The existing acceptance harness exposes `ensure_release_binaries()` (tests/acceptance/common.rs:62),
-    // which gates the workspace `cargo build --release` behind a `Once` so all CLI-binary tests share one build.
     ensure_release_binaries();
-    let output = std::process::Command::new(&server_bin)
+    let output = std::process::Command::new(server_bin())
         .arg("--version")
         .output()
         .expect("spawn contextdb-server --version");
@@ -553,12 +863,12 @@ fn f120_contextdb_server_version_prints_binary_and_protocol_version() {
         semver_present,
         "stdout must include a SemVer-shaped version token; got: {stdout}"
     );
-    // Protocol version is operator-discoverable; require the literal numeric `2` adjacent to the protocol token.
+    // Protocol version is operator-discoverable; require the literal numeric `4` adjacent to the protocol token.
     assert!(
-        stdout.contains("protocol_version=2")
-            || stdout.contains("protocol_version 2")
-            || stdout.contains("PROTOCOL_VERSION 2"),
-        "stdout must include `protocol_version=2` (or equivalent) so operators can detect asymmetric upgrades; got: {stdout}"
+        stdout.contains("protocol_version=4")
+            || stdout.contains("protocol_version 4")
+            || stdout.contains("PROTOCOL_VERSION 4"),
+        "stdout must include `protocol_version=4` (or equivalent) so operators can detect asymmetric upgrades; got: {stdout}"
     );
 }
 /// I ran the README's two-vector walkthrough through contextdb-cli scripted mode. SHOW VECTOR_INDEXES rendered

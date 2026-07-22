@@ -419,6 +419,7 @@ fn wire_struct_round_trip_byte_identical() {
         values: HashMap::new(),
         deleted: false,
         lsn: Lsn(11),
+        created_at: None,
     };
     let rc_bytes = encode_to_vec(&row_change, cfg).expect("encode RowChange");
     let (rc_back, _): (RowChange, usize) =
@@ -437,6 +438,8 @@ fn wire_struct_round_trip_byte_identical() {
         values: HashMap<String, Value>,
         deleted: bool,
         lsn: u64,
+        // `Option<Wallclock>` must encode exactly like `Option<u64>`.
+        created_at: Option<u64>,
     }
     let rc_mirror = RowChangeMirror {
         table: "t".into(),
@@ -447,6 +450,7 @@ fn wire_struct_round_trip_byte_identical() {
         values: HashMap::new(),
         deleted: false,
         lsn: 11,
+        created_at: None,
     };
     let rc_mirror_bytes = encode_to_vec(&rc_mirror, cfg).expect("encode RowChange mirror");
     assert_eq!(
@@ -760,6 +764,13 @@ fn semantic_bridges_are_inline_and_zero_cost() {
 #[test]
 fn wallclock_seam_enables_clock_injection() {
     use contextdb_core::Wallclock;
+
+    // Safety net: if an assertion below panics between set and clear, this
+    // guard's unwind drop restores the clean no-mock state instead of leaking
+    // the 2000-clock to later tests on this thread under --test-threads=1.
+    // The set/clear pair itself stays the API under test.
+    let _leak_guard = Wallclock::test_clock_guard(|| 0);
+    Wallclock::clear_test_clock();
 
     // Install mock clock returning a fixed value.
     Wallclock::set_test_clock(|| 2000);

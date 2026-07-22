@@ -155,6 +155,21 @@ impl Wallclock {
         });
     }
 
+    /// Test seam: install a clock closure and get an RAII guard that restores
+    /// the previously-installed clock (or none) when dropped — including
+    /// during panic unwinding. Tests should prefer this over a trailing
+    /// `reset_test_clock()`, which is skipped when an assertion panics first
+    /// and leaks the override to later tests on the same thread under
+    /// `--test-threads=1`.
+    #[must_use]
+    pub fn test_clock_guard<F>(f: F) -> WallclockTestClockGuard
+    where
+        F: Fn() -> u64 + Send + Sync + 'static,
+    {
+        let previous = WALLCLOCK_TEST_CLOCK.with(|slot| slot.borrow_mut().replace(Arc::new(f)));
+        WallclockTestClockGuard { previous }
+    }
+
     /// Test seam alias used by TU10 — same semantics as `reset_test_clock`.
     pub fn clear_test_clock() {
         Self::reset_test_clock();
@@ -164,6 +179,21 @@ impl Wallclock {
     #[inline]
     fn test_clock() -> Option<WallclockFn> {
         WALLCLOCK_TEST_CLOCK.with(|slot| slot.borrow().clone())
+    }
+}
+
+/// RAII guard from [`Wallclock::test_clock_guard`]: restores the previously
+/// installed thread-local test clock (or none) on drop, panic-safe.
+pub struct WallclockTestClockGuard {
+    previous: Option<WallclockFn>,
+}
+
+impl Drop for WallclockTestClockGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        WALLCLOCK_TEST_CLOCK.with(|slot| {
+            *slot.borrow_mut() = previous;
+        });
     }
 }
 
@@ -344,6 +374,84 @@ pub enum DirectedValue {
 }
 
 pub type IndexKey = Vec<DirectedValue>;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ContextId(pub Uuid);
+
+impl ContextId {
+    pub fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+/// A sync tenant identifier. A newtype (like [`ContextId`]) so a tenant id is
+/// unambiguous at the call site of the sync surface and cannot be silently
+/// swapped with another bare string. The inner value is private; construct one
+/// with `TenantId::from(..)`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TenantId(String);
+
+impl TenantId {
+    /// Borrow the inner id (for wire subjects, tracing, and validation).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Build a persisted/config key for this tenant. This is the ONE place the
+    /// `"<prefix>:<tenant_id>"` key format is authored — the persisted watermark
+    /// keys (`sync_push_watermark:*`, `sync_pull_watermark:*`,
+    /// `sync_applied_push_watermark:*`) all route through here, so the on-disk
+    /// format stays byte-identical and lives in a single location.
+    pub fn config_key(&self, prefix: &str) -> String {
+        format!("{prefix}:{}", self.0)
+    }
+}
+
+impl From<String> for TenantId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for TenantId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<&String> for TenantId {
+    fn from(value: &String) -> Self {
+        Self(value.clone())
+    }
+}
+
+impl AsRef<str> for TenantId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TenantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ScopeLabel(pub String);
+
+impl ScopeLabel {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Principal {
+    System,
+    Agent(String),
+    Human(String),
+}
 
 impl PartialEq for TotalOrdAsc {
     fn eq(&self, other: &Self) -> bool {
@@ -553,6 +661,50 @@ pub enum UpsertResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallclock_test_clock_guard_restores_on_panic_unwind() {
+        // Baseline: no test clock installed on this thread.
+        Wallclock::reset_test_clock();
+        let real_before = Wallclock::now();
+
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = Wallclock::test_clock_guard(|| 42);
+            assert_eq!(
+                Wallclock::now(),
+                Wallclock(42),
+                "guard clock must be active"
+            );
+            panic!("deliberate unwind while the guard is held");
+        });
+        assert!(panicked.is_err(), "closure must have panicked");
+
+        // The guard's Drop ran during unwinding: the mock must be gone and the
+        // real clock restored (a real reading is >= the pre-guard reading and
+        // far above the mock's 42).
+        let real_after = Wallclock::now();
+        assert!(
+            real_after >= real_before,
+            "after unwind the real clock must be back; got {real_after:?}"
+        );
+        assert_ne!(
+            real_after,
+            Wallclock(42),
+            "mock clock must not survive unwind"
+        );
+
+        // Nesting: the guard restores the PREVIOUS clock, not merely none.
+        let _outer = Wallclock::test_clock_guard(|| 7);
+        {
+            let _inner = Wallclock::test_clock_guard(|| 8);
+            assert_eq!(Wallclock::now(), Wallclock(8));
+        }
+        assert_eq!(
+            Wallclock::now(),
+            Wallclock(7),
+            "dropping the inner guard must restore the outer clock"
+        );
+    }
 
     #[test]
     fn value_conversion_helpers() {

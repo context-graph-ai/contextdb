@@ -22,32 +22,46 @@ impl GraphStore {
     }
 
     pub fn apply_inserts(&self, inserts: Vec<AdjEntry>) {
+        self.apply_inserts_ref(&inserts);
+    }
+
+    pub fn apply_inserts_ref(&self, inserts: &[AdjEntry]) {
+        // Stage owned copies BEFORE acquiring the adjacency write guards. Each
+        // entry is retained in both the forward and reverse maps, so one copy
+        // per side is unavoidable; staging outside the lock lets us move one of
+        // them in (rather than clone both under the guard) and keeps the
+        // writer's lock-hold window off the per-entry copy cost.
+        let staged: Vec<AdjEntry> = inserts.to_vec();
         let mut fwd = self.forward_adj.write();
         let mut rev = self.reverse_adj.write();
 
-        for entry in inserts {
+        for entry in staged {
             rev.entry(entry.target).or_default().push(entry.clone());
             fwd.entry(entry.source).or_default().push(entry);
         }
     }
 
     pub fn apply_deletes(&self, deletes: Vec<(NodeId, EdgeType, NodeId, TxId)>) {
+        self.apply_deletes_ref(&deletes);
+    }
+
+    pub fn apply_deletes_ref(&self, deletes: &[(NodeId, EdgeType, NodeId, TxId)]) {
         let mut fwd = self.forward_adj.write();
         let mut rev = self.reverse_adj.write();
 
         for (source, edge_type, target, deleted_tx) in deletes {
-            if let Some(entries) = fwd.get_mut(&source) {
+            if let Some(entries) = fwd.get_mut(source) {
                 for e in entries.iter_mut() {
-                    if e.target == target && e.edge_type == edge_type && e.deleted_tx.is_none() {
-                        e.deleted_tx = Some(deleted_tx);
+                    if e.target == *target && e.edge_type == *edge_type && e.deleted_tx.is_none() {
+                        e.deleted_tx = Some(*deleted_tx);
                     }
                 }
             }
 
-            if let Some(entries) = rev.get_mut(&target) {
+            if let Some(entries) = rev.get_mut(target) {
                 for e in entries.iter_mut() {
-                    if e.source == source && e.edge_type == edge_type && e.deleted_tx.is_none() {
-                        e.deleted_tx = Some(deleted_tx);
+                    if e.source == *source && e.edge_type == *edge_type && e.deleted_tx.is_none() {
+                        e.deleted_tx = Some(*deleted_tx);
                     }
                 }
             }

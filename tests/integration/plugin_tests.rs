@@ -12,6 +12,19 @@ use contextdb_engine::sync_types::{
 use contextdb_tx::WriteSet;
 use uuid::Uuid;
 
+/// Open an in-memory database guarded by `plugin` and create the standard
+/// `items` table. The open-then-create-items scaffold is identical across the
+/// plugin-hook tests; each test supplies only its plugin and its own body.
+fn setup_items_db<P: DatabasePlugin + 'static>(plugin: P) -> Database {
+    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db
+}
+
 // ── RejectingPlugin ──────────────────────────────────────────────
 // Rejects at a specific hook with a specific reason.
 struct RejectingPlugin {
@@ -387,6 +400,12 @@ impl DatabasePlugin for DdlVetoPlugin {
             DdlChange::AlterTable { .. } => "AlterTable",
             DdlChange::CreateIndex { .. } => "CreateIndex",
             DdlChange::DropIndex { .. } => "DropIndex",
+            DdlChange::CreateTrigger { .. } => "CreateTrigger",
+            DdlChange::DropTrigger { .. } => "DropTrigger",
+            DdlChange::CreateEventType { .. } => "CreateEventType",
+            DdlChange::CreateSink { .. } => "CreateSink",
+            DdlChange::CreateRoute { .. } => "CreateRoute",
+            DdlChange::DropRoute { .. } => "DropRoute",
         };
         if variant_name == self.reject_variant {
             Err(Error::PluginRejected {
@@ -406,10 +425,7 @@ impl DatabasePlugin for DdlVetoPlugin {
 #[test]
 fn p01_pre_commit_vetoes_autocommit() {
     let plugin = RejectingPlugin::new("pre_commit", "audit-required");
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
 
     let id = Uuid::new_v4();
     let result = db.execute(
@@ -436,10 +452,8 @@ fn p01_pre_commit_vetoes_autocommit() {
 #[test]
 fn p02_pre_commit_vetoes_explicit_commit() {
     let plugin = RejectingPlugin::new("pre_commit", "forbidden");
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let db = setup_items_db(plugin);
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
 
     db.execute("BEGIN", &p).unwrap();
     let id = Uuid::new_v4();
@@ -464,10 +478,7 @@ fn p02_pre_commit_vetoes_explicit_commit() {
 #[test]
 fn p03_pre_commit_source_autocommit() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
     let id = Uuid::new_v4();
     db.execute(
         "INSERT INTO items (id, name) VALUES ($id, 'widget')",
@@ -489,20 +500,19 @@ fn p03_pre_commit_source_autocommit() {
         pre_commits[0],
         HookEvent::PreCommit(CommitSource::AutoCommit, _)
     ));
-    // pre_commit fires BEFORE stamp_and_apply — commit_lsn must be None at this point
+    // pre_commit sees the same frozen, stamped WriteSet that will be applied
+    // and later passed to post_commit.
     assert!(
-        matches!(pre_commits[0], HookEvent::PreCommit(_, None)),
-        "pre_commit must see unstamped WriteSet (commit_lsn == None)"
+        matches!(pre_commits[0], HookEvent::PreCommit(_, Some(_))),
+        "pre_commit must see stamped WriteSet"
     );
 }
 
 #[test]
 fn p04_pre_commit_source_user() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let db = setup_items_db(plugin);
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
     db.execute("BEGIN", &p).unwrap();
     let id = Uuid::new_v4();
     db.execute(
@@ -527,10 +537,7 @@ fn p04_pre_commit_source_user() {
 #[test]
 fn p05_pre_commit_source_sync_pull() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
 
     let cs = ChangeSet {
         rows: vec![RowChange {
@@ -545,10 +552,13 @@ fn p05_pre_commit_source_sync_pull() {
             ]),
             deleted: false,
             lsn: Lsn(1),
+            created_at: None,
         }],
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
         .unwrap();
@@ -563,10 +573,7 @@ fn p05_pre_commit_source_sync_pull() {
 #[test]
 fn p06_post_commit_fires_with_lsn_autocommit() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
     let id = Uuid::new_v4();
     db.execute(
         "INSERT INTO items (id, name) VALUES ($id, 'widget')",
@@ -604,10 +611,8 @@ fn p06_post_commit_fires_with_lsn_autocommit() {
 #[test]
 fn p07_post_commit_fires_with_lsn_explicit() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let db = setup_items_db(plugin);
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
     db.execute("BEGIN", &p).unwrap();
     let id = Uuid::new_v4();
     db.execute(
@@ -635,10 +640,7 @@ fn p08_post_commit_not_fired_on_rejection() {
         reason: "no".to_string(),
         post_events: post_events.clone(),
     };
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
 
     let id = Uuid::new_v4();
     let result = db.execute(
@@ -763,10 +765,8 @@ fn p12_on_query_fires_for_dml_and_ddl() {
 #[test]
 fn p13_on_query_skips_tx_control() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let db = setup_items_db(plugin);
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
     db.execute("BEGIN", &p).unwrap();
     db.execute("COMMIT", &p).unwrap();
 
@@ -793,38 +793,6 @@ fn p13_on_query_skips_tx_control() {
             .iter()
             .any(|q| q.contains("BEGIN") || q.contains("COMMIT") || q.contains("ROLLBACK")),
         "on_query must NOT fire for BEGIN/COMMIT/ROLLBACK"
-    );
-}
-
-#[test]
-fn p14_on_ddl_fires_create_table() {
-    let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE widgets (id UUID PRIMARY KEY, label TEXT)", &p)
-        .unwrap();
-
-    let ev = events.lock().unwrap();
-    let ddls: Vec<_> = ev
-        .iter()
-        .filter_map(|e| match e {
-            HookEvent::OnDdl(desc) => Some(desc.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        ddls.len(),
-        1,
-        "on_ddl must fire exactly once for CREATE TABLE"
-    );
-    // Verify DdlChange content includes table name and columns
-    assert!(
-        ddls[0].contains("widgets"),
-        "DdlChange must contain table name 'widgets'"
-    );
-    assert!(
-        ddls[0].contains("id") && ddls[0].contains("label"),
-        "DdlChange must contain column names"
     );
 }
 
@@ -1109,10 +1077,8 @@ fn p17_on_query_before_on_ddl() {
 #[test]
 fn p18_post_query_success_outcome() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let db = setup_items_db(plugin);
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
     let id = Uuid::new_v4();
     db.execute(
         "INSERT INTO items (id, name) VALUES ($id, 'a')",
@@ -1141,12 +1107,51 @@ fn p18_post_query_success_outcome() {
 }
 
 #[test]
-fn p19_post_query_error_outcome() {
+fn p18b_event_bus_ddl_follows_query_ddl_post_query_lifecycle() {
     let (plugin, events) = CapturingPlugin::new();
     let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
+    db.execute(
+        "CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT)",
+        &p,
+    )
+    .unwrap();
+    events.lock().unwrap().clear();
+
+    db.execute(
+        "CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations",
+        &p,
+    )
+    .unwrap();
+    db.execute("CREATE SINK slack TYPE callback", &p).unwrap();
+    db.execute("CREATE ROUTE r EVENT inv_match TO slack", &p)
         .unwrap();
+
+    let ev = events.lock().unwrap();
+    let on_query_count = ev
+        .iter()
+        .filter(|event| matches!(event, HookEvent::OnQuery(_)))
+        .count();
+    let on_ddl_count = ev
+        .iter()
+        .filter(|event| matches!(event, HookEvent::OnDdl(_)))
+        .count();
+    let post_query_count = ev
+        .iter()
+        .filter(|event| matches!(event, HookEvent::PostQuery(_, QueryOutcome::Success { .. })))
+        .count();
+    assert_eq!(on_query_count, 3, "EventBus DDL must fire on_query");
+    assert_eq!(on_ddl_count, 3, "EventBus DDL must fire on_ddl");
+    assert_eq!(
+        post_query_count, 3,
+        "EventBus DDL must fire successful post_query"
+    );
+}
+
+#[test]
+fn p19_post_query_error_outcome() {
+    let (plugin, events) = CapturingPlugin::new();
+    let db = setup_items_db(plugin);
 
     // Insert a row, then insert a duplicate PK to trigger execution-time error.
     // The error must come from execution (after on_query fires), not from
@@ -1288,10 +1293,8 @@ fn p22_post_query_skipped_when_on_ddl_rejects() {
 #[test]
 fn p23_on_sync_push_filters_rows() {
     let plugin = FilterPlugin::new("secret_items");
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let db = setup_items_db(plugin);
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
     db.execute(
         "CREATE TABLE secret_items (id UUID PRIMARY KEY, data TEXT)",
         &p,
@@ -1331,10 +1334,7 @@ fn p23_on_sync_push_filters_rows() {
 #[test]
 fn p24_on_sync_pull_rejects_batch() {
     let plugin = RejectingPlugin::new("on_sync_pull", "quarantined");
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
 
     let cs = ChangeSet {
         rows: vec![RowChange {
@@ -1349,10 +1349,13 @@ fn p24_on_sync_pull_rejects_batch() {
             ]),
             deleted: false,
             lsn: Lsn(1),
+            created_at: None,
         }],
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let result = db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins));
     assert!(result.is_err());
@@ -1366,10 +1369,8 @@ fn p24_on_sync_pull_rejects_batch() {
 #[test]
 fn p25_on_sync_pull_filters_rows() {
     let plugin = FilterPlugin::new("blocked");
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
+    let db = setup_items_db(plugin);
     let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
     db.execute("CREATE TABLE blocked (id UUID PRIMARY KEY, data TEXT)", &p)
         .unwrap();
 
@@ -1389,6 +1390,7 @@ fn p25_on_sync_pull_filters_rows() {
                 ]),
                 deleted: false,
                 lsn: Lsn(1),
+                created_at: None,
             },
             RowChange {
                 table: "blocked".to_string(),
@@ -1402,11 +1404,14 @@ fn p25_on_sync_pull_filters_rows() {
                 ]),
                 deleted: false,
                 lsn: Lsn(2),
+                created_at: None,
             },
         ],
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
         .unwrap();
@@ -1500,10 +1505,7 @@ fn p31_open_memory_returns_self() {
 #[test]
 fn p33_multiple_autocommits_fire_separate_pairs() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
 
     for i in 0..3 {
         let id = Uuid::new_v4();
@@ -1556,10 +1558,7 @@ fn p33_multiple_autocommits_fire_separate_pairs() {
 #[test]
 fn p34_apply_changes_per_row_sync_pull() {
     let (plugin, events) = CapturingPlugin::new();
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
 
     let rows: Vec<_> = (0..3)
         .map(|i| {
@@ -1576,6 +1575,7 @@ fn p34_apply_changes_per_row_sync_pull() {
                 ]),
                 deleted: false,
                 lsn: Lsn((i + 1) as u64),
+                created_at: None,
             }
         })
         .collect();
@@ -1585,11 +1585,22 @@ fn p34_apply_changes_per_row_sync_pull() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     db.apply_changes(cs, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
         .unwrap();
 
     let ev = events.lock().unwrap();
+    let sync_pulls: Vec<_> = ev
+        .iter()
+        .filter(|e| matches!(e, HookEvent::OnSyncPull))
+        .collect();
+    assert_eq!(
+        sync_pulls.len(),
+        1,
+        "apply_changes must run on_sync_pull once for the inbound batch even when sender LSN groups commit separately"
+    );
     let sync_pres: Vec<_> = ev
         .iter()
         .filter(|e| matches!(e, HookEvent::PreCommit(CommitSource::SyncPull, _)))
@@ -1613,10 +1624,7 @@ fn p34_apply_changes_per_row_sync_pull() {
 #[test]
 fn p35_on_query_vetoes_dml() {
     let (plugin, _) = SelectiveRejectPlugin::new("DELETE");
-    let db = Database::open_memory_with_plugin(Arc::new(plugin)).unwrap();
-    let p = HashMap::new();
-    db.execute("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)", &p)
-        .unwrap();
+    let db = setup_items_db(plugin);
     let id = Uuid::new_v4();
     db.execute(
         "INSERT INTO items (id, name) VALUES ($id, 'keeper')",

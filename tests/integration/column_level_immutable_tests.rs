@@ -854,6 +854,8 @@ fn sc03_create_table_ddl_round_trips_immutable_flag_via_apply_changes() {
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: vec![create],
+
+        ddl_lsn: vec![contextdb_core::Lsn(1)],
     };
     let _: ApplyResult = peer
         .apply_changes(
@@ -883,6 +885,7 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
             name,
             columns,
             constraints,
+            ..
         } = change
         {
             if name == table {
@@ -931,6 +934,9 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
                             immutable: c.immutable,
                             quantization: contextdb_core::VectorQuantization::F32,
                             rank_policy: None,
+                            context_id: c.context_id,
+                            scope_label: None,
+                            acl_ref: None,
                         })
                         .collect(),
                     ..TableMeta::default()
@@ -960,6 +966,8 @@ fn sc04_peer_update_on_flagged_column_rejected_after_replication() {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: vec![create],
+
+            ddl_lsn: vec![contextdb_core::Lsn(1)],
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
@@ -1012,6 +1020,7 @@ fn sa01_apply_changes_rejects_flagged_mutation_on_existing_row() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(10_000),
+        created_at: None,
     };
     let result: ApplyResult = db
         .apply_changes(
@@ -1020,6 +1029,8 @@ fn sa01_apply_changes_rejects_flagged_mutation_on_existing_row() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1069,6 +1080,7 @@ fn sa02_apply_changes_new_row_sets_flagged_column_value() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(20_000),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -1077,6 +1089,8 @@ fn sa02_apply_changes_new_row_sets_flagged_column_value() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1116,6 +1130,7 @@ fn sa03_apply_changes_same_value_replay_is_noop() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(30_000),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -1124,6 +1139,8 @@ fn sa03_apply_changes_same_value_replay_is_noop() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1159,6 +1176,7 @@ fn sa04_apply_changes_fresh_row_accepted() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(40_000),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -1167,6 +1185,8 @@ fn sa04_apply_changes_fresh_row_accepted() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1209,6 +1229,7 @@ fn sa05_sync_upsert_flagged_diff_rejected_row_unchanged() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(u64::MAX / 2),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -1217,6 +1238,8 @@ fn sa05_sync_upsert_flagged_diff_rejected_row_unchanged() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -1558,6 +1581,8 @@ fn al07_same_statement_drop_add_still_refuses_flagged_drop() {
 fn al08_alter_add_column_immutable_cross_checks_propagation_rules() {
     let db = Database::open_memory();
     let empty: HashMap<String, Value> = HashMap::new();
+    db.execute("CREATE TABLE parent (id UUID PRIMARY KEY)", &empty)
+        .expect("parent table must exist for FK propagation schema");
     db.execute(
         "CREATE TABLE t (           id UUID PRIMARY KEY,           status TEXT NOT NULL,           parent_id UUID REFERENCES parent(id) ON STATE archived PROPAGATE SET status         )",
         &empty,
@@ -1591,6 +1616,8 @@ fn al08_alter_add_column_immutable_cross_checks_propagation_rules() {
 fn al09_alter_add_column_immutable_succeeds_when_no_propagation_rule_targets_it() {
     let db = Database::open_memory();
     let empty: HashMap<String, Value> = HashMap::new();
+    db.execute("CREATE TABLE parent (id UUID PRIMARY KEY)", &empty)
+        .expect("parent table must exist for FK propagation schema");
     db.execute(
         "CREATE TABLE t (           id UUID PRIMARY KEY,           status TEXT NOT NULL,           parent_id UUID REFERENCES parent(id) ON STATE archived PROPAGATE SET status         )",
         &empty,
@@ -1610,7 +1637,7 @@ fn al09_alter_add_column_immutable_succeeds_when_no_propagation_rule_targets_it(
 #[test]
 fn ic03a_insert_row_library_path_sets_flagged_column() {
     let db = db_with_decisions();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let id = Uuid::new_v4();
     let mut values: HashMap<String, Value> = HashMap::new();
     values.insert("id".to_string(), Value::Uuid(id));
@@ -1640,7 +1667,7 @@ fn ic03b_upsert_row_library_path_rejects_flagged_mutation() {
     let id = Uuid::new_v4();
     insert_decision(&db, id);
 
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut values: HashMap<String, Value> = HashMap::new();
     values.insert("id".to_string(), Value::Uuid(id));
     values.insert(
@@ -2143,6 +2170,7 @@ fn ic09_sync_apply_rejection_under_edge_wins() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(u64::MAX / 2),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -2151,6 +2179,8 @@ fn ic09_sync_apply_rejection_under_edge_wins() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
@@ -2197,6 +2227,7 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(50_000),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -2205,6 +2236,8 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
         )
@@ -2376,6 +2409,7 @@ fn ic12_concurrent_update_and_sync_apply_on_flagged() {
             ]),
             deleted: false,
             lsn: contextdb_core::Lsn(u64::MAX / 2 + 1),
+            created_at: None,
         };
         let result = db_b
             .apply_changes(
@@ -2384,6 +2418,8 @@ fn ic12_concurrent_update_and_sync_apply_on_flagged() {
                     edges: Vec::new(),
                     vectors: Vec::new(),
                     ddl: Vec::new(),
+
+                    ddl_lsn: Vec::new(),
                 },
                 &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
             )
@@ -2561,6 +2597,7 @@ fn ic14_cross_variant_coercion_into_flagged_column_rejected() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(u64::MAX / 2),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -2569,6 +2606,8 @@ fn ic14_cross_variant_coercion_into_flagged_column_rejected() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -2631,6 +2670,7 @@ fn ic14b_sync_apply_fresh_row_correct_variant_accepted() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(1000),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -2639,6 +2679,8 @@ fn ic14b_sync_apply_fresh_row_correct_variant_accepted() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -2737,6 +2779,7 @@ fn sa06_partial_changeset_rejects_flagged_row_applies_clean_row() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(u64::MAX / 2),
+        created_at: None,
     };
     let row_b_clean = RowChange {
         table: "decisions".to_string(),
@@ -2758,6 +2801,7 @@ fn sa06_partial_changeset_rejects_flagged_row_applies_clean_row() {
         ]),
         deleted: false,
         lsn: contextdb_core::Lsn(u64::MAX / 2 + 10),
+        created_at: None,
     };
     let result = db
         .apply_changes(
@@ -2766,6 +2810,8 @@ fn sa06_partial_changeset_rejects_flagged_row_applies_clean_row() {
                 edges: Vec::new(),
                 vectors: Vec::new(),
                 ddl: Vec::new(),
+
+                ddl_lsn: Vec::new(),
             },
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
         )
@@ -2852,6 +2898,8 @@ fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: vec![create_ddl],
+
+            ddl_lsn: vec![contextdb_core::Lsn(1)],
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )
@@ -2873,12 +2921,15 @@ fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
         !alter_ddl.is_empty(),
         "origin ALTER must emit an AlterTable DDL"
     );
+    let alter_ddl_lsn = vec![contextdb_core::Lsn(1); alter_ddl.len()];
     peer.apply_changes(
         ChangeSet {
             rows: Vec::new(),
             edges: Vec::new(),
             vectors: Vec::new(),
             ddl: alter_ddl,
+
+            ddl_lsn: alter_ddl_lsn,
         },
         &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     )

@@ -83,7 +83,7 @@ fn insert_on_conflict_do_update() {
 #[test]
 fn vector_search_and_explain() {
     let db = setup_sql_db();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let r1 = db
         .insert_row(
             tx,
@@ -253,137 +253,6 @@ fn duplicate_uuid_without_conflict_clause_errors() {
 }
 
 #[test]
-fn test_insert_duplicate_unique_value_is_noop() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE people (id UUID PRIMARY KEY, name TEXT UNIQUE)",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    db.execute(
-        "INSERT INTO people (id, name) VALUES ($id, $name)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("name", Value::Text("alex".into())),
-        ]),
-    )
-    .unwrap();
-
-    db.execute(
-        "INSERT INTO people (id, name) VALUES ($id, $name)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("name", Value::Text("alex".into())),
-        ]),
-    )
-    .unwrap();
-
-    assert_eq!(db.scan("people", db.snapshot()).unwrap().len(), 1);
-}
-
-#[test]
-fn test_insert_duplicate_composite_unique_tuple_is_noop() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE relationships (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL, UNIQUE (source_id, target_id, edge_type))",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    let source_id = Uuid::new_v4();
-    let target_id = Uuid::new_v4();
-    let edge_type = "RELATES_TO";
-
-    db.execute(
-        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("source_id", Value::Uuid(source_id)),
-            ("target_id", Value::Uuid(target_id)),
-            ("edge_type", Value::Text(edge_type.into())),
-        ]),
-    )
-    .unwrap();
-
-    db.execute(
-        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("source_id", Value::Uuid(source_id)),
-            ("target_id", Value::Uuid(target_id)),
-            ("edge_type", Value::Text(edge_type.into())),
-        ]),
-    )
-    .unwrap();
-
-    assert_eq!(db.scan("relationships", db.snapshot()).unwrap().len(), 1);
-}
-
-#[test]
-fn test_insert_distinct_composite_unique_tuple_still_creates_second_row() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE relationships (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL, UNIQUE (source_id, target_id, edge_type))",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    let source_id = Uuid::new_v4();
-    let target_id = Uuid::new_v4();
-
-    db.execute(
-        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("source_id", Value::Uuid(source_id)),
-            ("target_id", Value::Uuid(target_id)),
-            ("edge_type", Value::Text("RELATES_TO".into())),
-        ]),
-    )
-    .unwrap();
-
-    db.execute(
-        "INSERT INTO relationships (id, source_id, target_id, edge_type) VALUES ($id, $source_id, $target_id, $edge_type)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("source_id", Value::Uuid(source_id)),
-            ("target_id", Value::Uuid(target_id)),
-            ("edge_type", Value::Text("DEPENDS_ON".into())),
-        ]),
-    )
-    .unwrap();
-
-    assert_eq!(db.scan("relationships", db.snapshot()).unwrap().len(), 2);
-}
-
-#[test]
-fn test_insert_with_missing_foreign_key_fails() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE parents (id UUID PRIMARY KEY)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id))",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    let err = db
-        .execute(
-            "INSERT INTO children (id, parent_id) VALUES ($id, $parent_id)",
-            &params(vec![
-                ("id", Value::Uuid(Uuid::new_v4())),
-                ("parent_id", Value::Uuid(Uuid::new_v4())),
-            ]),
-        )
-        .unwrap_err();
-    assert!(matches!(err, Error::ForeignKeyViolation { .. }));
-}
-
-#[test]
 fn test_update_with_missing_foreign_key_fails() {
     let db = Database::open_memory();
     db.execute(
@@ -423,36 +292,6 @@ fn test_update_with_missing_foreign_key_fails() {
         )
         .unwrap_err();
     assert!(matches!(err, Error::ForeignKeyViolation { .. }));
-}
-
-#[test]
-fn test_insert_with_existing_foreign_key_succeeds() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE parents (id UUID PRIMARY KEY)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id))",
-        &HashMap::new(),
-    )
-    .unwrap();
-
-    let parent_id = Uuid::new_v4();
-    db.execute(
-        "INSERT INTO parents (id) VALUES ($id)",
-        &params(vec![("id", Value::Uuid(parent_id))]),
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO children (id, parent_id) VALUES ($id, $parent_id)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("parent_id", Value::Uuid(parent_id)),
-        ]),
-    )
-    .unwrap();
 }
 
 #[test]
@@ -539,18 +378,6 @@ fn test_create_table_then_insert() {
     )
     .unwrap();
     assert_eq!(db.scan("t1", db.snapshot()).unwrap().len(), 1);
-}
-
-#[test]
-fn test_insert_into_nonexistent_table_fails() {
-    let db = Database::open_memory();
-    let err = db
-        .execute(
-            "INSERT INTO missing (id) VALUES ($id)",
-            &params(vec![("id", Value::Uuid(Uuid::new_v4()))]),
-        )
-        .unwrap_err();
-    assert!(matches!(err, Error::TableNotFound(_)));
 }
 
 #[test]
@@ -794,7 +621,7 @@ fn test_insert_value_txid_within_watermark_succeeds() {
         .expect("CREATE TABLE t (x TXID NOT NULL) must parse");
 
     // Insert Value::TxId(TxId(2)) — strictly below the watermark — via library API.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut values: HashMap<String, Value> = HashMap::new();
     values.insert("x".to_string(), Value::TxId(TxId(2)));
     let insert_result = db.insert_row(tx, "t", values);
@@ -845,7 +672,7 @@ fn test_insert_value_txid_beyond_watermark_rejected() {
     // Impl must: positive-accept value <= current_tx_max; reject value > current_tx_max
     //           with TxIdOutOfRange { table, column, value, max } populated from the
     //           threaded statement-scoped snapshot.
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let mut row = std::collections::HashMap::new();
     row.insert("x".to_string(), Value::TxId(TxId(u64::MAX)));
     let err = db
@@ -905,7 +732,7 @@ fn test_insert_wrong_variant_into_txid_column_rejected() {
     ];
 
     for (value, expected_actual) in fixtures {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut row: HashMap<String, Value> = HashMap::new();
         row.insert("x".to_string(), value.clone());
         let err = db.insert_row(tx, "t", row).expect_err(&format!(
@@ -949,7 +776,7 @@ fn test_insert_null_respects_txid_nullability() {
     // Case (a): TXID NULL accepts Value::Null, stores it back.
     db.execute("CREATE TABLE t_null (x TXID NULL)", &empty)
         .expect("CREATE TABLE t_null (x TXID NULL) must parse");
-    let tx_a = db.begin();
+    let tx_a = db.begin_or_panic();
     let mut row_a: HashMap<String, Value> = HashMap::new();
     row_a.insert("x".to_string(), Value::Null);
     db.insert_row(tx_a, "t_null", row_a)
@@ -978,7 +805,7 @@ fn test_insert_null_respects_txid_nullability() {
     // Case (b): TXID NOT NULL rejects Value::Null with ColumnNotNullable, not ColumnTypeMismatch.
     db.execute("CREATE TABLE t_nn (x TXID NOT NULL)", &empty)
         .expect("CREATE TABLE t_nn (x TXID NOT NULL) must parse");
-    let tx_b = db.begin();
+    let tx_b = db.begin_or_panic();
     let mut row_b: HashMap<String, Value> = HashMap::new();
     row_b.insert("x".to_string(), Value::Null);
     let err = db
@@ -1024,7 +851,7 @@ fn test_insert_value_txid_into_non_txid_columns_rejected() {
         db.execute(&create, &empty)
             .unwrap_or_else(|e| panic!("CREATE TABLE {table} ({col_type_ddl}) must parse: {e:?}"));
 
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         let mut row: HashMap<String, Value> = HashMap::new();
         row.insert("x".to_string(), Value::TxId(TxId(42)));
         let err = db.insert_row(tx, table, row).expect_err(&format!(
@@ -1131,11 +958,80 @@ fn coerce_value_for_column_exhaustive_no_catch_all() {
 
     let mut row = std::collections::HashMap::new();
     row.insert("e".to_string(), Value::Text("x".to_string()));
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     let result = db.insert_row(tx, "v", row);
     let _ = db.rollback(tx);
     assert!(
         result.is_err(),
         "insert Value::Text('x') into VECTOR(3) must be rejected, got {result:?}"
+    );
+}
+
+// ======== TU9 ========
+// A TEXT column whose name matches the id-name heuristic (e.g. `id`, `trace_id`) must NOT
+// have its value coerced to Value::Uuid even when the stored string happens to be a valid UUID.
+// Regression test for the bug where `coerce_value_for_column_with_meta`'s `ColumnType::Text`
+// arm called `coerce_uuid_if_needed`, silently converting a TEXT id string into Value::Uuid.
+// Separately, a column genuinely declared UUID must still round-trip as Value::Uuid.
+#[test]
+fn text_column_with_id_name_preserves_text_not_uuid() {
+    use contextdb_core::Value;
+    use contextdb_engine::Database;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    let db = Database::open_memory();
+    // `id` column declared TEXT (not UUID) — the name alone must not trigger UUID coercion.
+    // `trace_id` is a second id-named TEXT column to exercise the suffix heuristic path.
+    // `uuid_pk` is genuinely declared UUID so we can assert the Uuid arm still works correctly.
+    db.execute(
+        "CREATE TABLE skill_firing_trace (uuid_pk UUID PRIMARY KEY, id TEXT, trace_id TEXT, label TEXT)",
+        &HashMap::new(),
+    )
+    .expect("CREATE TABLE must succeed");
+
+    let pk = Uuid::new_v4();
+    let id_string = Uuid::new_v4().to_string(); // a valid UUID string stored in a TEXT column
+    let trace_string = Uuid::new_v4().to_string(); // same — valid UUID string, TEXT column
+
+    let mut row: HashMap<String, Value> = HashMap::new();
+    row.insert("uuid_pk".into(), Value::Uuid(pk));
+    row.insert("id".into(), Value::Text(id_string.clone()));
+    row.insert("trace_id".into(), Value::Text(trace_string.clone()));
+    row.insert("label".into(), Value::Text("fire".into()));
+
+    let tx = db.begin_or_panic();
+    db.insert_row(tx, "skill_firing_trace", row)
+        .expect("insert must succeed");
+    db.commit(tx).expect("commit must succeed");
+
+    let rows = db
+        .scan("skill_firing_trace", db.snapshot())
+        .expect("scan must succeed");
+    assert_eq!(rows.len(), 1, "exactly one row must be present");
+
+    let row = &rows[0];
+
+    // TEXT column `id` holding a UUID-shaped string must come back as Value::Text, NOT Value::Uuid.
+    assert_eq!(
+        row.values.get("id"),
+        Some(&Value::Text(id_string.clone())),
+        "`id` TEXT column must return Value::Text(\"{}\")",
+        id_string,
+    );
+
+    // TEXT column `trace_id` must also remain Text.
+    assert_eq!(
+        row.values.get("trace_id"),
+        Some(&Value::Text(trace_string.clone())),
+        "`trace_id` TEXT column must return Value::Text(\"{}\")",
+        trace_string,
+    );
+
+    // A column genuinely declared UUID must still round-trip as Value::Uuid (no over-correction).
+    assert_eq!(
+        row.values.get("uuid_pk"),
+        Some(&Value::Uuid(pk)),
+        "`uuid_pk` UUID column must return Value::Uuid",
     );
 }

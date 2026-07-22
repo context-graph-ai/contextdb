@@ -11,6 +11,9 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
     index smoke gates under the `nv_` filter
 - `cargo bench -p contextdb-engine --bench engine_full_throughput`
   - heavier engine benchmarks for larger write/reopen and mixed workflow paths
+- `cargo bench -p contextdb-engine --bench storage_scale_hardening`
+  - storage-scale guard for table-local index maintenance, reopen locality,
+    wide-row commit batch size, and file-backed single-row autocommit
 - `cargo bench -p contextdb-engine --bench mixed_workflows_pr`
   - bounded PR-tier mixed graph + relational + vector workflows
 - `cargo bench -p contextdb-engine --bench subscriptions_pr`
@@ -18,7 +21,8 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
 - `cargo bench -p contextdb-server --bench server_throughput`
   - CLI smoke bench
 - `cargo bench -p contextdb-server --bench server_sync_system`
-  - system sync bench with real NATS via testcontainers
+  - system sync bench with a real NATS broker via testcontainers; broker-backed,
+    so it requires `--features nats-tests` and Docker (the deprecated NATS path)
 - `cargo bench -p contextdb-server --bench sync_pr`
   - bounded PR-tier sync workloads using direct sync APIs
 
@@ -26,9 +30,12 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
 
 - Use the parser and engine smoke benches for quick local regression checks.
 - Use `engine_full_throughput` when you want larger local workloads.
+- Use `storage_scale_hardening` after storage, commit-path, or open-path
+  changes. Its fixtures assert locality counters before timing, so a failing
+  run is a correctness/locality failure first and a performance result second.
 - Use `mixed_workflows_pr` and `subscriptions_pr` for realistic engine-level PR regression coverage.
 - Use `sync_pr` when you want realistic sync regression coverage without CLI/process overhead in the timed path.
-- Use `server_sync_system` only when you are intentionally testing sync/system behavior.
+- Use `server_sync_system` only when you are intentionally testing sync/system behavior. It exercises the deprecated NATS broker path, so it requires a build with `--features nats-tests` and a running Docker daemon. The default dial-by-key benches need no broker.
 - The server sync bench is heavier because it uses release binaries, a real NATS container, and file-backed CLI/server processes.
 
 ## Suggested Commands
@@ -39,11 +46,12 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
   - `timeout 180s cargo bench -p contextdb-server --bench server_throughput -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
 - PR:
   - `timeout 180s cargo bench -p contextdb-engine --bench engine_full_throughput -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
+  - `timeout 900s cargo bench -p contextdb-engine --bench storage_scale_hardening -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
   - `timeout 180s cargo bench -p contextdb-engine --bench mixed_workflows_pr -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
   - `timeout 180s cargo bench -p contextdb-engine --bench subscriptions_pr -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
   - `timeout 180s cargo bench -p contextdb-server --bench sync_pr -- chunked_large_pull_600_rows --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
-- system:
-  - `timeout 180s cargo bench -p contextdb-server --bench server_sync_system -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
+- system (deprecated NATS path — needs `--features nats-tests` and Docker):
+  - `timeout 180s cargo bench -p contextdb-server --features nats-tests --bench server_sync_system -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
 
 Always use `timeout` on heavier runs. If a benchmark spends the whole run on setup/build noise and never reaches useful Criterion output, treat that as a benchmark-shape problem to fix rather than a valid perf result.
 
@@ -51,6 +59,11 @@ The named-vector `nv_` cases use bounded local defaults so they are practical as
 a smoke gate. Set `CONTEXTDB_NV_BENCH_FULL=1` or the per-case
 `CONTEXTDB_NV_*` sizing variables in `benches/engine_throughput.rs` when running
 the full ship-scale footprint, replay, and latency checks.
+
+The storage-scale hardening bench defaults the reopen axis to 1K, 10K, and
+100K rows with five table-local index slots. Set `CONTEXTDB_SSH_REOPEN_1M=1`
+to add the optional 1M-row reopen point, or `CONTEXTDB_SSH_REOPEN_ROWS=<n>` to
+override that optional scale.
 
 ## Design Rules
 

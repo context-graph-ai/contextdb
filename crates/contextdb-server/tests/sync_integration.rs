@@ -1,7 +1,6 @@
 use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-use contextdb_server::protocol::{MessageType, PushResponse, WireApplyResult, encode};
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,19 +105,25 @@ async fn sync_round_trip_smoke() {
     let server = Arc::new(SyncServer::new(
         server_db,
         &nats.nats_url,
-        "test_tenant",
+        contextdb_core::TenantId::from("test_tenant"),
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
 
-    let client = SyncClient::new(edge, &nats.nats_url, "test_tenant");
+    let client = SyncClient::new(
+        edge,
+        &nats.nats_url,
+        contextdb_core::TenantId::from("test_tenant"),
+    );
     let _ = client.pull(&policies).await;
 }
 
+#[cfg(feature = "nats")]
 #[tokio::test]
 async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
     use contextdb_core::Value;
+    use contextdb_server::protocol::{MessageType, PushResponse, WireApplyResult, encode};
     use futures_util::StreamExt;
     use uuid::Uuid;
 
@@ -164,7 +169,11 @@ async fn sync_00b_push_retries_malformed_reply_before_succeeding() {
         }
     });
 
-    let client = SyncClient::new(edge.clone(), &nats.nats_url, "malformed-reply");
+    let client = SyncClient::new(
+        edge.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("malformed-reply"),
+    );
     let id = Uuid::new_v4();
     let mut p = HashMap::new();
     p.insert("id".to_string(), Value::Uuid(id));
@@ -193,7 +202,7 @@ async fn sync_00_server_bootstrap_survives_permission_denied_subscribe() {
     let server = Arc::new(SyncServer::new(
         server_db,
         &nats.nats_url,
-        "bootstrap-denied",
+        contextdb_core::TenantId::from("bootstrap-denied"),
         policies,
     ));
     let server_handle = server.clone();
@@ -233,14 +242,18 @@ async fn a1_lazy_connection_and_reuse() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "reuse-test",
+        contextdb_core::TenantId::from("reuse-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "reuse-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("reuse-test"),
+    );
 
     // Before any call, should not be connected (lazy)
     assert!(
@@ -302,7 +315,11 @@ async fn a2_connection_failure_actionable_error() {
         .unwrap();
 
     // Client pointing to unreachable port
-    let client = SyncClient::new(db, "nats://localhost:19999", "no-server-registered");
+    let client = SyncClient::new(
+        db,
+        "nats://localhost:19999",
+        contextdb_core::TenantId::from("no-server-registered"),
+    );
     let result = client.push().await;
 
     assert!(result.is_err(), "push to unreachable NATS must fail");
@@ -353,14 +370,18 @@ async fn a3_pull_default_uses_configured_policies() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "pull-default-test",
+        contextdb_core::TenantId::from("pull-default-test"),
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "pull-default-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("pull-default-test"),
+    );
 
     // Configure EdgeWins — edge value should survive
     client.set_default_conflict_policy(ConflictPolicy::EdgeWins);
@@ -428,17 +449,23 @@ async fn a4_set_table_direction_blocks_pull() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "direction-test",
+        contextdb_core::TenantId::from("direction-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "direction-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("direction-test"),
+    );
 
     // Block the "blocked" table
-    client.set_table_direction("blocked", SyncDirection::None);
+    client
+        .set_table_direction("blocked", SyncDirection::None)
+        .expect("an ordinary table accepts any direction");
     client.pull(&policies).await.unwrap();
 
     // "synced" row should appear on edge
@@ -483,7 +510,7 @@ async fn a5_websocket_transport() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "ws-test",
+        contextdb_core::TenantId::from("ws-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
@@ -491,7 +518,11 @@ async fn a5_websocket_transport() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Edge connects via WebSocket
-    let client = SyncClient::new(edge_db.clone(), &nats.ws_url, "ws-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.ws_url,
+        contextdb_core::TenantId::from("ws-test"),
+    );
 
     // Edge pushes a row over WebSocket
     let push_id = Uuid::new_v4();
@@ -551,7 +582,7 @@ async fn a6_reconnect_clears_and_reestablishes() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "reconnect-test",
+        contextdb_core::TenantId::from("reconnect-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
@@ -559,7 +590,11 @@ async fn a6_reconnect_clears_and_reestablishes() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Success path
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "reconnect-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("reconnect-test"),
+    );
     client.push().await.unwrap(); // establishes connection
     assert!(client.is_connected().await, "must be connected after push");
     client.reconnect().await; // drops and re-establishes
@@ -571,7 +606,11 @@ async fn a6_reconnect_clears_and_reestablishes() {
 
     // Failure path: bad port
     let bad_db = Arc::new(Database::open_memory());
-    let bad_client = SyncClient::new(bad_db, "nats://localhost:19999", "bad-port");
+    let bad_client = SyncClient::new(
+        bad_db,
+        "nats://localhost:19999",
+        contextdb_core::TenantId::from("bad-port"),
+    );
     bad_client.reconnect().await;
     assert!(
         !bad_client.is_connected().await,
@@ -640,14 +679,18 @@ async fn a7_per_table_conflict_policy_override() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "policy-override-test",
+        contextdb_core::TenantId::from("policy-override-test"),
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "policy-override-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("policy-override-test"),
+    );
 
     // Default = ServerWins, but observations = InsertIfNotExists (skip duplicates)
     client.set_default_conflict_policy(ConflictPolicy::ServerWins);
@@ -717,14 +760,18 @@ async fn a8_pull_watermark_advances() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "pull-wm-test",
+        contextdb_core::TenantId::from("pull-wm-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "pull-wm-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("pull-wm-test"),
+    );
 
     // First pull — gets 5 rows
     let result1 = client.pull(&policies).await.unwrap();
@@ -780,14 +827,18 @@ async fn a9_row_delete_events_synced() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "rowdelete-test",
+        contextdb_core::TenantId::from("rowdelete-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "rowdelete-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("rowdelete-test"),
+    );
 
     // Insert row on edge and push to server
     let id = Uuid::new_v4();
@@ -853,14 +904,18 @@ async fn a9_file_backed_row_delete_events_synced() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "rowdelete-file-test",
+        contextdb_core::TenantId::from("rowdelete-file-test"),
         policies,
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "rowdelete-file-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("rowdelete-file-test"),
+    );
 
     let id = Uuid::new_v4();
     let mut p = HashMap::new();
@@ -908,15 +963,23 @@ async fn a9_fresh_pull_after_delete_history_converges_without_conflict() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "fresh-delete-history",
+        contextdb_core::TenantId::from("fresh-delete-history"),
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let edge_a = SyncClient::new(edge_a_db.clone(), &nats.nats_url, "fresh-delete-history");
-    let edge_b = SyncClient::new(edge_b_db.clone(), &nats.nats_url, "fresh-delete-history");
+    let edge_a = SyncClient::new(
+        edge_a_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("fresh-delete-history"),
+    );
+    let edge_b = SyncClient::new(
+        edge_b_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("fresh-delete-history"),
+    );
 
     let keep_id = Uuid::new_v4();
     let delete_id = Uuid::new_v4();
@@ -978,7 +1041,7 @@ async fn a9_file_backed_fresh_pull_after_delete_history_converges_without_confli
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "file-fresh-delete-history",
+        contextdb_core::TenantId::from("file-fresh-delete-history"),
         policies.clone(),
     ));
     let server_handle = server.clone();
@@ -988,12 +1051,12 @@ async fn a9_file_backed_fresh_pull_after_delete_history_converges_without_confli
     let edge_a = SyncClient::new(
         edge_a_db.clone(),
         &nats.nats_url,
-        "file-fresh-delete-history",
+        contextdb_core::TenantId::from("file-fresh-delete-history"),
     );
     let edge_b = SyncClient::new(
         edge_b_db.clone(),
         &nats.nats_url,
-        "file-fresh-delete-history",
+        contextdb_core::TenantId::from("file-fresh-delete-history"),
     );
 
     let keep_id = Uuid::new_v4();
@@ -1088,6 +1151,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                 },
                 deleted: false,
                 lsn: Lsn(10),
+                created_at: None,
             },
             RowChange {
                 table: "t".to_string(),
@@ -1105,6 +1169,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                 },
                 deleted: false,
                 lsn: Lsn(11),
+                created_at: None,
             },
             RowChange {
                 table: "t".to_string(),
@@ -1121,6 +1186,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
                 },
                 deleted: false,
                 lsn: Lsn(12),
+                created_at: None,
             },
         ],
         edges: Vec::new(),
@@ -1145,6 +1211,8 @@ async fn a10_vector_mapping_survives_failed_inserts() {
             },
         ],
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     // EdgeWins forces upsert attempt on row B — which fails due to state machine
@@ -1226,44 +1294,78 @@ async fn a11_tenant_id_validation() {
 
     // These must panic
     let r = catch_unwind(AssertUnwindSafe(|| {
-        SyncClient::new(db.clone(), "nats://x", "foo.bar")
+        SyncClient::new(
+            db.clone(),
+            "nats://x",
+            contextdb_core::TenantId::from("foo.bar"),
+        )
     }));
     assert!(r.is_err(), "dot in tenant_id must panic");
 
     let r = catch_unwind(AssertUnwindSafe(|| {
-        SyncClient::new(db.clone(), "nats://x", "foo*")
+        SyncClient::new(
+            db.clone(),
+            "nats://x",
+            contextdb_core::TenantId::from("foo*"),
+        )
     }));
     assert!(r.is_err(), "wildcard in tenant_id must panic");
 
     let r = catch_unwind(AssertUnwindSafe(|| {
-        SyncClient::new(db.clone(), "nats://x", "foo>")
+        SyncClient::new(
+            db.clone(),
+            "nats://x",
+            contextdb_core::TenantId::from("foo>"),
+        )
     }));
     assert!(r.is_err(), "NATS multi-level wildcard must panic");
 
     let r = catch_unwind(AssertUnwindSafe(|| {
-        SyncClient::new(db.clone(), "nats://x", "")
+        SyncClient::new(db.clone(), "nats://x", contextdb_core::TenantId::from(""))
     }));
     assert!(r.is_err(), "empty tenant_id must panic");
 
     let r = catch_unwind(AssertUnwindSafe(|| {
-        SyncClient::new(db.clone(), "nats://x", "foo bar")
+        SyncClient::new(
+            db.clone(),
+            "nats://x",
+            contextdb_core::TenantId::from("foo bar"),
+        )
     }));
     assert!(r.is_err(), "space in tenant_id must panic");
 
     // Same for SyncServer
     let policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
     let r = catch_unwind(AssertUnwindSafe(|| {
-        SyncServer::new(db.clone(), "nats://x", "foo.bar", policies.clone())
+        SyncServer::new(
+            db.clone(),
+            "nats://x",
+            contextdb_core::TenantId::from("foo.bar"),
+            policies.clone(),
+        )
     }));
     assert!(r.is_err(), "SyncServer must also reject dots");
 
     // These must succeed (no panic)
-    SyncClient::new(db.clone(), "nats://x", "valid-tenant");
-    SyncClient::new(db.clone(), "nats://x", "tenant_123");
-    SyncClient::new(db.clone(), "nats://x", "MyTenant");
+    SyncClient::new(
+        db.clone(),
+        "nats://x",
+        contextdb_core::TenantId::from("valid-tenant"),
+    );
+    SyncClient::new(
+        db.clone(),
+        "nats://x",
+        contextdb_core::TenantId::from("tenant_123"),
+    );
+    SyncClient::new(
+        db.clone(),
+        "nats://x",
+        contextdb_core::TenantId::from("MyTenant"),
+    );
 }
 
 // A12: NATS request timeout returns an error
+#[cfg(feature = "nats")]
 #[tokio::test]
 async fn a12_nats_request_timeout_returns_error() {
     use contextdb_core::Value;
@@ -1285,7 +1387,7 @@ async fn a12_nats_request_timeout_returns_error() {
     let _server = SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "timeout-test",
+        contextdb_core::TenantId::from("timeout-test"),
         policies.clone(),
     );
 
@@ -1296,7 +1398,11 @@ async fn a12_nats_request_timeout_returns_error() {
         .await
         .unwrap();
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "timeout-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("timeout-test"),
+    );
 
     // Insert data so push has something to send
     let id = Uuid::new_v4();
@@ -1354,6 +1460,7 @@ async fn a13_pull_pagination_fetches_all_pages() {
             values,
             deleted: false,
             lsn: Lsn(0),
+            created_at: None,
         });
     }
     let changeset = ChangeSet {
@@ -1361,6 +1468,8 @@ async fn a13_pull_pagination_fetches_all_pages() {
         edges: vec![],
         vectors: vec![],
         ddl: vec![],
+
+        ddl_lsn: Vec::new(),
     };
     let insert_policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     server_db
@@ -1372,7 +1481,7 @@ async fn a13_pull_pagination_fetches_all_pages() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "pagination-test",
+        contextdb_core::TenantId::from("pagination-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
@@ -1380,7 +1489,11 @@ async fn a13_pull_pagination_fetches_all_pages() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Edge client connects via NATS (NOT local fallback)
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "pagination-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("pagination-test"),
+    );
 
     // Pull all data
     let result = client.pull(&policies).await.unwrap();
@@ -1450,14 +1563,18 @@ async fn a15_concurrent_push_and_pull() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "concurrent-client-test",
+        contextdb_core::TenantId::from("concurrent-client-test"),
         policies.clone(),
     ));
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "concurrent-client-test");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("concurrent-client-test"),
+    );
 
     // Insert data on edge (for push to send)
     let edge_id = Uuid::new_v4();
@@ -1522,10 +1639,13 @@ fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
             values,
             deleted: false,
             lsn: contextdb_core::Lsn(1),
+            created_at: None,
         }],
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     // Apply on edge-B — apply_changes is the sync-pull entry point and internally
@@ -1561,7 +1681,7 @@ fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
     // A subsequent local transaction on edge-B must allocate a TxId >= 101 —
     // proving the allocator did not silently reuse an id. begin() returns a bare
     // TxId; rollback releases it.
-    let probe_tx = edge_b.begin();
+    let probe_tx = edge_b.begin_or_panic();
     assert!(
         probe_tx.0 >= 101,
         "new transaction on edge_b must issue TxId >= 101 after allocator advance; got {:?}",
@@ -1638,10 +1758,13 @@ fn sync_apply_rejects_peer_txid_u64_max() {
             values,
             deleted: false,
             lsn: contextdb_core::Lsn(1),
+            created_at: None,
         }],
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     // Apply must return Err(Error::TxIdOverflow { table: "t", incoming: u64::MAX }).
@@ -1724,6 +1847,7 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
             values,
             deleted: false,
             lsn: contextdb_core::Lsn(100 + i),
+            created_at: None,
         });
     }
     let changeset = ChangeSet {
@@ -1731,6 +1855,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
         edges: Vec::new(),
         vectors: Vec::new(),
         ddl: Vec::new(),
+
+        ddl_lsn: Vec::new(),
     };
 
     let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);

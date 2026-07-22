@@ -14,6 +14,14 @@ stmt = _{
     | drop_table_stmt
     | create_index_stmt
     | drop_index_stmt
+    | create_schedule_stmt
+    | drop_schedule_stmt
+    | create_trigger_stmt
+    | drop_trigger_stmt
+    | create_event_type_stmt
+    | create_sink_stmt
+    | create_route_stmt
+    | drop_route_stmt
     | insert_stmt
     | delete_stmt
     | update_stmt
@@ -83,7 +91,10 @@ clause_end = _{ EOI | ";" | ")" | "," }
 order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_item ~ ("," ~ order_item)* }
 order_item = { cosine_expr | expr ~ sort_dir? }
 sort_dir = { ^"ASC" | ^"DESC" }
-cosine_expr = { additive_expr ~ "<=>" ~ additive_expr }
+cosine_expr = { additive_expr ~ "<=>" ~ cosine_rhs }
+cosine_rhs = { row_vector_source | additive_expr }
+row_vector_source = { ^"ROW_VECTOR" ~ "(" ~ string ~ "," ~ string ~ "," ~ row_vector_key ~ ")" }
+row_vector_key = { parameter | bool_lit | float | integer | string }
 
 use_rank_clause = { ^"USE" ~ ^"RANK" ~ identifier }
 
@@ -132,8 +143,22 @@ create_table_stmt = {
     ~ table_option*
 }
 if_not_exists = { ^"IF" ~ ^"NOT" ~ ^"EXISTS" }
-table_element = { column_def | unique_table_constraint }
+table_element = { column_def | unique_table_constraint | foreign_key_table_constraint }
 unique_table_constraint = { ^"UNIQUE" ~ "(" ~ identifier ~ ("," ~ identifier)* ~ ")" }
+foreign_key_table_constraint = {
+    ^"FOREIGN"
+    ~ ^"KEY"
+    ~ "("
+    ~ identifier
+    ~ ("," ~ identifier)*
+    ~ ")"
+    ~ ^"REFERENCES"
+    ~ identifier
+    ~ "("
+    ~ identifier
+    ~ ("," ~ identifier)*
+    ~ ")"
+}
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
 alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_table_conflict_policy | drop_table_conflict_policy }
@@ -179,8 +204,19 @@ column_constraint = {
     | expires_constraint
     | immutable_constraint
     | rank_policy_clause
+    | context_id_constraint
+    | scope_label_split
+    | scope_label_simple
+    | acl_constraint
     | state_machine_option
 }
+context_id_constraint = { ^"CONTEXT_ID" }
+scope_label_simple = { ^"SCOPE_LABEL" ~ "(" ~ string ~ ("," ~ string)* ~ ")" }
+scope_label_split = {
+    ^"SCOPE_LABEL_READ" ~ "(" ~ string ~ ("," ~ string)* ~ ")"
+    ~ ^"WRITE" ~ "(" ~ string ~ ("," ~ string)* ~ ")"
+}
+acl_constraint = { ^"ACL" ~ ^"REFERENCES" ~ identifier ~ "(" ~ identifier ~ ")" }
 expires_constraint = { ^"EXPIRES" }
 immutable_constraint = { ^"IMMUTABLE" }
 not_null = { ^"NOT" ~ ^"NULL" }
@@ -223,7 +259,10 @@ table_option = {
 }
 retain_option = { ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 retain_unit = { ^"SECONDS" | ^"MINUTES" | ^"HOURS" | ^"DAYS" }
-sync_safe_option = { ^"SYNC" ~ ^"SAFE" }
+sync_safe_option = { ^"SYNC" ~ ^"SAFE" ~ retained_sync_direction? }
+retained_sync_direction = { push_only_direction | two_way_direction }
+push_only_direction = { ^"PUSH" ~ ^"ONLY" }
+two_way_direction = { ^"TWO" ~ ^"WAY" }
 immutable_option = { ^"IMMUTABLE" }
 state_machine_option = { (^"STATE_MACHINE" | (^"STATE" ~ ^"MACHINE")) ~ "(" ~ state_machine_entries ~ ")" }
 state_machine_entries = { state_machine_entry ~ ("," ~ state_machine_entry)* }
@@ -275,6 +314,51 @@ index_sort_direction = { ^"ASC" | ^"DESC" }
 drop_index_stmt = {
     ^"DROP" ~ ^"INDEX" ~ if_exists? ~ identifier ~ ^"ON" ~ identifier
 }
+
+create_schedule_stmt = {
+    ^"CREATE" ~ ^"SCHEDULE" ~ identifier
+    ~ ^"EVERY" ~ string
+    ~ ^"TX" ~ "(" ~ identifier ~ ")"
+    ~ missed_tick_clause?
+}
+missed_tick_clause = {
+    ^"MISSED_TICK_POLICY" ~ string
+    ~ (^"WITHIN" ~ integer ~ ^"SECONDS")?
+}
+drop_schedule_stmt = { ^"DROP" ~ ^"SCHEDULE" ~ identifier }
+
+create_trigger_stmt = {
+    ^"CREATE" ~ ^"TRIGGER" ~ identifier
+    ~ ^"ON" ~ identifier
+    ~ ^"WHEN" ~ event_trigger
+}
+drop_trigger_stmt = { ^"DROP" ~ ^"TRIGGER" ~ identifier }
+
+create_event_type_stmt = {
+    ^"CREATE" ~ ^"EVENT" ~ ^"TYPE" ~ identifier
+    ~ ^"WHEN" ~ event_trigger
+    ~ ^"ON" ~ identifier
+}
+event_trigger = { ^"INSERT" | ^"UPDATE" | ^"DELETE" }
+
+create_sink_stmt = {
+    ^"CREATE" ~ ^"SINK" ~ identifier
+    ~ ^"TYPE" ~ sink_type
+    ~ sink_url_clause?
+}
+sink_type = { ^"webhook" | ^"callback" }
+sink_url_clause = { ^"URL" ~ string }
+
+create_route_stmt = {
+    ^"CREATE" ~ ^"ROUTE" ~ identifier
+    ~ ^"EVENT" ~ identifier
+    ~ ^"TO" ~ identifier
+    ~ route_where_clause?
+}
+route_where_clause = {
+    ^"WHERE" ~ identifier ~ ^"IN" ~ "(" ~ string ~ ("," ~ string)* ~ ")"
+}
+drop_route_stmt = { ^"DROP" ~ ^"ROUTE" ~ identifier }
 
 insert_stmt = {
     ^"INSERT"

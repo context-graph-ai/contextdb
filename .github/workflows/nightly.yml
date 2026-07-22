@@ -1,0 +1,27 @@
+name: Nightly
+
+# Nightly test tier. Stress/journey tests re-tiered out of the default gate are marked
+# `#[cfg(feature = "nightly-tests")]` (the same mechanism as the deprecated nats-tests
+# marker) and build/run only here. This deliberately does NOT use `--include-ignored`:
+# the tree carries `#[ignore]` tests that must stay skipped everywhere (pinned RED,
+# quarantined, platform- and corpus-gated). Deprecated NATS suites stay off.
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  full-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo test -p contextdb-engine --features nightly-tests
+      - run: cargo test -p contextdb-engine --features nightly-tests --release --test acceptance

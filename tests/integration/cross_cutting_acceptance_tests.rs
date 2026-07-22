@@ -1,25 +1,35 @@
 use super::helpers::*;
 use contextdb_core::Value;
 use contextdb_engine::Database;
+#[cfg(feature = "nats-tests")]
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+#[cfg(feature = "nats-tests")]
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::HashMap;
+#[cfg(feature = "nats-tests")]
 use std::sync::Arc;
+#[cfg(feature = "nats-tests")]
 use std::time::Duration;
 use tempfile::TempDir;
+#[cfg(feature = "nats-tests")]
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+#[cfg(feature = "nats-tests")]
 use testcontainers::runners::AsyncRunner;
+#[cfg(feature = "nats-tests")]
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+#[cfg(feature = "nats-tests")]
 struct NatsFixture {
     _container: ContainerAsync<GenericImage>,
     nats_url: String,
 }
 
+#[cfg(feature = "nats-tests")]
 fn setup_nats_conf() -> String {
     format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(feature = "nats-tests")]
 async fn start_nats() -> NatsFixture {
     let image = GenericImage::new("nats", "latest")
         .with_exposed_port(4222.tcp())
@@ -36,7 +46,7 @@ async fn start_nats() -> NatsFixture {
 }
 
 #[test]
-fn hc_f01_ontology_ops() {
+fn ontology_ops() {
     let db = setup_ontology_db();
     let id = uuid::Uuid::new_v4();
     db.execute(
@@ -51,16 +61,16 @@ fn hc_f01_ontology_ops() {
 }
 
 #[test]
-fn hc_f03_ignored_hnsw_recall() {}
+fn ignored_hnsw_recall() {}
 
 #[test]
 #[ignore = "requires ARM64 cross compile"]
-fn hc_f06_ignored_arm64() {}
+fn ignored_arm64() {}
 
 #[test]
-fn hc_t01_oom_does_not_partially_commit_visible_state() {
+fn oom_does_not_partially_commit_visible_state() {
     let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("hc_t01.db");
+    let path = tmp.path().join("t01.db");
     let db = Database::open(&path).unwrap();
     db.execute("SET MEMORY_LIMIT '1K'", &HashMap::new())
         .unwrap();
@@ -92,8 +102,9 @@ fn hc_t01_oom_does_not_partially_commit_visible_state() {
     );
 }
 
+#[cfg(feature = "nats-tests")]
 #[tokio::test]
-async fn hc_t02_restart_preserves_committed_sync_visibility() {
+async fn restart_preserves_committed_sync_visibility() {
     let nats = start_nats().await;
     let edge_tmp = TempDir::new().unwrap();
     let server_tmp = TempDir::new().unwrap();
@@ -128,7 +139,7 @@ async fn hc_t02_restart_preserves_committed_sync_visibility() {
     let server = Arc::new(SyncServer::new(
         server_db.clone(),
         &nats.nats_url,
-        "hc_t02",
+        contextdb_core::TenantId::from("t02"),
         policies.clone(),
     ));
     let handle = tokio::spawn({
@@ -137,12 +148,18 @@ async fn hc_t02_restart_preserves_committed_sync_visibility() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let client = SyncClient::new(edge_db.clone(), &nats.nats_url, "hc_t02");
+    let client = SyncClient::new(
+        edge_db.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("t02"),
+    );
     let initial_pull = client.pull(&policies).await.unwrap();
     assert_eq!(initial_pull.applied_rows, 2);
     assert_eq!(initial_pull.skipped_rows, 0);
 
     handle.abort();
+    let _ = handle.await;
+    drop(server);
     drop(client);
     drop(edge_db);
     drop(server_db);
@@ -163,7 +180,7 @@ async fn hc_t02_restart_preserves_committed_sync_visibility() {
     let restarted_server = Arc::new(SyncServer::new(
         reopened_server.clone(),
         &nats.nats_url,
-        "hc_t02",
+        contextdb_core::TenantId::from("t02"),
         policies.clone(),
     ));
     let restarted_handle = tokio::spawn({
@@ -172,7 +189,11 @@ async fn hc_t02_restart_preserves_committed_sync_visibility() {
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let restarted_client = SyncClient::new(reopened_edge.clone(), &nats.nats_url, "hc_t02");
+    let restarted_client = SyncClient::new(
+        reopened_edge.clone(),
+        &nats.nats_url,
+        contextdb_core::TenantId::from("t02"),
+    );
     let delta_pull = restarted_client.pull(&policies).await.unwrap();
     assert_eq!(
         delta_pull.applied_rows, 1,
@@ -191,14 +212,16 @@ async fn hc_t02_restart_preserves_committed_sync_visibility() {
     );
 
     restarted_handle.abort();
+    let _ = restarted_handle.await;
+    drop(restarted_server);
 }
 
 #[test]
-fn hc_t04_bfs_mvcc() {
+fn bfs_mvcc() {
     let db = setup_ontology_db();
     let a = uuid::Uuid::new_v4();
     let b = uuid::Uuid::new_v4();
-    let tx = db.begin();
+    let tx = db.begin_or_panic();
     db.insert_edge(tx, a, b, "R".to_string(), std::collections::HashMap::new())
         .unwrap();
     db.commit(tx).unwrap();

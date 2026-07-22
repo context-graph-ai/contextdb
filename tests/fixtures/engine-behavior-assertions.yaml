@@ -1,13 +1,10 @@
 ---
 fixture_basis: empirical
-source: "63 spike assertions across 10 categories validating impact analysis, replay, provenance, and invariants"
-status: draft
-owner: claude
-last_updated: 2026-03-07
+source: "49 assertions across 10 categories validating impact analysis, replay, provenance, and invariants"
 ---
 
-# Spike 63 Assertions — Reference Fixture
-# ContextDB passes when all 63 assertions pass with ContextDB as backend.
+# Behavior Assertions — Reference Fixture
+# ContextDB passes when all 49 assertions pass with ContextDB as backend.
 
 assertion_categories:
   - name: "[GO-01] Impact Analysis Output Shape"
@@ -54,9 +51,7 @@ assertion_categories:
     count: 2
     tests: "cannot archive intention with active decisions"
 
-total_assertions: 49  # Note: spike reported 63 total assertions
-# Discrepancy to reconcile during spike step — some assertions may be
-# in additional test functions not categorized above
+total_assertions: 49
 
 adaptation_notes: |
   To run these against ContextDB:

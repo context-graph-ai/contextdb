@@ -1,7 +1,9 @@
 use super::common::*;
+#[cfg(feature = "nats-tests")]
 use contextdb_core::Value;
 use tempfile::TempDir;
 
+#[cfg(feature = "nats-tests")]
 fn seed_edge_big_table(edge_path: &std::path::Path, rows: usize) {
     let db = contextdb_engine::Database::open(edge_path).expect("open edge db");
     db.execute(
@@ -142,6 +144,7 @@ fn a_db5_file_backed_disk_limit_survives_restart() {
     );
 }
 
+#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
     let tmp = TempDir::new().expect("tempdir");

@@ -30,7 +30,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut chain = Vec::<Uuid>::new();
     let mut batches = 0usize;
     for batch in 0..8usize {
-        let tx = db.begin();
+        let tx = db.begin_or_panic();
         for i in 0..250usize {
             let ordinal = batch * 250 + i;
             let node_id = Uuid::from_u128(ordinal as u128 + 1);
@@ -69,6 +69,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         batches += 1;
     }
 
+    db.close()?;
     let reopened = Database::open(&db_path)?;
     let snapshot = reopened.snapshot();
     let rows = reopened.scan("rss_items", snapshot)?;

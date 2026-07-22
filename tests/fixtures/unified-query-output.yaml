@@ -1,13 +1,10 @@
 ---
 fixture_basis: hypothetical
 source: "Unified query expected output validating graph-to-relational-to-vector pipeline with neighborhood exclusion and similarity ranking"
-status: draft
-owner: claude
-last_updated: 2026-03-07
 ---
 
 # Unified Query — Expected Output Fixture
-# NOTE: hypothetical fixture — pay 2x attention during spike validation
+# NOTE: hand-computed / hypothetical values
 
 # Graph phase: 2-hop BFS from "hub" via RELATES_TO
 #   hop 1: n1, n2

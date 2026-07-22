@@ -1,26 +1,24 @@
 services:
-  nats:
-    image: nats:latest
-    ports:
-      - "4222:4222"
-      - "9222:9222"
-    volumes:
-      - ./nats.conf:/etc/nats/nats.conf:ro
-    command: ["-c", "/etc/nats/nats.conf"]
-
   contextdb-server:
     # To build from source instead: docker compose build
     image: ghcr.io/context-graph-ai/contextdb-server:latest
     build: .
-    depends_on:
-      - nats
     environment:
-      CONTEXTDB_NATS_URL: "nats://nats:4222"
+      # Dial-by-key sync endpoint. The identity key persists on the mounted
+      # volume so the server keeps the same cryptographic identity across
+      # restarts. Port 4433/udp carries the sync traffic.
+      # NOTE: /data/fabric-identity.key is a SECRET — back up the volume and
+      # never commit or share the key; losing it invalidates issued tickets.
+      CONTEXTDB_SYNC_ENDPOINT: "iroh:?identity=/data/fabric-identity.key&port=4433"
       CONTEXTDB_TENANT_ID: "default"
       CONTEXTDB_DB_PATH: "/data/server.db"
+    ports:
+      - "4433:4433/udp"
     volumes:
       - contextdb-data:/data
     restart: unless-stopped
+    # The enrollment ticket edges paste into `--sync-endpoint` is printed to the
+    # container logs on startup: `docker compose logs contextdb-server`.
 
 volumes:
   contextdb-data:

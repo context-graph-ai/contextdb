@@ -67,11 +67,13 @@ pub async fn run_loop<P, Fut, R>(
                     report(format!("sync conflict: {reason}"));
                 }
                 if !outcome.caught_up && !rx.is_closed() {
-                    next_delay = Some(Duration::ZERO);
+                    next_delay = Some(config.retry_backoff);
                 }
             }
             Err(err) => {
-                report(format!("auto-sync push failed: {err}"));
+                report(format!(
+                    "Background auto-sync could not push pending local changes: {err}. It will retry automatically; run `.sync status` to check connectivity."
+                ));
                 if rx.is_closed() {
                     break;
                 }
@@ -133,7 +135,7 @@ mod tests {
         assert!(
             reports
                 .iter()
-                .any(|msg| msg.contains("auto-sync push failed")),
+                .any(|msg| msg.contains("could not push pending local changes")),
             "auto-sync should surface push failures"
         );
     }
