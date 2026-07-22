@@ -144,10 +144,7 @@ fn nv07b_sync_apply_routes_to_matching_index() {
     let cs = ChangeSet {
         rows: vec![RowChange {
             table: "evidence".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".into(), Value::Uuid(id)),
             values: row_values,
             deleted: false,
             lsn,
@@ -245,10 +242,7 @@ fn nv07c_receiver_promoted_to_leader_emits_correct_index_keyed_envelopes() {
     let cs = ChangeSet {
         rows: vec![RowChange {
             table: "evidence".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".into(), Value::Uuid(id)),
             values: row_values,
             deleted: false,
             lsn,

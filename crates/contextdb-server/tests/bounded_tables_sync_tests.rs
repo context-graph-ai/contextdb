@@ -1,9 +1,11 @@
-//! Bounded tables — transport-side acceptance: synced DDL, `SYNC SAFE`
-//! watermark advance, one-way table policy, and per-peer transfer receipts.
+//! Bounded tables — the transport-side acceptance tests: a synced retained
+//! table starts maintaining itself, rows delete only after confirmed delivery,
+//! a push-only table is never sent back, a pruned row never comes back, and
+//! transfer receipts count per peer and direction.
 //!
-//! Before this feature, the sync client never advanced the engine's
-//! `SYNC SAFE` watermark, the one-way table policy did not exist, and
-//! there were no per-peer transfer receipts on either plane.
+//! Before this change: the sync client never advanced the engine's `SYNC SAFE`
+//! watermark, the one-way table policy did not exist, and there were no per-peer
+//! transfer receipts on either plane.
 //!
 //! Discipline: no sleeps, no elapsed-time assertions, no raw clock reads. Time
 //! moves through `Wallclock::test_clock_guard`; pruning is driven synchronously
@@ -38,10 +40,10 @@ const TENANT: &str = "bounded";
 /// same way the iroh path presents the dialed endpoint's node id.
 const HUB_NODE: &str = "hub-node-a";
 const OTHER_HUB_NODE: &str = "hub-node-b";
-/// The retention-windowed table these tests use, engine-generically
-/// named: a small window row that ages out and only ever travels edge -> hub.
+/// A retained table for a downstream application, engine-generically named: a
+/// small window row that ages out and only ever travels edge -> hub.
 const RETAINED_DDL: &str = "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-     RETAIN 1 HOURS SYNC SAFE PUSH ONLY";
+     RETAIN 1 HOURS SYNC SAFE SYNC PUSH ONLY";
 const CONTROL_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
 
 fn p() -> HashMap<String, Value> {
@@ -218,7 +220,7 @@ impl ClientTransport for OfflineTransport {
 }
 
 // ---------------------------------------------------------------------------
-// C1 — retention runs by itself, including for a table that ARRIVED by sync
+// Retention runs by itself, including for a table that ARRIVED by sync
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -250,7 +252,7 @@ async fn c1_synced_ddl_arrival_starts_maintenance_on_the_receiving_edge() {
 }
 
 // ---------------------------------------------------------------------------
-// C3 — delete only after delivery
+// Delete only after delivery
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -288,7 +290,7 @@ async fn c3_confirmed_push_advances_the_engine_sync_watermark() {
     hub.stop().await;
 }
 
-/// The decisive row for C3: a write made AFTER the confirmed batch sits beyond
+/// The decisive row: a write made AFTER the confirmed batch sits beyond
 /// the frontier and must survive a prune that takes every confirmed row, however
 /// far past its window it is. This is what a watermark that ran ahead of
 /// confirmation would delete.
@@ -416,7 +418,7 @@ async fn c3_offline_backlog_prunes_only_after_reconnect_and_confirm() {
 }
 
 // ---------------------------------------------------------------------------
-// C4 — the hub never sends a retained table back
+// The hub never sends a retained table back
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -547,7 +549,7 @@ async fn c4_pushing_a_retained_table_registers_the_hub_and_a_second_hub_is_refus
 }
 
 // ---------------------------------------------------------------------------
-// C5 — a pruned row never comes back
+// A pruned row never comes back
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -685,7 +687,7 @@ async fn c5_hub_ages_retained_rows_on_its_own_clock() {
 }
 
 // ---------------------------------------------------------------------------
-// C9 — transfer receipts
+// Transfer receipts
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -762,10 +764,10 @@ async fn c9_client_receipts_record_both_directions_against_the_hub_node_id() {
     insert_notes(&edge, 1..7);
     let client = edge_client(&edge, &broker, "edge-a");
     // Pull BEFORE push, deliberately: whether a pull echoes a client's own
-    // pushed rows back is the known open pull-watermark limitation
-    // that these tests leave untouched. Pulling first means the
-    // hub holds only the four foreign rows at that moment, so the count is
-    // exact without depending on either answer to that open question.
+    // pushed rows back is an open pull-watermark question this test leaves
+    // untouched. Pulling first means the hub holds only the four foreign rows
+    // at that moment, so the count is exact without depending on either answer
+    // to that open question.
     within(client.pull_default()).await.expect("pull");
     within(client.push()).await.expect("push");
 
@@ -1075,7 +1077,7 @@ async fn c9_blob_receipts_split_serve_and_fetch_by_peer() {
 }
 
 // ---------------------------------------------------------------------------
-// C3 — the delivery promise cannot be revoked from the side
+// The delivery promise cannot be revoked from the side
 //
 // `set_table_direction` is public and unguarded. Setting `None` or `Pull` on a
 // `SYNC SAFE` table drops its rows from the outbound changeset while the GLOBAL
@@ -1226,8 +1228,8 @@ async fn c3_a_direction_set_before_the_table_existed_is_refused_at_push() {
 /// which is exactly what the counters' contract forbids.
 ///
 /// Only the hub side is tested here. The pulling side already draws both figures
-/// from the same pre-apply row set (`sync_client.rs:612-614`, fixed in 9b68c70),
-/// so its twin would assert behaviour that is already correct; the hub's handler
+/// from the same pre-apply row set (`sync_client.rs:612-614`), so its twin would
+/// assert behaviour that is already correct; the hub's handler
 /// (`sync_server.rs:579`) is the remaining half.
 #[tokio::test]
 async fn c9_hub_receipts_count_transmitted_rows_even_when_conflict_policy_skips_them() {

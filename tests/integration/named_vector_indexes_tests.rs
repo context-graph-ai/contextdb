@@ -1061,7 +1061,7 @@ fn nv02b_null_vector_column_produces_no_index_entry() {
     )
     .expect("create");
 
-    // A downstream evidence shape: a Text-kind row populates vector_text only; vector_vision is NULL.
+    // A downstream consumer's evidence shape: a Text-kind row populates vector_text only; vector_vision is NULL.
     let text_row = Uuid::new_v4();
     db.execute(
         "INSERT INTO evidence (id, kind, vector_text) VALUES ($id, $k, $t)",
@@ -1651,8 +1651,8 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
     assert_eq!(column, "vector_text");
 
     // SHOW VECTOR_INDEXES surface columns are exactly the engine-level columns — no space_id, no
-    // downstream-side metadata. A downstream embedding_space_bindings table joins these
-    // (table, column) pairs back to embedding_space_id at the downstream layer.
+    // consumer-side metadata. A downstream consumer's embedding_space_bindings table joins these
+    // (table, column) pairs back to embedding_space_id at the consumer layer.
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4))",
@@ -1676,7 +1676,7 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
     for col in &indexes.columns {
         assert!(
             allowed.contains(col.as_str()),
-            "SHOW VECTOR_INDEXES column `{col}` is not in the engine-only allowlist; embedding_space_id and downstream-side metadata must NOT appear in the engine surface"
+            "SHOW VECTOR_INDEXES column `{col}` is not in the engine-only allowlist; embedding_space_id and consumer-side metadata must NOT appear in the engine surface"
         );
     }
 }
@@ -1712,10 +1712,7 @@ fn nv19b_changeset_ddl_applies_before_vector_changes_for_new_index() {
     let cs = ChangeSet {
         rows: vec![RowChange {
             table: "evidence".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".into(), Value::Uuid(id)),
             values: row_values, // contains only id and vector_text; vector_vision is delivered ONLY via VectorChange
             deleted: false,
             lsn,
@@ -2323,10 +2320,7 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
     let cs = ChangeSet {
         rows: vec![RowChange {
             table: "evidence".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: Value::Uuid(new_id),
-            },
+            natural_key: NaturalKey::single("id".into(), Value::Uuid(new_id)),
             values: row_values,
             deleted: false,
             lsn: Lsn(20),
@@ -2582,8 +2576,8 @@ fn nv13c_multi_row_multi_vector_insert_partial_failure_rolls_back_atomically() {
     )
     .expect("create");
 
-    // A downstream ingest shape: one INSERT statement carries N rows (e.g., a video frame with N
-    // detected objects ingested as N evidence rows). One bad row anywhere in the batch must roll back the whole
+    // A downstream consumer's ingest shape: one INSERT statement carries N rows (e.g., a video frame with N detected
+    // faces ingested as N evidence rows). One bad row anywhere in the batch must roll back the whole
     // statement — not just the offending row.
     let id_a = Uuid::new_v4();
     let id_b = Uuid::new_v4(); // bad row: vector_vision dim 7
@@ -2762,7 +2756,7 @@ fn nv14c_record_observation_fanout_unified_tx_atomicity() {
 
     let pre_snap = db.snapshot();
 
-    // A downstream record_observation fanout: 1 entity + 1 snapshot + 3 evidence rows (text, vision, mixed)
+    // A downstream consumer's record_observation fanout: 1 entity + 1 snapshot + 3 evidence rows (text, vision, mixed)
     // + a graph edge linking entity → snapshot, all in ONE transaction.
     let entity_id = Uuid::new_v4();
     let snapshot_id = Uuid::new_v4();

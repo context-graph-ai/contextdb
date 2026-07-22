@@ -123,10 +123,7 @@ fn host_insert_sql() -> &'static str {
 fn row_change(table: &str, id: Uuid, content: &str, lsn: Lsn) -> RowChange {
     RowChange {
         table: table.to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("content".to_string(), Value::Text(content.to_string())),
@@ -625,10 +622,7 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
                 ),
                 RowChange {
                     table: "sibling_vectors".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(uuid(0x198)),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(uuid(0x198))),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(uuid(0x198))),
                         (
@@ -1612,10 +1606,7 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
             ddl_lsn: vec![Lsn(30)],
             rows: vec![RowChange {
                 table: "type_checked_writes".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(uuid(0x1530)),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(uuid(0x1530))),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(uuid(0x1530))),
                     ("content".to_string(), Value::TxId(TxId(30))),
@@ -1658,10 +1649,10 @@ fn t3_sync_mixed_ddl_preflight_rejects_noncanonical_natural_key_envelopes_withou
             "column mismatch",
             RowChange {
                 table: "host_writes".into(),
-                natural_key: NaturalKey {
-                    column: "content".into(),
-                    value: Value::Text("content-as-key".into()),
-                },
+                natural_key: NaturalKey::single(
+                    "content".into(),
+                    Value::Text("content-as-key".into()),
+                ),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(uuid(0x7005))),
                     ("content".to_string(), Value::Text("content-as-key".into())),
@@ -1675,10 +1666,7 @@ fn t3_sync_mixed_ddl_preflight_rejects_noncanonical_natural_key_envelopes_withou
             "value mismatch",
             RowChange {
                 table: "host_writes".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(uuid(0x7006)),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(uuid(0x7006))),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(uuid(0x7007))),
                     ("content".to_string(), Value::Text("wrong-envelope".into())),
@@ -1807,10 +1795,7 @@ fn t3_sync_trigger_ddl_preflight_rejects_fk_invalid_data_before_any_trigger_ddl_
             ddl_lsn: vec![Lsn(10), Lsn(30)],
             rows: vec![RowChange {
                 table: "child_rows".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(child_id),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(child_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(child_id)),
                     ("parent_id".to_string(), Value::Uuid(missing_parent)),
@@ -1880,10 +1865,7 @@ fn t3_sync_trigger_ddl_fk_preflight_respects_sender_lsn_order() {
             rows: vec![
                 RowChange {
                     table: "child_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(child_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(child_id)),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(child_id)),
                         ("parent_id".to_string(), Value::Uuid(parent_id)),
@@ -1895,10 +1877,7 @@ fn t3_sync_trigger_ddl_fk_preflight_respects_sender_lsn_order() {
                 },
                 RowChange {
                     table: "parent_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(parent_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(parent_id)),
                     values: HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
                     deleted: false,
                     lsn: Lsn(30),
@@ -1981,10 +1960,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_parent_delete_before_trigger_leak() 
             ddl_lsn: vec![Lsn(10), Lsn(30)],
             rows: vec![RowChange {
                 table: "parent_rows".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(parent_id),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(parent_id)),
                 values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
                 deleted: true,
                 lsn: Lsn(20),
@@ -2068,10 +2044,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_stale_parent_prefix_after_update() {
             rows: vec![
                 RowChange {
                     table: "parent_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(parent_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(parent_id)),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(parent_id)),
                         ("ref_id".to_string(), Value::Uuid(new_ref)),
@@ -2082,10 +2055,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_stale_parent_prefix_after_update() {
                 },
                 RowChange {
                     table: "child_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(child_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(child_id)),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(child_id)),
                         ("parent_ref".to_string(), Value::Uuid(old_ref)),
@@ -2183,10 +2153,7 @@ fn t3_sync_trigger_ddl_fk_preflight_accepts_child_update_before_parent_delete() 
             rows: vec![
                 RowChange {
                     table: "child_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(child_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(child_id)),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(child_id)),
                         ("parent_id".to_string(), Value::Null),
@@ -2198,10 +2165,7 @@ fn t3_sync_trigger_ddl_fk_preflight_accepts_child_update_before_parent_delete() 
                 },
                 RowChange {
                     table: "parent_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(parent_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(parent_id)),
                     values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
                     deleted: true,
                     lsn: Lsn(30),
@@ -2282,10 +2246,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_skipped_child_update_before_parent_d
             rows: vec![
                 RowChange {
                     table: "child_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(child_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(child_id)),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(child_id)),
                         ("parent_id".to_string(), Value::Null),
@@ -2297,10 +2258,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_skipped_child_update_before_parent_d
                 },
                 RowChange {
                     table: "parent_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(parent_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(parent_id)),
                     values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
                     deleted: true,
                     lsn: Lsn(30),
@@ -2565,10 +2523,7 @@ fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
             ddl_lsn: vec![Lsn(10), Lsn(30)],
             rows: vec![RowChange {
                 table: "host_vectors".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(vector_id),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(vector_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(vector_id)),
                     ("embedding".to_string(), Value::Vector(vec![1.0, 0.0, 0.0])),
@@ -2626,10 +2581,7 @@ fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
             ddl_lsn: vec![Lsn(40), Lsn(40)],
             rows: vec![RowChange {
                 table: "host_vectors".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(same_lsn_id),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(same_lsn_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(same_lsn_id)),
                     ("embedding".to_string(), Value::Vector(vec![0.0, 1.0, 0.0])),

@@ -1991,10 +1991,7 @@ fn a9_15_archive_not_delete_status_transition_sync() {
     // have apply_changes treat empty values as a delete signal.
     let empty_values_change = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(uuid_d),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(uuid_d)),
         values: HashMap::new(), // deliberately empty
         deleted: false,
         lsn: Lsn(999),
@@ -4088,101 +4085,15 @@ async fn nt_14_large_bidirectional_vector_sync() {
 // CP — Sync Conflict Policy SQL Surface Tests
 // ---------------------------------------------------------------------------
 
-/// SET SYNC_CONFLICT_POLICY sets the default policy and SHOW returns it.
-#[test]
-fn cp01_set_and_show_sync_conflict_policy() {
-    let db = Database::open_memory();
-    db.execute("SET SYNC_CONFLICT_POLICY 'latest_wins'", &HashMap::new())
-        .expect("SET must succeed");
-    let result = db
-        .execute("SHOW SYNC_CONFLICT_POLICY", &HashMap::new())
-        .expect("SHOW must succeed");
-    assert!(!result.rows.is_empty(), "SHOW must return a row");
-    let policy = &result.rows[0][0];
-    assert_eq!(
-        *policy,
-        Value::Text("latest_wins".to_string()),
-        "default policy must be latest_wins"
-    );
-}
-
-/// SET SYNC_CONFLICT_POLICY accepts all valid policy names.
-#[test]
-fn cp02_all_policy_names_accepted() {
-    let db = Database::open_memory();
-    for policy in &["latest_wins", "server_wins", "edge_wins"] {
-        db.execute(
-            &format!("SET SYNC_CONFLICT_POLICY '{policy}'"),
-            &HashMap::new(),
-        )
-        .unwrap_or_else(|e| panic!("SET '{policy}' must succeed: {e}"));
-    }
-}
-
-/// SET SYNC_CONFLICT_POLICY rejects invalid policy names.
-#[test]
-fn cp03_invalid_policy_rejected() {
-    let db = Database::open_memory();
-    let result = db.execute("SET SYNC_CONFLICT_POLICY 'bogus'", &HashMap::new());
-    assert!(result.is_err(), "invalid policy name must be rejected");
-}
-
-/// ALTER TABLE SET SYNC_CONFLICT_POLICY sets a per-table override.
-#[test]
-fn cp04_per_table_conflict_policy() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "ALTER TABLE sensors SET SYNC_CONFLICT_POLICY 'server_wins'",
-        &HashMap::new(),
-    )
-    .expect("ALTER TABLE SET policy must succeed");
-    let result = db
-        .execute("SHOW SYNC_CONFLICT_POLICY", &HashMap::new())
-        .expect("SHOW must succeed");
-    // SHOW must include the per-table override
-    let output = format!("{:?}", result.rows);
-    assert!(
-        output.contains("server_wins"),
-        "SHOW must reflect per-table policy, got: {output}"
-    );
-}
-
-/// ALTER TABLE DROP SYNC_CONFLICT_POLICY removes a per-table override.
-#[test]
-fn cp05_drop_per_table_policy() {
-    let db = Database::open_memory();
-    db.execute(
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "ALTER TABLE sensors SET SYNC_CONFLICT_POLICY 'server_wins'",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "ALTER TABLE sensors DROP SYNC_CONFLICT_POLICY",
-        &HashMap::new(),
-    )
-    .expect("DROP policy must succeed");
-}
-
-/// SET SYNC_CONFLICT_POLICY actually determines conflict resolution behavior during apply_changes.
-/// This test sets 'server_wins', creates a conflict, and verifies the server's value is kept.
-/// Then sets 'edge_wins' on the same scenario and verifies the edge's value overwrites.
+/// A table's conflict policy is honored by `apply_changes` from the passed
+/// `ConflictPolicies`: `server_wins` keeps the server's value on a conflict,
+/// `edge_wins` overwrites with the edge's. (The legacy `SET SYNC_CONFLICT_POLICY`
+/// statement surface was removed — policy is declared on the table or passed to
+/// the apply.)
 #[test]
 fn cp06_conflict_policy_wired_to_apply_changes() {
     let id = uuid::Uuid::from_u128(1);
-    let key = NaturalKey {
-        column: "id".to_string(),
-        value: Value::Uuid(id),
-    };
+    let key = NaturalKey::single("id".to_string(), Value::Uuid(id));
 
     // Scenario: server has row with name="server_value", edge pushes name="edge_value"
     let changeset = ChangeSet {
@@ -4467,10 +4378,7 @@ fn integrity_11_sync_apply_respects_memory_limit() {
     let changes = ChangeSet {
         rows: vec![RowChange {
             table: "items".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(id)),
                 ("data".to_string(), Value::Text("x".repeat(4096))),
@@ -4548,10 +4456,7 @@ fn integrity_12_sync_delete_removes_vectors() {
     let changes = ChangeSet {
         rows: vec![RowChange {
             table: "observations".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(target_id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(target_id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(target_id)),
                 ("data".to_string(), Value::Text("target".into())),
@@ -4637,10 +4542,7 @@ fn integrity_13_sync_upsert_refreshes_vector() {
     let changes = ChangeSet {
         rows: vec![RowChange {
             table: "observations".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(target_id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(target_id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(target_id)),
                 ("data".to_string(), Value::Text("new".into())),

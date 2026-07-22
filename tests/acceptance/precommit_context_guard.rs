@@ -948,10 +948,7 @@ fn t4_14_sync_apply_does_not_insert_other_context_rows() {
             ChangeSet {
                 rows: vec![RowChange {
                     table: "memos".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(row_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(row_id)),
                     values: HashMap::from([
                         ("id".into(), Value::Uuid(row_id)),
                         ("body".into(), Value::Text("from-sync".into())),

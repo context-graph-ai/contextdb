@@ -1,5 +1,5 @@
-//! Measurement driver for the bounded-tables + transfer-receipts live
-//! end-to-end smoke driver for bounded-table retention behavior.
+//! Measurement driver for the bounded-tables + transfer-receipts live-smoke
+//! (`scripts/bounded-tables-live-smoke.sh`).
 //!
 //! This binary is a CALLER of the public library surface — the same shape as
 //! `examples/media_transfer_fabric_demo.rs`. It runs the real product path: a
@@ -10,18 +10,18 @@
 //!
 //! Division of labour: this binary MEASURES and prints `key=value` lines. It
 //! makes no pass/fail judgement — every assertion lives in the shell script, so
-//! a reviewer diffs the script against the frozen smoke contract and never has
-//! to trust a verdict computed inside the thing under test.
+//! a reviewer reads the pass/fail logic there and never has to trust a verdict
+//! computed inside the thing under test.
 //!
-//! The named table is a downstream-shaped, retention-windowed metric table with
-//! the retention window compressed to seconds, plus a surrogate primary key. See
-//! `retained_ddl` for the full reasoning: a literal keyless shape silently
-//! destroyed data on this smoke's first run and the engine now refuses it at
-//! declaration.
+//! The named table is a downstream application's retained-metric table with the
+//! retention window compressed to seconds, plus ONE deliberate deviation from a
+//! verbatim table declaration — the surrogate primary key. See `retained_ddl`
+//! for the full reasoning: the literal keyless shape silently destroyed data on
+//! this smoke's first run and the engine now refuses it at declaration.
 //!
 //! ```sql
-//! CREATE TABLE sensor_metric_windows (
-//!     window_key   TEXT PRIMARY KEY,   -- the surrogate primary key
+//! CREATE TABLE metric_windows (
+//!     window_key   TEXT PRIMARY KEY,   -- the deliberate deviation
 //!     machine_id   TEXT,
 //!     sensor_id    TEXT,
 //!     metric       TEXT,
@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The retained table's name and shape.
-const RETAINED_TABLE: &str = "sensor_metric_windows";
+const RETAINED_TABLE: &str = "metric_windows";
 /// An ordinary two-way table alongside it: the control that proves a pull path
 /// works at all, so "the retained table did not come back" is never a
 /// failed-transfer tautology.
@@ -62,16 +62,17 @@ const CONTROL_TABLE: &str = "smoke_notes";
 /// ticks, rather than one reading per cycle at an arbitrary phase.
 const FILE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The retention-windowed metric table, plus a surrogate primary key.
+/// The retained-metric table, plus a surrogate primary key.
 ///
-/// The surrogate primary key is a deliberate deviation from a keyless shape.
-/// A keyless declaration silently destroys data: rows of a keyless table never
-/// enter the pushed changeset, the push still reports success, the watermark
-/// advances over their LSNs, and the engine's retention loop then deletes rows
-/// the hub never received — with `skipped_rows: 0`, so nothing anywhere reports
-/// the loss. The engine now REFUSES keyless + `SYNC SAFE` at declaration (proved
-/// on the product path by the `keyless-probe` subcommand below), so a keyless
-/// declaration is no longer legal.
+/// DELIBERATE DEVIATION from a verbatim table declaration. The original example
+/// declares no key at all, and this smoke's first run proved that shape destroys
+/// data: rows of a keyless table never enter the pushed changeset, the push
+/// still reports success, the watermark advances over their LSNs, and the
+/// engine's retention loop then deletes rows the hub never received — with
+/// `skipped_rows: 0`, so nothing anywhere reports the loss. The engine now
+/// REFUSES keyless + `SYNC SAFE` at declaration (proved on the product path by
+/// the `keyless-probe` subcommand below), so the literal keyless example is no
+/// longer a legal declaration.
 ///
 /// The key is a surrogate rather than the natural composite because the engine
 /// supports no composite primary key: `grammar.pest:224` offers `PRIMARY KEY`
@@ -96,8 +97,8 @@ fn retained_ddl(retain_secs: u64, sync_safe: bool) -> String {
     )
 }
 
-/// A literal keyless declaration, kept ONLY so the smoke can prove the
-/// engine now refuses it on the real product path.
+/// The literal keyless declaration, kept ONLY so the smoke can prove the engine
+/// now refuses it on the real product path.
 fn keyless_retained_ddl(retain_secs: u64) -> String {
     format!(
         "CREATE TABLE {RETAINED_TABLE}_keyless (\
@@ -301,7 +302,7 @@ async fn wait_until<F: FnMut() -> bool>(budget: Duration, mut probe: F) -> bool 
 #[derive(Parser)]
 #[command(
     name = "bounded_tables_smoke",
-    about = "Measurement driver for the bounded-tables live end-to-end smoke"
+    about = "Measurement driver for the bounded-tables live-smoke"
 )]
 struct Args {
     #[command(subcommand)]
@@ -315,10 +316,10 @@ enum Command {
         #[arg(long)]
         identity: PathBuf,
     },
-    /// Try to declare a LITERAL keyless retained table and report whether the
-    /// engine refused it, with the message it gave. An early run of this smoke
-    /// proved that shape silently destroys data; this turns that disaster into a
-    /// standing assertion on the product path.
+    /// Try to declare the LITERAL keyless retained table and report whether the
+    /// engine refused it, with the message it gave. Run 1 of this
+    /// smoke proved that shape silently destroys data; this turns that
+    /// disaster into a standing assertion on the product path.
     KeylessProbe {
         #[arg(long)]
         db_path: PathBuf,
@@ -710,8 +711,8 @@ async fn main() {
     }
 }
 
-/// Declare a literal keyless retained table and report whether the
-/// engine refused it. A refusal at declaration is the only safe outcome: a
+/// Declare the literal keyless retained table and report whether the engine
+/// refused it. A refusal at declaration is the only safe outcome: a
 /// keyless retained table's rows cannot enter a changeset, so accepting one
 /// means acking a delivery that never happened and then deleting the rows.
 fn run_keyless_probe(db_path: &Path, retain_secs: u64) {
@@ -757,8 +758,8 @@ fn run_probe(db_path: &Path, prefix: &str) {
             emit(&format!("{prefix}.retained.present"), 1);
             emit(&format!("{prefix}.retained.sync_safe"), meta.sync_safe);
             emit(
-                &format!("{prefix}.retained.policy"),
-                format!("{:?}", meta.retained_sync_policy),
+                &format!("{prefix}.retained.direction"),
+                format!("{:?}", meta.sync_direction),
             );
             emit(
                 &format!("{prefix}.retained.window_secs"),
@@ -1732,8 +1733,8 @@ fn run_s6_audit(db_path: &Path, firings_per_round: u64) {
     emit("s6.ring_capacity", ring);
     emit("s6.retention_secs", retention.as_secs());
 
-    // DEVIATION FROM THE BLANKET "NO CLOCK MOCKING" RULE — explained here in
-    // place so a script-vs-source diff finds the rationale where it applies.
+    // DELIBERATE DEVIATION from this smoke's blanket "no clock mocking" rule,
+    // explained in place so a reviewer sees why it is justified here.
     //
     // Why the clause exists: `Wallclock`'s override is thread-local, so an
     // engine BACKGROUND thread never sees it — mocking time to prove background

@@ -230,10 +230,7 @@ fn strict_hub_rejects_callbackless_trigger_table_apply() {
     let data_only = ChangeSet {
         rows: vec![RowChange {
             table: "widgets".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: Value::Uuid(data_only_id),
-            },
+            natural_key: NaturalKey::single("id".into(), Value::Uuid(data_only_id)),
             values: widget_params(data_only_id, "strict-data-only"),
             deleted: false,
             lsn: Lsn(10),
@@ -278,10 +275,7 @@ fn assert_relay_still_rejects_trigger_table_fk_violation() {
             rows: vec![
                 RowChange {
                     table: "child_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(child_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(child_id)),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(child_id)),
                         ("parent_id".to_string(), Value::Uuid(parent_id)),
@@ -293,10 +287,7 @@ fn assert_relay_still_rejects_trigger_table_fk_violation() {
                 },
                 RowChange {
                     table: "parent_rows".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Uuid(parent_id),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Uuid(parent_id)),
                     values: HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
                     deleted: false,
                     lsn: Lsn(30),
@@ -348,10 +339,7 @@ fn assert_relay_still_rejects_trigger_table_schema_violation() {
         ChangeSet {
             rows: vec![RowChange {
                 table: "widgets".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(id)),
                     ("label".to_string(), Value::TxId(TxId(99))),
@@ -522,10 +510,7 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
         ChangeSet {
             rows: vec![RowChange {
                 table: "widgets".into(),
-                natural_key: NaturalKey {
-                    column: "id".into(),
-                    value: Value::Uuid(constructor_id),
-                },
+                natural_key: NaturalKey::single("id".into(), Value::Uuid(constructor_id)),
                 values: widget_params(constructor_id, "constructor-relay"),
                 deleted: false,
                 lsn: Lsn(10),

@@ -787,6 +787,7 @@ impl Database {
             trigger: self.trigger.clone(),
             sync_relay_mode: self.sync_relay_mode.clone(),
             in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
+            sync_incarnations: self.sync_incarnations.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),

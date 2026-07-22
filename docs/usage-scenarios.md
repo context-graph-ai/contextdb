@@ -402,8 +402,8 @@ The applied count reports data rows; the `CREATE TABLE` replicates too (instance
 Sync is bidirectional, per-table configurable:
 
 ```sql
--- This table only pushes (observations flow up, never down)
-ALTER TABLE observations SET SYNC_CONFLICT_POLICY 'insert_if_not_exists'
+-- Conflict resolution is declared on the table itself (keep-first is the default)
+CREATE TABLE observations (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST
 ```
 
 ```

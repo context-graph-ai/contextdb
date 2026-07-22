@@ -2645,10 +2645,7 @@ fn p36_noop_sync_commit_does_not_reuse_lsn_after_reopen() {
             contextdb_engine::sync_types::ChangeSet {
                 rows: vec![RowChange {
                     table: "t".to_string(),
-                    natural_key: NaturalKey {
-                        column: "id".to_string(),
-                        value: Value::Uuid(id),
-                    },
+                    natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                     values: HashMap::new(),
                     deleted: false,
                     lsn: Lsn(100),

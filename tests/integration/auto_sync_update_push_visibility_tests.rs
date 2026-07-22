@@ -91,10 +91,7 @@ fn row_values(key: Uuid, text: &str) -> HashMap<String, Value> {
 fn row_change(key: Uuid, text: &str, lsn: Lsn) -> RowChange {
     RowChange {
         table: "t".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(key),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(key)),
         values: row_values(key, text),
         deleted: false,
         lsn,

@@ -5,7 +5,7 @@ use crate::protocol::{
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
 use crate::transport::{ClientTransport, TransportError};
-use contextdb_core::{AtomicLsn, Error, Lsn, TenantId};
+use contextdb_core::{AtomicLsn, Error, Incarnation, Lsn, TenantId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, SyncDirection,
@@ -34,6 +34,10 @@ pub struct SyncClient {
     tenant_id: TenantId,
     push_watermark: AtomicLsn,
     pull_watermark: AtomicLsn,
+    /// Directions set at runtime by the embedding application. These fill in
+    /// for tables that DECLARED no direction; a table's own declaration is the
+    /// source of truth and is never overridden from here, so what the
+    /// application wrote in its schema is what happens.
     table_directions: std::sync::RwLock<HashMap<String, SyncDirection>>,
     conflict_policies: std::sync::RwLock<ConflictPolicies>,
     /// Per-peer transfer counters for the sync plane. In memory only.
@@ -173,13 +177,32 @@ impl SyncClient {
     /// cooperation from the embedding application and before a single retained
     /// row leaves the edge.
     fn bind_retention_hub(&self) -> Result<(), Error> {
-        if push_only_retained_tables(&self.db).is_empty() {
+        if !self.has_retained_table_that_delivers()? {
             return Ok(());
         }
         let Some(hub) = self.hub_node_id() else {
             return Ok(());
         };
         self.db.register_retention_sync_peer(&hub)
+    }
+
+    /// Whether any RETAINED table on this database actually delivers rows
+    /// outbound. Any delivering direction arms the binding — not push-only
+    /// alone — because a two-way retained table's rows are just as subject to
+    /// delete-after-delivery, and a binding that failed to arm would let the
+    /// gate open against a destination this edge was never bound to.
+    fn has_retained_table_that_delivers(&self) -> Result<bool, Error> {
+        let directions = self.table_directions()?;
+        Ok(self.db.table_names().into_iter().any(|table| {
+            self.db
+                .table_meta(&table)
+                .is_some_and(|meta| meta.default_ttl_seconds.is_some())
+                && directions
+                    .get(&table)
+                    .copied()
+                    .unwrap_or(contextdb_core::DEFAULT_SYNC_DIRECTION)
+                    .delivers()
+        }))
     }
 
     pub fn has_pending_push_changes(&self) -> Result<bool, Error> {
@@ -197,11 +220,17 @@ impl SyncClient {
     }
 
     /// Stale-restore probe: best-effort, bounded status exchange on the
-    /// dedicated per-tenant status subject. Every failure mode (no responder,
-    /// timeout, transport status reply, malformed payload) yields `None`, and the
-    /// caller proceeds exactly as today.
-    async fn fetch_sync_status(&self) -> Option<SyncStatusResponse> {
-        let encoded = encode(MessageType::StatusRequest, &SyncStatusRequest {}).ok()?;
+    /// dedicated per-tenant status subject. The request carries this edge's
+    /// incarnation so the hub answers with the record for THIS life of the edge.
+    /// Every failure mode (no responder, timeout, transport status reply,
+    /// malformed payload) yields `None`, and the caller proceeds exactly as
+    /// today.
+    async fn fetch_sync_status(&self, incarnation: Incarnation) -> Option<SyncStatusResponse> {
+        let encoded = encode(
+            MessageType::StatusRequest,
+            &SyncStatusRequest { incarnation },
+        )
+        .ok()?;
         let reply = self
             .transport
             .request_single_reply(
@@ -351,14 +380,27 @@ impl SyncClient {
         self.bind_retention_hub()?;
         self.refuse_directions_that_break_delivery()?;
 
+        // This life's incarnation, stamped on both the status probe and every
+        // push below so the hub keys its per-edge record by (node_id,
+        // incarnation). A wiped-and-recreated edge reusing its node id mints a
+        // fresh one, so the hub answers Lsn(0) for it and its interrupted push
+        // is never confirmed by the prior life's stale-high watermark.
+        let incarnation = self
+            .db
+            .sync_incarnation(&self.tenant_id)
+            .map_err(|err| Error::SyncError(err.to_string()))?;
+
         // Exchange status with the server before computing the changeset
         // — including when there is nothing locally new (contract item 2). A
         // server whose applied-push watermark is behind ours was restored from
         // a stale artifact and silently lost acked commits; regress the local
         // push watermark so the changeset recomputation re-pushes them.
         let local = self.push_watermark.load(Ordering::SeqCst);
-        if let Some(status) = self.fetch_sync_status().await
-            && let Some(server_applied) = status.applied_push_watermark
+        let pre_push_server_watermark = self
+            .fetch_sync_status(incarnation)
+            .await
+            .and_then(|status| status.applied_push_watermark);
+        if let Some(server_applied) = pre_push_server_watermark
             && server_applied < local
         {
             tracing::info!(
@@ -381,6 +423,14 @@ impl SyncClient {
             .changes_since(since)
             .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
         let changeset = drop_rows_that_arrived_by_sync(&self.db, changeset);
+
+        // The greatest LSN this push actually TRANSMITS, taken PRE-send from the
+        // changeset computed under the directions read above. A lost-ack
+        // reconciliation must bound the hub's answer by this — recomputing it
+        // after the await would let a concurrent direction change (a delivering
+        // table switched to SYNC OFF) drop the bound below what already shipped
+        // and reject a batch the hub genuinely holds.
+        let transmitted_ceiling = changeset.max_lsn().unwrap_or(Lsn(0));
 
         if changeset.rows.is_empty()
             && changeset.edges.is_empty()
@@ -419,6 +469,7 @@ impl SyncClient {
             let batch_payload_bytes = row_payload_bytes(&batch.rows);
             let request = PushRequest {
                 changeset: batch.clone().into(),
+                incarnation,
             };
             let encoded = encode(MessageType::PushRequest, &request)
                 .map_err(|e| Error::SyncError(e.to_string()))?;
@@ -443,6 +494,8 @@ impl SyncClient {
                             hub.as_deref(),
                             batch_items,
                             batch_payload_bytes,
+                            transmitted_ceiling,
+                            incarnation,
                         )
                         .await;
                 }
@@ -507,6 +560,7 @@ impl SyncClient {
     ///   the batch. The outcome is genuinely UNKNOWN, so surface the distinct
     ///   [`Error::SyncPushUnconfirmed`] (never a definitive failure) and leave the
     ///   watermark untouched so a later push re-sends the batch idempotently.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_interrupted_push(
         &self,
         transport_err: Error,
@@ -515,18 +569,39 @@ impl SyncClient {
         hub: Option<&str>,
         batch_items: u64,
         batch_payload_bytes: u64,
+        transmitted_ceiling: Lsn,
+        incarnation: Incarnation,
     ) -> Result<ApplyResult, Error> {
-        // This confirmation rests on the same single-logical-writer /
-        // monotonic-LSN assumption the stale-restore reconcile above already
-        // relies on: the per-tenant `applied_push_watermark` is a meaningful
-        // "covers this batch" comparison only while one edge advances a tenant's
-        // LSN counter. Two edges sharing a tenant with diverged LSN counters
-        // could let a foreign commit false-confirm this batch.
+        // The hub answers this edge with the per-edge record it holds for THIS
+        // life of the edge — keyed by (node_id, incarnation), stamped on the
+        // status probe below. A lost acknowledgement is confirmed only when that
+        // record both covers this batch AND is bounded by what this push actually
+        // transmitted:
+        //
+        //  * The ceiling is the greatest LSN this push actually TRANSMITTED,
+        //    captured from the changeset PRE-send. Recomputing it here would let a
+        //    direction change racing this reconciliation (a delivering table
+        //    switched to SYNC OFF) drop the ceiling below what already shipped and
+        //    reject a batch the hub genuinely holds; and the whole-database
+        //    `current_lsn` would overstate it (sync-off and pull-only writes never
+        //    leave the edge), letting purely local work vouch for a stale hub
+        //    watermark.
+        //  * A wiped-and-recreated edge reusing its node id carries a FRESH
+        //    incarnation, so the hub holds no record for it and answers Lsn(0) —
+        //    below this batch's max — and the confirmation is refused by
+        //    construction. The prior life's high watermark lives under the OLD
+        //    incarnation's key and can never be read on this one.
+        //
+        // Failing the bound leaves the outcome unconfirmed and the edge
+        // re-uploads — never opening the SYNC SAFE deletion gate on rows the hub
+        // never received.
         let confirmed = self
-            .fetch_sync_status()
+            .fetch_sync_status(incarnation)
             .await
             .and_then(|status| status.applied_push_watermark)
-            .is_some_and(|server_applied| server_applied >= batch_max_lsn);
+            .is_some_and(|server_applied| {
+                server_applied >= batch_max_lsn && server_applied <= transmitted_ceiling
+            });
 
         if confirmed {
             tracing::info!(
@@ -587,7 +662,11 @@ impl SyncClient {
         // apply idempotently via the conflict policy, and genuinely new
         // server commits are never skipped.
         let local = self.pull_watermark.load(Ordering::SeqCst);
-        if let Some(status) = self.fetch_sync_status().await
+        let incarnation = self
+            .db
+            .sync_incarnation(&self.tenant_id)
+            .map_err(|err| Error::SyncError(err.to_string()))?;
+        if let Some(status) = self.fetch_sync_status(incarnation).await
             && let Some(server_lsn) = status.server_current_lsn
             && server_lsn < local
         {
@@ -704,6 +783,40 @@ impl SyncClient {
         &self.endpoint
     }
 
+    /// The hub this edge is provably connected to, taken from the
+    /// transport-authenticated node id. `None` when the transport authenticates
+    /// no peer (e.g. not connected, or a broker transport that has no dialed
+    /// endpoint). The operator surface reads this so a destination change adopts
+    /// the hub the edge is actually talking to, rather than a hand-copied id.
+    pub fn connected_hub_node_id(&self) -> Option<String> {
+        self.hub_node_id()
+    }
+
+    /// Move this edge's retained-data destination to the hub identified by
+    /// `new_node_id`, forgetting what the previous destination confirmed in the
+    /// SAME operation (see [`Database::change_retention_sync_peer`]). The
+    /// operator points the edge process at the new endpoint (configuration);
+    /// this authorises the move at the sync layer, so the next push rebuilds the
+    /// new destination from everything the edge holds — including rows older
+    /// than the previous destination's last confirmation — and no local row is
+    /// deleted until the new destination confirms receipt.
+    pub fn change_destination(&self, new_node_id: &str) -> Result<(), Error> {
+        let result = self
+            .db
+            .change_retention_sync_peer(&self.tenant_id, new_node_id);
+        // A long-lived client caches the confirmation frontier in memory; drop it
+        // in lockstep with the persisted record the engine clears. Reset it
+        // regardless of the engine outcome: the engine clears the durable
+        // watermarks on the safe side before it can fail, so leaving the cache at
+        // the old high frontier would let the next push skip rows a new
+        // destination never received. Resetting to zero only ever re-uploads,
+        // which is idempotent and safe. The error, if any, still surfaces to the
+        // caller.
+        self.push_watermark.store(Lsn(0), Ordering::SeqCst);
+        self.pull_watermark.store(Lsn(0), Ordering::SeqCst);
+        result
+    }
+
     /// Set the sync direction for `table`.
     ///
     /// Refused when the table is declared `SYNC SAFE` and the direction would
@@ -724,13 +837,27 @@ impl SyncClient {
         Ok(())
     }
 
-    /// Re-check every configured direction against the tables as they stand
-    /// now. A direction set BEFORE its table existed could not be judged then;
-    /// this is where that contradiction becomes visible, and the push refuses
-    /// rather than shipping a changeset that silently omits a delivery-promising
-    /// table while the watermark advances over everything else in it.
+    /// Re-check every RUNTIME-configured direction against the tables as they
+    /// stand now. A direction set BEFORE its table existed could not be judged
+    /// then; this is where that contradiction becomes visible, and the push
+    /// refuses rather than shipping a changeset that silently omits a
+    /// delivery-promising table while the watermark advances over everything
+    /// else in it.
+    ///
+    /// This reads the RAW runtime settings, never the persisted declaration
+    /// merged on top: the declaration is the source of truth for what actually
+    /// crosses the wire, but a runtime setting that contradicts a `SYNC SAFE`
+    /// table's delivery promise is a conflict to REFUSE loudly, not to resolve
+    /// by silently letting the declaration win — the operator's explicit
+    /// setting would then be ignored with no error. Merging the declaration
+    /// here would mask exactly the contradiction this check exists to catch.
     fn refuse_directions_that_break_delivery(&self) -> Result<(), Error> {
-        for (table, direction) in self.table_directions()? {
+        let runtime_directions = self
+            .table_directions
+            .read()
+            .map(|directions| directions.clone())
+            .map_err(|_| Error::SyncError("sync table directions lock poisoned".to_string()))?;
+        for (table, direction) in runtime_directions {
             refuse_direction_that_breaks_delivery(&self.db, &table, direction)?;
         }
         Ok(())
@@ -754,11 +881,27 @@ impl SyncClient {
         }
     }
 
+    /// The direction every table actually syncs by. Runtime settings first,
+    /// then the PERSISTED declarations on top of them: a table that declared
+    /// `SYNC OFF` stays off whatever the application registered, so no second
+    /// setting quietly wins. A table that declared nothing keeps whatever the
+    /// application configured, and failing that the engine default.
     fn table_directions(&self) -> Result<HashMap<String, SyncDirection>, Error> {
-        self.table_directions
+        let mut directions = self
+            .table_directions
             .read()
             .map(|directions| directions.clone())
-            .map_err(|_| Error::SyncError("sync table directions lock poisoned".to_string()))
+            .map_err(|_| Error::SyncError("sync table directions lock poisoned".to_string()))?;
+        for table in self.db.table_names() {
+            if let Some(declared) = self
+                .db
+                .table_meta(&table)
+                .and_then(|meta| meta.sync_direction)
+            {
+                directions.insert(table, declared);
+            }
+        }
+        Ok(directions)
     }
 
     fn conflict_policies(&self) -> Result<ConflictPolicies, Error> {
@@ -808,7 +951,7 @@ fn decode_push_response(reply: &[u8]) -> Result<ApplyResult, PushReplyError> {
 /// `Push` and `Both`, so any other setting keeps the table out of the outbound
 /// changeset entirely.
 fn direction_delivers(direction: SyncDirection) -> bool {
-    matches!(direction, SyncDirection::Push | SyncDirection::Both)
+    direction.delivers()
 }
 
 /// Refuse a direction that would stop a `SYNC SAFE` table being delivered.
@@ -844,30 +987,33 @@ fn refuse_direction_that_breaks_delivery(
 /// propagates. Edges, vectors and DDL are untouched.
 pub(crate) fn drop_rows_that_arrived_by_sync(db: &Database, changes: ChangeSet) -> ChangeSet {
     let mut changes = changes;
-    changes.rows.retain(|row| {
-        !db.row_version_arrived_by_sync(&row.table, &row.natural_key.column, &row.natural_key.value)
-    });
+    changes
+        .rows
+        .retain(|row| !db.row_version_arrived_by_sync(&row.table, &row.natural_key));
     changes
 }
 
-/// Every table this database declares as a one-way retained table. Read from
-/// the persisted table meta, so the policy survives a restart with no app
-/// re-registration — the defect the declared policy exists to close.
-pub(crate) fn push_only_retained_tables(db: &Database) -> BTreeSet<String> {
+/// Every table this database declares as `SYNC PUSH ONLY`. Read from the
+/// persisted table meta, so the declaration survives a restart with no app
+/// re-registration. Never-sent-back is a consequence of the declared direction
+/// alone, independent of retention: a NON-retained push-only table is suppressed
+/// here just like a retained one, so the hub never serves its rows back. A table
+/// that declared `SYNC TWO WAY` is deliberately absent.
+pub(crate) fn push_only_tables(db: &Database) -> BTreeSet<String> {
     db.table_names()
         .into_iter()
         .filter(|table| {
             db.table_meta(table).is_some_and(|meta| {
-                meta.retained_sync_policy == Some(contextdb_core::RetainedSyncPolicy::PushOnly)
+                meta.sync_direction == Some(contextdb_core::SyncDirection::Push)
             })
         })
         .collect()
 }
 
-/// Drop the ROWS (and vectors) of one-way retained tables from an inbound
-/// changeset. Their DDL is kept: a table must still be able to ARRIVE by sync.
+/// Drop the ROWS (and vectors) of push-only tables from an inbound changeset.
+/// Their DDL is kept: a table must still be able to ARRIVE by sync.
 pub(crate) fn drop_push_only_retained_rows(db: &Database, changes: ChangeSet) -> ChangeSet {
-    let one_way = push_only_retained_tables(db);
+    let one_way = push_only_tables(db);
     if one_way.is_empty() {
         return changes;
     }
@@ -1126,10 +1272,7 @@ mod tests {
             values.insert("data".to_string(), Value::Text(large_text.clone()));
             rows.push(RowChange {
                 table: "t".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values,
                 deleted: false,
                 lsn: Lsn(i + 1),
@@ -1213,10 +1356,7 @@ mod tests {
             values.insert("payload".to_string(), Value::Text(large_payload.clone()));
             rows.push(RowChange {
                 table: table.to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values,
                 deleted: false,
                 lsn: Lsn((i + 1) as u64),
@@ -1348,10 +1488,7 @@ mod tests {
             values.insert("data".to_string(), Value::Text("x".repeat(3000)));
             rows.push(RowChange {
                 table: "t".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values,
                 deleted: false,
                 lsn: Lsn(i as u64 + 1),
@@ -1400,10 +1537,7 @@ mod tests {
             let id = Uuid::new_v4();
             rows.push(RowChange {
                 table: "t".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(id)),
                     ("data".to_string(), Value::Text(format!("small-{i}"))),
@@ -1457,10 +1591,7 @@ mod tests {
         values.insert("data".to_string(), Value::Text(oversized_text));
         let row = RowChange {
             table: "observations".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
             values,
             deleted: false,
             lsn: Lsn(1),
@@ -1504,10 +1635,7 @@ mod tests {
             values.insert("data".to_string(), Value::Text("x".repeat(100 * 1024)));
             rows.push(RowChange {
                 table: "observations".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values,
                 deleted: false,
                 lsn: Lsn((i + 1) as u64),
@@ -1676,10 +1804,7 @@ mod tests {
         let changeset = ChangeSet {
             rows: vec![RowChange {
                 table: "host_writes".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(id)),
                     (
@@ -1747,10 +1872,7 @@ mod tests {
         let changeset = ChangeSet {
             rows: vec![RowChange {
                 table: "host_writes".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(id)),
                     (

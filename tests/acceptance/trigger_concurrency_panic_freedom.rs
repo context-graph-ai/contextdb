@@ -66,10 +66,6 @@ fn forbidden_statement_samples() -> &'static [(&'static str, &'static str)] {
         ("drop_route", "DROP ROUTE existing_route"),
         ("set_memory_limit", "SET MEMORY_LIMIT '1G'"),
         ("set_disk_limit", "SET DISK_LIMIT '1G'"),
-        (
-            "set_sync_conflict_policy",
-            "SET SYNC_CONFLICT_POLICY 'latest_wins'",
-        ),
     ]
 }
 
@@ -257,10 +253,7 @@ fn populated_changeset(table: &str, key: u128) -> ChangeSet {
     ChangeSet {
         rows: vec![RowChange {
             table: table.to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(uuid(key)),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(uuid(key))),
             values,
             deleted: false,
             lsn: Lsn(1),
@@ -284,10 +277,7 @@ fn populated_changeset_n(table: &str, key_base: u128, n: usize) -> ChangeSet {
         values.insert("id".to_string(), Value::Uuid(uuid(key)));
         rows.push(RowChange {
             table: table.to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(uuid(key)),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(uuid(key))),
             values,
             deleted: false,
             lsn: Lsn(1 + i as u64),
@@ -533,8 +523,6 @@ fn prepare_forbidden_statement_side_effect_probe(db: &Database) {
         &empty(),
     )
     .expect("existing route setup");
-    db.execute("SET SYNC_CONFLICT_POLICY 'server_wins'", &empty())
-        .expect("baseline conflict policy setup");
 }
 
 fn assert_forbidden_statement_family_left_no_side_effects(
@@ -603,11 +591,6 @@ fn assert_forbidden_statement_family_left_no_side_effects(
         db.disk_limit(),
         None,
         "{context}: SET DISK_LIMIT side effect leaked"
-    );
-    assert_eq!(
-        db.conflict_policies().default,
-        ConflictPolicy::ServerWins,
-        "{context}: SET SYNC_CONFLICT_POLICY side effect leaked"
     );
 
     db.execute(
@@ -1011,7 +994,7 @@ fn assert_display_impl_does_not_allocate(iterations_per_case: usize, profile_lab
 }
 
 // ============================================================================
-// t01_begin_a1_cron_reentry — RED
+// t01_begin_a1_cron_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -1047,7 +1030,7 @@ fn t01_begin_a1_cron_reentry() {
 }
 
 // ============================================================================
-// t02_begin_a2_trigger_reentry — RED
+// t02_begin_a2_trigger_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -1098,7 +1081,7 @@ fn t02_begin_a2_trigger_reentry() {
 }
 
 // ============================================================================
-// t03_begin_b1_cron_cross_thread — RED
+// t03_begin_b1_cron_cross_thread
 // ============================================================================
 #[test]
 #[serial]
@@ -1143,7 +1126,7 @@ fn t04_begin_cross_db_trigger_independent() {
 }
 
 // ============================================================================
-// t05_commit_a1_cron_reentry — RED
+// t05_commit_a1_cron_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -1183,7 +1166,7 @@ fn t05_commit_a1_cron_reentry() {
 }
 
 // ============================================================================
-// t06_commit_a2_trigger_reentry — RED
+// t06_commit_a2_trigger_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -1238,7 +1221,7 @@ fn t06_commit_a2_trigger_reentry() {
 }
 
 // ============================================================================
-// t07_commit_b1_cron_cross_thread — RED
+// t07_commit_b1_cron_cross_thread
 // ============================================================================
 #[test]
 #[serial]
@@ -1271,7 +1254,7 @@ fn t07_commit_b1_cron_cross_thread() {
 }
 
 // ============================================================================
-// t08_commit_b2_trigger_cross_thread — RED
+// t08_commit_b2_trigger_cross_thread
 // ============================================================================
 #[test]
 #[serial]
@@ -1295,7 +1278,7 @@ fn t08_commit_cross_db_trigger_independent() {
 }
 
 // ============================================================================
-// t09_rollback_a1_cron_reentry — RED
+// t09_rollback_a1_cron_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -1335,7 +1318,7 @@ fn t09_rollback_a1_cron_reentry() {
 }
 
 // ============================================================================
-// t10_rollback_a2_trigger_reentry — RED
+// t10_rollback_a2_trigger_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -1390,7 +1373,7 @@ fn t10_rollback_a2_trigger_reentry() {
 }
 
 // ============================================================================
-// t11_rollback_b1_cron_cross_thread — RED
+// t11_rollback_b1_cron_cross_thread
 // ============================================================================
 #[test]
 #[serial]
@@ -1423,7 +1406,7 @@ fn t11_rollback_b1_cron_cross_thread() {
 }
 
 // ============================================================================
-// t12_rollback_b2_trigger_cross_thread — RED
+// t12_rollback_b2_trigger_cross_thread
 // ============================================================================
 #[test]
 #[serial]
@@ -1471,7 +1454,7 @@ fn t_apply_changes_positive_control_helper_inserts_when_uncontended() {
 }
 
 // ============================================================================
-// t13_apply_changes_a1_cron_reentry — RED
+// t13_apply_changes_a1_cron_reentry
 // Populated ChangeSet (1 row) — pins fail-early-and-rebuild semantics: the
 // gate trips BEFORE consuming the changeset (post-Err scan returns 0 rows).
 // ============================================================================
@@ -1522,7 +1505,7 @@ fn t13_apply_changes_a1_cron_reentry() {
 }
 
 // ============================================================================
-// t13b_apply_changes_non_row_shapes_a1_cron_reentry — RED
+// t13b_apply_changes_non_row_shapes_a1_cron_reentry
 // Empty, edge-only, vector-only, valid DDL-only, and malformed-ddl-lsn
 // ChangeSets still trip the surface gate before apply_changes inspects or
 // validates content. Prevents a row-only/empty-only typed implementation.
@@ -1586,7 +1569,7 @@ fn t13b_apply_changes_non_row_shapes_a1_cron_reentry() {
 }
 
 // ============================================================================
-// t14_apply_changes_a2_trigger_reentry — RED
+// t14_apply_changes_a2_trigger_reentry
 // Populated ChangeSet (1 row); post-Err absence assertion.
 // ============================================================================
 #[test]
@@ -1651,7 +1634,7 @@ fn t14_apply_changes_a2_trigger_reentry() {
 }
 
 // ============================================================================
-// t14b_apply_changes_non_row_shapes_a2_trigger_reentry — RED
+// t14b_apply_changes_non_row_shapes_a2_trigger_reentry
 // Empty, edge-only, vector-only, valid DDL-only, and malformed-ddl-lsn
 // ChangeSets still trip the surface gate before apply_changes inspects or
 // validates content under pure trigger reentry.
@@ -1721,7 +1704,7 @@ fn t14b_apply_changes_non_row_shapes_a2_trigger_reentry() {
 }
 
 // ============================================================================
-// t15_apply_changes_b1_cron_cross_thread — RED
+// t15_apply_changes_b1_cron_cross_thread
 // Populated ChangeSet (1 row); post-Err absence assertion.
 // ============================================================================
 #[test]
@@ -1761,7 +1744,7 @@ fn t15_apply_changes_b1_cron_cross_thread() {
 }
 
 // ============================================================================
-// t15b_apply_changes_non_row_shapes_b1_cron_cross_thread — RED
+// t15b_apply_changes_non_row_shapes_b1_cron_cross_thread
 // B1 gate is content-independent: empty, edge-only, vector-only, valid DDL-only,
 // and malformed-ddl-lsn changesets must all fail before apply_changes inspects
 // or validates them.
@@ -1816,7 +1799,7 @@ fn t15b_apply_changes_non_row_shapes_b1_cron_cross_thread() {
 }
 
 // ============================================================================
-// t16_apply_changes_b2_trigger_cross_thread — RED
+// t16_apply_changes_b2_trigger_cross_thread
 // Populated ChangeSet (1 row); post-Err absence assertion.
 // ============================================================================
 #[test]
@@ -1843,7 +1826,7 @@ fn t16_apply_changes_cross_db_trigger_independent() {
 }
 
 // ============================================================================
-// t16b_apply_changes_non_row_shapes_b2_trigger_cross_thread — RED
+// t16b_apply_changes_non_row_shapes_b2_trigger_cross_thread
 // B2 gate is content-independent: empty, edge-only, vector-only, valid DDL-only,
 // and malformed-ddl-lsn changesets must all fail before apply_changes inspects
 // or validates them.
@@ -1896,7 +1879,7 @@ fn t16b_apply_changes_non_row_shapes_cross_db_trigger_independent() {
 }
 
 // ============================================================================
-// t17_close_a1_cron_reentry — RED
+// t17_close_a1_cron_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -1933,7 +1916,7 @@ fn t17_close_a1_cron_reentry() {
 }
 
 // ============================================================================
-// t18_close_a2_trigger_reentry — RED (NEW check; surface previously missing)
+// t18_close_a2_trigger_reentry (NEW check; surface previously missing)
 // ============================================================================
 #[test]
 #[serial]
@@ -1985,7 +1968,7 @@ fn t18_close_a2_trigger_reentry() {
 }
 
 // ============================================================================
-// t19_close_b1_cron_cross_thread — RED
+// t19_close_b1_cron_cross_thread
 // ============================================================================
 #[test]
 #[serial]
@@ -2015,7 +1998,7 @@ fn t19_close_b1_cron_cross_thread() {
 }
 
 // ============================================================================
-// t20_close_b2_trigger_cross_thread — RED
+// t20_close_b2_trigger_cross_thread
 // ============================================================================
 #[test]
 #[serial]
@@ -2034,7 +2017,7 @@ fn t20_close_cross_db_trigger_independent() {
 }
 
 // ============================================================================
-// t21_helper_inside_cron_a1 — RED — execute() forbidden-statement gate
+// t21_helper_inside_cron_a1 — execute() forbidden-statement gate
 // ============================================================================
 #[test]
 #[serial]
@@ -2087,7 +2070,7 @@ fn t21_helper_inside_cron_a1() {
 }
 
 // ============================================================================
-// t22_helper_inside_trigger_a2 — RED
+// t22_helper_inside_trigger_a2
 // ============================================================================
 #[test]
 #[serial]
@@ -2151,7 +2134,7 @@ fn t22_helper_inside_trigger_a2() {
 }
 
 // ============================================================================
-// t23_helper_cross_thread_b1 — RED
+// t23_helper_cross_thread_b1
 // ============================================================================
 #[test]
 #[serial]
@@ -2190,7 +2173,7 @@ fn t23_helper_cross_thread_b1() {
 }
 
 // ============================================================================
-// t24_helper_cross_thread_b2 — RED
+// t24_helper_cross_thread_b2
 // ============================================================================
 #[test]
 #[serial]
@@ -2216,7 +2199,7 @@ fn t24_execute_helper_cross_db_trigger_independent() {
 }
 
 // ============================================================================
-// t25_helper_tx_bound_b1 — RED — execute_in_tx vs assert_cron_callback_tx_bound_handle
+// t25_helper_tx_bound_b1 — execute_in_tx vs assert_cron_callback_tx_bound_handle
 // ============================================================================
 #[test]
 #[serial]
@@ -2258,7 +2241,7 @@ fn t25_helper_tx_bound_b1() {
 }
 
 // ============================================================================
-// t25b_direct_api_tx_bound_b1 — RED
+// t25b_direct_api_tx_bound_b1
 // Direct library APIs (`insert_row`, `upsert_row`, graph/vector helpers) route
 // through `assert_cron_callback_tx_bound_handle`, not the SQL helper gate. This
 // pins B1 on that direct API guard instead of only covering execute_in_tx().
@@ -2358,7 +2341,7 @@ fn t25b_direct_api_tx_bound_b1() {
 }
 
 // ============================================================================
-// t26b_direct_api_tx_bound_same_db_b2_waits_and_proceeds — RED
+// t26b_direct_api_tx_bound_same_db_b2_waits_and_proceeds
 // Symmetric direct library API coverage for same-DB wait/proceed gating.
 #[test]
 #[serial]
@@ -2520,7 +2503,7 @@ fn t26b_direct_api_tx_bound_same_db_b2_waits_and_proceeds() {
 }
 
 // ============================================================================
-// t26_helper_tx_bound_same_db_b2_waits_and_proceeds — RED
+// t26_helper_tx_bound_same_db_b2_waits_and_proceeds
 #[test]
 #[serial]
 fn t26_helper_tx_bound_same_db_b2_waits_and_proceeds() {
@@ -2561,7 +2544,7 @@ fn t26_helper_tx_bound_same_db_b2_waits_and_proceeds() {
 }
 
 // ============================================================================
-// t27_execute_in_tx_inline_a1 — RED
+// t27_execute_in_tx_inline_a1
 // ============================================================================
 #[test]
 #[serial]
@@ -2686,7 +2669,7 @@ fn t28_display_strings_exact() {
 }
 
 // ============================================================================
-// t29_display_impl_does_not_allocate — RED — counts allocator activity directly
+// t29_display_impl_does_not_allocate — counts allocator activity directly
 // Pins the alloc-freeness behavior contract against Display. Wraps the global
 // allocator with a counter; takes a delta snapshot around a 1M-iteration
 // `write!` loop on a single thread (so the delta attributes only to this
@@ -2702,7 +2685,7 @@ fn t29_display_impl_does_not_allocate() {
 }
 
 // ============================================================================
-// t29b_display_impl_does_not_allocate_release_profile — RED in release
+// t29b_display_impl_does_not_allocate_release_profile
 // Dedicated release-profile gate for the alloc-free Display contract. The main
 // t29 probe also runs in debug, but this release-only test prevents a
 // cfg(debug_assertions)-only implementation from satisfying the suite.
@@ -2852,7 +2835,7 @@ fn t31_cross_db_worker_progress_shape() {
 }
 
 // ============================================================================
-// t32_priority_a1_over_a2 — RED — source order: A1 > A2
+// t32_priority_a1_over_a2 — source order: A1 > A2
 // ============================================================================
 #[test]
 #[serial]
@@ -2917,7 +2900,7 @@ fn t32_priority_a1_over_a2() {
 }
 
 // ============================================================================
-// t32b_priority_a2_over_b1_and_b2 — RED — source order: A2 > B1 > B2
+// t32b_priority_a2_over_b1_and_b2 — source order: A2 > B1 > B2
 // Covers the middle priority pair from the contract's A1 > A2 > B1 > B2
 // source order. T1 is inside a trigger callback (A2 set), while another
 // thread holds either a cron callback parked (B1 visible from T1) or a trigger
@@ -3005,7 +2988,7 @@ fn t32b_priority_a2_over_b1_and_b2_when_trigger_active_and_other_callback_parked
 }
 
 // ============================================================================
-// t32c_priority_b1_over_b2 — RED — source order: B1 > B2
+// t32c_priority_b1_over_b2 — source order: B1 > B2
 // T1 holds a parked cron callback; T2 holds a parked trigger callback;
 // T3 calls db.begin() — sees BOTH B1 and B2 cross-thread, must return
 // the cron variant (source order B1 before B2).
@@ -3089,7 +3072,7 @@ fn t32c_priority_b1_over_b2_when_cron_and_trigger_both_parked_cross_thread() {
 }
 
 // ============================================================================
-// t32d_priority_source_order_is_symmetric_across_all_tx_control_surfaces — RED
+// t32d_priority_source_order_is_symmetric_across_all_tx_control_surfaces
 // The focused t32/t32b/t32c probes are intentionally readable begin() examples.
 // This matrix blocks a shallow implementation that wires the priority order only
 // for begin() while leaving commit/rollback/apply_changes/close asymmetric.
@@ -3664,7 +3647,7 @@ fn t35_tx_bound_handle_writes_inside_callback_succeed() {
 }
 
 // ============================================================================
-// t36_callback_uses_outer_handle_outer_commit_fails — RED
+// t36_callback_uses_outer_handle_outer_commit_fails
 // ============================================================================
 #[test]
 #[serial]
@@ -3713,7 +3696,7 @@ fn t36_callback_uses_outer_handle_outer_commit_fails() {
 }
 
 // ============================================================================
-// t36b_reentry_retry_never_helps_inside_trigger_callback — RED
+// t36b_reentry_retry_never_helps_inside_trigger_callback
 // CallbackReentry is misuse (Class A) — retrying inside the same callback body
 // must NOT make progress. Pins that Class A is not retry-safe and that no
 // future regression silently downgrades A2 to B2 (which would be retry-safe)
@@ -3765,7 +3748,7 @@ fn t36b_reentry_retry_never_helps_inside_trigger_callback() {
 }
 
 // ============================================================================
-// t38_multi_handle_same_thread_reentry — RED
+// t38_multi_handle_same_thread_reentry
 // ============================================================================
 #[test]
 #[serial]
@@ -3810,7 +3793,7 @@ fn t38_multi_handle_same_thread_reentry() {
 }
 
 // ============================================================================
-// t39_cron_tickler_resilience_after_callback_active — RED
+// t39_cron_tickler_resilience_after_callback_active
 // ============================================================================
 #[test]
 #[serial]
@@ -3858,7 +3841,7 @@ fn t39_cron_tickler_resilience_after_callback_active() {
         let fire = fire_trigger_in_thread(db.clone(), 0xC39);
         entered.wait();
         // Drive a cron tick while the trigger callback is parked. begin()
-        // sees B2 and propagates Err via Stub 5's `?` on cron.rs:464.
+        // sees B2 and propagates Err via the `?` on cron.rs:464.
         let _ = db.cron_run_due_now_for_test();
         let audit_after_contention = db.cron_audit_log_for_test();
         // Pin BOTH the schedule_name AND the inner Failed(String) — accept
@@ -3905,7 +3888,7 @@ fn t39_cron_tickler_resilience_after_callback_active() {
 // ============================================================================
 
 // ============================================================================
-// t39c_cron_tickler_survives_sustained_b2_contention — RED
+// t39c_cron_tickler_survives_sustained_b2_contention
 // A trigger callback parked across 5 consecutive cron ticks. All 5 audit
 // entries must be Failed; the schedule must NOT have stopped; post-unblock
 // the next tick must log Fired. Pins that the tickler does not give up
@@ -3945,7 +3928,7 @@ fn t39c_cron_tickler_survives_sustained_b2_contention() {
         entered.wait();
 
         // Drive 5 consecutive cron ticks while the trigger callback remains parked.
-        // Each tick's begin() observes B2 and propagates the typed Err via Stub 5's
+        // Each tick's begin() observes B2 and propagates the typed Err via the
         // `?` on cron.rs:464; run_cron_callback_transaction records Failed.
         for _ in 0..5 {
             let _ = db.cron_run_due_now_for_test();
@@ -3968,7 +3951,7 @@ fn t39c_cron_tickler_survives_sustained_b2_contention() {
         let counter_during = counter.load(AtomicOrdering::SeqCst);
 
         // Unblock the parked trigger callback and let the firing thread complete
-        // before asserting the RED condition, so a stub-time failure cannot leave
+        // before asserting the expected condition, so an early failure cannot leave
         // global trigger callback owner state parked for the next test.
         done.wait();
         fire.join().unwrap().unwrap();
@@ -4039,7 +4022,7 @@ fn t40_sync_wire_substring_contract() {
 }
 
 // ============================================================================
-// t40b_sync_push_response_error_carries_typed_substrings_over_wire — RED
+// t40b_sync_push_response_error_carries_typed_substrings_over_wire
 // End-to-end wire test. A real contextdb-server child process is spawned
 // alongside testcontainers NATS; a SyncClient pushes a ChangeSet whose
 // receiver-side apply_changes hits B2 (parked trigger callback on the
@@ -4164,12 +4147,11 @@ async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
     );
 }
 
-// t41 lives in tests/acceptance/observation_trigger.rs — see Stub 6.
-// At stub time t41 is RED (substring drift). After Step 5 implementation,
-// the rewrite asserts pass against the typed-variant Display strings.
+// t41 lives in tests/acceptance/observation_trigger.rs. It guards against
+// substring drift by asserting the typed-variant Display strings.
 
 // ============================================================================
-// t42_begin_or_panic_helper_visibility — REGRESSION GUARD post-stubs
+// t42_begin_or_panic_helper_visibility — REGRESSION GUARD
 // ============================================================================
 #[test]
 #[serial]
@@ -4210,9 +4192,9 @@ fn t43_surface_string_no_begin_token() {
 }
 
 // ============================================================================
-// t44b_post_stub_begin_cross_db_contention_no_panic
+// t44b_begin_cross_db_contention_no_panic
 // NOT feature-gated. STRICT: asserts catch_unwind returns Ok(Ok(_)) for
-// unrelated cross-DB trigger contention. Stays after Step 5 as a regression
+// unrelated cross-DB trigger contention. A standing regression
 // guard against any future panic or process-wide false-positive regression.
 // ============================================================================
 #[test]
@@ -4316,7 +4298,7 @@ fn t44b_close_cross_db_contention_no_panic_proceeds() {
 }
 
 // ============================================================================
-// t45_constrained_handle_classifies_reentry_and_same_db_b2_progress — RED
+// t45_constrained_handle_classifies_reentry_and_same_db_b2_progress
 // Constrained handles still classify Class A as CallbackReentry, while same-DB
 // B2 now waits and proceeds because it shares the parked trigger's state.
 #[test]
@@ -4601,7 +4583,7 @@ fn t47_apply_changes_100_row_changeset_cross_db_contention_proceeds() {
 }
 
 // ============================================================================
-// t48_eventual_progress_under_cron_and_unrelated_trigger_contention — RED
+// t48_eventual_progress_under_cron_and_unrelated_trigger_contention
 // A retry loop observes B1 while a cron callback is parked. An unrelated
 // trigger callback on DB-X remains parked after B1 clears; the loop must then
 // succeed without seeing a trigger typed-Err from process-wide state.
@@ -4725,7 +4707,7 @@ fn t48_eventual_progress_under_cron_and_unrelated_trigger_contention() {
 }
 
 // ============================================================================
-// t49_begin_or_panic_panics_with_typed_display_when_inside_trigger_callback — RED
+// t49_begin_or_panic_panics_with_typed_display_when_inside_trigger_callback
 // Pins that begin_or_panic surfaces the typed Err's Display in the panic
 // payload, not a generic "begin failed" message.
 // ============================================================================

@@ -27,9 +27,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// The sync protocol's ALPN. The trailing version tracks the wire
-/// `PROTOCOL_VERSION` (4): payload semantics are unchanged by this adapter,
-/// so the version does not bump.
+/// The sync protocol's ALPN. The trailing version is this adapter's own framing
+/// version, distinct from the opaque payload's `PROTOCOL_VERSION`. This adapter
+/// moves bytes and does not read the payload, so a payload-version bump does not
+/// change the framing and this ALPN does not move — two peers built from this
+/// code always agree on it, and a payload-version skew is caught later at the
+/// envelope version check.
 pub const SYNC_ALPN: &[u8] = b"contextdb.sync.v4";
 
 /// Ceiling on one framed request or reply. Batching above the seam keeps
@@ -300,7 +303,7 @@ pub fn dial_spec(ticket: &str, identity_path: &Path) -> String {
 
 /// One request arriving on a registered peer protocol. Carries WHO is
 /// asking — the caller's fabric identity (`node_id`) as authenticated by the
-/// transport handshake — because the media transfer plan authorizes fetches
+/// transport handshake — because the media-transfer path authorizes fetches
 /// by node identity.
 pub struct PeerRequest {
     pub remote_node_id: String,
@@ -309,7 +312,7 @@ pub struct PeerRequest {
 
 /// Handler for an additional peer protocol registered on a serving endpoint:
 /// an authenticated peer request in, complete reply bytes out. This is the
-/// fabric-internal peer surface the media transfer plan builds on.
+/// fabric-internal peer surface the media-transfer path builds on.
 pub type PeerHandler = Arc<dyn Fn(PeerRequest) -> TransportFuture<'static, Vec<u8>> + Send + Sync>;
 
 type PeerProtocols = Arc<Mutex<HashMap<Vec<u8>, PeerHandler>>>;
@@ -681,7 +684,7 @@ pub async fn peer_request(
 /// An accepted (or dialed) peer-protocol connection: the caller's
 /// authenticated fabric identity plus the raw transport connection, on which
 /// the protocol owner opens/accepts its own streams. This is the streaming
-/// half of the fabric-internal peer surface (the media transfer plan's
+/// half of the fabric-internal peer surface (the media-transfer path's
 /// substrate); [`peer_request`] remains the one-shot request-reply half.
 pub struct PeerConnection {
     pub remote_node_id: String,

@@ -1,11 +1,11 @@
-//! Bounded tables — engine-side acceptance: table declaration, the maintenance
-//! lifecycle, pruning reporting, per-table size, durable trigger-audit
-//! retention, and the one-way `PUSH ONLY` table policy.
+//! Bounded tables — engine-side acceptance for the maintenance lifecycle,
+//! pruning reports, per-table sizing, durable trigger-audit retention, and the
+//! one-way `PUSH ONLY` table policy.
 //!
-//! Before this feature, the maintenance lifecycle surface
-//! (`maintenance_status`, `run_maintenance_cycle`), the reporting fields on
-//! `PruningReport`, the per-table size answer, the durable trigger-audit
-//! retention, and the one-way `PUSH ONLY` table policy did not exist yet.
+//! Before this change, the maintenance lifecycle surface (`maintenance_status`,
+//! `run_maintenance_cycle`), the reporting fields on `PruningReport`, the
+//! per-table size answer, the durable trigger-audit retention, and the one-way
+//! `PUSH ONLY` table policy did not exist yet.
 //!
 //! Discipline: no sleeps, no elapsed-time assertions, no raw clock reads. Time
 //! moves through `Wallclock::test_clock_guard` and maintenance is DRIVEN
@@ -13,7 +13,6 @@
 //! engine background thread would see the real clock). Loop LIFECYCLE is
 //! asserted separately from pruning CORRECTNESS.
 
-use contextdb_core::table_meta::RetainedSyncPolicy;
 use contextdb_core::{Value, Wallclock};
 use contextdb_engine::{
     Database, REDB_COMPACT_FRAGMENTATION_THRESHOLD, RETENTION_CLOCK_SKEW_TOLERANCE,
@@ -132,8 +131,8 @@ fn c1_retained_table_starts_maintenance_at_open() {
     );
 }
 
-/// Restart case: the retained table arrives from disk, not from a
-/// `CREATE TABLE` this process ran, and the loop must still start.
+/// Restart is the case the seed calls out: the retained table arrives from disk,
+/// not from a `CREATE TABLE` this process ran, and the loop must still start.
 #[test]
 fn c1_maintenance_restarts_after_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -515,8 +514,8 @@ fn c7_compaction_rides_the_same_fragmentation_threshold_as_the_currency_path() {
 /// gate. So the below-threshold state is not representable as a deterministic
 /// fixture here. What survives is the equivalence (which binds at whatever ratio
 /// the engine measures) plus report honesty; the operational claim that steady
-/// churn does not compact every cycle is carried by the end-to-end smoke test's
-/// plateau assertion, where it is pinned.
+/// churn does not compact every cycle is carried by smoke S3's plateau, where it
+/// is frozen.
 #[test]
 fn c7_a_small_prune_on_a_live_file_reports_its_compaction_decision_honestly() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -602,7 +601,7 @@ fn c7_a_small_prune_on_a_live_file_reports_its_compaction_decision_honestly() {
 /// Deliberately NOT asserted here: a write landing DURING the cycle's critical
 /// section. `run_maintenance_cycle` is synchronous with no mid-cycle observation
 /// seam, and inventing one would be a `src/` testability touch. "No stall
-/// during" is covered by the end-to-end smoke test, where the real bound lives.
+/// during" is frozen as smoke S3, where the real bound lives.
 #[test]
 fn c7_writers_commit_before_and_after_a_maintenance_cycle() {
     use std::sync::mpsc;
@@ -742,7 +741,7 @@ fn c8_estimates_are_per_table_and_never_claim_the_whole_file() {
     );
 
     // Deliberately NOT asserted: that the per-table estimates sum to at most the
-    // whole-file size. These are estimates and make no claim to exact
+    // whole-file size. The criteria call these estimates and refuse exact
     // physical attribution, so demanding additivity would force the estimator to
     // model shared structure (indexes, overhead) it is not specified to model.
     // Whole-file bytes are checked as themselves, alongside.
@@ -871,8 +870,8 @@ fn c10_trigger_heavy_workload_leaves_the_durable_audit_bounded() {
     );
 }
 
-/// DROP TABLE never deletes the dropped table's audit rows. They must age out
-/// by the same retention as everything else.
+/// A second guaranteed fact: DROP TABLE never deletes the dropped table's
+/// audit rows. They must age out by the same retention as everything else.
 #[test]
 fn c10_dropped_table_orphan_audit_rows_age_out() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -902,16 +901,36 @@ fn c10_dropped_table_orphan_audit_rows_age_out() {
     );
 }
 
+/// A push-only declaration renders `SYNC PUSH ONLY` and none of the other three
+/// directions — a render that prints two of them, or a different one, is wrong
+/// in a way a bare `contains` check waves through.
+fn assert_renders_exactly_push_only(rendered: &str) {
+    for spelling in [
+        "SYNC OFF",
+        "SYNC PUSH ONLY",
+        "SYNC PULL ONLY",
+        "SYNC TWO WAY",
+    ] {
+        let found = rendered.matches(spelling).count();
+        let wanted = usize::from(spelling == "SYNC PUSH ONLY");
+        assert_eq!(
+            found, wanted,
+            "the declaration must render SYNC PUSH ONLY and nothing else, but \
+             '{spelling}' appears {found} time(s), got:\n{rendered}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C4 — one-way policy, declared and durable (engine-side declaration half;
 // the transport half lives in contextdb-server's bounded_tables_sync_tests.rs)
 // ---------------------------------------------------------------------------
 
-/// The policy is declared in DDL and persisted in table meta — an app never
-/// re-registers it on start. Bare `SYNC SAFE` on a retained table means the one
-/// supported contract, so existing declarations keep working.
+/// The direction is declared in DDL and persisted with the table — an app never
+/// re-registers it on start. Retention alone declares no direction, so the bare
+/// `SYNC SAFE` table beside it stays two-way (the engine default).
 #[test]
-fn c4_push_only_policy_persists_in_table_meta_across_restart() {
+fn c4_push_only_direction_persists_in_table_meta_across_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("policy.db");
 
@@ -919,7 +938,7 @@ fn c4_push_only_policy_persists_in_table_meta_across_restart() {
         let db = Database::open(&path).expect("open");
         db.execute(
             "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-             RETAIN 48 HOURS SYNC SAFE PUSH ONLY",
+             RETAIN 48 HOURS SYNC SAFE SYNC PUSH ONLY",
             &p(),
         )
         .expect("declared one-way retained table must create");
@@ -932,74 +951,66 @@ fn c4_push_only_policy_persists_in_table_meta_across_restart() {
 
     let db = Database::open(&path).expect("reopen");
     let meta = db.table_meta("windows").expect("table meta after restart");
-    assert_eq!(
-        meta.retained_sync_policy,
-        Some(RetainedSyncPolicy::PushOnly),
-        "the one-way policy must survive restart with no app re-registration"
-    );
+    let rendered = contextdb_engine::cli_render::render_table_meta("windows", &meta);
+    assert_renders_exactly_push_only(&rendered);
     assert!(meta.sync_safe, "SYNC SAFE survives alongside it");
-    assert_eq!(
-        db.table_meta("implied")
-            .expect("implied table meta")
-            .retained_sync_policy,
-        Some(RetainedSyncPolicy::PushOnly),
-        "a retained SYNC SAFE table without an explicit direction is the supported one-way contract"
-    );
+    let implied = db.table_meta("implied").expect("implied table meta");
+    let implied_rendered = contextdb_engine::cli_render::render_table_meta("implied", &implied);
+    for one_way in ["PUSH ONLY", "PULL ONLY", "SYNC OFF"] {
+        assert!(
+            !implied_rendered.contains(one_way),
+            "a retained SYNC SAFE table that declared no direction stays two-way — \
+             retention decides no direction, got:\n{implied_rendered}"
+        );
+    }
 }
 
-/// The unsupported combinations are refused LOUDLY at declaration, not silently
-/// downgraded — and the table must not exist afterwards.
+/// A retained table that declares two-way is accepted: retention says when rows
+/// expire, the direction clause says where they go, and the two are independent.
 #[test]
-fn c4_two_way_retained_table_is_refused_at_declaration() {
+fn c4_two_way_retained_table_is_accepted_at_declaration() {
     let db = Database::open_memory();
-    let err = db
-        .execute(
-            "CREATE TABLE windows (id INTEGER PRIMARY KEY) RETAIN 48 HOURS SYNC SAFE TWO WAY",
-            &p(),
-        )
-        .expect_err("a two-way retained table must be refused at declaration");
-    let message = err.to_string();
+    db.execute(
+        "CREATE TABLE windows (id INTEGER PRIMARY KEY) \
+         RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY",
+        &p(),
+    )
+    .expect("a retained two-way table must be accepted at declaration");
+    let meta = db.table_meta("windows").expect("table meta");
+    let rendered = contextdb_engine::cli_render::render_table_meta("windows", &meta);
     assert!(
-        message.contains("TWO WAY") || message.to_lowercase().contains("two-way"),
-        "the refusal must name the unsupported combination, got: {message}"
-    );
-    assert!(
-        message.to_lowercase().contains("retain") || message.to_lowercase().contains("retained"),
-        "the refusal must say it is the retained table that forbids it, got: {message}"
-    );
-    assert!(
-        db.table_meta("windows").is_none(),
-        "a refused declaration must not leave a half-created table"
+        rendered.contains("RETAIN 48 HOURS SYNC SAFE") && rendered.contains("SYNC TWO WAY"),
+        "both declarations must be visible to an operator, got:\n{rendered}"
     );
 }
 
-/// `.schema` renders whatever policy the table declares, and the rendered DDL
-/// re-parses to the same meta — the policy is never invisible to an operator.
+/// `.schema` renders whatever direction the table declares, and the rendered DDL
+/// re-parses to the same declaration — it is never invisible to an operator.
 #[test]
-fn c4_schema_render_round_trips_the_one_way_policy() {
+fn c4_schema_render_round_trips_the_one_way_direction() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-         RETAIN 48 HOURS SYNC SAFE PUSH ONLY",
+         RETAIN 48 HOURS SYNC SAFE SYNC PUSH ONLY",
         &p(),
     )
     .expect("create");
     let meta = db.table_meta("windows").expect("table meta");
     let rendered = contextdb_engine::cli_render::render_table_meta("windows", &meta);
     assert!(
-        rendered.contains("RETAIN 48 HOURS SYNC SAFE PUSH ONLY"),
-        "the rendered schema must show the declared one-way policy, got:\n{rendered}"
+        rendered.contains("RETAIN 48 HOURS SYNC SAFE"),
+        "the rendered schema must show the retention window, got:\n{rendered}"
     );
+    assert_renders_exactly_push_only(&rendered);
 
     let db2 = Database::open_memory();
     db2.execute(&rendered, &p())
         .unwrap_or_else(|err| panic!("rendered DDL must execute: {err}\n{rendered}"));
+    let round_tripped = db2.table_meta("windows").expect("round-tripped meta");
     assert_eq!(
-        db2.table_meta("windows")
-            .expect("round-tripped meta")
-            .retained_sync_policy,
-        Some(RetainedSyncPolicy::PushOnly),
-        "the policy must survive the .schema round trip"
+        contextdb_engine::cli_render::render_table_meta("windows", &round_tripped),
+        rendered,
+        "the declaration must survive the .schema round trip unchanged"
     );
 }
 
@@ -1010,7 +1021,7 @@ fn c4_schema_render_round_trips_the_one_way_policy() {
 fn c4_second_sync_peer_on_a_retained_table_is_refused() {
     let db = Database::open_memory();
     db.execute(
-        "CREATE TABLE windows (id INTEGER PRIMARY KEY) RETAIN 48 HOURS SYNC SAFE PUSH ONLY",
+        "CREATE TABLE windows (id INTEGER PRIMARY KEY) RETAIN 48 HOURS SYNC SAFE SYNC PUSH ONLY",
         &p(),
     )
     .expect("create");
@@ -1047,7 +1058,7 @@ fn c4_the_established_sync_peer_survives_restart_and_still_refuses_a_second() {
     {
         let db = Database::open(&path).expect("open");
         db.execute(
-            "CREATE TABLE windows (id INTEGER PRIMARY KEY) RETAIN 48 HOURS SYNC SAFE PUSH ONLY",
+            "CREATE TABLE windows (id INTEGER PRIMARY KEY) RETAIN 48 HOURS SYNC SAFE SYNC PUSH ONLY",
             &p(),
         )
         .expect("create");
@@ -1079,14 +1090,14 @@ fn c4_the_established_sync_peer_survives_restart_and_still_refuses_a_second() {
 }
 
 /// The ALTER path must not be a side door into the refused posture: the
-/// two-way spelling is rejected there exactly as at CREATE, and the table keeps
-/// the policy it already had.
+/// nested direction form is a parse error there exactly as at CREATE, and the
+/// table keeps the declaration it already had.
 #[test]
-fn c4_alter_set_retain_two_way_is_refused_and_leaves_the_existing_policy_intact() {
+fn c4_alter_set_retain_with_the_nested_direction_form_is_refused_and_changes_nothing() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-         RETAIN 48 HOURS SYNC SAFE PUSH ONLY",
+         RETAIN 48 HOURS SYNC SAFE SYNC PUSH ONLY",
         &p(),
     )
     .expect("create");
@@ -1096,19 +1107,16 @@ fn c4_alter_set_retain_two_way_is_refused_and_leaves_the_existing_policy_intact(
             "ALTER TABLE windows SET RETAIN 12 HOURS SYNC SAFE TWO WAY",
             &p(),
         )
-        .expect_err("ALTER must refuse the two-way posture just as CREATE does");
+        .expect_err("ALTER must refuse the nested direction form just as CREATE does");
     let message = err.to_string();
     assert!(
-        message.contains("TWO WAY") || message.to_lowercase().contains("two-way"),
-        "the refusal must name the unsupported combination, got: {message}"
+        message.to_uppercase().contains("SYNC TWO WAY"),
+        "the refusal must name the separate direction clause to write instead, got: {message}"
     );
 
     let meta = db.table_meta("windows").expect("table meta");
-    assert_eq!(
-        meta.retained_sync_policy,
-        Some(RetainedSyncPolicy::PushOnly),
-        "a refused ALTER must leave the declared policy exactly as it was"
-    );
+    let rendered = contextdb_engine::cli_render::render_table_meta("windows", &meta);
+    assert_renders_exactly_push_only(&rendered);
     assert_eq!(
         meta.default_ttl_seconds,
         Some(48 * 60 * 60),
@@ -1117,42 +1125,39 @@ fn c4_alter_set_retain_two_way_is_refused_and_leaves_the_existing_policy_intact(
     assert!(meta.sync_safe, "SYNC SAFE is likewise untouched");
 }
 
-/// The inverse corner. An ordinary table syncs two-way by default (an
-/// unregistered table's direction is `Both`); the moment retention is declared
-/// on it the declaration is authoritative and the table becomes one-way, so no
-/// path in the system can produce a two-way retained table.
+/// The inverse corner. An ordinary table syncs two-way by default; declaring
+/// retention on it says when its rows expire and nothing about where they go,
+/// so it is still two-way afterwards.
 #[test]
-fn c4_alter_adding_retain_to_a_two_way_table_lands_as_push_only() {
+fn c4_alter_adding_retain_to_a_two_way_table_leaves_it_two_way() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT)",
         &p(),
     )
     .expect("create");
-    assert_eq!(
-        db.table_meta("windows")
-            .expect("table meta")
-            .retained_sync_policy,
-        None,
-        "an ordinary table declares no retained policy and syncs both ways"
-    );
 
     db.execute("ALTER TABLE windows SET RETAIN 48 HOURS SYNC SAFE", &p())
         .expect("adding retention to an existing table must succeed");
+    let meta = db.table_meta("windows").expect("table meta");
+    let rendered = contextdb_engine::cli_render::render_table_meta("windows", &meta);
+    for one_way in ["PUSH ONLY", "PULL ONLY", "SYNC OFF"] {
+        assert!(
+            !rendered.contains(one_way),
+            "declaring retention must not convert the table to {one_way}, got:\n{rendered}"
+        );
+    }
     assert_eq!(
-        db.table_meta("windows")
-            .expect("table meta")
-            .retained_sync_policy,
-        Some(RetainedSyncPolicy::PushOnly),
-        "declaring retention converts the table to the one supported one-way contract"
+        meta.default_ttl_seconds,
+        Some(48 * 60 * 60),
+        "while the window it did declare lands: {meta:?}"
     );
 }
 
-/// Retention without `SYNC SAFE` closes the last hole: a retained table that
-/// still syncs is retained-and-synced, so it is one-way too. `SYNC SAFE` gates
-/// deletion on delivery; it is not what makes the table one-way.
+/// Retention without `SYNC SAFE` is the same story with no delivery promise at
+/// all: a window, and nothing said about direction.
 #[test]
-fn c4_alter_adding_retain_without_sync_safe_is_still_one_way() {
+fn c4_alter_adding_retain_without_sync_safe_changes_no_direction() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE windows (id INTEGER PRIMARY KEY)", &p())
         .expect("create");
@@ -1160,11 +1165,14 @@ fn c4_alter_adding_retain_without_sync_safe_is_still_one_way() {
         .expect("adding a bare retention window must succeed");
 
     let meta = db.table_meta("windows").expect("table meta");
-    assert_eq!(
-        meta.retained_sync_policy,
-        Some(RetainedSyncPolicy::PushOnly),
-        "no declaration path may leave a retained table syncing both ways"
-    );
+    let rendered = contextdb_engine::cli_render::render_table_meta("windows", &meta);
+    for one_way in ["PUSH ONLY", "PULL ONLY", "SYNC OFF"] {
+        assert!(
+            !rendered.contains(one_way),
+            "no declaration path may attach a direction the writer never wrote \
+             ({one_way}), got:\n{rendered}"
+        );
+    }
     assert!(
         !meta.sync_safe,
         "and SYNC SAFE stays off — the delete-after-delivery gate is a separate promise"
@@ -1188,7 +1196,7 @@ fn c4_alter_adding_retain_without_sync_safe_is_still_one_way() {
 /// layer along.
 ///
 /// The wording stays in the engine's own vocabulary (node, origin). The engine
-/// is schema-agnostic (C11), so a message that reached for a consumer's nouns
+/// is schema-agnostic, so a message that reached for a consumer's nouns
 /// would put that consumer's vocabulary into engine source — which is exactly
 /// what the product-noun grep forbids.
 fn assert_keyless_sync_safe_refusal(message: &str) {
@@ -1205,7 +1213,7 @@ fn assert_keyless_sync_safe_refusal(message: &str) {
         lower.contains("unique") && (lower.contains("node") || lower.contains("origin")),
         "the refusal must carry the cross-node caution — key values must be \
          unique across the nodes that write them (an origin/node identifier, or \
-         globally unique ids). The engine is schema-agnostic (C11), so the \
+         globally unique ids). The engine is schema-agnostic, so the \
          wording must stay generic: no consumer-domain nouns — got: {message}"
     );
 }
@@ -1251,7 +1259,7 @@ fn c4_alter_adding_sync_safe_to_a_keyless_table_is_refused() {
         "and applies no part of the statement, not even the window: {meta:?}"
     );
     assert_eq!(
-        meta.retained_sync_policy, None,
+        meta.sync_direction, None,
         "and establishes no sync policy: {meta:?}"
     );
 }
@@ -1501,7 +1509,7 @@ fn c7_unconfirmed_sync_safe_entries_are_never_truncated() {
     let db = Database::open(dir.path().join("bounded.db")).expect("open");
     db.execute(
         "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-         RETAIN 1 HOURS SYNC SAFE PUSH ONLY",
+         RETAIN 1 HOURS SYNC SAFE SYNC PUSH ONLY",
         &p(),
     )
     .expect("retained, delivery-promising table");

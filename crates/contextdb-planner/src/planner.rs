@@ -15,12 +15,15 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             name: ct.name.clone(),
             columns: ct.columns.clone(),
             unique_constraints: ct.unique_constraints.clone(),
+            primary_key_columns: ct.primary_key_columns.clone(),
             composite_foreign_keys: ct.composite_foreign_keys.clone(),
             immutable: ct.immutable,
             state_machine: ct.state_machine.clone(),
             dag_edge_types: ct.dag_edge_types.clone(),
             propagation_rules: extract_propagation_rules(ct)?,
             retain: ct.retain.clone(),
+            sync_direction: ct.sync_direction,
+            conflict_policy: ct.conflict_policy,
         })),
         Statement::AlterTable(at) => Ok(PhysicalPlan::AlterTable(AlterTablePlan {
             table: at.table.clone(),
@@ -63,9 +66,6 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
         Statement::ShowMemoryLimit => Ok(PhysicalPlan::ShowMemoryLimit),
         Statement::SetDiskLimit(val) => Ok(PhysicalPlan::SetDiskLimit(val.clone())),
         Statement::ShowDiskLimit => Ok(PhysicalPlan::ShowDiskLimit),
-        Statement::SetSyncConflictPolicy(policy) => {
-            Ok(PhysicalPlan::SetSyncConflictPolicy(policy.clone()))
-        }
         Statement::ShowSyncConflictPolicy => Ok(PhysicalPlan::ShowSyncConflictPolicy),
         Statement::ShowVectorIndexes => Ok(PhysicalPlan::ShowVectorIndexes),
         Statement::CreateSchedule { .. }

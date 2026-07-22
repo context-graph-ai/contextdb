@@ -121,7 +121,7 @@ fn assert_no_ghost_write(
 }
 
 // ============================================================================
-// CE01 — RED — UPDATE of flagged column rejected; row unchanged. [I1, I2]
+// CE01 — UPDATE of flagged column rejected; row unchanged.
 // Pins: `UPDATE SET flagged = ...` returns Error::ImmutableColumn with the
 // correct table + column fields, and the row is untouched on readback.
 // ============================================================================
@@ -152,7 +152,7 @@ fn ce01_update_flagged_column_rejected_and_row_unchanged() {
 }
 
 // ============================================================================
-// CE02 — RED — mutable column still updatable. Positive control for CE01.
+// CE02 — mutable column still updatable. Positive control for CE01.
 // ============================================================================
 #[test]
 fn ce02_update_non_flagged_column_succeeds() {
@@ -170,7 +170,7 @@ fn ce02_update_non_flagged_column_succeeds() {
 }
 
 // ============================================================================
-// CE03 — RED — mixed SET list: whole statement rejected, neither column written.
+// CE03 — mixed SET list: whole statement rejected, neither column written.
 // Pins I1 (all-or-nothing).
 // ============================================================================
 #[test]
@@ -195,7 +195,7 @@ fn ce03_mixed_set_list_rejects_whole_statement() {
 }
 
 // ============================================================================
-// CE04 — RED — error names first flagged column in SET-list iteration order.
+// CE04 — error names first flagged column in SET-list iteration order.
 // Pins I2. Reverse-order variant binds determinism.
 // ============================================================================
 #[test]
@@ -228,7 +228,7 @@ fn ce04_first_flagged_column_in_set_list_named_in_error() {
 }
 
 // ============================================================================
-// CE05 — RED — ON CONFLICT DO UPDATE SET flagged_col: rejected, row count
+// CE05 — ON CONFLICT DO UPDATE SET flagged_col: rejected, row count
 // unchanged.
 // ============================================================================
 #[test]
@@ -317,7 +317,7 @@ fn ce07_delete_row_with_flagged_columns_succeeds() {
 }
 
 // ============================================================================
-// CE08 — RED — nonexistent column beats ImmutableColumn in error ordering.
+// CE08 — nonexistent column beats ImmutableColumn in error ordering.
 // ============================================================================
 #[test]
 fn ce08_nonexistent_column_error_outranks_immutable_column() {
@@ -344,7 +344,7 @@ fn ce08_nonexistent_column_error_outranks_immutable_column() {
 }
 
 // ============================================================================
-// CE09 — RED — table-level IMMUTABLE wins over column-level on UPDATE.
+// CE09 — table-level IMMUTABLE wins over column-level on UPDATE.
 // ============================================================================
 #[test]
 fn ce09_table_immutable_short_circuits_column_check() {
@@ -378,7 +378,7 @@ fn ce09_table_immutable_short_circuits_column_check() {
 }
 
 // ============================================================================
-// CE10 — RED — I13: nonexistent column error wins even over ImmutableTable.
+// CE10 — nonexistent column error wins even over ImmutableTable.
 // ============================================================================
 #[test]
 fn ce10_nonexistent_column_outranks_table_immutable() {
@@ -420,7 +420,7 @@ fn ce10_nonexistent_column_outranks_table_immutable() {
 }
 
 // ============================================================================
-// CE11 — RED — PK+IMMUTABLE: UPDATE of id rejected with ImmutableColumn.
+// CE11 — PK+IMMUTABLE: UPDATE of id rejected with ImmutableColumn.
 // ============================================================================
 #[test]
 fn ce11_pk_plus_immutable_update_rejected_as_immutable_column() {
@@ -514,7 +514,7 @@ fn ce12_state_machine_plus_immutable_on_different_columns_parses() {
 }
 
 // ============================================================================
-// CE13 — RED — parser rejects STATE MACHINE status column declared IMMUTABLE.
+// CE13 — parser rejects STATE MACHINE status column declared IMMUTABLE.
 // Pins I8.
 // ============================================================================
 #[test]
@@ -537,7 +537,7 @@ fn ce13_parser_rejects_state_machine_status_column_declared_immutable() {
 }
 
 // ============================================================================
-// CE14 — RED — UNIQUE + IMMUTABLE + NOT NULL + DEFAULT + REFERENCES + EXPIRES
+// CE14 — UNIQUE + IMMUTABLE + NOT NULL + DEFAULT + REFERENCES + EXPIRES
 // compose on the same column.
 // ============================================================================
 #[test]
@@ -583,7 +583,7 @@ fn ce15_table_and_column_immutable_parse_together() {
 }
 
 // ============================================================================
-// CE16 — RED — DAG + RETAIN + per-column IMMUTABLE compose.
+// CE16 — DAG + RETAIN + per-column IMMUTABLE compose.
 // ============================================================================
 #[test]
 fn ce16_dag_retain_plus_column_immutable_compose() {
@@ -639,7 +639,7 @@ fn ce16_dag_retain_plus_column_immutable_compose() {
 }
 
 // ============================================================================
-// CP01 — RED — IMMUTABLE accepted as column_constraint in any position.
+// CP01 — IMMUTABLE accepted as column_constraint in any position.
 // ============================================================================
 #[test]
 fn cp01_immutable_accepted_in_any_constraint_position() {
@@ -660,7 +660,7 @@ fn cp01_immutable_accepted_in_any_constraint_position() {
 }
 
 // ============================================================================
-// CP02 — RED — IMMUTABLE is case-insensitive.
+// CP02 — IMMUTABLE is case-insensitive.
 // ============================================================================
 #[test]
 fn cp02_immutable_case_insensitive() {
@@ -677,7 +677,7 @@ fn cp02_immutable_case_insensitive() {
 }
 
 // ============================================================================
-// CP03 — RED — duplicate IMMUTABLE names the offending column.
+// CP03 — duplicate IMMUTABLE names the offending column.
 // ============================================================================
 #[test]
 fn cp03_duplicate_immutable_names_offending_column() {
@@ -698,7 +698,7 @@ fn cp03_duplicate_immutable_names_offending_column() {
 }
 
 // ============================================================================
-// CP04 — RED — misplaced IMMUTABLE keyword returns a targeted ParseError.
+// CP04 — misplaced IMMUTABLE keyword returns a targeted ParseError.
 // ============================================================================
 #[test]
 fn cp04_misplaced_immutable_keyword_yields_parse_error() {
@@ -731,7 +731,7 @@ fn cp05_immutable_with_explicit_null_parses() {
 }
 
 // ============================================================================
-// CP06 — RED — table-level `COLUMN IMMUTABLE (...)` clause is NOT part of this
+// CP06 — table-level `COLUMN IMMUTABLE (...)` clause is NOT part of this
 // feature.
 // ============================================================================
 #[test]
@@ -812,7 +812,7 @@ fn sc01_bincode_legacy_column_def_payload_fails_loudly() {
 }
 
 // ============================================================================
-// SC02 — RED — reopen: flag survives Database::open after close.
+// SC02 — reopen: flag survives Database::open after close.
 // ============================================================================
 #[test]
 fn sc02_flag_survives_close_and_reopen() {
@@ -836,7 +836,7 @@ fn sc02_flag_survives_close_and_reopen() {
 }
 
 // ============================================================================
-// SC03 — RED — CreateTable DdlChange round-trips the flag via apply_changes.
+// SC03 — CreateTable DdlChange round-trips the flag via apply_changes.
 // ============================================================================
 #[test]
 fn sc03_create_table_ddl_round_trips_immutable_flag_via_apply_changes() {
@@ -948,7 +948,7 @@ fn peer_table_meta(db: &Database, table: &str) -> TableMeta {
 }
 
 // ============================================================================
-// SC04 — RED — after replication, peer UPDATE on flagged column rejected.
+// SC04 — after replication, peer UPDATE on flagged column rejected.
 // ============================================================================
 #[test]
 fn sc04_peer_update_on_flagged_column_rejected_after_replication() {
@@ -992,7 +992,7 @@ fn sc04_peer_update_on_flagged_column_rejected_after_replication() {
 }
 
 // ============================================================================
-// SA01 — RED — apply_changes rejects flagged mutation on existing row.
+// SA01 — apply_changes rejects flagged mutation on existing row.
 // ============================================================================
 #[test]
 fn sa01_apply_changes_rejects_flagged_mutation_on_existing_row() {
@@ -1005,10 +1005,7 @@ fn sa01_apply_changes_rejects_flagged_mutation_on_existing_row() {
 
     let incoming = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("decision_type".to_string(), Value::Text("tampered".into())),
@@ -1060,7 +1057,7 @@ fn sa01_apply_changes_rejects_flagged_mutation_on_existing_row() {
 }
 
 // ============================================================================
-// SA02 — RED — apply_changes: new row applies normally; flagged column set.
+// SA02 — apply_changes: new row applies normally; flagged column set.
 // ============================================================================
 #[test]
 fn sa02_apply_changes_new_row_sets_flagged_column_value() {
@@ -1068,10 +1065,7 @@ fn sa02_apply_changes_new_row_sets_flagged_column_value() {
     let id = Uuid::new_v4();
     let incoming = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("decision_type".to_string(), Value::Text("fresh".into())),
@@ -1101,8 +1095,8 @@ fn sa02_apply_changes_new_row_sets_flagged_column_value() {
 
 // ============================================================================
 // SA03 — REGRESSION GUARD — same-value replay: no immutable-reasoned conflict raised.
-// Passes vacuously on the stub (no immutable check runs); gate value is
-// binding the impl not to label same-value replays as immutable-conflicts.
+// Guards the implementation against labeling a same-value replay as an
+// immutable conflict.
 // ============================================================================
 #[test]
 fn sa03_apply_changes_same_value_replay_is_noop() {
@@ -1112,10 +1106,7 @@ fn sa03_apply_changes_same_value_replay_is_noop() {
 
     let incoming = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             (
@@ -1164,10 +1155,7 @@ fn sa04_apply_changes_fresh_row_accepted() {
     let id = Uuid::new_v4();
     let incoming = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("decision_type".to_string(), Value::Text("anchor".into())),
@@ -1201,7 +1189,7 @@ fn sa04_apply_changes_fresh_row_accepted() {
 }
 
 // ============================================================================
-// SA05 — RED — upsert with differing flagged value rejected; row unchanged
+// SA05 — upsert with differing flagged value rejected; row unchanged
 // even under LatestWins with a higher LSN.
 // ============================================================================
 #[test]
@@ -1214,10 +1202,7 @@ fn sa05_sync_upsert_flagged_diff_rejected_row_unchanged() {
 
     let incoming = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("decision_type".to_string(), Value::Text("TAMPERED".into())),
@@ -1250,7 +1235,7 @@ fn sa05_sync_upsert_flagged_diff_rejected_row_unchanged() {
 }
 
 // ============================================================================
-// AL01 — RED — ALTER DROP COLUMN on flagged column rejected.
+// AL01 — ALTER DROP COLUMN on flagged column rejected.
 // ============================================================================
 #[test]
 fn al01_alter_drop_flagged_column_rejected() {
@@ -1280,7 +1265,7 @@ fn al02_alter_drop_non_flagged_column_succeeds() {
 }
 
 // ============================================================================
-// AL03 — RED — ALTER RENAME COLUMN on flagged column rejected.
+// AL03 — ALTER RENAME COLUMN on flagged column rejected.
 // ============================================================================
 #[test]
 fn al03_alter_rename_flagged_column_rejected() {
@@ -1310,7 +1295,7 @@ fn al04_alter_rename_non_flagged_column_succeeds() {
 }
 
 // ============================================================================
-// AL05 — RED — ALTER ADD COLUMN ... IMMUTABLE then UPDATE rejected.
+// AL05 — ALTER ADD COLUMN ... IMMUTABLE then UPDATE rejected.
 // ============================================================================
 #[test]
 fn al05_alter_add_immutable_column_then_update_rejected() {
@@ -1369,7 +1354,7 @@ fn re01_read_paths_unaffected_by_flag() {
 }
 
 // ============================================================================
-// RC01 — RED — render_table_meta emits IMMUTABLE on flagged columns only.
+// RC01 — render_table_meta emits IMMUTABLE on flagged columns only.
 // ============================================================================
 #[test]
 fn rc01_schema_render_shows_immutable_per_column() {
@@ -1395,7 +1380,7 @@ fn rc01_schema_render_shows_immutable_per_column() {
 }
 
 // ============================================================================
-// RC02 — RED — render -> parse round-trip preserves the flag.
+// RC02 — render -> parse round-trip preserves the flag.
 // ============================================================================
 #[test]
 fn rc02_render_parse_round_trip_preserves_flag() {
@@ -1421,7 +1406,7 @@ fn rc02_render_parse_round_trip_preserves_flag() {
 }
 
 // ============================================================================
-// CL01 — RED — Display for ImmutableColumn matches the contract string.
+// CL01 — Display for ImmutableColumn matches the contract string.
 // ============================================================================
 #[test]
 fn cl01_cli_raw_path_immutable_column_display() {
@@ -1443,7 +1428,7 @@ fn cl01_cli_raw_path_immutable_column_display() {
 }
 
 // ============================================================================
-// IC01 — RED — Rejected UPDATE does not survive across handle drop + reopen.
+// IC01 — Rejected UPDATE does not survive across handle drop + reopen.
 // After rollback + drop(db) + Database::open(path), the readback equals the
 // original INSERTed value. Pins: a write-then-error bug cannot hide behind
 // read-your-own-writes.
@@ -1486,7 +1471,7 @@ fn ic01_fresh_handle_readback_after_rejected_update() {
 }
 
 // ============================================================================
-// AL06 — RED — ALTER COLUMN TYPE on a flagged column is rejected (parse OR
+// AL06 — ALTER COLUMN TYPE on a flagged column is rejected (parse OR
 // enforcement). The engine currently does not support ALTER COLUMN TYPE at
 // all, so the positive path for this test is parser rejection. When / if the
 // engine grows the syntax, enforcement must fire.
@@ -1528,7 +1513,7 @@ fn al06_alter_column_type_on_flagged_rejected() {
 }
 
 // ============================================================================
-// AL07 — RED — DROP on flagged rejected; subsequent ADD of same name fails
+// AL07 — DROP on flagged rejected; subsequent ADD of same name fails
 // because the column still exists with its original value. "Nothing disappears."
 // ============================================================================
 #[test]
@@ -1571,7 +1556,7 @@ fn al07_same_statement_drop_add_still_refuses_flagged_drop() {
 }
 
 // ============================================================================
-// AL08 — RED — ALTER ADD COLUMN IMMUTABLE cross-checks existing propagation
+// AL08 — ALTER ADD COLUMN IMMUTABLE cross-checks existing propagation
 // rules. If a propagation rule's SET target names the new column, the ADD is
 // rejected with Error::ImmutableColumn{table,column}. Closes the
 // DROP-then-ADD-as-flagged loophole: a propagation rule that targeted a
@@ -1631,7 +1616,7 @@ fn al09_alter_add_column_immutable_succeeds_when_no_propagation_rule_targets_it(
 }
 
 // ============================================================================
-// IC03a — RED — Library write path Database::insert_row accepts a flagged
+// IC03a — Library write path Database::insert_row accepts a flagged
 // column value on a fresh row; readback matches.
 // ============================================================================
 #[test]
@@ -1657,7 +1642,7 @@ fn ic03a_insert_row_library_path_sets_flagged_column() {
 }
 
 // ============================================================================
-// IC03b — RED — Library write path Database::upsert_row with a DIFFERENT
+// IC03b — Library write path Database::upsert_row with a DIFFERENT
 // flagged column value against an existing row returns ImmutableColumn; local
 // row unchanged.
 // ============================================================================
@@ -1727,7 +1712,7 @@ fn ic03c_api_surface_row_mutations_locked() {
 }
 
 // ============================================================================
-// IC04 — RED — Supersede-via-new-row preserves both rows with original values.
+// IC04 — Supersede-via-new-row preserves both rows with original values.
 // ============================================================================
 #[test]
 fn ic04_supersede_with_new_row_preserves_both() {
@@ -1778,7 +1763,7 @@ fn ic04_supersede_with_new_row_preserves_both() {
 }
 
 // ============================================================================
-// IC05 — RED — Rejection followed by handle drop + reopen preserves original.
+// IC05 — Rejection followed by handle drop + reopen preserves original.
 // Variant of IC01 without an explicit rollback — auto-commit UPDATE failure.
 // ============================================================================
 #[test]
@@ -1811,7 +1796,7 @@ fn ic05_rejection_then_reopen_preserves() {
 }
 
 // ============================================================================
-// IC06 — RED — After ON CONFLICT rejection, a subsequent unrelated INSERT
+// IC06 — After ON CONFLICT rejection, a subsequent unrelated INSERT
 // succeeds — proving allocator / checkpoint state was restored.
 // ============================================================================
 #[test]
@@ -1856,7 +1841,7 @@ fn ic06_on_conflict_rejection_checkpoint_restored() {
 }
 
 // ============================================================================
-// IC07a — RED — UPDATE on nonexistent table returns TableNotFound, never
+// IC07a — UPDATE on nonexistent table returns TableNotFound, never
 // ImmutableColumn. Position 1 of the error ordering.
 // ============================================================================
 #[test]
@@ -1875,7 +1860,7 @@ fn ic07a_error_ordering_table_not_exist_wins() {
 }
 
 // ============================================================================
-// IC07b — RED — ImmutableColumn wins over InvalidStateTransition.
+// IC07b — ImmutableColumn wins over InvalidStateTransition.
 // Position 4 before position 5 of the error ordering.
 // ============================================================================
 #[test]
@@ -1899,7 +1884,7 @@ fn ic07b_error_ordering_immutable_wins_over_state_machine() {
 }
 
 // ============================================================================
-// IC07c — RED — ImmutableColumn wins over NOT NULL violation.
+// IC07c — ImmutableColumn wins over NOT NULL violation.
 // Position 4 before position 6 of the error ordering.
 // ============================================================================
 #[test]
@@ -1923,7 +1908,7 @@ fn ic07c_error_ordering_immutable_wins_over_not_null() {
 }
 
 // ============================================================================
-// IC08_<type> — RED — Type-agnostic enforcement. One test per supported type.
+// IC08_<type> — Type-agnostic enforcement. One test per supported type.
 // Each test creates a fresh table with exactly one flagged column of the
 // target type, INSERTs a value, attempts UPDATE, destructures the error, and
 // reads the row back to confirm the flagged column's value is bytes-identical
@@ -1974,7 +1959,7 @@ fn type_reject_helper(
     );
 }
 
-// IC08_text — RED — Type-coverage: TEXT-typed flagged column UPDATE rejected.
+// IC08_text — Type-coverage: TEXT-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_text_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -1991,7 +1976,7 @@ fn ic08_text_flagged_update_rejected() {
     );
 }
 
-// IC08_uuid — RED — Type-coverage: UUID-typed flagged column UPDATE rejected.
+// IC08_uuid — Type-coverage: UUID-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_uuid_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2009,7 +1994,7 @@ fn ic08_uuid_flagged_update_rejected() {
     );
 }
 
-// IC08_txid — RED — Type-coverage: TXID-typed flagged column UPDATE rejected.
+// IC08_txid — Type-coverage: TXID-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_txid_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2029,7 +2014,7 @@ fn ic08_txid_flagged_update_rejected() {
     );
 }
 
-// IC08_json — RED — Type-coverage: JSON-typed flagged column UPDATE rejected.
+// IC08_json — Type-coverage: JSON-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_json_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2049,7 +2034,7 @@ fn ic08_json_flagged_update_rejected() {
     );
 }
 
-// IC08_integer — RED — Type-coverage: INTEGER-typed flagged column UPDATE rejected.
+// IC08_integer — Type-coverage: INTEGER-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_integer_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2066,7 +2051,7 @@ fn ic08_integer_flagged_update_rejected() {
     );
 }
 
-// IC08_real — RED — Type-coverage: REAL-typed flagged column UPDATE rejected.
+// IC08_real — Type-coverage: REAL-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_real_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2083,7 +2068,7 @@ fn ic08_real_flagged_update_rejected() {
     );
 }
 
-// IC08_boolean — RED — Type-coverage: BOOLEAN-typed flagged column UPDATE rejected.
+// IC08_boolean — Type-coverage: BOOLEAN-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_boolean_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2100,7 +2085,7 @@ fn ic08_boolean_flagged_update_rejected() {
     );
 }
 
-// IC08_timestamp — RED — Type-coverage: TIMESTAMP-typed flagged column UPDATE rejected.
+// IC08_timestamp — Type-coverage: TIMESTAMP-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_timestamp_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2117,7 +2102,7 @@ fn ic08_timestamp_flagged_update_rejected() {
     );
 }
 
-// IC08_vector — RED — Type-coverage: VECTOR-typed flagged column UPDATE rejected.
+// IC08_vector — Type-coverage: VECTOR-typed flagged column UPDATE rejected.
 #[test]
 fn ic08_vector_flagged_update_rejected() {
     let id = Uuid::new_v4();
@@ -2138,7 +2123,7 @@ fn ic08_vector_flagged_update_rejected() {
 }
 
 // ============================================================================
-// IC09 — RED — Sync apply rejection under non-LatestWins policies.
+// IC09 — Sync apply rejection under non-LatestWins policies.
 // EdgeWins: locally-authored policy that prefers "the edge" (incoming).
 // Flagged-column diff must still be refused.
 // ============================================================================
@@ -2152,10 +2137,7 @@ fn ic09_sync_apply_rejection_under_edge_wins() {
 
     let incoming = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             (
@@ -2209,10 +2191,7 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
 
     let incoming = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             (
@@ -2251,7 +2230,7 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
 }
 
 // ============================================================================
-// IC10 — RED — Explicit BEGIN session: flagged-UPDATE rejection does not
+// IC10 — Explicit BEGIN session: flagged-UPDATE rejection does not
 // abort the session; surrounding mutable UPDATEs commit.
 // ============================================================================
 #[test]
@@ -2331,7 +2310,7 @@ fn ic11a_multi_row_update_flagged_in_where_succeeds() {
 }
 
 // ============================================================================
-// IC11b — RED — Multi-row UPDATE that SETs a flagged column is rejected in
+// IC11b — Multi-row UPDATE that SETs a flagged column is rejected in
 // full; zero rows mutated, including their non-flagged columns.
 // ============================================================================
 #[test]
@@ -2361,7 +2340,7 @@ fn ic11b_multi_row_update_flagged_in_set_rejects_all_rows() {
 }
 
 // ============================================================================
-// IC12 — RED — Concurrent SQL UPDATE + apply_changes on same flagged column.
+// IC12 — Concurrent SQL UPDATE + apply_changes on same flagged column.
 // Both reject; local row unchanged after both threads return.
 // The Database handle is Send + Sync via Arc; we share it across two threads.
 // ============================================================================
@@ -2394,10 +2373,7 @@ fn ic12_concurrent_update_and_sync_apply_on_flagged() {
     let t_b = thread::spawn(move || {
         let incoming = RowChange {
             table: "decisions".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(id)),
                 ("decision_type".to_string(), Value::Text("thread_b".into())),
@@ -2436,7 +2412,7 @@ fn ic12_concurrent_update_and_sync_apply_on_flagged() {
 }
 
 // ============================================================================
-// CE17 — RED — Parser rejects a STATE MACHINE whose status column is also
+// CE17 — Parser rejects a STATE MACHINE whose status column is also
 // declared IMMUTABLE when the table also declares a PROPAGATE ON EDGE rule
 // targeting that status column. The propagation rule writes the status
 // column; combined with IMMUTABLE on that column, the declaration is
@@ -2485,7 +2461,7 @@ fn ce17b_propagation_rule_targeting_mutable_status_with_flagged_other_parses() {
 }
 
 // ============================================================================
-// CE17c — RED — Parser rejects an FK-propagation clause (column-level
+// CE17c — Parser rejects an FK-propagation clause (column-level
 // `REFERENCES parent(id) ON STATE x PROPAGATE SET flagged_col`) whose SET
 // target is a column declared IMMUTABLE on the same table. The FK-propagation
 // path writes into the target column; combined with IMMUTABLE on that column,
@@ -2536,7 +2512,7 @@ fn ce17d_fk_propagation_clause_targeting_mutable_column_parses() {
 }
 
 // ============================================================================
-// IC14 — RED — Cross-Value-variant coercion into a flagged column must be
+// IC14 — Cross-Value-variant coercion into a flagged column must be
 // rejected. sync-apply receives a RowChange whose flagged-column value is a
 // Value::Int64 against a local Value::TxId(TxId(42)). Behavior contract:
 // ImmutableColumn wins (variant mismatch on a flagged column = attempted
@@ -2587,10 +2563,7 @@ fn ic14_cross_variant_coercion_into_flagged_column_rejected() {
     // Cross-variant incoming: Int64 into a TxId column, differing value.
     let incoming = RowChange {
         table: "t".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("created_tx".to_string(), Value::Int64(99)),
@@ -2657,10 +2630,7 @@ fn ic14b_sync_apply_fresh_row_correct_variant_accepted() {
     let id = Uuid::new_v4();
     let incoming = RowChange {
         table: "t".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             (
@@ -2689,7 +2659,7 @@ fn ic14b_sync_apply_fresh_row_correct_variant_accepted() {
 }
 
 // ============================================================================
-// IC11c — RED — Multi-row mixed SET list: seed 10 rows with DISTINCT flagged
+// IC11c — Multi-row mixed SET list: seed 10 rows with DISTINCT flagged
 // AND mutable values, run UPDATE that SETs both a flagged and a mutable
 // column. All 4 matched rows are rejected; zero partial mutation observable.
 // ============================================================================
@@ -2747,7 +2717,7 @@ fn ic11c_multi_row_mixed_set_list_rejects_all_rows_no_partial_mutation() {
 }
 
 // ============================================================================
-// SA06 — RED — Partial ChangeSet: 2 row-changes, one mutates a flagged column
+// SA06 — Partial ChangeSet: 2 row-changes, one mutates a flagged column
 // (reject), the other mutates a mutable column only (apply). applied_rows ==
 // 1; conflicts.len() == 1; row A unchanged; row B reflects the new value.
 // ============================================================================
@@ -2761,10 +2731,7 @@ fn sa06_partial_changeset_rejects_flagged_row_applies_clean_row() {
 
     let row_a_tamper = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id_a),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id_a)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id_a)),
             (
@@ -2783,10 +2750,7 @@ fn sa06_partial_changeset_rejects_flagged_row_applies_clean_row() {
     };
     let row_b_clean = RowChange {
         table: "decisions".to_string(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id_b),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id_b)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id_b)),
             (
@@ -2826,7 +2790,7 @@ fn sa06_partial_changeset_rejects_flagged_row_applies_clean_row() {
 }
 
 // ============================================================================
-// RC03 — RED — `sql_type_for_meta_column` direct-render path emits IMMUTABLE
+// RC03 — `sql_type_for_meta_column` direct-render path emits IMMUTABLE
 // on a flagged column. Bypasses the AST route and hits the engine-internal
 // render helper used by DDL replication.
 // The function is a module-private `fn` in `contextdb-engine::database`, so

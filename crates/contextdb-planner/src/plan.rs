@@ -91,7 +91,6 @@ pub enum PhysicalPlan {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
-    SetSyncConflictPolicy(String),
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
 }
@@ -210,12 +209,17 @@ pub struct CreateTablePlan {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub unique_constraints: Vec<Vec<String>>,
+    /// The ordered columns of a table-level `PRIMARY KEY (a, b, ...)`; empty
+    /// for a single-column or absent primary key.
+    pub primary_key_columns: Vec<String>,
     pub composite_foreign_keys: Vec<CompositeForeignKey>,
     pub immutable: bool,
     pub state_machine: Option<StateMachineDef>,
     pub dag_edge_types: Vec<String>,
     pub propagation_rules: Vec<PropagationRule>,
     pub retain: Option<RetainOption>,
+    pub sync_direction: Option<contextdb_core::SyncDirection>,
+    pub conflict_policy: Option<contextdb_core::ConflictPolicy>,
 }
 
 #[derive(Debug, Clone)]

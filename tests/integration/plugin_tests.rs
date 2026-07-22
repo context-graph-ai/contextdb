@@ -542,10 +542,7 @@ fn p05_pre_commit_source_sync_pull() {
     let cs = ChangeSet {
         rows: vec![RowChange {
             table: "items".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(Uuid::new_v4()),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(Uuid::new_v4())),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(Uuid::new_v4())),
                 ("name".to_string(), Value::Text("synced".to_string())),
@@ -1339,10 +1336,7 @@ fn p24_on_sync_pull_rejects_batch() {
     let cs = ChangeSet {
         rows: vec![RowChange {
             table: "items".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(Uuid::new_v4()),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(Uuid::new_v4())),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(Uuid::new_v4())),
                 ("name".to_string(), Value::Text("incoming".to_string())),
@@ -1380,10 +1374,7 @@ fn p25_on_sync_pull_filters_rows() {
         rows: vec![
             RowChange {
                 table: "items".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id1),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id1)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(id1)),
                     ("name".to_string(), Value::Text("allowed".to_string())),
@@ -1394,10 +1385,7 @@ fn p25_on_sync_pull_filters_rows() {
             },
             RowChange {
                 table: "blocked".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id2),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id2)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(id2)),
                     ("data".to_string(), Value::Text("nope".to_string())),
@@ -1565,10 +1553,7 @@ fn p34_apply_changes_per_row_sync_pull() {
             let id = Uuid::new_v4();
             RowChange {
                 table: "items".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(id)),
                     ("name".to_string(), Value::Text(format!("sync-{i}"))),

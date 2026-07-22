@@ -1,7 +1,7 @@
-//! The Iroh adapter's acceptance tests (criteria C2–C7, C9 of the frozen
-//! criteria doc). Everything here runs over REAL localhost Iroh endpoints —
-//! no relay, no internet, no third-party contact, no Docker — and is the
-//! default-gate replacement for the demoted broker suites.
+//! The Iroh adapter's acceptance tests. Everything here runs over REAL
+//! localhost Iroh endpoints — no relay, no internet, no third-party contact,
+//! no Docker — and is the default-gate replacement for the deprecated broker
+//! suites.
 
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -117,7 +117,7 @@ impl RunningHub {
     }
 }
 
-// C5 — identity is fabric-owned.
+// Identity is fabric-owned.
 
 #[test]
 fn identity_keypair_persists_and_yields_same_node_id() {
@@ -200,7 +200,7 @@ async fn bound_endpoint_uses_the_fabric_identity_not_a_transport_minted_one() {
     );
 }
 
-// C3 — no third-party contact by default; opt-ins are explicit.
+// No third-party contact by default; opt-ins are explicit.
 
 #[test]
 fn default_endpoint_config_disables_relay_and_publishing() {
@@ -257,7 +257,7 @@ fn broker_urls_are_not_iroh_endpoints() {
     }
 }
 
-// C2 — the sync protocol end to end over real localhost Iroh endpoints.
+// The sync protocol end to end over real localhost Iroh endpoints.
 
 #[tokio::test]
 async fn sync_push_pull_status_over_iroh() {
@@ -281,8 +281,8 @@ async fn sync_push_pull_status_over_iroh() {
     let note_a = Uuid::new_v4();
     insert_note(&edge_a, note_a, "from-edge-a");
     // The polymorphic constructor: the plain ticket string in the slot where
-    // a NATS URL used to go. This is exactly what lets a downstream consumer's
-    // smoke run over Iroh with zero consumer code change.
+    // a NATS URL used to go. This is exactly what lets a downstream
+    // application's smoke run over Iroh with zero downstream code change.
     let client_a = SyncClient::new(
         edge_a.clone(),
         &hub.ticket,
@@ -489,7 +489,7 @@ async fn unreachable_hub_maps_to_transport_neutral_errors() {
     );
 }
 
-// C6 — ticket enrollment.
+// Ticket enrollment.
 
 #[tokio::test]
 async fn ticket_round_trips_as_opaque_config_string() {
@@ -521,7 +521,7 @@ async fn ticket_round_trips_as_opaque_config_string() {
     hub.stop().await;
 }
 
-// C9 — the fabric-internal peer surface (what the media transfer plan builds on).
+// The fabric-internal peer surface (what the media-transfer path builds on).
 
 #[tokio::test]
 async fn second_alpn_peer_stream_exchanges_bytes_without_hub() {
@@ -538,7 +538,7 @@ async fn second_alpn_peer_stream_exchanges_bytes_without_hub() {
             Box::pin(async move {
                 // Echo back WHO asked plus the bytes: the handler must see
                 // the caller's authenticated fabric identity, because the
-                // media transfer plan authorizes fetches by node identity.
+                // media-transfer path authorizes fetches by node identity.
                 let mut reply = format!("from={}:", request.remote_node_id).into_bytes();
                 reply.extend_from_slice(&request.bytes);
                 Ok(reply)
@@ -714,7 +714,7 @@ async fn ticket_relay_url_enables_relay_dialing() {
     hub.stop().await;
 }
 
-// C7 — the deprecated broker path errors actionably when not built.
+// The deprecated broker path errors actionably when not built.
 
 #[cfg(not(feature = "nats"))]
 #[tokio::test]
@@ -736,7 +736,7 @@ async fn broker_url_without_nats_feature_errors_actionably() {
     );
 }
 
-// C4 — transport neutrality holds structurally.
+// Transport neutrality holds structurally.
 
 #[test]
 fn iroh_word_confined_to_adapter_and_config_surface() {
@@ -783,11 +783,11 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         // adapter for the same reason the media suites do.
         "contextdb-server/tests/bounded_tables_sync_tests.rs",
         // The bounded-tables live-smoke driver must name the real transport it
-        // drives — the smoke contract requires the real endpoint path, not a
-        // test double.
+        // drives — the live-smoke requires the real endpoint path, not a test
+        // double.
         "contextdb-server/examples/bounded_tables_smoke.rs",
         // The test-estate ratchet audit names test FILES (including this one)
-        // in its frozen per-file sleep counts — filenames, not transport use.
+        // in its per-file sleep counts — filenames, not transport use.
         "contextdb-core/tests/test_estate_audit.rs",
     ];
 
@@ -836,14 +836,14 @@ fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-// Fix bundle: operator-trap regressions.
+// Operator-trap regressions.
 
 #[tokio::test]
 async fn hub_restart_without_port_keeps_the_same_ticket() {
     // Port stickiness by default: a hub bound WITHOUT port= records its
     // chosen port beside the identity key and reuses it, so tickets survive
-    // restarts (the owner's live-smoke trap: a restarted hub minted a new
-    // random port and every issued ticket went stale).
+    // restarts (a live-smoke trap: a restarted hub minted a new random port
+    // and every issued ticket went stale).
     let dir = tempfile::tempdir().expect("tempdir");
     let spec = bind_spec(&identity_file(&dir));
 
@@ -1023,7 +1023,7 @@ async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
 async fn peer_connection_protocol_exposes_raw_streams() {
     // The streaming half of the peer surface: the protocol owner gets the
     // raw connection (plus the caller's authenticated identity) and drives
-    // its own streams — the media transfer plan's substrate.
+    // its own streams — the media-transfer path's substrate.
     let dir = tempfile::tempdir().expect("tempdir");
     let endpoint = within(IrohServer::bind(&bind_spec(&identity_file(&dir))))
         .await
@@ -1082,8 +1082,8 @@ async fn start_local_dns_pkarr() -> (iroh::test_utils::DnsPkarrServer, String, S
     (server, url.clone(), url)
 }
 
-// Review-caught defects (2026-07-07): fail fast, tell the truth about
-// liveness, and never print a ticket whose stability was not persisted.
+// Operator-trap regressions: fail fast, tell the truth about liveness, and
+// never print a ticket whose stability was not persisted.
 
 #[cfg(not(feature = "nats"))]
 #[tokio::test]
@@ -1231,7 +1231,7 @@ async fn iroh_push_arms_the_retention_hub_and_records_client_receipts() {
     let edge = Arc::new(Database::open_memory());
     edge.execute(
         "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-         RETAIN 48 HOURS SYNC SAFE PUSH ONLY",
+         RETAIN 48 HOURS SYNC SAFE SYNC PUSH ONLY",
         &HashMap::new(),
     )
     .expect("retained table");

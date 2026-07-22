@@ -1654,6 +1654,33 @@ impl RedbPersistence {
         })
     }
 
+    /// Every config value whose key starts with `prefix`, decoded, in key order.
+    /// The config keys are sorted, so a range from `prefix` and a stop at the
+    /// first key that no longer shares it collects exactly the contiguous run.
+    pub fn load_config_values_with_prefix<T: serde::de::DeserializeOwned>(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, T)>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let config_table = match read_txn.open_table(CONFIG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let mut out = Vec::new();
+            for entry in config_table.range(prefix..).map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                let key = key.value();
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                out.push((key.to_string(), Self::decode(value.value())?));
+            }
+            Ok(out)
+        })
+    }
+
     pub fn load_config_value<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,

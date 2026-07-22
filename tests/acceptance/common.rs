@@ -519,6 +519,7 @@ pub(crate) async fn push_many_changes_through_server(
         .expect("subscribe direct push inbox");
     let request = PushRequest {
         changeset: db.changes_since(Lsn(0)).into(),
+        incarnation: contextdb_core::Incarnation::default(),
     };
     let encoded =
         encode(MessageType::PushRequest, &request).expect("encode direct in-flight push request");

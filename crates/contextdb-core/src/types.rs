@@ -437,6 +437,71 @@ impl fmt::Display for TenantId {
     }
 }
 
+/// A random 128-bit token identifying one LIFE of a syncing database. It is
+/// minted the first time a database syncs and stays fixed for that life; a
+/// database that is wiped and recreated (its data gone but its transport
+/// identity key-file reused) mints a NEW one, while a plain reopen of the same
+/// data loads the same one back.
+///
+/// The hub keys its per-edge received-up-to record by `(node_id, incarnation)`,
+/// so a rebuilt edge — same node id, fresh incarnation — is an unknown edge to
+/// the hub and is answered "I hold nothing from you" rather than the prior
+/// life's stale-high watermark. That closes the reincarnation false-confirmation
+/// by construction: the stale record can never vouch for a batch the hub never
+/// received.
+///
+/// It rides the wire as two positional `u64` halves (high, low) so the encoding
+/// is deterministic across encoders regardless of any 128-bit integer support,
+/// and is a fixed 32-hex-character string when it forms part of a config key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Incarnation(pub u128);
+
+impl Incarnation {
+    /// Mint a fresh random incarnation: 128 uniformly random bits drawn from the
+    /// OS CSPRNG (no fixed version/variant bits). The chance of two lives colliding
+    /// is negligible, which is exactly the property the per-edge keying needs.
+    pub fn mint() -> Self {
+        Self(rand::random::<u128>())
+    }
+
+    /// The fixed 32-character lowercase hex rendering used inside config keys.
+    pub fn to_hex(self) -> String {
+        format!("{:032x}", self.0)
+    }
+
+    /// Parse the hex rendering produced by [`Incarnation::to_hex`].
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        u128::from_str_radix(hex, 16).ok().map(Self)
+    }
+}
+
+impl fmt::Display for Incarnation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl Serialize for Incarnation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let hi = (self.0 >> 64) as u64;
+        let lo = self.0 as u64;
+        (hi, lo).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Incarnation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (hi, lo) = <(u64, u64)>::deserialize(deserializer)?;
+        Ok(Self((u128::from(hi) << 64) | u128::from(lo)))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ScopeLabel(pub String);
 

@@ -1,6 +1,6 @@
 use clap::Parser;
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_engine::sync_types::ConflictPolicies;
 use contextdb_server::SyncServer;
 use contextdb_server::protocol::PROTOCOL_VERSION;
 use contextdb_server::transport::iroh::{EndpointSpec, IrohServer};
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Parser)]
 #[command(
     name = "contextdb-server",
-    version = concat!(env!("CARGO_PKG_VERSION"), " protocol_version=4"),
+    version = concat!(env!("CARGO_PKG_VERSION"), " protocol_version=5"),
     after_help = "EXAMPLES:\n  \
         contextdb-server --db-path mydata.db --tenant-id acme\n    \
             Serve mydata.db, binding a dial-by-key sync endpoint and printing an\n    \
@@ -99,7 +99,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Arc::new(Database::open(std::path::Path::new(&args.db_path))?)
     };
-    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+    // The hub honors each table's DECLARED conflict policy (carried on its
+    // meta); this uniform default only decides a table that declared none, and
+    // it is the engine's non-overwriting default, agreeing with Database::open.
+    let policies = ConflictPolicies::uniform(contextdb_core::DEFAULT_CONFLICT_POLICY);
 
     // For a dial-by-key endpoint, bind eagerly so the enrollment ticket is
     // available up front (logged, and written to --ticket-file when asked).

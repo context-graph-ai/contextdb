@@ -275,6 +275,7 @@ pub(crate) fn handle_meta_command(
             );
             println!(".sync pull                Pull remote changes from server");
             println!(".sync reconnect           Reconnect to the sync endpoint");
+            println!(".sync destination         Move retained-data delivery to the connected hub");
             println!(".sync direction <t> <d>   Set table sync direction (Push|Pull|Both|None)");
             println!(
                 ".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)"
@@ -527,6 +528,43 @@ fn run_sync_command(
                 SyncCommandOutcome { message, ok: false }
             }
         }
+        "destination" => {
+            // Move this edge's retained-data destination to the hub it is
+            // currently, provably connected to. The operator points the process
+            // at the new server (`--sync-endpoint`) and restarts, then runs
+            // this; it authorises the move at the sync layer — clearing what the
+            // PREVIOUS destination confirmed — so the next push rebuilds the new
+            // destination from everything the edge holds, and nothing local is
+            // deleted until the new destination confirms receipt.
+            if rt.block_on(client.ensure_connected()).is_err() {
+                return SyncCommandOutcome {
+                    message: format!(
+                        "Cannot change destination: the sync endpoint {} is unreachable. Start the CLI pointed at the new server with --sync-endpoint, then run `.sync destination`.",
+                        client.endpoint()
+                    ),
+                    ok: false,
+                };
+            }
+            let Some(node_id) = client.connected_hub_node_id() else {
+                return SyncCommandOutcome {
+                    message: "Cannot change destination: the transport does not authenticate a hub identity, so there is nothing to bind to. Use the dial-by-key (iroh) transport."
+                        .to_string(),
+                    ok: false,
+                };
+            };
+            match client.change_destination(&node_id) {
+                Ok(()) => SyncCommandOutcome {
+                    message: format!(
+                        "Retained-data destination is now hub {node_id}. Run `.sync push` to rebuild it from everything this edge holds; nothing local is deleted until it confirms receipt."
+                    ),
+                    ok: true,
+                },
+                Err(err) => SyncCommandOutcome {
+                    message: format!("Changing destination failed: {err}"),
+                    ok: false,
+                },
+            }
+        }
         "direction" => {
             if parts.len() != 3 {
                 return SyncCommandOutcome {
@@ -633,7 +671,7 @@ fn run_sync_command(
         }
         _ => SyncCommandOutcome {
             message: format!(
-                "Unknown sync command: {sub}. Try: status, push, pull, reconnect, direction, policy, auto"
+                "Unknown sync command: {sub}. Try: status, push, pull, reconnect, destination, direction, policy, auto"
             ),
             ok: true,
         },

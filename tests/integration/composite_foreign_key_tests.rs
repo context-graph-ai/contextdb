@@ -1017,10 +1017,7 @@ fn ddl_sync_row_apply_rejects_orphan_child_returns_apply_result_with_conflict() 
     create_parent_child(&receiver);
     let row = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("c1".into(), Value::Int64(9)),
@@ -1054,10 +1051,7 @@ fn ddl_sync_apply_ok_when_receiver_has_parent() {
     insert_parent(&receiver, 1, 2);
     let row = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("c1".into(), Value::Int64(1)),
@@ -1097,10 +1091,7 @@ fn ddl_sync_skipped_parent_row_does_not_satisfy_composite_fk_child() {
 
     let child = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(2),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(2)),
         values: HashMap::from([
             ("id".into(), Value::Int64(2)),
             ("c1".into(), Value::Int64(9)),
@@ -1112,10 +1103,7 @@ fn ddl_sync_skipped_parent_row_does_not_satisfy_composite_fk_child() {
     };
     let skipped_parent = RowChange {
         table: "parent".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("a".into(), Value::Int64(9)),
@@ -1175,10 +1163,7 @@ fn ddl_sync_child_before_parent_same_batch_uses_applied_parent_projection() {
 
     let child = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("c1".into(), Value::Int64(1)),
@@ -1190,10 +1175,7 @@ fn ddl_sync_child_before_parent_same_batch_uses_applied_parent_projection() {
     };
     let parent = RowChange {
         table: "parent".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("a".into(), Value::Int64(1)),
@@ -1240,10 +1222,7 @@ fn ddl_sync_future_parent_delete_does_not_satisfy_composite_fk_child() {
 
     let child = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("c1".into(), Value::Int64(1)),
@@ -1255,10 +1234,7 @@ fn ddl_sync_future_parent_delete_does_not_satisfy_composite_fk_child() {
     };
     let delete_parent = RowChange {
         table: "parent".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("a".into(), Value::Int64(1)),
@@ -1318,10 +1294,7 @@ fn ddl_sync_future_parent_update_away_does_not_satisfy_composite_fk_child() {
 
     let child = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("c1".into(), Value::Int64(1)),
@@ -1333,10 +1306,7 @@ fn ddl_sync_future_parent_update_away_does_not_satisfy_composite_fk_child() {
     };
     let parent_update = RowChange {
         table: "parent".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("a".into(), Value::Int64(9)),
@@ -1402,10 +1372,7 @@ fn ddl_sync_parent_update_rejected_by_immutable_does_not_satisfy_composite_fk_ch
 
     let child = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("c1".into(), Value::Int64(9)),
@@ -1417,10 +1384,7 @@ fn ddl_sync_parent_update_rejected_by_immutable_does_not_satisfy_composite_fk_ch
     };
     let rejected_parent_update = RowChange {
         table: "parent".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("a".into(), Value::Int64(9)),
@@ -1498,10 +1462,7 @@ fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composit
 
     let child = RowChange {
         table: "child".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("c1".into(), Value::Int64(9)),
@@ -1513,10 +1474,7 @@ fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composit
     };
     let projected_unique_holder = RowChange {
         table: "parent".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(2),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(2)),
         values: HashMap::from([
             ("id".into(), Value::Int64(2)),
             ("a".into(), Value::Int64(5)),
@@ -1529,10 +1487,7 @@ fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composit
     };
     let rejected_parent_update = RowChange {
         table: "parent".into(),
-        natural_key: NaturalKey {
-            column: "id".into(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
         values: HashMap::from([
             ("id".into(), Value::Int64(1)),
             ("a".into(), Value::Int64(9)),
@@ -2164,7 +2119,7 @@ fn ddl_sync_round_trip_distinguishes_pk_covered_from_unique_covered_fk() {
 
 #[test]
 fn protocol_version_bumps_for_structured_constraint_wire() {
-    assert_eq!(contextdb_server::protocol::PROTOCOL_VERSION, 4);
+    assert_eq!(contextdb_server::protocol::PROTOCOL_VERSION, 5);
     let envelope = Envelope {
         version: 3,
         message_type: MessageType::PullRequest,
@@ -2176,11 +2131,11 @@ fn protocol_version_bumps_for_structured_constraint_wire() {
         err,
         SyncError::ProtocolVersionMismatch {
             received: 3,
-            supported: 4
+            supported: 5
         }
     ));
 
     let encoded = encode(MessageType::PullRequest, &()).unwrap();
     let decoded = decode(&encoded).unwrap();
-    assert_eq!(decoded.version, 4);
+    assert_eq!(decoded.version, 5);
 }

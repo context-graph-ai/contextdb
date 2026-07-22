@@ -381,6 +381,7 @@ async fn server_run_until_returns_after_accepted_push_apply_finishes() {
 
     let request = PushRequest {
         changeset: edge_db.changes_since(Lsn(0)).into(),
+        incarnation: contextdb_core::Incarnation::default(),
     };
     let request_bytes = encode(MessageType::PushRequest, &request).unwrap();
     let response_bytes = Arc::new(Mutex::new(None));

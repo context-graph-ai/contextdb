@@ -86,10 +86,7 @@ fn s04_apply_changes_source_is_sync_pull() {
     let changes = ChangeSet {
         rows: vec![RowChange {
             table: "t".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(row_id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(row_id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(row_id)),
                 ("name".to_string(), Value::Text("synced".to_string())),

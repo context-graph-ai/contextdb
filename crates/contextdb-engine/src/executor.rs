@@ -6,8 +6,8 @@ use crate::rank_formula::RankFormula;
 use crate::sync_types::ConflictPolicy;
 use contextdb_core::*;
 use contextdb_parser::ast::{
-    AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, RetainedSyncDirection,
-    SelectStatement, SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
+    AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
+    SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
 };
 use contextdb_planner::{
     DeletePlan, GraphStepPlan, InsertPlan, OnConflictPlan, PhysicalPlan, UpdatePlan, plan,
@@ -38,12 +38,12 @@ pub(crate) fn execute_plan(
                     reason: "acl_grants cannot itself declare ACL-protected columns".to_string(),
                 });
             }
-            // A retained table is refused before anything is created, so a
+            // The contradiction is refused before anything is created, so a
             // rejected declaration never leaves a half-made table behind.
-            refuse_two_way_retained_table(
-                p.retain
-                    .as_ref()
-                    .and_then(|retain| retain.declared_sync_direction),
+            refuse_promise_with_no_delivery(
+                &p.name,
+                p.retain.as_ref().is_some_and(|retain| retain.sync_safe),
+                p.sync_direction,
             )?;
             let expires_column = expires_column_name(&p.columns)?;
             // Auto-generate implicit indexes for PK / UNIQUE columns and
@@ -148,8 +148,10 @@ pub(crate) fn execute_plan(
                 // routing programmatically.
                 indexes: auto_indexes.clone(),
                 composite_foreign_keys,
-                retained_sync_policy: p.retain.as_ref().map(|_| RetainedSyncPolicy::PushOnly),
+                sync_direction: p.sync_direction,
                 retain_declared_unit: p.retain.as_ref().map(|retain| retain.declared_unit),
+                primary_key_columns: p.primary_key_columns.clone(),
+                conflict_policy: p.conflict_policy,
             };
             refuse_sync_safe_without_key(&p.name, &meta)?;
             let candidate_meta = meta.clone();
@@ -427,6 +429,20 @@ pub(crate) fn execute_plan(
                             p.table, name
                         )));
                     }
+                    // A table-level composite PRIMARY KEY (col, col, ...) does not
+                    // set the column-level primary_key flag above, so guard its key
+                    // columns explicitly: a composite key column is as un-droppable
+                    // as a single-column one. Dropping one would leave
+                    // primary_key_columns naming an absent column and strand rows
+                    // out of outgoing sync.
+                    if let Some(existing_meta) = db.table_meta(&p.table)
+                        && existing_meta.primary_key_columns.iter().any(|c| c == name)
+                    {
+                        return Err(Error::Other(format!(
+                            "cannot drop primary key column {}.{}",
+                            p.table, name
+                        )));
+                    }
                     validate_projected_foreign_keys_after_drop_column(db, &p.table, name)?;
                     // RESTRICT / CASCADE on indexed columns. Only user-declared
                     // indexes gate the RESTRICT path — auto-indexes dissolve
@@ -587,6 +603,18 @@ pub(crate) fn execute_plan(
                             from
                         )));
                     }
+                    // A table-level composite PRIMARY KEY (col, col, ...) does not
+                    // set the column-level primary_key flag above, so guard its key
+                    // columns explicitly: renaming one leaves primary_key_columns
+                    // naming an absent column.
+                    if let Some(existing_meta) = db.table_meta(&p.table)
+                        && existing_meta.primary_key_columns.iter().any(|c| c == from)
+                    {
+                        return Err(Error::Other(format!(
+                            "cannot rename primary key column '{}'",
+                            from
+                        )));
+                    }
                     validate_projected_foreign_keys_after_rename_column(db, &p.table, from, to)?;
                     if renamed_vector_column
                         && db
@@ -647,17 +675,20 @@ pub(crate) fn execute_plan(
                 AlterAction::SetRetain {
                     duration_seconds,
                     sync_safe,
-                    declared_sync_direction,
                     declared_unit,
                 } => {
                     // Refused before the write lock is taken, so a rejected
-                    // ALTER applies no part of itself — not the direction, not
-                    // the new window, not the SYNC SAFE flag.
-                    refuse_two_way_retained_table(*declared_sync_direction)?;
+                    // ALTER applies no part of itself — not the new window,
+                    // not the SYNC SAFE flag.
                     if *sync_safe {
                         let existing = db.table_meta(&p.table).ok_or_else(|| {
                             Error::Other(format!("table '{}' not found", p.table))
                         })?;
+                        refuse_promise_with_no_delivery(
+                            &p.table,
+                            true,
+                            Some(effective_sync_direction(&existing)),
+                        )?;
                         refuse_sync_safe_without_key_for(&p.table, &existing)?;
                     }
                     let mut meta = store.table_meta.write();
@@ -671,7 +702,6 @@ pub(crate) fn execute_plan(
                     }
                     table_meta.default_ttl_seconds = Some(*duration_seconds);
                     table_meta.sync_safe = *sync_safe;
-                    table_meta.retained_sync_policy = Some(RetainedSyncPolicy::PushOnly);
                     table_meta.retain_declared_unit = Some(*declared_unit);
                 }
                 AlterAction::DropRetain => {
@@ -681,15 +711,24 @@ pub(crate) fn execute_plan(
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     table_meta.default_ttl_seconds = None;
                     table_meta.sync_safe = false;
-                    table_meta.retained_sync_policy = None;
                     table_meta.retain_declared_unit = None;
                 }
-                AlterAction::SetSyncConflictPolicy(policy) => {
-                    let cp = parse_conflict_policy(policy)?;
-                    db.set_table_conflict_policy(&p.table, cp);
-                }
-                AlterAction::DropSyncConflictPolicy => {
-                    db.drop_table_conflict_policy(&p.table);
+                AlterAction::SetSyncDirection(direction) => {
+                    // Refused before the write lock, for the same reason: a
+                    // rejected ALTER applies no part of itself.
+                    let existing = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    refuse_promise_with_no_delivery(
+                        &p.table,
+                        existing.sync_safe,
+                        Some(*direction),
+                    )?;
+                    let mut meta = store.table_meta.write();
+                    let table_meta = meta
+                        .get_mut(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    table_meta.sync_direction = Some(*direction);
                 }
             }
             if let Some(table_meta) = db.table_meta(&p.table) {
@@ -699,8 +738,6 @@ pub(crate) fn execute_plan(
                     AlterAction::AddColumn(_)
                         | AlterAction::SetRetain { .. }
                         | AlterAction::DropRetain
-                        | AlterAction::SetSyncConflictPolicy(_)
-                        | AlterAction::DropSyncConflictPolicy
                 ) {
                     db.persist_table_rows(&p.table)?;
                 }
@@ -1774,21 +1811,25 @@ pub(crate) fn execute_plan(
                 cascade: None,
             })
         }
-        PhysicalPlan::SetSyncConflictPolicy(policy) => {
-            let cp = parse_conflict_policy(policy)?;
-            db.set_default_conflict_policy(cp);
-            Ok(QueryResult::empty())
-        }
         PhysicalPlan::ShowSyncConflictPolicy => {
+            // The per-table policy is DECLARED on each table's meta (via
+            // `CREATE ... SYNC CONFLICT ...`), which is what the sync apply
+            // resolves against. Read it from there so SHOW reports what the sync
+            // path actually uses; the runtime layer only carries the deployment
+            // default.
             let policies = db.conflict_policies();
             let default_str = conflict_policy_to_string(policies.default);
             let mut rows = vec![vec![Value::Text(default_str)]];
-            for (table, policy) in &policies.per_table {
-                rows.push(vec![Value::Text(format!(
-                    "{}={}",
-                    table,
-                    conflict_policy_to_string(*policy)
-                ))]);
+            let mut tables = db.table_names();
+            tables.sort();
+            for table in tables {
+                if let Some(policy) = db.table_meta(&table).and_then(|meta| meta.conflict_policy) {
+                    rows.push(vec![Value::Text(format!(
+                        "{}={}",
+                        table,
+                        conflict_policy_to_string(policy)
+                    ))]);
+                }
             }
             Ok(QueryResult {
                 columns: vec!["policy".to_string()],
@@ -7383,20 +7424,42 @@ fn validate_expires_column(col: &contextdb_parser::ast::ColumnDef) -> Result<()>
     Ok(())
 }
 
-/// A retained table travels one way only — edge to hub — because its rows are
-/// deleted locally once delivered, and a hub that sent them back would replant
-/// exactly what the edge aged out. The `TWO WAY` spelling is therefore refused
-/// wherever it is declared (CREATE and ALTER alike), before any part of the
-/// statement is applied.
-fn refuse_two_way_retained_table(declared: Option<RetainedSyncDirection>) -> Result<()> {
-    if declared == Some(RetainedSyncDirection::TwoWay) {
-        return Err(Error::SchemaInvalid {
-            reason: "a RETAIN table is delivered one way (edge -> hub), so TWO WAY is not \
-                     supported on a retained table: declare PUSH ONLY, or drop the retention"
-                .to_string(),
-        });
+/// The direction a table actually has: the one it declared, or the engine
+/// default when it declared none.
+pub(crate) fn effective_sync_direction(meta: &TableMeta) -> SyncDirection {
+    meta.sync_direction.unwrap_or(DEFAULT_SYNC_DIRECTION)
+}
+
+/// `SYNC SAFE` promises that a row is not expired locally until the
+/// destination confirms receipt. A direction that never sends the table
+/// anywhere makes that promise unkeepable — the rows would simply never
+/// expire. So the contradiction is refused at the moment it is written, at
+/// every door: CREATE, ALTER, and DDL arriving from another machine.
+///
+/// Plain retention with no delivery promise is untouched: a colocated
+/// installation that keeps one copy declares `RETAIN … SYNC OFF` and is
+/// entirely legal.
+pub(crate) fn refuse_promise_with_no_delivery(
+    table: &str,
+    sync_safe: bool,
+    direction: Option<SyncDirection>,
+) -> Result<()> {
+    if !sync_safe {
+        return Ok(());
     }
-    Ok(())
+    let direction = direction.unwrap_or(DEFAULT_SYNC_DIRECTION);
+    if direction.delivers() {
+        return Ok(());
+    }
+    Err(Error::SchemaInvalid {
+        reason: format!(
+            "table '{table}' declares SYNC SAFE, which promises that a row is not expired here \
+             until the destination confirms receipt — but {} never delivers this table \
+             anywhere, so the promise could never be kept and the rows would never expire. \
+             Declare SYNC PUSH ONLY or SYNC TWO WAY, or drop SYNC SAFE and keep plain RETAIN.",
+            direction.sql()
+        ),
+    })
 }
 
 /// `SYNC SAFE` promises delete-only-AFTER-DELIVERY, and delivery needs a key
@@ -7545,6 +7608,30 @@ pub(crate) fn validate_exact_constraint_keys_for_meta(table: &str, meta: &TableM
         }
     }
 
+    // A multi-column PRIMARY KEY is the sync identity and needs a covering
+    // index over exact-matchable columns; refuse a key column that cannot be
+    // exact-indexed (REAL / JSON / VECTOR) at declaration rather than failing
+    // the sync-apply probe later.
+    for column_name in &meta.primary_key_columns {
+        let Some(column) = meta
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == *column_name)
+        else {
+            return Err(Error::ColumnNotFound {
+                table: table.to_string(),
+                column: column_name.clone(),
+            });
+        };
+        if !exact_constraint_key_indexable(&column.column_type) {
+            return Err(Error::ColumnNotIndexable {
+                table: table.to_string(),
+                column: column_name.clone(),
+                column_type: column.column_type.clone(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -7607,6 +7694,35 @@ pub(crate) fn auto_indexes_for_table_meta(meta: &TableMeta) -> Vec<contextdb_cor
             columns,
             kind: contextdb_core::IndexKind::Auto,
         });
+    }
+    // The multi-column PRIMARY KEY is also the sync identity, and the exact
+    // sync-key probe refuses to run without a covering index over
+    // the whole key. Back it with an ordered auto-index over its columns, in
+    // declared order, so an arriving row is matched by its full identity.
+    if meta.primary_key_columns.len() >= 2
+        && meta.primary_key_columns.iter().all(|column_name| {
+            meta.columns
+                .iter()
+                .find(|column| column.name == *column_name)
+                .is_some_and(|column| exact_constraint_key_indexable(&column.column_type))
+        })
+    {
+        let columns = meta
+            .primary_key_columns
+            .iter()
+            .map(|column| (column.clone(), contextdb_core::SortDirection::Asc))
+            .collect::<Vec<_>>();
+        if !auto_index_with_columns_exists(&meta_with_indexes, &columns) {
+            let name = unique_auto_index_name(
+                &meta_with_indexes,
+                format!("__pk_{}", meta.primary_key_columns.join("_")),
+            );
+            meta_with_indexes.indexes.push(contextdb_core::IndexDecl {
+                name,
+                columns,
+                kind: contextdb_core::IndexKind::Auto,
+            });
+        }
     }
     append_single_column_fk_auto_indexes(&mut meta_with_indexes);
     append_composite_fk_auto_indexes(&mut meta_with_indexes);
@@ -8448,16 +8564,6 @@ fn map_vector_quantization(
         contextdb_parser::ast::VectorQuantization::F32 => contextdb_core::VectorQuantization::F32,
         contextdb_parser::ast::VectorQuantization::SQ8 => contextdb_core::VectorQuantization::SQ8,
         contextdb_parser::ast::VectorQuantization::SQ4 => contextdb_core::VectorQuantization::SQ4,
-    }
-}
-
-fn parse_conflict_policy(s: &str) -> Result<ConflictPolicy> {
-    match s {
-        "latest_wins" => Ok(ConflictPolicy::LatestWins),
-        "server_wins" => Ok(ConflictPolicy::ServerWins),
-        "edge_wins" => Ok(ConflictPolicy::EdgeWins),
-        "insert_if_not_exists" => Ok(ConflictPolicy::InsertIfNotExists),
-        _ => Err(Error::Other(format!("unknown conflict policy: {s}"))),
     }
 }
 

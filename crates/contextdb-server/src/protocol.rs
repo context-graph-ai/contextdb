@@ -1,6 +1,6 @@
 use crate::error::SyncError;
 use contextdb_core::{
-    CompositeForeignKey, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
+    CompositeForeignKey, Incarnation, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
 };
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, VectorChange,
@@ -8,7 +8,7 @@ use contextdb_engine::sync_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 5;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -49,6 +49,11 @@ pub enum MessageType {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PushRequest {
     pub changeset: WireChangeSet,
+    /// The pushing edge's per-life incarnation. The hub keys its per-edge
+    /// received-up-to record by `(node_id, incarnation)`, so a rebuilt edge
+    /// reusing its node id is recorded under a fresh key and never confirmed by
+    /// the prior life's stale watermark.
+    pub incarnation: Incarnation,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -233,10 +238,18 @@ pub enum WireDdlChange {
     },
 }
 
+/// The wire mirror of `NaturalKey`: the leading key column/value plus every
+/// further key column in declared order. `rest` is a required field — msgpack
+/// encodes this struct as a sequence, so a single-column identity encodes as a
+/// three-element sequence carrying an EMPTY `rest`, which is the one current
+/// shape. A multi-column `PRIMARY KEY (a, b, c)` carries `a` flat and `b, c` in
+/// `rest`, so the whole identity crosses the wire and an arriving row is matched
+/// on all its columns. The obsolete two-element encoding is rejected at decode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireNaturalKey {
     pub column: String,
     pub value: Value,
+    pub rest: Vec<(String, Value)>,
 }
 
 impl Default for WireNaturalKey {
@@ -244,6 +257,7 @@ impl Default for WireNaturalKey {
         Self {
             column: String::new(),
             value: Value::Null,
+            rest: Vec::new(),
         }
     }
 }
@@ -600,6 +614,7 @@ impl From<NaturalKey> for WireNaturalKey {
         Self {
             column: value.column,
             value: value.value,
+            rest: value.rest,
         }
     }
 }
@@ -609,6 +624,7 @@ impl From<WireNaturalKey> for NaturalKey {
         Self {
             column: value.column,
             value: value.value,
+            rest: value.rest,
         }
     }
 }
@@ -661,10 +677,15 @@ impl From<WireConflict> for Conflict {
     }
 }
 
-/// Request on the per-tenant sync-status subject. Tenant identity rides
-/// the subject; the body is intentionally empty and growth-tolerant.
+/// Request on the per-tenant sync-status subject. Tenant identity rides the
+/// subject and the asking node id rides the authenticated connection; the body
+/// carries the asking edge's per-life incarnation so the hub reads back the
+/// record for THIS life of the edge — a rebuilt edge (fresh incarnation) is
+/// answered `Lsn(0)`, never the prior life's stale-high watermark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncStatusRequest {}
+pub struct SyncStatusRequest {
+    pub incarnation: Incarnation,
+}
 
 /// Reply on the per-tenant sync-status subject. This struct is NEW wire
 /// surface — old peers never see it (old servers are not subscribed; old

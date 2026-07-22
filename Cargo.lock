@@ -893,6 +893,7 @@ dependencies = [
  "contextdb-engine",
  "contextdb-server",
  "contextdb-tx",
+ "rand 0.9.2",
  "regex",
  "rmp-serde",
  "roaring",

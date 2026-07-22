@@ -126,7 +126,16 @@ fn assert_status_exchange(
         MessageType::StatusRequest,
         &format!("{label} request"),
     );
-    assert_eq!(request, SyncStatusRequest {}, "{label} request payload");
+    // The status request now carries the asking edge's per-life incarnation (its
+    // value is minted per open, so it is not pinned here); the asking node id
+    // still rides the authenticated connection, never the payload. Re-encoding
+    // the decoded request must reproduce the exact wire bytes, proving the
+    // payload is a faithful SyncStatusRequest and nothing else.
+    let reencoded = rmp_serde::to_vec(&request).expect("re-encode status request payload");
+    assert_eq!(
+        reencoded, exchange.0.payload,
+        "{label} request payload must round-trip exactly"
+    );
     let response: SyncStatusResponse = payload(
         &exchange.1,
         MessageType::StatusResponse,
@@ -755,6 +764,7 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
         .filter(|batch| {
             let request = PushRequest {
                 changeset: (*batch).clone().into(),
+                incarnation: contextdb_core::Incarnation::default(),
             };
             encode(MessageType::PushRequest, &request)
                 .expect("encode expected push batch")

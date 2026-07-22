@@ -1,4 +1,4 @@
-// ======== T7b ========
+// ======== sync protocol type round-trips ========
 
 #[test]
 fn sync_protocol_types_roundtrip_under_rmp_serde() {
@@ -69,8 +69,8 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
     // ---- Envelope ----
     // Envelope has explicit fields `version: u8`, `message_type: MessageType`,
     // `payload: Vec<u8>`. Build via `default_pull_request()` which selects the
-    // `MessageType::PullRequest` flavor. T7b asserts round-trip identity; TU7
-    // below asserts the concrete protocol version.
+    // `MessageType::PullRequest` flavor. This test asserts round-trip identity;
+    // the test below asserts the concrete protocol version.
     use contextdb_server::protocol::MessageType;
     let original = Envelope::default_pull_request();
     let bytes = rmp_serde::to_vec(&original).expect("Envelope encode");
@@ -97,7 +97,7 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
     );
 }
 
-// ======== TU7 ========
+// ======== protocol version wire constant ========
 
 #[test]
 fn protocol_version_uses_current_constant_for_structured_constraint_wire() {
@@ -202,4 +202,64 @@ fn wire_changeset_rejects_mismatched_ddl_lsn_lengths_for_current_protocol() {
             "error should name ddl_lsn length mismatch, got {err}"
         );
     }
+}
+
+/// `WireNaturalKey.rest` and `NaturalKey.rest` are required fields:
+/// msgpack encodes a struct as a sequence, so the obsolete two-element identity
+/// (`column`, `value`) with no `rest` must be REJECTED at decode rather than
+/// silently read as an empty `rest`. Greenfield forbids a dual wire shape, and
+/// this mirrors `wire_changeset_requires_ddl_lsn_field_for_current_protocol`.
+/// Before this change the code carried `#[serde(default)]` on `rest`.
+#[test]
+fn natural_key_rest_field_is_required_and_rejects_the_obsolete_two_element_shape() {
+    use contextdb_core::Value;
+    use contextdb_engine::sync_types::NaturalKey;
+    use contextdb_server::protocol::WireNaturalKey;
+
+    // The obsolete shape a pre-`rest` sender put on the wire: two elements only.
+    #[derive(serde::Serialize)]
+    struct LegacyTwoElementKey {
+        column: String,
+        value: Value,
+    }
+    let legacy = LegacyTwoElementKey {
+        column: "id".to_string(),
+        value: Value::Int64(7),
+    };
+    let legacy_bytes = rmp_serde::to_vec(&legacy).expect("legacy two-element key encodes");
+
+    let wire_decoded = rmp_serde::from_slice::<WireNaturalKey>(&legacy_bytes);
+    assert!(
+        wire_decoded.is_err(),
+        "current WireNaturalKey must reject a two-element array that omits rest; got {wire_decoded:?}"
+    );
+    let engine_decoded = rmp_serde::from_slice::<NaturalKey>(&legacy_bytes);
+    assert!(
+        engine_decoded.is_err(),
+        "current NaturalKey must reject a two-element array that omits rest; got {engine_decoded:?}"
+    );
+
+    // The ONE current shape: a single-column key round-trips as a three-element
+    // sequence carrying an empty rest.
+    let single = WireNaturalKey {
+        column: "id".to_string(),
+        value: Value::Int64(7),
+        rest: Vec::new(),
+    };
+    let single_bytes = rmp_serde::to_vec(&single).expect("single-column key encodes");
+    let single_back =
+        rmp_serde::from_slice::<WireNaturalKey>(&single_bytes).expect("single-column key decodes");
+    assert_eq!(
+        single_back, single,
+        "single-column key round-trips unchanged"
+    );
+
+    let engine_single = NaturalKey::single("id".to_string(), Value::Int64(7));
+    let engine_bytes = rmp_serde::to_vec(&engine_single).expect("engine single key encodes");
+    let engine_back =
+        rmp_serde::from_slice::<NaturalKey>(&engine_bytes).expect("engine single key decodes");
+    assert_eq!(
+        engine_back, engine_single,
+        "engine single-column key round-trips unchanged"
+    );
 }

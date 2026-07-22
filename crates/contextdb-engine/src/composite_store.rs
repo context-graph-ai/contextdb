@@ -1,4 +1,4 @@
-use crate::sync_types::{DdlChange, NaturalKey, natural_key_column_for_meta};
+use crate::sync_types::{DdlChange, NaturalKey, natural_key_from_row_values};
 use contextdb_core::{
     EdgeType, Lsn, NodeId, Result, RowId, TableMeta, TableName, Value, VectorIndexRef, VersionedRow,
 };
@@ -309,36 +309,29 @@ impl CompositeStore {
         values: &HashMap<String, Value>,
         meta: Option<&TableMeta>,
     ) -> NaturalKey {
-        if let Some(column) = meta.and_then(natural_key_column_for_meta)
-            && let Some(value) = values.get(&column).cloned()
+        if let Some(meta) = meta
+            && let Some(natural_key) = natural_key_from_row_values(meta, values)
         {
-            return NaturalKey { column, value };
+            return natural_key;
         }
 
-        NaturalKey {
-            column: "id".to_string(),
-            value: Value::Int64(row_id.0 as i64),
-        }
+        NaturalKey::single("id".to_string(), Value::Int64(row_id.0 as i64))
     }
 
     fn natural_key_for_row_delete(&self, table: &str, row_id: RowId) -> NaturalKey {
         let meta = self.relational.table_meta.read().get(table).cloned();
-        let key_col = meta.as_ref().and_then(natural_key_column_for_meta);
         let row_values = self
             .relational
             .live_row_by_id(table, row_id)
             .map(|row| row.values);
 
-        if let (Some(column), Some(values)) = (key_col, row_values)
-            && let Some(value) = values.get(&column).cloned()
+        if let (Some(meta), Some(values)) = (meta.as_ref(), row_values.as_ref())
+            && let Some(natural_key) = natural_key_from_row_values(meta, values)
         {
-            return NaturalKey { column, value };
+            return natural_key;
         }
 
-        NaturalKey {
-            column: "id".to_string(),
-            value: Value::Int64(row_id.0 as i64),
-        }
+        NaturalKey::single("id".to_string(), Value::Int64(row_id.0 as i64))
     }
 
     pub(crate) fn apply_exact(&self, ws: &WriteSet) -> Result<()> {

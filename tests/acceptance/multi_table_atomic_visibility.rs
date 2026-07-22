@@ -208,10 +208,7 @@ fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
     let sync_changes = ChangeSet {
         rows: vec![RowChange {
             table: "entities".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: Value::Uuid(sync_target),
-            },
+            natural_key: NaturalKey::single("id".into(), Value::Uuid(sync_target)),
             values: sync_values,
             deleted: false,
             lsn: Lsn(10),
@@ -1298,10 +1295,7 @@ fn t21_14_mixed_sync_edge_error_rolls_back_rows() {
     let changes = ChangeSet {
         rows: vec![RowChange {
             table: "items".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(id)),
                 (
@@ -1354,10 +1348,7 @@ fn t21_16_mixed_sync_vector_error_rolls_back_rows() {
     let changes = ChangeSet {
         rows: vec![RowChange {
             table: "items".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(id)),
                 (

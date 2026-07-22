@@ -45,7 +45,7 @@ fn insert_row_t(db: &Database, a: i64, b: i64, tag: &str) -> Uuid {
 }
 
 // ============================================================================
-// EP01 — RED — equality on indexed column picks IndexScan. [I1, I15]
+// EP01 — equality on indexed column picks IndexScan.
 // ============================================================================
 #[test]
 fn ep01_equality_on_indexed_column_picks_index_scan() {
@@ -83,8 +83,8 @@ fn ep01_equality_on_indexed_column_picks_index_scan() {
 }
 
 // ============================================================================
-// EP02 — RED — BETWEEN on indexed column picks IndexScan; predicates_pushed
-// contains "a". [I1, I15]
+// EP02 — BETWEEN on indexed column picks IndexScan; predicates_pushed
+// contains "a".
 // ============================================================================
 #[test]
 fn ep02_between_on_indexed_column_picks_index_scan() {
@@ -119,7 +119,7 @@ fn ep02_between_on_indexed_column_picks_index_scan() {
 }
 
 // ============================================================================
-// EP03 — RED — IN (const_list) on indexed column returns the exact rows. [I2]
+// EP03 — IN (const_list) on indexed column returns the exact rows.
 // ============================================================================
 #[test]
 fn ep03_in_const_list_on_indexed_column_returns_exact_rows() {
@@ -178,8 +178,8 @@ fn ep03b_in_real_literal_on_integer_index_matches_evaluator() {
 }
 
 // ============================================================================
-// EP04 — RED — `!=` on indexed column still picks IndexScan; residual applied.
-// [I1, I2]
+// EP04 — `!=` on indexed column still picks IndexScan; residual applied.
+//
 // ============================================================================
 #[test]
 fn ep04_not_equal_on_indexed_column_picks_index_scan() {
@@ -196,8 +196,8 @@ fn ep04_not_equal_on_indexed_column_picks_index_scan() {
 }
 
 // ============================================================================
-// EP05 — RED — function call disqualifies IndexScan; falls back to Scan.
-// `indexes_considered` names candidate with a structured reason. [I1, I15]
+// EP05 — function call disqualifies IndexScan; falls back to Scan.
+// `indexes_considered` names candidate with a structured reason.
 // ============================================================================
 #[test]
 fn ep05_function_call_in_predicate_disqualifies_index() {
@@ -257,7 +257,7 @@ fn ep05_function_call_in_predicate_disqualifies_index() {
 }
 
 // ============================================================================
-// EP06 — RED — arithmetic in predicate disqualifies. [I1]
+// EP06 — arithmetic in predicate disqualifies.
 // ============================================================================
 #[test]
 fn ep06_arithmetic_in_predicate_disqualifies_index() {
@@ -279,7 +279,7 @@ fn ep06_arithmetic_in_predicate_disqualifies_index() {
 }
 
 // ============================================================================
-// EP07 — RED — column-to-column ref RHS disqualifies. [I1]
+// EP07 — column-to-column ref RHS disqualifies.
 // ============================================================================
 #[test]
 fn ep07_column_ref_rhs_disqualifies_index() {
@@ -302,7 +302,7 @@ fn ep07_column_ref_rhs_disqualifies_index() {
 }
 
 // ============================================================================
-// EP08 — RED — subquery RHS disqualifies the OUTER IndexScan. [I1]
+// EP08 — subquery RHS disqualifies the OUTER IndexScan.
 // ============================================================================
 #[test]
 fn ep08_subquery_rhs_disqualifies_outer_index() {
@@ -325,7 +325,7 @@ fn ep08_subquery_rhs_disqualifies_outer_index() {
 }
 
 // ============================================================================
-// EP09 — RED — parameterized equality with non-NULL bind picks IndexScan.
+// EP09 — parameterized equality with non-NULL bind picks IndexScan.
 // ============================================================================
 #[test]
 fn ep09_parameterized_equality_picks_index_scan() {
@@ -343,7 +343,7 @@ fn ep09_parameterized_equality_picks_index_scan() {
 }
 
 // ============================================================================
-// EP10 — RED — parameterized equality with NULL bind returns zero rows.
+// EP10 — parameterized equality with NULL bind returns zero rows.
 // Pair with EP09. I15.
 // ============================================================================
 #[test]
@@ -370,7 +370,7 @@ fn ep10_parameterized_equality_with_null_bind_returns_no_rows() {
 }
 
 // ============================================================================
-// EP11 — RED — IS NULL on indexed column uses IndexScan; returns exactly the
+// EP11 — IS NULL on indexed column uses IndexScan; returns exactly the
 // NULL partition rows.
 // ============================================================================
 #[test]
@@ -420,7 +420,7 @@ fn ep11_is_null_on_indexed_column_uses_index() {
 }
 
 // ============================================================================
-// EP12 — RED — IS NOT NULL returns non-NULL partition. Pair with EP11.
+// EP12 — IS NOT NULL returns non-NULL partition. Pair with EP11.
 // ============================================================================
 #[test]
 fn ep12_is_not_null_on_indexed_column_uses_index() {
@@ -457,7 +457,7 @@ fn ep12_is_not_null_on_indexed_column_uses_index() {
 }
 
 // ============================================================================
-// EP13 — RED — tie-break between two equality-capable indexes on same column
+// EP13 — tie-break between two equality-capable indexes on same column
 // picks creation-order-earlier.
 // ============================================================================
 #[test]
@@ -487,7 +487,7 @@ fn ep13_tie_break_by_creation_order() {
 }
 
 // ============================================================================
-// EP14 — RED — picker prefers equality > range when both available.
+// EP14 — picker prefers equality > range when both available.
 // ============================================================================
 #[test]
 fn ep14_picker_prefers_equality_over_range() {
@@ -532,7 +532,7 @@ fn ep14_picker_prefers_equality_over_range() {
 }
 
 // ============================================================================
-// EP15 — RED — composite index (a, b) with `a = X AND b = Y` pushes BOTH columns.
+// EP15 — composite index (a, b) with `a = X AND b = Y` pushes BOTH columns.
 // `predicates_pushed == ["a","b"]`; examined == exact full-key match count.
 // ============================================================================
 #[test]
@@ -585,7 +585,7 @@ fn ep15_composite_index_pushes_full_matched_prefix() {
 }
 
 // ============================================================================
-// EP16 — RED — LIKE residual only; planner emits Scan; considered
+// EP16 — LIKE residual only; planner emits Scan; considered
 // rejected with reason.
 // ============================================================================
 #[test]
@@ -617,8 +617,8 @@ fn ep16_like_is_residual_only() {
 }
 
 // ============================================================================
-// EP17 — RED — IndexScan plus residual LIKE returns rows matching BOTH.
-// [I2, I10]
+// EP17 — IndexScan plus residual LIKE returns rows matching BOTH.
+//
 // ============================================================================
 #[test]
 fn ep17_index_scan_with_residual_like_returns_intersection() {
@@ -654,8 +654,8 @@ fn ep17_index_scan_with_residual_like_returns_intersection() {
 }
 
 // ============================================================================
-// MV01 — RED — snapshot isolation: reader opened before INSERT sees zero.
-// [I5]
+// MV01 — snapshot isolation: reader opened before INSERT sees zero.
+//
 // ============================================================================
 #[test]
 fn mv01_reader_before_insert_sees_zero_rows_via_index_scan() {
@@ -671,8 +671,8 @@ fn mv01_reader_before_insert_sees_zero_rows_via_index_scan() {
 }
 
 // ============================================================================
-// MV02 — RED — soft-delete tombstone: pre-DELETE reader still sees row.
-// [I5, I7]
+// MV02 — soft-delete tombstone: pre-DELETE reader still sees row.
+//
 // ============================================================================
 #[test]
 fn mv02_pre_delete_reader_still_sees_row() {
@@ -703,8 +703,8 @@ fn mv02_pre_delete_reader_still_sees_row() {
 }
 
 // ============================================================================
-// MV03 — RED — UPDATE changes indexed column; pre-UPDATE snapshot sees old key,
-// post-UPDATE sees new. Each exactly once. [I5]
+// MV03 — UPDATE changes indexed column; pre-UPDATE snapshot sees old key,
+// post-UPDATE sees new. Each exactly once.
 // ============================================================================
 #[test]
 fn mv03_update_changes_indexed_column_visibility() {
@@ -733,7 +733,7 @@ fn mv03_update_changes_indexed_column_visibility() {
 }
 
 // ============================================================================
-// MV04 — RED — WriteSet rollback leaves index unchanged. [I6]
+// MV04 — WriteSet rollback leaves index unchanged.
 // ============================================================================
 #[test]
 fn mv04_rollback_leaves_index_unchanged() {
@@ -752,7 +752,7 @@ fn mv04_rollback_leaves_index_unchanged() {
 }
 
 // ============================================================================
-// MV05 — RED — sync-apply batch holds indexes.write() exactly once. [I14]
+// MV05 — sync-apply batch holds indexes.write() exactly once.
 // Counter-instrumented via test-only probe on Database.
 // ============================================================================
 #[test]
@@ -770,10 +770,7 @@ fn mv05_sync_apply_batch_single_write_lock() {
         vals.insert("tag".to_string(), Value::Text(format!("r{i}")));
         rows.push(RowChange {
             table: "t".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: vals["id"].clone(),
-            },
+            natural_key: NaturalKey::single("id".to_string(), vals["id"].clone()),
             values: vals,
             deleted: false,
             lsn: Lsn(0),
@@ -795,8 +792,8 @@ fn mv05_sync_apply_batch_single_write_lock() {
 }
 
 // ============================================================================
-// MV06 — RED — cross-open: IndexScan selected after reopen; rows byte-identical.
-// [I4]
+// MV06 — cross-open: IndexScan selected after reopen; rows byte-identical.
+//
 // ============================================================================
 #[test]
 fn mv06_cross_open_index_scan_preserved() {
@@ -823,9 +820,8 @@ fn mv06_cross_open_index_scan_preserved() {
 }
 
 // ============================================================================
-// MV07 — RED — concurrent writer + reader: reader at snapshot S sees no
-// post-commit row via IndexScan while writer is committing. [I5 under
-// contention]
+// MV07 — concurrent writer + reader: reader at snapshot S sees no
+// post-commit row via IndexScan while writer is committing.
 // ============================================================================
 #[test]
 fn indexed_scan_concurrent_writer_reader_no_ghost_rows() {
@@ -892,7 +888,7 @@ fn indexed_scan_concurrent_writer_reader_no_ghost_rows() {
 }
 
 // ============================================================================
-// DDL01 — RED — CREATE INDEX writes IndexDecl into TableMeta.indexes.
+// DDL01 — CREATE INDEX writes IndexDecl into TableMeta.indexes.
 // ============================================================================
 #[test]
 fn ddl01_create_index_records_index_decl() {
@@ -918,7 +914,7 @@ fn ddl01_create_index_records_index_decl() {
 }
 
 // ============================================================================
-// DDL02 — RED — CREATE INDEX with explicit DESC preserves direction.
+// DDL02 — CREATE INDEX with explicit DESC preserves direction.
 // ============================================================================
 #[test]
 fn ddl02_create_index_desc_preserves_direction() {
@@ -938,7 +934,7 @@ fn ddl02_create_index_desc_preserves_direction() {
 }
 
 // ============================================================================
-// DDL02neg — RED — bogus direction token returns ParseError naming the token.
+// DDL02neg — bogus direction token returns ParseError naming the token.
 // Negative with positive control DDL02.
 // ============================================================================
 #[test]
@@ -956,7 +952,7 @@ fn ddl02neg_create_index_bogus_direction_rejected() {
 }
 
 // ============================================================================
-// DDL03 — RED — composite index with mixed directions preserves per-column.
+// DDL03 — composite index with mixed directions preserves per-column.
 // ============================================================================
 #[test]
 fn ddl03_create_index_composite_mixed_directions() {
@@ -985,7 +981,7 @@ fn ddl03_create_index_composite_mixed_directions() {
 }
 
 // ============================================================================
-// DDL04 — RED — CREATE INDEX on nonexistent column → ColumnNotFound.
+// DDL04 — CREATE INDEX on nonexistent column → ColumnNotFound.
 // ============================================================================
 #[test]
 fn ddl04_create_index_on_missing_column_returns_column_not_found() {
@@ -1005,7 +1001,7 @@ fn ddl04_create_index_on_missing_column_returns_column_not_found() {
 }
 
 // ============================================================================
-// DDL05 — RED — CREATE INDEX on Json column → ColumnNotIndexable. [I16]
+// DDL05 — CREATE INDEX on Json column → ColumnNotIndexable.
 // ============================================================================
 #[test]
 fn ddl05_create_index_on_json_returns_column_not_indexable() {
@@ -1033,7 +1029,7 @@ fn ddl05_create_index_on_json_returns_column_not_indexable() {
 }
 
 // ============================================================================
-// DDL06 — RED — CREATE INDEX on Vector column → ColumnNotIndexable. [I16]
+// DDL06 — CREATE INDEX on Vector column → ColumnNotIndexable.
 // ============================================================================
 #[test]
 fn ddl06_create_index_on_vector_returns_column_not_indexable() {
@@ -1061,7 +1057,7 @@ fn ddl06_create_index_on_vector_returns_column_not_indexable() {
 }
 
 // ============================================================================
-// DDL07 — RED — duplicate index name → DuplicateIndex.
+// DDL07 — duplicate index name → DuplicateIndex.
 // ============================================================================
 #[test]
 fn ddl07_duplicate_index_name_returns_duplicate_index() {
@@ -1082,7 +1078,7 @@ fn ddl07_duplicate_index_name_returns_duplicate_index() {
 }
 
 // ============================================================================
-// DDL07a — RED — CREATE INDEX on nonexistent table → TableNotFound.
+// DDL07a — CREATE INDEX on nonexistent table → TableNotFound.
 // Pins error-precedence position 1: TableNotFound beats every other error.
 // ============================================================================
 #[test]
@@ -1101,7 +1097,7 @@ fn ddl07a_create_index_on_nonexistent_table_returns_table_not_found() {
 }
 
 // ============================================================================
-// DDL07b — RED — CREATE INDEX with simultaneous ColumnNotFound + DuplicateIndex:
+// DDL07b — CREATE INDEX with simultaneous ColumnNotFound + DuplicateIndex:
 // ColumnNotFound wins. Pins error-precedence position 2 > 4.
 // ============================================================================
 #[test]
@@ -1126,7 +1122,7 @@ fn ddl07b_create_index_column_not_found_beats_duplicate_index() {
 }
 
 // ============================================================================
-// DDL07c — RED — CREATE INDEX with simultaneous ColumnNotIndexable + DuplicateIndex:
+// DDL07c — CREATE INDEX with simultaneous ColumnNotIndexable + DuplicateIndex:
 // ColumnNotIndexable wins. Pins error-precedence position 3 > 4.
 // ============================================================================
 #[test]
@@ -1152,7 +1148,7 @@ fn ddl07c_create_index_column_not_indexable_beats_duplicate_index() {
 }
 
 // ============================================================================
-// DDL08 — RED — two indexes same column, different names: both allowed.
+// DDL08 — two indexes same column, different names: both allowed.
 // ============================================================================
 #[test]
 fn ddl08_two_indexes_same_column_different_names_succeed() {
@@ -1172,7 +1168,7 @@ fn ddl08_two_indexes_same_column_different_names_succeed() {
 }
 
 // ============================================================================
-// DDL09 — RED — same index name on two tables: both succeed (table-scoped).
+// DDL09 — same index name on two tables: both succeed (table-scoped).
 // ============================================================================
 #[test]
 fn ddl09_same_index_name_across_tables_succeeds() {
@@ -1216,7 +1212,7 @@ fn ddl09_same_index_name_across_tables_succeeds() {
 }
 
 // ============================================================================
-// DDL10 — RED — DROP INDEX removes; subsequent SELECT falls back to Scan.
+// DDL10 — DROP INDEX removes; subsequent SELECT falls back to Scan.
 // ============================================================================
 #[test]
 fn ddl10_drop_index_falls_back_to_scan() {
@@ -1230,7 +1226,7 @@ fn ddl10_drop_index_falls_back_to_scan() {
 }
 
 // ============================================================================
-// DDL11 — RED — DROP INDEX missing index → IndexNotFound.
+// DDL11 — DROP INDEX missing index → IndexNotFound.
 // ============================================================================
 #[test]
 fn ddl11_drop_index_missing_returns_index_not_found() {
@@ -1250,7 +1246,7 @@ fn ddl11_drop_index_missing_returns_index_not_found() {
 }
 
 // ============================================================================
-// DDL12 — RED — DROP INDEX IF EXISTS is idempotent.
+// DDL12 — DROP INDEX IF EXISTS is idempotent.
 // ============================================================================
 #[test]
 fn ddl12_drop_index_if_exists_is_idempotent() {
@@ -1283,7 +1279,7 @@ fn ddl12_drop_index_if_exists_is_idempotent() {
 }
 
 // ============================================================================
-// DDL13 — RED — DROP COLUMN RESTRICT with indexed column → ColumnInIndex. [I17]
+// DDL13 — DROP COLUMN RESTRICT with indexed column → ColumnInIndex.
 // ============================================================================
 #[test]
 fn ddl13_drop_column_restrict_on_indexed_rejects() {
@@ -1310,7 +1306,7 @@ fn ddl13_drop_column_restrict_on_indexed_rejects() {
 }
 
 // ============================================================================
-// DDL14 — RED — default modifier (omitted) is RESTRICT.
+// DDL14 — default modifier (omitted) is RESTRICT.
 // ============================================================================
 #[test]
 fn ddl14_drop_column_default_is_restrict() {
@@ -1334,8 +1330,8 @@ fn ddl14_drop_column_default_is_restrict() {
 }
 
 // ============================================================================
-// DDL15 — RED — CASCADE drops indexes referencing the column; cascade report
-// populated. [I11]
+// DDL15 — CASCADE drops indexes referencing the column; cascade report
+// populated.
 // ============================================================================
 #[test]
 fn ddl15_drop_column_cascade_drops_indexes_and_reports() {
@@ -1367,7 +1363,7 @@ fn ddl15_drop_column_cascade_drops_indexes_and_reports() {
 }
 
 // ============================================================================
-// DDL16 — RED — CASCADE with no dependent indexes: Some, empty vec.
+// DDL16 — CASCADE with no dependent indexes: Some, empty vec.
 // ============================================================================
 #[test]
 fn ddl16_drop_column_cascade_empty_vec_when_unindexed() {
@@ -1437,7 +1433,7 @@ fn ddl17_drop_column_unindexed_succeeds_both_modifiers() {
 }
 
 // ============================================================================
-// DDL18neg — RED — bad modifier token rejected by parser.
+// DDL18neg — bad modifier token rejected by parser.
 // ============================================================================
 #[test]
 fn ddl18neg_drop_column_bad_modifier_rejected() {
@@ -1457,7 +1453,7 @@ fn ddl18neg_drop_column_bad_modifier_rejected() {
 }
 
 // ============================================================================
-// DDL22 — RED — DROP TABLE cascades all indexes; re-creating the table shows
+// DDL22 — DROP TABLE cascades all indexes; re-creating the table shows
 // empty indexes; no stale storage leaks from the dropped table's indexes.
 // ============================================================================
 #[test]
@@ -1513,9 +1509,9 @@ fn drop_table_unregisters_all_indexes_and_releases_storage() {
 }
 
 // ============================================================================
-// PK01 — RED — INSERTs route PK constraint checks through the PK index. The
+// PK01 — INSERTs route PK constraint checks through the PK index. The
 // wall-clock budget lives in the Criterion bench.
-// [I13]
+//
 // ============================================================================
 #[test]
 fn pk01_pk_constraint_check_routes_through_index() {
@@ -1549,7 +1545,7 @@ fn pk01_pk_constraint_check_routes_through_index() {
 }
 
 // ============================================================================
-// PK02 — UNIQUE constraint check routes through index. [I13]
+// PK02 — UNIQUE constraint check routes through index.
 //
 // Plan intent is routing (where the probe runs), not error semantics. The
 // shipped v0.3.3 contract — commit 134cce1 — says a duplicate INSERT on a
@@ -1637,7 +1633,7 @@ fn pk03_composite_unique_routes_through_index() {
 }
 
 // ============================================================================
-// ORD05 — RED — deterministic ordering across identical SELECTs. [I3]
+// ORD05 — deterministic ordering across identical SELECTs.
 // ============================================================================
 #[test]
 fn ord05_two_identical_selects_return_identical_order() {
@@ -1665,7 +1661,7 @@ fn ord05_two_identical_selects_return_identical_order() {
 }
 
 // ============================================================================
-// ORD06 — RED — non-unique index tie-break by row_id ascending. [I18]
+// ORD06 — non-unique index tie-break by row_id ascending.
 // Two rows sharing the same key: they appear in row_id-ascending order.
 // ============================================================================
 #[test]
@@ -1688,7 +1684,7 @@ fn ord06_non_unique_index_tie_break_by_row_id_ascending() {
 }
 
 // ============================================================================
-// NUL01 — RED — ASC index: NULL sorts LAST. [I12]
+// NUL01 — ASC index: NULL sorts LAST.
 // ============================================================================
 #[test]
 fn nul01_asc_null_sorts_last() {
@@ -1725,7 +1721,7 @@ fn nul01_asc_null_sorts_last() {
 }
 
 // ============================================================================
-// NUL02 — RED — DESC index: NULL sorts FIRST. [I12]
+// NUL02 — DESC index: NULL sorts FIRST.
 // ============================================================================
 #[test]
 fn nul02_desc_null_sorts_first() {
@@ -1762,7 +1758,7 @@ fn nul02_desc_null_sorts_first() {
 }
 
 // ============================================================================
-// NAN01 — RED — Float64 ASC: NaN sorts greater than finite values. [I12]
+// NAN01 — Float64 ASC: NaN sorts greater than finite values.
 // `f64::total_cmp` semantics.
 // ============================================================================
 #[test]
@@ -1802,7 +1798,7 @@ fn nan01_asc_nan_sorts_greater_than_finite() {
 }
 
 // ============================================================================
-// NAN02 — RED — WHERE col = NaN returns zero rows. [I19]
+// NAN02 — WHERE col = NaN returns zero rows.
 // ============================================================================
 #[test]
 fn nan02_where_equal_nan_returns_zero_rows() {
@@ -1846,7 +1842,7 @@ fn nan02_where_equal_nan_returns_zero_rows() {
 }
 
 // ============================================================================
-// NAN03 — RED — parameterized NaN bind returns zero rows. [I19]
+// NAN03 — parameterized NaN bind returns zero rows.
 // ============================================================================
 #[test]
 fn nan03_param_nan_bind_returns_zero_rows() {
@@ -1893,7 +1889,7 @@ fn nan03_param_nan_bind_returns_zero_rows() {
 }
 
 // ============================================================================
-// NAN04 — RED — IS NULL does NOT match NaN. Pair with NAN02 for I19 coverage.
+// NAN04 — IS NULL does NOT match NaN. Pair with NAN02 for I19 coverage.
 // ============================================================================
 #[test]
 fn nan04_is_null_does_not_match_nan() {
@@ -1924,7 +1920,7 @@ fn nan04_is_null_does_not_match_nan() {
 }
 
 // ============================================================================
-// NAN05 — RED — Float64 DESC: NaN ordering mirrors f64::total_cmp reversed.
+// NAN05 — Float64 DESC: NaN ordering mirrors f64::total_cmp reversed.
 // Under total_cmp NaN > all finite, so DESC (reverse of total_cmp order)
 // places NaN FIRST, then 2.0, then 1.0. Pins I12's DESC half.
 // ============================================================================
@@ -1965,7 +1961,7 @@ fn indexed_scan_float64_nan_ordering_desc_mirrors_total_cmp() {
 }
 
 // ============================================================================
-// ORD01 — RED — prefix-compatible ORDER BY elides Sort.
+// ORD01 — prefix-compatible ORDER BY elides Sort.
 // ============================================================================
 #[test]
 fn ord01_prefix_compatible_order_by_elides_sort() {
@@ -1991,7 +1987,7 @@ fn ord01_prefix_compatible_order_by_elides_sort() {
 }
 
 // ============================================================================
-// ORD02 — RED — direction mismatch keeps Sort node.
+// ORD02 — direction mismatch keeps Sort node.
 // ============================================================================
 #[test]
 fn ord02_direction_mismatch_keeps_sort() {
@@ -2014,7 +2010,7 @@ fn ord02_direction_mismatch_keeps_sort() {
 }
 
 // ============================================================================
-// ORD03 — RED — ORDER BY prefix of composite index elides Sort.
+// ORD03 — ORDER BY prefix of composite index elides Sort.
 // ============================================================================
 #[test]
 fn ord03_prefix_of_composite_elides_sort() {
@@ -2053,7 +2049,7 @@ fn ord03_prefix_of_composite_elides_sort() {
 }
 
 // ============================================================================
-// ORD04 — RED — ORDER BY non-prefix keeps Sort.
+// ORD04 — ORDER BY non-prefix keeps Sort.
 // ============================================================================
 #[test]
 fn ord04_non_prefix_keeps_sort() {
@@ -2092,7 +2088,7 @@ fn ord04_non_prefix_keeps_sort() {
 }
 
 // ============================================================================
-// ORD09 — RED — composite mixed-direction elision requires exact per-column
+// ORD09 — composite mixed-direction elision requires exact per-column
 // direction match. Index `(a ASC, b DESC)`:
 //   - ORDER BY a ASC, b DESC  → sort_elided == true
 //   - ORDER BY a ASC, b ASC   → sort_elided == false + Sort node retained
@@ -2153,7 +2149,7 @@ fn order_by_composite_mixed_direction_elision_requires_exact_match() {
 }
 
 // ============================================================================
-// PR01 — RED — CREATE INDEX survives reopen; IndexScan still selected. [I4]
+// PR01 — CREATE INDEX survives reopen; IndexScan still selected.
 // ============================================================================
 #[test]
 fn pr01_index_survives_reopen() {
@@ -2191,7 +2187,7 @@ fn pr01_index_survives_reopen() {
 
 // ============================================================================
 // PR02 — REGRESSION GUARD — legacy TableMeta without `indexes` field decodes
-// cleanly via `#[serde(default)]` on the new field. Once the indexed-scan stubs land,
+// cleanly via `#[serde(default)]` on the new field. With indexed-scan support in place,
 // this test passes; it guards against a future removal of the serde default.
 // ============================================================================
 #[test]
@@ -2259,7 +2255,7 @@ fn pr02_legacy_table_meta_bincode_fails_loudly() {
 }
 
 // ============================================================================
-// PR03 — RED — CREATE INDEX / DROP INDEX emit DdlChange entries in ddl_log.
+// PR03 — CREATE INDEX / DROP INDEX emit DdlChange entries in ddl_log.
 // ============================================================================
 #[test]
 fn pr03_index_ddl_emits_ddl_log_entries() {
@@ -2345,7 +2341,7 @@ fn insert_statement_cache_is_cleared_by_schema_ddl() {
 }
 
 // ============================================================================
-// PR04 — RED — file-backed rows + index survive close and reopen. The 100K
+// PR04 — file-backed rows + index survive close and reopen. The 100K
 // reopen wall-clock budget lives in the Criterion bench.
 // ============================================================================
 #[test]
@@ -2444,7 +2440,7 @@ fn in_memory_pk_inserts_mid_load_durability() {
 }
 
 // ============================================================================
-// SY01 — RED — DdlChange::CreateIndex replicates across sync. [I8]
+// SY01 — DdlChange::CreateIndex replicates across sync.
 // ============================================================================
 #[test]
 fn sy01_create_index_replicates_through_sync() {
@@ -2489,7 +2485,7 @@ fn sy01_create_index_replicates_through_sync() {
 }
 
 // ============================================================================
-// SY02 — RED — DdlChange::DropIndex replicates. [I8]
+// SY02 — DdlChange::DropIndex replicates.
 // ============================================================================
 #[test]
 fn sy02_drop_index_replicates_through_sync() {
@@ -2540,8 +2536,8 @@ fn sy02_drop_index_replicates_through_sync() {
 }
 
 // ============================================================================
-// SY03 — RED — sync-apply batch of 100 row inserts acquires indexes.write()
-// exactly once. [I14] Named distinctly from MV05 to differentiate pathway.
+// SY03 — sync-apply batch of 100 row inserts acquires indexes.write()
+// exactly once. Named distinctly from MV05 to differentiate pathway.
 // ============================================================================
 #[test]
 fn sy03_sync_apply_batch_single_index_write_lock() {
@@ -2557,10 +2553,7 @@ fn sy03_sync_apply_batch_single_index_write_lock() {
         vals.insert("tag".into(), Value::Text("x".into()));
         rows.push(RowChange {
             table: "t".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: vals["id"].clone(),
-            },
+            natural_key: NaturalKey::single("id".into(), vals["id"].clone()),
             values: vals,
             deleted: false,
             lsn: Lsn(0),
@@ -2578,8 +2571,8 @@ fn sy03_sync_apply_batch_single_index_write_lock() {
 }
 
 // ============================================================================
-// TR01 — RED — QueryResult.trace.physical_plan is always populated with a
-// non-empty string. [I15]
+// TR01 — QueryResult.trace.physical_plan is always populated with a
+// non-empty string.
 // ============================================================================
 #[test]
 fn tr01_physical_plan_always_populated() {
@@ -2602,7 +2595,7 @@ fn tr01_physical_plan_always_populated() {
 }
 
 // ============================================================================
-// TR02 — RED — predicates_pushed for equality is exactly [column]. [I15]
+// TR02 — predicates_pushed for equality is exactly [column].
 // ============================================================================
 #[test]
 fn tr02_predicates_pushed_is_exact_singleton() {
@@ -2620,7 +2613,7 @@ fn tr02_predicates_pushed_is_exact_singleton() {
 }
 
 // ============================================================================
-// TR03 — RED — indexes_considered populated with rejected candidates. [I15]
+// TR03 — indexes_considered populated with rejected candidates.
 // ============================================================================
 #[test]
 fn tr03_indexes_considered_populated_with_reasons() {
@@ -2648,7 +2641,7 @@ fn tr03_indexes_considered_populated_with_reasons() {
 }
 
 // ============================================================================
-// TR04 — RED — sort_elided populated in isolation.
+// TR04 — sort_elided populated in isolation.
 // ============================================================================
 #[test]
 fn tr04_sort_elided_populated_independently() {
@@ -2668,9 +2661,9 @@ fn tr04_sort_elided_populated_independently() {
 }
 
 // ============================================================================
-// SCL01 — RED — 10K-row scale gate: IndexScan examines <<100 rows on a filter
+// SCL01 — 10K-row scale gate: IndexScan examines <<100 rows on a filter
 // returning ~10 matches. A full-scan impl that lies about the trace examines
-// 10K and fails this test. [I15 + non-fakeable performance gate]
+// 10K and fails this test. This is a non-fakeable performance gate.
 // ============================================================================
 #[test]
 fn indexed_scan_select_at_10k_rows_sublinear_rows_examined() {
@@ -2745,7 +2738,7 @@ fn scan_select_at_10k_rows_examines_full_table() {
 }
 
 // ============================================================================
-// EX01 — RED — programmatic trace carries "IndexScan" on an indexed query.
+// EX01 — programmatic trace carries "IndexScan" on an indexed query.
 // (`.explain` is a REPL command, not a SQL prefix; machine-readable access
 // is QueryResult.trace per the behavior contract.)
 // ============================================================================
@@ -2760,7 +2753,7 @@ fn ex01_programmatic_trace_indexed_query() {
 }
 
 // ============================================================================
-// EX02 — RED — programmatic trace carries "Scan" on an unindexed query.
+// EX02 — programmatic trace carries "Scan" on an unindexed query.
 // Pair with EX01.
 // ============================================================================
 #[test]
@@ -2774,7 +2767,7 @@ fn ex02_programmatic_trace_unindexed_query() {
 }
 
 // ============================================================================
-// EX03 — RED — CLI `.explain <sql>` rendering helper produces human-readable
+// EX03 — CLI `.explain <sql>` rendering helper produces human-readable
 // text containing "IndexScan" and the index name. The CLI binary (binary-only
 // crate `contextdb-cli`) delegates its `.explain` REPL command to a public
 // renderer in `contextdb_engine::cli_render::render_explain`, which tests can
@@ -2794,8 +2787,8 @@ fn ex03_cli_explain_renders_index_scan_text() {
 }
 
 // ============================================================================
-// SC01 — RED — render_table_meta emits CREATE INDEX lines with directions.
-// [I9]
+// SC01 — render_table_meta emits CREATE INDEX lines with directions.
+//
 // ============================================================================
 #[test]
 fn sc01_render_table_meta_emits_create_index_lines() {
@@ -2817,8 +2810,8 @@ fn sc01_render_table_meta_emits_create_index_lines() {
 }
 
 // ============================================================================
-// SC02 — RED — round-trip render → parse → apply yields identical indexes.
-// [I9]
+// SC02 — round-trip render → parse → apply yields identical indexes.
+//
 // ============================================================================
 #[test]
 fn sc02_round_trip_rendered_schema_matches() {
@@ -2843,7 +2836,7 @@ fn sc02_round_trip_rendered_schema_matches() {
 }
 
 // ============================================================================
-// BA01 — RED — ChangeSet with 50 rows + 1 CreateIndex: index applied BEFORE
+// BA01 — ChangeSet with 50 rows + 1 CreateIndex: index applied BEFORE
 // rows so rows populate the new structure. Post-apply IndexScan returns all 50.
 // ============================================================================
 #[test]
@@ -2864,10 +2857,7 @@ fn ba01_batch_apply_create_index_before_rows() {
         vals.insert("tag".into(), Value::Text(format!("r{i}")));
         rows.push(RowChange {
             table: "t".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: vals["id"].clone(),
-            },
+            natural_key: NaturalKey::single("id".into(), vals["id"].clone()),
             values: vals,
             deleted: false,
             lsn: Lsn(0),
@@ -2955,7 +2945,7 @@ fn engine_side_entity_list_filter_under_budget() {
 }
 
 // ============================================================================
-// CO01 — RED — IMMUTABLE column + index: INSERT + IndexScan works identically.
+// CO01 — IMMUTABLE column + index: INSERT + IndexScan works identically.
 // ============================================================================
 #[test]
 fn co01_index_on_immutable_column_succeeds_and_filters() {
@@ -3003,7 +2993,7 @@ fn co01_index_on_immutable_column_succeeds_and_filters() {
 }
 
 // ============================================================================
-// CO02 — RED — STATE MACHINE status column + index: query by status uses
+// CO02 — STATE MACHINE status column + index: query by status uses
 // IndexScan; state-machine rules still enforced on UPDATE.
 // ============================================================================
 #[test]
@@ -3056,7 +3046,7 @@ fn co02_index_on_state_machine_column_succeeds_and_filters() {
 }
 
 // ============================================================================
-// CO03 — RED — DAG table + index: INSERT + IndexScan works; DAG constraint
+// CO03 — DAG table + index: INSERT + IndexScan works; DAG constraint
 // still governs edges.
 // ============================================================================
 #[test]
@@ -3107,7 +3097,7 @@ fn co03_index_on_dag_table_succeeds() {
 }
 
 // ============================================================================
-// CO04 — RED — RETAIN table + index: IndexScan works during the retain window.
+// CO04 — RETAIN table + index: IndexScan works during the retain window.
 // ============================================================================
 #[test]
 fn co04_index_on_retain_table_succeeds() {
@@ -3157,7 +3147,7 @@ fn co04_index_on_retain_table_succeeds() {
 }
 
 // ============================================================================
-// CO05 — RED — REFERENCES column + index: FK still enforced, IndexScan used.
+// CO05 — REFERENCES column + index: FK still enforced, IndexScan used.
 // ============================================================================
 #[test]
 fn co05_index_on_references_column_succeeds() {
@@ -3227,7 +3217,7 @@ fn co05_index_on_references_column_succeeds() {
 }
 
 // ============================================================================
-// CO06 — RED — EXPIRES column + index: IndexScan works on the expires column.
+// CO06 — EXPIRES column + index: IndexScan works on the expires column.
 //
 // NOTE: The original test body referenced `chrono::DateTime::from_timestamp`,
 // which is not a dependency of this workspace, and wrapped the result in
@@ -3281,7 +3271,7 @@ fn co06_index_on_expires_column_succeeds() {
 }
 
 // ============================================================================
-// DDL19 — RED — CREATE INDEX on UUID column succeeds and walks sorted.
+// DDL19 — CREATE INDEX on UUID column succeeds and walks sorted.
 // ============================================================================
 #[test]
 fn ddl19_create_index_on_uuid_column_succeeds_and_walks_sorted() {
@@ -3325,7 +3315,7 @@ fn ddl19_create_index_on_uuid_column_succeeds_and_walks_sorted() {
 }
 
 // ============================================================================
-// DDL20 — RED — CREATE INDEX on TXID column succeeds and walks sorted.
+// DDL20 — CREATE INDEX on TXID column succeeds and walks sorted.
 // ============================================================================
 #[test]
 fn ddl20_create_index_on_txid_column_succeeds_and_walks_sorted() {
@@ -3386,7 +3376,7 @@ fn ddl20_create_index_on_txid_column_succeeds_and_walks_sorted() {
 }
 
 // ============================================================================
-// DDL21 — RED — CREATE INDEX on BOOLEAN column succeeds; equality walks the
+// DDL21 — CREATE INDEX on BOOLEAN column succeeds; equality walks the
 // true / false partitions.
 // ============================================================================
 #[test]
@@ -3441,7 +3431,7 @@ fn ddl21_create_index_on_bool_column_succeeds_and_walks_sorted() {
 }
 
 // ============================================================================
-// ORD07 — RED — non-unique tie-break: row_id ordering survives reopen. [I18]
+// ORD07 — non-unique tie-break: row_id ordering survives reopen.
 // ============================================================================
 #[test]
 fn ord07_tie_break_row_id_ascending_cross_reopen_stable() {
@@ -3484,8 +3474,8 @@ fn ord07_tie_break_row_id_ascending_cross_reopen_stable() {
 }
 
 // ============================================================================
-// ORD08 — RED — non-unique tie-break: row_id ordering is byte-identical across
-// peers via sync. [I18 "byte-identical across peers"]
+// ORD08 — non-unique tie-break: row_id ordering is byte-identical across
+// peers via sync.
 // ============================================================================
 #[test]
 fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
@@ -3533,7 +3523,7 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
 }
 
 // ============================================================================
-// SY04 — RED — DESC direction replicates; peer's IndexScan returns rows in
+// SY04 — DESC direction replicates; peer's IndexScan returns rows in
 // DESC order. Augments I8.
 // ============================================================================
 #[test]
@@ -3606,7 +3596,7 @@ fn sy04_desc_direction_replicates_through_sync_ddl() {
 }
 
 // ============================================================================
-// SY05 — RED — mixed-direction composite replicates; peer IndexScan respects
+// SY05 — mixed-direction composite replicates; peer IndexScan respects
 // both directions. Augments I8.
 // ============================================================================
 #[test]
@@ -3756,7 +3746,7 @@ fn extract_fenced_sql(body: &str) -> Vec<String> {
 }
 
 // ============================================================================
-// DO01 — RED — docs/query-language.md has a section titled "Indexes" that
+// DO01 — docs/query-language.md has a section titled "Indexes" that
 // mentions CREATE INDEX, per-column ASC/DESC, and the ColumnNotIndexable error.
 // ============================================================================
 #[test]
@@ -3779,7 +3769,7 @@ fn do01_query_language_md_indexes_section_present() {
 }
 
 // ============================================================================
-// DO02 — RED — docs/cli.md contains "Trace vs Explain" subsection or
+// DO02 — docs/cli.md contains "Trace vs Explain" subsection or
 // equivalent section distinguishing the programmatic trace from CLI explain.
 // ============================================================================
 #[test]
@@ -3805,7 +3795,7 @@ fn do02_cli_md_trace_vs_explain_subsection() {
 }
 
 // ============================================================================
-// DO03 — RED — docs/getting-started.md contains a CREATE INDEX + filtered
+// DO03 — docs/getting-started.md contains a CREATE INDEX + filtered
 // SELECT example; extracted SQL runs against a fresh DB and produces
 // trace.physical_plan == "IndexScan" on the filtered SELECT.
 // ============================================================================
@@ -3840,7 +3830,7 @@ fn do03_getting_started_md_filtered_select_with_explain() {
 }
 
 // ============================================================================
-// DO04 — RED — docs/usage-scenarios.md contains a composite CREATE INDEX on a
+// DO04 — docs/usage-scenarios.md contains a composite CREATE INDEX on a
 // decisions- or entities-style table.
 // ============================================================================
 #[allow(clippy::collapsible_if)]

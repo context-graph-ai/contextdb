@@ -1715,10 +1715,7 @@ fn t5_24_failed_sync_event_bus_ddl_rolls_back_rows_in_same_changeset() {
         ddl_lsn: vec![Lsn(42), Lsn(42)],
         rows: vec![RowChange {
             table: "existing".into(),
-            natural_key: NaturalKey {
-                column: "id".into(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".into(), Value::Uuid(id)),
             values: HashMap::from([("id".into(), Value::Uuid(id))]),
             deleted: false,
             lsn: Lsn(42),

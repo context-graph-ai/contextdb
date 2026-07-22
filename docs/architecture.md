@@ -289,7 +289,9 @@ instead of parsing memory operation tags.
 
 ## Sync
 
-The wire protocol is currently `PROTOCOL_VERSION = 4` (ALPN `contextdb.sync.v4`).
+The wire protocol is currently `PROTOCOL_VERSION = 5`. The ALPN identifier
+deliberately stays `contextdb.sync.v4` — it names the transport framing, which is
+unchanged; payload version skew is caught by the envelope check below, not the ALPN.
 The server reports the supported protocol version in `contextdb-server --version`
 and in its INFO logs; mismatched envelopes are rejected instead of being
 partially applied.

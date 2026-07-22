@@ -51,6 +51,18 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
         let ty = crate::database::sql_type_for_meta_column(col, &meta.propagation_rules);
         write!(&mut buf, "  {} {}", col.name, ty).unwrap();
     }
+    // A multi-column primary key is a table-level element, rendered after the
+    // columns so `.schema` gives back the `PRIMARY KEY (a, b, ...)` the operator
+    // wrote and re-parses to the same identity. A single-column primary key
+    // rides its column's type token above and never reaches here.
+    if !meta.primary_key_columns.is_empty() {
+        write!(
+            &mut buf,
+            ",\n  PRIMARY KEY ({})",
+            meta.primary_key_columns.join(", ")
+        )
+        .unwrap();
+    }
     buf.push_str("\n)");
     if meta.immutable {
         buf.push_str(" IMMUTABLE");

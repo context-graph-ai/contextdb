@@ -1070,7 +1070,7 @@ impl RelationalStore {
                 .ok_or_else(|| {
                     format!("column '{}' does not exist in table '{}'", column, table)
                 })?;
-            if m.columns[pos].primary_key {
+            if m.columns[pos].primary_key || m.primary_key_columns.iter().any(|c| c == column) {
                 return Err(format!("cannot drop primary key column '{}'", column));
             }
             m.columns.remove(pos);
@@ -1102,6 +1102,9 @@ impl RelationalStore {
                     "column '{}' already exists in table '{}'",
                     to, table
                 ));
+            }
+            if m.primary_key_columns.iter().any(|c| c == from) {
+                return Err(format!("cannot rename primary key column '{}'", from));
             }
             let col = m
                 .columns

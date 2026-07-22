@@ -60,15 +60,6 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
         Rule::update_stmt => Statement::Update(build_update(inner)?),
         Rule::select_stmt => Statement::Select(build_select(inner)?),
-        Rule::set_sync_conflict_policy => {
-            let policy = inner
-                .into_inner()
-                .find(|p| p.as_rule() == Rule::conflict_policy_value)
-                .ok_or_else(|| Error::ParseError("missing conflict policy value".to_string()))?
-                .as_str()
-                .to_lowercase();
-            Statement::SetSyncConflictPolicy(policy)
-        }
         Rule::show_sync_conflict_policy => Statement::ShowSyncConflictPolicy,
         Rule::show_vector_indexes_stmt => Statement::ShowVectorIndexes,
         Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
@@ -1087,6 +1078,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut if_not_exists = false;
     let mut columns = Vec::new();
     let mut unique_constraints = Vec::new();
+    let mut primary_key_columns: Vec<String> = Vec::new();
     let mut composite_foreign_keys = Vec::new();
     let mut immutable = false;
     let mut state_machine = None;
@@ -1094,6 +1086,8 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut propagation_rules = Vec::new();
     let mut has_propagation = false;
     let mut retain = None;
+    let mut sync_direction = None;
+    let mut conflict_policy = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1126,6 +1120,14 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                     }
                     Rule::unique_table_constraint => {
                         unique_constraints.push(build_unique_table_constraint(element)?);
+                    }
+                    Rule::primary_key_table_constraint => {
+                        if !primary_key_columns.is_empty() {
+                            return Err(Error::ParseError(
+                                "duplicate table-level PRIMARY KEY constraint".to_string(),
+                            ));
+                        }
+                        primary_key_columns = build_primary_key_table_constraint(element)?;
                     }
                     Rule::foreign_key_table_constraint => {
                         composite_foreign_keys.push(build_composite_foreign_key(element)?);
@@ -1176,6 +1178,22 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                             return Err(Error::ParseError("duplicate RETAIN clause".to_string()));
                         }
                         retain = Some(build_retain_option(opt)?);
+                    }
+                    Rule::sync_direction_option => {
+                        if sync_direction.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate sync direction clause".to_string(),
+                            ));
+                        }
+                        sync_direction = Some(build_sync_direction_option(opt)?);
+                    }
+                    Rule::sync_conflict_option => {
+                        if conflict_policy.is_some() {
+                            return Err(Error::ParseError(
+                                "duplicate SYNC CONFLICT clause".to_string(),
+                            ));
+                        }
+                        conflict_policy = Some(build_sync_conflict_option(opt)?);
                     }
                     other => return Err(unexpected_rule(other, "build_create_table.table_option")),
                 }
@@ -1263,10 +1281,31 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         }
     }
 
+    if !primary_key_columns.is_empty() {
+        // A table-level PRIMARY KEY and a column-level PRIMARY KEY name two
+        // different identities for one table; refuse the contradiction rather
+        // than silently pick one.
+        if columns.iter().any(|column| column.primary_key) {
+            return Err(Error::ParseError(
+                "a table-level PRIMARY KEY (...) cannot be combined with a column-level PRIMARY KEY"
+                    .to_string(),
+            ));
+        }
+        for column_name in &primary_key_columns {
+            if !columns.iter().any(|column| column.name == *column_name) {
+                return Err(Error::ParseError(format!(
+                    "PRIMARY KEY references unknown column '{}'",
+                    column_name
+                )));
+            }
+        }
+    }
+
     Ok(CreateTable {
         name: name.ok_or_else(|| Error::ParseError("missing table name".to_string()))?,
         columns,
         unique_constraints,
+        primary_key_columns,
         composite_foreign_keys: std::mem::take(&mut composite_foreign_keys),
         if_not_exists,
         immutable,
@@ -1274,6 +1313,8 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         dag_edge_types,
         propagation_rules,
         retain,
+        sync_direction,
+        conflict_policy,
     })
 }
 
@@ -1353,21 +1394,19 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             Ok(AlterAction::SetRetain {
                 duration_seconds: retain.duration_seconds,
                 sync_safe: retain.sync_safe,
-                declared_sync_direction: retain.declared_sync_direction,
                 declared_unit: retain.declared_unit,
             })
         }
         Rule::drop_retain_action => Ok(AlterAction::DropRetain),
-        Rule::set_table_conflict_policy => {
-            let policy = action
+        Rule::set_sync_direction_action => {
+            let clause = action
                 .into_inner()
-                .find(|p| p.as_rule() == Rule::conflict_policy_value)
-                .ok_or_else(|| Error::ParseError("missing conflict policy value".to_string()))?
-                .as_str()
-                .to_lowercase();
-            Ok(AlterAction::SetSyncConflictPolicy(policy))
+                .find(|part| part.as_rule() == Rule::sync_direction_option)
+                .ok_or_else(|| Error::ParseError("SET SYNC missing a direction".to_string()))?;
+            Ok(AlterAction::SetSyncDirection(build_sync_direction_option(
+                clause,
+            )?))
         }
-        Rule::drop_table_conflict_policy => Ok(AlterAction::DropSyncConflictPolicy),
         _ => Err(Error::ParseError(
             "unsupported ALTER TABLE action".to_string(),
         )),
@@ -1638,6 +1677,34 @@ fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(columns)
 }
 
+fn build_primary_key_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
+    let columns: Vec<String> = pair
+        .into_inner()
+        .filter(|part| part.as_rule() == Rule::identifier)
+        .map(|part| parse_identifier(part.as_str()))
+        .collect();
+
+    if columns.len() < 2 {
+        return Err(Error::ParseError(
+            "table-level PRIMARY KEY requires at least two columns; declare a single-column \
+             primary key with a column-level PRIMARY KEY"
+                .to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for column in &columns {
+        if !seen.insert(column.clone()) {
+            return Err(Error::ParseError(format!(
+                "duplicate column '{}' in PRIMARY KEY",
+                column
+            )));
+        }
+    }
+
+    Ok(columns)
+}
+
 fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
     let mut identifiers = pair
         .into_inner()
@@ -1670,11 +1737,55 @@ fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignK
     })
 }
 
+/// The refusal for the deleted nested spelling. It names the separate clause
+/// to write instead, because a writer who reaches this wrote a real intention
+/// and needs to know where it now goes — not merely that this is wrong.
+fn refuse_nested_direction(nested: Pair<'_, Rule>) -> Error {
+    let clause = match nested
+        .into_inner()
+        .next()
+        .map(|spelling| spelling.as_rule())
+    {
+        Some(Rule::two_way_direction) => "SYNC TWO WAY",
+        _ => "SYNC PUSH ONLY",
+    };
+    Error::ParseError(format!(
+        "RETAIN no longer declares a sync direction; write it as its own clause: {clause}."
+    ))
+}
+
+fn build_sync_direction_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::SyncDirection> {
+    use contextdb_core::SyncDirection;
+    let spelling = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("SYNC clause missing a direction".to_string()))?;
+    Ok(match spelling.as_rule() {
+        Rule::sync_off => SyncDirection::None,
+        Rule::sync_push_only => SyncDirection::Push,
+        Rule::sync_pull_only => SyncDirection::Pull,
+        Rule::sync_two_way => SyncDirection::Both,
+        other => return Err(unexpected_rule(other, "build_sync_direction_option")),
+    })
+}
+
+fn build_sync_conflict_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::ConflictPolicy> {
+    use contextdb_core::ConflictPolicy;
+    let policy = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("SYNC CONFLICT clause missing a policy".to_string()))?;
+    Ok(match policy.as_rule() {
+        Rule::conflict_keep_first => ConflictPolicy::InsertIfNotExists,
+        Rule::conflict_keep_latest => ConflictPolicy::LatestWins,
+        other => return Err(unexpected_rule(other, "build_sync_conflict_option")),
+    })
+}
+
 fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     let mut amount = None;
     let mut unit = None;
     let mut sync_safe = false;
-    let mut declared_sync_direction = None;
 
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -1689,18 +1800,11 @@ fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
             Rule::retain_unit => unit = Some(part.as_str().to_ascii_uppercase()),
             Rule::sync_safe_option => {
                 sync_safe = true;
-                for direction in part.into_inner() {
-                    if direction.as_rule() != Rule::retained_sync_direction {
-                        return Err(unexpected_rule(direction.as_rule(), "build_retain_option"));
+                if let Some(nested) = part.into_inner().next() {
+                    if nested.as_rule() != Rule::nested_direction_removed {
+                        return Err(unexpected_rule(nested.as_rule(), "build_retain_option"));
                     }
-                    declared_sync_direction =
-                        direction
-                            .into_inner()
-                            .next()
-                            .map(|spelling| match spelling.as_rule() {
-                                Rule::two_way_direction => RetainedSyncDirection::TwoWay,
-                                _ => RetainedSyncDirection::PushOnly,
-                            });
+                    return Err(refuse_nested_direction(nested));
                 }
             }
             other => return Err(unexpected_rule(other, "build_retain_option")),
@@ -1725,7 +1829,6 @@ fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     Ok(RetainOption {
         duration_seconds,
         sync_safe,
-        declared_sync_direction,
         declared_unit,
     })
 }

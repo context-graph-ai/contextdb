@@ -4,12 +4,14 @@
 //! edges whose acked commits postdate the artifact's snapshot point, without
 //! user intervention. Regression detection rides a dedicated per-tenant
 //! sync-status subject; the existing push/pull subjects and wire structs stay
-//! byte-identical (sr7 pins the exact bytes).
+//! byte-identical (the frozen wire-bytes guard pins the exact bytes).
 //!
-//! sr1/sr2/sr3 exercise the reconvergence contract above; sr4–sr8 are
+//! Before this change, sr1–sr3 fail: a sync with nothing locally new is
+//! short-circuited to a no-op and never contacts the server, so a freshly
+//! restored (stale) server's regression goes undetected. sr4–sr8 are
 //! regression guards.
 
-use contextdb_core::{Lsn, Value};
+use contextdb_core::{Incarnation, Lsn, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_server::protocol::{
@@ -92,7 +94,7 @@ async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
 }
 
 /// Tight 10s bound: pins the no-hang property of the status probe against
-/// servers that do not answer the status subject (contract item 5).
+/// servers that do not answer the status subject.
 async fn bounded10<T>(fut: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(std::time::Duration::from_secs(10), fut)
         .await
@@ -154,13 +156,12 @@ fn expect_rows(pairs: &[(Uuid, &str)]) -> BTreeSet<(Uuid, String)> {
     pairs.iter().map(|(id, v)| (*id, v.to_string())).collect()
 }
 
-// ======== sr1 — RED: THE journey (contract items 1, 3, 6) ========
+// ======== sr1 — THE journey ========
 //
-// Pre-fix: SyncClient::push computes an empty changeset (edge has nothing
-// locally new past its push watermark) and early-returns Ok(applied=0) without
-// contacting the restored server. The restored server holds A forever; this
-// test fails at the restored-server row-set assertion, exactly the contract's
-// reproduction.
+// Before this change: SyncClient::push computes an empty changeset (edge has
+// nothing locally new past its push watermark) and early-returns Ok(applied=0)
+// without contacting the restored server. The restored server holds A forever;
+// this test fails at the restored-server row-set assertion.
 #[tokio::test]
 async fn sr1_restored_server_reconverges_after_edge_repush() {
     let nats = start_nats().await;
@@ -239,9 +240,9 @@ async fn sr1_restored_server_reconverges_after_edge_repush() {
     assert_eq!(
         row_set(&restored_db),
         union,
-        "RED today: restored server must reconverge to the exact union of all \
-         acked commits after the edge's next push; current dev early-returns on \
-         an empty changeset and the server keeps only A"
+        "restored server must reconverge to the exact union of all \
+         acked commits after the edge's next push; before this change it early-returns \
+         on an empty changeset and the server keeps only A"
     );
     assert_eq!(
         row_set(&edge_db),
@@ -311,12 +312,12 @@ async fn sr1_restored_server_reconverges_after_edge_repush() {
     stop_server(gen2).await;
 }
 
-// ======== sr2 — RED: the probe (contract item 2) ========
+// ======== sr2 — the probe ========
 //
-// Pre-fix: a push with nothing locally new never performs a server exchange
-// (no status request exists today), so a freshly-restored server's regression
-// is undetectable. Both nothing-new pushes below early-return today; the
-// union assertion fails.
+// Before this change: a push with nothing locally new never performs a server
+// exchange (no status request exists today), so a freshly-restored server's
+// regression is undetectable. Both nothing-new pushes below early-return today;
+// the union assertion fails.
 #[tokio::test]
 async fn sr2_push_with_nothing_new_still_converges_restored_server() {
     let nats = start_nats().await;
@@ -377,7 +378,7 @@ async fn sr2_push_with_nothing_new_still_converges_restored_server() {
     assert_eq!(
         row_set(&restored_db),
         union,
-        "RED today: a push with nothing locally new must still exchange status \
+        "a push with nothing locally new must still exchange status \
          with the server, detect the regression, and re-push acked commits — \
          even the second nothing-new push must leave a freshly-restored server \
          converged"
@@ -391,10 +392,10 @@ async fn sr2_push_with_nothing_new_still_converges_restored_server() {
     stop_server(gen2).await;
 }
 
-// ======== sr3 — RED: pull-side regression safety (contract item 4) ========
+// ======== sr3 — pull-side regression safety ========
 //
-// Pre-fix: the edge's pull watermark (server-LSN space) is ahead of the
-// restored server's LSN clock; pull sends since_lsn above the server's
+// Before this change: the edge's pull watermark (server-LSN space) is ahead of
+// the restored server's LSN clock; pull sends since_lsn above the server's
 // position, the server returns an empty page, and a genuinely new server
 // commit (s4, stamped below the stale watermark) is skipped forever.
 #[tokio::test]
@@ -482,7 +483,7 @@ async fn sr3_pull_resumes_from_restored_server_position_and_delivers_new_commits
     assert_eq!(
         row_set(&edge_db),
         edge_expected,
-        "RED today: pull must resume from the restored server's actual position; \
+        "pull must resume from the restored server's actual position; \
          the genuinely new commit s4 must never be skipped, and re-delivered \
          rows (s1, s2) must apply idempotently"
     );
@@ -508,7 +509,7 @@ async fn sr3_pull_resumes_from_restored_server_position_and_delivers_new_commits
     stop_server(gen2).await;
 }
 
-// ======== sr4 — REGRESSION GUARD: steady-state push (contract item 6) ========
+// ======== sr4 — REGRESSION GUARD: steady-state push ========
 //
 // Passes today. Pins exact applied counts, watermark advancement, and
 // zero duplicates so the fix cannot buy convergence with blanket re-pushes.
@@ -579,7 +580,7 @@ async fn sr4_guard_steady_state_push_counts_and_no_duplicates() {
     stop_server(server_gen).await;
 }
 
-// ======== sr5 — REGRESSION GUARD: steady-state pull (contract item 6) ========
+// ======== sr5 — REGRESSION GUARD: steady-state pull ========
 //
 // Passes today. Pins pull counts, no-op watermark stability, and exact sets.
 #[tokio::test]
@@ -651,12 +652,12 @@ async fn sr5_guard_steady_state_pull_counts_and_watermark() {
     stop_server(server_gen).await;
 }
 
-// ======== sr6 — REGRESSION GUARD: new client + old server (contract item 5) ========
+// ======== sr6 — REGRESSION GUARD: new client + old server ========
 //
-// "Old server" means: a server that does not answer the status subject. At
-// stub time the real SyncServer is exactly that, so this runs the genuine
-// no-responders path today. Post-fix the real SyncServer answers status and
-// this becomes a bounded steady-state guard; sr8's hand-rolled fixture keeps
+// "Old server" means: a server that does not answer the status subject. Before
+// the fix the real SyncServer is exactly that, so this runs the genuine
+// no-responders path today. After the fix the real SyncServer answers status
+// and this becomes a bounded steady-state guard; sr8's hand-rolled fixture keeps
 // the no-responder path covered durably. Every op carries the tight 10s
 // bound: an unanswered probe must never hang, error, churn watermarks, or
 // re-push.
@@ -734,25 +735,27 @@ async fn sr6_guard_new_client_with_old_server_completes_bounded_and_inert() {
     stop_server(server_gen).await;
 }
 
-// ======== sr7 — REGRESSION GUARD: old client + new server, byte-frozen wire ========
+// ======== sr7 — REGRESSION GUARD: the wire bytes are frozen at PROTOCOL_VERSION 5 ========
 //
-// Contract item 5: "every existing subject and struct is byte-identical".
-// These hex constants are the actual encoder output on dev (captured
-// 2026-06-11) for a fixed, fully deterministic fixture (single-entry maps
-// only). Shipped old peers parse these subjects with derived positional-array
-// deserializers: ANY field add/remove/reorder (including 'harmless' trailing
-// #[serde(default)] fields — proven to fail with LengthMismatch), MessageType
-// name change, or PROTOCOL_VERSION bump changes these bytes and breaks them.
+// These hex constants are the actual encoder output for a fixed, fully
+// deterministic fixture (single-entry maps only). They are a snapshot guard: any
+// field add/remove/reorder, MessageType name change, or PROTOCOL_VERSION bump
+// changes these bytes, so an UNINTENDED wire change fails here loudly. The
+// wire-incarnation change deliberately reshaped this surface — PushRequest gained
+// a trailing incarnation field and every envelope's version byte went 4→5 (a
+// clean break; a peer speaking the old version is rejected at the envelope
+// version check, not by struct shape) — so the constants were regenerated to the
+// true new v5 encoding and re-frozen here.
 
 fn wire_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-const PUSH_REQUEST_WIRE: &str = "9304ab5075736852657175657374dc0024cc91cc95cc90cc90cc91cc95cca174cc92cca26964cc81cca5496e74363407cc81cca26964cc81cca5496e74363407ccc207cc90cc90";
-const PUSH_RESPONSE_WIRE: &str = "9304ac50757368526573706f6e736597cc92cc940100cc9007ccc0";
-const PULL_REQUEST_WIRE: &str = "9304ab50756c6c5265717565737495cc922acccd01ccf4";
+const PUSH_REQUEST_WIRE: &str = "9305ab5075736852657175657374dc0029cc92cc95cc90cc90cc91cc96cca174cc93cca26964cc81cca5496e74363407cc90cc81cca26964cc81cca5496e74363407ccc207ccc0cc90cc90cc920000";
+const PUSH_RESPONSE_WIRE: &str = "9305ac50757368526573706f6e736597cc92cc940100cc9007ccc0";
+const PULL_REQUEST_WIRE: &str = "9305ab50756c6c5265717565737495cc922acccd01ccf4";
 const PULL_RESPONSE_WIRE: &str =
-    "9304ac50756c6c526573706f6e736599cc93cc95cc90cc90cc90cc90cc90ccc22a";
+    "9305ac50756c6c526573706f6e736599cc93cc95cc90cc90cc90cc90cc90ccc22a";
 
 #[test]
 fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
@@ -762,6 +765,7 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
         natural_key: WireNaturalKey {
             column: "id".to_string(),
             value: Value::Int64(7),
+            rest: Vec::new(),
         },
         values: HashMap::from([("id".to_string(), Value::Int64(7))]),
         deleted: false,
@@ -776,6 +780,7 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
             edges: Vec::new(),
             vectors: Vec::new(),
         },
+        incarnation: Incarnation::default(),
     };
     let push_request_bytes = encode(MessageType::PushRequest, &push_request).unwrap();
     assert_eq!(

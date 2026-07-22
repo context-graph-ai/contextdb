@@ -21,6 +21,10 @@ mod commit_failed_observer_tests;
 mod commit_write_volume_scaling_tests;
 #[path = "integration/composite_foreign_key_tests.rs"]
 mod composite_foreign_key_tests;
+#[path = "integration/composite_primary_key_tests.rs"]
+mod composite_primary_key_tests;
+#[path = "integration/conflict_policy_declared_tests.rs"]
+mod conflict_policy_declared_tests;
 #[path = "integration/ddl_sync_tests.rs"]
 mod ddl_sync_tests;
 #[path = "integration/gate_a_primitives.rs"]
@@ -69,6 +73,8 @@ mod state_propagation;
 mod storage_scale_hardening_tests;
 #[path = "integration/subscription_tests.rs"]
 mod subscription_tests;
+#[path = "integration/sync_direction_tests.rs"]
+mod sync_direction_tests;
 #[cfg(feature = "nats-tests")]
 #[path = "integration/sync_relay_trigger_tables_tests.rs"]
 mod sync_relay_trigger_tables_tests;

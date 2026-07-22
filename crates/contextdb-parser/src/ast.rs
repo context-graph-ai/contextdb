@@ -16,7 +16,6 @@ pub enum Statement {
     ShowMemoryLimit,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
-    SetSyncConflictPolicy(String),
     ShowSyncConflictPolicy,
     ShowVectorIndexes,
     CreateSchedule {
@@ -323,6 +322,10 @@ pub struct CreateTable {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub unique_constraints: Vec<Vec<String>>,
+    /// The ordered columns of a table-level `PRIMARY KEY (a, b, ...)`. Empty
+    /// when the primary key is single-column (carried on the column's
+    /// `primary_key` flag) or absent.
+    pub primary_key_columns: Vec<String>,
     pub composite_foreign_keys: Vec<CompositeForeignKey>,
     pub if_not_exists: bool,
     pub immutable: bool,
@@ -330,6 +333,13 @@ pub struct CreateTable {
     pub dag_edge_types: Vec<String>,
     pub propagation_rules: Vec<AstPropagationRule>,
     pub retain: Option<RetainOption>,
+    /// The direction clause the declaration wrote, when it wrote one. `None`
+    /// means it named no direction, and the engine applies its default.
+    pub sync_direction: Option<contextdb_core::SyncDirection>,
+    /// The conflict-policy clause the declaration wrote, when it wrote one.
+    /// `None` means it named no policy, and the engine applies its
+    /// non-overwriting default (keep-first).
+    pub conflict_policy: Option<contextdb_core::ConflictPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,21 +349,10 @@ pub struct CompositeForeignKey {
     pub parent_columns: Vec<String>,
 }
 
-/// The sync direction a `RETAIN … SYNC SAFE` declaration spells out
-/// explicitly. Absent (`None` on [`RetainOption`]) means the declaration named
-/// no direction; the engine, not the parser, decides what that means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetainedSyncDirection {
-    PushOnly,
-    TwoWay,
-}
-
 #[derive(Debug, Clone)]
 pub struct RetainOption {
     pub duration_seconds: u64,
     pub sync_safe: bool,
-    /// The direction the DDL spelled out, when it spelled one out at all.
-    pub declared_sync_direction: Option<RetainedSyncDirection>,
     /// The unit the window was written in, kept so the declaration can be
     /// rendered back the way the operator wrote it.
     pub declared_unit: contextdb_core::RetainUnit,
@@ -379,12 +378,10 @@ pub enum AlterAction {
     SetRetain {
         duration_seconds: u64,
         sync_safe: bool,
-        declared_sync_direction: Option<RetainedSyncDirection>,
         declared_unit: contextdb_core::RetainUnit,
     },
+    SetSyncDirection(contextdb_core::SyncDirection),
     DropRetain,
-    SetSyncConflictPolicy(String),
-    DropSyncConflictPolicy,
 }
 
 #[derive(Debug, Clone)]

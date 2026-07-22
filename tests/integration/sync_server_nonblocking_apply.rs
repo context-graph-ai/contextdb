@@ -178,10 +178,7 @@ fn item_changeset(ids: &[Uuid], name_prefix: &str, payload_len: usize, lsn: Lsn)
             let name = format!("{name_prefix}-{idx}");
             RowChange {
                 table: TABLE.to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(*id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(*id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(*id)),
                     ("name".to_string(), Value::Text(name)),
@@ -207,10 +204,7 @@ fn two_row_conflict_changeset(existing_id: Uuid, fresh_id: Uuid, lsn: Lsn) -> Ch
         rows: vec![
             RowChange {
                 table: TABLE.to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(existing_id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(existing_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(existing_id)),
                     (
@@ -225,10 +219,7 @@ fn two_row_conflict_changeset(existing_id: Uuid, fresh_id: Uuid, lsn: Lsn) -> Ch
             },
             RowChange {
                 table: TABLE.to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(fresh_id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(fresh_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(fresh_id)),
                     ("name".to_string(), Value::Text("client-fresh".to_string())),
@@ -250,10 +241,7 @@ fn missing_table_changeset(id: Uuid) -> ChangeSet {
     ChangeSet {
         rows: vec![RowChange {
             table: "missing_items".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
             values: HashMap::from([
                 ("id".to_string(), Value::Uuid(id)),
                 ("name".to_string(), Value::Text("bad".to_string())),
@@ -274,10 +262,7 @@ fn valid_then_missing_table_changeset(valid_id: Uuid, missing_id: Uuid, lsn: Lsn
         rows: vec![
             RowChange {
                 table: TABLE.to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(valid_id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(valid_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(valid_id)),
                     (
@@ -292,10 +277,7 @@ fn valid_then_missing_table_changeset(valid_id: Uuid, missing_id: Uuid, lsn: Lsn
             },
             RowChange {
                 table: "missing_items".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(missing_id),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(missing_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(missing_id)),
                     (
@@ -328,6 +310,7 @@ async fn raw_push_with_reply(
 ) -> async_nats::Subscriber {
     let request = PushRequest {
         changeset: changeset.into(),
+        incarnation: contextdb_core::Incarnation::default(),
     };
     let encoded = encode(MessageType::PushRequest, &request).expect("encode push request");
     raw_encoded_push_with_reply(client, tenant_id, encoded).await
@@ -608,6 +591,7 @@ fn assert_client_push_fixture_uses_chunking(db: &Database) {
         batches.iter().any(|batch| {
             let request = PushRequest {
                 changeset: batch.clone().into(),
+                incarnation: contextdb_core::Incarnation::default(),
             };
             let encoded =
                 encode(MessageType::PushRequest, &request).expect("encode candidate batch");
@@ -801,6 +785,7 @@ async fn ss09_duplicate_retry_joins_parked_apply_without_reapplying() {
     let ids = new_ids(50);
     let request = PushRequest {
         changeset: item_changeset(&ids, "retry", 0, Lsn(2500)).into(),
+        incarnation: contextdb_core::Incarnation::default(),
     };
     let encoded = encode(MessageType::PushRequest, &request).expect("encode duplicate push");
 

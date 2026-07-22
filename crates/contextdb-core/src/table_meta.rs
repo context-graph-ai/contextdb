@@ -1,4 +1,5 @@
 use crate::Direction;
+use crate::types::{Value, Wallclock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -50,15 +51,87 @@ impl RetainUnit {
     }
 }
 
-/// How a RETAINED table is allowed to move under sync. A retained table is
-/// delivered one way — edge to hub — because its rows are deleted locally once
-/// delivered; a hub that sent them back would replant what the edge just aged
-/// out. `PushOnly` is the only supported contract, so the enum has one arm and
-/// the absence of a policy (`None`) means the table declares no retention.
+/// Where a table's rows travel under synchronization — the whole vocabulary,
+/// in one place, because the DDL words, the persisted declaration and the sync
+/// filter must never drift apart. `SYNC OFF` = [`SyncDirection::None`],
+/// `SYNC PUSH ONLY` = [`SyncDirection::Push`], `SYNC PULL ONLY` =
+/// [`SyncDirection::Pull`], `SYNC TWO WAY` = [`SyncDirection::Both`].
+///
+/// This says nothing about how long rows are kept: retention is a separate
+/// declaration (`RETAIN`), and neither implies the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RetainedSyncPolicy {
-    PushOnly,
+pub enum SyncDirection {
+    Push,
+    Pull,
+    Both,
+    None,
 }
+
+impl SyncDirection {
+    /// The DDL clause that declares this direction — the same words the
+    /// operator writes, so `.schema` gives the declaration back verbatim.
+    pub fn sql(self) -> &'static str {
+        match self {
+            SyncDirection::None => "SYNC OFF",
+            SyncDirection::Push => "SYNC PUSH ONLY",
+            SyncDirection::Pull => "SYNC PULL ONLY",
+            SyncDirection::Both => "SYNC TWO WAY",
+        }
+    }
+
+    /// Whether this direction still carries the table's rows OUT of this
+    /// database. `SYNC SAFE` promises deletion only after delivery, so a
+    /// direction that does not deliver cannot keep that promise.
+    pub fn delivers(self) -> bool {
+        matches!(self, SyncDirection::Push | SyncDirection::Both)
+    }
+}
+
+/// How synchronization resolves a conflict on a table: which value survives when
+/// the same key is written on more than one machine, or the same row is re-sent.
+/// It lives here, next to the [`TableMeta`] that persists it, because the DDL
+/// words, the stored declaration and the sync-apply resolver must never drift
+/// into two different enums.
+///
+/// The two policies an application DECLARES on a table are `KEEP FIRST`
+/// ([`Self::InsertIfNotExists`] — the first value written for a key stays; a
+/// re-send does not overwrite it) and `KEEP LATEST` ([`Self::LatestWins`] — the
+/// newest write for a key wins). [`Self::ServerWins`] and [`Self::EdgeWins`] are
+/// role-relative resolutions used only by the engine's baked distributed-contract
+/// tables (the work ledger and peer directory); they are NOT part of the DDL
+/// surface, because "server" and "edge" are not table properties an application
+/// declares — see [`Self::declared_clause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictPolicy {
+    InsertIfNotExists,
+    ServerWins,
+    EdgeWins,
+    LatestWins,
+}
+
+impl ConflictPolicy {
+    /// The DDL clause that DECLARES this policy — the same words an operator
+    /// writes, so `.schema` gives the declaration back verbatim. Only the two
+    /// application-facing policies render; the role-relative distributed-contract
+    /// policies are not declarable and render nothing.
+    pub fn declared_clause(self) -> Option<&'static str> {
+        match self {
+            ConflictPolicy::InsertIfNotExists => Some("SYNC CONFLICT KEEP FIRST"),
+            ConflictPolicy::LatestWins => Some("SYNC CONFLICT KEEP LATEST"),
+            ConflictPolicy::ServerWins | ConflictPolicy::EdgeWins => None,
+        }
+    }
+}
+
+/// The conflict policy a table gets when its declaration named none:
+/// keep-first, the non-overwriting default. A re-send of an existing key does
+/// not silently overwrite it; `SYNC CONFLICT KEEP LATEST` is the explicit
+/// opt-in for last-writer-wins current-state semantics.
+pub const DEFAULT_CONFLICT_POLICY: ConflictPolicy = ConflictPolicy::InsertIfNotExists;
+
+/// The direction a table gets when its declaration named none: two-way, the
+/// engine default and the recovery contract.
+pub const DEFAULT_SYNC_DIRECTION: SyncDirection = SyncDirection::Both;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TableMeta {
@@ -82,13 +155,32 @@ pub struct TableMeta {
     pub indexes: Vec<IndexDecl>,
     #[serde(default)]
     pub composite_foreign_keys: Vec<CompositeForeignKey>,
-    /// Set on every table that declares RETAIN; `None` on every other table.
+    /// The direction this table DECLARED, when it declared one at all.
+    /// `None` means the declaration named no direction, and the table gets
+    /// [`DEFAULT_SYNC_DIRECTION`]. Kept as an option rather than collapsed to
+    /// the default so `.schema` renders back exactly what was written.
     #[serde(default)]
-    pub retained_sync_policy: Option<RetainedSyncPolicy>,
+    pub sync_direction: Option<SyncDirection>,
     /// The unit the RETAIN window was declared in, so `.schema` renders the
     /// declaration back as it was written.
     #[serde(default)]
     pub retain_declared_unit: Option<RetainUnit>,
+    /// The ordered columns of a table-level `PRIMARY KEY (a, b, ...)`. Empty
+    /// for a single-column primary key (carried on the column's `primary_key`
+    /// flag) and for a keyless table. When present it is the table's whole sync
+    /// identity — a row is told apart from another by every one of these
+    /// columns, in this order — and it is what `.schema` renders as the
+    /// table-level `PRIMARY KEY (...)` clause.
+    #[serde(default)]
+    pub primary_key_columns: Vec<String>,
+    /// The conflict policy this table DECLARED, when it declared one at all.
+    /// `None` means the declaration named no policy, and the table gets
+    /// [`DEFAULT_CONFLICT_POLICY`] (keep-first, non-overwriting). Kept as an
+    /// option rather than collapsed to the default so `.schema` renders back
+    /// exactly what was written, and so the hub honors the DECLARED policy
+    /// instead of a uniform rule it hardcodes.
+    #[serde(default)]
+    pub conflict_policy: Option<ConflictPolicy>,
 }
 
 // Custom `Deserialize` that tolerates prior on-disk `TableMeta` encoded
@@ -142,11 +234,15 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let composite_foreign_keys = seq
                     .next_element::<Vec<CompositeForeignKey>>()?
                     .unwrap_or_default();
-                let retained_sync_policy = seq
-                    .next_element::<Option<RetainedSyncPolicy>>()?
+                let sync_direction = seq
+                    .next_element::<Option<SyncDirection>>()?
                     .unwrap_or_default();
                 let retain_declared_unit = seq
                     .next_element::<Option<RetainUnit>>()?
+                    .unwrap_or_default();
+                let primary_key_columns = seq.next_element::<Vec<String>>()?.unwrap_or_default();
+                let conflict_policy = seq
+                    .next_element::<Option<ConflictPolicy>>()?
                     .unwrap_or_default();
                 Ok(TableMeta {
                     columns,
@@ -161,8 +257,10 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     expires_column,
                     indexes,
                     composite_foreign_keys,
-                    retained_sync_policy,
+                    sync_direction,
                     retain_declared_unit,
+                    primary_key_columns,
+                    conflict_policy,
                 })
             }
 
@@ -182,8 +280,10 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let mut expires_column: Option<Option<String>> = None;
                 let mut indexes: Option<Vec<IndexDecl>> = None;
                 let mut composite_foreign_keys: Option<Vec<CompositeForeignKey>> = None;
-                let mut retained_sync_policy: Option<Option<RetainedSyncPolicy>> = None;
+                let mut sync_direction: Option<Option<SyncDirection>> = None;
                 let mut retain_declared_unit: Option<Option<RetainUnit>> = None;
+                let mut primary_key_columns: Option<Vec<String>> = None;
+                let mut conflict_policy: Option<Option<ConflictPolicy>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -201,8 +301,10 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                         "composite_foreign_keys" => {
                             composite_foreign_keys = Some(map.next_value()?)
                         }
-                        "retained_sync_policy" => retained_sync_policy = Some(map.next_value()?),
+                        "sync_direction" => sync_direction = Some(map.next_value()?),
                         "retain_declared_unit" => retain_declared_unit = Some(map.next_value()?),
+                        "primary_key_columns" => primary_key_columns = Some(map.next_value()?),
+                        "conflict_policy" => conflict_policy = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -223,8 +325,10 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     expires_column: expires_column.unwrap_or_default(),
                     indexes: indexes.unwrap_or_default(),
                     composite_foreign_keys: composite_foreign_keys.unwrap_or_default(),
-                    retained_sync_policy: retained_sync_policy.unwrap_or_default(),
+                    sync_direction: sync_direction.unwrap_or_default(),
                     retain_declared_unit: retain_declared_unit.unwrap_or_default(),
+                    primary_key_columns: primary_key_columns.unwrap_or_default(),
+                    conflict_policy: conflict_policy.unwrap_or_default(),
                 })
             }
         }
@@ -242,10 +346,68 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
             "expires_column",
             "indexes",
             "composite_foreign_keys",
-            "retained_sync_policy",
+            "sync_direction",
             "retain_declared_unit",
+            "primary_key_columns",
+            "conflict_policy",
         ];
         deserializer.deserialize_struct("TableMeta", FIELDS, TableMetaVisitor)
+    }
+}
+
+impl TableMeta {
+    /// The column tuples whose values must be unique across the table's rows:
+    /// every declared `UNIQUE (...)` plus a multi-column `PRIMARY KEY (...)`.
+    /// The composite primary key is a uniqueness rule like any other UNIQUE —
+    /// it is just also the sync identity — so the same insert-time and
+    /// commit-time checks that reject a duplicate `UNIQUE` reject a duplicate
+    /// key. Single-column primary keys are carried on the column flag and are
+    /// checked separately, so they are not repeated here.
+    pub fn enforced_unique_tuples(&self) -> impl Iterator<Item = &Vec<String>> {
+        self.unique_constraints
+            .iter()
+            .chain((self.primary_key_columns.len() >= 2).then_some(&self.primary_key_columns))
+    }
+
+    /// Whether a row of this retained table has passed its retention window —
+    /// the single expiry judgement shared by the local prune rule and the
+    /// serve-time sync filter, so the two can never disagree about a row.
+    ///
+    /// A per-row `EXPIRES` timestamp takes PRECEDENCE over the `RETAIN` window:
+    /// `i64::MAX` pins the row forever, a negative stamp retires it immediately,
+    /// any other stamp expires it once the clock reaches it. Only when the table
+    /// declares no `EXPIRES` column, or the row carries no timestamp there, does
+    /// the `created_at` + window judgement apply; a row with no creation stamp
+    /// to judge is treated as not expired. A table with no `RETAIN` window never
+    /// expires a row here.
+    ///
+    /// This is deliberately ONLY the expiry judgement: it says nothing about the
+    /// `SYNC SAFE` delete-after-delivery pin, which is delete safety, not
+    /// expiry, and which the serve filter must not consult.
+    pub fn retained_row_has_expired(
+        &self,
+        values: &HashMap<String, Value>,
+        created_at: Option<Wallclock>,
+        now: Wallclock,
+    ) -> bool {
+        let Some(default_ttl_seconds) = self.default_ttl_seconds else {
+            return false;
+        };
+
+        if let Some(expires_column) = &self.expires_column {
+            match values.get(expires_column) {
+                Some(Value::Timestamp(millis)) if *millis == i64::MAX => return false,
+                Some(Value::Timestamp(millis)) if *millis < 0 => return true,
+                Some(Value::Timestamp(millis)) => return (*millis as u64) <= now.0,
+                Some(Value::Null) | None => {}
+                Some(_) => {}
+            }
+        }
+
+        let ttl_millis = default_ttl_seconds.saturating_mul(1000);
+        created_at
+            .map(|created_at| now.0.saturating_sub(created_at.0) > ttl_millis)
+            .unwrap_or(false)
     }
 }
 

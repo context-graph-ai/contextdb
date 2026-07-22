@@ -4962,10 +4962,10 @@ fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violatio
             rows: vec![
                 sync::RowChange {
                     table: "t".to_string(),
-                    natural_key: sync::NaturalKey {
-                        column: "id".to_string(),
-                        value: Value::Uuid(sarg_uuid(2)),
-                    },
+                    natural_key: sync::NaturalKey::single(
+                        "id".to_string(),
+                        Value::Uuid(sarg_uuid(2)),
+                    ),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(sarg_uuid(2))),
                         ("context_id".to_string(), Value::Uuid(ctx_b)),
@@ -4977,10 +4977,10 @@ fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violatio
                 },
                 sync::RowChange {
                     table: "t".to_string(),
-                    natural_key: sync::NaturalKey {
-                        column: "id".to_string(),
-                        value: Value::Uuid(sarg_uuid(3)),
-                    },
+                    natural_key: sync::NaturalKey::single(
+                        "id".to_string(),
+                        Value::Uuid(sarg_uuid(3)),
+                    ),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(sarg_uuid(3))),
                         ("context_id".to_string(), Value::Uuid(ctx_c)),
@@ -5028,10 +5028,10 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
                 rows: vec![
                     sync::RowChange {
                         table: "t".to_string(),
-                        natural_key: sync::NaturalKey {
-                            column: "id".to_string(),
-                            value: Value::Uuid(hidden_id),
-                        },
+                        natural_key: sync::NaturalKey::single(
+                            "id".to_string(),
+                            Value::Uuid(hidden_id),
+                        ),
                         values: HashMap::from([
                             ("id".to_string(), Value::Uuid(hidden_id)),
                             ("context_id".to_string(), Value::Uuid(ctx_b)),
@@ -5043,10 +5043,10 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
                     },
                     sync::RowChange {
                         table: "t".to_string(),
-                        natural_key: sync::NaturalKey {
-                            column: "id".to_string(),
-                            value: Value::Uuid(visible_id),
-                        },
+                        natural_key: sync::NaturalKey::single(
+                            "id".to_string(),
+                            Value::Uuid(visible_id),
+                        ),
                         values: HashMap::from([
                             ("id".to_string(), Value::Uuid(visible_id)),
                             ("context_id".to_string(), Value::Uuid(ctx_a)),
@@ -5120,10 +5120,7 @@ fn scoped_sync_apply_skips_hidden_graph_edges_and_applies_allowed_edges() {
 
     let node_row = |id, context, data: &str, lsn| sync::RowChange {
         table: "nodes".to_string(),
-        natural_key: sync::NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("context_id".to_string(), Value::Uuid(context)),
@@ -5135,10 +5132,7 @@ fn scoped_sync_apply_skips_hidden_graph_edges_and_applies_allowed_edges() {
     };
     let edge_row = |id, source, target, context, lsn| sync::RowChange {
         table: "edges".to_string(),
-        natural_key: sync::NaturalKey {
-            column: "id".to_string(),
-            value: Value::Uuid(id),
-        },
+        natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(id)),
         values: HashMap::from([
             ("id".to_string(), Value::Uuid(id)),
             ("source_id".to_string(), Value::Uuid(source)),
@@ -5234,10 +5228,7 @@ fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
             rows: vec![
                 sync::RowChange {
                     table: "outcomes".to_string(),
-                    natural_key: sync::NaturalKey {
-                        column: "id".to_string(),
-                        value: Value::Uuid(new_id),
-                    },
+                    natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(new_id)),
                     values: HashMap::from([
                         ("id".to_string(), Value::Uuid(new_id)),
                         ("decision_id".to_string(), Value::Uuid(decision_id)),
@@ -5249,10 +5240,7 @@ fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
                 },
                 sync::RowChange {
                     table: "outcomes".to_string(),
-                    natural_key: sync::NaturalKey {
-                        column: "id".to_string(),
-                        value: Value::Uuid(old_id),
-                    },
+                    natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(old_id)),
                     values: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
                     deleted: true,
                     lsn: Lsn(2),
@@ -5299,10 +5287,7 @@ fn sync_edge_wins_replaces_committed_unique_conflict_with_incoming_row() {
         sync::ChangeSet {
             rows: vec![sync::RowChange {
                 table: "outcomes".to_string(),
-                natural_key: sync::NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(incoming_id),
-                },
+                natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(incoming_id)),
                 values: HashMap::from([
                     ("id".to_string(), Value::Uuid(incoming_id)),
                     ("decision_id".to_string(), Value::Uuid(decision_id)),
@@ -11190,5 +11175,93 @@ fn prv_16_row_vector_query_releases_accountant_on_every_error_path() {
         prv_memory_usage_tuple(&db),
         baseline,
         "ROW_VECTOR error paths must release every transient accountant allocation"
+    );
+}
+
+// ============================================================
+// A table-level composite PRIMARY KEY column cannot be dropped or
+// renamed, and the refusal names the reason. Single-column PK columns
+// are already un-droppable and un-renamable with a clear "cannot
+// drop/rename primary key column" error; a composite key column must
+// match that behavior. The ALTER guards check only the column-level
+// primary_key flag, which a table-level PRIMARY KEY (...) does not set,
+// so before this guard the refusal came from a DOWNSTREAM constraint
+// check and surfaced as a misleading `column not found`. The guard must
+// refuse the operation up front and name the key, mirroring the
+// single-column case.
+// ============================================================
+
+const COMPOSITE_PK_DDL: &str = "CREATE TABLE metric_windows (\
+     machine_id TEXT NOT NULL, \
+     sensor_id TEXT NOT NULL, \
+     metric TEXT NOT NULL, \
+     window_start INTEGER NOT NULL, \
+     value INTEGER NOT NULL, \
+     PRIMARY KEY (machine_id, sensor_id, metric, window_start))";
+
+#[test]
+fn dropping_a_composite_primary_key_column_is_refused() {
+    let db = Database::open_memory();
+    db.execute(COMPOSITE_PK_DDL, &empty())
+        .expect("composite-key table creates");
+
+    let result = db.execute("ALTER TABLE metric_windows DROP COLUMN sensor_id", &empty());
+    let err = result.expect_err("dropping a composite primary key column must be refused");
+    assert!(
+        err.to_string().contains("primary key"),
+        "the refusal must name that it is a primary key column, got {err:?}",
+    );
+
+    let meta = db.table_meta("metric_windows").expect("table still exists");
+    assert_eq!(
+        meta.primary_key_columns,
+        vec![
+            "machine_id".to_string(),
+            "sensor_id".to_string(),
+            "metric".to_string(),
+            "window_start".to_string(),
+        ],
+        "the composite key declaration is left intact after the refusal",
+    );
+    assert!(
+        meta.columns.iter().any(|c| c.name == "sensor_id"),
+        "the key column is still present after the refused drop",
+    );
+}
+
+#[test]
+fn renaming_a_composite_primary_key_column_is_refused() {
+    let db = Database::open_memory();
+    db.execute(COMPOSITE_PK_DDL, &empty())
+        .expect("composite-key table creates");
+
+    let result = db.execute(
+        "ALTER TABLE metric_windows RENAME COLUMN window_start TO ws",
+        &empty(),
+    );
+    let err = result.expect_err("renaming a composite primary key column must be refused");
+    assert!(
+        err.to_string().contains("primary key"),
+        "the refusal must name that it is a primary key column, got {err:?}",
+    );
+
+    let meta = db.table_meta("metric_windows").expect("table still exists");
+    assert_eq!(
+        meta.primary_key_columns,
+        vec![
+            "machine_id".to_string(),
+            "sensor_id".to_string(),
+            "metric".to_string(),
+            "window_start".to_string(),
+        ],
+        "the composite key declaration is left intact after the refusal",
+    );
+    assert!(
+        meta.columns.iter().any(|c| c.name == "window_start"),
+        "the original key column name is unchanged after the refused rename",
+    );
+    assert!(
+        !meta.columns.iter().any(|c| c.name == "ws"),
+        "the rename did not take effect",
     );
 }

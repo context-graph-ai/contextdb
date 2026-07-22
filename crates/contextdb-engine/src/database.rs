@@ -10,7 +10,8 @@ use crate::rank_formula::{FormulaEvalError, RankFormula};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
-    NaturalKey, RowChange, VectorChange, natural_key_column_for_meta,
+    NaturalKey, RowChange, VectorChange, natural_key_column_for_meta, natural_key_columns_for_meta,
+    natural_key_from_row_values,
 };
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
@@ -561,6 +562,11 @@ pub struct Database {
     trigger: Arc<TriggerState>,
     sync_relay_mode: Arc<AtomicBool>,
     in_memory_applied_push_watermarks: Arc<Mutex<HashMap<String, Lsn>>>,
+    /// This database life's per-tenant sync incarnation, minted on first use and
+    /// held for the life of the handle. Backed by a persisted config value for
+    /// file-backed databases (so a plain reopen loads the same one) and by this
+    /// cache alone for in-memory databases (each open is a fresh life).
+    sync_incarnations: Arc<Mutex<HashMap<String, Incarnation>>>,
     pending_event_bus_ddl: Mutex<HashMap<TxId, Vec<DdlChange>>>,
     pending_commit_metadata: Mutex<HashMap<TxId, PendingCommitMetadata>>,
     disk_limit: AtomicU64,
@@ -1307,6 +1313,17 @@ fn log_maintenance_cycle(report: &MaintenanceReport) {
 /// Database-metadata key holding the ONE hub a retained table is delivered to.
 pub(crate) const RETENTION_SYNC_PEER_CONFIG_KEY: &str = "retention_sync_peer";
 
+thread_local! {
+    /// Test-only injection seam: when armed, the NEXT
+    /// [`Database::change_retention_sync_peer`] on this thread fails at the point
+    /// after the confirmation record is cleared, so a test can assert the
+    /// operation lands on the SAFE side of a mid-operation I/O failure. Armed
+    /// only by `__arm_retention_peer_persist_fault_for_test`; default off, so the
+    /// production path reads a thread-local that is never set — production-dead,
+    /// following the existing `__inject_*_for_test` precedent.
+    static RETENTION_PEER_PERSIST_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// High-churn "currency" tables whose rows are rewritten every poll cadence via
 /// `INSERT … ON CONFLICT DO UPDATE`. Each update mints a new MVCC version and
 /// tombstones the prior one, and nothing ever reclaims the superseded versions,
@@ -1696,7 +1713,9 @@ impl Database {
             plugin,
             access: AccessConstraints::default(),
             accountant,
-            conflict_policies: RwLock::new(ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
+            conflict_policies: RwLock::new(ConflictPolicies::uniform(
+                contextdb_core::DEFAULT_CONFLICT_POLICY,
+            )),
             subscriptions: Arc::new(Mutex::new(SubscriptionState::new())),
             pruning_runtime: Mutex::new(PruningRuntime::new()),
             pruning_guard: Arc::new(Mutex::new(())),
@@ -1706,6 +1725,7 @@ impl Database {
             trigger,
             sync_relay_mode: Arc::new(AtomicBool::new(false)),
             in_memory_applied_push_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            sync_incarnations: Arc::new(Mutex::new(HashMap::new())),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
@@ -1903,6 +1923,7 @@ impl Database {
             trigger: self.trigger.clone(),
             sync_relay_mode: self.sync_relay_mode.clone(),
             in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
+            sync_incarnations: self.sync_incarnations.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
@@ -2928,7 +2949,6 @@ impl Database {
                 | Statement::DropRoute { .. }
                 | Statement::SetMemoryLimit(_)
                 | Statement::SetDiskLimit(_)
-                | Statement::SetSyncConflictPolicy(_)
         )
     }
 
@@ -3953,29 +3973,41 @@ impl Database {
                     AlterAction::SetRetain {
                         duration_seconds,
                         sync_safe,
-                        declared_sync_direction,
                         declared_unit,
                     } => {
-                        // The execution paths refuse this statement outright, so
-                        // the projection must not hand a plugin a PushOnly table
-                        // the engine is about to reject.
-                        if *declared_sync_direction
-                            == Some(contextdb_parser::ast::RetainedSyncDirection::TwoWay)
+                        // The execution path refuses a delivery promise the
+                        // table's direction could never keep, so the projection
+                        // must not hand a plugin a statement about to be
+                        // rejected.
+                        if crate::executor::refuse_promise_with_no_delivery(
+                            &at.table,
+                            *sync_safe,
+                            Some(crate::executor::effective_sync_direction(&meta)),
+                        )
+                        .is_err()
                         {
                             return None;
                         }
                         meta.default_ttl_seconds = Some(*duration_seconds);
                         meta.sync_safe = *sync_safe;
-                        meta.retained_sync_policy = Some(RetainedSyncPolicy::PushOnly);
                         meta.retain_declared_unit = Some(*declared_unit);
                     }
                     AlterAction::DropRetain => {
                         meta.default_ttl_seconds = None;
                         meta.sync_safe = false;
-                        meta.retained_sync_policy = None;
                         meta.retain_declared_unit = None;
                     }
-                    AlterAction::SetSyncConflictPolicy(_) | AlterAction::DropSyncConflictPolicy => { /* handled in executor */
+                    AlterAction::SetSyncDirection(direction) => {
+                        if crate::executor::refuse_promise_with_no_delivery(
+                            &at.table,
+                            meta.sync_safe,
+                            Some(*direction),
+                        )
+                        .is_err()
+                        {
+                            return None;
+                        }
+                        meta.sync_direction = Some(*direction);
                     }
                 }
                 Some(DdlChange::AlterTable {
@@ -4265,19 +4297,27 @@ impl Database {
         &self,
         tx: TxId,
         table: &str,
-        conflict_col: &str,
+        natural_key: &NaturalKey,
         values: HashMap<ColName, Value>,
         created_at: Option<Wallclock>,
     ) -> Result<UpsertResult> {
         let values = self.coerce_row_for_insert(table, values, None, None)?;
         let snapshot = self.snapshot_for_read();
-        let existing_row = values
-            .get(conflict_col)
-            .map(|conflict_value| {
-                self.point_lookup_in_tx(tx, table, conflict_col, conflict_value, snapshot)
-            })
-            .transpose()?
-            .flatten();
+        // Resolve the existing row on the WHOLE natural key — every key column —
+        // so a composite identity is matched in full rather than collapsed onto a
+        // leading-column probe that resolves the wrong row and drops the update.
+        // A single-column key routes through the same point lookup as before.
+        let key_columns = natural_key.key_columns();
+        let key_values: Option<Vec<Value>> = key_columns
+            .iter()
+            .map(|column| values.get(column).cloned())
+            .collect();
+        let existing_row = match key_values {
+            Some(key_values) => {
+                self.conflict_lookup_in_tx(tx, table, &key_columns, &key_values, snapshot)?
+            }
+            None => None,
+        };
         let existing_row_id = existing_row.as_ref().map(|row| row.row_id);
 
         if let (Some(existing), Some(meta)) = (existing_row.as_ref(), self.table_meta(table)) {
@@ -4364,23 +4404,15 @@ impl Database {
     /// (see `sync_source_lsn_updates`), so it describes the CURRENT version,
     /// never the row's history: a pulled row that was then edited locally
     /// reads `false`.
-    pub fn row_version_arrived_by_sync(
-        &self,
-        table: &str,
-        natural_key_column: &str,
-        natural_key_value: &Value,
-    ) -> bool {
+    pub fn row_version_arrived_by_sync(&self, table: &str, natural_key: &NaturalKey) -> bool {
         let _operation = self.assert_open_operation();
-        let Ok(Some(row)) = self.point_lookup(
-            table,
-            natural_key_column,
-            natural_key_value,
-            self.snapshot_for_read(),
-        ) else {
+        let Some(row_id) =
+            self.row_id_for_natural_key_full(table, natural_key, self.snapshot_for_read())
+        else {
             return false;
         };
         self.relational_store
-            .sync_source_lsn(table, row.row_id)
+            .sync_source_lsn(table, row_id)
             .is_some()
     }
 
@@ -4723,7 +4755,18 @@ impl Database {
             )?;
         }
 
-        for unique_constraint in &meta.unique_constraints {
+        // A composite UNIQUE duplicate is a silent no-op on a plain insert
+        // (allow_duplicate_unique_noop); a composite PRIMARY KEY duplicate is a
+        // hard error, exactly like the single-column primary key above. Same
+        // probe, different no-op policy per tuple.
+        let composite_pk =
+            (meta.primary_key_columns.len() >= 2).then_some(&meta.primary_key_columns);
+        for (unique_constraint, allow_noop) in meta
+            .unique_constraints
+            .iter()
+            .map(|tuple| (tuple, allow_duplicate_unique_noop))
+            .chain(composite_pk.map(|tuple| (tuple, false)))
+        {
             let mut candidate_values = Vec::with_capacity(unique_constraint.len());
             let mut has_null = false;
 
@@ -4779,7 +4822,7 @@ impl Database {
                 table,
                 column_label,
                 &matching_row_ids,
-                allow_duplicate_unique_noop,
+                allow_noop,
                 &mut duplicate_unique_row_id,
             )?;
         }
@@ -5487,7 +5530,7 @@ impl Database {
                 }
             }
 
-            for unique_constraint in &meta.unique_constraints {
+            for unique_constraint in meta.enforced_unique_tuples() {
                 Self::add_staged_tuple_columns(
                     &mut columns_by_table,
                     table,
@@ -5894,15 +5937,22 @@ impl Database {
         Ok(!rows.is_empty())
     }
 
-    fn visible_row_by_column(
+    /// The committed row carrying a whole sync identity — every key column
+    /// matched through the covering index.
+    fn visible_row_by_natural_key(
         &self,
         table: &str,
-        column: &str,
-        value: &Value,
+        natural_key: &NaturalKey,
         snapshot: SnapshotId,
         skip_deleted: &HashSet<RowId>,
     ) -> Result<Option<VersionedRow>> {
-        self.required_indexed_visible_row_by_column(table, column, value, snapshot, skip_deleted)
+        self.required_indexed_visible_row_by_columns(
+            table,
+            &natural_key.key_columns(),
+            &natural_key.key_values(),
+            snapshot,
+            skip_deleted,
+        )
     }
 
     fn indexed_visible_row_exists_by_columns(
@@ -6601,7 +6651,7 @@ impl Database {
                 }
             }
 
-            for unique_constraint in &meta.unique_constraints {
+            for unique_constraint in meta.enforced_unique_tuples() {
                 let mut values = Vec::with_capacity(unique_constraint.len());
                 let mut has_null = false;
                 for column in unique_constraint {
@@ -10466,6 +10516,81 @@ impl Database {
         self.retention_sync_peer.lock().clone()
     }
 
+    /// Move this edge's retained-data destination to `new_node_id`, and in the
+    /// SAME operation forget everything the PREVIOUS destination confirmed. A
+    /// retained table is delivered to exactly one destination at a time (see
+    /// [`Database::register_retention_sync_peer`], which refuses a silent
+    /// second binding); this is the shipped way to change WHICH one — any
+    /// number of times, in either direction — without editing the database by
+    /// hand.
+    ///
+    /// The two halves must be one operation, and it must fail safe. The
+    /// persisted push and pull watermarks (per tenant) and the engine
+    /// deletion-gate watermark all record progress against the OLD destination's
+    /// history. Left in place while the binding moves, the edge would skip
+    /// re-uploading rows the new — possibly empty — destination never received,
+    /// and would delete locally-expired rows the moment retention next runs,
+    /// because the deletion gate still reads "already delivered".
+    ///
+    /// So the whole body runs under the pruning guard (no maintenance cycle can
+    /// prune in the window), and the confirmation record is cleared BEFORE the
+    /// new binding is made durable. The deletion-gate watermark is driven
+    /// explicitly BACK to `Lsn(0)` — the forward-only
+    /// `advance_engine_sync_watermark` path cannot express a reset, so this is
+    /// the one place that regresses it. If any step fails part-way, the edge is
+    /// left on the SAFE side: the old peer is still bound and the gate is low, so
+    /// nothing local is deleted and a re-upload targets the OLD hub, which
+    /// already holds the rows. After a clean change nothing local is deleted
+    /// until the NEW destination confirms receipt, exactly as a first-ever
+    /// upload.
+    pub fn change_retention_sync_peer(
+        &self,
+        tenant_id: &TenantId,
+        new_node_id: &str,
+    ) -> Result<()> {
+        let _operation = self.open_operation()?;
+        // Hold the pruning guard for the whole operation: a maintenance cycle
+        // that ran between the gate reset and the rebind could otherwise prune
+        // SYNC SAFE rows against a frontier that no longer applies. Neither the
+        // watermark persists nor the config flush below take the pruning guard,
+        // so this does not self-deadlock; `open_operation` is reentrant, so the
+        // nested calls take no second operation lock.
+        let _guard = self.pruning_guard.lock();
+        // Clear the confirmation record FIRST, so a mid-operation failure lands
+        // on the safe side. The gate goes to `Lsn(0)` and both persisted
+        // watermarks are cleared before the new binding is durable.
+        self.sync_watermark.store(Lsn(0), Ordering::SeqCst);
+        self.persist_sync_push_watermark(tenant_id, Lsn(0))?;
+        self.persist_sync_pull_watermark(tenant_id, Lsn(0))?;
+        if self.take_retention_peer_persist_fault_for_test() {
+            return Err(Error::Other(
+                "injected persistence failure mid destination change (test seam)".to_string(),
+            ));
+        }
+        // Only now make the new binding durable — last, so a failure above leaves
+        // the OLD destination bound with the gate already low.
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .flush_config_value(RETENTION_SYNC_PEER_CONFIG_KEY, &new_node_id.to_string())?;
+        }
+        *self.retention_sync_peer.lock() = Some(new_node_id.to_string());
+        Ok(())
+    }
+
+    /// Arm the one-shot test injection seam: the next
+    /// `change_retention_sync_peer` on THIS thread fails after clearing the
+    /// confirmation record. Production-dead — nothing but tests calls it.
+    #[doc(hidden)]
+    pub fn __arm_retention_peer_persist_fault_for_test(&self) {
+        RETENTION_PEER_PERSIST_FAULT.with(|f| f.set(true));
+    }
+
+    /// Consume the armed injection flag, if any. Reads a thread-local that is
+    /// never set outside a test, so the production path takes the `false` arm.
+    fn take_retention_peer_persist_fault_for_test(&self) -> bool {
+        RETENTION_PEER_PERSIST_FAULT.with(|f| f.replace(false))
+    }
+
     /// Collapse the high-churn currency tables (see [`VERSION_COMPACTION_TABLES`])
     /// back to one live version per logical row, dropping superseded MVCC
     /// versions and their change-log entries in lockstep, then — if dead pages
@@ -11473,31 +11598,13 @@ impl Database {
         })
     }
 
-    /// Get a clone of the current conflict policies.
+    /// Get a clone of the current conflict policies. The declared per-table
+    /// policy lives on each table's meta (`sync_conflict_policy_for_table`
+    /// resolves against it); this carries the deployment default, which callers
+    /// pass to a `SyncServer` as its baseline.
     pub fn conflict_policies(&self) -> ConflictPolicies {
         let _operation = self.assert_open_operation();
         self.conflict_policies.read().clone()
-    }
-
-    /// Set the default conflict policy.
-    pub fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
-        let _operation = self.assert_open_operation();
-        self.conflict_policies.write().default = policy;
-    }
-
-    /// Set a per-table conflict policy.
-    pub fn set_table_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
-        let _operation = self.assert_open_operation();
-        self.conflict_policies
-            .write()
-            .per_table
-            .insert(table.to_string(), policy);
-    }
-
-    /// Remove a per-table conflict policy override.
-    pub fn drop_table_conflict_policy(&self, table: &str) {
-        let _operation = self.assert_open_operation();
-        self.conflict_policies.write().per_table.remove(table);
     }
 
     pub fn plugin(&self) -> &dyn DatabasePlugin {
@@ -11786,6 +11893,40 @@ impl Database {
         Ok(())
     }
 
+    /// This database life's sync incarnation for `tenant_id`, minted the first
+    /// time it is asked for and stable thereafter. A file-backed database
+    /// persists it as a config value, so a plain reopen loads the same one; a
+    /// wipe-and-recreate loses the config with the data and re-mints a fresh one.
+    /// An in-memory database holds it in this handle's cache only — every
+    /// in-memory open is a fresh life. The edge stamps it on every push and
+    /// status exchange so the hub can key its per-edge record by
+    /// `(node_id, incarnation)`.
+    pub fn sync_incarnation(&self, tenant_id: &TenantId) -> Result<Incarnation> {
+        let _operation = self.open_operation()?;
+        let mut cache = self.sync_incarnations.lock();
+        if let Some(incarnation) = cache.get(tenant_id.as_str()) {
+            return Ok(*incarnation);
+        }
+        let key = tenant_id.config_key("sync_incarnation");
+        let incarnation = if let Some(persistence) = &self.persistence {
+            match persistence.load_config_value::<String>(&key)? {
+                Some(hex) => Incarnation::from_hex(&hex).ok_or_else(|| Error::StoreCorrupted {
+                    path: key.clone(),
+                    reason: format!("persisted sync incarnation is not valid hex: {hex}"),
+                })?,
+                None => {
+                    let minted = Incarnation::mint();
+                    persistence.flush_config_value(&key, &minted.to_hex())?;
+                    minted
+                }
+            }
+        } else {
+            Incarnation::mint()
+        };
+        cache.insert(tenant_id.as_str().to_string(), incarnation);
+        Ok(incarnation)
+    }
+
     /// Per-tenant record of the highest edge-LSN this database has applied
     /// from sync pushes. Stored as a config value so `export_snapshot` carries
     /// it with the artifact at the snapshot point, exactly like the tenant sync
@@ -11830,6 +11971,117 @@ impl Database {
         Ok(())
     }
 
+    /// The prefix every per-`(tenant, edge, incarnation)` applied-push key shares
+    /// for one edge. The incarnation hex is appended to it and the tenant is the
+    /// `":<tenant>"` suffix `config_key` adds, so all of one edge's incarnation
+    /// records across tenants sort together under this prefix — which is how the
+    /// edge-lifetime lookup below collects them. The `.inc.` delimiter cannot
+    /// appear inside a transport node id, so one edge's keys never bleed into
+    /// another's.
+    fn applied_push_watermark_node_prefix(node_id: &str) -> String {
+        format!("sync_applied_push_watermark_node.{node_id}.inc.")
+    }
+
+    /// The one place the per-`(tenant, edge, incarnation)` applied-push key is
+    /// authored, so the on-disk format stays byte-identical across readers and
+    /// writers.
+    fn applied_push_watermark_node_incarnation_key(
+        tenant_id: &TenantId,
+        node_id: &str,
+        incarnation: Incarnation,
+    ) -> String {
+        tenant_id.config_key(&format!(
+            "{}{}",
+            Self::applied_push_watermark_node_prefix(node_id),
+            incarnation.to_hex()
+        ))
+    }
+
+    /// Per-`(tenant, edge, incarnation)` record of the highest edge-LSN this
+    /// database has applied from THAT life of THAT edge's pushes. The per-tenant
+    /// record above is raised by whichever edge pushed last, so with more than
+    /// one edge it cannot answer "what do you hold from ME?"; and keying by edge
+    /// alone would let a wiped-and-recreated edge — same node id, LSNs reset —
+    /// be false-confirmed by the prior life's stale-high watermark. Keying by
+    /// incarnation makes a rebuilt life an unknown edge, answered `None`. Stored
+    /// the same way as the per-tenant record (a config value, carried by
+    /// `export_snapshot`; in-memory for ephemeral databases). `None` means this
+    /// hub has applied nothing from that life of that edge.
+    pub fn persisted_sync_applied_push_watermark_for_node_incarnation(
+        &self,
+        tenant_id: &TenantId,
+        node_id: &str,
+        incarnation: Incarnation,
+    ) -> Result<Option<Lsn>> {
+        let _operation = self.open_operation()?;
+        let key =
+            Self::applied_push_watermark_node_incarnation_key(tenant_id, node_id, incarnation);
+        if let Some(persistence) = &self.persistence {
+            return Ok(persistence.load_config_value::<u64>(&key)?.map(Lsn));
+        }
+        Ok(self
+            .in_memory_applied_push_watermarks
+            .lock()
+            .get(&key)
+            .copied())
+    }
+
+    /// The highest edge-LSN this database has applied from `node_id` across ALL
+    /// of that edge's lives (incarnations) — the operator-facing "what have I
+    /// ever taken from this edge?" figure, computed from the per-incarnation
+    /// records so there is a single source of truth. `None` when this hub has
+    /// applied nothing from the edge. The delivery-confirmation path never reads
+    /// this aggregate; it reads the exact `(node, incarnation)` record above so a
+    /// rebuilt life cannot be vouched for by an older one.
+    pub fn persisted_sync_applied_push_watermark_for_node(
+        &self,
+        tenant_id: &TenantId,
+        node_id: &str,
+    ) -> Result<Option<Lsn>> {
+        let _operation = self.open_operation()?;
+        let prefix = Self::applied_push_watermark_node_prefix(node_id);
+        let tenant_suffix = format!(":{}", tenant_id.as_str());
+        if let Some(persistence) = &self.persistence {
+            let max = persistence
+                .load_config_values_with_prefix::<u64>(&prefix)?
+                .into_iter()
+                .filter(|(key, _)| key.ends_with(&tenant_suffix))
+                .map(|(_, value)| value)
+                .max();
+            return Ok(max.map(Lsn));
+        }
+        Ok(self
+            .in_memory_applied_push_watermarks
+            .lock()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix) && key.ends_with(&tenant_suffix))
+            .map(|(_, value)| *value)
+            .max())
+    }
+
+    /// Persist the per-`(tenant, edge, incarnation)` applied-push watermark.
+    /// Callers enforce monotonic advancement within one incarnation, exactly as
+    /// they do for the per-tenant record.
+    pub fn persist_sync_applied_push_watermark_for_node(
+        &self,
+        tenant_id: &TenantId,
+        node_id: &str,
+        incarnation: Incarnation,
+        watermark: Lsn,
+    ) -> Result<()> {
+        let _operation = self.open_operation()?;
+        let key =
+            Self::applied_push_watermark_node_incarnation_key(tenant_id, node_id, incarnation);
+        if let Some(persistence) = &self.persistence {
+            persistence.flush_config_value(&key, &watermark.0)?;
+        } else {
+            self.in_memory_applied_push_watermarks
+                .lock()
+                .insert(key, watermark);
+        }
+        Ok(())
+    }
+
     pub(crate) fn persist_table_rows(&self, name: &str) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             let tables = self.relational_store.tables.read();
@@ -11859,10 +12111,9 @@ impl Database {
                     natural_key: row.natural_key,
                     lsn: row.lsn,
                 });
-            } else if let Some(row_id) = self.row_id_for_natural_key(
+            } else if let Some(row_id) = self.row_id_for_natural_key_full(
                 &row.table,
-                &row.natural_key.column,
-                &row.natural_key.value,
+                &row.natural_key,
                 self.snapshot_at(row.lsn),
             ) {
                 entries.push(ChangeLogEntry::RowInsert {
@@ -12046,25 +12297,20 @@ impl Database {
                 Some(m) => m,
                 None => continue,
             };
-            let key_col = natural_key_column_for_meta(meta).unwrap_or_default();
-            if key_col.is_empty() {
+            if natural_key_columns_for_meta(meta).is_none() {
                 continue;
             }
             for row in table_rows.iter().filter(|r| r.deleted_tx.is_none()) {
                 if !self.row_read_allowed_for_change(table_name, row, self.snapshot()) {
                     continue;
                 }
-                let key_val = match row.values.get(&key_col) {
-                    Some(v) => v.clone(),
-                    None => continue,
+                let Some(natural_key) = natural_key_from_row_values(meta, &row.values) else {
+                    continue;
                 };
                 live_row_ids.insert(row.row_id);
                 rows.push(RowChange {
                     table: table_name.clone(),
-                    natural_key: NaturalKey {
-                        column: key_col.clone(),
-                        value: key_val,
-                    },
+                    natural_key,
                     values: row.values.clone(),
                     deleted: false,
                     lsn: row.lsn,
@@ -12159,8 +12405,7 @@ impl Database {
                 Some(meta) => meta,
                 None => continue,
             };
-            let key_col = natural_key_column_for_meta(meta).unwrap_or_default();
-            if key_col.is_empty() {
+            if natural_key_columns_for_meta(meta).is_none() {
                 continue;
             }
             for row in table_rows.iter().filter(|row| row.deleted_tx.is_none()) {
@@ -12171,16 +12416,12 @@ impl Database {
                 if row.lsn <= since_lsn {
                     continue;
                 }
-                let key_val = match row.values.get(&key_col) {
-                    Some(value) => value.clone(),
-                    None => continue,
+                let Some(natural_key) = natural_key_from_row_values(meta, &row.values) else {
+                    continue;
                 };
                 rows.push(RowChange {
                     table: table_name.clone(),
-                    natural_key: NaturalKey {
-                        column: key_col.clone(),
-                        value: key_val,
-                    },
+                    natural_key,
                     values: row.values.clone(),
                     deleted: false,
                     lsn: row.lsn,
@@ -12266,16 +12507,17 @@ impl Database {
                 .get(&row.table)
                 .ok_or_else(|| Error::TableNotFound(row.table.clone()))?;
 
-            let policy = policies
-                .per_table
-                .get(&row.table)
-                .copied()
-                .unwrap_or(policies.default);
+            let policy =
+                Self::sync_conflict_policy_for_table(policies, Some(table_meta), &row.table);
             let existing = if self.table_meta(&row.table).is_some() {
-                self.required_indexed_visible_row_by_column(
+                // Probe the WHOLE natural key, matching the apply path
+                // (`sync_visible_point_lookup`). A table-level composite PK
+                // auto-indexes only the whole tuple, so a leading-column-only
+                // probe finds no covering index and aborts the entire apply.
+                self.required_indexed_visible_row_by_columns(
                     &row.table,
-                    &row.natural_key.column,
-                    &row.natural_key.value,
+                    &row.natural_key.key_columns(),
+                    &row.natural_key.key_values(),
                     self.snapshot(),
                     &empty_skip_deleted,
                 )?
@@ -12366,15 +12608,32 @@ impl Database {
                 composite_foreign_keys,
                 composite_unique,
             } => {
-                projected.entry(name.clone()).or_insert_with(|| {
-                    rough_sync_table_meta(
-                        columns,
-                        constraints,
-                        foreign_keys,
-                        composite_foreign_keys,
-                        composite_unique,
-                    )
-                });
+                let incoming = rough_sync_table_meta(
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                );
+                match projected.get_mut(name) {
+                    // A pre-existing table ADOPTS the arriving declaration's
+                    // policy, direction, and retention — the same overwrite the
+                    // real apply performs — so the memory charge is computed
+                    // against the policy apply will actually run under, not the
+                    // pre-adoption default. Keeping the old policy here can
+                    // over-charge (a keep-latest projection charges an update a
+                    // keep-first apply skips) or under-charge (the reverse).
+                    Some(meta) => {
+                        meta.conflict_policy = incoming.conflict_policy;
+                        meta.sync_direction = incoming.sync_direction;
+                        meta.default_ttl_seconds = incoming.default_ttl_seconds;
+                        meta.sync_safe = incoming.sync_safe;
+                        meta.retain_declared_unit = incoming.retain_declared_unit;
+                    }
+                    None => {
+                        projected.insert(name.clone(), incoming);
+                    }
+                }
             }
             DdlChange::AlterTable {
                 name,
@@ -12934,13 +13193,11 @@ impl Database {
         projected: &HashMap<String, TableMeta>,
         change: &DdlChange,
     ) -> Result<()> {
-        // A two-way retained table is illegal EVERYWHERE, not only where a
-        // local operator types it: a peer that spells `TWO WAY` in arriving
-        // DDL is refused here, before any of the statement is applied, exactly
-        // as the local CREATE and ALTER paths refuse it. Nothing silently
-        // converts it — silent conversion would let a foreign edge define a
-        // posture this engine has refused at every other door.
-        refuse_two_way_retained_sync_ddl(change)?;
+        // A delivery promise with nowhere to deliver is illegal EVERYWHERE,
+        // not only where a local operator types it: a peer that spells it in
+        // arriving DDL is refused here, before any of the statement is
+        // applied, exactly as the local CREATE and ALTER paths refuse it.
+        refuse_undeliverable_promise_sync_ddl(projected, change)?;
         refuse_keyless_sync_safe_sync_ddl(projected, change)?;
         match change {
             DdlChange::CreateTable {
@@ -13159,33 +13416,33 @@ impl Database {
             {
                 continue;
             }
-            let expected_natural_key = natural_key_column_for_meta(table_meta)
+            let expected_natural_key = natural_key_columns_for_meta(table_meta)
                 .ok_or_else(|| Error::NotSyncEligible(row.table.clone()))?;
-            if row.natural_key.column != expected_natural_key {
-                let column_exists = table_meta
-                    .columns
+            let arriving_key = row.natural_key.key_columns();
+            if arriving_key != expected_natural_key {
+                if let Some(unknown) = arriving_key
                     .iter()
-                    .any(|column| column.name == row.natural_key.column);
-                if column_exists {
-                    return Err(Error::SyncError(format!(
-                        "sync row natural key column mismatch for {}: got {}, expected {}",
-                        row.table, row.natural_key.column, expected_natural_key
-                    )));
+                    .find(|column| !table_meta.columns.iter().any(|c| c.name == **column))
+                {
+                    return Err(Error::ColumnNotFound {
+                        table: row.table.clone(),
+                        column: unknown.clone(),
+                    });
                 }
-                return Err(Error::ColumnNotFound {
-                    table: row.table.clone(),
-                    column: row.natural_key.column.clone(),
-                });
+                return Err(Error::SyncError(format!(
+                    "sync row natural key column mismatch for {}: got {}, expected {}",
+                    row.table,
+                    arriving_key.join(", "),
+                    expected_natural_key.join(", ")
+                )));
             }
             if !row.deleted {
-                match row.values.get(&expected_natural_key) {
-                    Some(value) if value == &row.natural_key.value => {}
-                    _ => {
-                        return Err(Error::SyncError(format!(
-                            "sync row natural key value mismatch for {}.{}",
-                            row.table, expected_natural_key
-                        )));
-                    }
+                if !row.natural_key.matches_values(&row.values) {
+                    return Err(Error::SyncError(format!(
+                        "sync row natural key value mismatch for {}.{}",
+                        row.table,
+                        expected_natural_key.join(", ")
+                    )));
                 }
                 for (column, value) in &row.values {
                     let is_vector_bypass = matches!(value, Value::Vector(_))
@@ -13282,10 +13539,9 @@ impl Database {
                 .get(&row.table)
                 .unwrap_or(&empty_deleted);
             if self.table_meta(&row.table).is_some()
-                && let Some(committed) = self.visible_row_by_column(
+                && let Some(committed) = self.visible_row_by_natural_key(
                     &row.table,
-                    &row.natural_key.column,
-                    &row.natural_key.value,
+                    &row.natural_key,
                     snapshot,
                     skip_deleted,
                 )?
@@ -13295,9 +13551,9 @@ impl Database {
                 continue;
             }
             if let Some(incoming) = incoming_values.get(&row.table).and_then(|table_values| {
-                table_values.iter().find(|values| {
-                    values.get(&row.natural_key.column) == Some(&row.natural_key.value)
-                })
+                table_values
+                    .iter()
+                    .find(|values| row.natural_key.matches_values(values))
             }) {
                 deleted_projected_rows.push((row.table.clone(), incoming.clone()));
             }
@@ -13306,9 +13562,7 @@ impl Database {
         let mut post_incoming_values = incoming_values.clone();
         for row in rows.iter().filter(|row| row.deleted) {
             if let Some(table_values) = post_incoming_values.get_mut(&row.table) {
-                table_values.retain(|values| {
-                    values.get(&row.natural_key.column) != Some(&row.natural_key.value)
-                });
+                table_values.retain(|values| !row.natural_key.matches_values(values));
             }
         }
         let mut post_deleted_committed_row_ids = deleted_committed_row_ids.clone();
@@ -13332,12 +13586,16 @@ impl Database {
             {
                 continue;
             }
-            let policy = Self::sync_conflict_policy_for_table(policies, &row.table);
+            let policy = Self::sync_conflict_policy_for_table(
+                policies,
+                projected_table_meta.get(&row.table),
+                &row.table,
+            );
             let mut replaces_incoming_prefix = false;
             if let Some(table_values) = post_incoming_values.get_mut(&row.table) {
                 let mut retained = Vec::with_capacity(table_values.len());
                 for values in table_values.drain(..) {
-                    if values.get(&row.natural_key.column) == Some(&row.natural_key.value) {
+                    if row.natural_key.matches_values(&values) {
                         replaces_incoming_prefix = true;
                         deleted_projected_rows.push((row.table.clone(), values));
                     } else {
@@ -13351,10 +13609,9 @@ impl Database {
                 .get(&row.table)
                 .unwrap_or(&empty_deleted);
             if self.table_meta(&row.table).is_some()
-                && let Some(committed) = self.visible_row_by_column(
+                && let Some(committed) = self.visible_row_by_natural_key(
                     &row.table,
-                    &row.natural_key.column,
-                    &row.natural_key.value,
+                    &row.natural_key,
                     snapshot,
                     skip_deleted,
                 )?
@@ -13615,12 +13872,28 @@ impl Database {
         Ok(None)
     }
 
-    fn sync_conflict_policy_for_table(policies: &ConflictPolicies, table: &str) -> ConflictPolicy {
-        policies
-            .per_table
-            .get(table)
-            .copied()
-            .unwrap_or(policies.default)
+    /// The conflict policy that resolves an arriving row for `table`. Conflict
+    /// resolution is an APPLICATION concern the table DECLARES, honored here — not
+    /// a rule the engine or the hub hardcodes. Precedence:
+    ///
+    /// 1. A baked per-table override in `policies` — the distributed contract of
+    ///    the work ledger and peer directory, which is not an operator tunable.
+    /// 2. The table's DECLARED policy, carried on its `TableMeta` and travelling
+    ///    with its synced definition.
+    /// 3. `policies.default` — the engine's non-overwriting default for a table
+    ///    that declared none.
+    fn sync_conflict_policy_for_table(
+        policies: &ConflictPolicies,
+        meta: Option<&TableMeta>,
+        table: &str,
+    ) -> ConflictPolicy {
+        if let Some(policy) = policies.per_table.get(table) {
+            return *policy;
+        }
+        if let Some(policy) = meta.and_then(|meta| meta.conflict_policy) {
+            return policy;
+        }
+        policies.default
     }
 
     fn sync_incoming_values_allowed_for_access(
@@ -13731,8 +14004,7 @@ impl Database {
                 self,
                 &projected_rows_cache,
                 &row.table,
-                &row.natural_key.column,
-                &row.natural_key.value,
+                &row.natural_key,
                 snapshot,
                 skip_deleted,
             )?;
@@ -13755,7 +14027,9 @@ impl Database {
 
             let mut values = row.values.clone();
             values.remove("__deleted");
-            let policy = Self::sync_conflict_policy_for_table(policies, &row.table);
+            let row_meta = self.table_meta(&row.table);
+            let policy =
+                Self::sync_conflict_policy_for_table(policies, row_meta.as_ref(), &row.table);
             let applies = match existing.as_ref() {
                 None => self
                     .sync_insert_constraint_error_for_values(
@@ -14440,15 +14714,16 @@ impl Database {
         // Only remove a delete if there is a non-delete entry with a HIGHER LSN
         // (i.e., the insert came after the delete, indicating an upsert).
         // If the insert has a lower LSN, the delete is genuine and must be kept.
-        let insert_max_lsn: HashMap<(String, String, String), Lsn> = {
-            let mut map: HashMap<(String, String, String), Lsn> = HashMap::new();
+        // Key the upsert-pairing by the WHOLE identity: two rows that share only
+        // a leading key column are different rows, and folding their delete and
+        // insert together would drop one of them.
+        let dedup_key = |r: &RowChange| -> (String, String) {
+            (r.table.clone(), format!("{:?}", r.natural_key.pairs()))
+        };
+        let insert_max_lsn: HashMap<(String, String), Lsn> = {
+            let mut map: HashMap<(String, String), Lsn> = HashMap::new();
             for r in rows.iter().filter(|r| !r.deleted) {
-                let key = (
-                    r.table.clone(),
-                    r.natural_key.column.clone(),
-                    format!("{:?}", r.natural_key.value),
-                );
-                let entry = map.entry(key).or_insert(Lsn(0));
+                let entry = map.entry(dedup_key(r)).or_insert(Lsn(0));
                 if r.lsn > *entry {
                     *entry = r.lsn;
                 }
@@ -14456,12 +14731,8 @@ impl Database {
             map
         };
         rows.retain(|r| {
+            let key = dedup_key(r);
             if r.deleted {
-                let key = (
-                    r.table.clone(),
-                    r.natural_key.column.clone(),
-                    format!("{:?}", r.natural_key.value),
-                );
                 // Keep the delete unless there is a subsequent insert (higher or equal LSN).
                 // Equal LSN means the delete+insert are part of the same upsert transaction.
                 match insert_max_lsn.get(&key) {
@@ -14469,7 +14740,12 @@ impl Database {
                     None => true,
                 }
             } else {
-                true
+                // A full-history replay (`changes_since(Lsn(0))`) walks every
+                // version a row ever had, so an updated row appears once per
+                // version. Keep only its latest, so the changeset carries the
+                // row's CURRENT value once — otherwise a first-writer-wins apply
+                // (`InsertIfNotExists`) would resurrect a superseded value.
+                insert_max_lsn.get(&key) == Some(&r.lsn)
             }
         });
 
@@ -14963,10 +15239,10 @@ impl Database {
                                 remote_sorted.sort();
                                 if local_sorted != remote_sorted {
                                     result.conflicts.push(Conflict {
-                                    natural_key: NaturalKey {
-                                        column: "table".to_string(),
-                                        value: Value::Text(name.clone()),
-                                    },
+                                    natural_key: NaturalKey::single(
+                                        "table".to_string(),
+                                        Value::Text(name.clone()),
+                                    ),
                                     resolution: ConflictPolicy::ServerWins,
                                     reason: Some(format!(
                                         "schema mismatch: local columns {:?} differ from remote {:?}",
@@ -14974,6 +15250,48 @@ impl Database {
                                     )),
                                 });
                                 }
+                            }
+                            // Adopt the arriving declaration's policy for a table
+                            // that already exists here undeclared — the same
+                            // adoption the AlterTable path performs, so a hub does
+                            // not silently keep its own default over an edge's
+                            // declared conflict policy, direction, or retention.
+                            let incoming = rough_sync_table_meta(
+                                &columns,
+                                &constraints,
+                                &foreign_keys,
+                                &composite_foreign_keys,
+                                &composite_unique,
+                            );
+                            if let Some(mut meta) = self.table_meta(&name)
+                                && (meta.conflict_policy != incoming.conflict_policy
+                                    || meta.sync_direction != incoming.sync_direction
+                                    || meta.default_ttl_seconds != incoming.default_ttl_seconds
+                                    || meta.sync_safe != incoming.sync_safe
+                                    || meta.retain_declared_unit != incoming.retain_declared_unit)
+                            {
+                                let old_meta = meta.clone();
+                                meta.conflict_policy = incoming.conflict_policy;
+                                meta.sync_direction = incoming.sync_direction;
+                                meta.default_ttl_seconds = incoming.default_ttl_seconds;
+                                meta.sync_safe = incoming.sync_safe;
+                                meta.retain_declared_unit = incoming.retain_declared_unit;
+                                let meta = self.replace_table_meta_and_refresh_auto_indexes(
+                                    &name, &old_meta, meta,
+                                )?;
+                                self.persist_table_meta(&name, &meta)?;
+                                // Relay the adoption onward: allocate an LSN and
+                                // log an AlterTable so a DIFFERENT edge pulling
+                                // later receives the declared policy/direction/
+                                // retention instead of the hub's older undeclared
+                                // CreateTable. Without this the declaration stops
+                                // at the hub. Mirrors the AlterTable door.
+                                self.allocate_ddl_lsn(|lsn| {
+                                    self.log_alter_table_ddl(&name, &meta, lsn)
+                                })?;
+                                self.clear_statement_cache();
+                                table_meta_cache.remove(&name);
+                                applied_rows_cache.remove(&name);
                             }
                             continue;
                         }
@@ -15230,6 +15548,18 @@ impl Database {
                             if !incoming.composite_foreign_keys.is_empty() {
                                 meta.composite_foreign_keys = incoming.composite_foreign_keys;
                             }
+                            // Retention and direction ride the full constraint
+                            // set every AlterTable emitter carries, so the
+                            // receiver takes the writer's post-alter policy
+                            // verbatim — a changed direction, a newly declared
+                            // window, or a dropped one. Reconstructed from the
+                            // arriving constraints exactly as CreateTable is,
+                            // closing the same gap on the ALTER door.
+                            meta.default_ttl_seconds = incoming.default_ttl_seconds;
+                            meta.sync_safe = incoming.sync_safe;
+                            meta.retain_declared_unit = incoming.retain_declared_unit;
+                            meta.sync_direction = incoming.sync_direction;
+                            meta.conflict_policy = incoming.conflict_policy;
                             let meta = self.replace_table_meta_and_refresh_auto_indexes(
                                 &name, &old_meta, meta,
                             )?;
@@ -15399,18 +15729,19 @@ impl Database {
                 continue;
             }
 
-            let policy = policies
-                .per_table
-                .get(&row.table)
-                .copied()
-                .unwrap_or(policies.default);
+            // Resolve by the table's DECLARED policy (carried on its meta),
+            // honoring what the application wrote instead of only the uniform
+            // default the hub was handed — the same resolution the projection
+            // paths use.
+            let row_meta = cached_table_meta(self, &mut table_meta_cache, &row.table);
+            let policy =
+                Self::sync_conflict_policy_for_table(policies, row_meta.as_ref(), &row.table);
 
-            let row_has_vector = cached_table_meta(self, &mut table_meta_cache, &row.table)
-                .is_some_and(|meta| {
-                    meta.columns
-                        .iter()
-                        .any(|col| matches!(col.column_type, ColumnType::Vector(_)))
-                });
+            let row_has_vector = row_meta.as_ref().is_some_and(|meta| {
+                meta.columns
+                    .iter()
+                    .any(|col| matches!(col.column_type, ColumnType::Vector(_)))
+            });
             if !row.deleted && non_vector_delete_phase_open {
                 self.commit_with_source(tx, CommitSource::SyncPull)?;
                 tx = self.begin()?;
@@ -15458,8 +15789,7 @@ impl Database {
                 self,
                 &applied_rows_cache,
                 &row.table,
-                &row.natural_key.column,
-                &row.natural_key.value,
+                &row.natural_key,
                 self.snapshot(),
                 &skip_deleted,
             ) {
@@ -15827,7 +16157,7 @@ impl Database {
                         match self.upsert_row_for_sync(
                             tx,
                             &row.table,
-                            &row.natural_key.column,
+                            &row.natural_key,
                             values.clone(),
                             row.created_at,
                         ) {
@@ -15883,20 +16213,17 @@ impl Database {
                                     row.lsn,
                                 );
                                 result.applied_rows += 1;
-                                if row_has_vector
-                                    && vector_row_ids.get(vector_row_idx).is_some()
-                                    && let Ok(Some(found)) = self.point_lookup_in_tx(
-                                        tx,
-                                        &row.table,
-                                        &row.natural_key.column,
-                                        &row.natural_key.value,
-                                        self.snapshot(),
-                                    )
-                                {
+                                if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                    // The upsert preserves `local.row_id` (the
+                                    // WHOLE-key-resolved target) across its
+                                    // delete+reinsert, so attach the vector there
+                                    // directly. A leading-column re-lookup would
+                                    // pick the wrong sibling when two rows share
+                                    // that column.
                                     consume_vector_row_group(
                                         &vector_row_ids,
                                         &mut vector_row_idx,
-                                        found.row_id,
+                                        local.row_id,
                                         &mut vector_row_map,
                                     );
                                 }
@@ -15950,7 +16277,7 @@ impl Database {
                     match self.upsert_row_for_sync(
                         tx,
                         &row.table,
-                        &row.natural_key.column,
+                        &row.natural_key,
                         values.clone(),
                         row.created_at,
                     ) {
@@ -15981,20 +16308,15 @@ impl Database {
                                 row.lsn,
                             );
                             result.applied_rows += 1;
-                            if row_has_vector
-                                && vector_row_ids.get(vector_row_idx).is_some()
-                                && let Ok(Some(found)) = self.point_lookup_in_tx(
-                                    tx,
-                                    &row.table,
-                                    &row.natural_key.column,
-                                    &row.natural_key.value,
-                                    self.snapshot(),
-                                )
-                            {
+                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                // Attach to the WHOLE-key-resolved row the upsert
+                                // preserved, not a leading-column re-lookup that
+                                // would pick the wrong sibling (see the LatestWins
+                                // arm).
                                 consume_vector_row_group(
                                     &vector_row_ids,
                                     &mut vector_row_idx,
-                                    found.row_id,
+                                    local.row_id,
                                     &mut vector_row_map,
                                 );
                             }
@@ -16108,14 +16430,18 @@ impl Database {
         if vectors.is_empty() {
             return;
         }
+        // Key on the WHOLE natural key, not the leading column alone: two
+        // composite-PK rows that share only their leading key are DIFFERENT rows,
+        // and folding them together drops the second row's synthesized owner
+        // change — leaving its vector with no remote-to-local mapping on the
+        // receiver. The same whole-key basis the row-upsert dedup uses.
         let mut represented = rows
             .iter()
             .filter(|row| !row.deleted)
             .map(|row| {
                 (
                     row.table.clone(),
-                    row.natural_key.column.clone(),
-                    format!("{:?}", row.natural_key.value),
+                    format!("{:?}", row.natural_key.pairs()),
                     row.lsn,
                 )
             })
@@ -16137,8 +16463,7 @@ impl Database {
             };
             let key = (
                 vector.index.table.clone(),
-                natural_key.column.clone(),
-                format!("{:?}", natural_key.value),
+                format!("{:?}", natural_key.pairs()),
                 vector.lsn,
             );
             if !represented.insert(key) {
@@ -16189,21 +16514,14 @@ impl Database {
         row: &VersionedRow,
     ) -> Option<(NaturalKey, HashMap<String, Value>)> {
         let meta = self.relational_store.table_meta.read();
-        let key_col = meta.get(table).and_then(natural_key_column_for_meta)?;
+        let natural_key = natural_key_from_row_values(meta.get(table)?, &row.values)?;
 
-        let key_val = row.values.get(&key_col)?.clone();
         let values = row
             .values
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<HashMap<_, _>>();
-        Some((
-            NaturalKey {
-                column: key_col,
-                value: key_val,
-            },
-            values,
-        ))
+        Some((natural_key, values))
     }
 
     fn row_id_for_natural_key(
@@ -16220,6 +16538,24 @@ impl Database {
             .iter()
             .rev()
             .find(|row| row.visible_at(snapshot) && row.values.get(key_col) == Some(key_value))
+            .map(|row| row.row_id)
+    }
+
+    /// The visible row carrying a whole sync identity, matched on every key
+    /// column — the composite-aware sibling of [`Self::row_id_for_natural_key`].
+    fn row_id_for_natural_key_full(
+        &self,
+        table: &str,
+        natural_key: &NaturalKey,
+        snapshot: SnapshotId,
+    ) -> Option<RowId> {
+        self.relational_store
+            .tables
+            .read()
+            .get(table)?
+            .iter()
+            .rev()
+            .find(|row| row.visible_at(snapshot) && natural_key.matches_values(&row.values))
             .map(|row| row.row_id)
     }
 
@@ -16514,12 +16850,11 @@ fn rank_float_desc(left: f32, right: f32) -> std::cmp::Ordering {
 fn projected_point_lookup(
     cache: &HashMap<String, Vec<VersionedRow>>,
     table: &str,
-    col: &str,
-    value: &Value,
+    natural_key: &NaturalKey,
 ) -> Option<VersionedRow> {
     cache
         .get(table)
-        .and_then(|rows| rows.iter().find(|r| r.values.get(col) == Some(value)))
+        .and_then(|rows| rows.iter().find(|r| natural_key.matches_values(&r.values)))
         .cloned()
 }
 
@@ -16527,18 +16862,25 @@ fn sync_visible_point_lookup(
     db: &Database,
     cache: &HashMap<String, Vec<VersionedRow>>,
     table: &str,
-    col: &str,
-    value: &Value,
+    natural_key: &NaturalKey,
     snapshot: SnapshotId,
     skip_deleted: &HashSet<RowId>,
 ) -> Result<Option<VersionedRow>> {
-    if let Some(projected) = projected_point_lookup(cache, table, col, value) {
+    if let Some(projected) = projected_point_lookup(cache, table, natural_key) {
         return Ok(Some(projected));
     }
     if db.table_meta(table).is_none() {
         return Err(Error::TableNotFound(table.to_string()));
     }
-    db.required_indexed_visible_row_by_column(table, col, value, snapshot, skip_deleted)
+    // Match the arriving row on its WHOLE identity — every key column — so two
+    // rows that share only a leading key column stay distinct on apply.
+    db.required_indexed_visible_row_by_columns(
+        table,
+        &natural_key.key_columns(),
+        &natural_key.key_values(),
+        snapshot,
+        skip_deleted,
+    )
 }
 
 fn record_cached_insert(
@@ -17769,24 +18111,11 @@ fn row_is_prunable(
         return false;
     }
 
-    let Some(default_ttl_seconds) = meta.default_ttl_seconds else {
-        return false;
-    };
-
-    if let Some(expires_column) = &meta.expires_column {
-        match row.values.get(expires_column) {
-            Some(Value::Timestamp(millis)) if *millis == i64::MAX => return false,
-            Some(Value::Timestamp(millis)) if *millis < 0 => return true,
-            Some(Value::Timestamp(millis)) => return (*millis as u64) <= now.0,
-            Some(Value::Null) | None => {}
-            Some(_) => {}
-        }
-    }
-
-    let ttl_millis = default_ttl_seconds.saturating_mul(1000);
-    row.created_at
-        .map(|created_at| now.0.saturating_sub(created_at.0) > ttl_millis)
-        .unwrap_or(false)
+    // The expiry judgement itself — EXPIRES-column precedence, then the
+    // created_at + window fallback — is shared with the serve-time sync filter
+    // so the two never disagree about a row. Only the SYNC SAFE delivery pin
+    // above is prune-local; expiry is not.
+    meta.retained_row_has_expired(&row.values, row.created_at, now)
 }
 
 fn max_tx_across_all(
@@ -18642,7 +18971,9 @@ fn sync_column_type_with_foreign_key(
 
 fn sync_constraint_is_table_element(constraint: &str) -> bool {
     let upper = normalize_schema_type(constraint).to_ascii_uppercase();
-    upper.starts_with("UNIQUE") || upper.starts_with("FOREIGN KEY")
+    upper.starts_with("UNIQUE")
+        || upper.starts_with("FOREIGN KEY")
+        || upper.starts_with("PRIMARY KEY")
 }
 
 fn sync_constraint_is_vector_rename(constraint: &str) -> bool {
@@ -18713,6 +19044,35 @@ fn ddl_unique_constraints(constraints: &[String]) -> Vec<Vec<String>> {
             (!columns.is_empty()).then_some(columns)
         })
         .collect()
+}
+
+/// The columns of a table-level `PRIMARY KEY (a, b, ...)` carried in an
+/// arriving DDL's constraint strings — the receiver's reconstruction of the
+/// multi-column sync identity. A single-column primary key rides its column's
+/// type token, not a table-level constraint, so it is not seen here.
+fn ddl_primary_key_columns(constraints: &[String]) -> Vec<String> {
+    for constraint in constraints {
+        let upper = normalize_schema_type(constraint).to_ascii_uppercase();
+        if !upper.starts_with("PRIMARY KEY") {
+            continue;
+        }
+        let Some(start) = constraint.find('(') else {
+            continue;
+        };
+        let Some(end_offset) = constraint[start + 1..].find(')') else {
+            continue;
+        };
+        let end = start + 1 + end_offset;
+        let columns = constraint[start + 1..end]
+            .split(',')
+            .map(|column| column.trim().to_string())
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if !columns.is_empty() {
+            return columns;
+        }
+    }
+    Vec::new()
 }
 
 fn sync_vector_rename_constraint(from: &str, to: &str) -> String {
@@ -18826,14 +19186,55 @@ fn merge_sync_alter_existing_column(current: &mut ColumnDef, incoming: ColumnDef
     }
 }
 
-/// Whether a synced DDL constraint spells the refused two-way posture on a
-/// retained table. Matched on the rendered constraint text because that is the
-/// shape table DDL travels in; the local paths refuse the same spelling at the
-/// parsed-statement level.
-fn constraint_declares_two_way_retention(constraint: &str) -> bool {
+/// The direction a synced DDL constraint declares, if it is a direction
+/// clause at all. Matched on the rendered constraint text because that is the
+/// shape table DDL travels in; the local doors read the same words off the
+/// parsed statement.
+fn constraint_declares_sync_direction(constraint: &str) -> Option<SyncDirection> {
     let upper = constraint.to_ascii_uppercase();
     let normalized = upper.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.starts_with("RETAIN ") && normalized.contains("TWO WAY")
+    [
+        SyncDirection::None,
+        SyncDirection::Push,
+        SyncDirection::Pull,
+        SyncDirection::Both,
+    ]
+    .into_iter()
+    .find(|direction| normalized == direction.sql())
+}
+
+/// The conflict policy a synced DDL constraint declares — so the receiving
+/// machine reconstructs the SAME declaration the writer made rather than a
+/// defaulted one, exactly as it does for the direction clause.
+fn constraint_declares_conflict_policy(constraint: &str) -> Option<ConflictPolicy> {
+    let upper = constraint.to_ascii_uppercase();
+    let normalized = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+    [
+        ConflictPolicy::InsertIfNotExists,
+        ConflictPolicy::LatestWins,
+    ]
+    .into_iter()
+    .find(|policy| policy.declared_clause() == Some(normalized.as_str()))
+}
+
+/// The retention window a synced DDL constraint declares — seconds plus the
+/// unit it was written in — so the receiving machine reconstructs the SAME
+/// declaration the writer made rather than a defaulted one.
+fn constraint_declares_retention(constraint: &str) -> Option<(u64, RetainUnit)> {
+    let upper = constraint.to_ascii_uppercase();
+    let mut words = upper.split_whitespace();
+    if words.next() != Some("RETAIN") {
+        return None;
+    }
+    let amount = words.next()?.parse::<u64>().ok()?;
+    let unit = match words.next()? {
+        "SECONDS" | "SECOND" => RetainUnit::Seconds,
+        "MINUTES" | "MINUTE" => RetainUnit::Minutes,
+        "HOURS" | "HOUR" => RetainUnit::Hours,
+        "DAYS" | "DAY" => RetainUnit::Days,
+        _ => return None,
+    };
+    Some((amount.saturating_mul(unit.seconds_multiplier()), unit))
 }
 
 /// Whether a synced DDL constraint declares the `SYNC SAFE` delivery promise.
@@ -18894,10 +19295,16 @@ fn refuse_keyless_sync_safe_sync_ddl(
     crate::executor::refuse_sync_safe_without_key_for(name, &meta)
 }
 
-/// Refuse arriving table DDL that declares a two-way retained table, on BOTH
-/// the CreateTable and AlterTable arrival paths. Returns before any projection
-/// or apply work, so a refused statement leaves existing metadata untouched.
-fn refuse_two_way_retained_sync_ddl(change: &DdlChange) -> Result<()> {
+/// Refuse arriving table DDL whose delivery promise has nowhere to deliver, on
+/// BOTH the CreateTable and AlterTable arrival paths — exactly as the local
+/// CREATE and ALTER doors refuse it. Returns before any projection or apply
+/// work, so a refused statement leaves existing metadata untouched. Without
+/// this a peer could install here the declaration every local door rejects,
+/// and this engine would hold rows that never expire on its behalf.
+fn refuse_undeliverable_promise_sync_ddl(
+    projected: &HashMap<String, TableMeta>,
+    change: &DdlChange,
+) -> Result<()> {
     let (name, constraints) = match change {
         DdlChange::CreateTable {
             name, constraints, ..
@@ -18907,19 +19314,23 @@ fn refuse_two_way_retained_sync_ddl(change: &DdlChange) -> Result<()> {
         } => (name, constraints),
         _ => return Ok(()),
     };
-    if constraints
+    let arriving_direction = constraints
         .iter()
-        .any(|constraint| constraint_declares_two_way_retention(constraint))
-    {
-        return Err(Error::SchemaInvalid {
-            reason: format!(
-                "table '{name}' arrived declaring a retained table as TWO WAY; a RETAIN table is \
-                 delivered one way (edge -> hub), so the declaration is refused rather than \
-                 silently converted"
-            ),
-        });
-    }
-    Ok(())
+        .find_map(|constraint| constraint_declares_sync_direction(constraint));
+    // An ALTER that names no direction leaves the one the table already has.
+    let direction = arriving_direction.or_else(|| {
+        matches!(change, DdlChange::AlterTable { .. })
+            .then(|| {
+                projected
+                    .get(name)
+                    .map(crate::executor::effective_sync_direction)
+            })
+            .flatten()
+    });
+    let sync_safe = constraints.iter().any(|c| constraint_declares_sync_safe(c))
+        || (matches!(change, DdlChange::AlterTable { .. })
+            && projected.get(name).is_some_and(|meta| meta.sync_safe));
+    crate::executor::refuse_promise_with_no_delivery(name, sync_safe, direction)
 }
 
 fn rough_sync_table_meta(
@@ -18954,6 +19365,10 @@ fn rough_sync_table_meta(
         }
     }
 
+    let retention = constraints
+        .iter()
+        .find_map(|constraint| constraint_declares_retention(constraint));
+
     let mut meta = TableMeta {
         columns: column_defs,
         immutable: constraints
@@ -18964,13 +19379,19 @@ fn rough_sync_table_meta(
         unique_constraints,
         natural_key_column: None,
         propagation_rules: Vec::new(),
-        default_ttl_seconds: None,
-        sync_safe: false,
+        default_ttl_seconds: retention.map(|(seconds, _)| seconds),
+        sync_safe: constraints.iter().any(|c| constraint_declares_sync_safe(c)),
         expires_column: None,
         indexes: Vec::new(),
         composite_foreign_keys: composite_foreign_keys.to_vec(),
-        retained_sync_policy: None,
-        retain_declared_unit: None,
+        sync_direction: constraints
+            .iter()
+            .find_map(|constraint| constraint_declares_sync_direction(constraint)),
+        retain_declared_unit: retention.map(|(_, unit)| unit),
+        primary_key_columns: ddl_primary_key_columns(constraints),
+        conflict_policy: constraints
+            .iter()
+            .find_map(|constraint| constraint_declares_conflict_policy(constraint)),
     };
     meta.indexes = crate::executor::auto_indexes_for_table_meta(&meta);
     meta
@@ -19203,6 +19624,13 @@ fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
         constraints.push(format!("UNIQUE ({})", unique_constraint.join(", ")));
     }
 
+    if !ct.primary_key_columns.is_empty() {
+        constraints.push(format!(
+            "PRIMARY KEY ({})",
+            ct.primary_key_columns.join(", ")
+        ));
+    }
+
     for fk in &ct.composite_foreign_keys {
         constraints.push(format!(
             "FOREIGN KEY ({}) REFERENCES {}({})",
@@ -19274,12 +19702,40 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
         constraints.push(format!("DAG({edge_types})"));
     }
 
+    // Carried in the unit it was DECLARED in: the receiving machine
+    // reconstructs this text back into its own meta, and a re-spelled window
+    // would reconstruct a declaration nobody wrote. The window itself is
+    // stored in seconds, so two edges that spell the same window differently
+    // still agree on when rows expire.
     if let Some(ttl_seconds) = meta.default_ttl_seconds {
-        constraints.push(retain_clause_from_meta(meta, ttl_seconds, false));
+        constraints.push(retain_clause_from_meta(meta, ttl_seconds));
+    }
+
+    // The direction travels with the definition, as its own constraint string,
+    // so the receiving machine honors the policy that was declared rather than
+    // one nobody wrote.
+    if let Some(direction) = meta.sync_direction {
+        constraints.push(direction.sql().to_string());
+    }
+
+    // The conflict policy travels the same way, so the hub honors the
+    // declaration the table carries instead of a uniform rule it hardcodes.
+    if let Some(clause) = meta
+        .conflict_policy
+        .and_then(|policy| policy.declared_clause())
+    {
+        constraints.push(clause.to_string());
     }
 
     for unique_constraint in &meta.unique_constraints {
         constraints.push(format!("UNIQUE ({})", unique_constraint.join(", ")));
+    }
+
+    if !meta.primary_key_columns.is_empty() {
+        constraints.push(format!(
+            "PRIMARY KEY ({})",
+            meta.primary_key_columns.join(", ")
+        ));
     }
 
     for fk in &meta.composite_foreign_keys {
@@ -19336,12 +19792,12 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
 /// Foreign-key propagation is rendered on its owning column (see
 /// `sql_type_for_meta_column`), so `PropagationRule::ForeignKey` is skipped
 /// here — matching the sync DDL emitter's split.
-/// The declared retention clause, policy included. The one-way direction is
-/// rendered explicitly so an operator reading `.schema` — or an edge receiving
-/// this DDL over sync — sees the contract the table actually carries.
-fn retain_clause_from_meta(meta: &TableMeta, ttl_seconds: u64, as_declared: bool) -> String {
-    let window = match (as_declared, meta.retain_declared_unit) {
-        (true, Some(unit)) if unit.seconds_multiplier() != 0 => {
+/// The declared retention clause, in the unit it was written in. Direction is
+/// a separate clause: this one says only when rows expire, and whether their
+/// expiry waits on delivery.
+fn retain_clause_from_meta(meta: &TableMeta, ttl_seconds: u64) -> String {
+    let window = match meta.retain_declared_unit {
+        Some(unit) if unit.seconds_multiplier() != 0 => {
             format!("{} {}", ttl_seconds / unit.seconds_multiplier(), unit.sql())
         }
         _ => ttl_seconds_to_sql(ttl_seconds),
@@ -19349,9 +19805,6 @@ fn retain_clause_from_meta(meta: &TableMeta, ttl_seconds: u64, as_declared: bool
     let mut clause = format!("RETAIN {window}");
     if meta.sync_safe {
         clause.push_str(" SYNC SAFE");
-        if meta.retained_sync_policy == Some(RetainedSyncPolicy::PushOnly) {
-            clause.push_str(" PUSH ONLY");
-        }
     }
     clause
 }
@@ -19360,7 +19813,23 @@ pub(crate) fn retain_and_propagate_clauses_from_meta(meta: &TableMeta) -> Vec<St
     let mut clauses = Vec::new();
 
     if let Some(ttl_seconds) = meta.default_ttl_seconds {
-        clauses.push(retain_clause_from_meta(meta, ttl_seconds, true));
+        clauses.push(retain_clause_from_meta(meta, ttl_seconds));
+    }
+
+    // Rendered only when it was DECLARED, so `.schema` gives the declaration
+    // back as it was written and an undeclared table shows no restriction for
+    // an operator to puzzle over.
+    if let Some(direction) = meta.sync_direction {
+        clauses.push(direction.sql().to_string());
+    }
+
+    // The conflict policy renders the same way: back verbatim when declared, and
+    // nothing at all for the non-overwriting default.
+    if let Some(clause) = meta
+        .conflict_policy
+        .and_then(|policy| policy.declared_clause())
+    {
+        clauses.push(clause.to_string());
     }
 
     let mut propagate = Vec::new();
@@ -19588,10 +20057,7 @@ mod commit_index_reconstruction_tests {
         ChangeLogEntry::RowDelete {
             table: table.to_string(),
             row_id,
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Null,
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Null),
             lsn,
         }
     }
@@ -20149,6 +20615,11 @@ mod currency_version_compaction_tests {
         // index-panics — the canonical scheduling-dependent verdict flip.
         db.__set_currency_maintenance_interval(Duration::from_secs(3600));
         const N: i64 = 120;
+        // Record a mid-range watermark straight from the ledger during the
+        // churn. A full pull already converges each identity to its current
+        // version, so the changeset carries one row, not N — a mid-range LSN
+        // comes from the clock at the midpoint, not from indexing the changeset.
+        let mut mid_lsn = Lsn(0);
         for advertised_at in 1..=N {
             crate::work_ledger::advertise_capability(
                 &db,
@@ -20158,9 +20629,10 @@ mod currency_version_compaction_tests {
                 advertised_at,
             )
             .expect("advertise");
+            if advertised_at == N / 2 {
+                mid_lsn = db.current_lsn();
+            }
         }
-        // Record a mid-range LSN for the watermark-regressed re-push case.
-        let mid_lsn = db.changes_since(Lsn(0)).rows[N as usize / 2].lsn;
 
         db.compact_currency_versions().expect("compact");
 

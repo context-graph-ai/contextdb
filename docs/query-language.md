@@ -6,7 +6,7 @@ contextdb's query language is built on three standards:
 - **pgvector conventions** — `<=>` operator for cosine similarity in `ORDER BY`
 - **SQL/PGQ-style graph queries** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded graph traversal (not a full standard implementation)
 
-On top of these, contextdb adds **declarative policy primitives**: `IMMUTABLE`, `STATE MACHINE`, `DAG`, `RETAIN`, and `PROPAGATE`. These are contextdb-specific extensions — everything else should feel familiar if you've used PostgreSQL.
+On top of these, contextdb adds **declarative policy primitives**: `IMMUTABLE`, `STATE MACHINE`, `DAG`, `RETAIN`, `SYNC`, and `PROPAGATE`. These are contextdb-specific extensions — everything else should feel familiar if you've used PostgreSQL.
 
 contextdb ships with no built-in tables or schema. You define your own tables and attach these primitives to whichever columns need them. The example tables in this reference (`documents`, `tasks`, `items`, `media`, and so on) are illustrative only — stand-ins for whatever schema you design, not something contextdb provides.
 
@@ -30,7 +30,7 @@ CREATE TABLE documents (
 ) IMMUTABLE
 ```
 
-See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, and PROPAGATE.
+See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, SYNC, and PROPAGATE.
 
 Later examples in this reference also use a second illustrative table, `items`:
 
@@ -55,9 +55,12 @@ ALTER TABLE t DROP [COLUMN] col
 ALTER TABLE t RENAME COLUMN old TO new
 ALTER TABLE t SET RETAIN 7 DAYS [SYNC SAFE]
 ALTER TABLE t DROP RETAIN
-ALTER TABLE t SET SYNC_CONFLICT_POLICY 'latest_wins'
-ALTER TABLE t DROP SYNC_CONFLICT_POLICY
+ALTER TABLE t SET SYNC OFF | SYNC PUSH ONLY | SYNC PULL ONLY | SYNC TWO WAY
 ```
+
+A table's conflict policy is declared on the table itself with the
+`SYNC CONFLICT KEEP FIRST | KEEP LATEST` clause (see CREATE TABLE), not set
+through a separate statement.
 
 ### DROP TABLE
 
@@ -170,7 +173,6 @@ ROLLBACK
 ### Configuration
 
 ```sql
-SET SYNC_CONFLICT_POLICY 'latest_wins'
 SHOW SYNC_CONFLICT_POLICY
 SET MEMORY_LIMIT '512M'
 SHOW MEMORY_LIMIT
@@ -456,6 +458,25 @@ CREATE TABLE edges (
 
 A duplicate `(source_id, target_id, edge_type)` tuple is a silent no-op — the second INSERT returns `Ok(rows_affected=0)` and the row count is unchanged, making agent operations idempotent. Rows that share individual column values but differ in at least one constrained column are allowed. Rows with `NULL` in any constrained column do not participate in the composite uniqueness check.
 
+### Composite Primary Key
+
+When a row's identity is a combination of columns — not a single surrogate key — declare it with a table-level `PRIMARY KEY (col, col, ...)`:
+
+```sql
+CREATE TABLE metric_windows (
+  machine_id TEXT NOT NULL,
+  sensor_id TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  value INTEGER NOT NULL,
+  PRIMARY KEY (machine_id, sensor_id, metric, window_start)
+)
+```
+
+The whole declared tuple is the row's identity everywhere it matters, including across synchronization: two machines writing the same `(machine_id, sensor_id, metric, window_start)` are the same row, and two rows differing in only one key column — even a later one such as `window_start` — are distinct rows and both survive a sync. Re-declaring the identical tuple is a duplicate and is refused. The columns are matched in the order declared, and the declaration round-trips through `.schema` and travels with synced DDL to a receiving machine.
+
+Use a table-level `PRIMARY KEY (...)` for a multi-column key only; a single-column key stays the column-level `id UUID PRIMARY KEY` form. A table-level `PRIMARY KEY (...)` cannot be combined with a column-level `PRIMARY KEY`, and its columns must exist and be exact-matchable (not `REAL`, `JSON`, or `VECTOR`). A table that promises cross-machine delivery (`RETAIN ... SYNC SAFE`) satisfies its key requirement with a multi-column primary key just as it would with a single-column one. A composite `UNIQUE` constraint or a multi-column index is a uniqueness or lookup rule, never the sync identity — only `PRIMARY KEY` is.
+
 ### Foreign Key State Propagation
 
 Trigger a state change on this row when the referenced row transitions:
@@ -519,7 +540,7 @@ Inserting an edge that would create a cycle returns `CycleDetected`. Duplicate `
 
 ### RETAIN
 
-Automatic row expiry. Units: `SECONDS`, `MINUTES`, `HOURS`, `DAYS`. Optional `SYNC SAFE` delays purging until synced:
+Automatic row expiry. Units: `SECONDS`, `MINUTES`, `HOURS`, `DAYS`. Optional `SYNC SAFE` means a row is not expired here until the destination confirms it received it:
 
 ```sql
 CREATE TABLE scratch (
@@ -533,6 +554,65 @@ Can also be set via ALTER TABLE:
 ```sql
 ALTER TABLE scratch SET RETAIN 7 DAYS
 ALTER TABLE scratch DROP RETAIN
+```
+
+`RETAIN` says only WHEN rows expire and `SYNC SAFE` says only that expiry waits on delivery. Neither decides where rows travel — that is the separate `SYNC` clause below. Writing a direction inside the retention clause (`RETAIN 24 HOURS SYNC SAFE PUSH ONLY`) is a parse error naming the clause to use instead.
+
+### SYNC
+
+Where a table's rows travel under synchronization. It applies to retained and non-retained tables alike, persists with the table definition, renders in `.schema`, and travels with the definition to other machines:
+
+```sql
+CREATE TABLE windows (
+  id UUID PRIMARY KEY,
+  body TEXT
+) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY
+```
+
+| Clause | Meaning |
+|---|---|
+| `SYNC OFF` | rows stay on the machine that wrote them |
+| `SYNC PUSH ONLY` | rows go out and never come back |
+| `SYNC PULL ONLY` | rows arrive from other machines; nothing local goes out |
+| `SYNC TWO WAY` | rows travel both ways |
+
+A table that declares no direction is `SYNC TWO WAY` — the default, and the recovery contract: delete a machine's database, recreate it against the same tenant, and every still-live row comes back.
+
+Changeable on an existing table:
+
+```sql
+ALTER TABLE windows SET SYNC PULL ONLY
+```
+
+`SYNC SAFE` with a direction that never delivers the table (`SYNC OFF` or `SYNC PULL ONLY`) is refused when it is written — at `CREATE`, at `ALTER`, and when the definition arrives from another machine. The promise could never be kept, so the rows would simply never expire. Plain `RETAIN` with no delivery promise may declare any direction, including `SYNC OFF` for a colocated installation that keeps one copy.
+
+### SYNC CONFLICT
+
+Which value survives when the same row is written on more than one machine, or the same key is re-sent. Like the direction clause, it is declared on the table itself, persists with the definition, renders in `.schema`, and travels with the synced definition to other machines, so the durable hub honors the table's declared policy:
+
+```sql
+CREATE TABLE observations (
+  id UUID PRIMARY KEY,
+  body TEXT
+) SYNC CONFLICT KEEP FIRST
+```
+
+| Clause | Meaning |
+|---|---|
+| `SYNC CONFLICT KEEP FIRST` | write-once — the first value written for a key stays; a re-send of that key does not overwrite it |
+| `SYNC CONFLICT KEEP LATEST` | last-writer-wins — a re-send of a key replaces the value already there |
+
+A table that declares no policy is `SYNC CONFLICT KEEP FIRST` — the non-overwriting default, so a re-send of an existing key never silently rewrites it.
+
+On a hub the policy is resolved in one order: a system table's baked policy wins first, then the table's own declaration, then the default. So an application table always gets exactly the policy it declared, while the engine's own distributed tables keep the policy their contract requires.
+
+The policy composes with the retention and direction clauses on one table:
+
+```sql
+CREATE TABLE windows (
+  id UUID PRIMARY KEY,
+  body TEXT
+) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP FIRST
 ```
 
 ### PROPAGATE ON EDGE

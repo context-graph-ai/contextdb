@@ -196,21 +196,50 @@ impl ChangeSet {
     }
 }
 
+/// Every column that makes up a table's sync identity, in the order the
+/// identity is declared. A row is told apart from another by ALL of these
+/// columns together — for a table-level `PRIMARY KEY (a, b, ...)` that is every
+/// listed column, in declaration order. Precedence matches the single-column
+/// resolver: an explicit override, then a multi-column primary key, then a
+/// single-column primary key, then a literal `id` column. `None` means the
+/// table has no identity and its rows are keyless-skipped from sync.
+pub(crate) fn natural_key_columns_for_meta(meta: &TableMeta) -> Option<Vec<String>> {
+    if let Some(column) = &meta.natural_key_column {
+        return Some(vec![column.clone()]);
+    }
+    if !meta.primary_key_columns.is_empty() {
+        return Some(meta.primary_key_columns.clone());
+    }
+    if let Some(column) = meta.columns.iter().find(|column| column.primary_key) {
+        return Some(vec![column.name.clone()]);
+    }
+    if meta.columns.iter().any(|column| column.name == "id") {
+        return Some(vec!["id".to_string()]);
+    }
+    None
+}
+
+/// The leading identity column — the first of [`natural_key_columns_for_meta`].
+/// Callers that only need to know a table HAS an identity (the `SYNC SAFE`
+/// gate) or that name the leading column keep using this; the full identity is
+/// resolved through the columns variant above.
 pub(crate) fn natural_key_column_for_meta(meta: &TableMeta) -> Option<String> {
-    meta.natural_key_column
-        .clone()
-        .or_else(|| {
-            meta.columns
-                .iter()
-                .find(|column| column.primary_key)
-                .map(|column| column.name.clone())
-        })
-        .or_else(|| {
-            meta.columns
-                .iter()
-                .find(|column| column.name == "id")
-                .map(|_| "id".to_string())
-        })
+    natural_key_columns_for_meta(meta).map(|mut columns| columns.remove(0))
+}
+
+/// Build the whole identity of a row from a table's key columns and the row's
+/// values. `None` when the table is keyless or the row is missing a key column.
+pub(crate) fn natural_key_from_row_values(
+    meta: &TableMeta,
+    values: &HashMap<String, Value>,
+) -> Option<NaturalKey> {
+    let columns = natural_key_columns_for_meta(meta)?;
+    let mut pairs = Vec::with_capacity(columns.len());
+    for column in columns {
+        let value = values.get(&column)?.clone();
+        pairs.push((column, value));
+    }
+    NaturalKey::from_pairs(pairs)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -616,19 +645,90 @@ struct DropRouteFields {
     table: String,
 }
 
+/// A row's sync identity. `column`/`value` are the LEADING key column and its
+/// value; `rest` carries every further key column, in declared order, each
+/// paired with its own value. `rest` is a required field — msgpack encodes this
+/// struct as a sequence, so a single-column key encodes as a three-element
+/// sequence with an EMPTY `rest`, which is the one current shape. A multi-column
+/// `PRIMARY KEY (a, b, c)` puts `a` in the flat fields and `b, c` in `rest` —
+/// the whole tuple is what tells one row from another across machines. The
+/// obsolete two-element encoding is rejected at decode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NaturalKey {
     pub column: String,
     pub value: Value,
+    pub rest: Vec<(String, Value)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ConflictPolicy {
-    InsertIfNotExists,
-    ServerWins,
-    EdgeWins,
-    LatestWins,
+impl NaturalKey {
+    /// A single-column identity — the shape every keyless-`id` and
+    /// single-`PRIMARY KEY` table carries.
+    pub fn single(column: String, value: Value) -> Self {
+        Self {
+            column,
+            value,
+            rest: Vec::new(),
+        }
+    }
+
+    /// Build an identity from its ordered `(column, value)` components. The
+    /// first pair is the leading key; the remainder are `rest`. `None` when the
+    /// component list is empty (a keyless row carries no identity).
+    pub fn from_pairs(mut pairs: Vec<(String, Value)>) -> Option<Self> {
+        if pairs.is_empty() {
+            return None;
+        }
+        let (column, value) = pairs.remove(0);
+        Some(Self {
+            column,
+            value,
+            rest: pairs,
+        })
+    }
+
+    /// The identity's column names in declared order (leading first).
+    pub fn key_columns(&self) -> Vec<String> {
+        let mut columns = Vec::with_capacity(1 + self.rest.len());
+        columns.push(self.column.clone());
+        columns.extend(self.rest.iter().map(|(column, _)| column.clone()));
+        columns
+    }
+
+    /// The identity's `(column, value)` components in declared order (leading
+    /// first) — a stable, whole-identity view for keying and diagnostics.
+    pub fn pairs(&self) -> Vec<(String, Value)> {
+        let mut pairs = Vec::with_capacity(1 + self.rest.len());
+        pairs.push((self.column.clone(), self.value.clone()));
+        pairs.extend(self.rest.iter().cloned());
+        pairs
+    }
+
+    /// The identity's values in the same order as [`Self::key_columns`].
+    pub fn key_values(&self) -> Vec<Value> {
+        let mut values = Vec::with_capacity(1 + self.rest.len());
+        values.push(self.value.clone());
+        values.extend(self.rest.iter().map(|(_, value)| value.clone()));
+        values
+    }
+
+    /// Whether a row's values carry this whole identity — every key column
+    /// present and equal. The composite-aware replacement for a single
+    /// `values.get(col) == Some(value)` check.
+    pub fn matches_values(&self, values: &HashMap<String, Value>) -> bool {
+        if values.get(&self.column) != Some(&self.value) {
+            return false;
+        }
+        self.rest
+            .iter()
+            .all(|(column, value)| values.get(column) == Some(value))
+    }
 }
+
+// The conflict-policy vocabulary lives in `contextdb-core`, next to the
+// `TableMeta` that persists it, so the DDL clause, the stored declaration and
+// this apply-side resolver can never drift into two different enums — the same
+// placement `SyncDirection` uses.
+pub use contextdb_core::ConflictPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictPolicies {
@@ -660,10 +760,7 @@ pub struct Conflict {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SyncDirection {
-    Push,
-    Pull,
-    Both,
-    None,
-}
+// The direction vocabulary lives in `contextdb-core`, next to the `TableMeta`
+// that persists it, so the DDL clause, the stored declaration and this filter
+// can never drift into two different enums.
+pub use contextdb_core::SyncDirection;

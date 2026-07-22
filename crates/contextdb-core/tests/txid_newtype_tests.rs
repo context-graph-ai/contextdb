@@ -407,15 +407,14 @@ fn wire_struct_round_trip_byte_identical() {
     );
 
     // ---------- RowChange ----------
-    // NaturalKey is a struct with named fields `column: String` and `value: Value`
-    // (NOT a newtype over Vec<Value>). The mirror below replicates that exact shape.
+    // NaturalKey is a struct with named fields `column: String`, `value: Value`, and
+    // `rest: Vec<(String, Value)>` (the trailing columns of a composite key; empty for a
+    // single-column identity). It is NOT a newtype over Vec<Value>. The mirror below
+    // replicates that exact shape.
     use contextdb_engine::sync_types::NaturalKey;
     let row_change = RowChange {
         table: "t".into(),
-        natural_key: NaturalKey {
-            column: "id".to_string(),
-            value: Value::Int64(1),
-        },
+        natural_key: NaturalKey::single("id".to_string(), Value::Int64(1)),
         values: HashMap::new(),
         deleted: false,
         lsn: Lsn(11),
@@ -430,6 +429,7 @@ fn wire_struct_round_trip_byte_identical() {
     struct NaturalKeyMirror {
         column: String,
         value: Value,
+        rest: Vec<(String, Value)>,
     }
     #[derive(Serialize, Deserialize)]
     struct RowChangeMirror {
@@ -446,6 +446,7 @@ fn wire_struct_round_trip_byte_identical() {
         natural_key: NaturalKeyMirror {
             column: "id".to_string(),
             value: Value::Int64(1),
+            rest: Vec::new(),
         },
         values: HashMap::new(),
         deleted: false,

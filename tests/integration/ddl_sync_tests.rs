@@ -756,10 +756,7 @@ fn ds10e_sync_apply_exact_natural_keys_do_not_scan_visible_tables() {
                 rows: vec![
                     RowChange {
                         table: "items".into(),
-                        natural_key: NaturalKey {
-                            column: "id".into(),
-                            value: Value::Int64(7),
-                        },
+                        natural_key: NaturalKey::single("id".into(), Value::Int64(7)),
                         values: vals(vec![("id", Value::Int64(7))]),
                         deleted: true,
                         lsn: Lsn(100),
@@ -767,10 +764,7 @@ fn ds10e_sync_apply_exact_natural_keys_do_not_scan_visible_tables() {
                     },
                     RowChange {
                         table: "items".into(),
-                        natural_key: NaturalKey {
-                            column: "id".into(),
-                            value: Value::Int64(900),
-                        },
+                        natural_key: NaturalKey::single("id".into(), Value::Int64(900)),
                         values: vals(vec![
                             ("id", Value::Int64(900)),
                             ("code", Value::Text("code-200".into())),
@@ -782,10 +776,7 @@ fn ds10e_sync_apply_exact_natural_keys_do_not_scan_visible_tables() {
                     },
                     RowChange {
                         table: "items".into(),
-                        natural_key: NaturalKey {
-                            column: "id".into(),
-                            value: Value::Int64(901),
-                        },
+                        natural_key: NaturalKey::single("id".into(), Value::Int64(901)),
                         values: vals(vec![
                             ("id", Value::Int64(901)),
                             ("code", Value::Text("remote-901".into())),
@@ -847,10 +838,7 @@ fn ds10f_sync_preflight_new_fk_column_parent_delete_does_not_scan_child_table() 
                 ddl_lsn: vec![Lsn(10)],
                 rows: vec![RowChange {
                     table: "p".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Int64(1),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
                     values: vals(vec![("id", Value::Int64(1))]),
                     deleted: true,
                     lsn: Lsn(11),
@@ -915,10 +903,7 @@ fn ds10g_sync_preflight_existing_column_new_fk_parent_delete_uses_existing_index
                 ddl_lsn: vec![Lsn(10)],
                 rows: vec![RowChange {
                     table: "p".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Int64(1),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
                     values: vals(vec![("id", Value::Int64(1))]),
                     deleted: true,
                     lsn: Lsn(11),
@@ -982,10 +967,7 @@ fn ds10h_sync_preflight_existing_column_new_fk_parent_delete_without_index_rejec
                 ddl_lsn: vec![Lsn(10)],
                 rows: vec![RowChange {
                     table: "p".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Int64(1),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Int64(1)),
                     values: vals(vec![("id", Value::Int64(1))]),
                     deleted: true,
                     lsn: Lsn(11),
@@ -1063,10 +1045,7 @@ fn ds10i_sync_preflight_projected_parent_unique_uses_existing_parent_index() {
                 ddl_lsn: vec![Lsn(10), Lsn(11)],
                 rows: vec![RowChange {
                     table: "c".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Int64(10),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Int64(10)),
                     values: vals(vec![
                         ("id", Value::Int64(10)),
                         ("p_code", Value::Text("p1".into())),
@@ -1139,10 +1118,7 @@ fn ds10j_sync_preflight_projected_parent_unique_without_index_rejects_before_sch
                 ddl_lsn: vec![Lsn(10), Lsn(11)],
                 rows: vec![RowChange {
                     table: "c".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Int64(10),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Int64(10)),
                     values: vals(vec![
                         ("id", Value::Int64(10)),
                         ("p_code", Value::Text("p1".into())),
@@ -1240,10 +1216,7 @@ fn ds10k_sync_vector_shape_alter_preserves_projected_parent_unique_for_fk_prefli
                 ddl_lsn: vec![Lsn(10), Lsn(11)],
                 rows: vec![RowChange {
                     table: "c".into(),
-                    natural_key: NaturalKey {
-                        column: "id".into(),
-                        value: Value::Int64(10),
-                    },
+                    natural_key: NaturalKey::single("id".into(), Value::Int64(10)),
                     values: vals(vec![
                         ("id", Value::Int64(10)),
                         ("p_code", Value::Text("p1".into())),

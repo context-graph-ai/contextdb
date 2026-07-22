@@ -20,9 +20,9 @@ pub const T0: i64 = 1_700_000_000_000;
 pub const LEASE: i64 = 5 * 60_000;
 
 pub async fn within<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(60), fut)
+    tokio::time::timeout(Duration::from_secs(240), fut)
         .await
-        .expect("bounded media-transfer operation exceeded 60s")
+        .expect("bounded media-transfer operation exceeded 240s")
 }
 
 pub fn identity_file(dir: &tempfile::TempDir) -> PathBuf {

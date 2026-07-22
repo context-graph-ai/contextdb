@@ -1138,10 +1138,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
         rows: vec![
             RowChange {
                 table: "t".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(uuid_a),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(uuid_a)),
                 values: {
                     let mut v = HashMap::new();
                     v.insert("id".to_string(), Value::Uuid(uuid_a));
@@ -1155,10 +1152,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
             },
             RowChange {
                 table: "t".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(uuid_b),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(uuid_b)),
                 values: {
                     let mut v = HashMap::new();
                     v.insert("id".to_string(), Value::Uuid(uuid_b));
@@ -1173,10 +1167,7 @@ async fn a10_vector_mapping_survives_failed_inserts() {
             },
             RowChange {
                 table: "t".to_string(),
-                natural_key: NaturalKey {
-                    column: "id".to_string(),
-                    value: Value::Uuid(uuid_c),
-                },
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(uuid_c)),
                 values: {
                     let mut v = HashMap::new();
                     v.insert("id".to_string(), Value::Uuid(uuid_c));
@@ -1453,10 +1444,7 @@ async fn a13_pull_pagination_fetches_all_pages() {
         values.insert("data".to_string(), Value::Text(format!("row_{}", i)));
         rows.push(RowChange {
             table: "t".to_string(),
-            natural_key: NaturalKey {
-                column: "id".to_string(),
-                value: Value::Uuid(id),
-            },
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
             values,
             deleted: false,
             lsn: Lsn(0),
@@ -1632,10 +1620,7 @@ fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
     let changeset = ChangeSet {
         rows: vec![RowChange {
             table: "t".to_string(),
-            natural_key: NaturalKey {
-                column: "pk".to_string(),
-                value: Value::Uuid(pk),
-            },
+            natural_key: NaturalKey::single("pk".to_string(), Value::Uuid(pk)),
             values,
             deleted: false,
             lsn: contextdb_core::Lsn(1),
@@ -1751,10 +1736,7 @@ fn sync_apply_rejects_peer_txid_u64_max() {
     let changeset = ChangeSet {
         rows: vec![RowChange {
             table: "t".to_string(),
-            natural_key: NaturalKey {
-                column: "pk".to_string(),
-                value: Value::Uuid(pk),
-            },
+            natural_key: NaturalKey::single("pk".to_string(), Value::Uuid(pk)),
             values,
             deleted: false,
             lsn: contextdb_core::Lsn(1),
@@ -1840,10 +1822,7 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
         values.insert("x".to_string(), Value::TxId(TxId(51 + i)));
         row_changes.push(RowChange {
             table: "t".to_string(),
-            natural_key: NaturalKey {
-                column: "pk".to_string(),
-                value: Value::Uuid(pk),
-            },
+            natural_key: NaturalKey::single("pk".to_string(), Value::Uuid(pk)),
             values,
             deleted: false,
             lsn: contextdb_core::Lsn(100 + i),
