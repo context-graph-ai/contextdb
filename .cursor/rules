@@ -1,0 +1,3 @@
+Read AGENTS.md at the repo root first — it routes to everything else.
+Using contextdb (CLI or library)? Start at the skills index in AGENTS.md, then skills/<name>/SKILL.md.
+Changing this repo? The five-step verification gate in AGENTS.md is binding; check crates/<crate>/AGENTS.md for crate-local rules.
