@@ -71,14 +71,14 @@ DROP TABLE t
 ### CREATE TRIGGER
 
 ```sql
-CREATE TRIGGER document_seen ON documents WHEN INSERT
-CREATE TRIGGER item_changed ON items WHEN UPDATE
-DROP TRIGGER document_seen
+CREATE TRIGGER document_seen ON documents WHEN INSERT;
+CREATE TRIGGER item_changed ON items WHEN UPDATE;
+DROP TRIGGER document_seen;
 ```
 
-`CREATE TRIGGER` declares a host-callback ObservationTrigger. The callback is
+`CREATE TRIGGER` declares a host-callback Trigger. The callback is
 registered through the Rust API with `Database::register_trigger_callback` and
-activated by `Database::complete_initialization`. ObservationTriggers are for
+activated by `Database::complete_initialization`. Triggers are for
 transactional observation and cascade writes; they are not validation triggers.
 Use `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` for engine-enforced
 invariants.
@@ -162,23 +162,23 @@ Predicate writes keep their existing contract. `UPDATE ... WHERE pk = $id` and
 ### Transactions
 
 ```sql
-BEGIN
+BEGIN;
 -- statements
-COMMIT
+COMMIT;
 
 -- or
-ROLLBACK
+ROLLBACK;
 ```
 
 ### Configuration
 
 ```sql
-SHOW SYNC_CONFLICT_POLICY
-SET MEMORY_LIMIT '512M'
-SHOW MEMORY_LIMIT
-SET DISK_LIMIT '1G'
-SET DISK_LIMIT 'none'
-SHOW DISK_LIMIT
+SHOW SYNC_CONFLICT_POLICY;
+SET MEMORY_LIMIT '512M';
+SHOW MEMORY_LIMIT;
+SET DISK_LIMIT '1G';
+SET DISK_LIMIT 'none';
+SHOW DISK_LIMIT;
 ```
 
 `SHOW MEMORY_LIMIT` returns `limit`, `used`, `available`, and `startup_ceiling`.
@@ -552,8 +552,8 @@ CREATE TABLE scratch (
 Can also be set via ALTER TABLE:
 
 ```sql
-ALTER TABLE scratch SET RETAIN 7 DAYS
-ALTER TABLE scratch DROP RETAIN
+ALTER TABLE scratch SET RETAIN 7 DAYS;
+ALTER TABLE scratch DROP RETAIN;
 ```
 
 `RETAIN` says only WHEN rows expire and `SYNC SAFE` says only that expiry waits on delivery. Neither decides where rows travel — that is the separate `SYNC` clause below. Writing a direction inside the retention clause (`RETAIN 24 HOURS SYNC SAFE PUSH ONLY`) is a parse error naming the clause to use instead.
@@ -578,10 +578,16 @@ CREATE TABLE windows (
 
 A table that declares no direction is `SYNC TWO WAY` — the default, and the recovery contract: delete a machine's database, recreate it against the same tenant, and every still-live row comes back.
 
-Changeable on an existing table:
+Changeable on an existing table — but `windows` is `SYNC SAFE`, and `SYNC SAFE` combined with `SYNC PULL ONLY` can never deliver the table outward for a destination to confirm, so this is refused (see below):
 
 ```sql
-ALTER TABLE windows SET SYNC PULL ONLY
+ALTER TABLE windows SET SYNC PULL ONLY;
+```
+
+On a table without `SYNC SAFE`, the same direction change is accepted:
+
+```sql
+ALTER TABLE items SET SYNC PULL ONLY;
 ```
 
 `SYNC SAFE` with a direction that never delivers the table (`SYNC OFF` or `SYNC PULL ONLY`) is refused when it is written — at `CREATE`, at `ALTER`, and when the definition arrives from another machine. The promise could never be kept, so the rows would simply never expire. Plain `RETAIN` with no delivery promise may declare any direction, including `SYNC OFF` for a colocated installation that keeps one copy.

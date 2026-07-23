@@ -5008,6 +5008,24 @@ fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violatio
     }
 }
 
+// The published three-bucket contract (`docs/architecture.md:352-359`,
+// `docs/cli.md:239`) says `conflicts` records ONLY genuine divergence
+// between two peers, and `skipped_rows` records a policy or context
+// refusal. This test's original assertion required the OPPOSITE for an
+// access-scope refusal — that it produce BOTH a skip AND a `Conflict`
+// record naming the hidden row's natural key. That premise contradicted the
+// documented contract and is corrected in place below (assertions only; the
+// scenario, table shape, and every other value are unchanged).
+// Access/context refusals are skipped-ONLY, no conflict record — the
+// receiver genuinely refused the row (nothing to leak, nothing to disagree
+// about), and a `Conflict` naming a natural key the receiver cannot see
+// would leak that the hidden row exists at all, which the access boundary
+// exists to prevent. The security ordering — the access gate runs before
+// the identical-row no-op check — is UNCHANGED and correct: a receiver must
+// never compare an incoming row's content against local state it is not
+// entitled to see, so an access-hidden row is always a refusal, even when
+// its content happens to be byte-identical to what the receiver cannot look
+// at.
 #[test]
 fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
     let db = Database::open_memory();
@@ -5064,16 +5082,19 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
         .expect("scoped sync apply must skip hidden incoming rows, not abort");
 
     assert_eq!(result.applied_rows, 1);
-    assert_eq!(result.skipped_rows, 1);
+    assert_eq!(
+        result.skipped_rows, 1,
+        "the hidden row is still refused — an access-scope refusal is genuine \
+         refused work, so it counts as skipped"
+    );
     assert!(
-        result.conflicts.iter().any(|conflict| {
-            conflict.natural_key.value == Value::Uuid(hidden_id)
-                && conflict
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("hidden by access scope"))
-        }),
-        "hidden incoming row must be reported as a skipped conflict: {:?}",
+        result.conflicts.is_empty(),
+        "an access-scope refusal must NOT produce a Conflict record — conflicts \
+         are reserved for genuine divergence between two peers that both saw \
+         and disagree on the same row. A receiver refusing to look at a row it \
+         cannot see has nothing to disagree about, and a conflict record naming \
+         the row's natural key would leak that the hidden row exists at all — \
+         exactly what the access boundary exists to prevent. Got {:?}",
         result.conflicts
     );
     let visible = scoped
@@ -5092,6 +5113,105 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
     assert!(
         hidden.rows.is_empty(),
         "hidden incoming sync row must not be stored by the scoped receiver"
+    );
+}
+
+/// GUARD, alongside the corrected test above: the access-refusal fix must not
+/// bleed into rows the scoped receiver CAN see. Two rows at the SAME natural
+/// key, both tagged with the receiver's OWN visible context (no access
+/// hiding involved anywhere in this scenario) but carrying GENUINELY
+/// DIFFERENT content, is real divergence a conflict policy must actually
+/// decide on — it must still produce exactly one `Conflict` record, with a
+/// reason that names the POLICY that resolved it (`"server_wins"`), never the
+/// access-scope reason, proving the two refusal classes stay genuinely
+/// distinct.
+#[test]
+fn scoped_sync_apply_genuine_divergence_within_visible_scope_still_conflicts() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID, data TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let ctx_a = sarg_uuid(0xA);
+    let row_id = sarg_uuid(0xC1);
+    let scoped = db.scoped_with_contexts(sarg_contexts(&[ctx_a]));
+
+    // The receiver already holds its OWN value for this key, within its own
+    // visible context — never hidden, never synced from anywhere.
+    scoped
+        .execute(
+            "INSERT INTO t (id, context_id, data) VALUES ($id, $context_id, $data)",
+            &params(vec![
+                ("id", Value::Uuid(row_id)),
+                ("context_id", Value::Uuid(ctx_a)),
+                ("data", Value::Text("local-version".to_string())),
+            ]),
+        )
+        .unwrap();
+
+    // An incoming row at the SAME key, the SAME (fully visible) context, but
+    // GENUINELY DIFFERENT content — a real competing write the receiver can
+    // see in full, not a re-delivery and not access-hidden.
+    let result = scoped
+        .apply_changes(
+            sync::ChangeSet {
+                rows: vec![sync::RowChange {
+                    table: "t".to_string(),
+                    natural_key: sync::NaturalKey::single("id".to_string(), Value::Uuid(row_id)),
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Uuid(row_id)),
+                        ("context_id".to_string(), Value::Uuid(ctx_a)),
+                        (
+                            "data".to_string(),
+                            Value::Text("incoming-version".to_string()),
+                        ),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(1),
+                    created_at: None,
+                }],
+                ..sync::ChangeSet::default()
+            },
+            &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        )
+        .expect("scoped sync apply of a genuinely diverging visible row must not abort");
+
+    assert_eq!(
+        result.skipped_rows, 1,
+        "ServerWins declines the incoming row, so it counts as skipped: {result:?}"
+    );
+    assert_eq!(
+        result.conflicts.len(),
+        1,
+        "a genuine divergence within fully visible scope must still be reported \
+         as exactly one conflict: {:?}",
+        result.conflicts
+    );
+    let conflict = &result.conflicts[0];
+    assert_eq!(
+        conflict.natural_key,
+        sync::NaturalKey::single("id".to_string(), Value::Uuid(row_id)),
+        "the conflict must name the genuinely diverging row: {conflict:?}"
+    );
+    assert_eq!(
+        conflict.reason.as_deref(),
+        Some("server_wins"),
+        "the reason must name the POLICY that resolved it, never the \
+         access-scope reason — this scenario has no hidden row anywhere: \
+         {conflict:?}"
+    );
+
+    let local = scoped
+        .execute(
+            "SELECT data FROM t WHERE id = $id",
+            &params(vec![("id", Value::Uuid(row_id))]),
+        )
+        .unwrap();
+    assert_eq!(
+        local.rows,
+        vec![vec![Value::Text("local-version".to_string())]],
+        "ServerWins keeps the receiver's own value through the genuine conflict"
     );
 }
 

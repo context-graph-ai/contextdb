@@ -5,8 +5,12 @@ edition = "2024"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 readme = "../../README.md"
 description = "Embedded database engine for agentic memory — relational, graph, and vector under unified MVCC transactions"
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 test-seams = ["contextdb-vector/test-seams"]

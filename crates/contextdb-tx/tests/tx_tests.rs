@@ -1,5 +1,5 @@
 use contextdb_core::{Error, Lsn, RowId, SnapshotId, TxId, VersionedRow};
-use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
+use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +27,7 @@ fn begin_is_monotonic() {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     assert_eq!(txm.begin(), TxId(1));
     assert_eq!(txm.begin(), TxId(2));
     assert_eq!(txm.begin(), TxId(3));
@@ -35,7 +35,7 @@ fn begin_is_monotonic() {
 
 #[test]
 fn snapshot_advances_on_commit() {
-    let txm = TxManager::new(MockStore {
+    let txm = TransactionManager::new(MockStore {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });
@@ -52,7 +52,7 @@ fn snapshot_advances_on_commit() {
 
 #[test]
 fn rollback_does_not_advance_snapshot() {
-    let txm = TxManager::new(MockStore {
+    let txm = TransactionManager::new(MockStore {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });
@@ -63,7 +63,7 @@ fn rollback_does_not_advance_snapshot() {
 
 #[test]
 fn commit_updates_watermark() {
-    let txm = TxManager::new(MockStore {
+    let txm = TransactionManager::new(MockStore {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });
@@ -87,7 +87,7 @@ fn commit_updates_watermark() {
 
 #[test]
 fn empty_commit_does_not_advance_snapshot_or_lsn() {
-    let txm = TxManager::new(MockStore {
+    let txm = TransactionManager::new(MockStore {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });
@@ -104,7 +104,7 @@ fn empty_commit_does_not_advance_snapshot_or_lsn() {
 
 #[test]
 fn double_commit_returns_tx_not_found() {
-    let txm = TxManager::new(MockStore {
+    let txm = TransactionManager::new(MockStore {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });
@@ -116,7 +116,7 @@ fn double_commit_returns_tx_not_found() {
 
 #[test]
 fn double_rollback_returns_tx_not_found() {
-    let txm = TxManager::new(MockStore {
+    let txm = TransactionManager::new(MockStore {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });
@@ -128,7 +128,7 @@ fn double_rollback_returns_tx_not_found() {
 
 #[test]
 fn late_lower_tx_is_reassigned_above_watermark() {
-    let txm = TxManager::new(MockStore {
+    let txm = TransactionManager::new(MockStore {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     });

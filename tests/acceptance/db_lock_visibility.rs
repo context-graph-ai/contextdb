@@ -141,12 +141,12 @@ fn t19_03_sequential_cross_process_open_sees_prior_commits() {
     let path = tmp.path().join("seq.redb");
 
     let script = "\
-CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)
-INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'row-0')
-INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'row-1')
-INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'row-2')
-INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'row-3')
-INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'row-4')
+CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);
+INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'row-0');
+INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'row-1');
+INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'row-2');
+INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'row-3');
+INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'row-4');
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(

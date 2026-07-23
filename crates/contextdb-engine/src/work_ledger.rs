@@ -1505,7 +1505,7 @@ pub fn advertised_tags(db: &Database, node_id: &str) -> Result<Vec<String>> {
 /// - [`contextdb_core::Error::InputRequiresBlobResolver`] if any of the
 ///   job's inputs is a `blob_ref` — its bytes never ride the ledger, so the
 ///   caller must fetch it through the blob resolver
-///   (`contextdb-server`'s `blob_resolver::BlobService::resolve_blob_ref`)
+///   (`contextdb-server`'s `blob_resolver::BlobStore::resolve_blob_ref`)
 ///   instead of this function.
 pub fn materialize_inputs(
     db: &Database,

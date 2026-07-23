@@ -1,6 +1,6 @@
 //! The media-transfer demo caller: a minimal product-neutral layer over the
 //! work ledger's `blob_ref` reference kind and the blob_ref resolver
-//! (`contextdb_server::blob_resolver::BlobService`). It demonstrates
+//! (`contextdb_server::blob_resolver::BlobStore`). It demonstrates
 //! real-machine media-transfer scenarios: version-gate
 //! evidence, entitlement/policy enforcement, hub blob-bytes isolation, and
 //! tamper detection.
@@ -35,7 +35,8 @@ use contextdb_engine::work_ledger::{
     self as ledger, BlobHash, ClaimInsert, InputRef, JobSpec, MovementPolicy, REF_KIND_BLOB_REF,
     insert_claim, install_work_ledger_schema, job_snapshot, submit_job,
 };
-use contextdb_server::blob_resolver::{BlobService, ResolveError};
+use contextdb_server::blob_resolver::{BlobStore, ResolveError};
+use contextdb_server::exit_codes::{EXIT_ERROR, verdict_exit_code};
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::{FabricIdentity, SyncClient};
 use std::path::PathBuf;
@@ -134,13 +135,6 @@ fn wall_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Exit code for a scenario whose observed outcome DEVIATED from its intent —
-/// a legitimate resolve that failed, or a rogue resolve that unexpectedly
-/// succeeded. Kept distinct from the `2` used at the setup/operational-error
-/// sites above so a caller/CI can tell "the scenario ran but its security /
-/// transfer outcome was wrong" apart from "the demo could not even start".
-const EXIT_OUTCOME_DEVIATION: i32 = 3;
-
 /// The outcome of a resolve-style scenario, tagged by which role produced it
 /// and therefore what result was INTENDED. The legitimate consumer is meant to
 /// succeed; the rogue is meant to be refused. `scenario_exit_code` turns this
@@ -164,21 +158,23 @@ enum ScenarioOutcome {
     RogueInconclusive,
 }
 
-/// Map a scenario outcome to a process exit code: `0` when the observed
-/// outcome matched intent (legit resolve succeeded, or rogue was refused),
-/// otherwise `EXIT_OUTCOME_DEVIATION`.
+/// Map a scenario outcome to a process exit code through the shared verdict
+/// helper: `0` when the observed outcome matched intent (legit resolve
+/// succeeded, or rogue was refused), otherwise a definitive failure. A
+/// deviation is an ordinary failure of this run — it deliberately does NOT get
+/// a code of its own, because `3` means exactly one thing across every
+/// contextdb binary (a push whose outcome the hub never confirmed, where
+/// re-pushing is the safe move), and a rogue that got through is not that.
 fn scenario_exit_code(outcome: &ScenarioOutcome) -> i32 {
-    match outcome {
+    verdict_exit_code(matches!(
+        outcome,
         // Outcome matched intent: the transfer worked, or the rogue was
-        // refused as it should be.
-        ScenarioOutcome::LegitResolveOk | ScenarioOutcome::RogueRefused => 0,
-        // Outcome deviated from intent: a real transfer failure, a rogue that
-        // got through (a security hole), or a rogue check that could not
-        // complete because of an infra failure (so it proved nothing).
-        ScenarioOutcome::LegitResolveErr
-        | ScenarioOutcome::RogueUnexpectedOk
-        | ScenarioOutcome::RogueInconclusive => EXIT_OUTCOME_DEVIATION,
-    }
+        // refused as it should be. Everything else — a real transfer failure,
+        // a rogue that got through (a security hole), or a rogue check that
+        // could not complete because of an infra failure (so it proved
+        // nothing) — deviated.
+        ScenarioOutcome::LegitResolveOk | ScenarioOutcome::RogueRefused
+    ))
 }
 
 /// Print a human-readable final pass/fail line for `outcome`, then exit the
@@ -213,7 +209,7 @@ fn open_node(
             "(one process per store: if another demo command is running against this \
              database, stop it first)"
         );
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     }));
     install_work_ledger_schema(&db).expect("install work ledger schema");
     install_peer_directory_schema(&db).expect("install peer directory schema");
@@ -356,11 +352,11 @@ async fn run_holder(
     let (db, client, node_id, identity_path) = open_node(db_path, endpoint, tenant);
     let auto_propagate = policy != "off";
     let movement = MovementPolicy { auto_propagate };
-    let holder = BlobService::new(db.clone(), movement, identity_path.clone());
+    let holder = BlobStore::new(db.clone(), movement, identity_path.clone());
 
     let hash = holder.ingest_file(file).unwrap_or_else(|err| {
         eprintln!("ingest failed: {err}");
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     });
     println!("hash={}", hash.to_hex());
 
@@ -410,7 +406,7 @@ async fn run_holder(
     let serve_spec = format!("iroh:?identity={}{relay_suffix}", serve_identity.display());
     let serve_endpoint = IrohServer::bind(&serve_spec).await.unwrap_or_else(|err| {
         eprintln!("cannot bind serving endpoint: {err}");
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     });
     eprintln!("[holder] serving endpoint bound (relay={relay})");
     holder.serve_on(&serve_endpoint);
@@ -464,18 +460,18 @@ async fn run_consumer(db_path: &str, endpoint: &str, tenant: &str, job_id: &str)
         ),
         Err(err) => {
             eprintln!("[consumer] pull failed: {err}");
-            std::process::exit(2);
+            std::process::exit(EXIT_ERROR);
         }
     }
 
     let Some(snapshot) = job_snapshot(&db, job_id).expect("job snapshot read") else {
         eprintln!("[consumer] job {job_id} not present after pull");
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     };
     let submitter_node_id = snapshot.submitter_node_id.clone();
     let Some(hash) = blob_hash_of_job(&snapshot.input_refs) else {
         eprintln!("[consumer] job {job_id} carries no blob_ref input");
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     };
 
     let now = wall_now_ms();
@@ -507,10 +503,10 @@ async fn run_consumer(db_path: &str, endpoint: &str, tenant: &str, job_id: &str)
     );
     let Some(ticket) = ticket else {
         eprintln!("[consumer] no directory entry for holder {submitter_node_id}");
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     };
 
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         db,
         MovementPolicy {
             auto_propagate: true,
@@ -570,7 +566,7 @@ async fn run_rogue(
     let (db, _client, node_id, identity_path) = open_node(db_path, endpoint, tenant);
     let hash = BlobHash::from_hex(hash_hex).unwrap_or_else(|err| {
         eprintln!("bad --hash: {err}");
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     });
 
     // Forge a job + claim entirely LOCAL to this node's own ledger mirror —
@@ -591,7 +587,7 @@ async fn run_rogue(
     // Deliberately never pushed to the hub — a rogue's forged rows must
     // never even leave this box to attempt the deception.
 
-    let rogue = BlobService::new(
+    let rogue = BlobStore::new(
         db,
         MovementPolicy {
             auto_propagate: true,
@@ -624,7 +620,7 @@ async fn run_rogue(
 fn run_scan_hub(db_path: &str, marker: &str) {
     let db = Database::open(db_path).unwrap_or_else(|err| {
         eprintln!("cannot open hub db {db_path}: {err}");
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     });
 
     let marker_hex = hex_encode_lower(marker.as_bytes());
@@ -661,6 +657,12 @@ fn run_scan_hub(db_path: &str, marker: &str) {
     println!("hub_marker_found={marker_found}");
     println!("hub_has_job_rows={has_job_rows}");
     println!("hub_has_claim_rows={has_claim_rows}");
+
+    // The scan exists to prove the marker never reached the hub's own store. A
+    // hit is the failure it was looking for, so it must fail the process — a
+    // caller branching on the exit status would otherwise read a leak as a
+    // clean pass.
+    std::process::exit(verdict_exit_code(!marker_found));
 }
 
 fn run_backend_evidence() {
@@ -686,7 +688,7 @@ fn run_backend_evidence() {
     let lockfile = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
     let Ok(contents) = std::fs::read_to_string(&lockfile) else {
         eprintln!("could not run `cargo tree` or read {}", lockfile.display());
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     };
     let mut lines = contents.lines();
     while let Some(line) = lines.next() {
@@ -699,7 +701,7 @@ fn run_backend_evidence() {
         }
     }
     eprintln!("iroh-blobs not found in {}", lockfile.display());
-    std::process::exit(2);
+    std::process::exit(EXIT_ERROR);
 }
 
 #[cfg(test)]
@@ -708,12 +710,12 @@ mod tests {
 
     // The legitimate consumer resolve is expected to SUCCEED; a printed
     // `resolve=ERR ...` (e.g. HolderUnreachable) is a real failure, so it must
-    // exit with the distinct non-zero deviation code, not 0.
+    // exit non-zero.
     #[test]
     fn legit_resolve_failure_exits_nonzero() {
         assert_eq!(
             scenario_exit_code(&ScenarioOutcome::LegitResolveErr),
-            EXIT_OUTCOME_DEVIATION
+            EXIT_ERROR
         );
         assert_ne!(scenario_exit_code(&ScenarioOutcome::LegitResolveErr), 0);
     }
@@ -732,7 +734,7 @@ mod tests {
     fn rogue_infra_failure_is_not_counted_as_refused() {
         assert_eq!(
             scenario_exit_code(&ScenarioOutcome::RogueInconclusive),
-            EXIT_OUTCOME_DEVIATION
+            EXIT_ERROR
         );
         assert_ne!(scenario_exit_code(&ScenarioOutcome::RogueInconclusive), 0);
     }
@@ -743,7 +745,7 @@ mod tests {
     fn rogue_unexpected_success_exits_nonzero() {
         assert_eq!(
             scenario_exit_code(&ScenarioOutcome::RogueUnexpectedOk),
-            EXIT_OUTCOME_DEVIATION
+            EXIT_ERROR
         );
         assert_ne!(scenario_exit_code(&ScenarioOutcome::RogueUnexpectedOk), 0);
     }
@@ -754,10 +756,25 @@ mod tests {
         assert_eq!(scenario_exit_code(&ScenarioOutcome::LegitResolveOk), 0);
     }
 
-    // The deviation code is distinct from the setup/operational-error code (2).
+    // A deviation never borrows the push-unconfirmed code: `3` means
+    // "re-pushing is the safe move", which is never true of a failed scenario.
     #[test]
-    fn deviation_code_is_distinct_from_setup_error() {
-        assert_ne!(EXIT_OUTCOME_DEVIATION, 0);
-        assert_ne!(EXIT_OUTCOME_DEVIATION, 2);
+    fn deviation_code_is_never_the_unconfirmed_push_code() {
+        let deviation = scenario_exit_code(&ScenarioOutcome::RogueUnexpectedOk);
+        assert_ne!(deviation, 0);
+        assert_ne!(
+            deviation,
+            contextdb_server::exit_codes::EXIT_INTERRUPTED_PUSH_UNCONFIRMED
+        );
+    }
+
+    // A marker found in the hub's own store is the leak the scan looks for, so
+    // it must fail the process rather than print `hub_marker_found=true` and
+    // exit 0.
+    #[test]
+    fn a_marker_hit_fails_the_scan() {
+        let marker_found = true;
+        assert_eq!(verdict_exit_code(!marker_found), EXIT_ERROR);
+        assert_eq!(verdict_exit_code(!false), 0);
     }
 }

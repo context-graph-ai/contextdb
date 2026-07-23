@@ -142,7 +142,7 @@ pub struct WorkerConfig {
     /// still fails at [`ledger::materialize_inputs`] with
     /// [`contextdb_core::Error::InputRequiresBlobResolver`]. Inert until
     /// `poll_and_execute_once` is taught to consult it.
-    pub blob_service: Option<Arc<crate::blob_resolver::BlobService>>,
+    pub blob_store: Option<Arc<crate::blob_resolver::BlobStore>>,
     /// When `true`, this worker must not claim its OWN submissions ahead of
     /// their `deadline_ms` — leaving them for another node to pick up first
     /// — and may only claim them itself once the deadline has passed.
@@ -171,7 +171,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("advertised_tags", &self.advertised_tags)
             .field("movement_policy", &self.movement_policy)
             .field("lease_duration_ms", &self.lease_duration_ms)
-            .field("blob_service", &self.blob_service.is_some())
+            .field("blob_store", &self.blob_store.is_some())
             .field(
                 "defer_own_submissions_until_deadline",
                 &self.defer_own_submissions_until_deadline,
@@ -375,19 +375,19 @@ fn read_ledger_input_rows(
     Ok(out)
 }
 
-/// Resolve a job's inputs through the worker's blob service, for the ONE
+/// Resolve a job's inputs through the worker's blob store, for the ONE
 /// case [`ledger::materialize_inputs`] itself refuses:
 /// [`contextdb_core::Error::InputRequiresBlobResolver`], i.e. at least one
 /// input is a `blob_ref`. Nothing here names a work class (Rule: class-
 /// blind) — it only walks `job.input_refs` in order, resolving each
-/// `blob_ref` node-to-node via `blob_service.resolve_blob_ref` (dialing the
+/// `blob_ref` node-to-node via `blob_store.resolve_blob_ref` (dialing the
 /// submitter's ticket from the fabric peer directory) and recovering any
 /// interleaved ledger-carried bytes straight from `work_inputs`, assembling
 /// the result in the job's own input-sequence order.
 async fn resolve_blob_job_inputs(
     db: &contextdb_engine::Database,
     job: &JobSnapshot,
-    blob_service: &crate::blob_resolver::BlobService,
+    blob_store: &crate::blob_resolver::BlobStore,
 ) -> Result<ExecutionInputs, Error> {
     let mut assembled: ExecutionInputs = Vec::new();
     let mut ledger_rows: Option<HashMap<i64, Vec<u8>>> = None;
@@ -414,7 +414,7 @@ async fn resolve_blob_job_inputs(
                     ))
                 })?;
             let mut sink: Vec<u8> = Vec::new();
-            blob_service
+            blob_store
                 .resolve_blob_ref(&hash, &ticket, &mut sink)
                 .await
                 .map_err(|err| {
@@ -524,9 +524,9 @@ pub async fn poll_and_execute_once(
             &config.movement_policy,
         ) {
             Ok(inputs) => inputs,
-            Err(Error::InputRequiresBlobResolver { .. }) if config.blob_service.is_some() => {
-                let blob_service = config.blob_service.as_ref().expect("checked Some above");
-                match resolve_blob_job_inputs(db, &job, blob_service).await {
+            Err(Error::InputRequiresBlobResolver { .. }) if config.blob_store.is_some() => {
+                let blob_store = config.blob_store.as_ref().expect("checked Some above");
+                match resolve_blob_job_inputs(db, &job, blob_store).await {
                     Ok(inputs) => inputs,
                     Err(err) => {
                         ledger::record_failure(

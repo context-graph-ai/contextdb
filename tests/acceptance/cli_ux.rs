@@ -17,7 +17,7 @@ fn f28_scripted_usage_via_stdin_pipe() {
     let script_path = tmp.path().join("commands.sql");
     fs::write(
         &script_path,
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'hello')\nSELECT * FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'hello');\nSELECT * FROM t;\n.quit\n",
     )
     .expect("write commands.sql");
     let output = run_cli_script_from_file(&db_path, &[], &script_path);
@@ -62,13 +62,29 @@ fn f30_sync_status_when_nats_is_unreachable() {
     assert!(output_string(&output.stdout).contains("unreachable"));
 }
 
-/// I typed a nonsense dot-command, and the CLI told me it was unknown instead of silently ignoring it.
+/// I typed a nonsense dot-command, and the CLI told me it was unknown on stderr and failed the run —
+/// not a silent success a script would trust.
+///
+/// This used to print to stdout and exit 0; every error now fails the run
+/// and goes to stderr.
 #[test]
 fn f31_unknown_commands_produce_helpful_errors() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(&temp_db_file(&tmp, "f31.db"), &[], ".bogus\n.quit\n");
-    assert!(output.status.success());
-    assert!(output_string(&output.stdout).contains("Unknown command"));
+    assert!(
+        !output.status.success(),
+        "an unknown command must fail the run"
+    );
+    let stdout = output_string(&output.stdout);
+    let stderr = output_string(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Unknown command"),
+        "stderr must name the unknown command, got: {stderr}"
+    );
 }
 
 /// I launched the CLI without any sync flags, and it still let me create tables, insert, and query locally.
@@ -78,21 +94,54 @@ fn f31b_cli_works_without_sync_flags_graceful_degradation() {
     let output = run_cli_script(
         &temp_db_file(&tmp, "f31b.db"),
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'ok')\nSELECT * FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'ok');\nSELECT * FROM t;\n.quit\n",
     );
     assert!(output.status.success());
     assert!(output_string(&output.stdout).contains("ok"));
 }
 
-/// I tried to sync push without configuring a tenant, and it told me what flags I was missing.
+/// I tried to sync push without configuring a tenant, and it told me what flags I was missing on
+/// stderr and failed the run — an action that never happened must not read as success to a script.
+///
+/// Every `.sync` subcommand (action or query) used to return `ok: true` when
+/// unconfigured, printing to stdout and exiting 0. The family now splits:
+/// ACTIONS (push/pull/reconnect/direction/policy) fail; QUERIES (status/auto)
+/// keep answering and exiting 0 (see the sibling test below).
 #[test]
 fn f31c_sync_push_without_sync_config_gives_helpful_error() {
     let tmp = TempDir::new().expect("tempdir");
     let output = run_cli_script(&temp_db_file(&tmp, "f31c.db"), &[], ".sync push\n.quit\n");
-    assert!(output.status.success());
+    assert!(
+        !output.status.success(),
+        "a sync ACTION with no sync configured must fail the run"
+    );
+    let stderr = output_string(&output.stderr);
+    assert!(
+        stderr.contains("Sync not configured"),
+        "got stderr: {stderr}"
+    );
+    assert!(stderr.contains("--tenant-id"), "got stderr: {stderr}");
+}
+
+/// I asked for sync status without configuring a tenant, and it answered the question (no sync
+/// configured) and exited cleanly — a QUERY, unlike an ACTION, isn't refused by missing config.
+#[test]
+fn f31c_sync_status_without_sync_config_still_succeeds() {
+    let tmp = TempDir::new().expect("tempdir");
+    let output = run_cli_script(
+        &temp_db_file(&tmp, "f31c-status.db"),
+        &[],
+        ".sync status\n.quit\n",
+    );
+    assert!(
+        output.status.success(),
+        "a sync QUERY with no sync configured must still exit 0"
+    );
     let stdout = output_string(&output.stdout);
-    assert!(stdout.contains("Sync not configured"));
-    assert!(stdout.contains("--tenant-id"));
+    assert!(
+        stdout.contains("Sync not configured"),
+        "got stdout: {stdout}"
+    );
 }
 
 /// I ran valid and invalid SQL in scripts, and the exit code was 0 for success and non-zero for errors, so my shell scripts can trust it.
@@ -102,17 +151,17 @@ fn f31d_cli_exit_codes_are_reliable_for_scripting() {
     let good = run_cli_script(
         &temp_db_file(&tmp, "f31d-good.db"),
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY)\nSELECT * FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY);\nSELECT * FROM t;\n.quit\n",
     );
     let parse_error = run_cli_script(
         &temp_db_file(&tmp, "f31d-parse.db"),
         &[],
-        "SELET * FROM t\n.quit\n",
+        "SELET * FROM t;\n.quit\n",
     );
     let missing_table = run_cli_script(
         &temp_db_file(&tmp, "f31d-missing.db"),
         &[],
-        "SELECT * FROM nonexistent\n.quit\n",
+        "SELECT * FROM nonexistent;\n.quit\n",
     );
     assert!(good.status.success());
     assert!(!parse_error.status.success());
@@ -126,7 +175,7 @@ fn f31e_errors_go_to_stderr_results_to_stdout() {
     let invalid = run_cli_script(
         &temp_db_file(&tmp, "f31e-invalid.db"),
         &[],
-        "SELET * FROM t\n.quit\n",
+        "SELET * FROM t;\n.quit\n",
     );
     assert!(output_string(&invalid.stdout).trim().is_empty());
     assert!(!output_string(&invalid.stderr).trim().is_empty());
@@ -134,7 +183,7 @@ fn f31e_errors_go_to_stderr_results_to_stdout() {
     let valid = run_cli_script(
         &temp_db_file(&tmp, "f31e-valid.db"),
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'ok')\nSELECT * FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'ok');\nSELECT * FROM t;\n.quit\n",
     );
     assert!(output_string(&valid.stderr).trim().is_empty());
     assert!(output_string(&valid.stdout).contains("ok"));
@@ -161,7 +210,7 @@ fn f31g_select_output_format_is_parseable() {
     let output = run_cli_script(
         &temp_db_file(&tmp, "f31g.db"),
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT, val REAL)\nINSERT INTO t (id, name, val) VALUES ('00000000-0000-0000-0000-000000000001', 'alpha', 1.5)\nSELECT * FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT, val REAL);\nINSERT INTO t (id, name, val) VALUES ('00000000-0000-0000-0000-000000000001', 'alpha', 1.5);\nSELECT * FROM t;\n.quit\n",
     );
     let stdout = output_string(&output.stdout);
     assert!(stdout.contains("| id "));
@@ -177,7 +226,7 @@ fn f31h_bfs_depth_exceeded_routes_to_stderr_and_nonzero_exit() {
     let output = run_cli_script(
         &temp_db_file(&tmp, "f31h.db"),
         &[],
-        "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,11}(b) COLUMNS (b.id AS b_id))\n.quit\n",
+        "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,11}(b) COLUMNS (b.id AS b_id));\n.quit\n",
     );
     assert!(
         !output.status.success(),
@@ -197,17 +246,17 @@ fn f31h_bfs_depth_exceeded_routes_to_stderr_and_nonzero_exit() {
 
 fn graph_trace_fixture_script(query: &str) -> String {
     format!(
-        "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT)\n\
-         CREATE TABLE edges (source_id UUID, target_id UUID, edge_type TEXT)\n\
-         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'root')\n\
-         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'a')\n\
-         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'b')\n\
-         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'other')\n\
-         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'c')\n\
-         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'LINKS')\n\
-         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'LINKS')\n\
-         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000005', 'LINKS')\n\
-         {query}\n\
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, name TEXT);\n\
+         CREATE TABLE edges (source_id UUID, target_id UUID, edge_type TEXT);\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'root');\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'a');\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'b');\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'other');\n\
+         INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'c');\n\
+         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'LINKS');\n\
+         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'LINKS');\n\
+         INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000005', 'LINKS');\n\
+         {query};\n\
          .quit\n"
     )
 }
@@ -245,21 +294,21 @@ fn ct01_default_cli_output_for_graph_query_has_no_trace_line() {
     let expected = "\
 ok (rows_affected=0)\n\
 ok (rows_affected=0)\n\
-INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'root')\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'root');\n\
 ok (rows_affected=1)\n\
-INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'a')\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'a');\n\
 ok (rows_affected=1)\n\
-INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'b')\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'b');\n\
 ok (rows_affected=1)\n\
-INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'other')\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'other');\n\
 ok (rows_affected=1)\n\
-INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'c')\n\
+INSERT INTO nodes (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'c');\n\
 ok (rows_affected=1)\n\
-INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'LINKS')\n\
+INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'LINKS');\n\
 ok (rows_affected=1)\n\
-INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'LINKS')\n\
+INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000003', 'LINKS');\n\
 ok (rows_affected=1)\n\
-INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000005', 'LINKS')\n\
+INSERT INTO edges (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000005', 'LINKS');\n\
 ok (rows_affected=1)\n\
 +--------------------------------------+\n\
 | t                                    |\n\
@@ -311,12 +360,12 @@ fn ct04_trace_on_relational_indexed_query_reports_index_scan() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "ct04.db");
     let script = "\
-CREATE TABLE things (id UUID PRIMARY KEY, name TEXT)\n\
-CREATE INDEX idx_things_name ON things (name)\n\
-INSERT INTO things (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'hit')\n\
-INSERT INTO things (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'miss')\n\
+CREATE TABLE things (id UUID PRIMARY KEY, name TEXT);\n\
+CREATE INDEX idx_things_name ON things (name);\n\
+INSERT INTO things (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'hit');\n\
+INSERT INTO things (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'miss');\n\
 .trace on\n\
-SELECT id FROM things WHERE name = 'hit'\n\
+SELECT id FROM things WHERE name = 'hit';\n\
 .quit\n";
     let output = run_cli_script(&db_path, &[], script);
     assert!(output.status.success());
@@ -333,7 +382,7 @@ fn ct05_trace_off_disables_subsequent_trace_lines() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "ct05.db");
     let script = graph_trace_fixture_script(&format!(
-        ".trace on\n{}\n.trace off\n{}",
+        ".trace on\n{};\n.trace off\n{}",
         graph_trace_default_query(),
         graph_trace_default_query()
     ));
@@ -408,7 +457,7 @@ fn ct09_scripted_explain_parse_error_exits_nonzero() {
     let output = run_cli_script(
         &db_path,
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY)\n.explain SELET * FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY);\n.explain SELET * FROM t\n.quit\n",
     );
     assert!(
         !output.status.success(),
@@ -471,9 +520,9 @@ fn ct12_scripted_explain_shows_runtime_index_trace() {
     let output = run_cli_script(
         &db_path,
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER)\n\
-         CREATE INDEX idx_a ON t (a)\n\
-         INSERT INTO t (id, a) VALUES ('00000000-0000-0000-0000-000000000001', 7)\n\
+        "CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER);\n\
+         CREATE INDEX idx_a ON t (a);\n\
+         INSERT INTO t (id, a) VALUES ('00000000-0000-0000-0000-000000000001', 7);\n\
          .explain SELECT id FROM t WHERE a = 7\n\
          .quit\n",
     );

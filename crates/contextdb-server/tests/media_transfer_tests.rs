@@ -7,7 +7,7 @@ use contextdb_engine::work_ledger::{
     BlobHash, ClaimInsert, InputRef, JobSpec, MovementPolicy, cancel_job, insert_claim,
     install_work_ledger_schema, record_failure, submit_job,
 };
-use contextdb_server::blob_resolver::{BlobService, ResolveError};
+use contextdb_server::blob_resolver::{BlobStore, ResolveError};
 use contextdb_server::transport::iroh::IrohServer;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,7 +88,7 @@ async fn ingest_round_trip_matches_blake3_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&db).expect("schema");
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         db,
         MovementPolicy {
             auto_propagate: true,
@@ -123,7 +123,7 @@ async fn entitled_resolve_streams_bit_identical_bytes() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -141,7 +141,7 @@ async fn entitled_resolve_streams_bit_identical_bytes() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -210,7 +210,7 @@ async fn holder_refuses_unentitled_fetcher_by_authenticated_node_id() {
         &wrong_hash_node,
         &other_hash,
     );
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -228,7 +228,7 @@ async fn holder_refuses_unentitled_fetcher_by_authenticated_node_id() {
     let rogue_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&rogue_db).expect("rogue schema");
     seed_entitlement(&rogue_db, "job-1", &holder_node, &rogue_node, &h);
-    let rogue = BlobService::new(
+    let rogue = BlobStore::new(
         rogue_db,
         MovementPolicy {
             auto_propagate: true,
@@ -249,7 +249,7 @@ async fn holder_refuses_unentitled_fetcher_by_authenticated_node_id() {
     let failed_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&failed_db).expect("failed claimant schema");
     seed_entitlement(&failed_db, "job-failed", &holder_node, &failed_node, &h);
-    let failed = BlobService::new(
+    let failed = BlobStore::new(
         failed_db,
         MovementPolicy {
             auto_propagate: true,
@@ -275,7 +275,7 @@ async fn holder_refuses_unentitled_fetcher_by_authenticated_node_id() {
         &wrong_hash_node,
         &h,
     );
-    let wrong_hash = BlobService::new(
+    let wrong_hash = BlobStore::new(
         wrong_hash_db,
         MovementPolicy {
             auto_propagate: true,
@@ -296,7 +296,7 @@ async fn holder_refuses_unentitled_fetcher_by_authenticated_node_id() {
     let impersonator_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&impersonator_db).expect("identity impersonator schema");
     seed_entitlement(&impersonator_db, "job-1", &holder_node, &consumer_node, &h);
-    let impersonator = BlobService::new(
+    let impersonator = BlobStore::new(
         impersonator_db,
         MovementPolicy {
             auto_propagate: true,
@@ -315,7 +315,7 @@ async fn holder_refuses_unentitled_fetcher_by_authenticated_node_id() {
 
     let bypass_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&bypass_db).expect("authorization bypass schema");
-    let bypass = BlobService::new(
+    let bypass = BlobStore::new(
         bypass_db,
         MovementPolicy {
             auto_propagate: true,
@@ -353,7 +353,7 @@ async fn holder_refuses_a_fetcher_whose_lease_has_expired_at_resolve() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -371,7 +371,7 @@ async fn holder_refuses_a_fetcher_whose_lease_has_expired_at_resolve() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -409,7 +409,7 @@ async fn unset_holder_clock_falls_back_to_fabric_wallclock_and_refuses_expired_l
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -426,7 +426,7 @@ async fn unset_holder_clock_falls_back_to_fabric_wallclock_and_refuses_expired_l
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -468,7 +468,7 @@ async fn resolve_time_policy_recheck_forbids_entitled_node() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: false,
@@ -486,7 +486,7 @@ async fn resolve_time_policy_recheck_forbids_entitled_node() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -525,7 +525,7 @@ async fn resolve_time_policy_recheck_forbids_entitled_node() {
         &mixed_consumer_node,
         &h,
     );
-    let mixed_holder = BlobService::new(
+    let mixed_holder = BlobStore::new(
         mixed_holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -549,7 +549,7 @@ async fn resolve_time_policy_recheck_forbids_entitled_node() {
         &mixed_consumer_node,
         &h,
     );
-    let mixed_consumer = BlobService::new(
+    let mixed_consumer = BlobStore::new(
         mixed_consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -587,7 +587,7 @@ async fn tampered_bytes_are_caught_by_hash_verify() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -607,7 +607,7 @@ async fn tampered_bytes_are_caught_by_hash_verify() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -655,7 +655,7 @@ async fn resolve_against_a_down_holder_is_holder_unreachable() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -704,7 +704,7 @@ async fn locally_held_content_materializes_without_reaching_the_holder() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -740,7 +740,7 @@ async fn authorized_holder_without_the_blob_returns_blob_not_found() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -757,7 +757,7 @@ async fn authorized_holder_without_the_blob_returns_blob_not_found() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -790,7 +790,7 @@ async fn holder_dropping_mid_transfer_yields_typed_abort_no_hang() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -809,7 +809,7 @@ async fn holder_dropping_mid_transfer_yields_typed_abort_no_hang() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -843,7 +843,7 @@ async fn blob_exceeding_the_frame_ceiling_transfers_over_the_streaming_surface()
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -861,7 +861,7 @@ async fn blob_exceeding_the_frame_ceiling_transfers_over_the_streaming_surface()
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -937,7 +937,7 @@ async fn hub_holds_only_the_reference_never_the_blob_bytes() {
     within(holder_client.push())
         .await
         .expect("holder push job row");
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db.clone(),
         MovementPolicy {
             auto_propagate: true,
@@ -972,7 +972,7 @@ async fn hub_holds_only_the_reference_never_the_blob_bytes() {
     within(holder_client.pull_default())
         .await
         .expect("holder pull consumer claim");
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1070,7 +1070,7 @@ async fn sink_write_failure_is_a_distinct_typed_error_no_hang() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1088,7 +1088,7 @@ async fn sink_write_failure_is_a_distinct_typed_error_no_hang() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1130,7 +1130,7 @@ async fn reclaim_spares_a_blob_a_live_job_still_references() {
     .expect("submit live");
     cancel_job(&db, "job-terminal", "operator", None, T0).expect("cancel terminal");
 
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         db.clone(),
         MovementPolicy {
             auto_propagate: true,
@@ -1174,7 +1174,7 @@ async fn reclaim_deletes_an_unreferenced_blob_then_resolve_is_blob_not_found() {
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
     cancel_job(&holder_db, "job-1", "operator", None, T0).expect("cancel");
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1199,7 +1199,7 @@ async fn reclaim_deletes_an_unreferenced_blob_then_resolve_is_blob_not_found() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1236,7 +1236,7 @@ async fn two_entitled_consumers_resolve_the_same_blob_concurrently() {
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-c1", &holder_node, &c1_node, &h);
     seed_entitlement(&holder_db, "job-c2", &holder_node, &c2_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1254,7 +1254,7 @@ async fn two_entitled_consumers_resolve_the_same_blob_concurrently() {
     let c1_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&c1_db).expect("c1 schema");
     seed_entitlement(&c1_db, "job-c1", &holder_node, &c1_node, &h);
-    let c1 = BlobService::new(
+    let c1 = BlobStore::new(
         c1_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1266,7 +1266,7 @@ async fn two_entitled_consumers_resolve_the_same_blob_concurrently() {
     let c2_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&c2_db).expect("c2 schema");
     seed_entitlement(&c2_db, "job-c2", &holder_node, &c2_node, &h);
-    let c2 = BlobService::new(
+    let c2 = BlobStore::new(
         c2_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1314,7 +1314,7 @@ async fn interrupted_large_transfer_resumes_from_offset_not_from_zero() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1333,7 +1333,7 @@ async fn interrupted_large_transfer_resumes_from_offset_not_from_zero() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1399,7 +1399,7 @@ async fn interrupted_large_transfer_resumes_from_offset_not_from_zero() {
         &rogue_node,
         &h,
     );
-    let rogue = BlobService::new(
+    let rogue = BlobStore::new(
         rogue_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1489,7 +1489,7 @@ async fn blackhole_holder_dial_returns_bounded_holder_unreachable() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1553,7 +1553,7 @@ fn shared_store_root_resolve_returns_bounded_typed_error_not_uncancellable_hang(
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -1570,7 +1570,7 @@ fn shared_store_root_resolve_returns_bounded_typed_error_not_uncancellable_hang(
 
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,

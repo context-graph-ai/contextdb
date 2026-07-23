@@ -2,6 +2,7 @@ use clap::Parser;
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::ConflictPolicies;
 use contextdb_server::SyncServer;
+use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_USAGE};
 use contextdb_server::protocol::PROTOCOL_VERSION;
 use contextdb_server::transport::iroh::{EndpointSpec, IrohServer};
 use std::sync::Arc;
@@ -66,10 +67,30 @@ fn default_endpoint_spec(db_path: &str) -> String {
     format!("iroh:?identity={}", identity.display())
 }
 
+/// A failure of the INVOCATION rather than of the run: the command line asked
+/// for something this build or this endpoint cannot do, and nothing was
+/// attempted. Carried as a distinct type so `main` can report it with the usage
+/// exit code, the same one `clap` uses for the errors it raises itself.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("Error: {err}");
-        std::process::exit(1);
+        let code = if err.is::<UsageError>() {
+            EXIT_USAGE
+        } else {
+            EXIT_ERROR
+        };
+        std::process::exit(code);
     }
 }
 
@@ -94,6 +115,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => default_endpoint_spec(&args.db_path),
     };
 
+    // Whether this endpoint is one this build can bind and serve. Decided
+    // BEFORE the database is opened, because the flag combinations it rules out
+    // are usage errors, and exit 2 promises that nothing was attempted — which
+    // has to include not creating a database file on a fresh path for a command
+    // that was never going to run.
+    let binds_sync_endpoint = EndpointSpec::parse(&endpoint_spec).is_some();
+    if !binds_sync_endpoint {
+        if args.show_ticket || args.ticket_file.is_some() {
+            return Err(UsageError(
+                "tickets exist only for sync endpoints, not broker URLs".to_string(),
+            )
+            .into());
+        }
+        #[cfg(not(feature = "nats"))]
+        {
+            return Err(UsageError(format!(
+                "{endpoint_spec} is a broker URL, but this build carries no deprecated NATS \
+                 adapter; pass a sync-endpoint ticket/spec, or rebuild with the `nats` cargo \
+                 feature"
+            ))
+            .into());
+        }
+    }
+
     let db = if args.db_path == ":memory:" {
         Arc::new(Database::open_memory())
     } else {
@@ -106,7 +151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // For a dial-by-key endpoint, bind eagerly so the enrollment ticket is
     // available up front (logged, and written to --ticket-file when asked).
-    let server = if EndpointSpec::parse(&endpoint_spec).is_some() {
+    let server = if binds_sync_endpoint {
         let endpoint = IrohServer::bind(&endpoint_spec).await?;
         let ticket = endpoint.ticket();
         tracing::info!(
@@ -157,9 +202,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             policies,
         )
     } else {
-        if args.show_ticket || args.ticket_file.is_some() {
-            return Err("tickets exist only for sync endpoints, not broker URLs".into());
-        }
+        // The ticket-flag and build-support checks already ran, above the
+        // database open.
         if args.json {
             eprintln!(
                 "Note: --json emits nothing for a broker URL — it carries no enrollment ticket; use a sync endpoint."
@@ -167,12 +211,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(feature = "nats"))]
         {
-            return Err(format!(
-                "{endpoint_spec} is a broker URL, but this build carries no deprecated NATS \
-                 adapter; pass a sync-endpoint ticket/spec, or rebuild with the `nats` cargo \
-                 feature"
+            unreachable!(
+                "a broker URL is refused before the database is opened when this build carries no NATS adapter"
             )
-            .into());
         }
         #[cfg(feature = "nats")]
         SyncServer::new(

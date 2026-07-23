@@ -16,10 +16,10 @@ fn f01_create_insert_quit_reopen_query() {
     let db_path = temp_db_file(&tmp, "f01.db");
 
     let mut script =
-        String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\n");
+        String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);\n");
     for idx in 0..50 {
         script.push_str(&format!(
-            "INSERT INTO sensors (id, name, reading) VALUES ('{:08}-0000-0000-0000-000000000000', 'temp-{idx}', {})\n",
+            "INSERT INTO sensors (id, name, reading) VALUES ('{:08}-0000-0000-0000-000000000000', 'temp-{idx}', {});\n",
             idx + 1,
             idx as f64 + 0.25
         ));
@@ -31,7 +31,7 @@ fn f01_create_insert_quit_reopen_query() {
     let second = run_cli_script(
         &db_path,
         &[],
-        "SELECT count(*) FROM sensors\nSELECT * FROM sensors WHERE name = 'temp-3'\n.quit\n",
+        "SELECT count(*) FROM sensors;\nSELECT * FROM sensors WHERE name = 'temp-3';\n.quit\n",
     );
     let stdout = output_string(&second.stdout);
     assert!(second.status.success());
@@ -46,9 +46,9 @@ fn f02_schema_survives_restart() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f02.db");
     let create = "\
-CREATE TABLE workflows (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: draft -> [review], review -> [published])\n\
-CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON')\n\
-CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(384))\n\
+CREATE TABLE workflows (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: draft -> [review], review -> [published]);\n\
+CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT) DAG('DEPENDS_ON');\n\
+CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(384));\n\
 .quit\n";
     assert!(run_cli_script(&db_path, &[], create).status.success());
 
@@ -73,15 +73,15 @@ fn f03_kill_9_during_idle_does_not_corrupt() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f03.db");
     let mut child = spawn_cli(&db_path, &[]);
-    let mut script = String::from("CREATE TABLE kill_test (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE kill_test (id UUID PRIMARY KEY, name TEXT);\n");
     for idx in 0..100 {
         script.push_str(&format!(
-            "INSERT INTO kill_test (id, name) VALUES ('{:08}-0000-0000-0000-000000000000', 'row-{idx}')\n",
+            "INSERT INTO kill_test (id, name) VALUES ('{:08}-0000-0000-0000-000000000000', 'row-{idx}');\n",
             idx + 1
         ));
     }
     write_child_stdin(&mut child, &script);
-    write_child_stdin(&mut child, "SELECT count(*) FROM kill_test\n");
+    write_child_stdin(&mut child, "SELECT count(*) FROM kill_test;\n");
     let barrier_output =
         wait_for_child_stdout_contains(&mut child, "| 100", Duration::from_secs(60));
     assert!(
@@ -90,7 +90,7 @@ fn f03_kill_9_during_idle_does_not_corrupt() {
     );
     stop_child(&mut child);
 
-    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM kill_test\n.quit\n");
+    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM kill_test;\n.quit\n");
     assert!(reopened.status.success());
     assert!(output_string(&reopened.stdout).contains("100"));
 }
@@ -104,18 +104,18 @@ fn f04_empty_database_file_is_a_valid_starting_point() {
         &db_path,
         &[],
         "\
-CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e')\n\
+CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e');\n\
 .quit\n",
     );
     assert!(output.status.success());
     assert!(db_path.exists());
 
-    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM sensors\n.quit\n");
+    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM sensors;\n.quit\n");
     assert!(reopened.status.success());
     assert!(output_string(&reopened.stdout).contains("5"));
 }
@@ -126,7 +126,7 @@ fn f05_two_processes_cannot_open_the_same_database_file() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f05.db");
     let mut first = spawn_cli(&db_path, &[]);
-    write_child_stdin(&mut first, "CREATE TABLE sensors (id UUID PRIMARY KEY)\n");
+    write_child_stdin(&mut first, "CREATE TABLE sensors (id UUID PRIMARY KEY);\n");
     thread::sleep(Duration::from_millis(200));
 
     let second = run_cli_script_allow_startup_failure(&db_path, &[], ".quit\n");
@@ -146,17 +146,17 @@ fn f05b_graph_edges_survive_persistence_reopen() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f05b.db");
     let script = "\
-CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)\n\
-INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'A')\n\
-INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'B')\n\
-INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'C')\n\
-INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'EDGE')\n\
-INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003', 'EDGE')\n\
+CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT);\n\
+INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'A');\n\
+INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'B');\n\
+INSERT INTO entities (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'C');\n\
+INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'EDGE');\n\
+INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003', 'EDGE');\n\
 .quit\n";
     let _ = run_cli_script(&db_path, &[], script);
 
     let query = "\
-SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,2}(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS(b.id AS target_id))\n\
+SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:EDGE]->{1,2}(b) WHERE a.id = '00000000-0000-0000-0000-000000000001' COLUMNS(b.id AS target_id));\n\
 .quit\n";
     let output = run_cli_script(&db_path, &[], query);
     let stdout = output_string(&output.stdout);
@@ -365,15 +365,15 @@ fn f05g_unified_cross_paradigm_data_survives_restart() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f05g.db");
     let script = "\
-CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, category TEXT, embedding VECTOR(384))\n\
-INSERT INTO entities (id, name, category) VALUES ('00000000-0000-0000-0000-000000000001', 'sensor-1', 'sensor')\n\
-INSERT INTO entities (id, name, category) VALUES ('00000000-0000-0000-0000-000000000002', 'sensor-2', 'sensor')\n\
-SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->(b) COLUMNS(b.id AS target_id))\n\
+CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, category TEXT, embedding VECTOR(384));\n\
+INSERT INTO entities (id, name, category) VALUES ('00000000-0000-0000-0000-000000000001', 'sensor-1', 'sensor');\n\
+INSERT INTO entities (id, name, category) VALUES ('00000000-0000-0000-0000-000000000002', 'sensor-2', 'sensor');\n\
+SELECT * FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->(b) COLUMNS(b.id AS target_id));\n\
 .quit\n";
     let _ = run_cli_script(&db_path, &[], script);
     let query = "\
 WITH neighborhood AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->{1,2}(b) WHERE a.name = 'sensor-1' COLUMNS(b.id AS b_id))) \
-SELECT id, name FROM entities WHERE category = 'sensor' ORDER BY embedding <=> $query LIMIT 5\n\
+SELECT id, name FROM entities WHERE category = 'sensor' ORDER BY embedding <=> $query LIMIT 5;\n\
 .quit\n";
     let first = run_cli_script(
         &db_path,
@@ -426,21 +426,21 @@ fn f05i_rollback_does_not_persist_after_restart() {
         &db_path,
         &[],
         "\
-CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-BEGIN\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b')\n\
-ROLLBACK\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000006', 'f')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000007', 'g')\n\
+CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+BEGIN;\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b');\n\
+ROLLBACK;\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000006', 'f');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000007', 'g');\n\
 .quit\n",
     );
     assert!(output.status.success());
 
-    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM sensors\n.quit\n");
+    let reopened = run_cli_script(&db_path, &[], "SELECT count(*) FROM sensors;\n.quit\n");
     assert!(reopened.status.success());
     assert!(output_string(&reopened.stdout).contains("5"));
 }

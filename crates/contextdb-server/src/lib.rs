@@ -10,7 +10,7 @@
 //! enrollment ticket (the hub's cryptographic identity); the hub runs a
 //! [`SyncServer`] for that same tenant, and the two exchange changesets in
 //! both directions. Content-addressed media moves node-to-node through the
-//! `BlobService` when the `iroh` feature is enabled. See each type's own
+//! `BlobStore` when the `iroh` feature is enabled. See each type's own
 //! documentation for constructor signatures and worked usage — the client and
 //! server are built with a database handle, an endpoint, and a `TenantId`.
 
@@ -18,6 +18,7 @@
 pub mod blob_resolver;
 pub mod chunking;
 pub mod error;
+pub mod exit_codes;
 pub mod identity;
 pub mod protocol;
 pub mod subjects;
@@ -29,7 +30,7 @@ pub mod transport;
 pub mod work_ledger;
 
 #[cfg(feature = "iroh")]
-pub use blob_resolver::{BlobService, ResolveError};
+pub use blob_resolver::{BlobStore, ResolveError};
 pub use identity::FabricIdentity;
 pub use sync_client::SyncClient;
 #[doc(hidden)]

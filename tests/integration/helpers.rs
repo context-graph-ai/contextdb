@@ -50,7 +50,7 @@ fn setup_ontology_db_with_edges(edges_ddl: &str) -> Database {
     )
     .unwrap();
     db.execute(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT, embedding VECTOR(2))",
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT, entity_type TEXT, context_id TEXT, embedding VECTOR(2))",
         &params,
     )
     .unwrap();

@@ -5,8 +5,12 @@ edition = "2024"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 readme = "../../README.md"
 description = "Core types, traits, and error types for contextdb"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 uuid.workspace = true

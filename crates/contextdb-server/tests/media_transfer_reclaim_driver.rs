@@ -1,7 +1,7 @@
 //! Production reclaim-driver coverage: the owned cadence actually reclaims.
 //!
 //! The frozen suite drives `reclaim_unreferenced` explicitly. This proves the
-//! OWNED driver — `BlobService::spawn_reclaim_driver` — actually invokes that
+//! OWNED driver — `BlobStore::spawn_reclaim_driver` — actually invokes that
 //! reclaim on its own, at the real fabric wall-clock, so a holder's blob store
 //! cannot fill without bound in a real deployment (a review found the
 //! cadence un-driven). It is NOT a frozen acceptance test;
@@ -12,7 +12,7 @@ use contextdb_engine::work_ledger::{
     BlobHash, InputRef, JobSpec, MovementPolicy, cancel_job, install_work_ledger_schema, submit_job,
 };
 use contextdb_server::FabricIdentity;
-use contextdb_server::blob_resolver::BlobService;
+use contextdb_server::blob_resolver::BlobStore;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +41,7 @@ async fn spawn_reclaim_driver_reclaims_a_terminal_past_grace_blob_on_its_own() {
     submit_job(&db, &blob_job("job-1", &node, &h), &[] as &[&[u8]]).expect("submit");
     cancel_job(&db, "job-1", "operator", None, 0).expect("cancel");
 
-    let service = Arc::new(BlobService::new(
+    let service = Arc::new(BlobStore::new(
         db,
         MovementPolicy {
             auto_propagate: true,
@@ -94,7 +94,7 @@ async fn ingest_file_accepts_a_relative_path() {
 
     let db = std::sync::Arc::new(Database::open_memory());
     install_work_ledger_schema(&db).expect("schema");
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         db,
         MovementPolicy {
             auto_propagate: true,

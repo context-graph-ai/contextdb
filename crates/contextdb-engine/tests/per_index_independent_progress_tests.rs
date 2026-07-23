@@ -1,7 +1,10 @@
 // Every test in this file exercises the `test-seams` pause-window seam, so the
 // whole binary is gated on that feature. (The one previously-ungated test,
-// `reopen_per_index_hnsw_rebuild_yields_same_live_set`, was folded into D03 in
-// hnsw_rebuild_determinism_tests.rs — see exec-folds-proofs.md Fold 10.)
+// `reopen_per_index_hnsw_rebuild_yields_same_live_set`, was folded into
+// `per_index_independent_progress_reopen_flake_is_fixed_under_repeat` in
+// hnsw_rebuild_determinism_tests.rs: the folded test's top-50 assertion is
+// strictly implied by that test's bitwise-sequence assertion, proven by a
+// decisive mutant both tests detect.)
 #![cfg(feature = "test-seams")]
 
 use contextdb_core::{Value, VectorIndexRef};
@@ -194,9 +197,8 @@ fn reopened_store_two_refs_both_enter_build_windows_concurrently() {
 }
 
 // NOTE: `reopen_per_index_hnsw_rebuild_yields_same_live_set` was folded into
-// `per_index_independent_progress_reopen_flake_is_fixed_under_repeat` (D03) in
-// hnsw_rebuild_determinism_tests.rs — D03 asserts the full bitwise search
+// `per_index_independent_progress_reopen_flake_is_fixed_under_repeat` in
+// hnsw_rebuild_determinism_tests.rs — that test asserts the full bitwise search
 // sequence + HNSW observation identity on the identical two-table reopen, which
 // strictly implies this test's top-50 ranked-results match. Proven by a
-// reopen-load-drop decisive mutant that both tests detect (exec-folds-proofs.md
-// Fold 10).
+// reopen-load-drop decisive mutant that both tests detect.

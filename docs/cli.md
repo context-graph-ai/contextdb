@@ -23,7 +23,7 @@ contextdb-cli <PATH> [OPTIONS]
 | `--nats-url <URL>` | `CONTEXTDB_NATS_URL` | *(none)* | **Deprecated.** NATS broker URL. Requires a build with the `nats` feature. |
 | `--memory-limit <SIZE>` | `CONTEXTDB_MEMORY_LIMIT` | *(unlimited)* | Memory ceiling. Suffixes: `K`, `M`, `G`. |
 | `--disk-limit <SIZE>` | `CONTEXTDB_DISK_LIMIT` | *(unlimited)* | Disk ceiling for file-backed databases. Suffixes: `K`, `M`, `G`. Ignored for `:memory:`. |
-| `--json` | | off | Emit query results as a JSON array of row objects (uncapped) instead of a table, for scripts and agents. Non-query statements print a small JSON status object like `{"rows_affected": N}`. Runtime errors route to stderr under this flag, so stdout stays pure machine data. |
+| `--json` | | off | Emit machine output for scripts and agents: stdout becomes JSON Lines — a JSON array of row objects (uncapped) per query, `{"rows_affected": N}` per non-query, and one document per meta-command. Errors, notices, traces and help are documents too, on stderr, so stdout stays pure machine data. |
 | `--all` | | off | Print every row of a table result, disabling the default 100-row cap on human table output. Has no effect under `--json` (JSON output is already uncapped). |
 
 #### `--json`
@@ -40,7 +40,53 @@ $ echo "CREATE TABLE t (id UUID PRIMARY KEY);" | contextdb-cli :memory: --json
 {"rows_affected":0}
 ```
 
-Under `--json`, runtime errors are written to stderr (never mixed into stdout), so a pipeline's stdout is always clean machine-readable output.
+Under `--json`, stdout is **JSON Lines**: one complete JSON document per line, one line per statement or meta-command that produced a result, and nothing else. A run that produced no results writes nothing to stdout.
+
+Every meta-command emits a document too. Each one's top-level key names its payload:
+
+```bash
+$ echo ".tables" | contextdb-cli ./my.db --json
+{"tables":["decisions","entities","intentions"]}
+```
+
+```bash
+$ echo ".schema decisions" | contextdb-cli ./my.db --json | jq '{pk: .primary_key, retain: .retain}'
+{"pk":["id"],"retain":{"window":30,"unit":"DAYS","seconds":2592000,"sync_safe":true}}
+```
+
+`.schema` returns the table's declared contract as data — `columns` (each with type, nullability, key/unique/immutable flags, `references` and its `ON STATE ... PROPAGATE SET ...` clause, vector quantization, rank policy), `primary_key`, `indexes`, `state_machine`, `retain`, `sync_direction`, `conflict_policy`, `dag_edge_types` and `propagate` (all three rule kinds, including the foreign-key rules the DDL renders on their column) — plus `ddl`, the exact text the human `.schema` prints, so a snapshot/replay flow keeps working. A policy the table never declared is absent rather than filled in with a default nobody wrote.
+
+`sync_direction` and `conflict_policy` speak a fixed vocabulary, the DDL's own clause words in lowercase — `sync_off`, `push_only`, `pull_only`, `two_way` for the direction, and `keep_first`, `keep_latest` for the two declarable policies. Two more policies exist on the engine's built-in distributed-contract tables and have no DDL clause to declare them: `server_wins` and `edge_wins`. The same words appear in `.sync direction` and `.sync policy` documents, so one concept reads the same everywhere.
+
+```bash
+$ echo ".sync status" | contextdb-cli ./my.db --tenant-id acme --sync-endpoint <ticket> --json
+{"sync":{"configured":true,"tenant":"acme","endpoint":"...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17}}
+```
+
+| Command | Document |
+|---------|----------|
+| `.tables` | `{"tables":[...]}` |
+| `.schema <table>` | `{"table":...,"columns":[...],"primary_key":[...],"indexes":[...],"ddl":...}` plus each declared policy |
+| `.explain <sql>` | `{"explain":{"physical_plan":...,"runtime_trace":true,"index_used":...,"predicates_pushed":[...],"indexes_considered":[...],"sort_elided":...}}` for a read-only statement; `{"explain":{"physical_plan":...,"runtime_trace":false}}` for any other |
+| `.trace on\|off` | `{"trace":"on"}` / `{"trace":"off"}` |
+| `.sync status` | `{"sync":{...}}` |
+| `.sync push` / `.sync pull` | `{"sync_push":{"applied_rows":N,"skipped_rows":N,"conflicts":[...],"outcome":"applied"}}` (`"unconfirmed"` for an interrupted push) |
+| `.sync reconnect` / `destination` / `direction` / `policy` / `auto` | `{"sync_reconnect":...}`, `{"sync_destination":...}`, `{"sync_direction":...}`, `{"sync_policy":...}`, `{"sync_auto":...}` |
+| `.help` | `{"help":["line", ...]}`, on stderr (see below) |
+
+Under `--json`, everything that is not a result goes to stderr, so stdout stays parseable. Every line there is a JSON document too, and there are four kinds — the first two are what a consumer branches on, the last two are output a command was asked for.
+
+The promise starts once the arguments have parsed. A malformed command line — an unrecognized flag, a missing value — is rejected by the argument parser before any of this runs, so it keeps that parser's own human rendering and exits `2`; everything after that point is JSON.
+
+
+- **Errors**, as one document per error: `{"error":{"class":"sql","message":"parse error: ...","line":3}}`. `class` is `sql`, `sync`, `io` or `usage` — the branch that tells "fix the query" from "the hub is unreachable" from "fix the command line". `line` is present when the CLI knows which input line the statement started on, and the message never repeats it as a prefix. It is not only the REPL's statements that arrive this way: an unparseable flag VALUE, a database that will not open, and every failure in the shutdown sequence use the same envelope.
+- **Notices**, as `{"notice":{"class":"sync","message":"..."}}` — carrying the same four class names as an error, but saying something worth seeing that is NOT a failure: a deprecated flag, a sync endpoint the CLI will keep retrying, or a final push whose outcome the hub never confirmed (that one also sets exit `3`). Reporting these as errors would say the run failed when it did not, so a consumer deciding whether the run succeeded reads `error` documents and the exit code, never `notice`.
+
+  The class names in both documents — `sql`, `sync`, `io`, `usage` — are the stable part of this contract and are safe to branch on. The `message` beside them is prose for a person to read, and its wording changes freely; treat an unrecognized class as "something happened" rather than as a parse failure.
+- **Execution traces** from `.trace on`, as `{"trace":{...,"rows_examined":N}}` — diagnostics about a result, not the result.
+- **`.help`**, as one `{"help":["line", ...]}` document per invocation — the same lines the human mode prints, carried as an array so the stream stays parseable. It goes to stderr rather than stdout because it is not a result, and its LINES are prose that changes with every feature: read them to show a person, not to discover the command surface. That surface is this document and `--help`.
+
+Operational logging (`RUST_LOG`) is a separate channel and stays human-readable on stderr; leave it at its default when parsing the stream.
 
 #### Row cap and `--all`
 
@@ -61,7 +107,7 @@ contextdb-cli :memory:         # ephemeral, lost on exit
 contextdb-cli ./my.db          # persisted to file
 ```
 
-All sync commands return `Sync not configured` in this mode.
+All sync commands report `Sync not configured` in this mode: `.sync status` and `.sync auto` answer and exit `0`, while the action subcommands fail (exit `1`) rather than let a script read an action that never happened as success.
 
 ### Sync Mode
 
@@ -111,6 +157,17 @@ contextdb> SELECT * FROM entities;
 
 The REPL accepts SQL statements (see [Query Language](query-language.md)) and meta-commands.
 
+Every statement ends with a `;`. Pressing Enter before one continues the statement on the next
+line under the `...>` prompt, so a multi-line `CREATE TABLE` can be pasted whole:
+
+```
+contextdb> CREATE TABLE notes (
+      ...>   id UUID PRIMARY KEY,
+      ...>   body TEXT
+      ...> );
+ok (rows_affected=0)
+```
+
 Runtime budget control is SQL-driven:
 
 - `SET MEMORY_LIMIT '512M'` / `SHOW MEMORY_LIMIT`
@@ -119,6 +176,8 @@ Runtime budget control is SQL-driven:
 For file-backed databases, `SET DISK_LIMIT` persists in the database file and survives reopen. `:memory:` accepts the command but ignores it.
 
 ### Meta-Commands
+
+Every command below emits a JSON document under `--json`; `.help` is the one whose document goes to stderr instead of stdout, because it is guidance for a person rather than a result. See [`--json`](#--json) for every shape.
 
 | Command | Alias | Description |
 |---------|-------|-------------|
@@ -137,6 +196,14 @@ physical strategy (`Scan`, `IndexScan`, `AdjacencyProbe`, `EdgesScan`,
 `GraphBfs`, etc.), the chosen index name when applicable, pushed predicates,
 and rejected index candidates. Use `.trace on` when you need the runtime route
 and exact `rows_examined` counter after each successful statement.
+
+`.explain` never applies a statement. A read-only query is run to collect the
+route it actually took; anything that would write — `INSERT`, `UPDATE`,
+`DELETE`, DDL — is planned without being executed, so `.explain DELETE FROM t`
+tells you what it would do and leaves the rows alone. Under `--json` that
+distinction is on the document as `runtime_trace`: `true` means the fields
+beside it were measured on a real run, `false` means the statement was only
+planned and the measured fields are absent rather than empty.
 
 For machine-readable access, every `QueryResult` returned by
 `Database::execute` carries `QueryResult.trace`, a `QueryTrace` with the
@@ -167,6 +234,8 @@ All sync commands require `--tenant-id` at startup. Without it:
 ```
 Sync not configured. Start with --tenant-id to enable.
 ```
+
+That message is a *query's* answer, not a failure: `.sync status` and `.sync auto` print it to stdout and exit `0`. The action subcommands — `push`, `pull`, `reconnect`, `destination`, `direction`, `policy` — print it to stderr and exit `1` instead, because the action did not happen and a scripted `push && shutdown` must never read "not configured" as "pushed".
 
 | Command | Description |
 |---------|-------------|
@@ -225,6 +294,10 @@ Pushed: 1 applied, 0 skipped, 0 conflicts
 
 The applied count reports data rows; the `CREATE TABLE` replicates too (client B's schema is created on pull) but does not add to the row tally.
 
+Push, then pull on that same client, and every count reads zero: the rows coming back are ones you already hold, and re-delivered data is counted nowhere — not applied, not skipped, not a conflict. `applied` means local state changed, `conflicts` means another machine genuinely disagreed at the same key, and `skipped` means a conflict policy or the context scope turned a row away. All zeros after a push is the sync confirming you are converged, not a silent failure.
+
+Those counts describe only rows your client can see. A row belonging to a context you are not scoped to is refused before its contents are looked at, so it lands in `skipped` and never in `conflicts` — a row you cannot see is not a row you can disagree about, and reporting it as a conflict would tell you it exists. Content-based judgements like the re-delivery no-op above apply within visible scope only.
+
 Terminal 3 — client B pulls and sees the data:
 ```bash
 contextdb-cli ./b.db --tenant-id demo --sync-endpoint <ticket>
@@ -249,7 +322,7 @@ contextdb-server --tenant-id <TENANT_ID> [OPTIONS]
 |------|---------|---------|-------------|
 | `--db-path <PATH>` | `CONTEXTDB_DB_PATH` | `:memory:` | Database file path. `:memory:` for ephemeral. |
 | `--sync-endpoint <SPEC>` | `CONTEXTDB_SYNC_ENDPOINT` | *(auto)* | Sync endpoint spec, form `iroh:?identity=<key-file>[&port=<u16>][&relay=<none\|n0\|url>][&relay-ca=<cert-file>][&publish=<n0\|url>][&lookup=<n0\|mdns\|dns:origin\|url>]`. When omitted, an identity file is created next to the database file (`<db-path>.fabric-identity.key`). |
-| `--ticket-file <PATH>` | | *(none)* | Write the enrollment ticket to this file once bound (overwrites), so scripts and operators can pick it up without parsing logs. |
+| `--ticket-file <PATH>` | | *(none)* | Write the enrollment ticket to this file once bound (overwrites), so scripts and operators can pick it up without parsing logs. The ticket is sensitive bearer material — keep the file out of version control and restrict its permissions. |
 | `--show-ticket` | | off | Print the bare enrollment ticket to stdout and exit, without serving. |
 | `--json` | | off | Emit one JSON object to stdout with `enrollment_ticket` and `dial_command` (plus `endpoint` and `tenant_id`), for scripts and agents enrolling a machine. |
 | `--tenant-id <ID>` | `CONTEXTDB_TENANT_ID` | *(required)* | Tenant identifier. |
@@ -272,6 +345,14 @@ This happens at any log level. Three modes adjust it for scripting:
 $ contextdb-server --tenant-id demo --json
 {"dial_command":"contextdb-cli <client-db-path> --sync-endpoint endpointab...  --tenant-id demo","endpoint":"474cc91e...","enrollment_ticket":"endpointab...","tenant_id":"demo"}
 ```
+
+**The ticket is sensitive bearer enrollment material, not a public identifier.** There is no
+allowlist: whoever holds a valid ticket can enroll and sync with this hub, until the hub's identity
+changes. Keep `--ticket-file` output (and any file or log you copy a printed ticket into) out of
+version control and restrict its file permissions. If a ticket leaks, rotate by re-keying the hub —
+delete `<db-path>.fabric-identity.key` and restart. That is the only thing that changes the hub's
+identity and invalidates every previously issued ticket; the identity loads exclusively from that
+file, so binding to a different port has no effect on it.
 
 Machines on one LAN reach each other over direct connections with zero external infrastructure and no internet. To cross networks, set `relay=<url>` to a self-hosted `iroh-relay` (a small stateless forwarder that only carries end-to-end-encrypted bytes), or `relay=n0` to opt into the free public relays. The default configuration contacts no third-party service. When the relay presents a private or self-signed certificate, add `relay-ca=<cert-file>` pointing at its PEM bundle or single DER certificate to trust it.
 
@@ -306,9 +387,13 @@ Default conflict policy is `LatestWins`. The default log level is `ERROR`; serve
 RUST_LOG=info contextdb-server --tenant-id dev
 ```
 
+### Server Exit Codes
+
+`contextdb-server` honors the same table as the CLI ([Exit Codes](#exit-codes)): `0` on clean shutdown, `2` when the invocation itself is wrong (an unknown flag, or asking for an enrollment ticket from a broker URL that has none), and `1` for anything that failed while running. Exit code `3` is the CLI's alone — the server never pushes.
+
 ### Restart Semantics and Port Stickiness
 
-A hub bound **without** `port=` records the port it chose in `<identity-file>.port`, next to the identity key, and reuses it on restart — so issued tickets survive restarts by default. An explicit `port=` always wins. If the remembered port can't be bound on restart, the server fails loudly with guidance: free the port, or pass `port=` for a specific port or `port=0` for a fresh random one (a new random port invalidates already-issued tickets).
+A hub bound **without** `port=` records the port it chose in `<identity-file>.port`, next to the identity key, and reuses it on restart — so issued tickets survive restarts by default. An explicit `port=` always wins. If the remembered port can't be bound on restart, the server fails loudly with guidance: free the port, or pass `port=` for a specific port or `port=0` for a fresh random one. Changing the port this way does not rotate the hub's identity or revoke any ticket — it only strands an already-issued **address-only** ticket in the default no-lookup configuration, since that ticket carries the old socket address; with a `lookup=` mode enabled (see [Address Lookup](#address-lookup-optional)), the hub stays reachable by identity across a port change.
 
 ### Files on Disk
 
@@ -318,7 +403,7 @@ The server (and any edge that syncs) writes these next to the database file:
 |------|---------|---------|
 | `<db-path>.fabric-identity.key` | **YES** | The machine's fabric identity — a 32-byte ed25519 seed, mode `0600`, created silently on first sync use. **Back it up and never commit or share it:** losing it changes the node's identity and invalidates its tickets. For a `:memory:` server, a per-process ephemeral identity is used instead (a pid-suffixed file in a temp dir). |
 | `<identity-file>.port` | No | The remembered sticky port (see above). |
-| `--ticket-file` output | No | The enrollment ticket — public, safe to share; it *is* what edges dial. |
+| `--ticket-file` output | **Sensitive** | The enrollment ticket — bearer enrollment material; whoever holds it can enroll and sync with this hub until the hub's identity changes. Keep it out of version control and restrict its file permissions; it *is* what edges dial. |
 | `<db-stem>.lock` | No | A PID lockfile. It can persist as a harmless orphan after exit. |
 
 Add `*.fabric-identity.key` (and its `.port` sibling) to your `.gitignore`.
@@ -334,9 +419,11 @@ The original NATS broker adapter is retained behind the `nats` cargo feature. `-
 When stdin is not a terminal, the CLI runs in pipe mode — useful for scripting, CI, and seeding databases:
 
 - No prompt, no version banner
+- Statements may span as many lines as they need: one ends at the first `;` outside a quoted string or a comment, so a real schema file runs as written. A statement left open when the input ends is run at that point
+- Meta-commands (`.tables`, `.schema`, `.sync`, …) stay single-line and take no `;`
 - INSERT statements are echoed to stdout before execution
-- Fatal errors (parse errors, missing tables) go to stderr and cause non-zero exit
-- Non-fatal runtime errors print to stdout, exit code stays zero
+- Results go to stdout; every error, warning, and diagnostic goes to stderr — no exceptions
+- Any error fails the run with a non-zero exit code (see [Exit Codes](#exit-codes)). The session still continues to the next statement, so one script run reports all of its errors, but the process never reports a run that hit an error as success
 
 ```bash
 echo "SELECT 1 + 1;" | contextdb-cli :memory:
@@ -352,14 +439,33 @@ For scripts and agents that want to consume results programmatically, add `--jso
 echo "SELECT * FROM decisions WHERE status = 'active';" | contextdb-cli ./my.db --json | jq '.[].description'
 ```
 
-### Error Routing
+### Exit Codes
+
+Every contextdb binary — `contextdb-cli`, `contextdb-server`, and the shipped demo drivers — reports one of four codes:
+
+| Code | Meaning | Raised by |
+|------|---------|-----------|
+| `0` | Success. Everything the run attempted worked. | A clean run. |
+| `1` | Error. The invocation was valid; something in the run failed. | Any SQL or engine error, a failed meta-command, a definitive sync failure, a database that could not be opened or closed, a demo whose observed outcome deviated from its intent. |
+| `2` | Usage error. The invocation itself is wrong and nothing was attempted. | An unknown flag or missing argument (raised by the argument parser), an unparseable flag value such as `--memory-limit 12Q`, or an incomplete combination such as `--tenant-id` with no `--sync-endpoint`. |
+| `3` | A `.sync push` was interrupted after sending and its outcome is unconfirmed — the hub never said whether it landed, so re-pushing is the safe move. | An interrupted push, including the automatic final push on exit. |
+
+Precedence: a definitive error (`1`) dominates an unconfirmed push (`3`), which dominates success (`0`). A usage error (`2`) is terminal at startup — nothing runs, so it never competes.
+
+Interactive sessions are the one exception to "any error fails the run": a terminal session showed you each error as it happened, so it exits `0` (as `psql` and `sqlite3` do). An unconfirmed push still reports `3` from an interactive session, because nobody can act on it once the process is gone.
+
+Finer classification lives on the output rather than in the exit status: under `--json`, each error is written to stderr as a `{"error":{"class":...}}` document whose `class` separates a SQL mistake from an unreachable hub, so the table above stays small and stable.
+
+Error routing, by example:
 
 | Error Type | Stream | Exit Code |
 |------------|--------|-----------|
-| Parse error | stderr | non-zero |
-| Table not found | stderr | non-zero |
-| Runtime error (e.g. constraint violation) | stdout | zero |
-| Permission denied on db path | stderr | non-zero |
-| `.sync push` interrupted after send, outcome unconfirmed | stderr | **3** |
+| Parse error | stderr | `1` |
+| Table not found | stderr | `1` |
+| Runtime error (e.g. constraint violation) | stderr | `1` |
+| Unknown meta-command, or a `.sync` action with no `--tenant-id` | stderr | `1` |
+| Permission denied on db path | stderr | `1` |
+| Unknown flag, or an invalid flag value | stderr | `2` |
+| `.sync push` interrupted after send, outcome unconfirmed | stderr | `3` |
 
 Exit code 3 is a distinct, narrow signal — it does **not** mean the push was declined or hit a conflict. It means a `.sync push` (including the automatic final push on exit) sent its changeset and was interrupted *before* the CLI could confirm whether the hub applied it. The outcome is unknown, not failed: re-pushing is safe and idempotent, and the next `.sync push` reconciles cleanly. Precedence: a definitive sync error is exit `1`; an interrupted, unconfirmed push is exit `3`; success is `0`. A scripted `push && shutdown` should treat `3` as "retry on next start," not as failure.

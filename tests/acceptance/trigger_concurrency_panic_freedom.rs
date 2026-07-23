@@ -4147,7 +4147,7 @@ async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
     );
 }
 
-// t41 lives in tests/acceptance/observation_trigger.rs. It guards against
+// t41 lives in tests/acceptance/trigger.rs. It guards against
 // substring drift by asserting the typed-variant Display strings.
 
 // ============================================================================

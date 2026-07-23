@@ -9,7 +9,7 @@
 
 use contextdb_engine::Database;
 use contextdb_engine::work_ledger::{BlobHash, MovementPolicy, install_work_ledger_schema};
-use contextdb_server::blob_resolver::BlobService;
+use contextdb_server::blob_resolver::BlobStore;
 use contextdb_server::transport::iroh::IrohServer;
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ async fn a_fully_delivered_fetch_releases_its_protection_tag() {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &consumer_node, &h);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -51,7 +51,7 @@ async fn a_fully_delivered_fetch_releases_its_protection_tag() {
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
     seed_entitlement(&consumer_db, "job-1", &holder_node, &consumer_node, &h);
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,

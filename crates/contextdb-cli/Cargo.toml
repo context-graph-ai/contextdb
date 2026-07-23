@@ -5,8 +5,12 @@ edition = "2024"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
 readme = "../../README.md"
 description = "Interactive CLI for contextdb — explore relational, graph, and vector queries in a REPL"
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 name = "contextdb_cli"
@@ -15,6 +19,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "contextdb-cli"
 path = "src/main.rs"
+
+[features]
+# The internal test seam (`contextdb_cli::testing`). Off by default, so a
+# downstream build of this crate cannot see or call the CLI's internals. The
+# self-dependency below turns it on for this crate's OWN test targets, which is
+# what lets the seam tests run in the default `cargo test -p contextdb-cli` gate
+# without the module existing for anyone else.
+test-seams = []
 
 [dependencies]
 contextdb-engine = { path = "../contextdb-engine", version = "1.0" }
@@ -29,3 +41,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 contextdb-parser = { path = "../contextdb-parser", version = "1.0" }
+# Depending on ourselves with `test-seams` on enables the feature when Cargo
+# builds this crate's test targets, and only then.
+contextdb-cli = { path = ".", features = ["test-seams"] }

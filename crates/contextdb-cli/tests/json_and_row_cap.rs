@@ -47,10 +47,10 @@ fn last_json(stdout: &str) -> Option<serde_json::Value> {
 
 #[test]
 fn json_select_emits_array_of_objects() {
-    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)\n\
-               INSERT INTO t (id, name) VALUES (1, 'alice')\n\
-               INSERT INTO t (id, name) VALUES (2, 'bob')\n\
-               SELECT id, name FROM t ORDER BY id\n";
+    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);\n\
+               INSERT INTO t (id, name) VALUES (1, 'alice');\n\
+               INSERT INTO t (id, name) VALUES (2, 'bob');\n\
+               SELECT id, name FROM t ORDER BY id;\n";
     let (ok, stdout, stderr) = run_cli(&["--json"], sql);
     assert!(ok, "cli must exit 0. stderr:\n{stderr}\nstdout:\n{stdout}");
 
@@ -70,13 +70,13 @@ fn json_select_emits_array_of_objects() {
 
 /// Build SQL that creates a table and inserts `n` rows, then a `SELECT *`.
 fn insert_n_then_select(n: usize) -> String {
-    let mut s = String::from("CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT)\n");
+    let mut s = String::from("CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT);\n");
     for i in 0..n {
         s.push_str(&format!(
-            "INSERT INTO big (id, name) VALUES ({i}, 'row{i}')\n"
+            "INSERT INTO big (id, name) VALUES ({i}, 'row{i}');\n"
         ));
     }
-    s.push_str("SELECT * FROM big ORDER BY id\n");
+    s.push_str("SELECT * FROM big ORDER BY id;\n");
     s
 }
 
@@ -129,25 +129,47 @@ fn json_output_is_uncapped() {
     assert_eq!(arr.len(), 150, "JSON output must not be capped");
 }
 
+// A UNIQUE-violation runtime error used to leave `ok` true (exit 0), because
+// that class was classified non-fatal. Every runtime error now fails the run
+// (exit 1), so `ok` is false here; the error still goes to stderr, stdout
+// stays pure JSON, and the surviving statements still produce their JSON.
 #[test]
-fn json_stdout_stays_pure_when_a_runtime_error_occurs() {
-    // A UNIQUE/PRIMARY-KEY violation is a NON-fatal runtime error: the session
-    // continues. Under --json its "Error:" line must go to stderr, never stdout
-    // — stdout must remain pure JSON so a machine consumer can parse the stream.
-    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)\n\
-               INSERT INTO t (id, name) VALUES (1, 'a')\n\
-               INSERT INTO t (id, name) VALUES (1, 'dup')\n\
-               SELECT id, name FROM t ORDER BY id\n";
+fn json_stdout_is_pure_and_run_exits_one_when_a_runtime_error_occurs() {
+    // A UNIQUE/PRIMARY-KEY violation is a runtime error: the SESSION
+    // continues (the surviving statements still run), but the RUN now fails.
+    // Under --json its "Error:" line must go to stderr, never stdout — stdout
+    // must remain pure JSON so a machine consumer can parse the stream.
+    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);\n\
+               INSERT INTO t (id, name) VALUES (1, 'a');\n\
+               INSERT INTO t (id, name) VALUES (1, 'dup');\n\
+               SELECT id, name FROM t ORDER BY id;\n";
     let (ok, stdout, stderr) = run_cli(&["--json"], sql);
     assert!(
-        ok,
-        "session must survive a non-fatal error. stderr:\n{stderr}"
+        !ok,
+        "a run that hit a runtime error must exit non-zero. stderr:\n{stderr}"
     );
 
-    // (a) the error text is on STDERR.
+    // (a) the error is a JSON envelope on STDERR — the general --json error
+    // contract (json_meta_commands.rs's json_sql_error_emits_error_envelope_on_stderr
+    // pins the general case). Parsing the envelope and checking its fields is
+    // strictly stronger than a bare `stderr.contains("Error:")` prefix check.
+    let error_doc: serde_json::Value = stderr
+        .lines()
+        .next()
+        .and_then(|l| serde_json::from_str(l.trim()).ok())
+        .unwrap_or_else(|| {
+            panic!("stderr's first line must be a JSON error envelope, got stderr:\n{stderr}")
+        });
+    assert_eq!(
+        error_doc["error"]["class"],
+        serde_json::json!("sql"),
+        "got: {error_doc}"
+    );
     assert!(
-        stderr.contains("Error:") && stderr.to_lowercase().contains("constraint"),
-        "the runtime error must be reported on stderr, got stderr:\n{stderr}"
+        error_doc["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.to_lowercase().contains("constraint")),
+        "error.message must mention the constraint violation, got: {error_doc}"
     );
 
     // (b) STDOUT is PURE JSON: every non-empty line parses as JSON, and no

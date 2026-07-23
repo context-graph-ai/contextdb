@@ -4,7 +4,7 @@ use contextdb_engine::work_ledger::{
     install_work_ledger_schema, submit_job,
 };
 use contextdb_server::FabricIdentity;
-use contextdb_server::blob_resolver::BlobService;
+use contextdb_server::blob_resolver::BlobStore;
 use contextdb_server::transport::iroh::IrohServer;
 use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
@@ -117,8 +117,8 @@ struct BenchFixture {
     _file_dir: tempfile::TempDir,
     _holder_dir: tempfile::TempDir,
     _consumer_dir: tempfile::TempDir,
-    _holder: BlobService,
-    consumer: BlobService,
+    _holder: BlobStore,
+    consumer: BlobStore,
     endpoint: IrohServer,
     ticket: String,
     hash: BlobHash,
@@ -141,7 +141,7 @@ async fn build_fixture(size: usize, iteration: u64) -> BenchFixture {
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "bench-job", &holder_node, &consumer_node, &hash);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -170,7 +170,7 @@ async fn build_fixture(size: usize, iteration: u64) -> BenchFixture {
         &consumer_node,
         &hash,
     );
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         consumer_db,
         MovementPolicy {
             auto_propagate: true,

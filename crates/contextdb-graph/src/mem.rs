@@ -1,6 +1,6 @@
 use crate::store::GraphStore;
 use contextdb_core::*;
-use contextdb_tx::{TxManager, WriteSetApplicator};
+use contextdb_tx::{TransactionManager, WriteSetApplicator};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ type AdjPair = (NodeId, NodeId);
 
 pub struct MemGraphExecutor<S: WriteSetApplicator> {
     store: Arc<GraphStore>,
-    tx_mgr: Arc<TxManager<S>>,
+    tx_mgr: Arc<TransactionManager<S>>,
     dag_edge_types: parking_lot::RwLock<HashSet<String>>,
     // The active BFS visited cap. Production value is always `MAX_VISITED`;
     // only the #[doc(hidden)] test seam below ever lowers it, so the boundary
@@ -22,7 +22,7 @@ pub struct MemGraphExecutor<S: WriteSetApplicator> {
 }
 
 impl<S: WriteSetApplicator> MemGraphExecutor<S> {
-    pub fn new(store: Arc<GraphStore>, tx_mgr: Arc<TxManager<S>>) -> Self {
+    pub fn new(store: Arc<GraphStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
         Self {
             store,
             tx_mgr,

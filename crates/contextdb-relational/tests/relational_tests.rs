@@ -3,7 +3,7 @@ use contextdb_core::{
     Value,
 };
 use contextdb_relational::{MemRelationalExecutor, RelationalStore};
-use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
+use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,7 +30,10 @@ fn map(pairs: Vec<(&str, Value)>) -> HashMap<ColName, Value> {
         .collect::<HashMap<_, _>>()
 }
 
-fn setup() -> (Arc<TxManager<TestStore>>, MemRelationalExecutor<TestStore>) {
+fn setup() -> (
+    Arc<TransactionManager<TestStore>>,
+    MemRelationalExecutor<TestStore>,
+) {
     let relational = Arc::new(RelationalStore::new());
     relational.create_table("entities", TableMeta::default());
     relational.create_table(
@@ -59,7 +62,7 @@ fn setup() -> (Arc<TxManager<TestStore>>, MemRelationalExecutor<TestStore>) {
             ..TableMeta::default()
         },
     );
-    let tx_mgr = Arc::new(TxManager::new(TestStore {
+    let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         relational: relational.clone(),
     }));
     let exec = MemRelationalExecutor::new(relational, tx_mgr.clone());

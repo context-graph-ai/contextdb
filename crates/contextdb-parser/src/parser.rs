@@ -2848,9 +2848,14 @@ fn contains_token_outside_strings(input: &str, token: &str) -> bool {
             continue;
         }
 
+        // `idx` is a char boundary, but `idx + token.len()` need not be: a
+        // multi-byte character starting inside the fixed-width window would put
+        // it mid-character. `get` returns None there instead of panicking, and
+        // a window that ends mid-character can never equal an ASCII token.
         if is_word_boundary(input, idx.saturating_sub(1))
-            && input[idx..].len() >= token.len()
-            && input[idx..idx + token.len()].eq_ignore_ascii_case(token)
+            && input
+                .get(idx..idx + token.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(token))
             && is_word_boundary(input, idx + token.len())
         {
             return true;

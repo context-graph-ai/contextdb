@@ -112,11 +112,11 @@ separate command reads by asking that owner, not by re-opening the file, and you
 never keep a copy of the data outside it. See
 [Store Ownership & Concurrency](docs/architecture.md#store-ownership--concurrency).
 
-### Observation Triggers
+### Triggers
 
 contextdb rejects PG-style validation triggers as an invariant mechanism:
 constraints such as `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` are
-engine-enforced. It does support host-callback ObservationTriggers for
+engine-enforced. It does support host-callback Triggers for
 transactional observation and cascade writes that belong with the firing
 transaction.
 

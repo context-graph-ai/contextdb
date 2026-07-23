@@ -15,7 +15,7 @@ use contextdb_core::{TenantId, Value, Wallclock};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
 use contextdb_engine::work_ledger::{BlobHash, MovementPolicy, install_work_ledger_schema};
-use contextdb_server::blob_resolver::BlobService;
+use contextdb_server::blob_resolver::BlobStore;
 use contextdb_server::subjects::{push_subject, status_subject};
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::transport::{
@@ -91,6 +91,24 @@ fn insert_notes(db: &Database, ids: std::ops::Range<i64>) {
         row.insert("body".to_string(), Value::Text(format!("note-{id}")));
         db.execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
             .expect("note insert");
+    }
+}
+
+/// A second writer's content at the SAME keys `insert_notes` uses, but
+/// genuinely DIFFERENT (`x` for `n`) — a real competing write a conflict
+/// policy must actually decide on, not a coincidental re-delivery of the same
+/// bytes. Kept the same byte length as `insert_notes`'s body ("note-{id}" vs
+/// "xote-{id}", both 6 bytes for the single-digit ids this file uses) on
+/// purpose: a receipt's `payload_bytes` is asserted equal between the two
+/// writers below, and a length mismatch would fail that equality for a reason
+/// that has nothing to do with what the test is actually about.
+fn insert_divergent_notes(db: &Database, ids: std::ops::Range<i64>) {
+    for id in ids {
+        let mut row = p();
+        row.insert("id".to_string(), Value::Int64(id));
+        row.insert("body".to_string(), Value::Text(format!("xote-{id}")));
+        db.execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
+            .expect("divergent note insert");
     }
 }
 
@@ -964,7 +982,7 @@ async fn c9_blob_receipts_split_serve_and_fetch_by_peer() {
     install_work_ledger_schema(&holder_db).expect("holder schema");
     seed_entitlement(&holder_db, "job-1", &holder_node, &one_node, &hash);
     seed_entitlement(&holder_db, "job-2", &holder_node, &two_node, &hash);
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         holder_db,
         MovementPolicy {
             auto_propagate: true,
@@ -984,7 +1002,7 @@ async fn c9_blob_receipts_split_serve_and_fetch_by_peer() {
         let db = Arc::new(Database::open_memory());
         install_work_ledger_schema(&db).expect("consumer schema");
         seed_entitlement(&db, "job-1", &holder_node, &one_node, &hash);
-        let service = BlobService::new(
+        let service = BlobStore::new(
             db,
             MovementPolicy {
                 auto_propagate: true,
@@ -1036,7 +1054,7 @@ async fn c9_blob_receipts_split_serve_and_fetch_by_peer() {
         let db = Arc::new(Database::open_memory());
         install_work_ledger_schema(&db).expect("consumer schema");
         seed_entitlement(&db, "job-2", &holder_node, &two_node, &hash);
-        let service = BlobService::new(
+        let service = BlobStore::new(
             db,
             MovementPolicy {
                 auto_propagate: true,
@@ -1251,10 +1269,17 @@ async fn c9_hub_receipts_count_transmitted_rows_even_when_conflict_policy_skips_
         "the first push genuinely lands its three rows"
     );
 
-    // Second writer sends the SAME natural keys. The rows cross the wire in
-    // full and are then skipped at apply — the case the item count got wrong.
+    // Second writer sends the SAME natural keys with GENUINELY DIFFERENT
+    // content — a real competing write, so `InsertIfNotExists` has an actual
+    // decision to make and actually declines it. (An identical-content
+    // resend at the same keys is a re-delivery the apply layer now recognizes
+    // as a no-op — see `Database::sync_incoming_row_is_already_local` — and
+    // correctly counts nowhere; that is a DIFFERENT case from this one and is
+    // covered by the `self_echo_pull_after_push_tests.rs` suite.) The rows
+    // still cross the wire in full and are then skipped at apply — the case
+    // the item count got wrong.
     let second = open_edge(None);
-    insert_notes(&second, 1..4);
+    insert_divergent_notes(&second, 1..4);
     let second_client = edge_client(&second, &broker, "edge-b");
     let second_result = within(second_client.push()).await.expect("second push");
     assert_eq!(
@@ -1292,9 +1317,10 @@ async fn c9_hub_receipts_count_transmitted_rows_even_when_conflict_policy_skips_
     );
     assert_eq!(
         from_second.counters, from_first.counters,
-        "and both peers shipped the identical row set, so their receipts must be \
-         identical — the outcome of applying differs, what moved does not: \
-         {receipts:?}"
+        "and both peers shipped an equally-sized row set (same item count, same \
+         byte length per row, genuinely different content), so their receipts \
+         must be identical — the outcome of applying differs, what moved does \
+         not: {receipts:?}"
     );
     assert!(
         from_second.counters.payload_bytes > 0,

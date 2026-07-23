@@ -1,9 +1,10 @@
-// ======== T34 ========
+// Audits that AtomicTxId/AtomicLsn are used only through their allowed
+// methods, and that those methods stay inlined.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 // Forces a hard compile dependency on the wrappers existing publicly.
-// If A4 regresses and the wrappers are removed, this test file fails to compile.
+// If the wrappers are ever removed, this test file fails to compile.
 #[allow(unused_imports)]
 use contextdb_core::{AtomicLsn, AtomicTxId};
 
@@ -116,8 +117,6 @@ fn atomic_wrapper_only_five_methods_used_on_typed_atomics() {
          Allowed methods: {ALLOWED_METHODS:?}"
     );
 }
-
-// ======== TU6 ========
 
 #[test]
 fn inline_on_atomic_wrapper_methods_audit() {

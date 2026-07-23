@@ -48,7 +48,7 @@ fn deferring_worker_config(node_id: &str) -> WorkerConfig {
             auto_propagate: true,
         },
         lease_duration_ms: LEASE,
-        blob_service: None,
+        blob_store: None,
         defer_own_submissions_until_deadline: true,
         writes_are_canonical: false,
     }

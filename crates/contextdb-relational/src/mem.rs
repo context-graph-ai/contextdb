@@ -1,16 +1,16 @@
 use crate::store::{RelationalStore, index_key_from_values};
 use contextdb_core::*;
-use contextdb_tx::{TxManager, WriteSetApplicator, row_matches_delete_predicates};
+use contextdb_tx::{TransactionManager, WriteSetApplicator, row_matches_delete_predicates};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct MemRelationalExecutor<S: WriteSetApplicator> {
     store: Arc<RelationalStore>,
-    tx_mgr: Arc<TxManager<S>>,
+    tx_mgr: Arc<TransactionManager<S>>,
 }
 
 impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
-    pub fn new(store: Arc<RelationalStore>, tx_mgr: Arc<TxManager<S>>) -> Self {
+    pub fn new(store: Arc<RelationalStore>, tx_mgr: Arc<TransactionManager<S>>) -> Self {
         Self { store, tx_mgr }
     }
 

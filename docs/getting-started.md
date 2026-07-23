@@ -276,6 +276,13 @@ To connect a client, run:
 
 The ticket *is* the hub's cryptographic identity — dial-by-key. Whoever holds it can dial the hub directly, wherever it is, including from behind NAT (the edge dials out; nothing needs to be reachable on machine A). The hub only serves — you don't type SQL at it; your data lives on the edges that dial in. For scripting, three flags skip the banner: `--show-ticket` prints the bare ticket and exits, `--ticket-file <path>` writes it to a file, and `--json` emits a JSON object with `enrollment_ticket`, `dial_command`, `endpoint`, and `tenant_id`.
 
+**Treat the ticket as sensitive bearer material, not a public identifier.** There is no allowlist —
+anyone who obtains the ticket can enroll and sync with the hub until the hub's identity changes.
+Keep any file it's written to (`--ticket-file`, `--json` output, shell history) out of version
+control and restrict its file permissions. If a ticket leaks, rotate by re-keying the hub — delete
+`hub.db.fabric-identity.key` and restart, which changes the hub's identity and invalidates every
+previously issued ticket.
+
 ### Connect two edges
 
 On each edge machine, paste the ticket, giving each its own database file:

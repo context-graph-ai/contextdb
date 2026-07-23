@@ -460,14 +460,14 @@ fn t5_06_durable_queue_survives_restart() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("bus.redb");
     let script = "\
-CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT)
-CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations
-CREATE SINK slack TYPE callback
-CREATE SINK audit TYPE callback
-CREATE ROUTE inv_to_slack EVENT inv_match TO slack
-CREATE ROUTE inv_to_audit EVENT inv_match TO audit
-INSERT INTO invalidations (id, severity, reason) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', 'queue-me')
-DELETE FROM invalidations WHERE id = '00000000-0000-0000-0000-000000000001'
+CREATE TABLE invalidations (id UUID PRIMARY KEY, severity TEXT, reason TEXT);
+CREATE EVENT TYPE inv_match WHEN INSERT ON invalidations;
+CREATE SINK slack TYPE callback;
+CREATE SINK audit TYPE callback;
+CREATE ROUTE inv_to_slack EVENT inv_match TO slack;
+CREATE ROUTE inv_to_audit EVENT inv_match TO audit;
+INSERT INTO invalidations (id, severity, reason) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', 'queue-me');
+DELETE FROM invalidations WHERE id = '00000000-0000-0000-0000-000000000001';
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(
@@ -1130,16 +1130,16 @@ fn t5_13_sink_excludes_acl_denied_rows() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("bus-acl.redb");
     let script = "\
-CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
-CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
-CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
-CREATE SINK alice_sink TYPE callback
-CREATE ROUTE r EVENT secret_event TO alice_sink
-INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
-INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'replay-granted', '00000000-0000-0000-0000-00000000000a')
-INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'replay-denied', '00000000-0000-0000-0000-00000000000b')
-DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000001'
-DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000002'
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID);
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id));
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets;
+CREATE SINK alice_sink TYPE callback;
+CREATE ROUTE r EVENT secret_event TO alice_sink;
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a');
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'replay-granted', '00000000-0000-0000-0000-00000000000a');
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'replay-denied', '00000000-0000-0000-0000-00000000000b');
+DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000001';
+DELETE FROM secrets WHERE id = '00000000-0000-0000-0000-000000000002';
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(
@@ -1239,15 +1239,15 @@ fn t5_15_durable_acl_replay_uses_route_time_gate_snapshot_after_schema_drop() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("bus-acl-route-time.redb");
     let script = "\
-CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
-CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
-CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
-CREATE SINK alice_sink TYPE callback
-CREATE ROUTE r EVENT secret_event TO alice_sink
-INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
-INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'route-time-only', '00000000-0000-0000-0000-00000000000a')
-DROP TABLE secrets
-DROP TABLE acl_grants
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID);
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id));
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets;
+CREATE SINK alice_sink TYPE callback;
+CREATE ROUTE r EVENT secret_event TO alice_sink;
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a');
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'route-time-only', '00000000-0000-0000-0000-00000000000a');
+DROP TABLE secrets;
+DROP TABLE acl_grants;
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(
@@ -1291,14 +1291,14 @@ fn t5_16_principal_scoped_sink_uses_handle_principal_when_registration_omits_one
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("bus-principal-handle.redb");
     let script = "\
-CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)
-CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))
-CREATE EVENT TYPE secret_event WHEN INSERT ON secrets
-CREATE SINK alice_sink TYPE callback
-CREATE ROUTE r EVENT secret_event TO alice_sink
-INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a')
-INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'granted', '00000000-0000-0000-0000-00000000000a')
-INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'denied', '00000000-0000-0000-0000-00000000000b')
+CREATE TABLE acl_grants (id UUID PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID);
+CREATE TABLE secrets (id UUID PRIMARY KEY, body TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id));
+CREATE EVENT TYPE secret_event WHEN INSERT ON secrets;
+CREATE SINK alice_sink TYPE callback;
+CREATE ROUTE r EVENT secret_event TO alice_sink;
+INSERT INTO acl_grants (id, principal_kind, principal_id, acl_id) VALUES ('00000000-0000-0000-0000-000000000100', 'Agent', 'alice', '00000000-0000-0000-0000-00000000000a');
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000001', 'granted', '00000000-0000-0000-0000-00000000000a');
+INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-000000000002', 'denied', '00000000-0000-0000-0000-00000000000b');
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(
@@ -2356,12 +2356,12 @@ fn t5_31_scoped_handle_register_sink_replays_durably_queued_events_child_process
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("scoped-replay.redb");
     let script = "\
-CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID)
-CREATE EVENT TYPE inv_match WHEN INSERT ON invs
-CREATE SINK slack TYPE callback
-CREATE ROUTE r EVENT inv_match TO slack
-INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', '00000000-0000-0000-0000-00000000000a')
-INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000002', 'warning', '00000000-0000-0000-0000-00000000000b')
+CREATE TABLE invs (id UUID PRIMARY KEY, severity TEXT, context_id UUID CONTEXT_ID);
+CREATE EVENT TYPE inv_match WHEN INSERT ON invs;
+CREATE SINK slack TYPE callback;
+CREATE ROUTE r EVENT inv_match TO slack;
+INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000001', 'warning', '00000000-0000-0000-0000-00000000000a');
+INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000000000002', 'warning', '00000000-0000-0000-0000-00000000000b');
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(

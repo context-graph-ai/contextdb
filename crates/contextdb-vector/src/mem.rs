@@ -1,6 +1,6 @@
 use crate::{HnswIndex, store::VectorStore};
 use contextdb_core::*;
-use contextdb_tx::{TxManager, WriteSetApplicator};
+use contextdb_tx::{TransactionManager, WriteSetApplicator};
 use parking_lot::RwLock;
 use roaring::RoaringTreemap;
 use std::collections::HashSet;
@@ -78,14 +78,14 @@ impl VectorSearchDebugTrace {
 
 pub struct MemVectorExecutor<S: WriteSetApplicator> {
     store: Arc<VectorStore>,
-    tx_mgr: Arc<TxManager<S>>,
+    tx_mgr: Arc<TransactionManager<S>>,
     accountant: Arc<MemoryAccountant>,
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     pub fn new(
         store: Arc<VectorStore>,
-        tx_mgr: Arc<TxManager<S>>,
+        tx_mgr: Arc<TransactionManager<S>>,
         hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
     ) -> Self {
         Self::new_with_accountant(store, tx_mgr, hnsw, Arc::new(MemoryAccountant::no_limit()))
@@ -93,7 +93,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
     pub fn new_with_accountant(
         store: Arc<VectorStore>,
-        tx_mgr: Arc<TxManager<S>>,
+        tx_mgr: Arc<TransactionManager<S>>,
         _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
         accountant: Arc<MemoryAccountant>,
     ) -> Self {

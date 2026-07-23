@@ -1,6 +1,6 @@
 use contextdb_core::{Direction, EdgeType, Error, GraphExecutor, RowId, Value};
 use contextdb_graph::{GraphStore, MemGraphExecutor};
-use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
+use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -21,9 +21,12 @@ impl WriteSetApplicator for TestStore {
     }
 }
 
-fn setup() -> (Arc<TxManager<TestStore>>, MemGraphExecutor<TestStore>) {
+fn setup() -> (
+    Arc<TransactionManager<TestStore>>,
+    MemGraphExecutor<TestStore>,
+) {
     let graph = Arc::new(GraphStore::new());
-    let tx_mgr = Arc::new(TxManager::new(TestStore {
+    let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         graph: graph.clone(),
     }));
     let exec = MemGraphExecutor::new(graph, tx_mgr.clone());
@@ -31,7 +34,7 @@ fn setup() -> (Arc<TxManager<TestStore>>, MemGraphExecutor<TestStore>) {
 }
 
 fn connect(
-    tx_mgr: &TxManager<TestStore>,
+    tx_mgr: &TransactionManager<TestStore>,
     exec: &MemGraphExecutor<TestStore>,
     source: Uuid,
     target: Uuid,

@@ -17,6 +17,7 @@ use contextdb_engine::Database;
 use contextdb_engine::work_ledger::{
     self as ledger, ExecutionInputs, InputRef, JobSnapshot, JobSpec, MovementPolicy,
 };
+use contextdb_server::exit_codes::EXIT_ERROR;
 use contextdb_server::work_ledger::{
     ClaimOutcome, ExecutionOutput, ExecutionVerdict, PollOutcome, WorkExecutor, WorkerConfig,
     claim_job, poll_and_execute_once,
@@ -172,7 +173,7 @@ async fn main() {
             "(one process per store: if a worker or another demo command is running against \
              this database, stop it first)"
         );
-        std::process::exit(2);
+        std::process::exit(EXIT_ERROR);
     }));
     ledger::install_work_ledger_schema(&db).expect("install work ledger schema");
 
@@ -308,7 +309,7 @@ async fn main() {
                 advertised_tags: vec!["class:wl.demo".to_string()],
                 movement_policy: policy,
                 lease_duration_ms: lease_ms,
-                blob_service: None,
+                blob_store: None,
                 defer_own_submissions_until_deadline: false,
                 writes_are_canonical: false,
             };

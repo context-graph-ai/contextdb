@@ -1,5 +1,5 @@
 use crate::composite_store::{ApplyPhasePause, ChangeLogEntry, CompositeStore};
-use crate::executor::{apply_on_conflict_updates, execute_plan};
+use crate::executor::{apply_on_conflict_updates, execute_plan, validate_plan_columns};
 use crate::persistence::RedbPersistence;
 use crate::persistent_store::PersistentCompositeStore;
 use crate::plugin::{
@@ -20,7 +20,7 @@ use contextdb_parser::ast::{AlterAction, CreateTable, DataType, Expr};
 use contextdb_planner::{OnConflictPlan, PhysicalPlan};
 use contextdb_relational::{MemRelationalExecutor, RelationalStore, index_key_from_values};
 use contextdb_tx::{
-    RelationalDeletePredicate, TxManager, WriteSet, WriteSetApplicator,
+    RelationalDeletePredicate, TransactionManager, WriteSet, WriteSetApplicator,
     row_matches_delete_predicates,
 };
 use contextdb_vector::{
@@ -529,7 +529,7 @@ fn global_callback_active_count() -> &'static AtomicUsize {
 /// dropping the last handle when deterministic shutdown matters; a waiter that
 /// wakes after close observes the normal closed-handle error.
 pub struct Database {
-    tx_mgr: Arc<TxManager<DynStore>>,
+    tx_mgr: Arc<TransactionManager<DynStore>>,
     relational_store: Arc<RelationalStore>,
     graph_store: Arc<GraphStore>,
     vector_store: Arc<VectorStore>,
@@ -1143,7 +1143,7 @@ pub(crate) struct MaintenanceContext {
     persistence: Option<Arc<RedbPersistence>>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
     trigger: Arc<trigger::TriggerState>,
-    tx_mgr: Arc<TxManager<DynStore>>,
+    tx_mgr: Arc<TransactionManager<DynStore>>,
     sync_watermark: Arc<AtomicLsn>,
     trigger_audit_retention: Duration,
 }
@@ -1670,7 +1670,7 @@ impl PruningRuntime {
 impl Database {
     #[allow(clippy::too_many_arguments)]
     fn build_db(
-        tx_mgr: Arc<TxManager<DynStore>>,
+        tx_mgr: Arc<TransactionManager<DynStore>>,
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
         vector_store: Arc<VectorStore>,
@@ -2137,7 +2137,7 @@ impl Database {
             Some(trigger.clone()),
         );
         let store: DynStore = Box::new(persistent);
-        let tx_mgr = Arc::new(TxManager::new_with_counters_and_commit_index(
+        let tx_mgr = Arc::new(TransactionManager::new_with_counters_and_commit_index(
             store,
             TxId(max_tx.0.saturating_add(1)),
             Lsn(max_lsn.0.saturating_add(1)),
@@ -2201,7 +2201,7 @@ impl Database {
             accountant.clone(),
             apply_phase_pause.clone(),
         ));
-        let tx_mgr = Arc::new(TxManager::new(store));
+        let tx_mgr = Arc::new(TransactionManager::new(store));
         let event_bus = Arc::new(EventBusState::new());
 
         let db = Self::build_db(
@@ -3121,6 +3121,9 @@ impl Database {
         let _operation = self.open_operation()?;
         let stmt = contextdb_parser::parse(sql)?;
         let plan = contextdb_planner::plan(&stmt)?;
+        // Refuse a statically-invalid query here too: rendering a plan for a
+        // query that can never run reads as a green light for it.
+        validate_plan_columns(self, &plan)?;
         let vector_shape = vector_search_shape_from_plan(&plan);
         let _vector_schema = vector_shape
             .as_ref()
@@ -3174,6 +3177,9 @@ impl Database {
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         if trigger_callback_bound && matches!(stmt, Statement::Update(_) | Statement::Delete(_)) {
             if let Some(plan) = cached_plan {
+                // This branch reaches execute_plan without going through
+                // run_planned_statement, so it applies the pass itself.
+                validate_plan_columns(self, plan)?;
                 let snapshot = self.snapshot_for_read();
                 return self
                     .with_snapshot_override(snapshot, || execute_plan(self, plan, params, Some(tx)))
@@ -3183,6 +3189,7 @@ impl Database {
             let stmt = self.pre_resolve_cte_subqueries(stmt, params, Some(tx))?;
             let plan = contextdb_planner::plan(&stmt)?;
             self.cache_statement_if_eligible(sql, &stmt, &plan);
+            validate_plan_columns(self, &plan)?;
             let snapshot = self.snapshot_for_read();
             return self
                 .with_snapshot_override(snapshot, || execute_plan(self, &plan, params, Some(tx)))
@@ -3770,6 +3777,13 @@ impl Database {
         skip_static_dml_validation: bool,
     ) -> Result<QueryResult> {
         if !skip_static_dml_validation && let Err(error) = validate_dml(plan, self, params) {
+            self.rollback_preopened_autocommit_tx(preopened_autocommit_tx);
+            return Err(error);
+        }
+        // Catalog validation for every column the plan names, before any row is
+        // read. Sits with the existing static DML check so both plan-time
+        // refusals happen at one seam.
+        if let Err(error) = validate_plan_columns(self, plan) {
             self.rollback_preopened_autocommit_tx(preopened_autocommit_tx);
             return Err(error);
         }
@@ -15160,6 +15174,43 @@ impl Database {
         self.ensure_sync_apply_ready()
     }
 
+    /// True when every column an incoming sync row carries already holds that
+    /// same value in the local row it collides with — the "unchanged" test
+    /// `upsert_row_for_sync` answers `UpsertResult::NoOp` on, hoisted ahead of
+    /// the conflict policies so re-delivered data is never mistaken for two
+    /// machines disagreeing.
+    ///
+    /// Columns that are literally equal cost one comparison; only a column that
+    /// differs is run through the column's own coercion, so a cell that differs
+    /// solely in representation (an `Int32` arriving for an `INTEGER` column)
+    /// still reads as unchanged without allocating on the equal path.
+    fn sync_incoming_row_is_already_local(
+        values: &HashMap<ColName, Value>,
+        local: &VersionedRow,
+        table: &str,
+        meta: Option<&TableMeta>,
+    ) -> bool {
+        values.iter().all(|(column, incoming)| {
+            let Some(local_value) = local.values.get(column) else {
+                return false;
+            };
+            if local_value == incoming {
+                return true;
+            }
+            meta.is_some_and(|meta| {
+                crate::executor::coerce_into_column_with_meta(
+                    table,
+                    meta,
+                    column,
+                    incoming.clone(),
+                    None,
+                    None,
+                )
+                .is_ok_and(|coerced| &coerced == local_value)
+            })
+        })
+    }
+
     fn apply_changes_single_lsn_group(
         &self,
         changes: ChangeSet,
@@ -15769,11 +15820,13 @@ impl Database {
                         &mut failed_row_ids,
                     );
                 }
-                result.conflicts.push(Conflict {
-                    natural_key: row.natural_key.clone(),
-                    resolution: policy,
-                    reason: Some("incoming row hidden by access scope".to_string()),
-                });
+                // Refused, and that is the whole story: no `Conflict` is
+                // recorded. A conflict says two peers both saw a row and
+                // disagreed about it; a receiver that cannot see this row has
+                // nothing to disagree about, and the record would name the
+                // hidden row's natural key — leaking the existence of a row the
+                // access boundary exists to hide. The refusal counts as
+                // `skipped_rows` above and stops there.
                 if commit_each_row {
                     self.commit_with_source(tx, CommitSource::SyncPull)?;
                     tx = self.begin()?;
@@ -15843,6 +15896,41 @@ impl Database {
 
             let mut values = row.values.clone();
             values.remove("__deleted");
+
+            // A row that arrives carrying exactly what this node already holds
+            // is a re-delivery, not a divergence — the everyday case being an
+            // edge pulling back the rows it pushed a moment ago. Under EVERY
+            // conflict policy that is a PURE no-op, counted in none of the three
+            // buckets: nothing was written, so it is not applied work; nothing
+            // disagreed, so it is not a conflict; and nothing was refused, so it
+            // is not skipped either — `skipped_rows` reports rows a policy or the
+            // context scope turned away, and an echo is a convergence
+            // confirmation rather than turned-away work. The decision is made per
+            // row against that row's own content, so a batch mixing an echo with
+            // a genuine divergence still reports the divergence in full; only
+            // rows whose content differs reach the policy arms below.
+            if let Some(local) = existing.as_ref()
+                && Self::sync_incoming_row_is_already_local(
+                    &values,
+                    local,
+                    &row.table,
+                    row_meta.as_ref(),
+                )
+            {
+                if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                    consume_vector_row_group(
+                        &vector_row_ids,
+                        &mut vector_row_idx,
+                        local.row_id,
+                        &mut vector_row_map,
+                    );
+                }
+                if commit_each_row {
+                    self.commit_with_source(tx, CommitSource::SyncPull)?;
+                    tx = self.begin()?;
+                }
+                continue;
+            }
 
             match (existing, policy) {
                 (None, _) => {
@@ -17681,7 +17769,7 @@ fn checked_prune_expired_rows(
 /// answers `TxId(0)` for every lookup and would hide the whole database. The
 /// most recent entry is kept as the anchor instead.
 fn retained_commit_index_after_prune(
-    tx_mgr: &TxManager<DynStore>,
+    tx_mgr: &TransactionManager<DynStore>,
     surviving_change_log: &[ChangeLogEntry],
 ) -> BTreeMap<Lsn, TxId> {
     let index = tx_mgr.commit_index_snapshot();

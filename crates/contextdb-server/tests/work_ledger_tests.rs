@@ -64,7 +64,7 @@ fn worker_config(node_id: &str) -> WorkerConfig {
             auto_propagate: true,
         },
         lease_duration_ms: LEASE,
-        blob_service: None,
+        blob_store: None,
         defer_own_submissions_until_deadline: false,
         writes_are_canonical: false,
     }
@@ -1445,7 +1445,7 @@ async fn canonical_worker_never_pushes_its_advertisement() {
             auto_propagate: true,
         },
         lease_duration_ms: 60_000,
-        blob_service: None,
+        blob_store: None,
         defer_own_submissions_until_deadline: false,
         writes_are_canonical: true,
     };

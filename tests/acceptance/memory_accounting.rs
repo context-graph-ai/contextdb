@@ -11,7 +11,7 @@ fn a_ma1_memory_limit_flag_sets_ceiling() {
     let output = run_cli_script(
         &db_path,
         &["--memory-limit", "4G"],
-        "SHOW MEMORY_LIMIT\n.quit\n",
+        "SHOW MEMORY_LIMIT;\n.quit\n",
     );
     assert!(
         output.status.success(),
@@ -46,7 +46,7 @@ fn a_ma2_env_var_sets_ceiling() {
                 .stdin
                 .as_mut()
                 .unwrap()
-                .write_all(b"SHOW MEMORY_LIMIT\n.quit\n")
+                .write_all(b"SHOW MEMORY_LIMIT;\n.quit\n")
                 .unwrap();
             child.wait_with_output()
         })
@@ -70,7 +70,7 @@ fn a_ma3_set_lower_than_ceiling() {
     let output = run_cli_script(
         &db_path,
         &["--memory-limit", "4G"],
-        "SET MEMORY_LIMIT '1G'\nSHOW MEMORY_LIMIT\n.quit\n",
+        "SET MEMORY_LIMIT '1G';\nSHOW MEMORY_LIMIT;\n.quit\n",
     );
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
@@ -96,16 +96,20 @@ fn a_ma4_set_higher_than_ceiling_errors() {
     let output = run_cli_script(
         &db_path,
         &["--memory-limit", "1G"],
-        "SET MEMORY_LIMIT '4G'\n.quit\n",
+        "SET MEMORY_LIMIT '4G';\n.quit\n",
     );
-    assert!(output.status.success(), "CLI must not crash on SET error");
-    let stdout = output_string(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "CLI must exit cleanly with the definitive-error code on SET error, not crash"
+    );
+    let stderr = output_string(&output.stderr);
     assert!(
-        stdout.contains("Error")
-            || stdout.contains("error")
-            || stdout.contains("exceed")
-            || stdout.contains("ceiling"),
-        "SET above ceiling must produce error: {stdout}"
+        stderr.contains("Error")
+            || stderr.contains("error")
+            || stderr.contains("exceed")
+            || stderr.contains("ceiling"),
+        "SET above ceiling must produce error on stderr: {stderr}"
     );
 }
 
@@ -119,13 +123,17 @@ fn a_ma5_set_none_with_ceiling_errors() {
     let output = run_cli_script(
         &db_path,
         &["--memory-limit", "1G"],
-        "SET MEMORY_LIMIT 'none'\n.quit\n",
+        "SET MEMORY_LIMIT 'none';\n.quit\n",
     );
-    assert!(output.status.success());
-    let stdout = output_string(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "CLI must exit cleanly with the definitive-error code on SET error, not crash"
+    );
+    let stderr = output_string(&output.stderr);
     assert!(
-        stdout.contains("Error") || stdout.contains("error") || stdout.contains("ceiling"),
-        "SET 'none' with ceiling must produce error: {stdout}"
+        stderr.contains("Error") || stderr.contains("error") || stderr.contains("ceiling"),
+        "SET 'none' with ceiling must produce error on stderr: {stderr}"
     );
 }
 
@@ -139,18 +147,22 @@ fn a_ma6_error_message_has_diagnostic_fields() {
     let output = run_cli_script(
         &db_path,
         &["--memory-limit", "512"],
-        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'test data that exceeds tiny budget')\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\nINSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'test data that exceeds tiny budget');\n.quit\n",
     );
-    assert!(output.status.success());
-    let stdout = output_string(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "CLI must exit cleanly with the definitive-error code on a memory budget error, not crash"
+    );
+    let stderr = output_string(&output.stderr);
     // Error must contain: subsystem, operation, requested bytes, available, budget, hint.
     assert!(
-        stdout.contains("memory budget exceeded"),
-        "error must mention 'memory budget exceeded': {stdout}"
+        stderr.contains("memory budget exceeded"),
+        "error must mention 'memory budget exceeded' on stderr: {stderr}"
     );
     assert!(
-        stdout.contains("Hint:") || stdout.contains("hint:"),
-        "error must contain a hint for AI agents: {stdout}"
+        stderr.contains("Hint:") || stderr.contains("hint:"),
+        "error must contain a hint for AI agents on stderr: {stderr}"
     );
 }
 
@@ -165,16 +177,20 @@ fn a_ma7_insert_exhaust_delete_insert() {
         &db_path,
         &["--memory-limit", "2048"],
         concat!(
-            "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)\n",
-            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'first')\n",
-            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'second attempt that may fail')\n",
-            "DELETE FROM t WHERE id = '00000000-0000-0000-0000-000000000001'\n",
-            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'after reclaim')\n",
-            "SELECT COUNT(*) FROM t\n",
+            "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\n",
+            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'first');\n",
+            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'second attempt that may fail');\n",
+            "DELETE FROM t WHERE id = '00000000-0000-0000-0000-000000000001';\n",
+            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'after reclaim');\n",
+            "SELECT COUNT(*) FROM t;\n",
             ".quit\n",
         ),
     );
-    assert!(output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "CLI must exit cleanly with the definitive-error code (the probing second INSERT fails), not crash"
+    );
     let stdout = output_string(&output.stdout);
     // The final INSERT (after DELETE) must succeed, proving memory reclamation works.
     // The SELECT COUNT(*) output must show a count (at least 1 row survived).
@@ -196,10 +212,10 @@ fn a_ma8_no_memory_limit_flag_works() {
         &db_path,
         &[],
         concat!(
-            "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)\n",
-            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'works')\n",
-            "SELECT * FROM t\n",
-            "SHOW MEMORY_LIMIT\n",
+            "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\n",
+            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'works');\n",
+            "SELECT * FROM t;\n",
+            "SHOW MEMORY_LIMIT;\n",
             ".quit\n",
         ),
     );
@@ -226,7 +242,7 @@ fn a_ma9_memory_limit_survives_restart() {
     let configured = run_cli_script(
         &db_path,
         &[],
-        "SET MEMORY_LIMIT '1K'\nSHOW MEMORY_LIMIT\n.quit\n",
+        "SET MEMORY_LIMIT '1K';\nSHOW MEMORY_LIMIT;\n.quit\n",
     );
     assert!(configured.status.success());
     let configured_stdout = output_string(&configured.stdout);
@@ -239,23 +255,25 @@ fn a_ma9_memory_limit_survives_restart() {
         &db_path,
         &[],
         &format!(
-            "SHOW MEMORY_LIMIT\nCREATE TABLE big (id UUID PRIMARY KEY, payload TEXT)\nINSERT INTO big (id, payload) VALUES ('00000000-0000-0000-0000-000000000001', '{}')\n.quit\n",
+            "SHOW MEMORY_LIMIT;\nCREATE TABLE big (id UUID PRIMARY KEY, payload TEXT);\nINSERT INTO big (id, payload) VALUES ('00000000-0000-0000-0000-000000000001', '{}');\n.quit\n",
             "x".repeat(4096)
         ),
     );
-    assert!(
-        reopened.status.success(),
-        "CLI must stay alive across OOM errors"
+    assert_eq!(
+        reopened.status.code(),
+        Some(1),
+        "CLI must exit cleanly with the definitive-error code across OOM errors, not crash"
     );
     let reopened_stdout = output_string(&reopened.stdout);
     assert!(
         reopened_stdout.contains("1024"),
         "reopened database must still report the configured MEMORY_LIMIT: {reopened_stdout}"
     );
+    let reopened_stderr = output_string(&reopened.stderr);
     assert!(
-        reopened_stdout
+        reopened_stderr
             .to_lowercase()
             .contains("memory budget exceeded"),
-        "reopened database must still enforce the persisted limit: {reopened_stdout}"
+        "reopened database must still enforce the persisted limit on stderr: {reopened_stderr}"
     );
 }

@@ -7,6 +7,8 @@ mod anti_tests;
 #[cfg(feature = "nats-tests")]
 #[path = "integration/auto_sync_update_push_visibility_tests.rs"]
 mod auto_sync_update_push_visibility_tests;
+#[path = "support/binary_path.rs"]
+mod binary_path;
 #[path = "integration/boundary_conditions.rs"]
 mod boundary_conditions;
 #[path = "integration/bounded_tables_tests.rs"]
@@ -25,8 +27,12 @@ mod composite_foreign_key_tests;
 mod composite_primary_key_tests;
 #[path = "integration/conflict_policy_declared_tests.rs"]
 mod conflict_policy_declared_tests;
+#[path = "integration/cross_cutting_acceptance_tests.rs"]
+mod cross_cutting_acceptance_tests;
 #[path = "integration/ddl_sync_tests.rs"]
 mod ddl_sync_tests;
+#[path = "integration/explain_plan_time_validation_tests.rs"]
+mod explain_plan_time_validation_tests;
 #[path = "integration/gate_a_primitives.rs"]
 mod gate_a_primitives;
 #[cfg(feature = "nats-tests")]
@@ -40,20 +46,24 @@ mod gate_c_d_lifecycle;
 mod golden_output;
 #[path = "integration/helpers.rs"]
 mod helpers;
-#[path = "integration/cross_cutting_acceptance_tests.rs"]
-mod cross_cutting_acceptance_tests;
 #[path = "integration/hnsw_tests.rs"]
 mod hnsw_tests;
+#[path = "integration/hybrid_query_on_true_join_tests.rs"]
+mod hybrid_query_on_true_join_tests;
 #[path = "integration/indexed_scan_filter_composite_routing_tests.rs"]
 mod indexed_scan_filter_composite_routing_tests;
 #[path = "integration/indexed_scan_filter_tests.rs"]
 mod indexed_scan_filter_tests;
 #[path = "integration/job_level.rs"]
 mod job_level;
+#[path = "integration/join_on_column_validation_tests.rs"]
+mod join_on_column_validation_tests;
 #[path = "integration/memory_accounting_tests.rs"]
 mod memory_accounting_tests;
 #[path = "integration/named_vector_indexes_tests.rs"]
 mod named_vector_indexes_tests;
+#[path = "integration/order_by_column_validation_tests.rs"]
+mod order_by_column_validation_tests;
 #[cfg(target_os = "linux")]
 #[path = "integration/peak_rss_harness.rs"]
 mod peak_rss_harness;
@@ -81,5 +91,7 @@ mod sync_relay_trigger_tables_tests;
 #[cfg(feature = "nats-tests")]
 #[path = "integration/sync_server_nonblocking_apply.rs"]
 mod sync_server_nonblocking_apply;
+#[path = "integration/where_clause_column_validation_tests.rs"]
+mod where_clause_column_validation_tests;
 #[path = "integration/work_ledger_tests.rs"]
 mod work_ledger_tests;

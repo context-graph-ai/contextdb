@@ -73,16 +73,16 @@ fn f58b_query_operators_work_through_cli() {
         &temp_db_file(&tmp, "f58b.db"),
         &[],
         "\
-CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, category TEXT, reading REAL)\n\
-INSERT INTO sensors (id, name, category, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'alice', 'a', 1.0)\n\
-INSERT INTO sensors (id, name, category, reading) VALUES ('00000000-0000-0000-0000-000000000002', 'bob', 'a', 2.0)\n\
-SELECT DISTINCT category FROM sensors\n\
-SELECT COUNT(*) FROM sensors\n\
-SELECT * FROM sensors WHERE name IN ('alice', 'bob')\n\
-SELECT * FROM sensors WHERE name LIKE 'a%'\n\
-SELECT * FROM sensors WHERE reading BETWEEN 1 AND 2 ORDER BY category ASC, reading DESC\n\
-BEGIN\n\
-COMMIT\n\
+CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, category TEXT, reading REAL);\n\
+INSERT INTO sensors (id, name, category, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'alice', 'a', 1.0);\n\
+INSERT INTO sensors (id, name, category, reading) VALUES ('00000000-0000-0000-0000-000000000002', 'bob', 'a', 2.0);\n\
+SELECT DISTINCT category FROM sensors;\n\
+SELECT COUNT(*) FROM sensors;\n\
+SELECT * FROM sensors WHERE name IN ('alice', 'bob');\n\
+SELECT * FROM sensors WHERE name LIKE 'a%';\n\
+SELECT * FROM sensors WHERE reading BETWEEN 1 AND 2 ORDER BY category ASC, reading DESC;\n\
+BEGIN;\n\
+COMMIT;\n\
 .quit\n",
     );
     assert!(output.status.success());
@@ -100,12 +100,12 @@ fn f58c_ddl_constraints_enforced_through_cli() {
         &temp_db_file(&tmp, "f58c.db"),
         &[],
         "\
-CREATE TABLE immutable_rows (id UUID PRIMARY KEY, name TEXT) IMMUTABLE\n\
-INSERT INTO immutable_rows (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'x')\n\
-UPDATE immutable_rows SET name = 'y'\n\
-CREATE TABLE workflows (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: draft -> [review], review -> [published])\n\
-INSERT INTO workflows (id, status) VALUES ('00000000-0000-0000-0000-000000000002', 'draft')\n\
-INSERT INTO workflows (id, status) VALUES ('00000000-0000-0000-0000-000000000002', 'published') ON CONFLICT (id) DO UPDATE SET status='published'\n\
+CREATE TABLE immutable_rows (id UUID PRIMARY KEY, name TEXT) IMMUTABLE;\n\
+INSERT INTO immutable_rows (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'x');\n\
+UPDATE immutable_rows SET name = 'y';\n\
+CREATE TABLE workflows (id UUID PRIMARY KEY, status TEXT) STATE MACHINE (status: draft -> [review], review -> [published]);\n\
+INSERT INTO workflows (id, status) VALUES ('00000000-0000-0000-0000-000000000002', 'draft');\n\
+INSERT INTO workflows (id, status) VALUES ('00000000-0000-0000-0000-000000000002', 'published') ON CONFLICT (id) DO UPDATE SET status='published';\n\
 .quit\n",
     );
     let combined = format!(
@@ -636,7 +636,7 @@ fn f88_begin_commit_atomicity() {
     let output = run_cli_script(
         &temp_db_file(&tmp, "f88.db"),
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY)\nBEGIN\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000001')\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000002')\nCOMMIT\nSELECT COUNT(*) FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY);\nBEGIN;\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000001');\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000002');\nCOMMIT;\nSELECT COUNT(*) FROM t;\n.quit\n",
     );
     assert!(output.status.success());
     assert!(output_string(&output.stdout).contains("2"));
@@ -649,7 +649,7 @@ fn f89_rollback_discards_changes() {
     let output = run_cli_script(
         &temp_db_file(&tmp, "f89.db"),
         &[],
-        "CREATE TABLE t (id UUID PRIMARY KEY)\nBEGIN\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000001')\nROLLBACK\nSELECT COUNT(*) FROM t\n.quit\n",
+        "CREATE TABLE t (id UUID PRIMARY KEY);\nBEGIN;\nINSERT INTO t (id) VALUES ('00000000-0000-0000-0000-000000000001');\nROLLBACK;\nSELECT COUNT(*) FROM t;\n.quit\n",
     );
     assert!(output.status.success());
     assert!(output_string(&output.stdout).contains("0"));

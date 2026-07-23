@@ -322,17 +322,32 @@ fn plan_select_body(
         };
     }
 
+    // Guarded by `!uses_vector_search` so the vector-similarity path
+    // (`ORDER BY <col> <=> <query> [USE RANK ...]`) is untouched: it was
+    // already turned into a VectorSearch/HnswSearch above and never reaches
+    // these rules.
     if !body.order_by.is_empty() && !uses_vector_search {
-        current = PhysicalPlan::Sort {
-            input: Box::new(current),
-            keys: body
-                .order_by
-                .iter()
-                .map(|item| SortKey {
-                    expr: item.expr.clone(),
+        let keys = body
+            .order_by
+            .iter()
+            .map(|item| {
+                let expr = resolve_order_by_output_alias(&item.expr, &body.columns);
+                // `Sort` reads a sort key by pulling a column out of a row, so
+                // anything that is not a column reference cannot be evaluated.
+                // Refuse it here rather than let the comparator treat every row
+                // as equal and hand back a silently unsorted result.
+                if !matches!(expr, Expr::Column(_)) {
+                    return Err(Error::OrderByExpressionNotSupported);
+                }
+                Ok(SortKey {
+                    expr,
                     direction: item.direction,
                 })
-                .collect(),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        current = PhysicalPlan::Sort {
+            input: Box::new(current),
+            keys,
         };
     }
 
@@ -373,6 +388,32 @@ fn plan_select_body(
     }
 
     Ok(current)
+}
+
+/// Resolve a bare `ORDER BY` name against the SELECT-list output names, as
+/// standard SQL does before falling back to the input columns.
+///
+/// `Sort` is planned *below* `Project`, so a SELECT-list alias does not exist
+/// in the sort input at all. Without this substitution `SELECT b AS x FROM t
+/// ORDER BY x` looks exactly like a reference to a column that does not exist,
+/// and the rows come back in storage order with no sort applied and no error.
+/// A qualified name (`t.x`) names a table column, never an output alias, so it
+/// is left alone.
+fn resolve_order_by_output_alias(
+    expr: &Expr,
+    columns: &[contextdb_parser::ast::SelectColumn],
+) -> Expr {
+    let Expr::Column(contextdb_parser::ast::ColumnRef {
+        table: None,
+        column,
+    }) = expr
+    else {
+        return expr.clone();
+    };
+    columns
+        .iter()
+        .find(|select| select.alias.as_deref() == Some(column.as_str()))
+        .map_or_else(|| expr.clone(), |select| select.expr.clone())
 }
 
 fn vector_search_parts(expr: &Expr) -> Result<(String, Expr)> {

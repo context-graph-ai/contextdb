@@ -367,8 +367,8 @@ fn t27_07_schedule_persists_across_engine_restart() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("cron.redb");
     let script = "\
-CREATE TABLE log (id UUID PRIMARY KEY)
-CREATE SCHEDULE persistent EVERY '500 MILLISECONDS' TX (cb) MISSED_TICK_POLICY 'catch-up' WITHIN 60 SECONDS
+CREATE TABLE log (id UUID PRIMARY KEY);
+CREATE SCHEDULE persistent EVERY '500 MILLISECONDS' TX (cb) MISSED_TICK_POLICY 'catch-up' WITHIN 60 SECONDS;
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(
@@ -562,9 +562,9 @@ fn t27_10_drop_schedule_persists_across_reopen() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("dropx.redb");
     let script = "\
-CREATE TABLE log (id UUID PRIMARY KEY)
-CREATE SCHEDULE doomed EVERY '500 MILLISECONDS' TX (cb) MISSED_TICK_POLICY 'skip-and-audit'
-DROP SCHEDULE doomed
+CREATE TABLE log (id UUID PRIMARY KEY);
+CREATE SCHEDULE doomed EVERY '500 MILLISECONDS' TX (cb) MISSED_TICK_POLICY 'skip-and-audit';
+DROP SCHEDULE doomed;
 ";
     let out = run_cli_script(&path, &[], script);
     assert!(

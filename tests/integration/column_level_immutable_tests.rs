@@ -2529,7 +2529,7 @@ fn ic14_cross_variant_coercion_into_flagged_column_rejected() {
     .unwrap();
 
     // Drive committed_watermark past 42 via auto-commit SQL so the seed INSERT's
-    // Value::TxId(TxId(42)) respects the txid B7 bound (n <= max(watermark, active_tx)).
+    // Value::TxId(TxId(42)) respects the txid bound (n <= max(watermark, active_tx)).
     db.execute(
         "CREATE TABLE bump (id UUID PRIMARY KEY, n INTEGER)",
         &empty(),

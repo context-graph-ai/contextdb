@@ -1576,24 +1576,22 @@ pub(crate) fn execute_plan(
                 input_result.trace.sort_elided = true;
                 return Ok(input_result);
             }
+            // Resolve every sort key to a column index ONCE, before a single
+            // pair is compared: the comparator cannot return an error, so an
+            // unresolved key would otherwise be swallowed as `Ordering::Equal`
+            // and the caller would get rows in storage order with no signal.
+            // Plan-time validation has already proven these resolve; this call
+            // is the sort's own index lookup, sharing one implementation with
+            // the validator so the two can never disagree.
+            let key_indexes = keys
+                .iter()
+                .map(|key| resolve_sort_key_index(&input_result.columns, input, key))
+                .collect::<Result<Vec<_>>>()?;
+
             input_result.rows.sort_by(|left, right| {
-                for key in keys {
-                    let Expr::Column(column_ref) = &key.expr else {
-                        return Ordering::Equal;
-                    };
-                    let left_value =
-                        match lookup_query_result_column(left, &input_result.columns, column_ref) {
-                            Ok(value) => value,
-                            Err(_) => return Ordering::Equal,
-                        };
-                    let right_value = match lookup_query_result_column(
-                        right,
-                        &input_result.columns,
-                        column_ref,
-                    ) {
-                        Ok(value) => value,
-                        Err(_) => return Ordering::Equal,
-                    };
+                for (key, index) in keys.iter().zip(&key_indexes) {
+                    let left_value = left.get(*index).cloned().unwrap_or(Value::Null);
+                    let right_value = right.get(*index).cloned().unwrap_or(Value::Null);
                     let ordering = compare_sort_values(&left_value, &right_value, key.direction);
                     if ordering != Ordering::Equal {
                         return ordering;
@@ -2951,6 +2949,406 @@ fn exec_update(
     }
 
     Ok(QueryResult::empty_with_affected(matched.len() as u64))
+}
+
+/// The one pseudo-column a predicate may name without it being declared on the
+/// table: `eval_expr_value` serves it from the row header, not the row values.
+const PREDICATE_PSEUDO_COLUMN: &str = "row_id";
+
+/// Reject a predicate that names a column the table does not declare.
+///
+/// Standard SQL treats an unknown column reference in a predicate as an error.
+/// The row-level evaluator instead reads absent names as NULL, so a typo turns
+/// into a wrong answer with no signal: zero rows from `WHERE nope = 'x'`, every
+/// row from `WHERE nope IS NULL`, and — on DELETE — the whole table gone.
+/// Checking the whole predicate before any row is touched also makes the answer
+/// independent of which branches a short-circuit would have reached.
+///
+/// Precedence matches `CREATE INDEX` (TableNotFound before ColumnNotFound): an
+/// absent table is left to the scan/DML path that reports it.
+fn validate_predicate_columns(db: &Database, table: &str, predicate: &Expr) -> Result<()> {
+    let Some(meta) = db.table_meta(table) else {
+        return Ok(());
+    };
+    check_predicate_columns_declared(table, &meta, predicate)
+}
+
+fn check_predicate_columns_declared(table: &str, meta: &TableMeta, expr: &Expr) -> Result<()> {
+    walk_predicate_columns(expr, &mut |column_ref| {
+        if column_ref.column == PREDICATE_PSEUDO_COLUMN
+            || meta
+                .columns
+                .iter()
+                .any(|column| column.name == column_ref.column)
+        {
+            Ok(())
+        } else {
+            Err(Error::ColumnNotFound {
+                table: table.to_string(),
+                column: column_ref.column.clone(),
+            })
+        }
+    })
+}
+
+/// Visit every column reference a predicate makes, in source order, so the
+/// first unknown name is the one reported.
+fn walk_predicate_columns(
+    expr: &Expr,
+    check: &mut dyn FnMut(&ColumnRef) -> Result<()>,
+) -> Result<()> {
+    match expr {
+        Expr::Column(column_ref) => check(column_ref),
+        Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
+        Expr::BinaryOp { left, right, .. } | Expr::CosineDistance { left, right } => {
+            walk_predicate_columns(left, check)?;
+            walk_predicate_columns(right, check)
+        }
+        Expr::UnaryOp { operand, .. } => walk_predicate_columns(operand, check),
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                walk_predicate_columns(arg, check)?;
+            }
+            Ok(())
+        }
+        Expr::InList { expr, list, .. } => {
+            walk_predicate_columns(expr, check)?;
+            for item in list {
+                walk_predicate_columns(item, check)?;
+            }
+            Ok(())
+        }
+        Expr::Like { expr, pattern, .. } => {
+            walk_predicate_columns(expr, check)?;
+            walk_predicate_columns(pattern, check)
+        }
+        // Only the outer operand belongs to this relation; the subquery body
+        // names its own columns and is validated when it is planned and run.
+        Expr::InSubquery { expr, .. } => walk_predicate_columns(expr, check),
+        Expr::IsNull { expr, .. } => walk_predicate_columns(expr, check),
+        // `ROW_VECTOR(table, column, key)` names another table's column and is
+        // legal only on the right of `<=>` in ORDER BY, never in a predicate.
+        Expr::RowVectorSource { .. } => Ok(()),
+    }
+}
+
+/// The table an error should name for a plan that is not a single bare scan.
+/// Over a join this is the left (anchor) relation — a join has no one owner,
+/// and naming the anchor beats inventing a table name or reporting none.
+/// Validate every column a plan names against the catalog, running none of it.
+///
+/// This is the plan-time seam: it runs after physical planning and before
+/// execution, and `Database::explain` calls it too, so a statically-invalid
+/// query is refused there instead of rendering a plan for something that
+/// cannot run. Because it derives each node's columns from the catalog rather
+/// than from materialized rows, a predicate over a join is refused before the
+/// join's left side is scanned at all — where the previous execution-time
+/// check could only run after the whole input had already been built.
+///
+/// It reuses the same predicate walk and the same resolution rules the
+/// executor uses, so relocating *when* validation happens changed no verdict:
+/// the deliberate bare-name/qualifier semantics are untouched.
+pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Result<()> {
+    match plan {
+        PhysicalPlan::Scan {
+            table,
+            filter: Some(predicate),
+            ..
+        } => validate_predicate_columns(db, table, predicate)?,
+        PhysicalPlan::Delete(p) => {
+            if let Some(predicate) = &p.where_clause {
+                validate_predicate_columns(db, &p.table, predicate)?;
+            }
+        }
+        PhysicalPlan::Update(p) => {
+            if let Some(predicate) = &p.where_clause {
+                validate_predicate_columns(db, &p.table, predicate)?;
+            }
+        }
+        PhysicalPlan::Filter { input, predicate } => {
+            validate_plan_columns(db, input)?;
+            if let Some(columns) = plan_output_columns(db, input) {
+                validate_filter_predicate_columns(&columns, input, predicate)?;
+            }
+        }
+        PhysicalPlan::Sort { input, keys } => {
+            validate_plan_columns(db, input)?;
+            if let Some(columns) = plan_output_columns(db, input) {
+                for key in keys {
+                    resolve_sort_key_index(&columns, input, key)?;
+                }
+            }
+        }
+        PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. } => validate_plan_columns(db, input)?,
+        PhysicalPlan::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            validate_plan_columns(db, left)?;
+            validate_plan_columns(db, right)?;
+            // The ON clause is evaluated per row PAIR, so an unknown column in
+            // it only ever surfaced when both sides happened to produce rows —
+            // an empty side skipped the check entirely and the query silently
+            // succeeded. Validate it here against the list the executor will
+            // actually evaluate it against.
+            if let Some(columns) = join_column_lists(db, plan) {
+                validate_filter_predicate_columns(&columns.condition, plan, condition)?;
+            }
+        }
+        PhysicalPlan::VectorSearch { candidates, .. }
+        | PhysicalPlan::HnswSearch { candidates, .. } => {
+            if let Some(candidates) = candidates {
+                validate_plan_columns(db, candidates)?;
+            }
+        }
+        // The traversal's own filter names graph aliases rather than table
+        // columns, so it stays with the runtime evaluator; the candidate
+        // sub-plan is an ordinary relational plan and is validated.
+        PhysicalPlan::GraphBfs {
+            start_candidates: Some(candidates),
+            ..
+        } => validate_plan_columns(db, candidates)?,
+        PhysicalPlan::Union { inputs, .. } => {
+            for input in inputs {
+                validate_plan_columns(db, input)?;
+            }
+        }
+        PhysicalPlan::Pipeline(plans) => {
+            for plan in plans {
+                validate_plan_columns(db, plan)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Resolve one ORDER BY key to an index into `columns`, reporting the unknown
+/// and ambiguous cases the way every other column error in the engine reads.
+fn resolve_sort_key_index(
+    columns: &[String],
+    input: &PhysicalPlan,
+    key: &contextdb_planner::SortKey,
+) -> Result<usize> {
+    let Expr::Column(column_ref) = &key.expr else {
+        return Err(Error::OrderByExpressionNotSupported);
+    };
+    match resolve_query_result_column(columns, column_ref) {
+        QueryResultColumn::Found(idx) => Ok(idx),
+        // Report against the same table name CREATE INDEX and the WHERE path
+        // use, so one unknown column reads the same way wherever it is named.
+        QueryResultColumn::NotFound => Err(Error::ColumnNotFound {
+            table: column_ref
+                .table
+                .clone()
+                .or_else(|| plan_anchor_table(input))
+                .unwrap_or_else(|| "<query>".to_string()),
+            column: column_ref.column.clone(),
+        }),
+        other => Err(query_result_column_error(column_ref, &other)),
+    }
+}
+
+/// The columns a plan node yields, derived from the catalog without running it.
+///
+/// `None` means "cannot be derived statically" — the caller then skips the
+/// check rather than guessing. Where a node's runtime column list varies by
+/// branch this deliberately returns a SUPERSET, so the validator can only ever
+/// reject a name that no branch could have produced. Each arm mirrors the
+/// column list the matching executor arm builds; the join arm reuses the very
+/// same helpers, so the two cannot drift.
+fn plan_output_columns(db: &Database, plan: &PhysicalPlan) -> Option<Vec<String>> {
+    match plan {
+        PhysicalPlan::Scan { table, .. } if table == "dual" => Some(Vec::new()),
+        PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
+            scan_output_columns(db, table)
+        }
+        PhysicalPlan::VectorSearch { table, .. } | PhysicalPlan::HnswSearch { table, .. } => {
+            let mut columns = scan_output_columns(db, table)?;
+            columns.push("score".to_string());
+            Some(columns)
+        }
+        PhysicalPlan::GraphBfs {
+            start_alias, steps, ..
+        } => {
+            let mut columns = vec![format!("{start_alias}.id")];
+            for step in steps {
+                columns.push(format!("{}.id", step.target_alias));
+            }
+            columns.push("id".to_string());
+            columns.push("depth".to_string());
+            Some(columns)
+        }
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. } => plan_output_columns(db, input),
+        PhysicalPlan::Project { columns, .. } => Some(project_output_columns(columns)),
+        PhysicalPlan::Join { .. } => Some(join_column_lists(db, plan)?.output),
+        _ => None,
+    }
+}
+
+/// The two DIFFERENT column lists a join builds, kept together because using
+/// the wrong one is the easy mistake here.
+///
+/// `condition` is what the `ON` clause is evaluated against: the left columns
+/// followed by the right columns, with only the names that COLLIDE across the
+/// two sides prefixed. `output` is what the join hands upward to a `Filter` or
+/// `Sort`: fully qualified. They are not interchangeable — validating an `ON`
+/// clause against `output` would reject valid SQL, because a name the condition
+/// legitimately uses unqualified only exists in qualified form there.
+struct JoinColumnLists {
+    condition: Vec<String>,
+    output: Vec<String>,
+}
+
+fn join_column_lists(db: &Database, plan: &PhysicalPlan) -> Option<JoinColumnLists> {
+    let PhysicalPlan::Join {
+        left,
+        right,
+        left_alias,
+        right_alias,
+        ..
+    } = plan
+    else {
+        return None;
+    };
+    let left_columns = plan_output_columns(db, left)?;
+    let right_columns = plan_output_columns(db, right)?;
+    let right_duplicate_names = duplicate_column_names(&left_columns, &right_columns);
+    let right_prefix = right_alias
+        .clone()
+        .unwrap_or_else(|| right_table_name(right));
+    let mut condition = left_columns.clone();
+    condition.extend(right_columns.iter().map(|column| {
+        if right_duplicate_names.contains(column) {
+            format!("{right_prefix}.{column}")
+        } else {
+            column.clone()
+        }
+    }));
+    let output = qualify_join_columns(
+        &condition,
+        &left_columns,
+        &right_columns,
+        left_alias,
+        &right_prefix,
+    );
+    Some(JoinColumnLists { condition, output })
+}
+
+/// A scan's columns: the synthetic `row_id` the executor prepends, then the
+/// table's declared columns in declaration order.
+fn scan_output_columns(db: &Database, table: &str) -> Option<Vec<String>> {
+    let meta = db.table_meta(table)?;
+    let mut columns = vec!["row_id".to_string()];
+    columns.extend(meta.columns.into_iter().map(|column| column.name));
+    Some(columns)
+}
+
+/// A projection's output names, mirroring both executor derivations: a COUNT
+/// aggregate names the column after the function, everything else after the
+/// projected column, and an explicit alias always wins.
+fn project_output_columns(columns: &[contextdb_planner::ProjectColumn]) -> Vec<String> {
+    let has_aggregate = columns.iter().any(|column| {
+        matches!(&column.expr, Expr::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    });
+    columns
+        .iter()
+        .map(|column| {
+            column.alias.clone().unwrap_or_else(|| match &column.expr {
+                Expr::FunctionCall { name, .. } if has_aggregate => name.clone(),
+                Expr::Column(col) if !has_aggregate => col.column.clone(),
+                _ => "expr".to_string(),
+            })
+        })
+        .collect()
+}
+
+fn plan_anchor_table(plan: &PhysicalPlan) -> Option<String> {
+    match plan {
+        PhysicalPlan::Scan { table, .. }
+        | PhysicalPlan::IndexScan { table, .. }
+        | PhysicalPlan::VectorSearch { table, .. }
+        | PhysicalPlan::HnswSearch { table, .. } => Some(table.clone()),
+        PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. } => plan_anchor_table(input),
+        PhysicalPlan::Join { left, .. } => plan_anchor_table(left),
+        _ => None,
+    }
+}
+
+/// Reject a post-scan predicate — the `WHERE` of a join or of a CTE-sourced
+/// SELECT — that names a column its input does not produce.
+///
+/// The single-table path is guarded at the scan against the declared schema,
+/// but a join or a CTE source plans its `WHERE` as a `Filter` node instead, and
+/// that node's row matcher discards evaluation errors (`unwrap_or(false)`). So
+/// the same typo that is an error on a plain SELECT silently returned zero rows
+/// here. The input's own column list is the authority: it is what the predicate
+/// will actually be evaluated against.
+fn validate_filter_predicate_columns(
+    input_columns: &[String],
+    input: &PhysicalPlan,
+    predicate: &Expr,
+) -> Result<()> {
+    walk_predicate_columns(predicate, &mut |column_ref| {
+        if column_ref.column == PREDICATE_PSEUDO_COLUMN
+            || filter_column_is_resolvable(input_columns, column_ref)
+        {
+            return Ok(());
+        }
+        Err(Error::ColumnNotFound {
+            table: column_ref
+                .table
+                .clone()
+                .or_else(|| plan_anchor_table(input))
+                .unwrap_or_else(|| "<query>".to_string()),
+            column: column_ref.column.clone(),
+        })
+    })
+}
+
+/// Whether a column reference can resolve against the columns an input yields.
+///
+/// An UNqualified reference matches any column with that bare name, exactly as
+/// the row evaluator does.
+///
+/// A QUALIFIED reference matches its exact qualified name, or a column carrying
+/// that bare name with NO qualifier of its own — nothing claims such a column,
+/// so the reference's qualifier cannot contradict it. What it must never do is
+/// match a column qualified to a DIFFERENT table: `s.b` may not resolve to
+/// `t.b` just because both end in `b`.
+///
+/// Both halves are load-bearing, and each is pinned by a test that the other
+/// rule breaks. A join's OUTPUT list is fully qualified, so rejecting the
+/// cross-table match is what makes `... JOIN s ... WHERE s.b = 1` name `s` when
+/// `b` lives only on `t`. A join's ON-CONDITION list qualifies only the names
+/// that COLLIDE across the two sides, leaving the rest bare — so accepting the
+/// unqualified match is what keeps `ON decisions.id = outcomes.decision_id`
+/// working, where `decision_id` is unique and therefore stays bare.
+fn filter_column_is_resolvable(input_columns: &[String], column_ref: &ColumnRef) -> bool {
+    let Some(table) = &column_ref.table else {
+        return input_columns.iter().any(|name| {
+            name == &column_ref.column
+                || name.rsplit('.').next() == Some(column_ref.column.as_str())
+        });
+    };
+    let qualified = format!("{table}.{}", column_ref.column);
+    input_columns
+        .iter()
+        .any(|name| name == &qualified || name == &column_ref.column)
 }
 
 fn exec_create_index(
@@ -5142,6 +5540,9 @@ fn eval_bool_expr(
             let is_null = eval_expr_value(row, expr, params)? == Value::Null;
             Ok(Some(if *negated { !is_null } else { is_null }))
         }
+        // A boolean literal is a legal predicate anywhere a predicate is
+        // legal (`ON TRUE`, `WHERE FALSE`), per standard SQL.
+        Expr::Literal(Literal::Bool(value)) => Ok(Some(*value)),
         Expr::FunctionCall { .. } => match eval_expr_value(row, expr, params)? {
             Value::Bool(value) => Ok(Some(value)),
             Value::Null => Ok(None),
@@ -5501,6 +5902,11 @@ pub(crate) fn resolve_in_subqueries_with_ctes(
                 ctes: ctes.to_vec(),
                 body: (**subquery).clone(),
             }))?;
+            // A subquery is planned here at execution time rather than being a
+            // subtree of the root plan, so it needs the plan-time pass applied
+            // to it directly — otherwise it would be the one path where an
+            // unknown column is still only caught while rows are being read.
+            validate_plan_columns(db, &query_plan)?;
             let result = execute_plan(db, &query_plan, params, tx)?;
             let select_expr = subquery
                 .columns
@@ -5739,6 +6145,9 @@ fn eval_query_result_bool_expr(
             let is_null = eval_query_result_expr(expr, row, columns, params)? == Value::Null;
             Ok(Some(if *negated { !is_null } else { is_null }))
         }
+        // A boolean literal is a legal predicate anywhere a predicate is
+        // legal (`ON TRUE`, `WHERE FALSE`), per standard SQL.
+        Expr::Literal(Literal::Bool(value)) => Ok(Some(*value)),
         Expr::FunctionCall { .. } => match eval_query_result_expr(expr, row, columns, params)? {
             Value::Bool(value) => Ok(Some(value)),
             Value::Null => Ok(None),
@@ -5754,16 +6163,26 @@ fn eval_query_result_bool_expr(
     }
 }
 
-fn lookup_query_result_column(
-    row: &[Value],
+/// How a column reference resolves against a query result's column list.
+///
+/// Kept distinct from the formatted error so callers that need to react to the
+/// two failures differently — the sort path reports an unknown ORDER BY column
+/// as `ColumnNotFound` — can do so without matching on message text.
+enum QueryResultColumn {
+    Found(usize),
+    NotFound,
+    Ambiguous,
+}
+
+fn resolve_query_result_column(
     input_columns: &[String],
     column_ref: &ColumnRef,
-) -> Result<Value> {
+) -> QueryResultColumn {
     if let Some(table) = &column_ref.table {
         let qualified = format!("{table}.{}", column_ref.column);
         // Prioritize qualified match (e.g., "e.id") over unqualified (e.g., "id")
         // to avoid picking the wrong table's column in JOINs.
-        let idx = input_columns
+        return input_columns
             .iter()
             .position(|name| name == &qualified)
             .or_else(|| {
@@ -5771,8 +6190,7 @@ fn lookup_query_result_column(
                     .iter()
                     .position(|name| name == &column_ref.column)
             })
-            .ok_or_else(|| Error::PlanError(format!("project column not found: {}", qualified)))?;
-        return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
+            .map_or(QueryResultColumn::NotFound, QueryResultColumn::Found);
     }
 
     let matches = input_columns
@@ -5786,15 +6204,35 @@ fn lookup_query_result_column(
         .collect::<Vec<_>>();
 
     match matches.as_slice() {
-        [] => Err(Error::PlanError(format!(
+        [] => QueryResultColumn::NotFound,
+        [idx] => QueryResultColumn::Found(*idx),
+        _ => QueryResultColumn::Ambiguous,
+    }
+}
+
+fn query_result_column_error(column_ref: &ColumnRef, resolution: &QueryResultColumn) -> Error {
+    match resolution {
+        QueryResultColumn::Ambiguous => {
+            Error::PlanError(format!("ambiguous column reference: {}", column_ref.column))
+        }
+        _ => Error::PlanError(format!(
             "project column not found: {}",
-            column_ref.column
-        ))),
-        [idx] => Ok(row.get(*idx).cloned().unwrap_or(Value::Null)),
-        _ => Err(Error::PlanError(format!(
-            "ambiguous column reference: {}",
-            column_ref.column
-        ))),
+            column_ref.table.as_ref().map_or_else(
+                || column_ref.column.clone(),
+                |table| format!("{table}.{}", column_ref.column)
+            )
+        )),
+    }
+}
+
+fn lookup_query_result_column(
+    row: &[Value],
+    input_columns: &[String],
+    column_ref: &ColumnRef,
+) -> Result<Value> {
+    match resolve_query_result_column(input_columns, column_ref) {
+        QueryResultColumn::Found(idx) => Ok(row.get(idx).cloned().unwrap_or(Value::Null)),
+        other => Err(query_result_column_error(column_ref, &other)),
     }
 }
 
@@ -7164,7 +7602,7 @@ fn coerce_txid_value(
             // Plan B7: `Value::TxId(n)` into a TXID column requires
             // `n <= max(committed_watermark, active_tx)`. The watermark is the
             // statement-scoped `current_tx_max` snapshot from
-            // `TxManager::current_tx_max()`; `active_tx` is the in-flight
+            // `TransactionManager::current_tx_max()`; `active_tx` is the in-flight
             // transaction that allocated the caller's TxId, which is permitted
             // as a self-reference. The error reports the watermark so callers
             // see what their edge has committed. Non-SQL callers pass `None`

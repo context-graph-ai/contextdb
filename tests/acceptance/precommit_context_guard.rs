@@ -966,10 +966,17 @@ fn t4_14_sync_apply_does_not_insert_other_context_rows() {
 
     assert_eq!(result.applied_rows, 0, "denied sync row must not apply");
     assert_eq!(result.skipped_rows, 1, "denied sync row must be skipped");
-    assert_eq!(
-        result.conflicts.len(),
-        1,
-        "denied sync row should surface as a conflict"
+    // Access/context refusals are skipped-ONLY — no Conflict record. Conflicts
+    // are reserved for genuine divergence between two peers that both saw and
+    // disagree on the same row; a receiver refusing to even look at a row it
+    // cannot see has nothing to disagree about, and a Conflict naming the
+    // row's natural key would leak that the hidden row exists at all — the
+    // opposite of what the context gate exists to prevent. This replaces the
+    // test's original premise, which required a conflict record.
+    assert!(
+        result.conflicts.is_empty(),
+        "a denied sync row must not produce a Conflict record: {:?}",
+        result.conflicts
     );
     drop(scoped);
     let admin = Database::open(&path).unwrap();

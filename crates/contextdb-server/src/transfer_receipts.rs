@@ -17,7 +17,7 @@
 //!   would quietly aggregate every anonymous peer together — and it never adds
 //!   to another peer's counters either.
 //! * **In memory only.** Counters are monotonic for the lifetime of the
-//!   `SyncClient` / `SyncServer` / `BlobService` that owns them. The engine
+//!   `SyncClient` / `SyncServer` / `BlobStore` that owns them. The engine
 //!   persists none of this, so a fresh handle starts from zero.
 
 use std::collections::HashMap;

@@ -215,6 +215,10 @@ pub enum Error {
     SubqueryNotSupported,
     #[error("full-text search (WHERE column MATCH) is not supported")]
     FullTextSearchNotSupported,
+    #[error(
+        "ORDER BY requires a column reference or a SELECT-list alias naming one; expression sort keys are not supported"
+    )]
+    OrderByExpressionNotSupported,
     #[error("parse error: {0}")]
     ParseError(String),
     #[error("plan error: {0}")]

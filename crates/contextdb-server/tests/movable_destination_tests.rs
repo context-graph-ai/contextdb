@@ -1,6 +1,5 @@
-//! The server is movable — criteria C4a–C4d of
-//! `contextdb-sync-policy-decoupling-criteria.md`, plus the guard the seed keeps:
-//! one destination AT A TIME.
+//! The server is movable, plus the guard the seed keeps: one destination AT A
+//! TIME.
 //!
 //! An edge persists the first hub it pushes retained data to
 //! (`database.rs:10441-10460`, armed on every push at `sync_client.rs:170-183`).

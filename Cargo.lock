@@ -874,6 +874,7 @@ name = "contextdb-cli"
 version = "1.0.0"
 dependencies = [
  "clap",
+ "contextdb-cli",
  "contextdb-core",
  "contextdb-engine",
  "contextdb-parser",

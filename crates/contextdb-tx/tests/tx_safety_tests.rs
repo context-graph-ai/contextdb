@@ -1,5 +1,5 @@
 use contextdb_core::{Error, Lsn, Result, RowId, TxId, Value, VersionedRow};
-use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
+use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ impl WriteSetApplicator for BlockingStore {
     }
 }
 
-fn stage_empty_row<S: WriteSetApplicator>(txm: &TxManager<S>, tx: TxId, row_id: u64) {
+fn stage_empty_row<S: WriteSetApplicator>(txm: &TransactionManager<S>, tx: TxId, row_id: u64) {
     txm.with_write_set(tx, |ws| {
         ws.relational_inserts.push((
             "items".to_string(),
@@ -95,7 +95,7 @@ fn tx_01_failed_apply_removes_transaction_under_commit_lock() {
         fail_apply: AtomicBool::new(true),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     let tx = txm.begin();
     txm.advance_for_sync(tx, "items", TxId(100))
         .expect("sync floor should stage before commit");
@@ -129,7 +129,7 @@ fn tx_02_commit_failure_does_not_advance_watermark() {
         fail_apply: AtomicBool::new(true),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     let tx = txm.begin();
     let before = txm.snapshot();
     stage_empty_row(&txm, tx, 1);
@@ -150,7 +150,7 @@ fn tx_03_sync_txid_floor_is_not_visible_until_commit() {
         fail_apply: AtomicBool::new(false),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     let tx = txm.begin();
     txm.advance_for_sync(tx, "items", TxId(100))
         .expect("sync floor should stage on active tx");
@@ -177,7 +177,7 @@ fn tx_04_failed_apply_rewinds_lsn_allocator() {
         fail_apply: AtomicBool::new(true),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     let tx = txm.begin();
     let before = txm.current_lsn();
     stage_empty_row(&txm, tx, 1);
@@ -197,7 +197,7 @@ fn tx_05_commit_removes_active_transaction_before_apply() {
         next_row_id: AtomicU64::new(1),
         ..Default::default()
     };
-    let txm = Arc::new(TxManager::new(store));
+    let txm = Arc::new(TransactionManager::new(store));
     let tx = txm.begin();
     stage_empty_row(&txm, tx, 1);
 
@@ -229,7 +229,7 @@ fn tx_06_failed_ddl_lsn_allocation_does_not_advance_current_lsn() {
         fail_apply: AtomicBool::new(false),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     let before = txm.current_lsn();
 
     let err = txm
@@ -254,7 +254,7 @@ fn tx_07_prepare_runs_after_transaction_is_frozen() {
         fail_apply: AtomicBool::new(false),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     let tx = txm.begin();
     txm.advance_for_sync(tx, "items", TxId(100))
         .expect("sync floor should stage before commit");
@@ -312,7 +312,7 @@ fn tx_08_prepare_apply_and_return_see_canonical_final_rows() {
         fail_apply: AtomicBool::new(false),
         ..Default::default()
     };
-    let txm = TxManager::new(store);
+    let txm = TransactionManager::new(store);
     let tx = txm.begin();
     txm.with_write_set(tx, |ws| {
         ws.relational_inserts.push((

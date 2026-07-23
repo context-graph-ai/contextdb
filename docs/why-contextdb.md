@@ -78,7 +78,7 @@ CREATE TABLE scratch (...) RETAIN 24 HOURS
 CREATE TABLE logs (...) RETAIN 90 DAYS SYNC SAFE
 ```
 
-**ObservationTriggers** — Host callbacks for transactional observation and
+**Triggers** — Host callbacks for transactional observation and
 cascade writes. These are not validation triggers; engine invariants stay in
 DDL. A declared `CREATE TRIGGER` plus a registered Rust callback runs inside
 the firing transaction. Same-DB cross-thread writers wait-and-proceed,

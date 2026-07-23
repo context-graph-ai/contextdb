@@ -10,7 +10,7 @@ fn gen_sensor_inserts(count: usize) -> String {
     let mut s = String::new();
     for i in 0..count {
         s.push_str(&format!(
-            "INSERT INTO sensors (id, name) VALUES ('{}', 'sensor-{}')\n",
+            "INSERT INTO sensors (id, name) VALUES ('{}', 'sensor-{}');\n",
             Uuid::new_v4(),
             i
         ));
@@ -56,17 +56,17 @@ async fn f06a_data_written_on_edge_appears_on_server_automatically() {
         &edge_path,
         &["--tenant-id", tenant, "--nats-url", &ws_url],
         "\
-CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000006', 'f')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000007', 'g')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000008', 'h')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000009', 'i')\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000010', 'j')\n\
+CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'a');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'b');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'c');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000004', 'd');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000005', 'e');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000006', 'f');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000007', 'g');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000008', 'h');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000009', 'i');\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000010', 'j');\n\
 .quit\n",
     );
     assert!(edge.status.success());
@@ -78,7 +78,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000010', '
     let checker_setup = run_cli_script(
         &checker_path,
         &["--tenant-id", tenant, "--nats-url", &ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(
         checker_setup.status.success(),
@@ -90,7 +90,7 @@ INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000010', '
             &checker_path,
             &["--tenant-id", tenant, "--nats-url", &ws_url],
             ".sync pull\n\
-             SELECT count(*) FROM sensors\n\
+             SELECT count(*) FROM sensors;\n\
              .quit\n",
         );
         output_string(&check.stdout).contains("| 10")
@@ -127,7 +127,7 @@ async fn f06b_data_from_another_edge_appears_on_this_edge_automatically() {
         setup_sync_env("f06b_data_from_another_edge_appears_on_this_edge_automatically").await;
     let tenant = "f06b_data_from_another_edge_appears_on_this_edge_automatically";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(10));
     script.push_str(".quit\n");
     let output = run_cli_script(
@@ -140,7 +140,7 @@ async fn f06b_data_from_another_edge_appears_on_this_edge_automatically() {
     let output = run_cli_script(
         &edge_path,
         &["--tenant-id", tenant, "--nats-url", &ws_url],
-        "SELECT count(*) FROM sensors\n.quit\n",
+        "SELECT count(*) FROM sensors;\n.quit\n",
     );
     assert!(output_string(&output.stdout).contains("10"));
 }
@@ -152,7 +152,7 @@ async fn f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog() {
         setup_sync_env("f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog").await;
     let tenant = "f06c_edge_reconnects_after_network_outage_and_auto_syncs_backlog";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(50));
     script.push_str(".quit\n");
     let output = run_cli_script(
@@ -172,7 +172,7 @@ async fn f06_edge_pushes_data_server_has_it() {
         setup_sync_env("f06_edge_pushes_data_server_has_it").await;
     let tenant = "f06_edge_pushes_data_server_has_it";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(100));
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
@@ -192,7 +192,7 @@ async fn f07_two_consecutive_pushes_do_not_duplicate_data() {
         setup_sync_env("f07_two_consecutive_pushes_do_not_duplicate_data").await;
     let tenant = "f07_two_consecutive_pushes_do_not_duplicate_data";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(50));
     script.push_str(".sync push\n");
     script.push_str(&gen_sensor_inserts(50));
@@ -214,7 +214,7 @@ async fn f08_push_then_pull_on_a_fresh_edge() {
         setup_sync_env("f08_push_then_pull_on_a_fresh_edge").await;
     let tenant = "f08_push_then_pull_on_a_fresh_edge";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(100));
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
@@ -227,7 +227,7 @@ async fn f08_push_then_pull_on_a_fresh_edge() {
     let pulled = run_cli_script(
         &fresh_path,
         &["--tenant-id", tenant, "--nats-url", &ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync pull\nSELECT count(*) FROM sensors\n.quit\n",
     );
     stop_child(&mut server);
     assert!(output_string(&pulled.stdout).contains("100"));
@@ -240,7 +240,7 @@ async fn f09_pull_after_server_restart_returns_data() {
         setup_sync_env("f09_pull_after_server_restart_returns_data").await;
     let tenant = "f09_pull_after_server_restart_returns_data";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(100));
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
@@ -255,14 +255,14 @@ async fn f09_pull_after_server_restart_returns_data() {
     let initialized = run_cli_script(
         &fresh_path,
         &["--tenant-id", tenant, "--nats-url", &ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(initialized.status.success());
     let pulled_ok = wait_until(Duration::from_secs(5), || {
         let pulled = run_cli_script(
             &fresh_path,
             &["--tenant-id", tenant, "--nats-url", &ws_url],
-            ".sync pull\nSELECT count(*) FROM sensors\n.quit\n",
+            ".sync pull\nSELECT count(*) FROM sensors;\n.quit\n",
         );
         output_string(&pulled.stdout).contains("100")
     });
@@ -281,7 +281,7 @@ async fn f09b_edge_closes_reopens_pushes_more_data() {
     let tenant = "f09b_edge_closes_reopens_pushes_more_data";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
     // First session: create table and insert 50 rows, push
-    let mut script1 = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script1 = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script1.push_str(&gen_sensor_inserts(50));
     script1.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
@@ -312,7 +312,7 @@ async fn f09c_edge_crash_recovers_then_pushes() {
     let tenant = "f09c_edge_crash_recovers_then_pushes";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
     // First session: create table, insert 100 rows, push
-    let mut script1 = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script1 = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script1.push_str(&gen_sensor_inserts(100));
     script1.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
@@ -364,7 +364,7 @@ async fn f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry() {
         setup_sync_env("f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry").await;
     let tenant = "f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(100));
     script.push_str(".quit\n");
     let output = run_cli_script(
@@ -381,8 +381,8 @@ async fn f09d_power_loss_during_sync_does_not_cause_duplicates_on_retry() {
 sync_red_test!(
     f09e_all_data_types_round_trip_through_sync,
     "\
-CREATE TABLE everything (id UUID PRIMARY KEY, note TEXT, count INTEGER, reading REAL, enabled BOOLEAN, embedding VECTOR(3))\n\
-INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('00000000-0000-0000-0000-000000000001', 'x', 7, 4.5, true, [1.0, 2.0, 3.0])\n\
+CREATE TABLE everything (id UUID PRIMARY KEY, note TEXT, count INTEGER, reading REAL, enabled BOOLEAN, embedding VECTOR(3));\n\
+INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('00000000-0000-0000-0000-000000000001', 'x', 7, 4.5, true, [1.0, 2.0, 3.0]);\n\
 .sync push\n\
 .quit\n",
     |_edge_path: &std::path::Path, server_path: &std::path::Path, _nats_url: &str| {
@@ -411,8 +411,8 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let edge1_output = run_cli_script(
         &edge1_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL)\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid')\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL);\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid');\n\
          .sync push\n\
          .quit\n",
     );
@@ -424,8 +424,8 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
     let violation_output = run_cli_script(
         &edge2_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-         INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002')\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+         INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002');\n\
          .sync push\n\
          .quit\n",
     );
@@ -443,9 +443,9 @@ async fn f09f_server_side_constraint_violation_during_push_returns_error_to_edge
 sync_red_test!(
     f09g_sync_push_during_open_transaction_is_rejected_or_queued,
     "\
-CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-BEGIN\n\
-INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'one')\n\
+CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+BEGIN;\n\
+INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'one');\n\
 .sync push\n\
 .quit\n",
     |_edge_path: &std::path::Path, server_path: &std::path::Path, _nats_url: &str| {
@@ -470,8 +470,8 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let push_output = run_cli_script(
         &edge_a_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\n\
-         INSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 1.0)\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);\n\
+         INSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 1.0);\n\
          .sync push\n\
          .quit\n",
     );
@@ -482,7 +482,7 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let pull_output = run_cli_script(
         &edge_b_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, label TEXT, score INTEGER)\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, label TEXT, score INTEGER);\n\
          .sync pull\n\
          .quit\n",
     );
@@ -515,8 +515,8 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
         &edge_a_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
         &format!(
-            "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived]))\n\
-             INSERT INTO tasks (id, status) VALUES ('{row_id}', 'active')\n\
+            "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived]));\n\
+             INSERT INTO tasks (id, status) VALUES ('{row_id}', 'active');\n\
              .sync push\n\
              .quit\n"
         ),
@@ -529,9 +529,9 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
         &edge_b_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
         &format!(
-            "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived]))\n\
+            "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> [review, archived]));\n\
              .sync pull\n\
-             UPDATE tasks SET status = 'review' WHERE id = '{row_id}'\n\
+             UPDATE tasks SET status = 'review' WHERE id = '{row_id}';\n\
              .sync push\n\
              .quit\n"
         ),
@@ -546,9 +546,9 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
             &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
             &format!(
-                "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT)\n\
+                "CREATE TABLE tasks (id UUID PRIMARY KEY, status TEXT);\n\
                  .sync pull\n\
-                 SELECT status FROM tasks WHERE id = '{row_id}'\n\
+                 SELECT status FROM tasks WHERE id = '{row_id}';\n\
                  .quit\n"
             ),
         );
@@ -567,7 +567,7 @@ async fn f09i_conflicting_state_machine_transitions_across_edges_during_sync() {
         &edge_a_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
         &format!(
-            "UPDATE tasks SET status = 'archived' WHERE id = '{row_id}'\n\
+            "UPDATE tasks SET status = 'archived' WHERE id = '{row_id}';\n\
              .sync push\n\
              .quit\n"
         ),
@@ -607,7 +607,7 @@ async fn f10_edge_offline_for_one_hour_then_pushes_backlog() {
         setup_sync_env("f10_edge_offline_for_one_hour_then_pushes_backlog").await;
     let tenant = "f10_edge_offline_for_one_hour_then_pushes_backlog";
     let mut server = spawn_server(&server_path, tenant, &nats_url);
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n");
     script.push_str(&gen_sensor_inserts(500));
     script.push_str(".sync push\n.quit\n");
     let output = run_cli_script(
@@ -643,9 +643,9 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     // Enable auto-sync, create table, insert a row
     write_child_stdin(
         &mut child,
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
          .sync auto on\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'probe')\n",
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'probe');\n",
     );
 
     // Wait for data to appear on server WHILE CLI IS STILL RUNNING.
@@ -655,7 +655,7 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
     let checker_setup = run_cli_script(
         &checker_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(
         checker_setup.status.success(),
@@ -666,7 +666,7 @@ async fn f12_auto_sync_pushes_on_commit_not_on_quit() {
             &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
             ".sync pull\n\
-             SELECT count(*) FROM sensors\n\
+             SELECT count(*) FROM sensors;\n\
              .quit\n",
         );
         let stdout = output_string(&check.stdout);
@@ -707,11 +707,11 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     // this test into f12e's quit-time-flush contract.
     write_child_stdin(
         &mut child,
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'original')\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'original');\n\
          .sync auto on\n\
          .sync push\n\
-         UPDATE sensors SET name = 'updated' WHERE id = '00000000-0000-0000-0000-000000000001'\n",
+         UPDATE sensors SET name = 'updated' WHERE id = '00000000-0000-0000-0000-000000000001';\n",
     );
 
     // Bootstrap the checker DB schema BEFORE wait_until: pull replays inserts/deletes,
@@ -720,7 +720,7 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
     let checker_setup = run_cli_script(
         &checker_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(
         checker_setup.status.success(),
@@ -754,7 +754,7 @@ async fn f12b_auto_sync_pushes_updates_not_just_inserts() {
             &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
             ".sync pull\n\
-             SELECT name FROM sensors WHERE id = '00000000-0000-0000-0000-000000000001'\n\
+             SELECT name FROM sensors WHERE id = '00000000-0000-0000-0000-000000000001';\n\
              .quit\n",
         );
         output_string(&check.stdout).contains("| updated")
@@ -816,19 +816,19 @@ async fn f12c_auto_sync_pushes_deletes() {
     // Create table, insert 2 rows, push, enable auto-sync, then DELETE one
     write_child_stdin(
         &mut child,
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep')\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me')\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep');\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me');\n\
          .sync push\n\
          .sync auto on\n\
-         DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002'\n",
+         DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002';\n",
     );
 
     let checker_path = edge_path.with_file_name("f12c-checker.db");
     let checker_setup = run_cli_script(
         &checker_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(
         checker_setup.status.success(),
@@ -844,7 +844,7 @@ async fn f12c_auto_sync_pushes_deletes() {
             &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
             ".sync pull\n\
-             SELECT count(*) FROM sensors\n\
+             SELECT count(*) FROM sensors;\n\
              .quit\n",
         );
         let stdout = output_string(&check.stdout);
@@ -879,9 +879,9 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
     let mut child = spawn_cli(&edge_path, &["--tenant-id", tenant, "--nats-url", ws_url]);
     write_child_stdin(
         &mut child,
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
          .sync auto on\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'late-server')\n",
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'late-server');\n",
     );
 
     std::thread::sleep(Duration::from_secs(2));
@@ -891,7 +891,7 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
     let checker_setup = run_cli_script(
         &checker_path,
         &["--tenant-id", tenant, "--nats-url", ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.quit\n",
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.quit\n",
     );
     assert!(
         checker_setup.status.success(),
@@ -903,7 +903,7 @@ async fn f12d_auto_sync_retries_after_server_starts_late() {
             &checker_path,
             &["--tenant-id", tenant, "--nats-url", ws_url],
             ".sync pull\n\
-             SELECT count(*) FROM sensors\n\
+             SELECT count(*) FROM sensors;\n\
              .quit\n",
         );
         let stdout = output_string(&check.stdout);
@@ -943,9 +943,9 @@ async fn f12e_quit_flushes_pending_auto_sync_work() {
             "--sync-debounce-ms",
             "5000",
         ],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
          .sync auto on\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'flush-me')\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'flush-me');\n\
          .quit\n",
     );
 
@@ -980,12 +980,12 @@ async fn f12e_quit_flushes_pending_delete_with_long_debounce() {
             "--sync-debounce-ms",
             "5000",
         ],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep')\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me')\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'keep');\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'delete_me');\n\
          .sync push\n\
          .sync auto on\n\
-         DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002'\n\
+         DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-000000000002';\n\
          .quit\n",
     );
 
@@ -1021,9 +1021,9 @@ async fn f12f_quit_reports_failed_final_sync_flush() {
             "--sync-debounce-ms",
             "5000",
         ],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
          .sync auto on\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'unsent')\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'unsent');\n\
          .quit\n",
     );
 

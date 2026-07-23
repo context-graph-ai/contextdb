@@ -119,7 +119,7 @@ the consuming application.
 
 ## Trigger Concurrency
 
-ObservationTriggers are host callbacks declared with `CREATE TRIGGER` and
+Triggers are host callbacks declared with `CREATE TRIGGER` and
 registered through `Database::register_trigger_callback`. They are not
 PG-style validation triggers; schema invariants remain engine-enforced through
 DDL. A trigger callback runs synchronously inside the firing transaction's
@@ -349,6 +349,23 @@ Per-table configurable policies:
 - `EdgeWins` — edge version takes precedence
 - `InsertIfNotExists` — insert if absent, skip otherwise
 
+Whichever policy applies, a conflict means two machines genuinely diverged. A row that arrives
+carrying exactly what the receiving node already holds is a re-delivery — the everyday case being
+an edge pulling back rows it just pushed — and is a pure no-op that appears in none of the three
+counts an apply reports: `applied_rows` counts rows that changed local state, `conflicts` records
+genuine divergence at a natural key, and `skipped_rows` counts rows a policy or the context scope
+turned away. Re-delivered data changed nothing and refused nothing, so it is counted nowhere. The
+decision is made per row against that row's own content, so one changeset mixing a re-delivery
+with a genuine divergence still reports the divergence in full.
+
+Both of those judgements are made strictly within what the receiver can see. A row outside the
+receiving handle's context scope is refused before its content is ever compared — it counts as
+`skipped_rows` and never as a conflict. A conflict says two peers both saw a row and disagreed
+about it, which a receiver that cannot see the row has no basis to claim, and the record would
+name the hidden row's natural key, disclosing the very existence the access boundary exists to
+hide. So "identical content is a no-op" is a statement about rows within visible scope; a hidden
+row is refused outright, whatever it contains.
+
 ### Transport
 
 Dial-by-key: each machine is reached by its own cryptographic identity (an ed25519 public key), carried by the Iroh library (iroh 1.0, wire-stable). A framed stream carries each payload whole — there is no 1MB message ceiling and no broker-side chunking; payload size is bounded by batching above the transport, and vector byte sizes are accounted for in batch estimation. LAN peers connect directly; cross-network peers are introduced by a self-hosted or opt-in relay.
@@ -372,6 +389,15 @@ Downstream consumers map their own organizing handle —
 an intention, a site, a tenant of their own — onto one or both of contextdb's
 axes, but the axes themselves stay separate: `TenantId` answers *who syncs with
 whom*, a context id answers *which rows are visible*.
+
+The relationship between the axes is one-to-many: **one tenant owns many
+contexts.** A person or organization is one tenant — their sync/routing
+identity — and partitions their worlds into contexts under that single
+tenancy (one user's product-development context and hobby-electronics context;
+one customer's N per-site contexts). The stack's consumers default a fresh
+capture context to the tenant's own name — "your tenant is your first
+context" — and users narrow into per-world contexts deliberately. The two
+identifiers are never two names for one thing and are not to be unified.
 
 ---
 
@@ -414,7 +440,7 @@ one layer up.
 
 ### Media / Blob Plane
 
-`contextdb_server::BlobService` (re-exported from the server crate root) moves
+`contextdb_server::BlobStore` (re-exported from the server crate root) moves
 opaque, content-addressed bytes between nodes:
 
 - **Ingest** on the holder node: `ingest_bytes(&[u8]) -> BlobHash` or
@@ -455,14 +481,21 @@ The ledger reserves the `blob_ref` input kind but doesn't resolve it:
 pointing the caller at the blob resolver above. The ledger tracks that a job
 depends on a blob; the media plane is what actually moves the bytes.
 
+The seven ledger tables are not created for you. Every call below — `submit_job`,
+`job_state`, `claim_job` — needs them present, so install them at open on each node:
+`install_work_ledger_schema(&db)?` is idempotent, safe to call every time, and safe when
+the schema already arrived via sync.
+
 ```rust,no_run
 // Node A (holder): ingest a blob, serve it, and submit a job that references it.
-use contextdb_engine::work_ledger::{InputRef, JobSpec, submit_job};
-use contextdb_server::{BlobService, work_ledger::claim_job};
+use contextdb_engine::work_ledger::{InputRef, JobSpec, install_work_ledger_schema, submit_job};
+use contextdb_server::{BlobStore, work_ledger::claim_job};
+
+install_work_ledger_schema(&db)?;
 
 let bytes = std::fs::read("frame.jpg")?;
-let blob_hash = blob_service.ingest_bytes(&bytes)?;
-blob_service.serve_on(&iroh_server);
+let blob_hash = blob_store.ingest_bytes(&bytes)?;
+blob_store.serve_on(&iroh_server);
 
 let spec = JobSpec::builder("job-1", "describe-image", "once", "node-a")
     .input_refs(vec![InputRef::blob_ref(blob_hash.clone())])
@@ -474,7 +507,7 @@ submit_job(&db, &spec, &no_direct_inputs)?;
 // Holding a live claim on this job is what entitles Node B to fetch the bytes.
 let claim = claim_job(&sync_client, "job-1", 1, "node-b", lease_deadline_ms, now_ms).await?;
 let mut sink = Vec::new();
-let bytes_written = blob_service
+let bytes_written = blob_store
     .resolve_blob_ref(&blob_hash, &holder_ticket, &mut sink)
     .await?;
 ```

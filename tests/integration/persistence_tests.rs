@@ -129,13 +129,13 @@ fn run_memory_mode_cli_workers() -> Vec<MemoryModeCliOutput> {
             std::thread::spawn(move || {
                 let id = Uuid::new_v4();
                 let script1 = format!(
-                    "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)\n\
-                     INSERT INTO t (id, v) VALUES ('{id}', 'memory_val')\n\
-                     SELECT * FROM t\n\
+                    "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT);\n\
+                     INSERT INTO t (id, v) VALUES ('{id}', 'memory_val');\n\
+                     SELECT * FROM t;\n\
                      .quit\n"
                 );
                 let result = run_live_cli_script(":memory:", &script1).and_then(|output1| {
-                    run_live_cli_script(":memory:", "SELECT * FROM t\n.quit\n")
+                    run_live_cli_script(":memory:", "SELECT * FROM t;\n.quit\n")
                         .map(|output2| (output1, output2))
                 });
                 let _ = tx.send((worker_index, id, result));
@@ -184,14 +184,14 @@ fn assert_spawn_helper_targets_cli_binary_directly() {
     assert_child_is_cli_binary(&mut child, &expected);
     {
         let stdin = child.stdin.as_mut().expect("stdin pipe");
-        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
+        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT);").unwrap();
         writeln!(
             stdin,
-            "INSERT INTO t (id, v) VALUES ('{}', 'identity_probe')",
+            "INSERT INTO t (id, v) VALUES ('{}', 'identity_probe');",
             Uuid::new_v4()
         )
         .unwrap();
-        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, "SELECT * FROM t;").unwrap();
         writeln!(stdin, ".quit").unwrap();
     }
     let output = child.wait_with_output().expect("CLI should finish");
@@ -232,8 +232,8 @@ fn assert_file_backed_cli_persistence_through_spawn_helper() {
     let path = tmp.path().join("cli-helper-persistence.db");
     let id = Uuid::new_v4();
     let script1 = format!(
-        "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)\n\
-         INSERT INTO t (id, v) VALUES ('{id}', 'alpha')\n\
+        "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT);\n\
+         INSERT INTO t (id, v) VALUES ('{id}', 'alpha');\n\
          .quit\n"
     );
     let output1 = run_live_cli_script(path.to_str().unwrap(), &script1)
@@ -245,7 +245,7 @@ fn assert_file_backed_cli_persistence_through_spawn_helper() {
         "file-backed CLI session 1 should succeed\nstdout:\n{stdout1}\nstderr:\n{stderr1}"
     );
 
-    let output2 = run_live_cli_script(path.to_str().unwrap(), "SELECT * FROM t\n.quit\n")
+    let output2 = run_live_cli_script(path.to_str().unwrap(), "SELECT * FROM t;\n.quit\n")
         .expect("file-backed CLI session 2 should spawn release binary");
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
@@ -1588,10 +1588,10 @@ fn p21_cli_persists_across_sessions() {
     let mut child1 = spawn_cli(path.to_str().unwrap(), &[]);
     {
         let stdin = child1.stdin.as_mut().unwrap();
-        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
+        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT);").unwrap();
         writeln!(
             stdin,
-            "INSERT INTO t (id, v) VALUES ('{}', 'alpha')",
+            "INSERT INTO t (id, v) VALUES ('{}', 'alpha');",
             Uuid::new_v4()
         )
         .unwrap();
@@ -1603,7 +1603,7 @@ fn p21_cli_persists_across_sessions() {
     let mut child2 = spawn_cli(path.to_str().unwrap(), &[]);
     {
         let stdin = child2.stdin.as_mut().unwrap();
-        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, "SELECT * FROM t;").unwrap();
         writeln!(stdin, ".quit").unwrap();
     }
     let output2 = child2.wait_with_output().unwrap();
@@ -2491,14 +2491,14 @@ fn p34_cli_memory_mode_smoke_test() {
     let mut child1 = spawn_cli(":memory:", &[]);
     {
         let stdin = child1.stdin.as_mut().unwrap();
-        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)").unwrap();
+        writeln!(stdin, "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT);").unwrap();
         writeln!(
             stdin,
-            "INSERT INTO t (id, v) VALUES ('{}', 'memory_val')",
+            "INSERT INTO t (id, v) VALUES ('{}', 'memory_val');",
             id
         )
         .unwrap();
-        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, "SELECT * FROM t;").unwrap();
         writeln!(stdin, ".quit").unwrap();
     }
     let output1 = child1.wait_with_output().unwrap();
@@ -2519,7 +2519,7 @@ fn p34_cli_memory_mode_smoke_test() {
     let mut child2 = spawn_cli(":memory:", &[]);
     {
         let stdin = child2.stdin.as_mut().unwrap();
-        writeln!(stdin, "SELECT * FROM t").unwrap();
+        writeln!(stdin, "SELECT * FROM t;").unwrap();
         writeln!(stdin, ".quit").unwrap();
     }
     let output2 = child2.wait_with_output().unwrap();

@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 
-pub struct TxManager<S: WriteSetApplicator> {
+pub struct TransactionManager<S: WriteSetApplicator> {
     next_tx: AtomicTxId,
     committed_watermark: AtomicTxId,
     next_lsn: AtomicLsn,
@@ -21,7 +21,7 @@ pub struct CommitFailure {
     pub write_set: Option<Box<WriteSet>>,
 }
 
-impl<S: WriteSetApplicator> TxManager<S> {
+impl<S: WriteSetApplicator> TransactionManager<S> {
     pub fn new(store: S) -> Self {
         Self::new_with_counters(store, TxId(1), Lsn(1), TxId(0))
     }
@@ -376,7 +376,7 @@ impl<S: WriteSetApplicator> TxManager<S> {
     }
 
     /// Commit-index entries at or below `up_to`. Read this inside the same
-    /// commit-mutex window (see [`TxManager::with_commit_lock`]) that captures
+    /// commit-mutex window (see [`TransactionManager::with_commit_lock`]) that captures
     /// the committed watermark and committed LSN, so the returned prefix is
     /// consistent with both. Snapshot-capture seam for checkpoint export.
     pub fn commit_index_prefix(&self, up_to: Lsn) -> BTreeMap<Lsn, TxId> {
@@ -506,20 +506,20 @@ impl<S: WriteSetApplicator> TxManager<S> {
     }
 }
 
-impl<S: WriteSetApplicator> contextdb_core::TransactionManager for TxManager<S> {
+impl<S: WriteSetApplicator> contextdb_core::TransactionManager for TransactionManager<S> {
     fn begin(&self) -> TxId {
-        TxManager::begin(self)
+        TransactionManager::begin(self)
     }
 
     fn commit(&self, tx: TxId) -> Result<()> {
-        TxManager::commit(self, tx)
+        TransactionManager::commit(self, tx)
     }
 
     fn rollback(&self, tx: TxId) -> Result<()> {
-        TxManager::rollback(self, tx)
+        TransactionManager::rollback(self, tx)
     }
 
     fn snapshot(&self) -> SnapshotId {
-        TxManager::snapshot(self)
+        TransactionManager::snapshot(self)
     }
 }

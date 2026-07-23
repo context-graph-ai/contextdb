@@ -18,7 +18,7 @@ fn entity_row(db: &contextdb_engine::Database, id: Uuid) -> contextdb_core::Vers
 }
 
 #[test]
-fn b1_01_observation_triggers_invalidation() {
+fn b1_01_new_observation_invalidates_decision() {
     let db = setup_ontology_db();
     let e = Uuid::new_v4();
     let d = Uuid::new_v4();

@@ -6,7 +6,7 @@
 //!
 //! A consumer may only resolve a blob while it holds a LIVE work-ledger
 //! claim on a job whose inputs reference that blob's hash; see
-//! [`BlobService::resolve_blob_ref`] for the entitlement precondition and
+//! [`BlobStore::resolve_blob_ref`] for the entitlement precondition and
 //! error conditions.
 
 use crate::adapter::{self, BlobStoreHandle, FetchFailure, FetchVerdict};
@@ -25,7 +25,7 @@ use std::time::Duration;
 
 /// A holder-side hook that refreshes THIS node's own ledger mirror (e.g. a
 /// `SyncClient::pull_default()`) before a second, final entitlement check.
-/// [`BlobService::serve_on`]'s verdict handler invokes it AT MOST ONCE per
+/// [`BlobStore::serve_on`]'s verdict handler invokes it AT MOST ONCE per
 /// fetch request, and only on an initial claim-lookup miss — never polled,
 /// never retried. `None` (the default every existing caller gets) preserves
 /// today's behavior exactly: a miss is a miss, checked once against
@@ -33,12 +33,12 @@ use std::time::Duration;
 pub type ClaimRefreshHook =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
-/// The owned reclaim cadence (see [`BlobService::spawn_reclaim_driver`]).
+/// The owned reclaim cadence (see [`BlobStore::spawn_reclaim_driver`]).
 const RECLAIM_INTERVAL: Duration = Duration::from_secs(300);
 
 /// A node's media data-plane host: the holder side (ingest, serve, reclaim)
 /// and the consumer side (resolve) of the blob_ref reference kind.
-pub struct BlobService {
+pub struct BlobStore {
     db: Arc<Database>,
     policy: MovementPolicy,
     identity_path: PathBuf,
@@ -122,7 +122,7 @@ impl std::error::Error for ResolveError {
     }
 }
 
-impl BlobService {
+impl BlobStore {
     pub fn new(db: Arc<Database>, policy: MovementPolicy, identity_path: PathBuf) -> Self {
         Self {
             db,
@@ -276,7 +276,7 @@ impl BlobService {
     }
 
     /// Test-only convenience: binds a real local peer endpoint for
-    /// `identity_path` and serves this BlobService on it in one step (the
+    /// `identity_path` and serves this BlobStore on it in one step (the
     /// same `bind` + `serve_on` pair every two-node blob test performs), so
     /// an integration test file never has to name the network adapter or
     /// spell out its config-surface spec string itself — that stays

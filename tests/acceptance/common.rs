@@ -46,11 +46,7 @@ pub(crate) struct NatsFixture {
 }
 
 pub(crate) fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
+    crate::binary_path::workspace_root()
 }
 
 pub(crate) fn cli_bin() -> PathBuf {
@@ -60,7 +56,7 @@ pub(crate) fn cli_bin() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb-cli") {
         return PathBuf::from(path);
     }
-    workspace_binary_path("contextdb-cli")
+    crate::binary_path::resolve_workspace_binary("contextdb-cli")
 }
 
 pub(crate) fn server_bin() -> PathBuf {
@@ -70,39 +66,20 @@ pub(crate) fn server_bin() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb-server") {
         return PathBuf::from(path);
     }
-    workspace_binary_path("contextdb-server")
+    crate::binary_path::resolve_workspace_binary("contextdb-server")
 }
 
-fn workspace_binary_path(binary: &str) -> PathBuf {
-    let binary = binary_name(binary);
-    let release = workspace_root()
-        .join("target")
-        .join("release")
-        .join(&binary);
-    if release.exists() {
-        return release;
-    }
-    let debug = workspace_root().join("target").join("debug").join(&binary);
-    if debug.exists() {
-        return debug;
-    }
-    release
-}
-
-fn binary_name(binary: &str) -> String {
-    if cfg!(windows) {
-        format!("{binary}.exe")
-    } else {
-        binary.to_string()
-    }
-}
+// Binary resolution (the newest-mtime-of-debug/release rule, plus the
+// CONTEXTDB_TEST_BIN_PROFILE override) lives once in tests/support/binary_path.rs,
+// shared with tests/integration/cli_spawn.rs -- see that module's doc comment
+// for the reasoning.
 
 pub(crate) fn ensure_release_binaries() {
     let cli = cli_bin();
     let server = server_bin();
     assert!(
         cli.exists() && server.exists(),
-        "contextdb CLI/server binaries must be built before acceptance tests run; looked for {} and {}. Run `cargo build --release -p contextdb-cli -p contextdb-server` before invoking CLI/server acceptance tests directly.",
+        "contextdb CLI/server binaries must be built before acceptance tests run; looked for {} and {}. Run `cargo build -p contextdb-cli -p contextdb-server` (add --release for the release profile) before invoking CLI/server acceptance tests directly.",
         cli.display(),
         server.display()
     );

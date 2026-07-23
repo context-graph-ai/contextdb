@@ -7326,7 +7326,7 @@ fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
     assert_eq!(
         trigger_fires.load(Ordering::SeqCst),
         1,
-        "cron callback writes must fire observation triggers in the same cron tx"
+        "cron callback writes must fire triggers in the same cron tx"
     );
     assert_eq!(
         trigger_apply_results.lock().unwrap().len(),

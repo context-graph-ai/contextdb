@@ -31,7 +31,7 @@ fn a_db1_disk_limit_flag_sets_startup_ceiling() {
     let output = run_cli_script(
         &db_path,
         &["--disk-limit", "4M"],
-        "SHOW DISK_LIMIT\n.quit\n",
+        "SHOW DISK_LIMIT;\n.quit\n",
     );
     assert!(
         output.status.success(),
@@ -62,7 +62,7 @@ fn a_db2_env_var_sets_startup_ceiling() {
                 .stdin
                 .as_mut()
                 .expect("stdin")
-                .write_all(b"SHOW DISK_LIMIT\n.quit\n")
+                .write_all(b"SHOW DISK_LIMIT;\n.quit\n")
                 .expect("write stdin");
             child.wait_with_output()
         })
@@ -82,7 +82,7 @@ fn a_db3_set_disk_limit_below_startup_ceiling_works() {
     let output = run_cli_script(
         &db_path,
         &["--disk-limit", "4M"],
-        "SET DISK_LIMIT '1M'\nSHOW DISK_LIMIT\n.quit\n",
+        "SET DISK_LIMIT '1M';\nSHOW DISK_LIMIT;\n.quit\n",
     );
     assert!(output.status.success());
     let stdout = output_string(&output.stdout);
@@ -103,9 +103,13 @@ fn a_db4_set_disk_limit_above_startup_ceiling_errors() {
     let output = run_cli_script(
         &db_path,
         &["--disk-limit", "1M"],
-        "SET DISK_LIMIT '4M'\n.quit\n",
+        "SET DISK_LIMIT '4M';\n.quit\n",
     );
-    assert!(output.status.success(), "CLI must stay alive on SET error");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "CLI must exit cleanly with the definitive-error code on SET error, not crash"
+    );
     let stdout = output_string(&output.stdout).to_lowercase();
     let stderr = output_string(&output.stderr).to_lowercase();
     assert!(
@@ -126,7 +130,7 @@ fn a_db5_file_backed_disk_limit_survives_restart() {
     let configured = run_cli_script(
         &db_path,
         &[],
-        "SET DISK_LIMIT '1M'\nSHOW DISK_LIMIT\n.quit\n",
+        "SET DISK_LIMIT '1M';\nSHOW DISK_LIMIT;\n.quit\n",
     );
     assert!(configured.status.success());
     let configured_stdout = output_string(&configured.stdout);
@@ -135,7 +139,7 @@ fn a_db5_file_backed_disk_limit_survives_restart() {
         "SHOW DISK_LIMIT must report configured limit before restart: {configured_stdout}"
     );
 
-    let reopened = run_cli_script(&db_path, &[], "SHOW DISK_LIMIT\n.quit\n");
+    let reopened = run_cli_script(&db_path, &[], "SHOW DISK_LIMIT;\n.quit\n");
     assert!(reopened.status.success());
     let reopened_stdout = output_string(&reopened.stdout);
     assert!(
@@ -200,7 +204,7 @@ async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
         "failed sync push must not leave partially visible remote rows on the server"
     );
 
-    let reopened = run_cli_script(&server_path, &[], "SHOW DISK_LIMIT\n.quit\n");
+    let reopened = run_cli_script(&server_path, &[], "SHOW DISK_LIMIT;\n.quit\n");
     assert!(reopened.status.success());
     let reopened_stdout = output_string(&reopened.stdout);
     assert!(

@@ -362,7 +362,10 @@ impl IrohServer {
         // beside the identity key and reuses it on restart, so issued tickets
         // stay valid. An explicit port= always wins; a sticky port that can
         // no longer bind fails LOUDLY rather than silently minting a new
-        // port (which would invalidate every ticket in the field).
+        // port, which would strand any already-issued address-only ticket
+        // (the default no-lookup config). This is not identity rotation —
+        // the identity above is loaded solely from the key file and is
+        // unaffected by which port the endpoint binds.
         let sticky = match parsed.port() {
             Some(_) => None,
             None => Some(sticky_port_path(identity_path)),
@@ -403,8 +406,9 @@ impl IrohServer {
                 };
                 TransportError::Unreachable(format!(
                     "{err} (while re-binding the remembered sync port {ports} from {}; free the \
-                     port, or pass an explicit port= — port=0 picks a fresh random port and \
-                     invalidates previously issued tickets)",
+                     port, or pass an explicit port= — port=0 picks a fresh random port, which \
+                     strands address-only tickets issued under the old port but does not rotate \
+                     the hub's identity)",
                     sticky_path.display()
                 ))
             }

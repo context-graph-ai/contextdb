@@ -16,14 +16,19 @@ cargo test --workspace
 
 ## Before Submitting a PR
 
-All four checks must pass:
+All five checks must pass:
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release
+cargo check --workspace --tests --features contextdb-engine/nats-tests,contextdb-server/nats
 ```
+
+The fifth step is compile-only — no Docker, no broker, seconds. The deprecated broker
+suites are feature-gated, so `cargo test --workspace` never builds them and an API change
+can break them with every other step still green.
 
 ## Crate Layout
 

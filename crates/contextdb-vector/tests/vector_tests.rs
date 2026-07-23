@@ -2,7 +2,7 @@ use contextdb_core::{
     Error, Lsn, MemoryAccountant, RowId, SnapshotId, TxId, Value, VectorEntry, VectorExecutor,
     VectorIndexRef, VectorQuantization,
 };
-use contextdb_tx::{TxManager, WriteSet, WriteSetApplicator};
+use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
 use contextdb_vector::{MemVectorExecutor, VectorStore, cosine_similarity};
 use roaring::RoaringTreemap;
 use std::collections::HashSet;
@@ -38,11 +38,14 @@ impl WriteSetApplicator for TestStore {
     }
 }
 
-fn setup() -> (Arc<TxManager<TestStore>>, MemVectorExecutor<TestStore>) {
+fn setup() -> (
+    Arc<TransactionManager<TestStore>>,
+    MemVectorExecutor<TestStore>,
+) {
     let hnsw = Arc::new(OnceLock::new());
     let vector = Arc::new(VectorStore::new(hnsw.clone()));
     vector.register_index(index(), 2, VectorQuantization::F32);
-    let tx_mgr = Arc::new(TxManager::new(TestStore {
+    let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         vector: vector.clone(),
     }));
     let exec = MemVectorExecutor::new(vector, tx_mgr.clone(), hnsw);
@@ -62,7 +65,7 @@ fn setup_refs(
     accountant: Arc<MemoryAccountant>,
 ) -> (
     Arc<VectorStore>,
-    Arc<TxManager<TestStore>>,
+    Arc<TransactionManager<TestStore>>,
     Arc<MemVectorExecutor<TestStore>>,
 ) {
     let hnsw = Arc::new(OnceLock::new());
@@ -70,7 +73,7 @@ fn setup_refs(
     for (index, dim) in refs {
         vector.register_index(index.clone(), *dim, VectorQuantization::F32);
     }
-    let tx_mgr = Arc::new(TxManager::new(TestStore {
+    let tx_mgr = Arc::new(TransactionManager::new(TestStore {
         vector: vector.clone(),
     }));
     let exec = Arc::new(MemVectorExecutor::new_with_accountant(

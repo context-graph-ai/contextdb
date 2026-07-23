@@ -45,7 +45,7 @@ const FETCH_IDLE: Duration = Duration::from_secs(20);
 /// fresh or existing store is a sub-second local operation; a slow disk gives
 /// this generous headroom. The bound exists to convert a PATHOLOGICAL wedge
 /// — the underlying redb file is already held exclusively by another store
-/// handle in this process (e.g. two `BlobService` instances whose identity
+/// handle in this process (e.g. two `BlobStore` instances whose identity
 /// files share a parent directory collide on the same `<dir>/blob-store`) —
 /// into a typed, bounded error instead of an un-cancellable hang. The store
 /// open runs on a dedicated thread and is awaited synchronously by `open`, so
@@ -112,7 +112,7 @@ pub(crate) enum FetchFailure {
 /// plus requested hash (opaque 32-byte digest), evaluated at serve time.
 /// Async so the resolver's entitlement check may run a bounded, at-most-once
 /// ledger-refresh hook on an initial miss before returning a final verdict
-/// (see [`crate::blob_resolver::BlobService::set_claim_refresh`]).
+/// (see [`crate::blob_resolver::BlobStore::set_claim_refresh`]).
 /// Called after a served fetch completes, with the authenticated peer that
 /// asked and the PAYLOAD bytes it received. The holder's transfer receipts are
 /// built from this — one call per completed serve, per peer.
@@ -155,7 +155,7 @@ impl Drop for StoreRuntime {
 }
 
 /// The holder/consumer-side blob store plus the serve seams. One per
-/// BlobService.
+/// BlobStore.
 pub(crate) struct BlobStoreHandle {
     inner: Arc<StoreRuntime>,
     /// Retained for diagnostics/future use (e.g. operator-facing store-path

@@ -4,7 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
-use contextdb_cli::{auto_sync, repl};
+use contextdb_cli::{
+    EXIT_ERROR, EXIT_INTERRUPTED_PUSH_UNCONFIRMED, EXIT_USAGE, ErrorClass, OutputOptions,
+    auto_sync, run,
+};
+use contextdb_server::exit_codes::exit_code_for;
 
 #[derive(Parser)]
 #[command(
@@ -72,14 +76,23 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    // Every message this binary writes — startup, shutdown, warnings — goes
+    // through these, so a `--json` consumer parses one stderr format for the
+    // whole process and not just for the REPL's own statements.
+    let output = OutputOptions {
+        json: args.json,
+        all: args.all,
+    };
     let accountant = args
         .memory_limit
         .as_ref()
         .map(|limit| parse_size_limit(limit).map(contextdb_core::MemoryAccountant::with_budget))
         .transpose()
         .unwrap_or_else(|err| {
-            eprintln!("Error: invalid --memory-limit: {err}");
-            std::process::exit(1);
+            // The invocation is wrong and nothing ran: a usage error, not a
+            // failure of the run.
+            output.report_error(ErrorClass::Usage, &format!("invalid --memory-limit: {err}"));
+            std::process::exit(EXIT_USAGE);
         })
         .map(Arc::new)
         .unwrap_or_else(|| Arc::new(contextdb_core::MemoryAccountant::no_limit()));
@@ -89,8 +102,8 @@ fn main() {
         .map(|limit| parse_size_limit(limit).map(|bytes| bytes as u64))
         .transpose()
         .unwrap_or_else(|err| {
-            eprintln!("Error: invalid --disk-limit: {err}");
-            std::process::exit(1);
+            output.report_error(ErrorClass::Usage, &format!("invalid --disk-limit: {err}"));
+            std::process::exit(EXIT_USAGE);
         });
 
     // If sync is configured, create the SyncPlugin before opening the DB.
@@ -104,6 +117,51 @@ fn main() {
     } else {
         (None, None)
     };
+
+    // Resolve the sync endpoint BEFORE the database is opened. An incomplete
+    // flag combination is a usage error, and exit 2 promises that nothing was
+    // attempted — which has to include not creating a database file on a fresh
+    // path for a command that was never going to run.
+    let sync_endpoint = args.tenant_id.as_ref().map(|_| {
+        let endpoint = args
+            .sync_endpoint
+            .clone()
+            .or_else(|| {
+                args.nats_url.as_ref().map(|url| {
+                    output.report_notice(
+                        ErrorClass::Sync,
+                        "Warning: --nats-url is deprecated; use --sync-endpoint with the server's ticket.",
+                    );
+                    url.clone()
+                })
+            })
+            .unwrap_or_else(|| {
+                output.report_error(
+                    ErrorClass::Usage,
+                    "--tenant-id needs a sync endpoint. Pass --sync-endpoint with the server's ticket.",
+                );
+                std::process::exit(EXIT_USAGE);
+            });
+        // A bare ticket gets the edge's own fabric identity pinned to it
+        // (derived from the database path), so this machine dials as its
+        // enrolled identity instead of an ephemeral key. In-memory databases
+        // have no data root and stay ephemeral.
+        use contextdb_server::transport::iroh::EndpointSpec;
+        match EndpointSpec::parse(&endpoint) {
+            Some(spec)
+                if spec.dial_ticket().is_some()
+                    && spec.identity_path().is_none()
+                    && args.path != ":memory:" =>
+            {
+                format!(
+                    "iroh:?to={}&identity={}.fabric-identity.key",
+                    spec.dial_ticket().expect("checked above"),
+                    args.path
+                )
+            }
+            _ => endpoint,
+        }
+    });
 
     debug!(path = %args.path, "opening database");
     let db = if args.path == ":memory:" {
@@ -125,8 +183,11 @@ fn main() {
         ) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("Error: failed to open database at '{}': {e}", args.path);
-                std::process::exit(1);
+                output.report_error(
+                    ErrorClass::of(&e),
+                    &format!("failed to open database at '{}': {e}", args.path),
+                );
+                std::process::exit(EXIT_ERROR);
             }
         }
     } else {
@@ -138,8 +199,11 @@ fn main() {
         ) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("Error: failed to open database at '{}': {e}", args.path);
-                std::process::exit(1);
+                output.report_error(
+                    ErrorClass::of(&e),
+                    &format!("failed to open database at '{}': {e}", args.path),
+                );
+                std::process::exit(EXIT_ERROR);
             }
         }
     };
@@ -153,44 +217,9 @@ fn main() {
             .enable_all()
             .build()
             .expect("failed to create tokio runtime");
-        let endpoint = args
-            .sync_endpoint
+        let endpoint = sync_endpoint
             .clone()
-            .or_else(|| {
-                args.nats_url.as_ref().map(|url| {
-                    eprintln!(
-                        "Warning: --nats-url is deprecated; use --sync-endpoint with the server's ticket."
-                    );
-                    url.clone()
-                })
-            })
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "Error: --tenant-id needs a sync endpoint. Pass --sync-endpoint with the server's ticket."
-                );
-                std::process::exit(1);
-            });
-        // A bare ticket gets the edge's own fabric identity pinned to it
-        // (derived from the database path), so this machine dials as its
-        // enrolled identity instead of an ephemeral key. In-memory databases
-        // have no data root and stay ephemeral.
-        let endpoint = {
-            use contextdb_server::transport::iroh::EndpointSpec;
-            match EndpointSpec::parse(&endpoint) {
-                Some(spec)
-                    if spec.dial_ticket().is_some()
-                        && spec.identity_path().is_none()
-                        && args.path != ":memory:" =>
-                {
-                    format!(
-                        "iroh:?to={}&identity={}.fabric-identity.key",
-                        spec.dial_ticket().expect("checked above"),
-                        args.path
-                    )
-                }
-                _ => endpoint,
-            }
-        };
+            .expect("an endpoint is resolved whenever --tenant-id is present");
         let client = Arc::new(contextdb_server::SyncClient::new(
             db.clone(),
             &endpoint,
@@ -214,7 +243,11 @@ fn main() {
         let probe = Arc::clone(client);
         Some(rt.spawn(async move {
             if let Err(err) = probe.ensure_connected().await {
-                eprintln!("Warning: sync endpoint unreachable: {err}");
+                // Not a failure: the session runs locally and sync retries.
+                output.report_notice(
+                    ErrorClass::Sync,
+                    &format!("Warning: sync endpoint unreachable: {err}"),
+                );
             }
         }))
     } else {
@@ -243,8 +276,9 @@ fn main() {
                             // already have landed on the hub. This is NOT a
                             // failure — auto-sync will re-push, which reconciles
                             // idempotently whether or not the batch committed.
-                            eprintln!(
-                                "Background auto-sync push was interrupted before the hub acknowledged: {detail}. It will re-push to reconcile."
+                            output.report_notice(
+                                ErrorClass::Sync,
+                                &format!("Background auto-sync push was interrupted before the hub acknowledged: {detail}. It will re-push to reconcile."),
                             );
                             return Ok(auto_sync::PushOutcome {
                                 conflicts: Vec::new(),
@@ -263,33 +297,36 @@ fn main() {
                     })
                 }
             },
-            |msg| eprintln!("{msg}"),
+            // The worker keeps retrying, so its report is a notice, not a
+            // failure of this run.
+            move |msg| output.report_notice(ErrorClass::Sync, &msg),
         )))
     } else {
         None
     };
 
-    // Process exit code: 0 = clean, 1 = definitive error, 3 = an interrupted
-    // push whose outcome the hub could not confirm (see
-    // `repl::EXIT_INTERRUPTED_PUSH_UNCONFIRMED`). A definitive error always
-    // dominates an unconfirmed push; an unconfirmed push never downgrades a 1.
-    let mut exit_code = repl::run(
+    // Process exit code, from the table in `contextdb_server::exit_codes`
+    // (documented at docs/cli.md, "Exit Codes"): 0 = clean, 1 = definitive
+    // error, 3 = an interrupted push whose outcome the hub could not confirm.
+    // A definitive error always dominates an unconfirmed push; an unconfirmed
+    // push never downgrades a 1.
+    let mut exit_code = run(
         db.clone(),
         sync_client.map(|c| c.as_ref()),
         rt,
         sync_plugin_arc.as_deref(),
-        repl::OutputOptions {
-            json: args.json,
-            all: args.all,
-        },
+        output,
     );
 
     // Graceful shutdown: stop background notifications, wait for any in-flight
     // auto-sync work to finish, then do one final flush before closing the DB.
     if let Some((rt, client)) = rt_and_client {
         if let Err(err) = db.execute("ROLLBACK", &std::collections::HashMap::new()) {
-            eprintln!("Final transaction rollback failed: {err}");
-            exit_code = 1;
+            output.report_error(
+                ErrorClass::of(&err),
+                &format!("Final transaction rollback failed: {err}"),
+            );
+            exit_code = EXIT_ERROR;
         }
         if let Some(ref plugin) = sync_plugin_arc {
             plugin.shutdown();
@@ -297,8 +334,13 @@ fn main() {
         if let Some(handle) = push_handle
             && let Err(err) = rt.block_on(handle)
         {
-            eprintln!("Auto-sync worker failed during shutdown: {err}");
-            exit_code = 1;
+            // A join failure of the auto-sync worker is a failure of the sync
+            // plane, not of the statements this session ran.
+            output.report_error(
+                ErrorClass::Sync,
+                &format!("Auto-sync worker failed during shutdown: {err}"),
+            );
+            exit_code = EXIT_ERROR;
         }
         match client.has_pending_push_changes() {
             Ok(true) => match rt.block_on(client.push()) {
@@ -310,22 +352,31 @@ fn main() {
                     // downgrading a harder error) — a `push && shutdown` caller
                     // must not read this as a clean success. The next push
                     // reconciles idempotently.
-                    eprintln!(
-                        "Final sync push was interrupted before the hub acknowledged: {detail}. The data may already have landed; run `.sync push` on next start to reconcile."
+                    // Indeterminate, not failed: a notice, with exit code 3
+                    // carrying the "re-push is safe" signal.
+                    output.report_notice(
+                        ErrorClass::Sync,
+                        &format!("Final sync push was interrupted before the hub acknowledged: {detail}. The data may already have landed; run `.sync push` on next start to reconcile."),
                     );
                     if exit_code == 0 {
-                        exit_code = repl::EXIT_INTERRUPTED_PUSH_UNCONFIRMED;
+                        exit_code = EXIT_INTERRUPTED_PUSH_UNCONFIRMED;
                     }
                 }
                 Err(err) => {
-                    eprintln!("Final sync push failed: {err}");
-                    exit_code = 1;
+                    output.report_error(
+                        ErrorClass::of(&err),
+                        &format!("Final sync push failed: {err}"),
+                    );
+                    exit_code = exit_code_for(&err);
                 }
             },
             Ok(false) => {}
             Err(err) => {
-                eprintln!("Final sync preflight failed: {err}");
-                exit_code = 1;
+                output.report_error(
+                    ErrorClass::of(&err),
+                    &format!("Final sync preflight failed: {err}"),
+                );
+                exit_code = exit_code_for(&err);
             }
         }
         rt.block_on(async {
@@ -341,8 +392,11 @@ fn main() {
     }
 
     if let Err(e) = db.close() {
-        eprintln!("Error: failed to close database: {e}");
-        std::process::exit(1);
+        output.report_error(
+            ErrorClass::of(&e),
+            &format!("failed to close database: {e}"),
+        );
+        std::process::exit(EXIT_ERROR);
     }
 
     if exit_code != 0 {

@@ -39,9 +39,10 @@ use contextdb_engine::work_ledger::{
     BlobHash, ClaimInsert, InputRef, JobSpec, MovementPolicy, insert_claim,
     install_work_ledger_schema, submit_job,
 };
+use contextdb_server::exit_codes::EXIT_ERROR;
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::{
-    BlobService, FabricIdentity, SyncClient, SyncServer, TransferDirection, TransferPlane,
+    BlobStore, FabricIdentity, SyncClient, SyncServer, TransferDirection, TransferPlane,
     TransferReceipt, peer_bind_spec, peer_dial_spec,
 };
 use std::collections::HashMap;
@@ -155,7 +156,7 @@ fn row_count(db: &Database, table: &str) -> i64 {
 
 fn die(context: &str, err: impl std::fmt::Display) -> ! {
     eprintln!("[driver] FATAL {context}: {err}");
-    std::process::exit(2);
+    std::process::exit(EXIT_ERROR);
 }
 
 fn emit(key: &str, value: impl std::fmt::Display) {
@@ -1566,7 +1567,7 @@ async fn run_blob_holder(
         Err(err) => die("seed the blob claim", err),
     }
 
-    let holder = BlobService::new(
+    let holder = BlobStore::new(
         db.clone(),
         MovementPolicy {
             auto_propagate: true,
@@ -1676,7 +1677,7 @@ async fn run_blob_fetch(
         Err(err) => die("mirror the blob claim", err),
     }
 
-    let consumer = BlobService::new(
+    let consumer = BlobStore::new(
         db.clone(),
         MovementPolicy {
             auto_propagate: true,

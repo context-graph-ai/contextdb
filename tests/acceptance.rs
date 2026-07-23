@@ -36,6 +36,8 @@ static GLOBAL: AllocCounter = AllocCounter;
 
 #[path = "acceptance/auto_stamped_txid.rs"]
 mod auto_stamped_txid;
+#[path = "support/binary_path.rs"]
+mod binary_path;
 #[path = "acceptance/cli_ux.rs"]
 mod cli_ux;
 #[path = "acceptance/common.rs"]
@@ -106,8 +108,6 @@ mod memory_accounting;
 mod multi_edge;
 #[path = "acceptance/multi_table_atomic_visibility.rs"]
 mod multi_table_atomic_visibility;
-#[path = "acceptance/observation_trigger.rs"]
-mod observation_trigger;
 #[path = "acceptance/persistence.rs"]
 mod persistence;
 #[path = "acceptance/precommit_context_guard.rs"]
@@ -140,6 +140,8 @@ mod storage_scale_hardening;
 mod sync;
 #[path = "acceptance/test_alloc_counter.rs"]
 pub mod test_alloc_counter;
+#[path = "acceptance/trigger.rs"]
+mod trigger;
 #[path = "acceptance/trigger_concurrency_panic_freedom.rs"]
 mod trigger_concurrency_panic_freedom;
 #[path = "acceptance/trigger_same_db_progress.rs"]

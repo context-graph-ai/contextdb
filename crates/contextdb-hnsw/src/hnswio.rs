@@ -1562,8 +1562,7 @@ mod tests {
     #[ignore = "quarantined: with seeded data, search misses the freshly inserted point in ~5/60 \
                 loaded runs (returns d_id 27 instead of 100 at the exact-match assert) — \
                 insert-after-mmap-reload recall suspect in the library, not a test artifact; \
-                un-ignore when root-caused (ledger: plans contextdb/active/todo.md, 'hnsw fork: \
-                search misses a freshly inserted point after mmap reload', 2026-07-18)"]
+                un-ignore when root-caused"]
     fn reload_with_mmap() {
         println!("\n\n hnswio tests : reload_with_mmap");
         log_init_test();

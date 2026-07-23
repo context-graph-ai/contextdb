@@ -1,7 +1,9 @@
 use crate::formatter::{DEFAULT_ROW_CAP, format_query_result_capped, format_query_result_json};
+use crate::json_output::{self, ErrorClass};
 use contextdb_core::{Error, TableMeta};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
+use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_INTERRUPTED_PUSH_UNCONFIRMED, EXIT_OK};
 use contextdb_server::{SyncClient, SyncPlugin};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -9,59 +11,104 @@ use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal};
 use std::sync::Arc;
 
-/// Process exit code for a `.sync push` that was interrupted after its batch was
-/// sent, where the hub could not confirm whether the batch landed. It is kept
-/// DISTINCT from a clean success (0) and a definitive failure (1) so a scripted
-/// `push && shutdown` never reads an unknown outcome as "landed" and closes the
-/// machine on data that may never have reached the hub; re-pushing is safe
-/// whether or not the batch committed. (clap uses 2; general errors 1; SIGINT
-/// 130 — 3 is free.)
-pub const EXIT_INTERRUPTED_PUSH_UNCONFIRMED: i32 = 3;
-
+/// Where a line came from: an interactive terminal or a script. The only
+/// framing difference between the two is the line number a script can cite and
+/// what an unfinished statement does at exit.
 #[derive(Clone, Copy)]
-struct InputContext {
-    interactive: bool,
-    script_line: Option<usize>,
-    output: OutputOptions,
+#[doc(hidden)]
+pub struct InputContext {
+    pub interactive: bool,
+    pub script_line: Option<usize>,
+    pub output: OutputOptions,
 }
 
 /// How query results are rendered. `--json` emits a JSON array of row objects
 /// (uncapped); otherwise the human table is capped at [`DEFAULT_ROW_CAP`] rows
 /// unless `all` (the `--all` flag) is set.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct OutputOptions {
     pub json: bool,
     pub all: bool,
 }
 
+impl OutputOptions {
+    /// Report a failure on stderr in whichever form this session speaks: the
+    /// `{"error":{...}}` document under `--json`, the human `Error: ...` line
+    /// otherwise.
+    ///
+    /// The CLI binary reports its own startup and shutdown failures through
+    /// this, so a `--json` consumer parses one stderr format for the whole
+    /// process, not just for the statements inside the REPL.
+    pub fn report_error(&self, class: ErrorClass, message: &str) {
+        if self.json {
+            json_output::print_error(class, message, None);
+        } else {
+            eprintln!("Error: {message}");
+        }
+    }
+
+    /// Report something the operator should see that is NOT a failure — a
+    /// deprecation, an endpoint the CLI will keep retrying, a push whose
+    /// outcome is merely unknown. Reporting these as errors would tell a
+    /// consumer the run failed when it did not.
+    pub fn report_notice(&self, class: ErrorClass, message: &str) {
+        if self.json {
+            json_output::print_notice(class, message);
+        } else {
+            eprintln!("{message}");
+        }
+    }
+}
+
+/// What a session has accumulated so far, and what its exit code will be.
 #[derive(Default)]
-struct SessionState {
-    had_error: bool,
+#[doc(hidden)]
+pub struct SessionState {
+    pub had_error: bool,
     /// Set when a `.sync push` was interrupted after sending and the hub could
     /// not confirm the batch landed. Drives [`EXIT_INTERRUPTED_PUSH_UNCONFIRMED`]
     /// in non-interactive use; the interactive REPL prints the warning and
     /// continues.
-    had_unconfirmed_push: bool,
-    trace_enabled: bool,
+    pub had_unconfirmed_push: bool,
+    pub trace_enabled: bool,
+    /// A terminal session showed the human every error as it happened, so the
+    /// process code reports the SESSION, not the statements inside it — the
+    /// same reason `psql` and `sqlite3` leave an interactive session at 0. A
+    /// scripted run has nobody watching, so there every error fails the run.
+    pub interactive: bool,
 }
 
 /// Collapse a finished session's state to a process exit code: a definitive
-/// error dominates (1), then an unconfirmed interrupted push (3), else success
-/// (0).
-fn session_exit_code(session: &SessionState) -> i32 {
-    if session.had_error {
-        1
+/// error dominates ([`EXIT_ERROR`]), then an unconfirmed interrupted push
+/// ([`EXIT_INTERRUPTED_PUSH_UNCONFIRMED`]), else success ([`EXIT_OK`]).
+///
+/// An unconfirmed push still reports its own code from an interactive session:
+/// the human cannot act on it once the process is gone, and a wrapper script
+/// around an interactive invocation must still learn that the data's fate is
+/// unknown.
+#[doc(hidden)]
+pub fn session_exit_code(session: &SessionState) -> i32 {
+    if session.had_error && !session.interactive {
+        EXIT_ERROR
     } else if session.had_unconfirmed_push {
         EXIT_INTERRUPTED_PUSH_UNCONFIRMED
     } else {
-        0
+        EXIT_OK
     }
 }
 
-/// Run the REPL loop. Returns the process exit code: `0` if all commands
-/// succeeded, `1` if any definitive error occurred, and
+/// Run the REPL loop. Returns the process exit code: [`EXIT_OK`] if all commands
+/// succeeded, [`EXIT_ERROR`] if any error occurred, and
 /// [`EXIT_INTERRUPTED_PUSH_UNCONFIRMED`] if a `.sync push` was interrupted after
 /// sending with its outcome unconfirmed (and no harder error occurred).
+///
+/// One exception: an INTERACTIVE session
+/// returns [`EXIT_OK`] even after errors. The person at the terminal saw each
+/// one as it happened and chose to keep going, so the exit code reports the
+/// session rather than the statements inside it — the same thing `psql` and
+/// `sqlite3` do. A scripted session has nobody watching, so there every error
+/// is reported. An unconfirmed push is reported in both, because nobody can act
+/// on it once the process is gone.
 pub fn run(
     db: Arc<Database>,
     sync_client: Option<&SyncClient>,
@@ -79,6 +126,226 @@ pub fn run(
     run_scripted(&db, sync_client, rt, sync_plugin, output)
 }
 
+/// One whole SQL statement gathered from the input, with the input line it
+/// started on so a parse error can still be placed in a script.
+#[doc(hidden)]
+pub struct PendingStatement {
+    pub text: String,
+    pub first_line: Option<usize>,
+}
+
+/// Gathers input lines into whole SQL statements, exactly as `psql` and
+/// `sqlite3` do: a statement ends at the first `;` that is not inside a quoted
+/// string or a comment, however many lines it spans, and a line that ends
+/// without such a `;` continues on the next one. Whatever is left when the
+/// input ends is run as a final statement.
+///
+/// The interactive and the scripted adapter both frame their input through
+/// this, so it carries the whole multi-line contract for both; it is re-exported
+/// through [`crate::testing`] to be asserted directly, without a terminal.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct StatementBuffer {
+    text: String,
+    first_line: Option<usize>,
+}
+
+impl StatementBuffer {
+    /// Whether no statement is open. What a terminator leaves behind is often
+    /// pure trivia — `SELECT 1; -- done` leaves ` -- done` — and trivia is not
+    /// a statement waiting to be continued: nothing follows it, so the next
+    /// line starts fresh and end of input has nothing to run.
+    pub fn is_empty(&self) -> bool {
+        is_only_trivia(&self.text)
+    }
+
+    pub fn push_line(&mut self, line: &str, line_no: Option<usize>) {
+        if self.is_empty() {
+            self.text.clear();
+            self.first_line = line_no;
+        }
+        self.text.push_str(line);
+        self.text.push('\n');
+    }
+
+    /// Split off the next `;`-terminated statement, leaving anything that
+    /// followed the `;` on the same line for the next round.
+    pub fn take_terminated(&mut self) -> Option<PendingStatement> {
+        let end = statement_terminator(&self.text)?;
+        let text: String = self.text.drain(..end).collect();
+        let first_line = self.first_line;
+        if self.is_empty() {
+            self.text.clear();
+            self.first_line = None;
+        }
+        Some(PendingStatement { text, first_line })
+    }
+
+    /// Take whatever is left, terminated or not (end of input).
+    pub fn take_remaining(&mut self) -> Option<PendingStatement> {
+        if self.is_empty() {
+            self.text.clear();
+            self.first_line = None;
+            return None;
+        }
+        Some(PendingStatement {
+            text: std::mem::take(&mut self.text),
+            first_line: self.first_line.take(),
+        })
+    }
+}
+
+/// Whether `text` is nothing but whitespace and CLOSED comments — nothing a
+/// statement could be continued from.
+///
+/// An UNCLOSED `/*` is deliberately NOT trivia. The next physical line genuinely
+/// continues that comment, so the statement stays open: a `.tables` typed after
+/// it is comment text, not a command, and at end of input the unterminated
+/// remainder reaches the parser and fails loudly rather than being silently
+/// discarded.
+fn is_only_trivia(text: &str) -> bool {
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((_, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '-' && chars.peek().is_some_and(|(_, next)| *next == '-') {
+            for (_, c) in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '*') {
+            chars.next();
+            let mut star = false;
+            let mut closed = false;
+            for (_, c) in chars.by_ref() {
+                if star && c == '/' {
+                    closed = true;
+                    break;
+                }
+                star = c == '*';
+            }
+            if !closed {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+
+    true
+}
+
+/// Byte offset just past the first statement-terminating `;` in `text`, or
+/// `None` when there is none. A `;` inside a single-quoted string, a
+/// double-quoted identifier, a `--` line comment, or a `/* */` block comment is
+/// not a terminator. Scanning is by character, so multi-byte text is safe.
+#[doc(hidden)]
+pub fn statement_terminator(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices().peekable();
+    let mut in_string = false;
+    let mut in_identifier = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' if !in_identifier => {
+                if in_string {
+                    // A doubled '' is an escaped quote, not the end of the string.
+                    if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                        chars.next();
+                    } else {
+                        in_string = false;
+                    }
+                } else {
+                    in_string = true;
+                }
+            }
+            '"' if !in_string => in_identifier = !in_identifier,
+            '-' if !in_string
+                && !in_identifier
+                && chars.peek().is_some_and(|(_, next)| *next == '-') =>
+            {
+                for (_, c) in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if !in_string
+                && !in_identifier
+                && chars.peek().is_some_and(|(_, next)| *next == '*') =>
+            {
+                chars.next();
+                let mut star = false;
+                for (_, c) in chars.by_ref() {
+                    if star && c == '/' {
+                        break;
+                    }
+                    star = c == '*';
+                }
+            }
+            ';' if !in_string && !in_identifier => return Some(idx + 1),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// What an input line is. Both adapters route every line through
+/// [`route_line`], so this is where "a meta-command is only a meta-command when
+/// no statement is open" is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum LineRouting {
+    /// A blank line or a whole-line comment between statements: not input.
+    Skip,
+    /// A meta-command. Stays single-line and needs no `;`.
+    Meta,
+    /// Text belonging to a SQL statement, gathered until a `;` closes it.
+    Sql,
+}
+
+/// Route one input line, given whether a statement is already open. While a
+/// statement is open every line continues it — a leading `.` or `--` inside an
+/// unfinished statement is that statement's text, not a command and not a
+/// comment to drop.
+#[doc(hidden)]
+pub fn route_line(line: &str, statement_open: bool) -> LineRouting {
+    if statement_open {
+        return LineRouting::Sql;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("--") {
+        return LineRouting::Skip;
+    }
+    if trimmed.starts_with('.') || trimmed.starts_with('\\') {
+        return LineRouting::Meta;
+    }
+    LineRouting::Sql
+}
+
+/// The interactive adapter's ONE per-line decision, made before the line
+/// reaches [`feed_line`]: `None` drops the line, `Some` is the text to feed.
+///
+/// The text is returned RAW. Inside an open statement a line's leading and
+/// trailing spaces are part of the SQL — a continuation line of a quoted value
+/// carries the user's indentation, and a blank line carries its own newline —
+/// so trimming here would silently corrupt stored data. Only a blank line typed
+/// when NO statement is open is dropped, because there is nothing for it to
+/// belong to.
+#[doc(hidden)]
+pub fn interactive_readline_filter(line: &str, statement_open: bool) -> Option<&str> {
+    if !statement_open && line.trim().is_empty() {
+        return None;
+    }
+    Some(line)
+}
+
 fn run_interactive(
     db: &Database,
     sync_client: Option<&SyncClient>,
@@ -87,22 +354,34 @@ fn run_interactive(
     output: OutputOptions,
 ) -> i32 {
     let mut rl = DefaultEditor::new().expect("failed to initialize readline");
-    let mut session = SessionState::default();
+    let mut session = SessionState {
+        interactive: true,
+        ..SessionState::default()
+    };
+    let mut pending = StatementBuffer::default();
 
     loop {
-        let readline = rl.readline("contextdb> ");
+        let prompt = if pending.is_empty() {
+            "contextdb> "
+        } else {
+            "      ...> "
+        };
+        let readline = rl.readline(prompt);
         match readline {
             Ok(line) => {
-                let line = line.trim();
-                if line.is_empty() {
+                let Some(fed) = interactive_readline_filter(&line, !pending.is_empty()) else {
                     continue;
+                };
+                // History gets a trimmed copy for recall; the SQL text does not.
+                let trimmed = fed.trim();
+                if !trimmed.is_empty() {
+                    let _ = rl.add_history_entry(trimmed);
                 }
-                let _ = rl.add_history_entry(line);
-                if !process_input_line(
+                if !feed_line(
                     db,
                     sync_client,
                     rt,
-                    line,
+                    fed,
                     InputContext {
                         interactive: true,
                         script_line: None,
@@ -110,6 +389,7 @@ fn run_interactive(
                     },
                     sync_plugin,
                     &mut session,
+                    &mut pending,
                 ) {
                     break;
                 }
@@ -117,6 +397,10 @@ fn run_interactive(
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(_) => break,
         }
+    }
+
+    if !pending.is_empty() {
+        eprintln!("Discarding incomplete statement (no closing `;`).");
     }
 
     session_exit_code(&session)
@@ -130,21 +414,19 @@ fn run_scripted(
     output: OutputOptions,
 ) -> i32 {
     let mut session = SessionState::default();
+    let mut pending = StatementBuffer::default();
     let stdin = std::io::stdin();
+    let mut stopped = false;
     for (line_idx, line) in stdin.lock().lines().enumerate() {
         let line = match line {
             Ok(line) => line,
             Err(_) => break,
         };
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("--") {
-            continue;
-        }
-        if !process_input_line(
+        if !feed_line(
             db,
             sync_client,
             rt,
-            line,
+            &line,
             InputContext {
                 interactive: false,
                 script_line: Some(line_idx + 1),
@@ -152,14 +434,101 @@ fn run_scripted(
             },
             sync_plugin,
             &mut session,
+            &mut pending,
         ) {
+            stopped = true;
             break;
         }
     }
+
+    // End of input closes the last statement even without a trailing `;`.
+    if !stopped && let Some(statement) = pending.take_remaining() {
+        run_statement(
+            db,
+            statement,
+            InputContext {
+                interactive: false,
+                script_line: None,
+                output,
+            },
+            &mut session,
+        );
+    }
+
     session_exit_code(&session)
 }
 
-fn process_input_line(
+/// Feed one input line to the session. Returns `false` when the session should
+/// stop (`.quit`).
+///
+/// This is the whole per-line path, and BOTH adapters call it: `run_interactive`
+/// and `run_scripted` differ only in where the line comes from, the line number
+/// they can cite, and what an unfinished statement does at exit. Driving this
+/// directly is therefore how the interactive path is covered without a terminal.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn feed_line(
+    db: &Database,
+    sync_client: Option<&SyncClient>,
+    rt: Option<&tokio::runtime::Runtime>,
+    line: &str,
+    input: InputContext,
+    sync_plugin: Option<&SyncPlugin>,
+    session: &mut SessionState,
+    pending: &mut StatementBuffer,
+) -> bool {
+    match route_line(line, !pending.is_empty()) {
+        LineRouting::Skip => return true,
+        LineRouting::Meta => {
+            return process_meta_line(
+                db,
+                sync_client,
+                rt,
+                line.trim(),
+                input,
+                sync_plugin,
+                session,
+            );
+        }
+        LineRouting::Sql => {}
+    }
+
+    pending.push_line(line, input.script_line);
+    while let Some(statement) = pending.take_terminated() {
+        run_statement(db, statement, input, session);
+    }
+    true
+}
+
+/// Run one gathered statement, echoing scripted INSERTs as before. A parse
+/// error is placed at the line the statement started on.
+fn run_statement(
+    db: &Database,
+    statement: PendingStatement,
+    input: InputContext,
+    session: &mut SessionState,
+) {
+    let sql = statement.text.trim();
+    if sql.is_empty() {
+        return;
+    }
+    let input = InputContext {
+        script_line: statement.first_line,
+        ..input
+    };
+    let upper = sql.to_uppercase();
+    // The scripted INSERT echo is human affordance; under --json stdout is
+    // the machine data channel, so suppress it to keep the stream clean.
+    if !input.interactive && !input.output.json && upper.starts_with("INSERT") {
+        println!("{sql}");
+    }
+    if !execute_sql(db, sql, input, session.trace_enabled) {
+        session.had_error = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_meta_line(
     db: &Database,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
@@ -179,150 +548,248 @@ fn process_input_line(
             sync_plugin,
             &mut session.had_unconfirmed_push,
         );
-        println!("{}", outcome.message);
-        if !outcome.ok {
+        if outcome.ok {
+            report_success(&outcome.message, &outcome.json, input.output);
+        } else {
+            report_failure(outcome.class, &outcome.message, input);
             session.had_error = true;
         }
     } else if is_trace_command(line) {
-        handle_trace_command(line, &mut session.trace_enabled);
+        if !handle_trace_command(line, input, &mut session.trace_enabled) {
+            session.had_error = true;
+        }
     } else if is_explain_command(line) {
         if !handle_explain_command(db, line, input) {
             session.had_error = true;
         }
-    } else if line.starts_with('.') || line.starts_with('\\') {
-        if !handle_meta_command(db, sync_client, rt, line, sync_plugin) {
-            return false;
-        }
     } else {
-        let upper = line.trim_start().to_uppercase();
-        // The scripted INSERT echo is human affordance; under --json stdout is
-        // the machine data channel, so suppress it to keep the stream clean.
-        if !input.interactive && !input.output.json && upper.starts_with("INSERT") {
-            println!("{line}");
-        }
-        if !execute_sql(db, line, input, session.trace_enabled) {
+        let outcome = handle_meta_command(db, sync_client, rt, line, input, sync_plugin);
+        if !outcome.ok {
             session.had_error = true;
+        }
+        if !outcome.keep_going {
+            return false;
         }
     }
     true
 }
 
+/// A meta-command's result: the JSON document on stdout under `--json`, the
+/// human line otherwise.
+fn report_success(message: &str, document: &serde_json::Value, output: OutputOptions) {
+    if output.json {
+        json_output::print_document(document);
+    } else {
+        println!("{message}");
+    }
+}
+
+/// A failure, always on stderr: the `{"error":{...}}` envelope under `--json`,
+/// the human line otherwise. stdout carries results and nothing else.
+fn report_failure(class: ErrorClass, message: &str, input: InputContext) {
+    if input.output.json {
+        json_output::print_error(class, message, input.script_line);
+    } else {
+        eprintln!("{message}");
+    }
+}
+
 struct SyncCommandOutcome {
     message: String,
+    /// The same outcome as a machine document, printed instead of `message`
+    /// under `--json`. Unused when the command failed — a failure is reported
+    /// through the error envelope on stderr.
+    json: serde_json::Value,
+    ok: bool,
+    /// Which error family a failure belongs to, for the `--json` envelope.
+    class: ErrorClass,
+}
+
+impl SyncCommandOutcome {
+    fn succeeded(message: String, json: serde_json::Value) -> Self {
+        Self {
+            message,
+            json,
+            ok: true,
+            class: ErrorClass::Sync,
+        }
+    }
+
+    fn failed(class: ErrorClass, message: String) -> Self {
+        Self {
+            message,
+            json: serde_json::Value::Null,
+            ok: false,
+            class,
+        }
+    }
+}
+
+/// What a meta-command did: whether the session continues (`.quit` ends it) and
+/// whether the command succeeded. A failed meta-command fails the run, exactly
+/// like a failed SQL statement — a script cannot tell the two apart from `$?`
+/// and should not have to.
+pub(crate) struct MetaCommandOutcome {
+    keep_going: bool,
     ok: bool,
 }
 
+impl MetaCommandOutcome {
+    fn done() -> Self {
+        Self {
+            keep_going: true,
+            ok: true,
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            keep_going: true,
+            ok: false,
+        }
+    }
+
+    fn quit() -> Self {
+        Self {
+            keep_going: false,
+            ok: true,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_meta_command(
     db: &Database,
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
     line: &str,
+    input: InputContext,
     sync_plugin: Option<&SyncPlugin>,
-) -> bool {
+) -> MetaCommandOutcome {
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
 
     match cmd {
-        ".quit" | ".exit" | "\\q" => return false,
+        ".quit" | ".exit" | "\\q" => return MetaCommandOutcome::quit(),
         ".help" | "\\?" => {
-            if rest.eq_ignore_ascii_case("vector") {
-                println!("VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')");
-                println!("SHOW VECTOR_INDEXES");
-                println!("ORDER BY embedding <=> [0.1, 0.2, 0.3] LIMIT 5");
-                println!("ORDER BY embedding <=> ROW_VECTOR('table', 'embedding', $key) LIMIT 5");
-                println!(
-                    "Vector errors include LegacyVectorStoreDetected, StoreCorrupted, VectorIndexDimensionMismatch, UnknownVectorIndex, PersistedRowVectorRowMissing, and PersistedRowVectorCellNull"
-                );
-                return true;
+            // Help is prose for a human, and there is no machine contract worth
+            // freezing in it: an agent discovers the surface from docs/cli.md
+            // and `--help`, not from the REPL banner. Under --json it is
+            // written to stderr as one document, so stdout stays pure JSON
+            // Lines and stderr stays parseable.
+            let lines = help_lines(rest);
+            if input.output.json {
+                eprintln!("{}", serde_json::json!({ "help": lines }));
+            } else {
+                for line in lines {
+                    println!("{line}");
+                }
             }
-            if rest.eq_ignore_ascii_case("propagate") {
-                println!(
-                    "PROPAGATE ON EDGE <edge_type> INCOMING|OUTGOING|BOTH STATE <state> SET <state>"
-                );
-                println!("  [MAX DEPTH n] [ABORT ON FAILURE]");
-                println!("PROPAGATE ON STATE <state> EXCLUDE VECTOR");
-                println!(
-                    "<column> REFERENCES <table>(<col>) ON STATE <state> PROPAGATE SET <state>"
-                );
-                println!();
-                println!("Worked example:");
-                println!("  CREATE TABLE decisions (");
-                println!("    id UUID PRIMARY KEY,");
-                println!("    status TEXT NOT NULL,");
-                println!("    intention_id UUID REFERENCES intentions(id)");
-                println!("      ON STATE archived PROPAGATE SET invalidated,");
-                println!("    embedding VECTOR(384)");
-                println!("  ) STATE MACHINE (status: active -> [invalidated, superseded])");
-                println!("    PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated");
-                println!("    PROPAGATE ON STATE invalidated EXCLUDE VECTOR");
-                println!("    PROPAGATE ON STATE superseded EXCLUDE VECTOR");
-                println!("See docs/query-language.md for the full grammar.");
-                return true;
-            }
-            println!(".help / \\?          Show this message");
-            println!(".help vector        Show vector index syntax and errors");
-            println!(".help propagate     Show PROPAGATE DDL grammar and a worked example");
-            println!(".quit/.exit / \\q    Exit REPL");
-            println!(".tables / \\dt       List tables");
-            println!(".schema / \\d <tbl>  Show table schema and constraints");
-            println!(".explain <sql>      Show execution plan");
-            println!(".trace on|off       Toggle one-line execution traces");
-            println!(".sync status              Show sync connection info");
-            println!(".sync push                Push local changes to server");
-            println!(
-                "                          exit codes: 0 = pushed; 1 = failed; 3 = interrupted after sending, outcome unconfirmed, re-push is safe"
-            );
-            println!(".sync pull                Pull remote changes from server");
-            println!(".sync reconnect           Reconnect to the sync endpoint");
-            println!(".sync destination         Move retained-data delivery to the connected hub");
-            println!(".sync direction <t> <d>   Set table sync direction (Push|Pull|Both|None)");
-            println!(
-                ".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)"
-            );
-            println!(".sync policy default <p>  Set default conflict policy");
-            println!(".sync auto [on|off]       Toggle auto-sync after DML");
         }
         ".tables" | "\\dt" => {
-            for t in db.table_names() {
-                println!("{t}");
+            let names = db.table_names();
+            if input.output.json {
+                json_output::print_document(&json_output::tables_document(names));
+            } else {
+                for t in names {
+                    println!("{t}");
+                }
             }
         }
         ".schema" | "\\d" => {
             if rest.is_empty() {
-                eprintln!("Usage: .schema <table> or \\d <table>");
+                report_failure(
+                    ErrorClass::Usage,
+                    "Usage: .schema <table> or \\d <table>",
+                    input,
+                );
+                return MetaCommandOutcome::failed();
             } else if let Some(meta) = db.table_meta(rest) {
-                print_table_meta(rest, &meta);
-            } else {
-                eprintln!("Table not found: {rest}");
-            }
-        }
-        ".explain" => {
-            if rest.is_empty() {
-                eprintln!("Usage: .explain <sql>");
-            } else {
-                match explain_output(db, rest) {
-                    Ok(plan) => print!("{}", plan),
-                    Err(e) => {
-                        if is_fatal_cli_error(&e) {
-                            eprintln!("Error: {}", e);
-                        } else {
-                            println!("Error: {}", e);
-                        }
-                    }
+                if input.output.json {
+                    json_output::print_document(&json_output::table_meta_document(rest, &meta));
+                } else {
+                    print_table_meta(rest, &meta);
                 }
+            } else {
+                report_failure(ErrorClass::Sql, &format!("Table not found: {rest}"), input);
+                return MetaCommandOutcome::failed();
             }
         }
         ".sync" | "\\sync" => {
-            println!(
-                "{}",
-                handle_sync_command(sync_client, rt, rest, sync_plugin)
-            );
+            let outcome = handle_sync_command(sync_client, rt, rest, sync_plugin);
+            if !outcome.ok {
+                report_failure(outcome.class, &outcome.message, input);
+                return MetaCommandOutcome::failed();
+            }
+            report_success(&outcome.message, &outcome.json, input.output);
         }
-        _ => println!("Unknown command: {}. Type \\? for help.", cmd),
+        _ => {
+            report_failure(
+                ErrorClass::Usage,
+                &format!("Unknown command: {cmd}. Type \\? for help."),
+                input,
+            );
+            return MetaCommandOutcome::failed();
+        }
     }
 
-    true
+    MetaCommandOutcome::done()
+}
+
+/// The help text for a topic, one line per entry. Rendering is the caller's
+/// business — stdout for a human, one JSON document on stderr under `--json`.
+fn help_lines(topic: &str) -> Vec<&'static str> {
+    if topic.eq_ignore_ascii_case("vector") {
+        return vec![
+            "VECTOR(N) WITH (quantization = 'F32'|'SQ8'|'SQ4')",
+            "SHOW VECTOR_INDEXES",
+            "ORDER BY embedding <=> [0.1, 0.2, 0.3] LIMIT 5",
+            "ORDER BY embedding <=> ROW_VECTOR('table', 'embedding', $key) LIMIT 5",
+            "Vector errors include LegacyVectorStoreDetected, StoreCorrupted, VectorIndexDimensionMismatch, UnknownVectorIndex, PersistedRowVectorRowMissing, and PersistedRowVectorCellNull",
+        ];
+    }
+    if topic.eq_ignore_ascii_case("propagate") {
+        return vec![
+            "PROPAGATE ON EDGE <edge_type> INCOMING|OUTGOING|BOTH STATE <state> SET <state>",
+            "  [MAX DEPTH n] [ABORT ON FAILURE]",
+            "PROPAGATE ON STATE <state> EXCLUDE VECTOR",
+            "<column> REFERENCES <table>(<col>) ON STATE <state> PROPAGATE SET <state>",
+            "",
+            "Worked example:",
+            "  CREATE TABLE decisions (",
+            "    id UUID PRIMARY KEY,",
+            "    status TEXT NOT NULL,",
+            "    intention_id UUID REFERENCES intentions(id)",
+            "      ON STATE archived PROPAGATE SET invalidated,",
+            "    embedding VECTOR(384)",
+            "  ) STATE MACHINE (status: active -> [invalidated, superseded])",
+            "    PROPAGATE ON EDGE CITES INCOMING STATE invalidated SET invalidated",
+            "    PROPAGATE ON STATE invalidated EXCLUDE VECTOR",
+            "    PROPAGATE ON STATE superseded EXCLUDE VECTOR",
+            "See docs/query-language.md for the full grammar.",
+        ];
+    }
+    vec![
+        ".help / \\?          Show this message",
+        ".help vector        Show vector index syntax and errors",
+        ".help propagate     Show PROPAGATE DDL grammar and a worked example",
+        ".quit/.exit / \\q    Exit REPL",
+        ".tables / \\dt       List tables",
+        ".schema / \\d <tbl>  Show table schema and constraints",
+        ".explain <sql>      Show execution plan",
+        ".trace on|off       Toggle one-line execution traces",
+        ".sync status              Show sync connection info",
+        ".sync push                Push local changes to server",
+        "                          exit codes: 0 = pushed; 1 = failed; 3 = interrupted after sending, outcome unconfirmed, re-push is safe",
+        ".sync pull                Pull remote changes from server",
+        ".sync reconnect           Reconnect to the sync endpoint",
+        ".sync destination         Move retained-data delivery to the connected hub",
+        ".sync direction <t> <d>   Set table sync direction (Push|Pull|Both|None)",
+        ".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)",
+        ".sync policy default <p>  Set default conflict policy",
+        ".sync auto [on|off]       Toggle auto-sync after DML",
+    ]
 }
 
 fn is_trace_command(line: &str) -> bool {
@@ -336,31 +803,77 @@ fn is_explain_command(line: &str) -> bool {
     matches!(line.split_whitespace().next(), Some(".explain"))
 }
 
-fn handle_trace_command(line: &str, trace_enabled: &mut bool) {
+fn handle_trace_command(line: &str, input: InputContext, trace_enabled: &mut bool) -> bool {
+    let output = input.output;
     let mut parts = line.split_whitespace();
     let _cmd = parts.next();
     match parts.next() {
         Some(state) if state.eq_ignore_ascii_case("on") => {
             *trace_enabled = true;
-            println!("Trace enabled");
+            report_success(
+                "Trace enabled",
+                &json_output::trace_state_document(true),
+                output,
+            );
         }
         Some(state) if state.eq_ignore_ascii_case("off") => {
             *trace_enabled = false;
-            println!("Trace disabled");
+            report_success(
+                "Trace disabled",
+                &json_output::trace_state_document(false),
+                output,
+            );
         }
         None => {
             let state = if *trace_enabled { "on" } else { "off" };
-            println!("Trace: {state}");
+            report_success(
+                &format!("Trace: {state}"),
+                &json_output::trace_state_document(*trace_enabled),
+                output,
+            );
         }
-        Some(_) => println!("Usage: .trace on|off"),
+        Some(_) => {
+            report_failure(ErrorClass::Usage, "Usage: .trace on|off", input);
+            return false;
+        }
     }
+    true
 }
 
 fn handle_explain_command(db: &Database, line: &str, input: InputContext) -> bool {
     let rest = line.strip_prefix(".explain").unwrap_or("").trim();
     if rest.is_empty() {
-        eprintln!("Usage: .explain <sql>");
-        return input.interactive;
+        report_failure(ErrorClass::Usage, "Usage: .explain <sql>", input);
+        return false;
+    }
+
+    if input.output.json {
+        // The same rule the human path applies through `explain_output`: only a
+        // read-only statement may be RUN to collect a runtime trace. Anything
+        // else is planned statically — `.explain DELETE FROM t` answers what it
+        // WOULD do, and must never do it.
+        if !explain_can_use_runtime_trace(rest) {
+            return match db.explain(rest) {
+                Ok(plan) => {
+                    json_output::print_document(&json_output::static_plan_document(&plan));
+                    true
+                }
+                Err(e) => {
+                    report_error(&e, input);
+                    false
+                }
+            };
+        }
+        return match db.execute(rest, &HashMap::new()) {
+            Ok(result) => {
+                json_output::print_document(&json_output::explain_document(&result));
+                true
+            }
+            Err(e) => {
+                report_error(&e, input);
+                false
+            }
+        };
     }
 
     match explain_output(db, rest) {
@@ -369,13 +882,24 @@ fn handle_explain_command(db: &Database, line: &str, input: InputContext) -> boo
             true
         }
         Err(e) => {
-            if is_fatal_cli_error(&e) {
-                eprintln!("Error: {}", e);
-            } else {
-                println!("Error: {}", e);
-            }
-            input.interactive
+            eprintln!("Error: {}", e);
+            false
         }
+    }
+}
+
+/// Report an engine error: the `{"error":{...}}` envelope on stderr under
+/// `--json`, the human `Error: ...` line on stderr otherwise. Never stdout.
+fn report_error(error: &Error, input: InputContext) {
+    let flattened = error.to_string().replace('\n', " ");
+    if input.output.json {
+        json_output::print_error(ErrorClass::of(error), &flattened, input.script_line);
+    } else if matches!(error, Error::ParseError(_))
+        && let Some(line) = input.script_line
+    {
+        eprintln!("Error: line {line}: {flattened}");
+    } else {
+        eprintln!("Error: {flattened}");
     }
 }
 
@@ -403,9 +927,9 @@ fn handle_sync_command(
     rt: Option<&tokio::runtime::Runtime>,
     args: &str,
     sync_plugin: Option<&SyncPlugin>,
-) -> String {
+) -> SyncCommandOutcome {
     let mut unconfirmed_push = false;
-    run_sync_command(sync_client, rt, args, sync_plugin, &mut unconfirmed_push).message
+    run_sync_command(sync_client, rt, args, sync_plugin, &mut unconfirmed_push)
 }
 
 fn run_sync_command(
@@ -415,34 +939,54 @@ fn run_sync_command(
     sync_plugin: Option<&SyncPlugin>,
     unconfirmed_push: &mut bool,
 ) -> SyncCommandOutcome {
-    let (Some(client), Some(rt)) = (sync_client, rt) else {
-        return SyncCommandOutcome {
-            message: "Sync not configured. Start with --tenant-id to enable.".to_string(),
-            ok: true,
-        };
-    };
-
     let parts: Vec<&str> = args.split_whitespace().collect();
     let sub = parts.first().copied().unwrap_or("status");
+
+    let (Some(client), Some(rt)) = (sync_client, rt) else {
+        // Without a sync endpoint a QUERY still answers the question it was
+        // asked ("is sync set up?" — no), so it succeeds. An ACTION did not
+        // happen: reporting it as success would let a scripted
+        // `push && shutdown` on a misconfigured machine abandon data it
+        // believes reached the hub, which is the same failure the distinct
+        // unconfirmed-push exit code exists to prevent.
+        let message = "Sync not configured. Start with --tenant-id to enable.".to_string();
+        return match sub {
+            "status" => SyncCommandOutcome::succeeded(
+                message,
+                serde_json::json!({ "sync": { "configured": false } }),
+            ),
+            "auto" => SyncCommandOutcome::succeeded(
+                message,
+                serde_json::json!({ "sync_auto": { "configured": false, "enabled": false } }),
+            ),
+            _ => SyncCommandOutcome::failed(ErrorClass::Usage, message),
+        };
+    };
 
     match sub {
         "status" => {
             let connected = rt.block_on(client.ensure_connected()).is_ok();
-            let base = crate::sync_status::render_sync_endpoint_status(
-                &crate::sync_status::SyncEndpointStatusView {
-                    tenant_id: client.tenant_id().to_string(),
-                    endpoint: client.endpoint().to_string(),
-                    transport_connected: connected,
-                    database_lsn: client.db().current_lsn().to_string(),
-                    push_watermark: client.push_watermark().to_string(),
-                    pull_watermark: client.pull_watermark().to_string(),
-                },
-            );
+            let view = crate::sync_status::SyncEndpointStatusView {
+                tenant_id: client.tenant_id().to_string(),
+                endpoint: client.endpoint().to_string(),
+                transport_connected: connected,
+                database_lsn: client.db().current_lsn().to_string(),
+                push_watermark: client.push_watermark().to_string(),
+                pull_watermark: client.pull_watermark().to_string(),
+            };
+            let base = crate::sync_status::render_sync_endpoint_status(&view);
             let render = contextdb_engine::cli_render::render_sync_status(client.db());
-            SyncCommandOutcome {
-                message: format!("{base}\n{render}"),
-                ok: true,
+            let mut document = crate::sync_status::sync_endpoint_status_json(&view);
+            if let Some(object) = document.as_object_mut() {
+                object.insert(
+                    "committed_txid".to_string(),
+                    serde_json::json!(client.db().committed_watermark().0),
+                );
             }
+            SyncCommandOutcome::succeeded(
+                format!("{base}\n{render}"),
+                serde_json::json!({ "sync": document }),
+            )
         }
         "push" => match rt.block_on(client.push()) {
             Ok(result) => {
@@ -457,10 +1001,10 @@ fn run_sync_command(
                         msg.push_str(&format!("\n  conflict: {}", reason));
                     }
                 }
-                SyncCommandOutcome {
-                    message: msg,
-                    ok: true,
-                }
+                SyncCommandOutcome::succeeded(
+                    msg,
+                    serde_json::json!({ "sync_push": apply_result_json(&result, "applied") }),
+                )
             }
             Err(contextdb_core::Error::SyncPushUnconfirmed { .. }) => {
                 // The batch reached the hub but the acknowledgement was lost, so
@@ -473,23 +1017,23 @@ fn run_sync_command(
                 // clean success. Re-running `.sync push` reconciles idempotently
                 // whether or not the batch committed.
                 *unconfirmed_push = true;
-                SyncCommandOutcome {
-                    message: format!(
+                SyncCommandOutcome::succeeded(
+                    format!(
                         "Push interrupted after sending to {} (tenant {}); the hub did not acknowledge, so the data may or may not have landed. Run `.sync push` again to reconcile — it is safe whether or not the batch committed.",
                         client.endpoint(),
                         client.tenant_id()
                     ),
-                    ok: true,
-                }
+                    serde_json::json!({ "sync_push": { "outcome": "unconfirmed" } }),
+                )
             }
-            Err(e) => SyncCommandOutcome {
-                message: format!(
+            Err(e) => SyncCommandOutcome::failed(
+                ErrorClass::of(&e),
+                format!(
                     "Push to sync endpoint {} (tenant {}) failed: {e}. Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync push`.",
                     client.endpoint(),
                     client.tenant_id()
                 ),
-                ok: false,
-            },
+            ),
         },
         "pull" => match rt.block_on(client.pull_default()) {
             Ok(result) => {
@@ -504,28 +1048,31 @@ fn run_sync_command(
                         msg.push_str(&format!("\n  conflict: {}", reason));
                     }
                 }
-                SyncCommandOutcome {
-                    message: msg,
-                    ok: true,
-                }
+                SyncCommandOutcome::succeeded(
+                    msg,
+                    serde_json::json!({ "sync_pull": apply_result_json(&result, "applied") }),
+                )
             }
-            Err(e) => SyncCommandOutcome {
-                message: format!(
+            Err(e) => SyncCommandOutcome::failed(
+                ErrorClass::of(&e),
+                format!(
                     "Pull from sync endpoint {} (tenant {}) failed: {e}. Check the endpoint is reachable, then retry with `.sync reconnect` followed by `.sync pull`.",
                     client.endpoint(),
                     client.tenant_id()
                 ),
-                ok: false,
-            },
+            ),
         },
         "reconnect" => {
             rt.block_on(client.reconnect());
             let connected = rt.block_on(client.is_connected());
             let message = crate::sync_status::render_reconnect_outcome(connected);
             if connected {
-                SyncCommandOutcome { message, ok: true }
+                SyncCommandOutcome::succeeded(
+                    message,
+                    serde_json::json!({ "sync_reconnect": { "connected": true } }),
+                )
             } else {
-                SyncCommandOutcome { message, ok: false }
+                SyncCommandOutcome::failed(ErrorClass::Sync, message)
             }
         }
         "destination" => {
@@ -537,40 +1084,40 @@ fn run_sync_command(
             // destination from everything the edge holds, and nothing local is
             // deleted until the new destination confirms receipt.
             if rt.block_on(client.ensure_connected()).is_err() {
-                return SyncCommandOutcome {
-                    message: format!(
+                return SyncCommandOutcome::failed(
+                    ErrorClass::Sync,
+                    format!(
                         "Cannot change destination: the sync endpoint {} is unreachable. Start the CLI pointed at the new server with --sync-endpoint, then run `.sync destination`.",
                         client.endpoint()
                     ),
-                    ok: false,
-                };
+                );
             }
             let Some(node_id) = client.connected_hub_node_id() else {
-                return SyncCommandOutcome {
-                    message: "Cannot change destination: the transport does not authenticate a hub identity, so there is nothing to bind to. Use the dial-by-key (iroh) transport."
+                return SyncCommandOutcome::failed(
+                    ErrorClass::Sync,
+                    "Cannot change destination: the transport does not authenticate a hub identity, so there is nothing to bind to. Use the dial-by-key (iroh) transport."
                         .to_string(),
-                    ok: false,
-                };
+                );
             };
             match client.change_destination(&node_id) {
-                Ok(()) => SyncCommandOutcome {
-                    message: format!(
+                Ok(()) => SyncCommandOutcome::succeeded(
+                    format!(
                         "Retained-data destination is now hub {node_id}. Run `.sync push` to rebuild it from everything this edge holds; nothing local is deleted until it confirms receipt."
                     ),
-                    ok: true,
-                },
-                Err(err) => SyncCommandOutcome {
-                    message: format!("Changing destination failed: {err}"),
-                    ok: false,
-                },
+                    serde_json::json!({ "sync_destination": { "hub_node_id": node_id } }),
+                ),
+                Err(err) => SyncCommandOutcome::failed(
+                    ErrorClass::of(&err),
+                    format!("Changing destination failed: {err}"),
+                ),
             }
         }
         "direction" => {
             if parts.len() != 3 {
-                return SyncCommandOutcome {
-                    message: "Usage: .sync direction <table> <Push|Pull|Both|None>".to_string(),
-                    ok: true,
-                };
+                return SyncCommandOutcome::failed(
+                    ErrorClass::Usage,
+                    "Usage: .sync direction <table> <Push|Pull|Both|None>".to_string(),
+                );
             }
             let table = parts[1];
             let dir = match parts[2] {
@@ -579,31 +1126,33 @@ fn run_sync_command(
                 "Both" | "both" => SyncDirection::Both,
                 "None" | "none" => SyncDirection::None,
                 other => {
-                    return SyncCommandOutcome {
-                        message: format!("Unknown direction: {other}. Use: Push, Pull, Both, None"),
-                        ok: true,
-                    };
+                    return SyncCommandOutcome::failed(
+                        ErrorClass::Usage,
+                        format!("Unknown direction: {other}. Use: Push, Pull, Both, None"),
+                    );
                 }
             };
             if let Err(err) = client.set_table_direction(table, dir) {
                 // A delivery-promising table refuses a direction that would
                 // stop delivering it; surface the engine's reason verbatim.
-                return SyncCommandOutcome {
-                    message: err.to_string(),
-                    ok: false,
-                };
+                return SyncCommandOutcome::failed(ErrorClass::of(&err), err.to_string());
             }
-            SyncCommandOutcome {
-                message: format!("{table} -> {dir:?}"),
-                ok: true,
-            }
+            SyncCommandOutcome::succeeded(
+                format!("{table} -> {dir:?}"),
+                serde_json::json!({
+                    "sync_direction": {
+                        "table": table,
+                        "direction": json_output::sync_direction_wire_word(dir),
+                    }
+                }),
+            )
         }
         "policy" => {
             if parts.len() != 3 {
-                return SyncCommandOutcome {
-                    message: "Usage: .sync policy <table> <InsertIfNotExists|ServerWins|EdgeWins|LatestWins>\n       .sync policy default <policy>".to_string(),
-                    ok: true,
-                };
+                return SyncCommandOutcome::failed(
+                    ErrorClass::Usage,
+                    "Usage: .sync policy <table> <InsertIfNotExists|ServerWins|EdgeWins|LatestWins>\n       .sync policy default <policy>".to_string(),
+                );
             }
             let policy = match parts[2] {
                 "InsertIfNotExists" => ConflictPolicy::InsertIfNotExists,
@@ -611,71 +1160,105 @@ fn run_sync_command(
                 "EdgeWins" => ConflictPolicy::EdgeWins,
                 "LatestWins" => ConflictPolicy::LatestWins,
                 other => {
-                    return SyncCommandOutcome {
-                        message: format!(
+                    return SyncCommandOutcome::failed(
+                        ErrorClass::Usage,
+                        format!(
                             "Unknown policy: {other}. Use: InsertIfNotExists, ServerWins, EdgeWins, LatestWins"
                         ),
-                        ok: true,
-                    };
+                    );
                 }
             };
             if parts[1] == "default" {
                 client.set_default_conflict_policy(policy);
-                SyncCommandOutcome {
-                    message: format!("Default conflict policy -> {policy:?}"),
-                    ok: true,
-                }
+                SyncCommandOutcome::succeeded(
+                    format!("Default conflict policy -> {policy:?}"),
+                    serde_json::json!({
+                        "sync_policy": {
+                            "scope": "default",
+                            "policy": json_output::conflict_policy_wire_word(policy),
+                        }
+                    }),
+                )
             } else {
                 client.set_conflict_policy(parts[1], policy);
-                SyncCommandOutcome {
-                    message: format!("{} -> {policy:?}", parts[1]),
-                    ok: true,
-                }
+                SyncCommandOutcome::succeeded(
+                    format!("{} -> {policy:?}", parts[1]),
+                    serde_json::json!({
+                        "sync_policy": {
+                            "table": parts[1],
+                            "policy": json_output::conflict_policy_wire_word(policy),
+                        }
+                    }),
+                )
             }
         }
         "auto" => {
             let Some(plugin) = sync_plugin else {
-                return SyncCommandOutcome {
-                    message: "Auto-sync is not enabled for this session. Restart the CLI with --tenant-id (and a sync endpoint) to turn it on.".to_string(),
-                    ok: true,
-                };
+                return SyncCommandOutcome::succeeded(
+                    "Auto-sync is not enabled for this session. Restart the CLI with --tenant-id (and a sync endpoint) to turn it on.".to_string(),
+                    serde_json::json!({ "sync_auto": { "configured": false, "enabled": false } }),
+                );
             };
             let toggle = parts.get(1).copied().unwrap_or("");
             match toggle {
                 "on" => {
                     plugin.set_auto(true);
-                    SyncCommandOutcome {
-                        message: "Auto-sync enabled".to_string(),
-                        ok: true,
-                    }
+                    SyncCommandOutcome::succeeded(
+                        "Auto-sync enabled".to_string(),
+                        auto_sync_json(true),
+                    )
                 }
                 "off" => {
                     plugin.set_auto(false);
-                    SyncCommandOutcome {
-                        message: "Auto-sync disabled".to_string(),
-                        ok: true,
-                    }
+                    SyncCommandOutcome::succeeded(
+                        "Auto-sync disabled".to_string(),
+                        auto_sync_json(false),
+                    )
                 }
                 "" => {
-                    let state = if plugin.is_auto() { "on" } else { "off" };
-                    SyncCommandOutcome {
-                        message: format!("Auto-sync: {state}"),
-                        ok: true,
-                    }
+                    let enabled = plugin.is_auto();
+                    let state = if enabled { "on" } else { "off" };
+                    SyncCommandOutcome::succeeded(
+                        format!("Auto-sync: {state}"),
+                        auto_sync_json(enabled),
+                    )
                 }
-                other => SyncCommandOutcome {
-                    message: format!("Unknown auto-sync option: {other}. Use: on, off"),
-                    ok: true,
-                },
+                other => SyncCommandOutcome::failed(
+                    ErrorClass::Usage,
+                    format!("Unknown auto-sync option: {other}. Use: on, off"),
+                ),
             }
         }
-        _ => SyncCommandOutcome {
-            message: format!(
+        _ => SyncCommandOutcome::failed(
+            ErrorClass::Usage,
+            format!(
                 "Unknown sync command: {sub}. Try: status, push, pull, reconnect, destination, direction, policy, auto"
             ),
-            ok: true,
-        },
+        ),
     }
+}
+
+/// A push or pull result as a document: what moved, what was skipped, and each
+/// conflict's reason — the same three facts the human line reports.
+fn apply_result_json(
+    result: &contextdb_engine::sync_types::ApplyResult,
+    outcome: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "applied_rows": result.applied_rows,
+        "skipped_rows": result.skipped_rows,
+        "conflicts": result
+            .conflicts
+            .iter()
+            .filter_map(|conflict| conflict.reason.as_ref())
+            .map(|reason| serde_json::json!({ "reason": reason }))
+            .collect::<Vec<_>>(),
+        "outcome": outcome,
+    })
+}
+
+fn auto_sync_json(enabled: bool) -> serde_json::Value {
+    serde_json::json!({ "sync_auto": { "configured": true, "enabled": enabled } })
 }
 
 fn print_table_meta(table: &str, meta: &TableMeta) {
@@ -719,63 +1302,32 @@ fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: boo
                 println!("{formatted}");
             }
             if trace_enabled {
-                println!(
-                    "{}",
-                    contextdb_engine::cli_render::render_query_trace(&result.trace, rows_examined)
-                );
+                if output.json {
+                    // The trace is diagnostics about a result, not the result:
+                    // on stdout it would corrupt the JSON Lines stream a
+                    // consumer is parsing.
+                    json_output::print_trace(&result.trace, rows_examined);
+                } else {
+                    println!(
+                        "{}",
+                        contextdb_engine::cli_render::render_query_trace(
+                            &result.trace,
+                            rows_examined
+                        )
+                    );
+                }
             }
             true
         }
         Err(e) => {
-            let rendered = if matches!(e, Error::ParseError(_)) {
-                if let Some(line) = input.script_line {
-                    format!("line {line}: {e}")
-                } else {
-                    e.to_string()
-                }
-            } else {
-                e.to_string()
-            }
-            .replace('\n', " ");
-            let scripted_plan_error = !input.interactive && matches!(e, Error::PlanError(_));
-            if scripted_plan_error || is_fatal_cli_error(&e) {
-                eprintln!("Error: {rendered}");
-                false
-            } else if output.json {
-                // Under --json, stdout is the machine data channel: a non-fatal
-                // error must not print an "Error:" line there. Keep it on stderr
-                // and continue (the session survives the recoverable error).
-                eprintln!("Error: {rendered}");
-                true
-            } else {
-                println!("Error: {rendered}");
-                true
-            }
+            // Every error goes to stderr and fails the run. The session still
+            // continues to the next statement (a script gets to see all of its
+            // errors, as in `psql` and `sqlite3`), but the process reports the
+            // failure — an error a caller cannot see on `$?` is an error it
+            // acts on as though it were success.
+            report_error(&e, input);
+            false
         }
-    }
-}
-
-pub fn is_fatal_cli_error_public(error: &Error) -> bool {
-    is_fatal_cli_error(error)
-}
-
-fn is_fatal_cli_error(error: &Error) -> bool {
-    match error {
-        Error::ParseError(_)
-        | Error::TableNotFound(_)
-        | Error::NotFound(_)
-        | Error::BfsDepthExceeded(_)
-        | Error::RecursiveCteNotSupported
-        | Error::WindowFunctionNotSupported
-        | Error::FullTextSearchNotSupported
-        | Error::VectorIndexDimensionMismatch { .. }
-        | Error::UnknownVectorIndex { .. }
-        | Error::PersistedRowVectorRowMissing { .. }
-        | Error::PersistedRowVectorCellNull { .. }
-        | Error::StoreCorrupted { .. }
-        | Error::LegacyVectorStoreDetected { .. } => true,
-        Error::MemoryBudgetExceeded { operation, .. } => operation.contains('@'),
-        _ => false,
     }
 }
 
@@ -785,12 +1337,22 @@ mod tests {
     use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
     use contextdb_parser::{Statement, parse};
 
+    /// A scripted, human-output context — what the meta-command tests below
+    /// drive, so they exercise the same path a piped session takes.
+    fn scripted_input() -> InputContext {
+        InputContext {
+            interactive: false,
+            script_line: None,
+            output: OutputOptions::default(),
+        }
+    }
+
     #[test]
     fn test_backslash_dt() {
         let db = Database::open_memory();
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
             .unwrap();
-        assert!(handle_meta_command(&db, None, None, "\\dt", None));
+        assert!(handle_meta_command(&db, None, None, "\\dt", scripted_input(), None).keep_going);
     }
 
     // B1: Existing \dt works with new handle_meta_command signature
@@ -800,30 +1362,44 @@ mod tests {
         db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &HashMap::new())
             .unwrap();
         // Pass None for sync_client and rt — existing commands must work without sync
-        assert!(handle_meta_command(&db, None, None, "\\dt", None));
+        let dt = handle_meta_command(&db, None, None, "\\dt", scripted_input(), None);
+        assert!(dt.keep_going && dt.ok);
         // Also verify .tables works
-        assert!(handle_meta_command(&db, None, None, ".tables", None));
-        // .quit returns false
-        assert!(!handle_meta_command(&db, None, None, ".quit", None));
+        let tables = handle_meta_command(&db, None, None, ".tables", scripted_input(), None);
+        assert!(tables.keep_going && tables.ok);
+        // .quit ends the session, successfully
+        let quit = handle_meta_command(&db, None, None, ".quit", scripted_input(), None);
+        assert!(!quit.keep_going && quit.ok);
     }
 
-    // B2: .sync subcommands handle missing sync configuration
+    // .sync subcommands handle missing sync configuration — every one of
+    // them SAYS so, and the QUERY/ACTION split decides whether that answer is a
+    // success. A query was answered; an action did not happen, and reporting it
+    // as success is what would let a scripted `push && shutdown` abandon data
+    // it believes reached the hub.
     #[test]
     fn b2_sync_not_configured_message() {
-        for subcmd in [
-            "status",
-            "push",
-            "pull",
-            "reconnect",
-            "direction t Push",
-            "policy t ServerWins",
+        for (subcmd, expected_ok) in [
+            ("status", true),
+            ("auto", true),
+            ("push", false),
+            ("pull", false),
+            ("reconnect", false),
+            ("destination", false),
+            ("direction t Push", false),
+            ("policy t ServerWins", false),
         ] {
             let result = handle_sync_command(None, None, subcmd, None);
             assert!(
-                result.contains("Sync not configured"),
+                result.message.contains("Sync not configured"),
                 "subcmd '{}' should return 'Sync not configured', got: {}",
                 subcmd,
-                result
+                result.message
+            );
+            assert_eq!(
+                result.ok, expected_ok,
+                "subcmd '{}' must report ok={} with no sync configured",
+                subcmd, expected_ok
             );
         }
     }
@@ -856,7 +1432,7 @@ mod tests {
             ("scratch", "None"),
         ] {
             let args = format!("direction {} {}", table, dir);
-            let result = handle_sync_command(Some(&client), Some(&rt), &args, None);
+            let result = handle_sync_command(Some(&client), Some(&rt), &args, None).message;
             assert!(
                 result.contains(table),
                 "direction command for '{}' should contain table name, got: {}",
@@ -892,7 +1468,8 @@ mod tests {
             Some(&rt),
             "policy obs InsertIfNotExists",
             None,
-        );
+        )
+        .message;
         assert!(
             result.contains("InsertIfNotExists"),
             "policy command should contain 'InsertIfNotExists', got: {}",
@@ -900,7 +1477,8 @@ mod tests {
         );
 
         let result =
-            handle_sync_command(Some(&client), Some(&rt), "policy default ServerWins", None);
+            handle_sync_command(Some(&client), Some(&rt), "policy default ServerWins", None)
+                .message;
         assert!(
             result.contains("Default") || result.contains("default"),
             "default policy command should reference 'default', got: {}",
@@ -930,7 +1508,7 @@ mod tests {
             "policy table_only",
             "policy t InvalidPolicy",
         ] {
-            let result = handle_sync_command(Some(&client), Some(&rt), bad_input, None);
+            let result = handle_sync_command(Some(&client), Some(&rt), bad_input, None).message;
             assert!(
                 !result.contains("not implemented"),
                 "bad input '{}' should not return 'not implemented', got: {}",
@@ -1140,6 +1718,7 @@ mod tests {
             had_error: false,
             had_unconfirmed_push: unconfirmed_push,
             trace_enabled: false,
+            interactive: false,
         };
         let code = session_exit_code(&session);
         assert_eq!(
@@ -1149,6 +1728,57 @@ mod tests {
         assert_ne!(code, 0, "must not be a clean-success exit");
         assert_ne!(code, 1, "must not be the definitive-failure exit");
         assert_eq!(EXIT_INTERRUPTED_PUSH_UNCONFIRMED, 3);
+    }
+
+    /// A terminal session showed the human every error as it happened, so
+    /// the process code reports the session, not the statements inside it.
+    /// A scripted run has nobody watching, so the same input fails there.
+    #[test]
+    fn interactive_session_errors_do_not_set_the_process_exit_code() {
+        for (interactive, expected) in [(true, EXIT_OK), (false, EXIT_ERROR)] {
+            let db = Database::open_memory();
+            let mut session = SessionState {
+                interactive,
+                ..SessionState::default()
+            };
+            let mut pending = StatementBuffer::default();
+            feed_line(
+                &db,
+                None,
+                None,
+                "SELET * FROM nothing;",
+                InputContext {
+                    interactive,
+                    script_line: Some(1),
+                    output: OutputOptions::default(),
+                },
+                None,
+                &mut session,
+                &mut pending,
+            );
+            assert!(session.had_error, "the parse error must be recorded");
+            assert_eq!(
+                session_exit_code(&session),
+                expected,
+                "an interactive session reports the session; a scripted one fails the run"
+            );
+        }
+    }
+
+    /// The unconfirmed push is the one signal a terminal session still
+    /// reports, because nobody can act on it once the process is gone.
+    #[test]
+    fn unconfirmed_push_still_exits_three_in_an_interactive_session() {
+        let session = SessionState {
+            had_error: false,
+            had_unconfirmed_push: true,
+            trace_enabled: false,
+            interactive: true,
+        };
+        assert_eq!(
+            session_exit_code(&session),
+            EXIT_INTERRUPTED_PUSH_UNCONFIRMED
+        );
     }
 
     /// The exit-code ordering: a definitive error dominates (1), then an
@@ -1165,6 +1795,7 @@ mod tests {
             had_error: false,
             had_unconfirmed_push: true,
             trace_enabled: false,
+            interactive: false,
         };
         assert_eq!(
             session_exit_code(&unconfirmed),
@@ -1176,6 +1807,7 @@ mod tests {
             had_error: true,
             had_unconfirmed_push: true,
             trace_enabled: false,
+            interactive: false,
         };
         assert_eq!(
             session_exit_code(&errored),

@@ -36,6 +36,28 @@ fn bind_spec_with_port(identity: &Path, port: u16) -> String {
     format!("iroh:?identity={}&port={port}", identity.display())
 }
 
+/// The UDP ports named by a parsed ticket's direct socket addresses (there is
+/// no accessor for this on `EndpointTicket`/`EndpointAddr`, so it is read off
+/// each address's own `Display` text — `"ip:<socket-addr>"` for an IP
+/// address, which trims to a plain `SocketAddr` the standard parser accepts).
+/// A restart on one explicit bound port produces the SAME port on every
+/// discovered address, even when which addresses got discovered varies.
+fn ticket_ports(
+    ticket: &iroh_tickets::endpoint::EndpointTicket,
+) -> std::collections::BTreeSet<u16> {
+    ticket
+        .endpoint_addr()
+        .addrs
+        .iter()
+        .filter_map(|addr| {
+            addr.to_string()
+                .strip_prefix("ip:")
+                .and_then(|rest| rest.parse::<std::net::SocketAddr>().ok())
+                .map(|socket| socket.port())
+        })
+        .collect()
+}
+
 fn create_notes_table(db: &Database) {
     db.execute(
         "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT)",
@@ -394,11 +416,27 @@ async fn reconnect_after_hub_restart_over_iroh() {
     hub.stop().await;
 
     // Same identity, same port: the ticket the edge already holds must keep
-    // working across a hub restart.
+    // working across a hub restart. The reprinted ticket's set of direct
+    // socket addresses is allowed to differ across a restart — which local
+    // interfaces get discovered by the time the endpoint prints its ticket
+    // can vary run to run, and that snapshot was never part of the promise.
+    // What must stay identical is the node's own identity and the UDP port
+    // it is bound to, since a caller only needs those two to keep dialing
+    // the same node at the same address.
     let hub = start_hub(&spec, tenant).await;
+    let before: iroh_tickets::endpoint::EndpointTicket =
+        ticket.parse().expect("previous ticket must parse");
+    let after: iroh_tickets::endpoint::EndpointTicket =
+        hub.ticket.parse().expect("reprinted ticket must parse");
     assert_eq!(
-        hub.ticket, ticket,
-        "same identity + same port must reproduce the same ticket"
+        after.endpoint_addr().id,
+        before.endpoint_addr().id,
+        "a hub restart with the same identity file must reprint the same node identity"
+    );
+    assert_eq!(
+        ticket_ports(&after),
+        ticket_ports(&before),
+        "a hub restart on the same explicit port must reprint the same port"
     );
     let second = Uuid::new_v4();
     insert_note(&edge, second, "after-restart");
@@ -855,9 +893,26 @@ async fn hub_restart_without_port_keeps_the_same_ticket() {
     let second_ticket = second.ticket();
     within(second.close()).await;
 
+    // The reprinted ticket's set of direct socket addresses is allowed to
+    // differ across a restart — which local interfaces get discovered by the
+    // time the endpoint prints its ticket can vary run to run, and that
+    // snapshot was never part of the promise. What this test is actually
+    // about is port stickiness: the node's own identity and the UDP port it
+    // is bound to (recorded beside the identity key and reused without an
+    // explicit port=) must stay identical.
+    let first: iroh_tickets::endpoint::EndpointTicket =
+        first_ticket.parse().expect("first ticket must parse");
+    let second: iroh_tickets::endpoint::EndpointTicket =
+        second_ticket.parse().expect("second ticket must parse");
     assert_eq!(
-        first_ticket, second_ticket,
-        "a restarted hub with the same identity must reproduce the same ticket without an explicit port="
+        second.endpoint_addr().id,
+        first.endpoint_addr().id,
+        "a restarted hub with the same identity must reprint the same node identity"
+    );
+    assert_eq!(
+        ticket_ports(&second),
+        ticket_ports(&first),
+        "a restarted hub without an explicit port= must reuse the same recorded port"
     );
 }
 

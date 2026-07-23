@@ -3,6 +3,8 @@
 # Fabric identity secret (ed25519 seed) and its remembered-port sibling — never commit
 *.fabric-identity.key
 *.fabric-identity.key.port
+# Enrollment tickets (--ticket-file output) — sensitive bearer material, never commit
+*.ticket
 spikes/
 *.swp
 *.swo
