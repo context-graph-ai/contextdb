@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 /// on stdin (scripted, non-interactive — stdin is piped, not a terminal).
 /// Returns (success, stdout, stderr).
 fn run_cli(extra_args: &[&str], stdin_sql: &str) -> (bool, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     cmd.arg(":memory:");
     for a in extra_args {
         cmd.arg(a);

@@ -22,7 +22,7 @@ fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn run_cli(args: &[&str], stdin_sql: &str) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     for a in args {
         cmd.arg(a);
     }

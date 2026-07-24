@@ -33,19 +33,14 @@ fn make_truncated_store(path: &std::path::Path) {
 
 #[test]
 fn opening_a_corrupt_store_does_not_leak_an_internal_panic_backtrace() {
-    let dir = std::env::temp_dir().join(format!(
-        "cdb-corrupt-open-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("corrupt.db");
+    let dir = tempfile::Builder::new()
+        .prefix("cdb-corrupt-open-")
+        .tempdir()
+        .expect("scratch dir");
+    let db_path = dir.path().join("corrupt.db");
     make_truncated_store(&db_path);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_contextdb-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_contextdb"))
         .arg(&db_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -54,8 +49,6 @@ fn opening_a_corrupt_store_does_not_leak_an_internal_panic_backtrace() {
         .expect("spawn contextdb-cli");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let _ = std::fs::remove_dir_all(&dir);
 
     // The CLI must fail to open (non-zero exit) — the store really is corrupt.
     assert!(
@@ -83,5 +76,44 @@ fn opening_a_corrupt_store_does_not_leak_an_internal_panic_backtrace() {
     assert!(
         stderr.contains("restore") || stderr.contains("remove the file"),
         "handled error must offer an actionable recovery next step. stderr:\n{stderr}"
+    );
+}
+
+/// Every `StoreCorrupted` raise site's message names the applicable
+/// command — today `CORRUPT_STORE_NEXT_STEP` (persistence.rs) says only
+/// "restore from a backup ... or remove the file to recreate it," with no
+/// mention of the `repair`/`reset` commands. Once those commands exist,
+/// opening a corrupt store must point the user at them by name.
+#[test]
+fn opening_a_corrupt_store_error_names_the_repair_and_reset_commands() {
+    let dir = tempfile::Builder::new()
+        .prefix("cdb-corrupt-open-names-commands-")
+        .tempdir()
+        .expect("scratch dir");
+    let db_path = dir.path().join("corrupt.db");
+    make_truncated_store(&db_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_contextdb"))
+        .arg(&db_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn contextdb-cli");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !stderr.contains("there is no in-place repair"),
+        "the old generic next-step text must be replaced by one naming the actual commands. \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("repair"),
+        "the corrupt-store error must name the `repair` command. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("reset"),
+        "the corrupt-store error must name the `reset` command. stderr:\n{stderr}"
     );
 }

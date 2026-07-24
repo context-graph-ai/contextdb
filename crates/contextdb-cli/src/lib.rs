@@ -1,6 +1,7 @@
 pub mod auto_sync;
 pub mod formatter;
 mod json_output;
+pub mod ops;
 mod repl;
 pub mod sync_status;
 // The internal test seam: unstable, hidden from rustdoc, and off by default.

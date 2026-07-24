@@ -24,7 +24,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_cli(stdin_sql: &str) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     cmd.arg("--json");
     cmd.arg(":memory:");
     let mut child = cmd

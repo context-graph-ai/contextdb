@@ -12,16 +12,16 @@ use contextdb_server::exit_codes::exit_code_for;
 
 #[derive(Parser)]
 #[command(
-    name = "contextdb-cli",
+    name = "contextdb",
     version,
     after_help = "EXAMPLES:\n  \
-        contextdb-cli mydata.db\n    \
+        contextdb mydata.db\n    \
             Open (or create) a local database and start the interactive shell.\n\n  \
-        echo \"SELECT * FROM decisions LIMIT 5\" | contextdb-cli mydata.db\n    \
+        echo \"SELECT * FROM decisions LIMIT 5\" | contextdb mydata.db\n    \
             Pipe one or more SQL statements in non-interactively and exit.\n\n  \
-        contextdb-cli :memory:\n    \
+        contextdb :memory:\n    \
             Open a throwaway in-memory database.\n\n  \
-        contextdb-cli mydata.db --sync-endpoint <server-ticket> --tenant-id acme\n    \
+        contextdb mydata.db --sync-endpoint <server-ticket> --tenant-id acme\n    \
             Open the database and connect to a contextdb-server using the enrollment\n    \
             ticket it printed (see `contextdb-server --help`).\n\n  \
         In the shell: .help propagate\n    \
@@ -70,6 +70,10 @@ struct Args {
 }
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if let Some(exit_code) = contextdb_cli::ops::dispatch_if_subcommand(&raw_args) {
+        std::process::exit(exit_code);
+    }
     let interactive = std::io::stdin().is_terminal();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

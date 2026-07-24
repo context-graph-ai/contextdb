@@ -16,6 +16,7 @@ use contextdb_core::table_meta::{
 use contextdb_engine::QueryResult;
 use contextdb_engine::cli_render;
 use contextdb_engine::database::QueryTrace;
+use contextdb_engine::{CompactionReport, MaintenancePolicy, MaintenanceReport, MaintenanceStatus};
 use serde_json::{Map, Value, json};
 
 /// Which family an error belongs to, for the `--json` error envelope.
@@ -133,6 +134,77 @@ pub(crate) fn conflict_policy_wire_word(policy: ConflictPolicy) -> &'static str 
         ConflictPolicy::ServerWins => "server_wins",
         ConflictPolicy::EdgeWins => "edge_wins",
     }
+}
+
+/// The wire word for a table's version-history policy, on the same terms.
+pub(crate) fn history_policy_wire_word(policy: contextdb_core::HistoryPolicy) -> &'static str {
+    match policy {
+        contextdb_core::HistoryPolicy::All => "ALL",
+        contextdb_core::HistoryPolicy::CurrentOnly => "CURRENT_ONLY",
+    }
+}
+
+/// The wire word for who owns a database's maintenance schedule.
+pub(crate) fn maintenance_policy_wire_word(policy: MaintenancePolicy) -> &'static str {
+    match policy {
+        MaintenancePolicy::EngineOwned => "engine_owned",
+        MaintenancePolicy::CallerDriven => "caller_driven",
+    }
+}
+
+/// `.maintenance status` under `--json`: what this database maintains and
+/// whether the loop is currently running.
+pub(crate) fn maintenance_status_document(status: &MaintenanceStatus) -> Value {
+    json!({
+        "maintenance": {
+            "running": status.running,
+            "retention_enabled": status.retention_enabled,
+            "currency_compaction_enabled": status.currency_compaction_enabled,
+            "active_maintenance_loops": status.active_maintenance_loops,
+            "policy": maintenance_policy_wire_word(status.policy),
+        }
+    })
+}
+
+/// `.maintenance run` under `--json`: what the one driven cycle reclaimed.
+/// `currency_redb_compacted` now always reads `false` here: currency version
+/// cleanup never compacts on its own (see `Database::compact_now`'s doc
+/// comment) — the cycle's own separate, rare automatic-compaction attempt is
+/// `compaction` below.
+pub(crate) fn maintenance_report_document(report: &MaintenanceReport) -> Value {
+    json!({
+        "maintenance_cycle": {
+            "pruned_rows": report.pruning.pruned_rows,
+            "reclaimed_bytes": report.pruning.reclaimed_bytes,
+            "file_shrank": report.pruning.file_shrank,
+            "currency_pruned_versions": report.currency.pruned_versions,
+            "currency_versions_deferred_for_readers": report.currency.versions_deferred_for_readers,
+            "currency_redb_compacted": report.currency.redb_compacted,
+            "pruned_trigger_audit_rows": report.pruned_trigger_audit_rows,
+            "compaction": compaction_report_fields(&report.compaction),
+        }
+    })
+}
+
+/// The shared field shape both `.maintenance run`'s `compaction` sub-document
+/// and `.maintenance compact`'s own top-level document render — one source
+/// for what an operator-visible compaction receipt looks like.
+fn compaction_report_fields(report: &CompactionReport) -> Value {
+    json!({
+        "ran": report.ran,
+        "duration_micros": report.duration_micros,
+        "bytes_before": report.bytes_before,
+        "bytes_after": report.bytes_after,
+        "file_shrank": report.file_shrank,
+        "fragmentation_before": report.fragmentation_before,
+    })
+}
+
+/// `.maintenance compact` under `--json`: the explicit, on-demand
+/// full-file redb compaction this call just ran (or, on an in-memory
+/// database, the honest no-op).
+pub(crate) fn compaction_report_document(report: &CompactionReport) -> Value {
+    json!({ "compaction": compaction_report_fields(report) })
 }
 
 /// Write one error to stderr as a JSON document. `line` is the input line the
@@ -290,6 +362,16 @@ pub(crate) fn table_meta_document(table: &str, meta: &TableMeta) -> Value {
         document.insert(
             "conflict_policy".to_string(),
             json!(conflict_policy_wire_word(policy)),
+        );
+    }
+    if let Some(policy) = meta.history_policy {
+        // An object, not a bare string, for the same reason "retain" is: the
+        // reserved windowed form (`HISTORY <n> <unit>`) would add `window`/
+        // `unit`/`seconds` keys next to `policy` without a shape break for an
+        // existing reader.
+        document.insert(
+            "history".to_string(),
+            json!({ "policy": history_policy_wire_word(policy) }),
         );
     }
     document.insert("dag_edge_types".to_string(), json!(meta.dag_edge_types));
@@ -740,6 +822,70 @@ mod tests {
         assert!(
             embedding.get("quantization").is_some(),
             "a vector column reports its quantization: {embedding}"
+        );
+    }
+
+    /// A table that declares `HISTORY CURRENT ONLY` must render the
+    /// declaration in `.schema` (the human DDL) AND carry a structured
+    /// `history` key in the `--json` document, exactly as `RETAIN` and
+    /// `SYNC CONFLICT` already do -- a declaration an operator wrote must be
+    /// visible in both surfaces, never silently dropped between the meta and
+    /// the render.
+    #[test]
+    fn declared_history_policy_renders_in_schema_and_json() {
+        let db = contextdb_engine::Database::open_memory();
+        db.execute(
+            "CREATE TABLE device_status (\
+               device_id TEXT PRIMARY KEY, \
+               state TEXT NOT NULL\
+             ) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST",
+            &HashMap::new(),
+        )
+        .expect("HISTORY CURRENT ONLY must be declarable");
+        let meta = db.table_meta("device_status").expect("meta");
+        assert_eq!(
+            meta.history_policy,
+            Some(contextdb_core::HistoryPolicy::CurrentOnly),
+            "the executor must carry the parsed HISTORY clause into TableMeta"
+        );
+
+        let ddl = cli_render::render_table_meta("device_status", &meta);
+        assert!(
+            ddl.contains("HISTORY CURRENT ONLY"),
+            ".schema must render the declared HISTORY policy verbatim, got:\n{ddl}"
+        );
+
+        let document = table_meta_document("device_status", &meta);
+        assert!(
+            document
+                .get("history")
+                .is_some_and(|value| !value.is_null()),
+            "the --json document must carry a `history` key for a declared policy: {document}"
+        );
+        assert_eq!(document["history"]["policy"], json!("CURRENT_ONLY"));
+    }
+
+    /// The mirror of the test above: a table that declares no HISTORY clause
+    /// shows nothing to puzzle over, matching the treatment an undeclared
+    /// RETAIN/conflict-policy/direction already gets.
+    #[test]
+    fn an_undeclared_history_policy_renders_nothing() {
+        let db = contextdb_engine::Database::open_memory();
+        db.execute(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            &HashMap::new(),
+        )
+        .expect("create");
+        let meta = db.table_meta("notes").expect("meta");
+        let ddl = cli_render::render_table_meta("notes", &meta);
+        assert!(
+            !ddl.contains("HISTORY"),
+            "an undeclared policy must render nothing, got:\n{ddl}"
+        );
+        let document = table_meta_document("notes", &meta);
+        assert!(
+            document.get("history").is_none_or(|value| value.is_null()),
+            "an undeclared policy must carry no `history` key: {document}"
         );
     }
 }

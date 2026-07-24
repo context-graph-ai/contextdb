@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     for a in args {
         cmd.arg(a);
     }
@@ -33,7 +33,7 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
 }
 
 fn run_with_stdin(args: &[&str], stdin_sql: &str) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     for a in args {
         cmd.arg(a);
     }

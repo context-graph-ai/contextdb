@@ -17,7 +17,7 @@ name = "contextdb_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "contextdb-cli"
+name = "contextdb"
 path = "src/main.rs"
 
 [features]
@@ -41,6 +41,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 contextdb-parser = { path = "../contextdb-parser", version = "1.0" }
+tempfile = "3"
 # Depending on ourselves with `test-seams` on enables the feature when Cargo
 # builds this crate's test targets, and only then.
 contextdb-cli = { path = ".", features = ["test-seams"] }

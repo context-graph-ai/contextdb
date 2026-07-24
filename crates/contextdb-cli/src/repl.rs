@@ -716,6 +716,78 @@ pub(crate) fn handle_meta_command(
                 return MetaCommandOutcome::failed();
             }
         }
+        ".maintenance" => match rest {
+            "status" => {
+                let status = db.maintenance_status();
+                if input.output.json {
+                    json_output::print_document(&json_output::maintenance_status_document(&status));
+                } else {
+                    println!(
+                        "running={} retention_enabled={} currency_compaction_enabled={} \
+                             active_maintenance_loops={} policy={}",
+                        status.running,
+                        status.retention_enabled,
+                        status.currency_compaction_enabled,
+                        status.active_maintenance_loops,
+                        json_output::maintenance_policy_wire_word(status.policy),
+                    );
+                }
+            }
+            "run" => match db.run_maintenance_cycle() {
+                Ok(report) => {
+                    if input.output.json {
+                        json_output::print_document(&json_output::maintenance_report_document(
+                            &report,
+                        ));
+                    } else {
+                        println!(
+                            "pruned_rows={} currency_pruned_versions={} \
+                                 pruned_trigger_audit_rows={} auto_compact_ran={}",
+                            report.pruning.pruned_rows,
+                            report.currency.pruned_versions,
+                            report.pruned_trigger_audit_rows,
+                            report.compaction.ran,
+                        );
+                    }
+                }
+                Err(err) => {
+                    report_failure(ErrorClass::of(&err), &err.to_string(), input);
+                    return MetaCommandOutcome::failed();
+                }
+            },
+            "compact" => match db.compact_now() {
+                Ok(report) => {
+                    if input.output.json {
+                        json_output::print_document(&json_output::compaction_report_document(
+                            &report,
+                        ));
+                    } else {
+                        println!(
+                            "ran={} duration_micros={} bytes_before={:?} bytes_after={:?} \
+                                 file_shrank={} fragmentation_before={}",
+                            report.ran,
+                            report.duration_micros,
+                            report.bytes_before,
+                            report.bytes_after,
+                            report.file_shrank,
+                            report.fragmentation_before,
+                        );
+                    }
+                }
+                Err(err) => {
+                    report_failure(ErrorClass::of(&err), &err.to_string(), input);
+                    return MetaCommandOutcome::failed();
+                }
+            },
+            _ => {
+                report_failure(
+                    ErrorClass::Usage,
+                    "Usage: .maintenance status | .maintenance run | .maintenance compact",
+                    input,
+                );
+                return MetaCommandOutcome::failed();
+            }
+        },
         ".sync" | "\\sync" => {
             let outcome = handle_sync_command(sync_client, rt, rest, sync_plugin);
             if !outcome.ok {
@@ -1345,6 +1417,40 @@ mod tests {
             script_line: None,
             output: OutputOptions::default(),
         }
+    }
+
+    #[test]
+    fn maintenance_status_reports_a_database_with_nothing_declared() {
+        let db = Database::open_memory();
+        let outcome = handle_meta_command(
+            &db,
+            None,
+            None,
+            ".maintenance status",
+            scripted_input(),
+            None,
+        );
+        assert!(outcome.keep_going && outcome.ok);
+    }
+
+    #[test]
+    fn maintenance_run_drives_one_cycle_on_demand() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY) RETAIN 1 HOURS",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let outcome =
+            handle_meta_command(&db, None, None, ".maintenance run", scripted_input(), None);
+        assert!(outcome.keep_going && outcome.ok);
+    }
+
+    #[test]
+    fn maintenance_with_no_subcommand_is_a_usage_error() {
+        let db = Database::open_memory();
+        let outcome = handle_meta_command(&db, None, None, ".maintenance", scripted_input(), None);
+        assert!(outcome.keep_going && !outcome.ok);
     }
 
     #[test]
