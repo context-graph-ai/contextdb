@@ -167,7 +167,14 @@ jobs:
         run: |
           mkdir -p dist
           for bin in $(echo "${{ matrix.bins }}" | tr ',' ' '); do
-            cp target/${{ matrix.target }}/release/$bin dist/
+            # `bin` here is the CRATE name (used above for `-p`); the built
+            # executable's own name only differs from its crate's for
+            # contextdb-cli, whose [[bin]] target is named `contextdb`.
+            case "$bin" in
+              contextdb-cli) exe=contextdb ;;
+              *) exe="$bin" ;;
+            esac
+            cp target/${{ matrix.target }}/release/$exe dist/
           done
           tar czf ${{ matrix.target }}.tar.gz -C dist .
       - uses: actions/upload-artifact@v4
