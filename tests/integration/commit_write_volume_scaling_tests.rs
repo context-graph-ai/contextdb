@@ -1486,8 +1486,12 @@ fn cwv_08_conditional_stale_update_downgrades_to_noop() {
     assert_eq!(row.rows[0][0], Value::Text("invalidated".to_string()));
 }
 
+// A multi-column UNIQUE violation on INSERT is a loud, standard-SQL
+// constraint error (`Error::UniqueViolation`) — never a silent `Ok`/no-op.
+// Superseded from an earlier revision of this test, which pinned the
+// opposite (silent-no-op) contract for a duplicate composite-UNIQUE tuple.
 #[test]
-fn cwv_09_composite_unique_duplicate_is_silent_noop() {
+fn cwv_09_composite_unique_duplicate_is_refused_loudly() {
     let db = Database::open_memory();
     declare_mixed_schema(&db);
     let (a, b) = seed_parent(&db, 0);
@@ -1504,7 +1508,7 @@ fn cwv_09_composite_unique_duplicate_is_silent_noop() {
         .unwrap();
     assert_eq!(first.rows_affected, 1, "positive: first tuple inserts");
 
-    let dup = db
+    let err = db
         .execute(
             "INSERT INTO child (id, c1, c2, tag) VALUES ($id, $c1, $c2, 'dup')",
             &params(vec![
@@ -1513,8 +1517,11 @@ fn cwv_09_composite_unique_duplicate_is_silent_noop() {
                 ("c2", Value::Int64(b)),
             ]),
         )
-        .expect("duplicate composite-UNIQUE tuple must be Ok, not Err");
-    assert_eq!(dup.rows_affected, 0, "duplicate composite tuple is a no-op");
+        .expect_err("a duplicate composite-UNIQUE tuple must be refused loudly, never Ok");
+    assert!(
+        matches!(&err, Error::UniqueViolation { table, .. } if table == "child"),
+        "expected Error::UniqueViolation naming table `child`, got {err:?}"
+    );
 
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
@@ -1522,7 +1529,7 @@ fn cwv_09_composite_unique_duplicate_is_silent_noop() {
             .rows
             .len(),
         1,
-        "no second row for the duplicate tuple"
+        "the refused duplicate must not have added a second row"
     );
 }
 

@@ -2119,7 +2119,7 @@ fn ddl_sync_round_trip_distinguishes_pk_covered_from_unique_covered_fk() {
 
 #[test]
 fn protocol_version_bumps_for_structured_constraint_wire() {
-    assert_eq!(contextdb_server::protocol::PROTOCOL_VERSION, 5);
+    assert_eq!(contextdb_server::protocol::PROTOCOL_VERSION, 6);
     let envelope = Envelope {
         version: 3,
         message_type: MessageType::PullRequest,
@@ -2131,11 +2131,11 @@ fn protocol_version_bumps_for_structured_constraint_wire() {
         err,
         SyncError::ProtocolVersionMismatch {
             received: 3,
-            supported: 5
+            supported: 6
         }
     ));
 
     let encoded = encode(MessageType::PullRequest, &()).unwrap();
     let decoded = decode(&encoded).unwrap();
-    assert_eq!(decoded.version, 5);
+    assert_eq!(decoded.version, 6);
 }

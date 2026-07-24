@@ -50,13 +50,13 @@ pub(crate) fn workspace_root() -> PathBuf {
 }
 
 pub(crate) fn cli_bin() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_contextdb-cli") {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_contextdb") {
         return PathBuf::from(path);
     }
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb-cli") {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb") {
         return PathBuf::from(path);
     }
-    crate::binary_path::resolve_workspace_binary("contextdb-cli")
+    crate::binary_path::resolve_workspace_binary("contextdb")
 }
 
 pub(crate) fn server_bin() -> PathBuf {

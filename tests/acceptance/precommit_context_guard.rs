@@ -700,6 +700,33 @@ fn t4_07d_scoped_view_observes_owner_close() {
     );
 }
 
+/// REGRESSION GUARD — t4_07e: a close landing in the narrow window between
+/// `execute`'s own already-closed pre-check and its read-snapshot
+/// registration must still surface as the typed closed-handle error, never
+/// a panic. Deterministic via the test-only race seam (the close runs
+/// synchronously, on the SAME thread, inside `execute` itself) rather than
+/// depending on a second thread ever winning a real race.
+#[test]
+fn t4_07e_execute_returns_typed_error_when_close_races_the_snapshot_registration() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("race-window.redb");
+    let ctx_a = Uuid::from_u128(0xA);
+    seed_memos(&path, &[(1, "in-a", ctx_a)]);
+
+    let db = Database::open(&path).unwrap();
+    db.__arm_close_in_snapshot_registration_race_window_for_test();
+
+    let err = assert_error(
+        db.execute("SELECT id FROM memos", &empty()),
+        "a close landing between the pre-check and the snapshot registration must surface as \
+         a typed error, not a panic",
+    );
+    assert!(
+        matches!(err, Error::Other(ref msg) if msg.contains("closed")),
+        "expected closed database error, got {err:?}"
+    );
+}
+
 /// REGRESSION GUARD — t4_08
 #[test]
 fn t4_08_admin_handle_sees_all_contexts() {

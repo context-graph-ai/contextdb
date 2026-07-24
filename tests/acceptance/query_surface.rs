@@ -476,9 +476,9 @@ fn f81_foreign_key_rejects_missing_reference() {
     assert!(matches!(err, Error::ForeignKeyViolation { .. }));
 }
 
-/// I inserted a duplicate tuple into a composite UNIQUE constraint, and the database treated it as a no-op.
+/// I inserted a duplicate tuple into a composite UNIQUE constraint, and the database refused it with a constraint error.
 #[test]
-fn f82_composite_unique_duplicate_is_noop() {
+fn f82_composite_unique_duplicate_is_refused() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE memberships (id UUID PRIMARY KEY, org_id UUID NOT NULL, email TEXT NOT NULL, UNIQUE (org_id, email))",
@@ -494,15 +494,20 @@ fn f82_composite_unique_duplicate_is_noop() {
         ]),
     )
     .expect("first tuple");
-    db.execute(
-        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("org_id", Value::Uuid(Uuid::from_u128(1))),
-            ("email", Value::Text("alice@example.com".into())),
-        ]),
-    )
-    .expect("duplicate tuple should be a no-op");
+    let err = db
+        .execute(
+            "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("org_id", Value::Uuid(Uuid::from_u128(1))),
+                ("email", Value::Text("alice@example.com".into())),
+            ]),
+        )
+        .expect_err("duplicate tuple should be refused with a constraint error");
+    assert!(
+        matches!(&err, Error::UniqueViolation { table, .. } if table == "memberships"),
+        "expected Error::UniqueViolation naming table `memberships`, got {err:?}"
+    );
 
     let rows = db
         .scan("memberships", db.snapshot())
@@ -510,7 +515,7 @@ fn f82_composite_unique_duplicate_is_noop() {
     assert_eq!(
         rows.len(),
         1,
-        "duplicate composite tuple must not create a second row"
+        "the refused duplicate must not create a second row"
     );
 }
 

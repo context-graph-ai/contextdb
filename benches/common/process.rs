@@ -20,7 +20,7 @@ pub fn target_dir() -> PathBuf {
 }
 
 pub fn cli_bin() -> PathBuf {
-    let mut path = target_dir().join("contextdb-cli");
+    let mut path = target_dir().join("contextdb");
     if cfg!(windows) {
         path.set_extension("exe");
     }

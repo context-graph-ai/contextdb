@@ -26,7 +26,7 @@ pub(crate) fn binary_name(binary: &str) -> String {
     }
 }
 
-/// Resolves `binary` (e.g. `"contextdb-cli"`) to a freshly built workspace
+/// Resolves `binary` (e.g. `"contextdb"`) to a freshly built workspace
 /// binary. `target/debug` and `target/release` can each hold a binary left
 /// over from an unrelated earlier build; picking either one blind risks
 /// running stale code, which can hide a live regression (false pass) just

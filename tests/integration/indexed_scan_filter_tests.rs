@@ -221,8 +221,18 @@ fn ep05_function_call_in_predicate_disqualifies_index() {
         )
         .unwrap();
     }
+    // `COALESCE`, not `UPPER`: this engine does not implement `UPPER` at
+    // all, so evaluating it now correctly fails (a genuine, propagated
+    // predicate-evaluation error) rather than being silently swallowed into
+    // an empty result the way it was before predicate errors propagated.
+    // `COALESCE` is a real, evaluable function call, so it exercises the
+    // identical index-disqualification reasoning this test is actually
+    // about without depending on an unimplemented function.
     let r = db
-        .execute("SELECT name FROM t WHERE UPPER(name) = 'ALPHA'", &empty())
+        .execute(
+            "SELECT name FROM t WHERE COALESCE(name, 'x') = 'alpha'",
+            &empty(),
+        )
         .expect("SELECT");
     assert_eq!(r.trace.physical_plan, "Scan");
     assert!(r.trace.index_used.is_none());
@@ -1592,8 +1602,12 @@ fn pk02_unique_constraint_check_routes_through_index() {
 // ============================================================================
 // PK03 — composite UNIQUE (a, b) constraint check routes through index.
 //
-// Same contract as PK02: duplicate composite INSERT = no-op, probe routes
-// through index.
+// Plan intent is routing (where the probe runs), same as PK02. The
+// outcome contract for a duplicate composite UNIQUE INSERT is NOT the
+// v0.3.3 no-op convention PK02 pins for a single-column UNIQUE: a
+// multi-column UNIQUE violation is standard-SQL loud (`Error::UniqueViolation`
+// naming every column of the constraint), never a silent `Ok`/no-op — the
+// single-column no-op convention is unchanged and stays pinned by PK02.
 // ============================================================================
 #[test]
 fn pk03_composite_unique_routes_through_index() {
@@ -1612,19 +1626,27 @@ fn pk03_composite_unique_routes_through_index() {
         ]),
     )
     .unwrap();
-    db.execute(
-        "INSERT INTO t (id, a, b) VALUES ($id, $a, $b)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("a", Value::Int64(1)),
-            ("b", Value::Int64(2)),
-        ]),
-    )
-    .expect("duplicate composite UNIQUE INSERT must be a no-op per v0.3.3 contract");
+    let err = db
+        .execute(
+            "INSERT INTO t (id, a, b) VALUES ($id, $a, $b)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("a", Value::Int64(1)),
+                ("b", Value::Int64(2)),
+            ]),
+        )
+        .expect_err(
+            "a duplicate composite UNIQUE INSERT must be refused with a loud \
+             constraint error, never accepted as a silent no-op",
+        );
+    assert!(
+        matches!(&err, Error::UniqueViolation { table, column } if table == "t" && column.contains('a') && column.contains('b')),
+        "expected Error::UniqueViolation naming table `t` and both of `a`/`b`, got {err:?}"
+    );
     assert_eq!(
         db.scan("t", db.snapshot()).unwrap().len(),
         1,
-        "duplicate composite UNIQUE INSERT must leave exactly one row"
+        "the refused duplicate must not have added a second row"
     );
     let probe = db
         .__probe_constraint_check("t", "a", Value::Int64(1))
@@ -1833,12 +1855,14 @@ fn nan02_where_equal_nan_returns_zero_rows() {
         .unwrap();
     assert_eq!(r_pos.trace.physical_plan, "IndexScan");
     assert_eq!(r_pos.rows, vec![vec![Value::Uuid(id_finite)]]);
-    // Negative: NaN equality short-circuits.
-    let r = db
-        .execute("SELECT f FROM t WHERE f = 0.0/0.0", &empty())
-        .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows, Vec::<Vec<Value>>::new());
+    // Division by zero in a WHERE predicate is a statement error (standard-SQL),
+    // not a short-circuit to NaN. The planner no longer resolves 0.0/0.0 to NaN.
+    let r = db.execute("SELECT f FROM t WHERE f = 0.0/0.0", &empty());
+    let err = r.expect_err("division by zero in WHERE must be a statement error");
+    assert!(
+        err.to_string().contains("division by zero"),
+        "expected a division-by-zero message, got {err:?}"
+    );
 }
 
 // ============================================================================

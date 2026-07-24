@@ -31,18 +31,18 @@ pub(crate) fn cli_bin() -> PathBuf {
 }
 
 fn resolve_cli_bin() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_contextdb-cli") {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_contextdb") {
         return PathBuf::from(path);
     }
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb-cli") {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_contextdb") {
         return PathBuf::from(path);
     }
-    crate::binary_path::resolve_workspace_binary("contextdb-cli")
+    crate::binary_path::resolve_workspace_binary("contextdb")
 }
 
 fn cli_command(db_path: &Path, extra_args: &[&str]) -> Command {
     let mut command = Command::new(cli_bin());
-    command.env_remove("CARGO_BIN_EXE_contextdb-cli");
+    command.env_remove("CARGO_BIN_EXE_contextdb");
     command.arg(db_path).args(extra_args);
     command
 }

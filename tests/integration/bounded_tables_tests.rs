@@ -87,11 +87,21 @@ fn insert_rows(db: &Database, table: &str, ids: std::ops::Range<i64>, body: &str
     }
 }
 
-/// The three currency tables the existing engine-owned maintenance thread
-/// serves. Declaring one is how a database becomes currency-eligible.
+/// A currency-eligible table: version-cleanup eligibility is now DECLARED
+/// (`HISTORY CURRENT ONLY`), not a hardcoded table-name list, so this fixture
+/// must declare it explicitly like any other currency table would (mirroring
+/// the policy the real `work_capabilities` schema in
+/// `contextdb-engine::work_ledger` declares -- this fixture's own column
+/// shape is deliberately NOT that table's: `work_capabilities` is one of the
+/// four engine-owned reserved names (see `engine_owned_ledger_policy_tests.rs`),
+/// so a generic test fixture must use its own name rather than squat on a
+/// reserved one).
+/// Behavior-change class: this file predates the HISTORY clause and the
+/// name-based `VERSION_COMPACTION_TABLES` list it rode has been deleted.
 fn create_currency_table(db: &Database) {
     db.execute(
-        "CREATE TABLE work_capabilities (id TEXT PRIMARY KEY, generation INTEGER)",
+        "CREATE TABLE currency_fixture (id TEXT PRIMARY KEY, generation INTEGER) \
+         HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST",
         &p(),
     )
     .expect("currency table must create");
@@ -102,7 +112,7 @@ fn upsert_currency_row(db: &Database, id: &str, generation: i64) {
     row.insert("id".to_string(), Value::Text(id.to_string()));
     row.insert("generation".to_string(), Value::Int64(generation));
     db.execute(
-        "INSERT INTO work_capabilities (id, generation) VALUES ($id, $generation) \
+        "INSERT INTO currency_fixture (id, generation) VALUES ($id, $generation) \
          ON CONFLICT (id) DO UPDATE SET generation = $generation",
         &row,
     )
@@ -241,7 +251,7 @@ fn c2_one_maintenance_cycle_prunes_retained_rows_and_compacts_currency_versions(
     }
     assert_eq!(row_count(&db, "windows"), 5);
     assert_eq!(
-        row_count(&db, "work_capabilities"),
+        row_count(&db, "currency_fixture"),
         1,
         "SQL already reads one logical row BEFORE compaction — which is why row \
          count alone cannot witness the currency half"
@@ -273,7 +283,7 @@ fn c2_one_maintenance_cycle_prunes_retained_rows_and_compacts_currency_versions(
     );
     assert_eq!(row_count(&db, "windows"), 0);
     assert_eq!(
-        row_count(&db, "work_capabilities"),
+        row_count(&db, "currency_fixture"),
         1,
         "currency compaction keeps exactly the current version of the logical row"
     );

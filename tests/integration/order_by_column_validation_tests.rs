@@ -147,26 +147,51 @@ fn order_by_select_list_alias_must_sort_not_silently_pass_through() {
 }
 
 // ============================================================================
-// ORDER BY a non-column expression (`a + 1`) must be a typed,
-// plan-time error, not silently accepted and left unsorted.
+// ORDER BY an arithmetic expression (`a + 1`) is standard SQL and must
+// actually SORT by the evaluated value — widening this contract from an
+// earlier revision of this test, which pinned `a + 1` as a typed refusal.
+// That guard's PURPOSE — never silently accept a sort key and leave the
+// result no-op-unsorted — is still honored: the engine now genuinely
+// evaluates the expression per row (the same arithmetic a SELECT-list
+// expression already evaluates) rather than either refusing it or silently
+// ignoring it. A genuinely unsupported ORDER BY form still gets the typed
+// refusal (see the nonexistent-column and ambiguous-column cases in this
+// file).
 //
-// Asserts only `is_err()`, not a specific error variant: which typed error
-// this becomes is an implementation detail, not part of the contract under
-// test, and pinning a variant name here would over-specify the assertion
-// and couple this test to an internal classification choice rather than
-// the observable behavior (errors loudly instead of silently no-op-sorting).
+// Fixture: `a` is inserted in an order that does NOT match `a`'s own
+// ascending order (3, 1, 2), so a no-op "sort" would be observably wrong —
+// the same discipline this file's header describes for the descending `b`
+// fixtures.
 // ============================================================================
 #[test]
-fn order_by_non_column_expression_is_a_typed_error_not_silently_unsorted() {
+fn order_by_arithmetic_expression_sorts_by_the_evaluated_value() {
     let db = Database::open_memory();
-    seed_t_descending(&db);
+    db.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY, a INTEGER, b INTEGER)",
+        &empty(),
+    )
+    .expect("CREATE TABLE t");
+    for (a, b) in [(3i64, 10i64), (1, 9), (2, 8)] {
+        db.execute(
+            "INSERT INTO t (id, a, b) VALUES ($id, $a, $b)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("a", Value::Int64(a)),
+                ("b", Value::Int64(b)),
+            ]),
+        )
+        .expect("INSERT t");
+    }
 
-    let result = db.execute("SELECT b FROM t ORDER BY a + 1", &empty());
-    assert!(
-        result.is_err(),
-        "ORDER BY a + 1 (a non-column expression) must be a typed error, not \
-         silently accepted and left unsorted: got {:?}",
-        result
+    let r = db
+        .execute("SELECT b FROM t ORDER BY a + 1", &empty())
+        .expect("ORDER BY a + 1 is standard SQL arithmetic and must succeed");
+    let got: Vec<i64> = r.rows.iter().map(|row| int_col(&row[0])).collect();
+    assert_eq!(
+        got,
+        vec![9, 8, 10],
+        "must sort ascending by a + 1 = [2, 3, 4] (a = [1, 2, 3]), got {:?}",
+        r.rows
     );
 }
 

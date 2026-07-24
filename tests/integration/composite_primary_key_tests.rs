@@ -22,7 +22,7 @@
 //! "still refuses a genuinely keyless table" half lives there, not duplicated
 //! here.
 
-use contextdb_core::Value;
+use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use std::collections::HashMap;
@@ -516,16 +516,16 @@ fn c5d_guard_a_single_column_primary_key_replicates_unchanged() {
     );
 }
 
-/// Guard. A multi-column `UNIQUE` constraint stays exactly what it is
-/// today — a uniqueness rule, not a sync identity. Today's behavior, pinned as observed rather than as one might
-/// wish it were: the second row carrying an already-used `(sensor_id, metric)`
-/// pair is NOT written, but the statement returns `Ok` with `rows_affected: 0`
-/// instead of an error, so a caller learns nothing. That silent-skip is a
-/// separate defect, pinned here so the
-/// composite-key work cannot change it unnoticed in either direction.
-/// Nothing here extends multi-column keys to unique constraints,
-/// indexes, foreign keys, or vector keys; composite FOREIGN KEY behavior is
-/// separately pinned in `tests/integration/composite_foreign_key_tests.rs`.
+/// Guard. A multi-column `UNIQUE` constraint stays exactly what it is —
+/// a uniqueness rule, not a sync identity — but the silent-skip contract is
+/// replaced by a loud constraint error: standard SQL errors on a UNIQUE
+/// violation. A row whose `(sensor_id, metric)` pair collides with an
+/// already-written row must be REFUSED with a typed constraint error, never
+/// accepted as `Ok` with `rows_affected: 0` — a caller must be able to tell
+/// "written" from "silently dropped" without re-reading the table. Nothing
+/// here extends multi-column keys to unique constraints, indexes, foreign
+/// keys, or vector keys; composite FOREIGN KEY behavior is separately
+/// pinned in `tests/integration/composite_foreign_key_tests.rs`.
 #[test]
 fn c5d_guard_a_multi_column_unique_constraint_is_not_an_identity() {
     let db = Database::open_memory();
@@ -552,12 +552,27 @@ fn c5d_guard_a_multi_column_unique_constraint_is_not_an_identity() {
     insert(1, "sensor-1", "motion", 11).expect("first reading");
     insert(2, "sensor-1", "occupancy", 22).expect("different metric is a different pair");
 
-    let duplicate_pair = insert(3, "sensor-1", "motion", 33)
-        .expect("today the duplicate pair returns Ok — see the doc comment");
-    assert_eq!(
-        duplicate_pair.rows_affected, 0,
-        "the duplicate pair writes nothing: {duplicate_pair:?}"
+    let duplicate_pair = insert(3, "sensor-1", "motion", 33);
+    let err = duplicate_pair.expect_err(
+        "a duplicate (sensor_id, metric) pair must be refused with a loud \
+         constraint error, never accepted as Ok with rows_affected: 0",
     );
+    match err {
+        Error::UniqueViolation { table, column } => {
+            assert_eq!(table, "readings", "UniqueViolation.table mismatch");
+            assert!(
+                column.contains("sensor_id") && column.contains("metric"),
+                "UniqueViolation.column must name both columns of the \
+                 composite constraint, got {column:?}"
+            );
+        }
+        other => panic!(
+            "expected a standard-SQL constraint error (Error::UniqueViolation) \
+             naming table `readings` and both of `sensor_id`/`metric`, got \
+             {other:?}"
+        ),
+    }
+
     let result = db
         .execute("SELECT id, value FROM readings", &p())
         .expect("readings scan");
