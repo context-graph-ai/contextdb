@@ -15,6 +15,7 @@ use contextdb_server::work_ledger::{
     ExecutionOutput, ExecutionVerdict, PollOutcome, WorkExecutor, WorkerConfig,
     poll_and_execute_once,
 };
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -106,7 +107,7 @@ async fn worker_defers_then_reclaims_own_submission_after_deadline() {
     let before = within(poll_and_execute_once(
         &a_client,
         &deferring_worker_config("node-a"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 1,
     ))
     .await
@@ -133,7 +134,7 @@ async fn worker_defers_then_reclaims_own_submission_after_deadline() {
     let after = within(poll_and_execute_once(
         &a_client,
         &deferring_worker_config("node-a"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         after_deadline,
     ))
     .await

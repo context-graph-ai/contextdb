@@ -18,6 +18,7 @@
 use contextdb_core::{Incarnation, Lsn, TenantId, Value, Wallclock};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_engine::work_ledger::{advertise_capability, install_work_ledger_schema};
 use contextdb_server::protocol::{
     MessageType, SyncStatusRequest, SyncStatusResponse, decode, encode,
 };
@@ -2220,4 +2221,78 @@ fn reopen_retains_the_edge_incarnation_while_a_fresh_database_mints_a_new_one() 
         first,
         "a freshly created database is a new life and mints a distinct incarnation"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Restart-survival regression guard: a row committed via the work-ledger
+// surface, dropped WITHOUT ever pushing, still pushes after a fresh reopen.
+// This is a GREEN pinning test: it verifies already-correct shipped
+// behavior (`SyncClient::with_transport` loads its push watermark from the
+// durable engine state, not an in-process-only counter), not a defect this
+// change fixes. It belongs beside
+// `reopen_retains_the_edge_incarnation_while_a_fresh_database_mints_a_new_one`
+// above, which pins the sibling incarnation-reload half of the same restart
+// story.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_row_committed_before_an_unclean_restart_still_pushes_after_reopen() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("edge.db");
+
+    let broker = InProcessBroker::new();
+    let hub_db = Arc::new(Database::open_memory());
+    install_work_ledger_schema(&hub_db).expect("hub work ledger schema");
+    let hub = start_hub_on(&broker, hub_db);
+
+    {
+        // First "process": commit a row via the work-ledger surface, then
+        // drop the handle WITHOUT ever pushing — simulating a crash or
+        // unclean shutdown before the push ran.
+        let db = Database::open(path.clone()).expect("open edge db");
+        install_work_ledger_schema(&db).expect("edge work ledger schema");
+        advertise_capability(
+            &db,
+            "edge-restart",
+            "cap.demo",
+            &["demo".to_string()],
+            T0 as i64,
+        )
+        .expect("advertise capability");
+        db.close().expect("close");
+        // `db` drops here — nothing has been pushed yet.
+    }
+
+    // Reopen fresh, exactly as a new process would after the restart.
+    let db = Arc::new(Database::open(path.clone()).expect("reopen edge db"));
+    let client = edge_client(&db, &broker, "edge-restart");
+
+    assert!(
+        client
+            .has_pending_push_changes()
+            .expect("pending-changes check"),
+        "the row committed before the unclean restart must still read as pending after reopen"
+    );
+
+    let applied = within(client.push()).await.expect("push after reopen");
+    assert!(
+        applied.applied_rows >= 1,
+        "the reopened client must actually push the pre-restart row, got {applied:?}"
+    );
+
+    let hub_rows = hub
+        .db
+        .execute(
+            "SELECT * FROM work_capabilities WHERE node_id = 'edge-restart'",
+            &p(),
+        )
+        .expect("hub scan")
+        .rows
+        .len();
+    assert_eq!(
+        hub_rows, 1,
+        "the hub must hold the row the reopened edge pushed"
+    );
+
+    hub.stop().await;
 }

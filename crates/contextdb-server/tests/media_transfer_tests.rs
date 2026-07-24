@@ -7,7 +7,7 @@ use contextdb_engine::work_ledger::{
     BlobHash, ClaimInsert, InputRef, JobSpec, MovementPolicy, cancel_job, insert_claim,
     install_work_ledger_schema, record_failure, submit_job,
 };
-use contextdb_server::blob_resolver::{BlobStore, ResolveError};
+use contextdb_server::blob_resolver::{BlobFetchPolicy, BlobStore, ResolveError};
 use contextdb_server::transport::iroh::IrohServer;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1615,4 +1615,153 @@ fn shared_store_root_resolve_returns_bounded_typed_error_not_uncancellable_hang(
     holder.set_store_open_timeout_ms_for_test(10_000);
 
     setup_rt.block_on(endpoint.close());
+}
+
+// ---------------------------------------------------------------------------
+// resolve_blob_ref gains a top-level deadline: a declared blob-fetch timeout
+// policy bounds the whole fetch attempt, not just the per-item idle bound
+// already applied inside the transfer loop.
+// ---------------------------------------------------------------------------
+
+/// The declared default is a real, checked value — a silent change to it
+/// should fail this pin, not just a doc-comment edit nobody reads.
+#[test]
+fn blob_fetch_policy_default_is_declared_and_documented() {
+    let default = BlobFetchPolicy::default();
+    assert_eq!(
+        default.fetch_deadline_ms, 120_000,
+        "the documented default bound changed without updating this pin"
+    );
+}
+
+/// The unbounded gap this guards: `resolve_blob_ref`'s fetch attempt (dial +
+/// verified-transfer loop + the local store's tag bookkeeping) has NO
+/// top-level deadline today — only the per-progress-item idle bound inside
+/// the transfer loop is bounded. A wedge anywhere in that attempt before the
+/// loop starts (the harness arms `arm_wedge_next_fetch_for_test` to stand in
+/// for one, deliberately not depending on iroh-blobs' own internal failure
+/// modes) hangs `resolve_blob_ref` forever today.
+///
+/// This wedge is an ordinary async-pending future (cooperatively
+/// cancellable), not the synchronous OS-level block the store-open
+/// contention guard above defends against, so a plain `tokio::time::timeout`
+/// wrapped around the call under test is enough to bound THIS harness's own
+/// wait — the fix under test is whether `resolve_blob_ref` bounds itself,
+/// not whether the test can reclaim a thread.
+#[tokio::test]
+async fn resolve_blob_ref_wedged_fetch_phase_returns_typed_timeout_within_declared_bound() {
+    let holder_dir = tempfile::tempdir().expect("holder dir");
+    let consumer_dir = tempfile::tempdir().expect("consumer dir");
+    let holder_key = identity_file(&holder_dir);
+    let consumer_key = identity_file(&consumer_dir);
+    let holder_node = node_id_of(&holder_key);
+    let consumer_node = node_id_of(&consumer_key);
+    let content = marked("BLOB-FETCH-WEDGE-MARKER", 64 * 1024);
+    let h = BlobHash::of(&content);
+
+    let holder_db = Arc::new(Database::open_memory());
+    install_work_ledger_schema(&holder_db).expect("holder schema");
+    seed_entitlement(&holder_db, "job-b4", &holder_node, &consumer_node, &h);
+    let holder = BlobStore::new(
+        holder_db,
+        MovementPolicy {
+            auto_propagate: true,
+        },
+        holder_key.clone(),
+    );
+    holder.set_test_clock(T0);
+    holder.ingest_bytes(&content).expect("ingest");
+    let endpoint = IrohServer::bind(&bind_spec(&holder_key))
+        .await
+        .expect("bind holder");
+    holder.serve_on(&endpoint);
+    let ticket = endpoint.ticket();
+
+    let consumer_db = Arc::new(Database::open_memory());
+    install_work_ledger_schema(&consumer_db).expect("consumer schema");
+    seed_entitlement(&consumer_db, "job-b4", &holder_node, &consumer_node, &h);
+    let consumer = BlobStore::new(
+        consumer_db,
+        MovementPolicy {
+            auto_propagate: true,
+        },
+        consumer_key,
+    );
+    consumer.set_test_clock(T0);
+    consumer.set_fetch_policy(BlobFetchPolicy {
+        fetch_deadline_ms: 300,
+    });
+    consumer.arm_wedge_next_fetch_for_test();
+
+    let mut sink = Vec::new();
+    // A generous CI-safety ceiling around the call under test, well above the
+    // 300ms bound declared above — NOT the bound being proven. Today this
+    // ceiling is what actually stops the test from hanging: nothing inside
+    // `resolve_blob_ref` bounds the wedge itself yet.
+    let guarded = tokio::time::timeout(
+        Duration::from_secs(5),
+        consumer.resolve_blob_ref(&h, &ticket, &mut sink),
+    )
+    .await;
+
+    let inner = guarded.expect(
+        "resolve_blob_ref must return within a bounded time even when the fetch phase wedges; \
+         it must never rely on the CALLER's own timeout to reclaim an unbounded internal await",
+    );
+    assert!(
+        matches!(inner, Err(ResolveError::FetchTimedOut { .. })),
+        "a wedged fetch phase must surface as a typed FetchTimedOut within the declared \
+         policy bound, got {inner:?}"
+    );
+    assert!(
+        sink.is_empty(),
+        "a timed-out fetch writes nothing to the sink"
+    );
+
+    endpoint.close().await;
+}
+
+/// No new bare duration constant in the resolver (grep-provable).
+/// `resolve_blob_ref`'s own body must read its bound from the declared
+/// `BlobFetchPolicy` (via `self.fetch_policy()`), never from an inline
+/// `Duration::from_*` literal — a source-scan guard in the style of
+/// `crates/contextdb-core/tests/test_estate_audit.rs`, scoped to exactly the
+/// one function body instead of the whole tree. Green today (nothing wraps
+/// the fetch attempt yet) and must stay green once the deadline is wired in.
+#[test]
+fn resolve_blob_ref_body_has_no_bare_duration_literal() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/blob_resolver.rs");
+    let source = std::fs::read_to_string(path).expect("read blob_resolver.rs");
+    let start_marker = "pub async fn resolve_blob_ref(";
+    let start = source
+        .find(start_marker)
+        .expect("resolve_blob_ref signature must exist in blob_resolver.rs");
+    // Walk forward from the signature to the function's opening brace, then
+    // track brace depth to find the matching close.
+    let body_start = source[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .expect("resolve_blob_ref must have a body");
+    let mut depth = 0i32;
+    let mut end = body_start;
+    for (offset, ch) in source[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = body_start + offset + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &source[body_start..end];
+    assert!(
+        !body.contains("Duration::from_"),
+        "resolve_blob_ref's own body must never hardcode a bound — read it from \
+         `self.fetch_policy()` (BlobFetchPolicy) instead. Found a bare Duration::from_* literal \
+         in the function body:\n{body}"
+    );
 }

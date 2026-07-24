@@ -861,6 +861,67 @@ pub(crate) struct FetchOutcome {
     pub bytes_written: u64,
 }
 
+/// The network-and-tag-bookkeeping phase of a fetch (dial + verify into the
+/// LOCAL store), isolated from the caller's sink: `[fetch_verified_into_local_store]`
+/// and `fetch_into_sink` below both drive this same body, so the two stay
+/// identical apart from what happens to the bytes once they are locally
+/// verified.
+async fn fetch_into_local_store(
+    store: &BlobStoreHandle,
+    identity_path: &Path,
+    ticket: &str,
+    hash: &[u8; 32],
+) -> std::result::Result<LocalFetchOutcome, FetchFailure> {
+    // Fetch over the blob door, verified into the local store. There is no
+    // separate preflight: the consumer dials the blob door directly, and a
+    // refusal arrives as a typed stream-reset code the holder sends BEFORE
+    // any payload byte (see `classify_get_error`). Upstream fetches only
+    // what the local partial state is missing, so a retry after an abort
+    // moves the tail, not the blob.
+    let backend = to_backend_hash(hash);
+    let peer = peer_connect(identity_path, ticket, iroh_blobs::protocol::ALPN)
+        .await
+        .map_err(|_| FetchFailure::Unreachable)?;
+    let holder_node_id = peer.remote_node_id.clone();
+    let moved = run_verified_fetch(store, &peer, backend, hash).await;
+    peer.close().await;
+    let moved = moved?;
+    Ok(LocalFetchOutcome {
+        moved,
+        holder_node_id,
+    })
+}
+
+/// The result of [`fetch_into_local_store`]: the wire payload bytes moved
+/// and the holder's transport-authenticated identity.
+pub(crate) struct LocalFetchOutcome {
+    pub moved: u64,
+    pub holder_node_id: String,
+}
+
+/// Owned/'static wrapper over [`fetch_into_local_store`]: every argument here
+/// is owned rather than borrowed, so a caller (see `resolve_blob_ref`'s
+/// declared-deadline wrap) can `tokio::spawn` this exact phase and bound the
+/// JOIN with a timeout — a `&mut dyn Write` sink cannot itself cross a spawn
+/// boundary, which is why the sink-touching second half (export) stays a
+/// separate, unspawned step in every caller.
+pub(crate) async fn fetch_verified_into_local_store(
+    store: Arc<BlobStoreHandle>,
+    identity_path: PathBuf,
+    ticket: String,
+    hash: [u8; 32],
+) -> std::result::Result<LocalFetchOutcome, FetchFailure> {
+    fetch_into_local_store(&store, &identity_path, &ticket, &hash).await
+}
+
+/// Release the consumer-side fetch-protection tag for `hash` once its bytes
+/// have been fully, successfully exported to the caller. Split out of
+/// `fetch_into_sink`'s tail so `resolve_blob_ref`'s spawned-and-joined path
+/// (which performs its own, separately-awaited export) can call it too.
+pub(crate) async fn release_fetch_protection(store: &BlobStoreHandle, hash: &[u8; 32]) {
+    store.release_fetch_tag(to_backend_hash(hash)).await;
+}
+
 /// Preflight + fetch + export `hash` from the holder at `ticket` into
 /// `sink`. `payload_moved` (when given) receives the wire payload bytes this
 /// call actually transferred (the resume-leg counter); `holder_node_id` (when
@@ -878,24 +939,9 @@ pub(crate) async fn fetch_into_sink(
     holder_node_id: Option<&mut String>,
     export_offset: u64,
 ) -> std::result::Result<FetchOutcome, FetchFailure> {
-    // 1. Fetch over the blob door, verified into the local store. There is
-    // no separate preflight: the consumer dials the blob door directly, and
-    // a refusal arrives as a typed stream-reset code the holder sends BEFORE
-    // any payload byte (see `classify_get_error`). Upstream fetches only
-    // what the local partial state is missing, so a retry after an abort
-    // moves the tail, not the blob.
-    let backend = to_backend_hash(hash);
-    let peer = peer_connect(identity_path, ticket, iroh_blobs::protocol::ALPN)
-        .await
-        .map_err(|_| FetchFailure::Unreachable)?;
-    if let Some(slot) = holder_node_id {
-        *slot = peer.remote_node_id.clone();
-    }
-    let moved = run_verified_fetch(store, &peer, backend, hash).await;
-    let moved = match moved {
-        Ok(moved) => moved,
+    let outcome = match fetch_into_local_store(store, identity_path, ticket, hash).await {
+        Ok(outcome) => outcome,
         Err(failure) => {
-            peer.close().await;
             if matches!(failure, FetchFailure::Aborted) {
                 // The local store already committed whatever it verified
                 // before the abort (bao writes verified chunks
@@ -909,12 +955,14 @@ pub(crate) async fn fetch_into_sink(
             return Err(failure);
         }
     };
-    peer.close().await;
-    if let Some(counter) = payload_moved {
-        *counter = moved;
+    if let Some(slot) = holder_node_id {
+        *slot = outcome.holder_node_id;
     }
-    // 2. Export the verified blob from the local store into the caller's
-    // sink, streaming in bounded chunks.
+    if let Some(counter) = payload_moved {
+        *counter = outcome.moved;
+    }
+    // Export the verified blob from the local store into the caller's sink,
+    // streaming in bounded chunks.
     let result = export_into_sink(store, hash, sink, export_offset).await;
     if result.is_ok() {
         // Fully delivered: the caller now holds the verified bytes, so the
@@ -922,7 +970,7 @@ pub(crate) async fn fetch_into_sink(
         // blob is GC-eligible like any other untagged content. On an abort
         // (handled above) the tag stays, so a later resume can reuse the
         // verified partial; an abandoned partial is swept by `reclaim`.
-        store.release_fetch_tag(backend).await;
+        release_fetch_protection(store, hash).await;
     }
     result
 }

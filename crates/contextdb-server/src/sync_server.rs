@@ -3,6 +3,7 @@ use crate::protocol::{
     SyncStatusResponse, decode, encode, row_payload_bytes,
 };
 use crate::subjects::{pull_subject, push_subject, status_subject};
+use crate::sync_client::refuse_keyless_tables_with_no_identity_fallback;
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
 use crate::transport::{
     HandlerRegistration, IncomingRequest, RequestHandler, Responder, ServerTransport,
@@ -10,7 +11,7 @@ use crate::transport::{
 };
 use contextdb_core::{AtomicLsn, Incarnation, Lsn, TenantId};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, SyncDirection};
+use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, SyncAdoption, SyncDirection};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -185,6 +186,7 @@ struct PushApplyWork {
     responder: Responder,
     request_key: PushRequestKey,
     changeset: ChangeSet,
+    arrivals: HashMap<Lsn, Option<Lsn>>,
     tenant_id: TenantId,
     applied_push_watermark: Arc<AtomicLsn>,
     per_edge_watermarks: Arc<PerEdgeAppliedPushWatermarks>,
@@ -377,11 +379,13 @@ impl SyncServer {
         let pull_handler = {
             let db = self.db.clone();
             let receipts = self.receipts.clone();
+            let tenant_id = self.tenant_id.clone();
             Arc::new(move |req: IncomingRequest| {
                 let db = db.clone();
                 let receipts = receipts.clone();
+                let tenant_id = tenant_id.clone();
                 Box::pin(async move {
-                    handle_pull(db, receipts, req)
+                    handle_pull(db, receipts, tenant_id, req)
                         .await
                         .map_err(to_transport_error)
                 }) as crate::transport::TransportFuture<'static, ()>
@@ -533,6 +537,7 @@ async fn handle_push(
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
     let incarnation = request.incarnation;
     let request_key = req.bytes;
+    let arrivals = crate::protocol::wire_row_arrivals(&request.changeset);
 
     match ChangeSet::try_from(request.changeset) {
         Ok(changeset) => {
@@ -545,6 +550,7 @@ async fn handle_push(
                 responder: req.responder,
                 request_key,
                 changeset,
+                arrivals,
                 tenant_id: state.tenant_id.clone(),
                 applied_push_watermark: state.applied_push_watermark.clone(),
                 per_edge_watermarks: state.per_edge_watermarks.clone(),
@@ -568,6 +574,7 @@ async fn handle_push(
 async fn handle_pull(
     db: Arc<Database>,
     receipts: Arc<TransferLedger>,
+    tenant_id: TenantId,
     req: IncomingRequest,
 ) -> contextdb_core::Result<()> {
     let envelope =
@@ -580,7 +587,14 @@ async fn handle_pull(
 
     let request: PullRequest = rmp_serde::from_slice(&envelope.payload)
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
-    let mut changes = db.changes_since(request.since_lsn);
+
+    // Refuse pull if the hub has keyless tables that would sync. The changeset
+    // cannot represent their rows (which lack a natural key), so silently omitting
+    // them would make the pull incomplete. The fix-up is the same as for push:
+    // declare a PRIMARY KEY, add an indexed `id` column, or set SYNC OFF.
+    refuse_keyless_tables_with_no_identity_fallback(&db, &HashMap::new())?;
+
+    let (mut changes, arrivals) = db.changes_since_with_arrivals(request.since_lsn);
 
     let mut has_more = false;
     if let Some(max_entries) = request.max_entries {
@@ -669,10 +683,16 @@ async fn handle_pull(
         changes.rows.len() as u64,
         row_payload_bytes(&changes.rows),
     );
+    // Propagate sync_incarnation errors rather than silently converting to None --
+    // a client holding a source-bound cursor cannot validate the identity if
+    // the response carries no source. Missing source identity is not idempotent
+    // with the stored cursor binding.
+    let source = db.sync_incarnation(&tenant_id)?;
     let response = PullResponse {
-        changeset: changes.into(),
+        changeset: crate::protocol::wire_changeset_with_arrivals(changes, &arrivals),
         has_more,
         cursor,
+        source: Some(source),
     };
     let payload = encode(MessageType::PullResponse, &response)
         .map_err(|e| contextdb_core::Error::SyncError(e.to_string()))?;
@@ -720,6 +740,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         responder,
         request_key,
         changeset,
+        arrivals,
         tenant_id,
         applied_push_watermark,
         per_edge_watermarks,
@@ -764,7 +785,16 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         let response = match apply_permits.acquire_owned().await {
             Ok(_permit) => {
                 match tokio::task::spawn_blocking(move || {
-                    let result = db.apply_changes(changeset, &policies)?;
+                    // A push has no cursor to re-adopt against — a hub never
+                    // detects "my own source changed," only a pulling client
+                    // does (see `SyncClient::pull`). Every push apply is the
+                    // ordinary, continuing case.
+                    let result = db.apply_synced_changes(
+                        changeset,
+                        &policies,
+                        &arrivals,
+                        SyncAdoption::Continuing,
+                    )?;
                     if let Some(max_lsn) = push_max_lsn {
                         // What this hub now holds FROM THIS EDGE. Raised only
                         // after the apply committed, so the number the status

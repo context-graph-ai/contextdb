@@ -42,6 +42,13 @@ mdns = ["dep:iroh-mdns-address-lookup"]
 # HTTP client that downstream dependency policies exclude. Self-builders who
 # want it enable the transport library's own feature at build time:
 #   cargo build --release -p contextdb-server --features iroh/portmapper
+# The internal test seam (harness-only accessors on `BlobStore`, e.g. arming a
+# fetch to stand in for a stuck internal await). Off by default, so a
+# downstream build of this crate cannot see or call it. The self-dependency
+# below turns it on for this crate's OWN test targets, which is what lets the
+# seam tests run in the default `cargo test -p contextdb-server` gate without
+# the accessor existing for anyone else.
+test-seams = []
 
 [[bin]]
 name = "contextdb-server"
@@ -103,6 +110,9 @@ tempfile = "3"
 uuid = { workspace = true }
 tokio.workspace = true
 roaring.workspace = true
+# Depending on ourselves with `test-seams` on enables the feature when Cargo
+# builds this crate's own test targets, and only then.
+contextdb-server = { path = ".", features = ["test-seams"] }
 
 [[test]]
 name = "iroh_transport_tests"

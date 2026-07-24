@@ -1,5 +1,38 @@
-//! Measurement driver for the bounded-tables + transfer-receipts live-smoke
-//! (`scripts/bounded-tables-live-smoke.sh`).
+//! Measurement driver for the bounded-tables + transfer-receipts live-smoke.
+//!
+//! There is no companion shell script in this repo — run the subcommands
+//! below directly (`cargo run --release -p contextdb-server --example
+//! bounded_tables_smoke -- <subcommand> --help` lists every flag for a
+//! given step):
+//!
+//! - `probe` / `keyless-probe` — read back a database's retained-table
+//!   declaration, or confirm the engine refuses the literal keyless shape.
+//! - `hub` — run a real sync hub (file-backed database, real `SyncServer`
+//!   over iroh, publishes an enrollment ticket + status file).
+//! - `s1-lifecycle` / `s1-restore` — retention lifecycle: write, push, let
+//!   the engine's own retention prune fire, pull; then a full worker wipe
+//!   and restore pull.
+//! - `s2-offline` — an offline worker keeps its unconfirmed backlog past the
+//!   retention window and prunes only after reconnect + confirmed push.
+//! - `s3-plateau` / `s3-reclaim` — steady write-and-expire churn across
+//!   retention cycles, then the prune/reclaim report (bytes reclaimed,
+//!   file shrink after compaction).
+//! - `s4-size` — the per-table size estimate tracked against inserts and
+//!   prunes.
+//! - `s5-sync` / `blob-holder` / `blob-fetch` — the sync and blob transfer
+//!   planes (row batches, and holder/fetcher blob transfer with receipts).
+//! - `s6-audit` — a trigger-heavy workload plus retention cycles, checked
+//!   against the engine's durable trigger-audit bound.
+//! - `currency-control-growth` / `currency-plateau` /
+//!   `currency-debris-first-pass` — the currency-version cleanup arms: an
+//!   unbounded control table, the shipped currency table under real
+//!   maintenance, and a one-shot pass over an already-accumulated debris
+//!   backlog.
+//!
+//! A typical run brings up a `hub`, then drives `s1-lifecycle` /
+//! `s2-offline` / `s3-plateau` / … against it from a separate edge database
+//! pointed at the hub's published ticket, reading each step's printed
+//! `key=value` measurement lines.
 //!
 //! This binary is a CALLER of the public library surface — the same shape as
 //! `examples/media_transfer_fabric_demo.rs`. It runs the real product path: a
@@ -119,6 +152,13 @@ fn control_ddl() -> String {
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
+}
+
+/// Convenience for the bounded-disk / debris-first-pass scenarios below,
+/// which bind more parameters per statement than the rest of this file's
+/// hand-built-`HashMap` style is worth repeating for.
+fn params(pairs: Vec<(String, Value)>) -> HashMap<String, Value> {
+    pairs.into_iter().collect()
 }
 
 /// Wall-clock milliseconds for values that get PERSISTED — work-ledger job
@@ -527,6 +567,53 @@ enum Command {
         db_path: PathBuf,
         #[arg(long)]
         firings_per_round: u64,
+        /// Real seconds the durable trigger-audit window is shrunk to via
+        /// `Database::set_trigger_audit_retention`, so this scenario ages
+        /// rows out under the real wall clock like every other retained
+        /// table in this smoke.
+        #[arg(long, default_value_t = 8)]
+        retain_secs: u64,
+    },
+    /// Bounded-disk control arm: the identical upsert-churn shape on a table
+    /// that is NEVER compaction-eligible, so a bounded declared-arm result
+    /// elsewhere is not a tautology about a workload that was never going to
+    /// grow in the first place.
+    CurrencyControlGrowth {
+        #[arg(long)]
+        db_path: PathBuf,
+        #[arg(long)]
+        small_versions: u64,
+        #[arg(long)]
+        large_versions: u64,
+    },
+    /// Bounded-disk declared arm: churns the shipped built-in currency table
+    /// (`work_capabilities`, already compaction-eligible today via the
+    /// hardcoded table list) under the engine's OWN maintenance loop at the
+    /// shipped, unshortened tick, alongside ballast, sampling file size and
+    /// physical version count continuously.
+    CurrencyPlateau {
+        #[arg(long)]
+        db_path: PathBuf,
+        /// 1 = small ballast, 20 = large ballast (both arms run the
+        /// identical currency-table churn; only ballast size differs).
+        #[arg(long)]
+        ballast_multiplier: usize,
+        #[arg(long)]
+        cycles: u64,
+        #[arg(long)]
+        cycle_secs: u64,
+        #[arg(long)]
+        writes_per_second: u64,
+    },
+    /// The first pass over an already-accumulated debris ledger: build the
+    /// backlog directly (representing many real cycles' worth of missed
+    /// compaction), then drive exactly one synchronous cleanup cycle and
+    /// report its cost.
+    CurrencyDebrisFirstPass {
+        #[arg(long)]
+        db_path: PathBuf,
+        #[arg(long)]
+        backlog_versions: u64,
     },
 }
 
@@ -708,7 +795,33 @@ async fn main() {
         Command::S6Audit {
             db_path,
             firings_per_round,
-        } => run_s6_audit(&db_path, firings_per_round),
+            retain_secs,
+        } => run_s6_audit(&db_path, firings_per_round, retain_secs),
+        Command::CurrencyControlGrowth {
+            db_path,
+            small_versions,
+            large_versions,
+        } => run_currency_control_growth(&db_path, small_versions, large_versions),
+        Command::CurrencyPlateau {
+            db_path,
+            ballast_multiplier,
+            cycles,
+            cycle_secs,
+            writes_per_second,
+        } => {
+            run_currency_plateau(
+                &db_path,
+                ballast_multiplier,
+                cycles,
+                cycle_secs,
+                writes_per_second,
+            )
+            .await
+        }
+        Command::CurrencyDebrisFirstPass {
+            db_path,
+            backlog_versions,
+        } => run_currency_debris_first_pass(&db_path, backlog_versions),
     }
 }
 
@@ -1708,7 +1821,7 @@ async fn run_blob_fetch(
 // S6 — the engine's own durable trigger audit stays bounded
 // ---------------------------------------------------------------------------
 
-fn run_s6_audit(db_path: &Path, firings_per_round: u64) {
+fn run_s6_audit(db_path: &Path, firings_per_round: u64, retain_secs: u64) {
     let db = match Database::open(db_path) {
         Ok(db) => db,
         Err(err) => die("open the audit database", err),
@@ -1726,6 +1839,15 @@ fn run_s6_audit(db_path: &Path, firings_per_round: u64) {
         die("complete initialization", err);
     }
 
+    // Shrink the durable trigger-audit window to a real, seconds-scale
+    // operator-declared value via the shipped open-config setter, then age
+    // rows out under the real wall clock -- exactly like every other
+    // retained table in this smoke (S1-S4). No clock mock anywhere in this
+    // scenario.
+    if let Err(err) = db.set_trigger_audit_retention(Duration::from_secs(retain_secs)) {
+        die("declare the durable audit retention", err);
+    }
+
     let ring = db.trigger_audit_ring_capacity();
     let retention = match db.trigger_audit_retention() {
         Some(retention) => retention,
@@ -1733,33 +1855,6 @@ fn run_s6_audit(db_path: &Path, firings_per_round: u64) {
     };
     emit("s6.ring_capacity", ring);
     emit("s6.retention_secs", retention.as_secs());
-
-    // DELIBERATE DEVIATION from this smoke's blanket "no clock mocking" rule,
-    // explained in place so a reviewer sees why it is justified here.
-    //
-    // Why the clause exists: `Wallclock`'s override is thread-local, so an
-    // engine BACKGROUND thread never sees it — mocking time to prove background
-    // retention would be a false green. That risk does not exist here: the two
-    // maintenance cycles below are driven SYNCHRONOUSLY on this very thread,
-    // which is the one place the override is genuinely honoured, and the rows
-    // being aged were stamped on this thread too.
-    //
-    // Why it is unavoidable: the durable trigger-audit window is the hardcoded
-    // `TRIGGER_AUDIT_RETENTION` = 7 days, with a read-only getter and NO setter
-    // or operator surface anywhere, so no real-time run can ever reach it.
-    //
-    // Scope: S6 ONLY, and only for the duration of this function's guard. Every
-    // retained-table window elsewhere in this smoke (S1/S2/S3/S4) is real
-    // wall-clock seconds against the engine's own unshortened 60s loop and
-    // touches no mock whatsoever.
-    let window_ms = retention.as_millis() as u64;
-    let base = now_ms() as u64;
-    let clock = Arc::new(AtomicU64::new(base));
-    let _guard = {
-        let clock = clock.clone();
-        Wallclock::test_clock_guard(move || clock.load(Ordering::SeqCst))
-    };
-    emit("s6.clock_override_scope", "s6_only_driven_cycle");
 
     let fire = |db: &Database, start: i64, count: u64| {
         for i in 0..count {
@@ -1785,9 +1880,10 @@ fn run_s6_audit(db_path: &Path, firings_per_round: u64) {
     emit("s6.history_after_flood", history_len(&db));
     emit("s6.ring_len_after_flood", db.trigger_audit_log().len());
 
-    // Round 1: age everything past the window, fire a fresh batch, drive a
-    // cycle. What survives is exactly the current window's firings.
-    clock.fetch_add(window_ms * 2, Ordering::SeqCst);
+    // Round 1: wait out the real declared window so round 0's rows are
+    // genuinely stale, fire a fresh batch, drive a cycle. What survives is
+    // exactly the current window's firings.
+    std::thread::sleep(Duration::from_secs(retain_secs + 3));
     fire(&db, 100_000, firings_per_round);
     let first = match db.run_maintenance_cycle() {
         Ok(report) => report,
@@ -1800,9 +1896,9 @@ fn run_s6_audit(db_path: &Path, firings_per_round: u64) {
     let after_first = history_len(&db);
     emit("s6.history_after_round1", after_first);
 
-    // Round 2: identical churn. A durable audit that accumulates would grow;
-    // a bounded one plateaus.
-    clock.fetch_add(window_ms * 2, Ordering::SeqCst);
+    // Round 2: identical churn, waiting out the same real window. A durable
+    // audit that accumulates would grow; a bounded one plateaus.
+    std::thread::sleep(Duration::from_secs(retain_secs + 3));
     fire(&db, 200_000, firings_per_round);
     let second = match db.run_maintenance_cycle() {
         Ok(report) => report,
@@ -1818,4 +1914,541 @@ fn run_s6_audit(db_path: &Path, firings_per_round: u64) {
     emit("s6.ring_len_final", db.trigger_audit_log().len());
     let _ = db.close();
     emit("s6.done", 1);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded disk under real currency-table churn (the engine's own maintenance
+// loop, the shipped 60s tick, no shortened interval) + the first pass over
+// an already-accumulated debris ledger.
+//
+// The declared arm below exercises the shipped built-in `work_capabilities`
+// table -- already compaction-eligible today via the hardcoded
+// `VERSION_COMPACTION_TABLES` list -- rather than a `HISTORY CURRENT ONLY`
+// declared table: broadening eligibility to an arbitrary declared table is a
+// separate, not-yet-landed piece of this work. This exercises the real,
+// already-eligible mechanism honestly instead of inventing a stand-in that
+// would run through code that does not exist yet.
+// ---------------------------------------------------------------------------
+
+/// The currency table these scenarios churn: the shipped built-in, already
+/// eligible for compaction via the hardcoded table list.
+const CURRENCY_TABLE: &str = "work_capabilities";
+/// A plain table with the IDENTICAL upsert-churn shape but never
+/// compaction-eligible -- the control that proves the workload really would
+/// grow the file without bound.
+const CURRENCY_CONTROL_TABLE: &str = "currency_control";
+/// Logical rows the churned currency table holds throughout every scenario
+/// below.
+const CURRENCY_LOGICAL_ROWS: u64 = 10;
+
+/// One sampler reading: (elapsed_secs, file_bytes, physical_versions, live_rows).
+type PlateauSample = (u64, u64, usize, i64);
+
+fn currency_control_ddl() -> String {
+    format!(
+        "CREATE TABLE {CURRENCY_CONTROL_TABLE} (\
+            capability_key TEXT PRIMARY KEY, \
+            node_id        TEXT, \
+            capability_id  TEXT, \
+            advertised_at  INTEGER\
+        )"
+    )
+}
+
+fn advertise_work_capability(db: &Database, key: &str, capability_id: &str, advertised_at: i64) {
+    if let Err(err) = db.execute(
+        &format!(
+            "INSERT INTO {CURRENCY_TABLE} \
+             (capability_key, node_id, capability_id, tags, detail, advertised_at) \
+             VALUES ($k, $node_id, $capability_id, $tags, NULL, $advertised_at) \
+             ON CONFLICT (capability_key) DO UPDATE SET \
+             advertised_at = $advertised_at, node_id = $node_id, capability_id = $capability_id"
+        ),
+        &params(vec![
+            ("k".to_string(), Value::Text(key.to_string())),
+            ("node_id".to_string(), Value::Text(key.to_string())),
+            (
+                "capability_id".to_string(),
+                Value::Text(capability_id.to_string()),
+            ),
+            ("tags".to_string(), Value::Json(serde_json::json!([]))),
+            ("advertised_at".to_string(), Value::Timestamp(advertised_at)),
+        ]),
+    ) {
+        die("advertise a work capability", err);
+    }
+}
+
+fn advertise_control(db: &Database, key: &str, capability_id: &str, advertised_at: i64) {
+    if let Err(err) = db.execute(
+        &format!(
+            "INSERT INTO {CURRENCY_CONTROL_TABLE} \
+             (capability_key, node_id, capability_id, advertised_at) \
+             VALUES ($k, $node_id, $capability_id, $advertised_at) \
+             ON CONFLICT (capability_key) DO UPDATE SET \
+             advertised_at = $advertised_at, node_id = $node_id, capability_id = $capability_id"
+        ),
+        &params(vec![
+            ("k".to_string(), Value::Text(key.to_string())),
+            ("node_id".to_string(), Value::Text(key.to_string())),
+            (
+                "capability_id".to_string(),
+                Value::Text(capability_id.to_string()),
+            ),
+            ("advertised_at".to_string(), Value::Int64(advertised_at)),
+        ]),
+    ) {
+        die("advertise into the control table", err);
+    }
+}
+
+/// Ballast the currency-table cleanup has no business touching: an unrelated
+/// vector-bearing table, unrelated graph edges, and an unrelated plain
+/// undeclared table -- declared once, only if absent (so a reopened arm
+/// does not re-declare).
+fn seed_currency_ballast(db: &Database, vector_rows: usize, edge_count: usize, plain_rows: usize) {
+    if db.table_meta("currency_ballast_vectors").is_none() {
+        if let Err(err) = db.execute(
+            "CREATE TABLE currency_ballast_vectors (id INTEGER PRIMARY KEY, embedding VECTOR(8))",
+            &p(),
+        ) {
+            die("create the currency ballast vector table", err);
+        }
+        for i in 0..vector_rows {
+            if let Err(err) = db.execute(
+                "INSERT INTO currency_ballast_vectors (id, embedding) VALUES ($id, $embedding)",
+                &params(vec![
+                    ("id".to_string(), Value::Int64(i as i64)),
+                    ("embedding".to_string(), Value::Vector(vec![0.25_f32; 8])),
+                ]),
+            ) {
+                die("insert a currency ballast vector row", err);
+            }
+        }
+    }
+    if edge_count > 0 {
+        let tx = db.begin_or_panic();
+        for i in 0..edge_count {
+            if let Err(err) = db.insert_edge(
+                tx,
+                uuid::Uuid::from_u128(0xCBA1_0000_0000_0000_0000_0000_0000_0000 + i as u128),
+                uuid::Uuid::from_u128(0xCBA2_0000_0000_0000_0000_0000_0000_0000 + i as u128),
+                "ballast".to_string(),
+                HashMap::new(),
+            ) {
+                die("insert a currency ballast edge", err);
+            }
+        }
+        if let Err(err) = db.commit(tx) {
+            die("commit currency ballast edges", err);
+        }
+    }
+    if db.table_meta("currency_ballast_plain").is_none() {
+        if let Err(err) = db.execute(
+            "CREATE TABLE currency_ballast_plain (id INTEGER PRIMARY KEY, body TEXT)",
+            &p(),
+        ) {
+            die("create the currency ballast plain table", err);
+        }
+        for i in 0..plain_rows {
+            if let Err(err) = db.execute(
+                "INSERT INTO currency_ballast_plain (id, body) VALUES ($id, $body)",
+                &params(vec![
+                    ("id".to_string(), Value::Int64(i as i64)),
+                    ("body".to_string(), Value::Text(format!("ballast-row-{i}"))),
+                ]),
+            ) {
+                die("insert a currency ballast plain row", err);
+            }
+        }
+    }
+}
+
+/// Bounded-disk control arm: the SAME 10-logical-row upsert-churn shape, on
+/// a table row-version cleanup never touches. Two checkpoints (small, then
+/// large) so the shell script can assert the file genuinely keeps growing --
+/// the workload is the right one to prove a bounded declared arm elsewhere
+/// is not a tautology.
+fn run_currency_control_growth(db_path: &Path, small_versions: u64, large_versions: u64) {
+    let db = match Database::open(db_path) {
+        Ok(db) => db,
+        Err(err) => die("open the currency-control database", err),
+    };
+    if db.table_meta(CURRENCY_CONTROL_TABLE).is_none()
+        && let Err(err) = db.execute(&currency_control_ddl(), &p())
+    {
+        die("declare the currency control table", err);
+    }
+
+    let writes_per_row_small = small_versions / CURRENCY_LOGICAL_ROWS;
+    for row in 0..CURRENCY_LOGICAL_ROWS {
+        let key = format!("row-{row}");
+        for v in 0..writes_per_row_small {
+            advertise_control(&db, &key, &format!("cap-{v}"), v as i64);
+        }
+    }
+    emit(
+        "currency_control.file_bytes_after_small",
+        db.disk_file_size().unwrap_or(0),
+    );
+    emit(
+        "currency_control.physical_versions_after_small",
+        db.__physical_version_count_for_test(CURRENCY_CONTROL_TABLE),
+    );
+
+    let writes_per_row_large = large_versions / CURRENCY_LOGICAL_ROWS;
+    for row in 0..CURRENCY_LOGICAL_ROWS {
+        let key = format!("row-{row}");
+        for v in writes_per_row_small..writes_per_row_large {
+            advertise_control(&db, &key, &format!("cap-{v}"), v as i64);
+        }
+    }
+    emit(
+        "currency_control.file_bytes_after_large",
+        db.disk_file_size().unwrap_or(0),
+    );
+    emit(
+        "currency_control.physical_versions_after_large",
+        db.__physical_version_count_for_test(CURRENCY_CONTROL_TABLE),
+    );
+    let _ = db.close();
+    emit("currency_control.done", 1);
+}
+
+/// Bounded-disk declared arm: the engine's OWN maintenance loop, the shipped
+/// 60s tick, real wall-clock cycles -- no manual `compact_currency_versions`
+/// call drives the steady sampling loop below. Mirrors S3Plateau's sampler +
+/// concurrent-writer shape.
+#[allow(clippy::too_many_arguments)]
+async fn run_currency_plateau(
+    db_path: &Path,
+    ballast_multiplier: usize,
+    cycles: u64,
+    cycle_secs: u64,
+    writes_per_second: u64,
+) {
+    let db = match Database::open(db_path) {
+        Ok(db) => Arc::new(db),
+        Err(err) => die("open the currency plateau database", err),
+    };
+    if db.table_meta(CURRENCY_TABLE).is_none()
+        && let Err(err) = install_work_ledger_schema(&db)
+    {
+        die("install the work ledger schema", err);
+    }
+
+    let vector_rows = 1_000 * ballast_multiplier;
+    let edge_count = 2_000 * ballast_multiplier;
+    let plain_rows = 10_000 * ballast_multiplier;
+    seed_currency_ballast(&db, vector_rows, edge_count, plain_rows);
+    emit("currency_plateau.ballast_multiplier", ballast_multiplier);
+    emit("currency_plateau.vector_ballast_rows", vector_rows);
+    emit("currency_plateau.edge_ballast_count", edge_count);
+    emit("currency_plateau.plain_ballast_rows", plain_rows);
+
+    // Seed the 10 logical rows once, up front, so the currency table exists
+    // and is eligible before the engine's loop takes its first tick.
+    for row in 0..CURRENCY_LOGICAL_ROWS {
+        advertise_work_capability(&db, &format!("row-{row}"), "seed", 1_700_000_000_000);
+    }
+
+    let status = db.maintenance_status();
+    emit(
+        "currency_plateau.maintenance_running_at_open",
+        status.running,
+    );
+    emit(
+        "currency_plateau.currency_compaction_enabled_at_open",
+        status.currency_compaction_enabled,
+    );
+
+    // D-3's "after the first 10,000" baseline: a burst BEFORE steady
+    // sampling starts, so the flat-vs-climbing comparison has an early
+    // checkpoint distinct from the run's settled/final size.
+    let mut version_counter: u64 = 0;
+    while version_counter < 10_000 {
+        let row = version_counter % CURRENCY_LOGICAL_ROWS;
+        advertise_work_capability(
+            &db,
+            &format!("row-{row}"),
+            &format!("burst-{version_counter}"),
+            1_700_000_100_000 + version_counter as i64,
+        );
+        version_counter += 1;
+    }
+    emit(
+        "currency_plateau.file_bytes_after_10k",
+        db.disk_file_size().unwrap_or(0),
+    );
+    emit(
+        "currency_plateau.physical_versions_after_10k",
+        db.__physical_version_count_for_test(CURRENCY_TABLE),
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let max_gap_ms = Arc::new(AtomicU64::new(0));
+    let writes = Arc::new(AtomicU64::new(0));
+
+    // Continuous file-size + physical-version + live-row sampler, same
+    // sawtooth-aware shape as S3Plateau: judge each cycle on its PEAK
+    // (provisioning ceiling) and TROUGH (settled, post-compaction size).
+    let samples: Arc<std::sync::Mutex<Vec<PlateauSample>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sampler = {
+        let db = db.clone();
+        let stop = stop.clone();
+        let samples = samples.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !stop.load(Ordering::SeqCst) {
+                let bytes = db.disk_file_size().unwrap_or(0);
+                let physical_versions = db.__physical_version_count_for_test(CURRENCY_TABLE);
+                let live_rows = row_count_fast(&db, CURRENCY_TABLE);
+                samples.lock().unwrap_or_else(|err| err.into_inner()).push((
+                    start.elapsed().as_secs(),
+                    bytes,
+                    physical_versions,
+                    live_rows,
+                ));
+                std::thread::sleep(FILE_SAMPLE_INTERVAL);
+            }
+        })
+    };
+
+    // A concurrent writer churning the currency table's own logical rows,
+    // recording the longest gap between its own successive committed
+    // writes -- a prune/compaction pause that stalled writers shows up here
+    // as observed state.
+    let writer = {
+        let db = db.clone();
+        let stop = stop.clone();
+        let max_gap_ms = max_gap_ms.clone();
+        let writes = writes.clone();
+        let interval = Duration::from_micros(1_000_000 / writes_per_second.max(1));
+        std::thread::spawn(move || {
+            let mut n: u64 = 1_000_000;
+            let mut last = Instant::now();
+            while !stop.load(Ordering::SeqCst) {
+                let row = n % CURRENCY_LOGICAL_ROWS;
+                advertise_work_capability(
+                    &db,
+                    &format!("row-{row}"),
+                    &format!("churn-{n}"),
+                    1_700_000_200_000 + n as i64,
+                );
+                n += 1;
+                writes.fetch_add(1, Ordering::SeqCst);
+                let gap = last.elapsed().as_millis() as u64;
+                max_gap_ms.fetch_max(gap, Ordering::SeqCst);
+                last = Instant::now();
+                std::thread::sleep(interval);
+            }
+        })
+    };
+
+    for cycle in 1..=cycles {
+        tokio::time::sleep(Duration::from_secs(cycle_secs)).await;
+        let cycle_samples: Vec<PlateauSample> = {
+            let mut held = samples.lock().unwrap_or_else(|err| err.into_inner());
+            std::mem::take(&mut *held)
+        };
+        let trace = cycle_samples
+            .iter()
+            .map(|(at, bytes, versions, rows)| format!("{at}s:{bytes}b/{versions}v/{rows}r"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        emit(&format!("currency_plateau.cycle{cycle}.trace"), trace);
+        emit(
+            &format!("currency_plateau.cycle{cycle}.peak_file_bytes"),
+            cycle_samples
+                .iter()
+                .map(|(_, b, _, _)| *b)
+                .max()
+                .unwrap_or(0),
+        );
+        let trough = cycle_samples
+            .iter()
+            .min_by_key(|(_, bytes, _, _)| *bytes)
+            .copied()
+            .unwrap_or((0, 0, 0, 0));
+        emit(
+            &format!("currency_plateau.cycle{cycle}.trough_file_bytes"),
+            trough.1,
+        );
+        emit(
+            &format!("currency_plateau.cycle{cycle}.trough_physical_versions"),
+            trough.2,
+        );
+        emit(
+            &format!("currency_plateau.cycle{cycle}.trough_live_rows"),
+            trough.3,
+        );
+        emit(
+            &format!("currency_plateau.cycle{cycle}.peak_physical_versions"),
+            cycle_samples
+                .iter()
+                .map(|(_, _, versions, _)| *versions)
+                .max()
+                .unwrap_or(0),
+        );
+        emit(
+            &format!("currency_plateau.cycle{cycle}.peak_live_rows"),
+            cycle_samples
+                .iter()
+                .map(|(_, _, _, rows)| *rows)
+                .max()
+                .unwrap_or(0),
+        );
+        emit(
+            &format!("currency_plateau.cycle{cycle}.file_bytes"),
+            db.disk_file_size().unwrap_or(0),
+        );
+        emit(
+            &format!("currency_plateau.cycle{cycle}.physical_versions"),
+            db.__physical_version_count_for_test(CURRENCY_TABLE),
+        );
+        emit(
+            &format!("currency_plateau.cycle{cycle}.live_rows"),
+            row_count(&db, CURRENCY_TABLE),
+        );
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = writer.join();
+    let _ = sampler.join();
+    emit(
+        "currency_plateau.file_sample_interval_secs",
+        FILE_SAMPLE_INTERVAL.as_secs(),
+    );
+    emit(
+        "currency_plateau.writer_writes_total",
+        writes.load(Ordering::SeqCst),
+    );
+    emit(
+        "currency_plateau.writer_max_gap_ms",
+        max_gap_ms.load(Ordering::SeqCst),
+    );
+    emit(
+        "currency_plateau.maintenance_running_final",
+        db.maintenance_status().running,
+    );
+    emit(
+        "currency_plateau.file_bytes_final",
+        db.disk_file_size().unwrap_or(0),
+    );
+
+    // D-5: physical_versions == live_rows immediately after a SYNCHRONOUS
+    // cycle -- driven explicitly here, once, as the design's own carve-out
+    // for this specific assertion (mirrors S3Reclaim's driven-cycle
+    // pattern); every other number above came from the engine's own loop,
+    // never a manual call.
+    let sync_report = match db.compact_currency_versions() {
+        Ok(report) => report,
+        Err(err) => die("drive the final synchronous currency cycle", err),
+    };
+    emit(
+        "currency_plateau.sync_cycle.pruned_versions",
+        sync_report.pruned_versions,
+    );
+    emit(
+        "currency_plateau.sync_cycle.physical_versions_after",
+        db.__physical_version_count_for_test(CURRENCY_TABLE),
+    );
+    emit(
+        "currency_plateau.sync_cycle.live_rows_after",
+        row_count(&db, CURRENCY_TABLE),
+    );
+
+    // D-8's building blocks: the shell script computes the ballast-adjusted
+    // comparison between a small-ballast and large-ballast run from these
+    // per-arm numbers (this process is ONE arm; the script invokes this
+    // scenario twice, once per ballast multiplier).
+    match db.table_size_estimate("currency_ballast_vectors") {
+        Some(estimate) => emit(
+            "currency_plateau.ballast_vectors_estimated_bytes",
+            estimate.estimated_live_bytes,
+        ),
+        None => emit("currency_plateau.ballast_vectors_estimated_bytes", 0),
+    }
+    match db.table_size_estimate("currency_ballast_plain") {
+        Some(estimate) => emit(
+            "currency_plateau.ballast_plain_estimated_bytes",
+            estimate.estimated_live_bytes,
+        ),
+        None => emit("currency_plateau.ballast_plain_estimated_bytes", 0),
+    }
+
+    let _ = db.close();
+    emit("currency_plateau.done", 1);
+}
+
+/// The first pass over an already-accumulated debris ledger (DEBRIS group):
+/// build the backlog directly -- representing many real cycles' worth of
+/// missed compaction -- then drive exactly ONE synchronous cleanup cycle and
+/// report commit-lock hold time and redb-compaction time as SEPARATE
+/// numbers. Currency version cleanup never compacts on its own (see
+/// `Database::compact_now`'s doc comment) -- the scoped cleanup pass's own
+/// numbers come from `compact_currency_versions()`; the file-shrink numbers
+/// come from a SEPARATE, explicit `compact_now()` call this scenario makes
+/// right after, exactly the operator action a real debris-ledger first pass
+/// would take (`cg`'s own `.maintenance compact`).
+fn run_currency_debris_first_pass(db_path: &Path, backlog_versions: u64) {
+    let db = match Database::open(db_path) {
+        Ok(db) => db,
+        Err(err) => die("open the currency debris database", err),
+    };
+    if db.table_meta(CURRENCY_TABLE).is_none()
+        && let Err(err) = install_work_ledger_schema(&db)
+    {
+        die("install the work ledger schema", err);
+    }
+
+    let writes_per_row = backlog_versions / CURRENCY_LOGICAL_ROWS;
+    for row in 0..CURRENCY_LOGICAL_ROWS {
+        let key = format!("row-{row}");
+        for v in 0..writes_per_row {
+            advertise_work_capability(&db, &key, &format!("cap-{v}"), 1_700_000_000_000 + v as i64);
+        }
+    }
+    emit(
+        "currency_debris.file_bytes_before_pass",
+        db.disk_file_size().unwrap_or(0),
+    );
+    emit(
+        "currency_debris.physical_versions_before_pass",
+        db.__physical_version_count_for_test(CURRENCY_TABLE),
+    );
+
+    let report = match db.compact_currency_versions() {
+        Ok(report) => report,
+        Err(err) => die("drive the first debris compaction pass", err),
+    };
+    emit("currency_debris.pruned_versions", report.pruned_versions);
+    emit(
+        "currency_debris.commit_lock_hold_micros",
+        report.commit_lock_hold_micros,
+    );
+    // Currency version cleanup itself never compacts (see
+    // `Database::compact_now`'s doc comment): the explicit operator action
+    // below is what actually reclaims the file, reported as its own,
+    // separate receipt.
+    let compaction = match db.compact_now() {
+        Ok(compaction) => compaction,
+        Err(err) => die("compact the debris ledger explicitly", err),
+    };
+    emit("currency_debris.redb_compacted", compaction.ran);
+    emit(
+        "currency_debris.redb_compact_micros",
+        compaction.duration_micros,
+    );
+    emit(
+        "currency_debris.file_bytes_after_pass",
+        db.disk_file_size().unwrap_or(0),
+    );
+    emit(
+        "currency_debris.physical_versions_after_pass",
+        db.__physical_version_count_for_test(CURRENCY_TABLE),
+    );
+    let _ = db.close();
+    emit("currency_debris.done", 1);
 }

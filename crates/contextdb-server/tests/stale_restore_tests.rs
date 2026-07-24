@@ -11,12 +11,12 @@
 //! restored (stale) server's regression goes undetected. sr4–sr8 are
 //! regression guards.
 
-use contextdb_core::{Incarnation, Lsn, Value};
+use contextdb_core::{Lsn, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_server::protocol::{
     MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireApplyResult,
-    WireChangeSet, WireNaturalKey, WireRowChange, decode, encode,
+    WireChangeSet, decode, encode,
 };
 use contextdb_server::{SyncClient, SyncServer};
 use std::collections::{BTreeSet, HashMap};
@@ -735,131 +735,11 @@ async fn sr6_guard_new_client_with_old_server_completes_bounded_and_inert() {
     stop_server(server_gen).await;
 }
 
-// ======== sr7 — REGRESSION GUARD: the wire bytes are frozen at PROTOCOL_VERSION 5 ========
-//
-// These hex constants are the actual encoder output for a fixed, fully
-// deterministic fixture (single-entry maps only). They are a snapshot guard: any
-// field add/remove/reorder, MessageType name change, or PROTOCOL_VERSION bump
-// changes these bytes, so an UNINTENDED wire change fails here loudly. The
-// wire-incarnation change deliberately reshaped this surface — PushRequest gained
-// a trailing incarnation field and every envelope's version byte went 4→5 (a
-// clean break; a peer speaking the old version is rejected at the envelope
-// version check, not by struct shape) — so the constants were regenerated to the
-// true new v5 encoding and re-frozen here.
-
-fn wire_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-const PUSH_REQUEST_WIRE: &str = "9305ab5075736852657175657374dc0029cc92cc95cc90cc90cc91cc96cca174cc93cca26964cc81cca5496e74363407cc90cc81cca26964cc81cca5496e74363407ccc207ccc0cc90cc90cc920000";
-const PUSH_RESPONSE_WIRE: &str = "9305ac50757368526573706f6e736597cc92cc940100cc9007ccc0";
-const PULL_REQUEST_WIRE: &str = "9305ab50756c6c5265717565737495cc922acccd01ccf4";
-const PULL_RESPONSE_WIRE: &str =
-    "9305ac50756c6c526573706f6e736599cc93cc95cc90cc90cc90cc90cc90ccc22a";
-
-#[test]
-fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
-    // PushRequest: one row, single-entry values map (deterministic encoding).
-    let row = WireRowChange {
-        table: "t".to_string(),
-        natural_key: WireNaturalKey {
-            column: "id".to_string(),
-            value: Value::Int64(7),
-            rest: Vec::new(),
-        },
-        values: HashMap::from([("id".to_string(), Value::Int64(7))]),
-        deleted: false,
-        lsn: Lsn(7),
-        created_at: None,
-    };
-    let push_request = PushRequest {
-        changeset: WireChangeSet {
-            ddl: Vec::new(),
-            ddl_lsn: Vec::new(),
-            rows: vec![row],
-            edges: Vec::new(),
-            vectors: Vec::new(),
-        },
-        incarnation: Incarnation::default(),
-    };
-    let push_request_bytes = encode(MessageType::PushRequest, &push_request).unwrap();
-    assert_eq!(
-        wire_hex(&push_request_bytes),
-        PUSH_REQUEST_WIRE,
-        "PushRequest wire bytes changed — old servers cannot decode a reshaped \
-         push request; existing subjects must stay byte-identical"
-    );
-    let envelope = decode(&push_request_bytes).unwrap();
-    let decoded: PushRequest = rmp_serde::from_slice(&envelope.payload).unwrap();
-    assert_eq!(
-        decoded, push_request,
-        "pinned PushRequest bytes must round-trip"
-    );
-
-    // PushResponse.
-    let push_response = PushResponse {
-        result: Some(WireApplyResult {
-            applied_rows: 1,
-            skipped_rows: 0,
-            conflicts: Vec::new(),
-            new_lsn: Lsn(7),
-        }),
-        error: None,
-    };
-    let push_response_bytes = encode(MessageType::PushResponse, &push_response).unwrap();
-    assert_eq!(
-        wire_hex(&push_response_bytes),
-        PUSH_RESPONSE_WIRE,
-        "PushResponse wire bytes changed — old clients cannot decode a reshaped \
-         push reply (trailing fields fail with LengthMismatch); regression data \
-         belongs on the status subject, not here"
-    );
-    let envelope = decode(&push_response_bytes).unwrap();
-    let decoded: PushResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
-    assert_eq!(
-        decoded, push_response,
-        "pinned PushResponse bytes must round-trip"
-    );
-
-    // PullRequest.
-    let pull_request = PullRequest {
-        since_lsn: Lsn(42),
-        max_entries: Some(500),
-    };
-    let pull_request_bytes = encode(MessageType::PullRequest, &pull_request).unwrap();
-    assert_eq!(
-        wire_hex(&pull_request_bytes),
-        PULL_REQUEST_WIRE,
-        "PullRequest wire bytes changed — old servers cannot decode a reshaped \
-         pull request"
-    );
-    let envelope = decode(&pull_request_bytes).unwrap();
-    let decoded: PullRequest = rmp_serde::from_slice(&envelope.payload).unwrap();
-    assert_eq!(
-        decoded, pull_request,
-        "pinned PullRequest bytes must round-trip"
-    );
-
-    // PullResponse.
-    let pull_response = PullResponse {
-        changeset: WireChangeSet::default(),
-        has_more: false,
-        cursor: Some(Lsn(42)),
-    };
-    let pull_response_bytes = encode(MessageType::PullResponse, &pull_response).unwrap();
-    assert_eq!(
-        wire_hex(&pull_response_bytes),
-        PULL_RESPONSE_WIRE,
-        "PullResponse wire bytes changed — old clients cannot decode a reshaped \
-         pull reply; regression data belongs on the status subject, not here"
-    );
-    let envelope = decode(&pull_response_bytes).unwrap();
-    let decoded: PullResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
-    assert_eq!(
-        decoded, pull_response,
-        "pinned PullResponse bytes must round-trip"
-    );
-}
+// sr7 (the frozen wire-bytes regression guard) moved to the default-run
+// `wire_format_freeze_tests.rs`: it is pure encode/decode against fixed
+// fixtures, needs no broker, and this file's `[[test]]` entry gates the
+// WHOLE binary on `required-features = ["nats"]` for the tests below that
+// genuinely need one -- so it never ran in the default suite.
 
 // ======== sr8 — REGRESSION GUARD: no status responder, bounded + exactly-once ========
 //
@@ -949,6 +829,7 @@ async fn sr8_guard_sync_cycle_bounded_when_status_subject_has_no_responder() {
                     changeset: WireChangeSet::default(),
                     has_more: false,
                     cursor: None,
+                    source: None,
                 };
                 let payload = encode(MessageType::PullResponse, &response).unwrap();
                 pull_conn.publish(reply, payload.into()).await.unwrap();

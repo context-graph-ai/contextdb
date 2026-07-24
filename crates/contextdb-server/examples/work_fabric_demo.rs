@@ -313,9 +313,9 @@ async fn main() {
                 defer_own_submissions_until_deadline: false,
                 writes_are_canonical: false,
             };
-            let executor = DemoExecutor {
+            let executor: Arc<dyn WorkExecutor> = Arc::new(DemoExecutor {
                 chunk_delay: Duration::from_millis(chunk_delay_ms),
-            };
+            });
             let shutdown = Arc::new(AtomicBool::new(false));
             let flag = shutdown.clone();
             tokio::spawn(async move {
@@ -324,7 +324,9 @@ async fn main() {
             });
             eprintln!("[worker] polling every {poll_ms}ms; Ctrl-C to stop");
             while !shutdown.load(Ordering::SeqCst) {
-                match poll_and_execute_once(&client, &config, &executor, wall_now_ms()).await {
+                match poll_and_execute_once(&client, &config, Arc::clone(&executor), wall_now_ms())
+                    .await
+                {
                     Ok(PollOutcome::NoMatchingWork) => {}
                     Ok(outcome) => eprintln!("[worker] {outcome:?}"),
                     Err(err) => eprintln!("[worker] poll error: {err}"),

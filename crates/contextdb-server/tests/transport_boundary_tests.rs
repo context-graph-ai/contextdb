@@ -210,6 +210,25 @@ fn expected_apply_results_for_batches(
         .collect()
 }
 
+/// The expected served changeset for a page whose every row was pushed
+/// fresh, with no established fleet-lineage ordering — the shape both
+/// `ip_01` and `ip_03` push. Computed from first principles, independent of
+/// the server's own arrival-stamping helpers (`changes_since_with_arrivals`
+/// / `wire_changeset_with_arrivals`) so this assertion cannot pass merely
+/// because the test calls the same machinery it is meant to check: a row
+/// with no incoming arrival is stamped with the accepting server's own
+/// commit position -- exactly its own resulting `.lsn`, never a value
+/// sampled before that commit (see `database.rs`'s `SYNC_SOURCE_LSN_OWN_
+/// COMMIT` sentinel; a sampled `current_lsn() == lsn - 1` value was the
+/// pre-fix defect this row would otherwise still pin).
+fn expected_wire_changeset_for_freshly_pushed_rows(changes: ChangeSet) -> WireChangeSet {
+    let mut wire: WireChangeSet = changes.into();
+    for row in &mut wire.rows {
+        row.arrival = Some(row.lsn);
+    }
+    wire
+}
+
 fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read {dir:?}: {err}")) {
         let entry = entry.unwrap_or_else(|err| panic!("read entry under {dir:?}: {err}"));
@@ -406,9 +425,12 @@ async fn ip_01_push_pull_converges_over_fake() {
     );
     let expected_pull_changes = server_db.changes_since(Lsn(0));
     let expected_pull_response = PullResponse {
-        changeset: expected_pull_changes.clone().into(),
+        changeset: expected_wire_changeset_for_freshly_pushed_rows(expected_pull_changes.clone()),
         has_more: false,
         cursor: expected_pull_changes.max_lsn(),
+        source: server_db
+            .sync_incarnation(&contextdb_core::TenantId::from(tenant))
+            .ok(),
     };
     assert!(
         within(edge_b.pull(&policies)).await.is_ok(),
@@ -866,9 +888,12 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
     );
     let expected_pull_changes = server_db.changes_since(Lsn(0));
     let expected_pull_response = PullResponse {
-        changeset: expected_pull_changes.clone().into(),
+        changeset: expected_wire_changeset_for_freshly_pushed_rows(expected_pull_changes.clone()),
         has_more: false,
         cursor: expected_pull_changes.max_lsn(),
+        source: server_db
+            .sync_incarnation(&contextdb_core::TenantId::from(tenant))
+            .ok(),
     };
     assert!(
         within(reader.pull(&policies)).await.is_ok(),

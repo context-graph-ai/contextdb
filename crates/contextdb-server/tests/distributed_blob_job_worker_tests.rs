@@ -184,14 +184,14 @@ async fn blob_ref_job_resolves_and_executes_via_worker_loop() {
         defer_own_submissions_until_deadline: false,
         writes_are_canonical: false,
     };
-    let executor = ReceivedBytesExecutor {
+    let executor = Arc::new(ReceivedBytesExecutor {
         received: Mutex::new(None),
-    };
+    });
 
     let outcome = within(poll_and_execute_once(
         &worker_client,
         &config,
-        &executor,
+        executor.clone(),
         T0 + 1,
     ))
     .await

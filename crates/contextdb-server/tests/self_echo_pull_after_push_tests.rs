@@ -400,3 +400,53 @@ async fn self_echo_leaves_the_row_completely_untouched() {
 
     hub.stop().await;
 }
+
+/// Standing guard: a row that arrived at this edge BY SYNC must never be
+/// offered back outbound on a later push — `drop_rows_that_arrived_by_sync`
+/// (`sync_client.rs`) already suppresses this on the shipped client. Pinned
+/// so every future arbitration or pull-cursor change keeps it true: both
+/// touch the exact comparison this guard depends on staying unreachable
+/// through the normal client path.
+#[tokio::test]
+async fn a_sync_arrived_row_is_never_offered_back_on_a_later_push() {
+    let tenant = "no-outbound-echo";
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker, tenant);
+
+    let edge_a = open_edge();
+    let client_a = edge_client(&edge_a, &broker, "edge-a", tenant);
+    insert_note(&edge_a, 1, "from-a");
+    within(client_a.push()).await.expect("A push");
+
+    let edge_b = open_edge();
+    let client_b = edge_client(&edge_b, &broker, "edge-b", tenant);
+    // Push once first, purely so B's OWN local DDL (its `CREATE TABLE`) is
+    // no longer pending — otherwise `has_pending_push_changes` would read
+    // true for that unrelated reason and this guard would prove nothing
+    // about row echo specifically.
+    within(client_b.push())
+        .await
+        .expect("B push (own schema only)");
+    within(client_b.pull_default())
+        .await
+        .expect("B pull (sync-arrived row)");
+
+    assert!(
+        !client_b
+            .has_pending_push_changes()
+            .expect("pending-changes probe"),
+        "a row that arrived at this edge BY SYNC must never be offered back \
+         on a later push"
+    );
+
+    let pushed = within(client_b.push())
+        .await
+        .expect("B push (should be empty)");
+    assert_eq!(
+        pushed.applied_rows + pushed.skipped_rows,
+        0,
+        "a sync-arrived row must not be transmitted outbound at all: {pushed:?}"
+    );
+
+    hub.stop().await;
+}

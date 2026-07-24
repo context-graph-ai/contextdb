@@ -5,14 +5,14 @@ use crate::protocol::{
 use crate::subjects::{pull_subject, push_subject, status_subject};
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
 use crate::transport::{ClientTransport, TransportError};
-use contextdb_core::{AtomicLsn, Error, Incarnation, Lsn, TenantId};
+use contextdb_core::{AtomicLsn, Error, Incarnation, Lsn, TableMeta, TenantId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
-    ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, SyncDirection,
+    ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, SyncAdoption, SyncDirection,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -34,6 +34,18 @@ pub struct SyncClient {
     tenant_id: TenantId,
     push_watermark: AtomicLsn,
     pull_watermark: AtomicLsn,
+    /// Pages served during a pull, then discarded unapplied because they
+    /// reported an incarnation other than the one this client's cursor
+    /// addresses. Zero today: nothing yet detects the mismatch, so a
+    /// mismatched page is applied as if it were a legitimate continuation.
+    /// Cumulative across every `pull`/`pull_default` call on this client.
+    pages_discarded_for_source_mismatch: AtomicUsize,
+    /// The store this client's pull cursor addresses — the serving store's
+    /// incarnation last seen on a pull response. `None` until the first
+    /// successful pull binds it. Loaded from the persisted `(source, lsn)`
+    /// pair at construction, so this survives a restart bound to the SAME
+    /// store as the cursor it accompanies.
+    pull_source: std::sync::RwLock<Option<Incarnation>>,
     /// Directions set at runtime by the embedding application. These fill in
     /// for tables that DECLARED no direction; a table's own declaration is the
     /// source of truth and is never overridden from here, so what the
@@ -62,6 +74,13 @@ impl std::fmt::Debug for SyncClient {
                 "pull_watermark",
                 &self.pull_watermark.load(Ordering::Relaxed),
             )
+            .field(
+                "pages_discarded_for_source_mismatch",
+                &self
+                    .pages_discarded_for_source_mismatch
+                    .load(Ordering::Relaxed),
+            )
+            .field("pull_source", &self.pull_source.read().map(|g| *g).ok())
             .field(
                 "table_directions",
                 &self.table_directions.read().map(|g| g.clone()).ok(),
@@ -104,6 +123,18 @@ impl SyncClient {
                 tracing::warn!(%tenant_id, error = %err, "failed to load persisted sync watermarks");
                 (Lsn(0), Lsn(0))
         });
+        // Only the SOURCE half loads here — the lsn half of the persisted
+        // pair is not consulted at construction so an edge upgrading from a
+        // build with no combined-cursor record yet keeps resuming from its
+        // existing `pull_watermark` unchanged; the first pull after upgrade
+        // simply starts recording source identity going forward.
+        let pull_source = db
+            .persisted_sync_pull_cursor(&tenant_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(%tenant_id, error = %err, "failed to load persisted pull cursor source");
+                None
+            })
+            .map(|(source, _lsn)| source);
         Self {
             db,
             transport,
@@ -111,6 +142,8 @@ impl SyncClient {
             tenant_id,
             push_watermark: AtomicLsn::new(push_watermark),
             pull_watermark: AtomicLsn::new(pull_watermark),
+            pages_discarded_for_source_mismatch: AtomicUsize::new(0),
+            pull_source: std::sync::RwLock::new(pull_source),
             table_directions: std::sync::RwLock::new(HashMap::new()),
             conflict_policies: std::sync::RwLock::new(ConflictPolicies {
                 per_table: HashMap::new(),
@@ -155,6 +188,14 @@ impl SyncClient {
 
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// An owned handle to this client's database, for a caller (the work
+    /// ledger's worker loop) that needs a `'static`-safe handle to move onto
+    /// a blocking-pool thread — [`Self::db`] borrows for this client's own
+    /// lifetime, which is not `'static`-compatible.
+    pub(crate) fn db_arc(&self) -> Arc<Database> {
+        self.db.clone()
     }
 
     /// What this edge has moved with its hub, per direction, since the client
@@ -418,10 +459,10 @@ impl SyncClient {
         let since = self.push_watermark.load(Ordering::SeqCst);
         // Clone directions out of RwLock BEFORE any .await
         let directions = self.table_directions()?;
-        let changeset = self
-            .db
-            .changes_since(since)
-            .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
+        refuse_keyless_tables_with_no_identity_fallback(&self.db, &directions)?;
+        let (changeset, arrivals) = self.db.changes_since_with_arrivals(since);
+        let changeset =
+            changeset.filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
         let changeset = drop_rows_that_arrived_by_sync(&self.db, changeset);
 
         // The greatest LSN this push actually TRANSMITS, taken PRE-send from the
@@ -468,7 +509,7 @@ impl SyncClient {
             let batch_items = batch.rows.len() as u64;
             let batch_payload_bytes = row_payload_bytes(&batch.rows);
             let request = PushRequest {
-                changeset: batch.clone().into(),
+                changeset: crate::protocol::wire_changeset_with_arrivals(batch.clone(), &arrivals),
                 incarnation,
             };
             let encoded = encode(MessageType::PushRequest, &request)
@@ -500,26 +541,33 @@ impl SyncClient {
                         .await;
                 }
             };
-            let retryable_legacy_lsn_conflict = has_retryable_legacy_lsn_conflict(&result);
-            if !retryable_legacy_lsn_conflict {
-                last_successful_lsn = batch_max_lsn;
-            }
+            // Every refusal this hub can still report advances the watermark:
+            // now that arbitration compares each row against a single
+            // accepting-node ordering position instead of two machines'
+            // unrelated clocks, a `LatestWins` push is never refused at all
+            // (it either wins outright or is a stale echo, both counted as
+            // nothing on the receipt) — so the only refusals left
+            // (`ServerWins`, `InsertIfNotExists`) are ones a later push could
+            // never win either, and must not be retried forever. The dead
+            // `has_retryable_legacy_lsn_conflict` guard this replaces never
+            // matched its own producer's reason string (`"local_lsn_newer_or_equal"`
+            // vs the engine's `"latest_wins_local_lsn_newer_or_equal"`) — it
+            // has never fired, and there is no refusal class left that
+            // landing it correctly would have helped: keeping it would
+            // instead wedge every push against a hub legitimately refusing
+            // under `ServerWins`.
+            last_successful_lsn = batch_max_lsn;
             total.applied_rows += result.applied_rows;
             total.skipped_rows += result.skipped_rows;
             total.conflicts.extend(result.conflicts);
             total.new_lsn = result.new_lsn;
-            if !retryable_legacy_lsn_conflict {
-                self.receipts.record(
-                    hub.as_deref(),
-                    TransferPlane::Sync,
-                    TransferDirection::Sent,
-                    batch.rows.len() as u64,
-                    row_payload_bytes(&batch.rows),
-                );
-            }
-            if retryable_legacy_lsn_conflict {
-                break;
-            }
+            self.receipts.record(
+                hub.as_deref(),
+                TransferPlane::Sync,
+                TransferDirection::Sent,
+                batch.rows.len() as u64,
+                row_payload_bytes(&batch.rows),
+            );
         }
 
         self.push_watermark
@@ -693,18 +741,96 @@ impl SyncClient {
             new_lsn: since_lsn,
         };
 
+        // The store this cursor addresses. A page whose source differs is
+        // discarded unapplied rather than partially trusted: a cursor is
+        // only ever compared against the history of the store that issued
+        // it. `None` means this client has never bound to a source yet — the
+        // first page of this call binds it fresh, with no mismatch possible.
+        let mut expected_source = self
+            .pull_source
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .to_owned();
+        let mut first_page = true;
+        // Set once this call detects its cursor's source changed, and never
+        // cleared for the rest of THIS call: every page from that point on
+        // is part of the same from-zero re-fetch of the newly adopted
+        // source's full history (see `SyncAdoption`).
+        let mut adoption = SyncAdoption::Continuing;
+
         loop {
             let request = PullRequest {
                 since_lsn,
                 max_entries: Some(PULL_PAGE_SIZE),
             };
 
-            let (changes, has_more, cursor) = {
-                let response = self.request_pull(request).await?;
-                let changes = ChangeSet::try_from(response.changeset)
-                    .map_err(|e| Error::SyncError(e.to_string()))?;
-                (changes, response.has_more, response.cursor)
-            };
+            let response = self.request_pull(request).await?;
+            let served_source = response.source;
+
+            // Check for source identity mismatches. Three cases:
+            // 1. Both expected and served are Some: if they differ, reject the page
+            // 2. Expected is Some but served is None: can't validate binding, refuse
+            // 3. Expected is None: bind to served (on first page)
+            if let Some(expected) = expected_source {
+                if let Some(served) = served_source {
+                    if served != expected {
+                        if first_page {
+                            // The serving store's identity changed since this cursor
+                            // was last recorded (a replaced/rebuilt hub under the same
+                            // transport identity). The old cursor addresses history
+                            // that no longer exists at this address: forget it and
+                            // re-address the new store from the beginning, in the
+                            // SAME call — the new source's served content is
+                            // authoritative for re-adoption, never arbitrated against
+                            // whatever the old source's provenance recorded.
+                            tracing::info!(
+                                tenant_id = %self.tenant_id,
+                                old_source = %expected,
+                                new_source = %served,
+                                "pull source changed; resetting cursor to re-pull the new store's full history"
+                            );
+                            since_lsn = Lsn(0);
+                            expected_source = Some(served);
+                            adoption = SyncAdoption::ReadoptingSource;
+                            continue;
+                        }
+                        // The source changed BETWEEN two pages of this one paged
+                        // pull. The page already addresses history this cursor no
+                        // longer provably owns: discard it unapplied — never
+                        // partially trusted — and stop. Everything already applied
+                        // from earlier pages in this call, and their cursor advance,
+                        // stands; the next `pull` call re-detects the change as a
+                        // first-page mismatch and re-pulls the new store in full.
+                        self.pages_discarded_for_source_mismatch
+                            .fetch_add(1, Ordering::SeqCst);
+                        tracing::info!(
+                            tenant_id = %self.tenant_id,
+                            old_source = %expected,
+                            new_source = %served,
+                            "served page's source changed mid-pull; discarding it unapplied"
+                        );
+                        break;
+                    }
+                } else {
+                    // Cursor is bound to a source, but the response carries no
+                    // source identity. Can't validate that the response addresses
+                    // the same store, so refuse the pull request entirely.
+                    return Err(Error::SyncError(format!(
+                        "pull response missing source identity for tenant {}: \
+                         cursor is bound to source {}, but response carries no source",
+                        self.tenant_id, expected
+                    )));
+                }
+            } else if let Some(served) = served_source {
+                // First page: bind to the served source
+                expected_source = Some(served);
+            }
+
+            let arrivals = crate::protocol::wire_row_arrivals(&response.changeset);
+            let changes = ChangeSet::try_from(response.changeset)
+                .map_err(|e| Error::SyncError(e.to_string()))?;
+            let has_more = response.has_more;
+            let cursor = response.cursor;
 
             // Extract server-side max LSN BEFORE filtering/applying
             let server_lsn = cursor.or_else(|| changes.max_lsn()).unwrap_or(since_lsn);
@@ -723,9 +849,12 @@ impl SyncClient {
             let received_items = filtered.rows.len() as u64;
             let received_payload_bytes = row_payload_bytes(&filtered.rows);
             let stop_for_trigger_bootstrap = filtered.has_create_trigger_ddl() && has_more;
-            let result = self
-                .db
-                .apply_changes(filtered, &remap_pull_policies(policies))?;
+            let result = self.db.apply_synced_changes(
+                filtered,
+                &remap_pull_policies(policies),
+                &arrivals,
+                adoption,
+            )?;
             self.receipts.record(
                 hub.as_deref(),
                 TransferPlane::Sync,
@@ -738,6 +867,7 @@ impl SyncClient {
             total.conflicts.extend(result.conflicts);
             total.new_lsn = result.new_lsn;
             last_server_lsn = server_lsn;
+            first_page = false;
 
             if !has_more {
                 break;
@@ -752,6 +882,15 @@ impl SyncClient {
         self.db
             .persist_sync_pull_watermark(&self.tenant_id, last_server_lsn)
             .map_err(|err| Error::SyncError(err.to_string()))?;
+        if let Some(source) = expected_source {
+            *self
+                .pull_source
+                .write()
+                .unwrap_or_else(|err| err.into_inner()) = Some(source);
+            self.db
+                .persist_sync_pull_cursor(&self.tenant_id, source, last_server_lsn)
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+        }
         Ok(total)
     }
 
@@ -772,6 +911,14 @@ impl SyncClient {
 
     pub fn pull_watermark(&self) -> Lsn {
         self.pull_watermark.load(Ordering::SeqCst)
+    }
+
+    /// How many served pages this client has discarded unapplied, across
+    /// every pull, because they reported an incarnation other than the one
+    /// its cursor addresses. Zero until that detection exists.
+    pub fn pages_discarded_for_source_mismatch(&self) -> usize {
+        self.pages_discarded_for_source_mismatch
+            .load(Ordering::SeqCst)
     }
 
     pub fn tenant_id(&self) -> &str {
@@ -814,6 +961,12 @@ impl SyncClient {
         // caller.
         self.push_watermark.store(Lsn(0), Ordering::SeqCst);
         self.pull_watermark.store(Lsn(0), Ordering::SeqCst);
+        // The pull cursor's bound source is explicitly stale the moment the
+        // operator repoints the destination — the next pull binds fresh to
+        // whatever the new destination reports, with no mismatch to detect.
+        if let Ok(mut pull_source) = self.pull_source.write() {
+            *pull_source = None;
+        }
         result
     }
 
@@ -978,6 +1131,70 @@ fn refuse_direction_that_breaks_delivery(
     )))
 }
 
+/// Whether `table` has a sync identity a receiver can actually use to tell
+/// one row from another. A declared identity — `natural_key_column`, a
+/// table-level composite `PRIMARY KEY`, or a single-column `PRIMARY KEY` — is
+/// auto-indexed by the engine at `CREATE`/`ALTER` time, so it is always
+/// usable. The bare `id`-name fallback (`natural_key_columns_for_meta`'s
+/// last resort) is NOT auto-indexed just by existing: the apply side's
+/// exact-key probe (`required_indexed_visible_row_by_column`) hard-errors
+/// against it with no covering index, so eligibility here requires that
+/// SAME covering index — trusting the column's name alone would let push
+/// declare a table eligible that the apply side then refuses.
+fn table_has_usable_sync_identity(db: &Database, table: &str, meta: &TableMeta) -> bool {
+    if meta.natural_key_column.is_some()
+        || !meta.primary_key_columns.is_empty()
+        || meta.columns.iter().any(|column| column.primary_key)
+    {
+        return true;
+    }
+    meta.columns.iter().any(|column| column.name == "id")
+        && db.column_has_covering_index(table, "id")
+}
+
+/// Refuse a table that WOULD sync (any direction but `SYNC OFF`) but has no
+/// usable sync identity (see [`table_has_usable_sync_identity`]) — the
+/// engine's own changeset builders (`Database::persisted_state_since` /
+/// `full_state_snapshot`) silently skip such a table's rows with a bare
+/// `continue`, so `push()` would otherwise still report success with those
+/// rows quietly dropped (the fixed silent-omission defect). A keyless table
+/// declared `SYNC OFF` is unaffected: it was never eligible to leave this
+/// machine either way, so there is nothing to refuse.
+pub(crate) fn refuse_keyless_tables_with_no_identity_fallback(
+    db: &Database,
+    directions: &HashMap<String, SyncDirection>,
+) -> Result<(), Error> {
+    for table in db.table_names() {
+        let Some(meta) = db.table_meta(&table) else {
+            continue;
+        };
+        // A table's declaration wins outright; a runtime-registered
+        // direction fills in only when the declaration named none; the
+        // engine default (`Both`, i.e. it WOULD sync) applies when neither
+        // said anything — matching `table_directions`' own precedence.
+        let direction = meta.sync_direction.unwrap_or_else(|| {
+            directions
+                .get(&table)
+                .copied()
+                .unwrap_or(contextdb_core::DEFAULT_SYNC_DIRECTION)
+        });
+        if !direction_delivers(direction) {
+            continue;
+        }
+        if table_has_usable_sync_identity(db, &table, &meta) {
+            continue;
+        }
+        return Err(Error::SyncError(format!(
+            "table '{table}' has no usable sync identity — no declared PRIMARY KEY and no \
+             indexed `id`-column fallback — so its rows cannot be told apart across the wire. \
+             Push refuses rather than silently omitting them while reporting success. Fix one \
+             of: declare a PRIMARY KEY on '{table}'; add an indexed `id` column as the fallback \
+             identity; or declare '{table}' SYNC OFF."
+        )));
+    }
+    Ok(())
+}
+
 /// An edge pushes what it WROTE, not what it was given: a row whose current
 /// local version arrived over sync is dropped from the outbound changeset.
 /// Pushing it back would hand the hub its own data — the echo that makes a
@@ -1034,13 +1251,6 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
             .collect();
     }
     split_changeset_by_size(bootstrap_batches.into_iter().next().unwrap_or_default())
-}
-
-fn has_retryable_legacy_lsn_conflict(result: &ApplyResult) -> bool {
-    result
-        .conflicts
-        .iter()
-        .any(|conflict| conflict.reason.as_deref() == Some("local_lsn_newer_or_equal"))
 }
 
 fn split_changeset_by_size(changeset: ChangeSet) -> Vec<ChangeSet> {

@@ -8,7 +8,7 @@ use contextdb_engine::sync_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -108,6 +108,13 @@ pub struct PullResponse {
     pub changeset: WireChangeSet,
     pub has_more: bool,
     pub cursor: Option<Lsn>,
+    /// The serving store's per-tenant incarnation, so a puller can bind its
+    /// cursor to the specific store that issued it — a served page from a
+    /// store other than the one the cursor addresses is discarded, never
+    /// partially trusted (`SyncClient::pull`). Defaulted so decoding an older
+    /// peer's reply is unaffected.
+    #[serde(default)]
+    pub source: Option<Incarnation>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +155,18 @@ pub struct WireRowChange {
     /// before this field decodes as "no stamp" and the receiver stamps its own.
     #[serde(default)]
     pub created_at: Option<contextdb_core::Wallclock>,
+    /// The row's ordering position — this row's sync provenance sidecar on
+    /// whichever node is SENDING it, `None` when that node authored the row
+    /// itself and never yet synced it anywhere (see
+    /// `wire_row_arrivals`/`wire_changeset_with_arrivals`). Arbitration
+    /// compares this, never `lsn` (which is the sender's own unrelated local
+    /// clock): an incoming row with no arrival always wins, one carrying an
+    /// arrival at or below the stored position is a stale echo, and one
+    /// above it wins. Defaulted so decoding an older peer's row is
+    /// unaffected — that peer is refused outright by the protocol version
+    /// check before this ever matters.
+    #[serde(default)]
+    pub arrival: Option<Lsn>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -341,6 +360,9 @@ impl From<RowChange> for WireRowChange {
             deleted: value.deleted,
             lsn: value.lsn,
             created_at: value.created_at,
+            // The engine's `RowChange` does not carry an ordering position
+            // yet, so every sender sends "none" here.
+            arrival: None,
         }
     }
 }
@@ -715,4 +737,37 @@ pub(crate) fn row_payload_bytes(rows: &[RowChange]) -> u64 {
                 .unwrap_or(0) as u64
         })
         .sum()
+}
+
+/// Per-row arrival positions read off a served/pushed wire changeset, keyed
+/// by each row's own `.lsn` (rows sharing an `.lsn` share one accepted commit
+/// and its fate, so the key is never ambiguous within one changeset). Built
+/// BEFORE the wire rows are converted into engine `RowChange`s — a plain
+/// conversion drops the field entirely, since the engine's own arbitration
+/// never reads a raw wire row — so this map is the one channel `arrival`
+/// crosses into `Database::apply_synced_changes`.
+pub fn wire_row_arrivals(changeset: &WireChangeSet) -> HashMap<Lsn, Option<Lsn>> {
+    changeset
+        .rows
+        .iter()
+        .map(|row| (row.lsn, row.arrival))
+        .collect()
+}
+
+/// Convert an outbound engine changeset to its wire form, additionally
+/// stamping each row's `arrival` from a pre-computed per-row map (see
+/// [`contextdb_engine::Database::changes_since_with_arrivals`]) instead of
+/// leaving it absent. Keyed by each row's own `.lsn`, which survives every
+/// filter/page/merge step between fetching the changeset and encoding it.
+pub fn wire_changeset_with_arrivals(
+    changes: ChangeSet,
+    arrivals: &HashMap<Lsn, Option<Lsn>>,
+) -> WireChangeSet {
+    let mut wire: WireChangeSet = changes.into();
+    for row in &mut wire.rows {
+        if let Some(arrival) = arrivals.get(&row.lsn) {
+            row.arrival = *arrival;
+        }
+    }
+    wire
 }

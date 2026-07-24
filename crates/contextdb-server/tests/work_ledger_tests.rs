@@ -299,7 +299,7 @@ async fn two_workers_race_exactly_one_wins_and_one_result_exists() {
     let a_out = within(poll_and_execute_once(
         &a_client,
         &worker_config("node-a"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 1,
     ))
     .await
@@ -316,7 +316,7 @@ async fn two_workers_race_exactly_one_wins_and_one_result_exists() {
     let b_out = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 2,
     ))
     .await
@@ -388,7 +388,7 @@ async fn lease_expiry_opens_attempt_two_and_the_revived_worker_stands_down() {
     let b_early = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 1,
     ))
     .await
@@ -404,7 +404,7 @@ async fn lease_expiry_opens_attempt_two_and_the_revived_worker_stands_down() {
     let b_late = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         after_expiry,
     ))
     .await
@@ -424,7 +424,7 @@ async fn lease_expiry_opens_attempt_two_and_the_revived_worker_stands_down() {
     let a_revived = within(poll_and_execute_once(
         &a_client,
         &worker_config("node-a"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         after_expiry + 1,
     ))
     .await
@@ -480,7 +480,7 @@ async fn failure_rows_reach_the_ceiling_and_the_job_is_terminal_everywhere() {
     let first = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &FailingExecutor,
+        Arc::new(FailingExecutor),
         T0 + 1,
     ))
     .await
@@ -497,7 +497,7 @@ async fn failure_rows_reach_the_ceiling_and_the_job_is_terminal_everywhere() {
     let second = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &FailingExecutor,
+        Arc::new(FailingExecutor),
         T0 + 2,
     ))
     .await
@@ -520,7 +520,7 @@ async fn failure_rows_reach_the_ceiling_and_the_job_is_terminal_everywhere() {
     let third = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &FailingExecutor,
+        Arc::new(FailingExecutor),
         T0 + 3,
     ))
     .await
@@ -609,14 +609,14 @@ async fn cancellation_stops_between_chunks_and_loses_to_a_result() {
 
     advertise_capability(&b_db, "node-b", "wl.demo", &tags(&["class:wl.demo"]), T0)
         .expect("B advertises");
-    let executor = ChunkedCancellableExecutor {
+    let executor = Arc::new(ChunkedCancellableExecutor {
         db: b_db.clone(),
         chunks_processed: AtomicUsize::new(0),
-    };
+    });
     let outcome = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &executor,
+        executor.clone(),
         T0 + 1,
     ))
     .await
@@ -689,7 +689,7 @@ async fn submit_on_a_execute_on_b_result_and_receipt_apply_back_on_a() {
     let outcome = within(poll_and_execute_once(
         &b_client,
         &worker_config("node-b"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 1,
     ))
     .await
@@ -787,7 +787,7 @@ async fn offline_node_drains_its_own_job_and_reconciles_on_reconnect() {
     let outcome = within(poll_and_execute_once(
         &a_client,
         &worker_config("node-a"),
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 1,
     ))
     .await
@@ -876,7 +876,7 @@ async fn movement_policy_withholds_foreign_jobs_from_a_closed_worker() {
     let withheld = within(poll_and_execute_once(
         &b_client,
         &closed,
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 1,
     ))
     .await
@@ -896,7 +896,7 @@ async fn movement_policy_withholds_foreign_jobs_from_a_closed_worker() {
     let executed = within(poll_and_execute_once(
         &b_client,
         &open,
-        &DemoExecutor,
+        Arc::new(DemoExecutor),
         T0 + 2,
     ))
     .await
@@ -936,7 +936,7 @@ async fn worker_loop_polls_until_shutdown_and_executes_arriving_work() {
             run_worker_loop(
                 &b_client,
                 &worker_config("node-b"),
-                &DemoExecutor,
+                Arc::new(DemoExecutor),
                 Duration::from_millis(10),
                 shutdown,
             )
@@ -1021,7 +1021,7 @@ async fn worker_repushes_capabilities_until_hub_receives_them() {
             run_worker_loop(
                 &w_client,
                 &worker_config("node-w"),
-                &DemoExecutor,
+                Arc::new(DemoExecutor),
                 Duration::from_millis(20),
                 shutdown,
             )
@@ -1105,7 +1105,7 @@ fn hub_last_contact_ms(hub: &Database, node_id: &str) -> Option<i64> {
     }
 }
 
-/// RED-2: a worker advertises a capability, syncs, then re-advertises the SAME
+/// A worker advertises a capability, syncs, then re-advertises the SAME
 /// (node, capability) key later and syncs again — the hub's row must converge
 /// to the NEWER advertised_at. Fails today: the local re-advertise is a
 /// write-once no-op AND `work_capabilities` syncs `InsertIfNotExists`, so the
@@ -1148,9 +1148,9 @@ async fn re_advertised_capability_currency_propagates_to_the_hub() {
     let _ = task.await;
 }
 
-/// RED-3: the hub records a hub-local last-contact per node on every sync
-/// exchange it serves, and that timestamp advances across exchanges. Fails
-/// today: no such record exists.
+/// The hub records a hub-local last-contact per node on every sync exchange
+/// it serves, and that timestamp advances across exchanges. Fails today: no
+/// such record exists.
 #[tokio::test]
 async fn hub_records_last_contact_per_node_and_it_advances() {
     let broker = InProcessBroker::new();
@@ -1333,11 +1333,6 @@ impl WorkExecutor for RemoteCancelProbeExecutor {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "pinned RED pending the hub-side cross-sender pull-watermark fix: the hub serves \
-history by SENDER LSNs, so a slower-clocked submitter's cancellation lands behind a \
-faster-clocked worker's pull watermark and is never served to it. The worker-side puller \
-(EXECUTION_PULL_INTERVAL_MS) is in place; un-ignore when that fix lands and this must pass \
-unchanged."]
 async fn remote_cancellation_stops_the_worker_between_chunks() {
     let broker = InProcessBroker::new();
     let tenant = "wl-s13";
@@ -1359,14 +1354,14 @@ async fn remote_cancellation_stops_the_worker_between_chunks() {
 
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
-    let executor = RemoteCancelProbeExecutor {
+    let executor = Arc::new(RemoteCancelProbeExecutor {
         reached_chunk_zero: reached_tx,
         proceed: std::sync::Mutex::new(proceed_rx),
         chunks_processed: AtomicUsize::new(0),
-    };
+    });
 
     let config = worker_config("node-b");
-    let poll = poll_and_execute_once(&b_client, &config, &executor, T0 + 1);
+    let poll = poll_and_execute_once(&b_client, &config, executor.clone(), T0 + 1);
     let control = async {
         within(async {
             loop {
@@ -1449,7 +1444,7 @@ async fn canonical_worker_never_pushes_its_advertisement() {
         defer_own_submissions_until_deadline: false,
         writes_are_canonical: true,
     };
-    let executor = DemoExecutor;
+    let executor: Arc<dyn WorkExecutor> = Arc::new(DemoExecutor);
     let worker_shutdown = Arc::new(AtomicBool::new(false));
     let loop_task = {
         let worker_shutdown = worker_shutdown.clone();
@@ -1457,7 +1452,7 @@ async fn canonical_worker_never_pushes_its_advertisement() {
             let _ = run_worker_loop(
                 &client,
                 &config,
-                &executor,
+                executor,
                 Duration::from_millis(50),
                 worker_shutdown,
             )
@@ -1478,6 +1473,130 @@ async fn canonical_worker_never_pushes_its_advertisement() {
         "a canonical worker's advertisement must never be PUSHED to a broker \
          hub — its own db is the canonical store; hub received {received} \
          capability row(s)"
+    );
+
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = task.await;
+}
+
+// ---------------------------------------------------------------------------
+// The worker stops blocking its caller's runtime task.
+//
+// `poll_and_execute_once` calls `executor.execute(...)` SYNCHRONOUSLY inside
+// `std::thread::scope`, blocking whichever OS thread is driving this
+// future's poll() for the executor's entire duration — with no yield point.
+// An async sibling multiplexed onto the SAME task (exactly the shape
+// `tokio::join!` produces, and exactly the shape the pinned remote-
+// cancellation test uses) cannot be polled until the executor returns. This
+// test is isolated so a fix is credited to a real engine change (moving the
+// executor call onto `spawn_blocking`), never to a test-only rewrite: a
+// public async fn that blocks a runtime task for an arbitrary consumer
+// callback is hostile to every consumer that links this crate directly as a
+// library.
+// ---------------------------------------------------------------------------
+
+/// An executor that signals it has started, then blocks its OS thread in two
+/// bounded halves (mirrors `RemoteCancelProbeExecutor`'s own
+/// `recv_timeout`-bounded block above — never a real-time sleep-as-sync).
+/// Between the two halves it takes a single STATE READ of the caller's own
+/// progress counter — not an elapsed-time assertion — so the recorded value
+/// proves whether an async sibling joined onto the same task was ever
+/// scheduled while this call was in flight.
+struct StarvationProbeExecutor {
+    reached: std::sync::mpsc::Sender<()>,
+    sibling_ticks: Arc<AtomicUsize>,
+    ticks_observed_mid_execution: Arc<AtomicUsize>,
+}
+
+impl WorkExecutor for StarvationProbeExecutor {
+    fn execute(
+        &self,
+        _job: &JobSnapshot,
+        _inputs: &ExecutionInputs,
+        _should_abandon: &dyn Fn() -> bool,
+    ) -> ExecutionVerdict {
+        let _ = self.reached.send(());
+        let (_first_tx, first_rx) = std::sync::mpsc::channel::<()>();
+        let _ = first_rx.recv_timeout(Duration::from_millis(150));
+        self.ticks_observed_mid_execution
+            .store(self.sibling_ticks.load(Ordering::SeqCst), Ordering::SeqCst);
+        let (_second_tx, second_rx) = std::sync::mpsc::channel::<()>();
+        let _ = second_rx.recv_timeout(Duration::from_millis(150));
+        ExecutionVerdict::Completed(ExecutionOutput {
+            output: b"starvation-probe-done".to_vec(),
+            receipt: serde_json::json!({}),
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_keeps_making_progress_while_the_executor_runs() {
+    let broker = InProcessBroker::new();
+    let tenant = "wl-s3-starvation";
+    let (_hub_db, shutdown, task) = start_hub(&broker, tenant);
+
+    let (a_db, a_client) = edge(&broker, tenant);
+    let (b_db, b_client) = edge(&broker, tenant);
+
+    submit_job(
+        &a_db,
+        &demo_spec("job-s3-starve", "node-a"),
+        &[b"chunk-0", b"chunk-1"],
+    )
+    .expect("submit");
+    within(a_client.push()).await.expect("A push");
+    advertise_capability(&b_db, "node-b", "wl.demo", &tags(&["class:wl.demo"]), T0)
+        .expect("B advertises");
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let sibling_ticks = Arc::new(AtomicUsize::new(0));
+    let ticks_observed_mid_execution = Arc::new(AtomicUsize::new(0));
+    let executor: Arc<dyn WorkExecutor> = Arc::new(StarvationProbeExecutor {
+        reached: reached_tx,
+        sibling_ticks: sibling_ticks.clone(),
+        ticks_observed_mid_execution: ticks_observed_mid_execution.clone(),
+    });
+    let config = worker_config("node-b");
+
+    let poll = poll_and_execute_once(&b_client, &config, executor, T0 + 1);
+    let sibling = {
+        let sibling_ticks = sibling_ticks.clone();
+        async move {
+            // Bounded, event-driven wait for the executor to genuinely
+            // start — cooperative yields only, no sleep.
+            for _ in 0..100_000 {
+                match reached_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(err) => panic!("worker never reached the executor: {err}"),
+                }
+            }
+            // A caller multiplexed onto poll_and_execute_once's own task
+            // (exactly what tokio::join! produces) must still be pollable
+            // while the executor is mid-call — each tick is one genuine
+            // poll of this sibling future.
+            for _ in 0..500 {
+                sibling_ticks.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+
+    let (outcome, ()) = within(async { tokio::join!(poll, sibling) }).await;
+    assert!(
+        outcome.is_ok(),
+        "poll_and_execute_once must not error: {outcome:?}"
+    );
+    assert!(
+        ticks_observed_mid_execution.load(Ordering::SeqCst) > 0,
+        "a caller multiplexed onto poll_and_execute_once's own task must \
+         keep making progress while the executor is mid-call — the \
+         sibling's progress counter was still {} when the executor sampled \
+         it at its own midpoint, meaning the sibling was never polled at \
+         all during the first half of the executor's call",
+        ticks_observed_mid_execution.load(Ordering::SeqCst)
     );
 
     shutdown.store(true, Ordering::SeqCst);

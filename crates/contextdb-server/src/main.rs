@@ -8,10 +8,30 @@ use contextdb_server::transport::iroh::{EndpointSpec, IrohServer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// The `--version` disclosure, computed from the real `PROTOCOL_VERSION`
+/// constant rather than a hand-maintained literal — a hardcoded string here
+/// drifted silently from the real wire version once already (the v5→v6
+/// bump), which is exactly the failure this function exists to make
+/// structurally impossible: there is no second number to forget to update.
+/// `clap::Command::version` requires a `&'static str`; leaking is the
+/// standard way to produce one from a value only known at runtime, and is
+/// harmless here — this runs at most once per process, for a CLI that
+/// either exits immediately (`--version`) or serves for the life of the
+/// process.
+fn disclosed_version() -> &'static str {
+    Box::leak(
+        format!(
+            "{} protocol_version={PROTOCOL_VERSION}",
+            env!("CARGO_PKG_VERSION")
+        )
+        .into_boxed_str(),
+    )
+}
+
 #[derive(Parser)]
 #[command(
     name = "contextdb-server",
-    version = concat!(env!("CARGO_PKG_VERSION"), " protocol_version=5"),
+    version = disclosed_version(),
     after_help = "EXAMPLES:\n  \
         contextdb-server --db-path mydata.db --tenant-id acme\n    \
             Serve mydata.db, binding a dial-by-key sync endpoint and printing an\n    \
@@ -163,7 +183,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::write(path, &ticket)?;
         }
         let dial_command = format!(
-            "contextdb-cli <client-db-path> --sync-endpoint {ticket} --tenant-id {}",
+            "contextdb <client-db-path> --sync-endpoint {ticket} --tenant-id {}",
             args.tenant_id
         );
         if args.json {

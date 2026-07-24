@@ -20,6 +20,7 @@ use contextdb_engine::work_ledger::{
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -35,6 +36,65 @@ pub type ClaimRefreshHook =
 
 /// The owned reclaim cadence (see [`BlobStore::spawn_reclaim_driver`]).
 const RECLAIM_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Operator-declared bound on one [`BlobStore::resolve_blob_ref`] fetch
+/// attempt, covering the whole dial-and-transfer path — not just the
+/// per-progress-item idle bound already applied inside the transfer loop.
+/// Declared like [`contextdb_engine::work_ledger::MovementPolicy`] (a plain
+/// struct an installation supplies) rather than a bare `Duration` constant
+/// buried in the resolver, so an installation can widen or narrow the bound
+/// without a code change. `resolve_blob_ref` enforces it by spawning the
+/// fetch attempt and timing out the JOIN; an installation sets a
+/// non-default bound via [`BlobStore::set_fetch_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobFetchPolicy {
+    /// The whole-attempt deadline, in milliseconds.
+    pub fetch_deadline_ms: u64,
+}
+
+impl Default for BlobFetchPolicy {
+    fn default() -> Self {
+        // Documented default: generous enough for a legitimately large
+        // resume/transfer over a slow link, bounded enough that a wedge
+        // surfaces as a typed error instead of an un-cancellable hang.
+        Self {
+            fetch_deadline_ms: 120_000,
+        }
+    }
+}
+
+impl BlobFetchPolicy {
+    /// The declared bound as a [`Duration`], for `resolve_blob_ref`'s
+    /// deadline wrap. Kept off that function's own body deliberately: the
+    /// no-bare-duration-literal guard (`resolve_blob_ref_body_has_no_bare_duration_literal`)
+    /// exists so the bound is ALWAYS read from this declared policy value,
+    /// never inlined ad hoc inside the resolver.
+    fn as_duration(&self) -> Duration {
+        Duration::from_millis(self.fetch_deadline_ms)
+    }
+}
+
+/// Ties a spawned fetch task's lifetime to the calling future's own: on
+/// every exit from `resolve_blob_ref`'s deadline wrap — the declared
+/// timeout firing, the join completing normally, or `resolve_blob_ref`'s
+/// OWN future being dropped by a caller that lost interest (its own outer
+/// `select!`/timeout) — the spawned task is aborted rather than left
+/// running unbounded in the background. `abort()` on an already-finished
+/// task is a harmless no-op, so the normal-completion path pays nothing
+/// extra for this.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    async fn join(&mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// A node's media data-plane host: the holder side (ingest, serve, reclaim)
 /// and the consumer side (resolve) of the blob_ref reference kind.
@@ -55,6 +115,27 @@ pub struct BlobStore {
     /// Per-peer transfer counters for the blob plane, both directions. In
     /// memory only.
     receipts: Arc<TransferLedger>,
+    /// The declared whole-fetch-attempt bound; see [`BlobFetchPolicy`].
+    /// Read by `resolve_blob_ref` at the top of each call to size its
+    /// deadline wrap.
+    fetch_policy: Mutex<BlobFetchPolicy>,
+    /// Test-only wedge, armed at most once per use: when set, the NEXT
+    /// `resolve_blob_ref` call on THIS instance that would otherwise dial
+    /// the holder instead blocks forever (an ordinary,
+    /// cooperatively-cancellable pending future — never a synchronous
+    /// OS-level block) right at the point the fetch attempt begins.
+    /// Standing in for a stuck internal await (e.g. the local store's tag
+    /// bookkeeping never returning) without depending on the fetch backend's
+    /// own internal failure modes: it proves whether `resolve_blob_ref` itself
+    /// carries a bound on the fetch attempt, independent of what actually
+    /// causes a real-world stall. Per-INSTANCE deliberately, like
+    /// `test_clock` above — a process-global flag would race across the
+    /// concurrently-running tests in one test binary. Off (the default)
+    /// changes nothing for every existing caller. The arming method below is
+    /// compiled only under `cfg(test)` / the `test-seams` feature, so no
+    /// ordinary consumer of this crate can reach it — production is never
+    /// armable.
+    wedge_next_fetch_for_test: AtomicBool,
 }
 
 /// Why a resolve failed. Seven outcomes the caller must tell apart: five
@@ -85,6 +166,13 @@ pub enum ResolveError {
     /// ENOSPC); the transfer never completed and no verified blob was
     /// produced.
     SinkWrite(std::io::Error),
+    /// The fetch attempt did not complete within the declared
+    /// [`BlobFetchPolicy::fetch_deadline_ms`] bound. Distinct from
+    /// [`Self::HolderUnreachable`] (a definitive dial failure) and
+    /// [`Self::TransferAborted`] (a definitive mid-stream drop): this is
+    /// "still not known," bounded so the caller is never left waiting
+    /// un-cancellably.
+    FetchTimedOut { after_ms: u64 },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -109,6 +197,10 @@ impl std::fmt::Display for ResolveError {
             ResolveError::BlobNotFound => write!(f, "the holder does not hold this blob"),
             ResolveError::TransferAborted => write!(f, "the transfer aborted mid-stream"),
             ResolveError::SinkWrite(err) => write!(f, "local sink write failed: {err}"),
+            ResolveError::FetchTimedOut { after_ms } => write!(
+                f,
+                "the fetch attempt did not complete within the declared {after_ms}ms bound"
+            ),
         }
     }
 }
@@ -132,7 +224,32 @@ impl BlobStore {
             test_clock: Arc::new(Mutex::new(None)),
             claim_refresh: Arc::new(Mutex::new(None)),
             receipts: Arc::new(TransferLedger::new()),
+            fetch_policy: Mutex::new(BlobFetchPolicy::default()),
+            wedge_next_fetch_for_test: AtomicBool::new(false),
         }
+    }
+
+    /// Declare the whole-fetch-attempt bound this instance's
+    /// [`Self::resolve_blob_ref`] enforces; see [`BlobFetchPolicy`].
+    pub fn set_fetch_policy(&self, policy: BlobFetchPolicy) {
+        *self.fetch_policy.lock().expect("fetch policy lock") = policy;
+    }
+
+    /// The currently declared fetch policy.
+    pub fn fetch_policy(&self) -> BlobFetchPolicy {
+        *self.fetch_policy.lock().expect("fetch policy lock")
+    }
+
+    /// Test-only: arm the wedge for the next `resolve_blob_ref` call on THIS
+    /// instance; see the `wedge_next_fetch_for_test` field doc. Compiled
+    /// only under `cfg(test)` (this crate's own unit tests) or the
+    /// `test-seams` feature (this crate's own integration test targets, via
+    /// the self-dependency in `Cargo.toml`) — production builds and every
+    /// downstream consumer never see this method at all, so a fetch can
+    /// never be armed outside a test binary.
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn arm_wedge_next_fetch_for_test(&self) {
+        self.wedge_next_fetch_for_test.store(true, Ordering::SeqCst);
     }
 
     /// Install (or clear, with `None`) the holder-side ledger-refresh hook —
@@ -335,6 +452,11 @@ impl BlobStore {
     /// - [`ResolveError::SinkWrite`] — the local materialization side
     ///   failed to accept the bytes (e.g. `ENOSPC`); no verified blob was
     ///   produced.
+    /// - [`ResolveError::FetchTimedOut`] — the fetch did not complete
+    ///   within the declared deadline; on a multi-thread runtime the call
+    ///   returns within the timeout and the abandoned fetch is aborted at
+    ///   its next yield point (see the runtime-shape note below for the
+    ///   current-thread limitation).
     pub async fn resolve_blob_ref(
         &self,
         hash: &BlobHash,
@@ -372,23 +494,75 @@ impl BlobStore {
                 .map(|outcome| outcome.bytes_written)
                 .map_err(|failure| map_failure(failure, hash));
         }
-        let mut holder_node_id = String::new();
-        let outcome = adapter::fetch_into_sink(
-            &store,
-            &self.identity_path,
-            holder_ticket,
-            &hash.as_bytes(),
-            sink,
-            None,
-            Some(&mut holder_node_id),
-            0,
-        )
-        .await
-        .map_err(|failure| map_failure(failure, hash))?;
+        // The declared whole-fetch-attempt bound (see `BlobFetchPolicy`):
+        // the network dial, the holder's tag bookkeeping, and the verified
+        // transfer loop all run inside a SPAWNED task, and only the JOIN is
+        // timed — never the future being awaited directly. On a MULTI-THREAD
+        // tokio runtime this is a genuine bound regardless of the spawned
+        // task's behavior: a non-yielding poll can only occupy the worker
+        // thread it landed on, leaving the timer free to fire on another
+        // thread. On a CURRENT-THREAD runtime this call does NOT return
+        // within the bound if the spawned task never yields — there is only
+        // one OS thread, so a non-cooperating poll starves that thread
+        // entirely, including the timer that would otherwise fire this
+        // deadline. The caller's own timeout is never what reclaims a
+        // wedged fetch on either runtime shape.
+        let policy = self.fetch_policy();
+        let wedged = self.wedge_next_fetch_for_test.swap(false, Ordering::SeqCst);
+        let fetch_store = store.clone();
+        let fetch_identity = self.identity_path.clone();
+        let fetch_ticket = holder_ticket.to_string();
+        let fetch_hash = hash.as_bytes();
+        let handle = tokio::spawn(async move {
+            if wedged {
+                // Harness seam: stand in for an unbounded internal wedge
+                // (e.g. the holder's own tag bookkeeping never returning)
+                // without depending on the fetch backend's own internal
+                // failure modes.
+                std::future::pending::<()>().await;
+            }
+            adapter::fetch_verified_into_local_store(
+                fetch_store,
+                fetch_identity,
+                fetch_ticket,
+                fetch_hash,
+            )
+            .await
+        });
+        let mut guard = AbortOnDrop(handle);
+        let local_outcome = match tokio::time::timeout(policy.as_duration(), guard.join()).await {
+            Ok(Ok(Ok(local_outcome))) => local_outcome,
+            Ok(Ok(Err(failure))) => {
+                if matches!(failure, adapter::FetchFailure::Aborted) {
+                    // The local store already committed whatever it
+                    // verified before the abort; export that verified
+                    // partial prefix into the caller's sink so a retry can
+                    // resume from it, then still report the abort.
+                    let _ = adapter::export_into_sink(&store, &hash.as_bytes(), sink, 0).await;
+                }
+                return Err(map_failure(failure, hash));
+            }
+            Ok(Err(_join_error)) => return Err(ResolveError::TransferAborted),
+            Err(_elapsed) => {
+                // Timeout fired: abort the spawned task explicitly so it stops
+                // at the next yield point and does not occupy its worker thread.
+                // The guard will also abort on drop, but we abort here explicitly
+                // to be clear about the intent.
+                guard.0.abort();
+                return Err(ResolveError::FetchTimedOut {
+                    after_ms: policy.fetch_deadline_ms,
+                });
+            }
+        };
+        let outcome = adapter::export_into_sink(&store, &hash.as_bytes(), sink, 0)
+            .await
+            .map_err(|failure| map_failure(failure, hash))?;
+        adapter::release_fetch_protection(&store, &hash.as_bytes()).await;
         // One blob, its own bytes, against the holder the ticket actually
         // dialed. Framing and encryption overhead are not counted.
         self.receipts.record(
-            (!holder_node_id.is_empty()).then_some(holder_node_id.as_str()),
+            (!local_outcome.holder_node_id.is_empty())
+                .then_some(local_outcome.holder_node_id.as_str()),
             TransferPlane::Blob,
             TransferDirection::Received,
             1,

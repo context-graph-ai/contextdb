@@ -41,21 +41,44 @@ const WORKER_LOOP_CAPABILITY: &str = "worker-loop";
 /// falls back to the capability's `advertised_at` for liveness.
 pub const WORK_NODE_CONTACTS_TABLE: &str = "work_node_contacts";
 
+// A hub-local liveness clock: current-truth, never synced (`SYNC OFF` is the
+// declared form of the hub's own `hub_never_sync_directions()` filter, which
+// never ships this table's rows to an edge regardless). Declaring `HISTORY
+// CURRENT ONLY` alongside it is the `SYNC OFF` carve-out of the delivery
+// hazard `refuse_reclaimed_history_under_keep_first` guards: a table that
+// never leaves this machine has no puller to hand a stale value to.
 const CREATE_WORK_NODE_CONTACTS: &str = "CREATE TABLE work_node_contacts (\
      node_id TEXT PRIMARY KEY, \
-     last_contact_ms TIMESTAMP NOT NULL)";
+     last_contact_ms TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC OFF";
 
 /// Create the hub-local `work_node_contacts` table if absent. Idempotent;
-/// safe to call at every hub open and on every recorded contact.
+/// safe to call at every hub open and on every recorded contact. A root
+/// created before this table declared `HISTORY CURRENT ONLY SYNC OFF` is
+/// reconciled via the same `ALTER TABLE` an operator would type.
 pub fn install_node_contacts_schema(db: &contextdb_engine::Database) -> Result<(), Error> {
-    if db
+    if !db
         .table_names()
         .iter()
         .any(|name| name == WORK_NODE_CONTACTS_TABLE)
     {
+        db.execute(CREATE_WORK_NODE_CONTACTS, &HashMap::new())?;
         return Ok(());
     }
-    db.execute(CREATE_WORK_NODE_CONTACTS, &HashMap::new())?;
+    let Some(meta) = db.table_meta(WORK_NODE_CONTACTS_TABLE) else {
+        return Ok(());
+    };
+    if meta.sync_direction != Some(contextdb_core::SyncDirection::None) {
+        db.execute(
+            "ALTER TABLE work_node_contacts SET SYNC OFF",
+            &HashMap::new(),
+        )?;
+    }
+    if meta.history_policy != Some(contextdb_core::HistoryPolicy::CurrentOnly) {
+        db.execute(
+            "ALTER TABLE work_node_contacts SET HISTORY CURRENT ONLY",
+            &HashMap::new(),
+        )?;
+    }
     Ok(())
 }
 
@@ -447,7 +470,7 @@ async fn resolve_blob_job_inputs(
 pub async fn poll_and_execute_once(
     client: &SyncClient,
     config: &WorkerConfig,
-    executor: &dyn WorkExecutor,
+    executor: Arc<dyn WorkExecutor>,
     now_ms: i64,
 ) -> Result<PollOutcome, Error> {
     let _ = client.pull_default().await;
@@ -562,57 +585,72 @@ pub async fn poll_and_execute_once(
             }
         };
 
+        let db_for_check = client.db_arc();
         let job_id_for_check = job.job_id.clone();
         let node_for_check = config.node_id.clone();
         let check = move || {
-            ledger::should_abandon(db, &job_id_for_check, attempt, &node_for_check, now_ms)
-                .unwrap_or(true)
+            ledger::should_abandon(
+                &db_for_check,
+                &job_id_for_check,
+                attempt,
+                &node_for_check,
+                now_ms,
+            )
+            .unwrap_or(true)
         };
 
         // The between-chunks abandonment check must see REMOTE state — a
         // cancellation from the submitter, a result someone else landed — so
-        // while the executor runs, a sidecar thread keeps pulling into this
-        // store. It is a plain OS thread with its own small runtime because
-        // the executor call blocks this task's thread, which would starve
-        // any async sibling on a current-thread runtime. Pull failures are
-        // tolerated (the offline mode); the thread stops the moment the
-        // executor returns. (Without this, a remote cancellation could never
-        // stop a running job.)
-        let verdict = {
-            let stop_pulling = AtomicBool::new(false);
-            // Stop the sidecar even when the executor PANICS: without this,
-            // the scope's join would wait forever on the still-looping
-            // puller and the worker would wedge on unwind instead of
-            // propagating the panic.
-            struct StopOnUnwind<'a>(&'a AtomicBool);
-            impl Drop for StopOnUnwind<'_> {
-                fn drop(&mut self) {
-                    self.0.store(true, Ordering::SeqCst);
+        // while the executor runs, this task keeps pulling into this store
+        // on an ordinary interval. The executor itself runs on Tokio's
+        // blocking thread pool (`spawn_blocking`) — never inline, never via a
+        // scoped OS thread with its own nested runtime — so THIS task's own
+        // poll can return `Pending` between pulls and let a sibling future
+        // joined onto the same task (`tokio::join!`, exactly the shape the
+        // pinned remote-cancellation test uses) keep making progress. A
+        // public async fn that blocks its caller's runtime task for the
+        // whole duration of an arbitrary consumer callback is hostile to
+        // every library-embedded consumer that links this crate directly.
+        // `spawn_blocking` requires its
+        // closure to be `'static`, which is exactly why this function takes
+        // an owned `Arc<dyn WorkExecutor>` rather than a borrowed
+        // `&dyn WorkExecutor` — the shared handle is the honest way to move
+        // the executor onto the blocking thread with no lifetime erasure.
+        // Pull failures are tolerated (the offline mode) and warned about
+        // ONCE per attempt, not once per pull, so a persistently unreachable
+        // hub during a long execution does not spam the log — a worker whose
+        // in-execution pulls are all failing was previously indistinguishable
+        // from one with nothing to observe.
+        let job_for_exec = job.clone();
+        let executor_for_exec = Arc::clone(&executor);
+        let executor_task = tokio::task::spawn_blocking(move || {
+            executor_for_exec.execute(&job_for_exec, &inputs, &check)
+        });
+        tokio::pin!(executor_task);
+        let mut warned_in_execution_pull_failure = false;
+        let verdict = loop {
+            tokio::select! {
+                biased;
+                result = &mut executor_task => {
+                    break result.unwrap_or_else(|err| {
+                        ExecutionVerdict::Failed(format!("worker executor task panicked: {err}"))
+                    });
+                }
+                _ = tokio::time::sleep(Duration::from_millis(EXECUTION_PULL_INTERVAL_MS)) => {
+                    if let Err(err) = client.pull_default().await
+                        && !warned_in_execution_pull_failure
+                    {
+                        warned_in_execution_pull_failure = true;
+                        tracing::warn!(
+                            node_id = %config.node_id,
+                            job_id = %job.job_id,
+                            error = %err,
+                            "in-execution pull failed; will keep executing and stop \
+                             warning for the rest of this attempt"
+                        );
+                    }
                 }
             }
-            std::thread::scope(|scope| {
-                let stop_guard = StopOnUnwind(&stop_pulling);
-                scope.spawn(|| {
-                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    else {
-                        return;
-                    };
-                    while !stop_pulling.load(Ordering::SeqCst) {
-                        let _ = runtime.block_on(client.pull_default());
-                        for _ in 0..(EXECUTION_PULL_INTERVAL_MS / 50) {
-                            if stop_pulling.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                    }
-                });
-                let verdict = executor.execute(&job, &inputs, &check);
-                drop(stop_guard);
-                verdict
-            })
         };
 
         return match verdict {
@@ -670,7 +708,7 @@ fn wall_now_ms() -> i64 {
 pub async fn run_worker_loop(
     client: &SyncClient,
     config: &WorkerConfig,
-    executor: &dyn WorkExecutor,
+    executor: Arc<dyn WorkExecutor>,
     poll_interval: Duration,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Error> {
@@ -714,7 +752,7 @@ pub async fn run_worker_loop(
             &config.advertised_tags,
             wall_now_ms(),
         )?;
-        poll_and_execute_once(client, config, executor, wall_now_ms()).await?;
+        poll_and_execute_once(client, config, Arc::clone(&executor), wall_now_ms()).await?;
         tokio::time::sleep(poll_interval).await;
     }
     Ok(())
