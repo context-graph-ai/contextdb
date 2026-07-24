@@ -159,9 +159,11 @@ foreign_key_table_constraint = {
 }
 
 alter_table_stmt = { ^"ALTER" ~ ^"TABLE" ~ identifier ~ alter_action }
-alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_sync_direction_action }
+alter_action = { add_column_action | drop_column_action | rename_column_action | set_retain_action | drop_retain_action | set_history_action | set_sync_conflict_action | set_sync_direction_action }
 set_retain_action = { ^"SET" ~ ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 drop_retain_action = { ^"DROP" ~ ^"RETAIN" }
+set_history_action = { ^"SET" ~ history_option }
+set_sync_conflict_action = { ^"SET" ~ sync_conflict_option }
 set_sync_direction_action = { ^"SET" ~ sync_direction_option }
 add_column_action = { ^"ADD" ~ (^"COLUMN")? ~ column_def }
 drop_column_action = { ^"DROP" ~ ^"COLUMN" ~ identifier ~ drop_column_modifier? }
@@ -253,11 +255,18 @@ table_option = {
     | propagate_edge_option
     | propagate_state_option
     | retain_option
+    | history_option
     | sync_direction_option
     | sync_conflict_option
 }
 retain_option = { ^"RETAIN" ~ integer ~ retain_unit ~ sync_safe_option? }
 retain_unit = { ^"SECONDS" | ^"MINUTES" | ^"HOURS" | ^"DAYS" }
+// How much of each live row's version history this table keeps. RETAIN says
+// when a ROW expires; HISTORY says how many past VALUES of a surviving row are
+// kept. An absent clause means every version is kept.
+history_option = { ^"HISTORY" ~ (history_all | history_current_only) }
+history_all = { ^"ALL" }
+history_current_only = { ^"CURRENT" ~ ^"ONLY" }
 // RETAIN says only WHEN rows expire and SYNC SAFE says only "do not expire an
 // outbound row before the destination confirms receipt". Neither names a
 // direction. The nested spelling below is matched solely so the refusal can

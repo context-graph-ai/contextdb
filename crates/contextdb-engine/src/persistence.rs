@@ -4,8 +4,9 @@ use crate::database::event_bus::{EventBusPersistenceCommit, PreparedSinkEvent, S
 use crate::database::trigger::TriggerPersistenceCommit;
 use crate::sync_types::DdlChange;
 use contextdb_core::{
-    AdjEntry, ColumnType, Error, Lsn, Result, RowId, TableMeta, TxId, Value, VectorEntry,
-    VectorIndexRef, VectorQuantization, VersionedRow, Wallclock,
+    AdjEntry, ColumnType, Error, ForeignKeyReference, IndexDecl, Lsn, PropagationRule, RankPolicy,
+    Result, RowId, StateMachineConstraint, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
+    VectorQuantization, VersionedRow, Wallclock,
 };
 use contextdb_tx::WriteSet;
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
@@ -19,11 +20,36 @@ use std::os::unix::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Serializes the process-global panic-hook swap in `open_hook_suppressed` so
 /// two concurrent store opens cannot interleave `take_hook`/`set_hook` and
 /// leave the no-op hook permanently installed.
 static HOOK_SWAP: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// Test-only injection seam: when armed, the NEXT [`RedbPersistence::
+    /// compact`]'s post-compact handle recycle (close the redb handle, then
+    /// reopen the same on-disk file) fails its reopen, so a test can assert
+    /// the on-disk file stays intact and a fresh `RedbPersistence::open`
+    /// still recovers every row after a mid-recycle failure. Armed only by
+    /// `arm_handle_recycle_reopen_fault_for_test`; default off, so
+    /// production reads a thread-local that is never set.
+    static HANDLE_RECYCLE_REOPEN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm the one-shot test injection seam: the NEXT `compact()` call on THIS
+/// thread fails to reopen after closing the handle. Production-dead —
+/// nothing but a test calls it.
+pub(crate) fn arm_handle_recycle_reopen_fault_for_test() {
+    HANDLE_RECYCLE_REOPEN_FAULT.with(|f| f.set(true));
+}
+
+/// Consume the armed injection flag, if any. Reads a thread-local that is
+/// never set outside a test, so the production path takes the `false` arm.
+fn take_handle_recycle_reopen_fault_for_test() -> bool {
+    HANDLE_RECYCLE_REOPEN_FAULT.with(|f| f.replace(false))
+}
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const FORMAT_METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
@@ -45,7 +71,7 @@ const VECTORS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vecto
 const SYNC_ROW_SOURCE_LSN_TABLE: TableDefinition<&[u8], u64> =
     TableDefinition::new("sync_row_source_lsn");
 const FORMAT_VERSION_KEY: &str = "format_version";
-const CURRENT_FORMAT_VERSION: &str = "1.0.0";
+pub(crate) const CURRENT_FORMAT_VERSION: &str = "1.0.0";
 const TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY: &str = "__trigger_audit_next_index";
 const TRIGGER_AUDIT_RING_CONFIG_KEY: &str = "__trigger_audit_ring";
 
@@ -53,6 +79,27 @@ pub struct RedbPersistence {
     path: std::path::PathBuf,
     lock_file: Mutex<Option<File>>,
     db: Mutex<Option<redb::Database>>,
+    /// Set the first time a table's meta decodes only via the exact
+    /// pre-`contextdb migrate` `v1.0.0` layout (see
+    /// [`Self::decode_table_meta_versioned`]) rather than the current one.
+    /// `Database::open` refuses on this (`Error::LegacyVectorStoreDetected`,
+    /// naming `contextdb migrate`); the migrate command's own loader reads
+    /// past it. Never set back to `false` — one legacy table is enough to
+    /// mark the whole root.
+    used_legacy_table_meta_layout: AtomicBool,
+}
+
+/// Point-removed key counts from one scoped prune pass — real integer
+/// counters, no rewritten-survivor cost, mirroring the `FkProbeStats`
+/// precedent. Folded into the caller's per-table receipt
+/// (`TableVersionCleanup`/`CurrencyCompactionReport`), and the bench's
+/// proportionality assertions read these directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneScopedStats {
+    pub row_keys_removed: u64,
+    pub change_log_keys_removed: u64,
+    pub vector_keys_removed: u64,
+    pub edge_keys_removed: u64,
 }
 
 pub(crate) struct SchemaDdlPersistence<'a> {
@@ -240,6 +287,107 @@ fn vector_min_max(vector: &[f32]) -> (f32, f32) {
         })
 }
 
+/// The exact `ColumnDef` layout `v1.0.0` (git tag `v1.0.0`, commit `e6cf60c`)
+/// wrote to disk — 11 fields, missing `context_id`/`scope_label`/`acl_ref`.
+/// See `RedbPersistence::decode_table_meta_versioned` for why a genuinely
+/// older-shaped payload needs its own struct rather than leaning on the
+/// current `ColumnDef`'s own trailing-field tolerance (which only protects a
+/// shorter CURRENT-shaped payload, never one from a release whose struct had
+/// fewer fields than today's).
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyColumnDefV1 {
+    name: String,
+    column_type: ColumnType,
+    nullable: bool,
+    primary_key: bool,
+    #[serde(default)]
+    unique: bool,
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    references: Option<ForeignKeyReference>,
+    #[serde(default)]
+    expires: bool,
+    #[serde(default)]
+    immutable: bool,
+    #[serde(default)]
+    quantization: VectorQuantization,
+    #[serde(default)]
+    rank_policy: Option<RankPolicy>,
+}
+
+impl From<LegacyColumnDefV1> for contextdb_core::ColumnDef {
+    fn from(legacy: LegacyColumnDefV1) -> Self {
+        contextdb_core::ColumnDef {
+            name: legacy.name,
+            column_type: legacy.column_type,
+            nullable: legacy.nullable,
+            primary_key: legacy.primary_key,
+            unique: legacy.unique,
+            default: legacy.default,
+            references: legacy.references,
+            expires: legacy.expires,
+            immutable: legacy.immutable,
+            quantization: legacy.quantization,
+            rank_policy: legacy.rank_policy,
+            // Fields v1.0.0 never wrote: honest, unset defaults.
+            context_id: false,
+            scope_label: None,
+            acl_ref: None,
+        }
+    }
+}
+
+/// The exact `TableMeta` layout `v1.0.0` wrote to disk — 11 fields, missing
+/// `composite_foreign_keys`/`sync_direction`/`retain_declared_unit`/
+/// `primary_key_columns`/`conflict_policy`.
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyTableMetaV1 {
+    columns: Vec<LegacyColumnDefV1>,
+    immutable: bool,
+    state_machine: Option<StateMachineConstraint>,
+    #[serde(default)]
+    dag_edge_types: Vec<String>,
+    #[serde(default)]
+    unique_constraints: Vec<Vec<String>>,
+    natural_key_column: Option<String>,
+    #[serde(default)]
+    propagation_rules: Vec<PropagationRule>,
+    #[serde(default)]
+    default_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    sync_safe: bool,
+    #[serde(default)]
+    expires_column: Option<String>,
+    #[serde(default)]
+    indexes: Vec<IndexDecl>,
+}
+
+impl From<LegacyTableMetaV1> for TableMeta {
+    fn from(legacy: LegacyTableMetaV1) -> Self {
+        TableMeta {
+            columns: legacy.columns.into_iter().map(Into::into).collect(),
+            immutable: legacy.immutable,
+            state_machine: legacy.state_machine,
+            dag_edge_types: legacy.dag_edge_types,
+            unique_constraints: legacy.unique_constraints,
+            natural_key_column: legacy.natural_key_column,
+            propagation_rules: legacy.propagation_rules,
+            default_ttl_seconds: legacy.default_ttl_seconds,
+            sync_safe: legacy.sync_safe,
+            expires_column: legacy.expires_column,
+            indexes: legacy.indexes,
+            // Fields v1.0.0 never wrote: honest, unset defaults.
+            composite_foreign_keys: Vec::new(),
+            sync_direction: None,
+            retain_declared_unit: None,
+            primary_key_columns: Vec::new(),
+            conflict_policy: None,
+            history_policy: None,
+        }
+    }
+}
+
 impl RedbPersistence {
     pub fn create(path: &Path) -> Result<Self> {
         let lock_file = Self::acquire_pid_lock(path)?;
@@ -263,6 +411,7 @@ impl RedbPersistence {
                     path: path.to_path_buf(),
                     lock_file: Mutex::new(Some(lock_file)),
                     db: Mutex::new(Some(db)),
+                    used_legacy_table_meta_layout: AtomicBool::new(false),
                 }),
                 Err(err) => {
                     drop(db);
@@ -289,6 +438,7 @@ impl RedbPersistence {
                     path: path.to_path_buf(),
                     lock_file: Mutex::new(Some(lock_file)),
                     db: Mutex::new(Some(db)),
+                    used_legacy_table_meta_layout: AtomicBool::new(false),
                 }),
                 Err(err) => {
                     drop(db);
@@ -323,6 +473,82 @@ impl RedbPersistence {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether any table's meta on this root decoded only via the legacy
+    /// pre-`contextdb migrate` layout (see
+    /// [`Self::decode_table_meta_versioned`]) rather than the current one.
+    /// Set the first time [`Self::load_all_table_meta`] hits that fallback;
+    /// never cleared. `Database::open` consults this to refuse a
+    /// schema-level-legacy root instead of silently loading it.
+    pub fn used_legacy_table_meta_layout(&self) -> bool {
+        self.used_legacy_table_meta_layout.load(Ordering::Relaxed)
+    }
+
+    /// Whether the store at `path` is legacy-format: either its top-level
+    /// format-version marker does not match [`CURRENT_FORMAT_VERSION`], or
+    /// the marker matches but the underlying `TableMeta`/`ColumnDef` schema
+    /// layout still only decodes via [`Self::decode_table_meta_versioned`]'s
+    /// legacy fallback (the `v1.0.0` case this whole module exists for).
+    ///
+    /// Decided through a `redb::ReadOnlyDatabase` handle SPECIFICALLY so
+    /// this check itself never mutates the file: a plain read-write
+    /// `redb::Database::open` performs a housekeeping write on every open —
+    /// independent of any application-level transaction — which would break
+    /// `contextdb migrate`'s "refuse an already-current-format root
+    /// untouched" contract if this detection used one.
+    pub fn is_legacy_format_store(path: &Path) -> Result<bool> {
+        // Suppressed + `catch_unwind`-guarded exactly like `open_db_checked`'s
+        // read-write open: a truncated/corrupt file can trip redb's internal
+        // page_manager assertion (a panic, not a clean `Err`) on the
+        // READ-ONLY path too, and this call must never let that raw panic
+        // (or its backtrace) escape to `repair`/`migrate`'s caller.
+        let opened = Self::open_hook_suppressed(|| redb::ReadOnlyDatabase::open(path));
+        let ro = match opened {
+            Ok(Ok(db)) => db,
+            Ok(Err(err)) => return Err(Self::storage_error(err)),
+            Err(_) => {
+                return Err(Error::StoreCorrupted {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "metadata/format read panicked; store may be truncated or corrupt — {}",
+                        Self::CORRUPT_STORE_NEXT_STEP
+                    ),
+                });
+            }
+        };
+        let read_txn = ro.begin_read().map_err(Self::storage_error)?;
+        let format_table = match read_txn.open_table(FORMAT_METADATA_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(true),
+            Err(err) => return Err(Self::storage_error(err)),
+        };
+        let Some(marker_bytes) = format_table
+            .get(FORMAT_VERSION_KEY)
+            .map_err(Self::storage_error)?
+        else {
+            return Ok(true);
+        };
+        let marker: String = Self::decode(marker_bytes.value())?;
+        if marker != CURRENT_FORMAT_VERSION {
+            return Ok(true);
+        }
+
+        let meta_table = match read_txn.open_table(META_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(err) => return Err(Self::storage_error(err)),
+        };
+        for entry in meta_table.iter().map_err(Self::storage_error)? {
+            let (key, value) = entry.map_err(Self::storage_error)?;
+            if key.value().strip_prefix("table:").is_some() {
+                let (_, via_legacy) = Self::decode_table_meta_versioned(value.value())?;
+                if via_legacy {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// PID-based advisory lock backed by an OS file lock.
@@ -372,9 +598,14 @@ impl RedbPersistence {
     }
 
     /// One-line actionable recovery step appended to a corrupt-store error so
-    /// the user is never left with a dead end.
-    const CORRUPT_STORE_NEXT_STEP: &'static str = "there is no in-place repair; \
-        restore from a backup or a healthy sync peer, or remove the file to recreate it";
+    /// the user is never left with a dead end: run `contextdb repair` to see
+    /// what is salvageable (never modifies the store), or `contextdb reset
+    /// --force` to recreate it once you've restored from a backup or a
+    /// healthy sync peer if you need the data first.
+    pub(crate) const CORRUPT_STORE_NEXT_STEP: &'static str = "run `contextdb repair <path>` to see what is \
+        salvageable (it never modifies the store), or `contextdb reset <path> --force` to \
+        recreate it — restore from a backup or a healthy sync peer first if you need the \
+        existing data";
 
     /// Run a redb store-open closure with the default panic hook suppressed.
     ///
@@ -445,7 +676,10 @@ impl RedbPersistence {
     fn validate_format_marker(db: &redb::Database, path: &Path) -> Result<()> {
         let read_txn = db.begin_read().map_err(|err| Error::StoreCorrupted {
             path: path.display().to_string(),
-            reason: format!("metadata read failed: {err}"),
+            reason: format!(
+                "metadata read failed: {err} — {}",
+                Self::CORRUPT_STORE_NEXT_STEP
+            ),
         })?;
         let table = match read_txn.open_table(FORMAT_METADATA_TABLE) {
             Ok(table) => table,
@@ -458,7 +692,10 @@ impl RedbPersistence {
             Err(err) => {
                 return Err(Error::StoreCorrupted {
                     path: path.display().to_string(),
-                    reason: format!("metadata table could not be read: {err}"),
+                    reason: format!(
+                        "metadata table could not be read: {err} — {}",
+                        Self::CORRUPT_STORE_NEXT_STEP
+                    ),
                 });
             }
         };
@@ -466,15 +703,24 @@ impl RedbPersistence {
             .get(FORMAT_VERSION_KEY)
             .map_err(|err| Error::StoreCorrupted {
                 path: path.display().to_string(),
-                reason: format!("metadata format_version could not be read: {err}"),
+                reason: format!(
+                    "metadata format_version could not be read: {err} — {}",
+                    Self::CORRUPT_STORE_NEXT_STEP
+                ),
             })?
             .ok_or_else(|| Error::StoreCorrupted {
                 path: path.display().to_string(),
-                reason: "metadata table is missing format_version".to_string(),
+                reason: format!(
+                    "metadata table is missing format_version — {}",
+                    Self::CORRUPT_STORE_NEXT_STEP
+                ),
             })?;
         let marker: String = Self::decode(value.value()).map_err(|err| Error::StoreCorrupted {
             path: path.display().to_string(),
-            reason: format!("metadata format_version is corrupt: {err}"),
+            reason: format!(
+                "metadata format_version is corrupt: {err} — {}",
+                Self::CORRUPT_STORE_NEXT_STEP
+            ),
         })?;
         if marker == CURRENT_FORMAT_VERSION {
             Ok(())
@@ -1647,7 +1893,12 @@ impl RedbPersistence {
                 let (key, value) = entry.map_err(Self::storage_error)?;
                 let key = key.value();
                 if let Some(name) = key.strip_prefix("table:") {
-                    tables.insert(name.to_string(), Self::decode(value.value())?);
+                    let (meta, via_legacy) = Self::decode_table_meta_versioned(value.value())?;
+                    if via_legacy {
+                        self.used_legacy_table_meta_layout
+                            .store(true, Ordering::Relaxed);
+                    }
+                    tables.insert(name.to_string(), meta);
                 }
             }
             Ok(tables)
@@ -2162,10 +2413,300 @@ impl RedbPersistence {
         })
     }
 
-    /// Compacts the store to its minimal on-disk size. Checkpoint export
-    /// runs this on the finished artifact so `bytes_written` reflects
-    /// content, not allocator slack from the batched copy.
-    pub(crate) fn compact(&self) -> Result<()> {
+    /// Remove exactly the named relational row VERSIONS, in ONE redb write
+    /// transaction, together with the change-log entries that referenced
+    /// them and the sync-source-lsn tracking rows that lost their last live
+    /// version. Nothing else in the file is read or rewritten: a table's
+    /// surviving rows stay exactly where they are, and vectors, edges, and
+    /// the commit index are untouched (see [`Self::prune_vectors_and_edges_scoped`]
+    /// for those).
+    ///
+    /// `row_keys` are `(table, row_id, created_tx, lsn)` — the full
+    /// relational key, so each is a point `remove` with no scan needed to
+    /// find it (`rel_row_key`, computed from a value already in hand — the
+    /// `VersionedRow` being pruned).
+    ///
+    /// `pruned_change_keys` are the `(table, row_id, lsn)` identities of the
+    /// same pruned versions, used to find which change-log entries
+    /// referenced them. This does NOT recompute each entry's on-disk
+    /// `(lsn, index)` coordinate from an in-memory recount: the moment a
+    /// scoped pass leaves holes (rather than the old wholesale rewrite's
+    /// full re-densify every pass), an in-memory recount goes stale on the
+    /// SECOND pass over an lsn group and can silently orphan a change-log
+    /// entry (see `changes_since`'s replay, which reads the row version AT
+    /// each logged LSN and substitutes the latest on a miss). Instead, for
+    /// every LSN any pruned version's change-log entry names, this reads
+    /// that LSN group's entries AS THEY ACTUALLY STAND ON DISK right now,
+    /// drops the ones naming a pruned version, and rewrites ONLY that LSN
+    /// group, densely renumbered from zero — exactly as a fresh sequence of
+    /// commits would have written them, and correct regardless of how many
+    /// prior scoped passes already touched that group. Cost is proportional
+    /// to the number of DISTINCT lsns touched (each an O(entries-in-that-
+    /// commit) read+rewrite), never to the whole change log.
+    ///
+    /// `orphaned_source_lsn_rows` are the `(table, row_id)` pairs that lost
+    /// their last LIVE version this pass — looked up by key
+    /// (`sync_row_source_lsn_key`) rather than by iterating the table, as
+    /// `retain_sync_source_lsns_for_table_rows` does today.
+    pub fn prune_versions_scoped(
+        &self,
+        row_keys: &[(String, RowId, TxId, Lsn)],
+        pruned_change_keys: &[(String, RowId, Lsn)],
+        orphaned_source_lsn_rows: &[(String, RowId)],
+    ) -> Result<PruneScopedStats> {
+        if row_keys.is_empty()
+            && pruned_change_keys.is_empty()
+            && orphaned_source_lsn_rows.is_empty()
+        {
+            return Ok(PruneScopedStats::default());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let mut change_log_keys_removed = 0u64;
+
+            // CHANGE-LOG-FIRST within this one transaction, for the same
+            // reason the shipped wholesale path orders it first: an orphaned
+            // change-log entry corrupts replay, while an orphaned row
+            // version is inert. Merging both into ONE transaction (rather
+            // than the two separate transactions the wholesale path used)
+            // removes the interleaving window entirely — after a crash the
+            // file has either both removals or neither.
+            if !pruned_change_keys.is_empty() {
+                let mut affected: BTreeMap<Lsn, HashSet<(String, RowId)>> = BTreeMap::new();
+                for (table, row_id, lsn) in pruned_change_keys {
+                    affected
+                        .entry(*lsn)
+                        .or_default()
+                        .insert((table.clone(), *row_id));
+                }
+                match write_txn.open_table(CHANGE_LOG_TABLE) {
+                    Ok(mut table) => {
+                        let mut key_buf = String::with_capacity(Self::change_log_entry_key_len());
+                        for (lsn, pruned_here) in &affected {
+                            let prefix = format!("{:020}:", lsn.0);
+                            let existing: Vec<(String, Vec<u8>)> = {
+                                let mut entries = Vec::new();
+                                for entry in table
+                                    .range(prefix.as_str()..)
+                                    .map_err(Self::storage_error)?
+                                {
+                                    let (key, value) = entry.map_err(Self::storage_error)?;
+                                    let key = key.value();
+                                    if !key.starts_with(prefix.as_str()) {
+                                        break;
+                                    }
+                                    entries.push((key.to_string(), value.value().to_vec()));
+                                }
+                                entries
+                            };
+                            let mut survivors: Vec<Vec<u8>> = Vec::with_capacity(existing.len());
+                            for (key, bytes) in existing {
+                                let decoded: ChangeLogEntry = Self::decode(&bytes)?;
+                                let referenced = match &decoded {
+                                    ChangeLogEntry::RowInsert { table, row_id, .. }
+                                    | ChangeLogEntry::RowDelete { table, row_id, .. } => {
+                                        pruned_here.contains(&(table.clone(), *row_id))
+                                    }
+                                    _ => false,
+                                };
+                                table.remove(key.as_str()).map_err(Self::storage_error)?;
+                                if referenced {
+                                    change_log_keys_removed =
+                                        change_log_keys_removed.saturating_add(1);
+                                } else {
+                                    survivors.push(bytes);
+                                }
+                            }
+                            for (index, bytes) in survivors.into_iter().enumerate() {
+                                Self::write_change_log_entry_key(*lsn, index, &mut key_buf);
+                                table
+                                    .insert(key_buf.as_str(), bytes.as_slice())
+                                    .map_err(Self::storage_error)?;
+                            }
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(err) => return Err(Self::storage_error(err)),
+                }
+            }
+
+            let mut opened_rel_tables: HashMap<String, redb::Table<'_, &[u8], &[u8]>> =
+                HashMap::new();
+            for (table, row_id, created_tx, lsn) in row_keys {
+                if !opened_rel_tables.contains_key(table) {
+                    let table_name = Self::rel_table_name(table);
+                    let table_def: TableDefinition<&[u8], &[u8]> =
+                        TableDefinition::new(table_name.as_str());
+                    match write_txn.open_table(table_def) {
+                        Ok(redb_table) => {
+                            opened_rel_tables.insert(table.clone(), redb_table);
+                        }
+                        Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                        Err(err) => return Err(Self::storage_error(err)),
+                    }
+                }
+                if let Some(redb_table) = opened_rel_tables.get_mut(table) {
+                    let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
+                    redb_table
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            drop(opened_rel_tables);
+
+            if !orphaned_source_lsn_rows.is_empty() {
+                match write_txn.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
+                    Ok(mut table) => {
+                        for (table_name, row_id) in orphaned_source_lsn_rows {
+                            let key = Self::sync_row_source_lsn_key(table_name, *row_id);
+                            table.remove(key.as_slice()).map_err(Self::storage_error)?;
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(err) => return Err(Self::storage_error(err)),
+                }
+            }
+
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(PruneScopedStats {
+                row_keys_removed: row_keys.len() as u64,
+                change_log_keys_removed,
+                vector_keys_removed: 0,
+                edge_keys_removed: 0,
+            })
+        })
+    }
+
+    /// Remove exactly the named vectors and edges, in ONE redb write
+    /// transaction. Used by the retention pass when pruned rows carried
+    /// vectors or graph nodes, and by version cleanup ONLY for the vector
+    /// copies attached to released row versions — version cleanup never
+    /// touches edges (edge identity is `(source, target, edge_type)` plus
+    /// its own `created_tx`/`lsn`, self-owned and versioned by no relational
+    /// row), so its caller always passes an empty `edges` slice.
+    pub fn prune_vectors_and_edges_scoped(
+        &self,
+        vectors: &[VectorEntry],
+        edges: &[AdjEntry],
+    ) -> Result<PruneScopedStats> {
+        if vectors.is_empty() && edges.is_empty() {
+            return Ok(PruneScopedStats::default());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            if !vectors.is_empty() {
+                match write_txn.open_table(VECTORS_TABLE) {
+                    Ok(mut table) => {
+                        for entry in vectors {
+                            let key = Self::vector_key(entry);
+                            table.remove(key.as_slice()).map_err(Self::storage_error)?;
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(err) => return Err(Self::storage_error(err)),
+                }
+            }
+            if !edges.is_empty() {
+                let fwd = write_txn.open_table(GRAPH_FWD_TABLE);
+                let rev = write_txn.open_table(GRAPH_REV_TABLE);
+                match (fwd, rev) {
+                    (Ok(mut fwd), Ok(mut rev)) => {
+                        for entry in edges {
+                            let fwd_key = Self::graph_fwd_key(entry);
+                            let rev_key = Self::graph_rev_key(entry);
+                            fwd.remove(fwd_key.as_slice())
+                                .map_err(Self::storage_error)?;
+                            rev.remove(rev_key.as_slice())
+                                .map_err(Self::storage_error)?;
+                        }
+                    }
+                    (Err(redb::TableError::TableDoesNotExist(_)), _)
+                    | (_, Err(redb::TableError::TableDoesNotExist(_))) => {}
+                    (Err(err), _) | (_, Err(err)) => return Err(Self::storage_error(err)),
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(PruneScopedStats {
+                row_keys_removed: 0,
+                change_log_keys_removed: 0,
+                vector_keys_removed: vectors.len() as u64,
+                edge_keys_removed: (edges.len() as u64).saturating_mul(2),
+            })
+        })
+    }
+
+    /// Remove exactly the named commit-index entries — the scoped
+    /// counterpart of `rewrite_commit_index`, used when a version-cleanup
+    /// pass only made a handful of LSNs' commit-index entries redundant
+    /// (their change-log entries are all gone and nothing else names them).
+    /// Point removes; nothing else in the index is read or rewritten.
+    pub fn remove_commit_index_entries_scoped(&self, lsns: &[Lsn]) -> Result<u64> {
+        if lsns.is_empty() {
+            return Ok(0);
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            let mut removed = 0u64;
+            match write_txn.open_table(COMMIT_INDEX_TABLE) {
+                Ok(mut table) => {
+                    for lsn in lsns {
+                        if table.remove(lsn.0).map_err(Self::storage_error)?.is_some() {
+                            removed = removed.saturating_add(1);
+                        }
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(err) => return Err(Self::storage_error(err)),
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(removed)
+        })
+    }
+
+    /// Compacts the store to its minimal on-disk size, THEN recycles the
+    /// redb handle (closes it and reopens the same, now-minimal, file) —
+    /// checkpoint export runs this on the finished artifact so
+    /// `bytes_written` reflects content, not allocator slack from the
+    /// batched copy.
+    ///
+    /// The recycle exists because redb retains in-process allocator/region
+    /// bookkeeping sized to a database's historical peak allocation, and a
+    /// file-level `compact()` does not reset it even though it fully
+    /// normalizes the on-disk btree and file size — confirmed by direct
+    /// measurement: two databases compacted down to a byte-identical
+    /// on-disk btree, one carrying a much larger prior-churn history, still
+    /// showed a large gap in per-transaction commit cost after compaction
+    /// alone; closing and reopening the handle closed that gap. A
+    /// long-running embedded consumer has no other opportunity to do this
+    /// (it cannot process-restart), so the recycle happens HERE,
+    /// transparently, under the SAME locks compaction itself already
+    /// holds: no other caller can observe (or race) an intermediate closed
+    /// state, because every access to the underlying handle — this
+    /// function included — goes through `self.db`'s mutex.
+    ///
+    /// A deliberate working-headroom margin between the shrink and the
+    /// recycle was tried and measured NOT to help: redb's own close-time
+    /// bookkeeping (`ensure_allocator_state_table_and_trim` in `Drop for
+    /// redb::Database`) regrows a maximally-shrunk file to roughly the
+    /// same final size whether or not a margin was left beforehand, so the
+    /// margin only added the cost of two extra write transactions for no
+    /// measured benefit — removed. The steady-state cost story for a file
+    /// carrying a large amount of PRE-cleanup history (never yet compacted
+    /// before) is the still-open retrofit-scenario question the version-
+    /// cleanup-scaling bench's A2 arm measures directly.
+    ///
+    /// Returns the recycle's own duration in microseconds, separate from
+    /// compaction's own timing (which the caller already measures around
+    /// the whole call), matching the existing convention of reporting every
+    /// compaction-adjacent cost as its own explicit number.
+    ///
+    /// On a reopen failure, the file itself is untouched (compaction had
+    /// already finished; nothing more is written to it here) and this
+    /// `RedbPersistence` is left closed — [`Error::StoreHandleRecycleFailed`]
+    /// names the failure; a fresh `RedbPersistence::open`/`Database::open`
+    /// on the same path recovers all data once this instance's lock is
+    /// released via `close()`.
+    pub(crate) fn compact(&self) -> Result<u64> {
         let lock_guard = self.lock_file.lock().expect("pid lock mutex poisoned");
         if lock_guard.is_none() {
             return Err(Error::Other("database persistence is closed".to_string()));
@@ -2175,7 +2716,31 @@ impl RedbPersistence {
             .as_mut()
             .ok_or_else(|| Error::Other("database persistence is closed".to_string()))?;
         while db.compact().map_err(Self::storage_error)? {}
-        Ok(())
+
+        let recycle_started = std::time::Instant::now();
+        let old = db_guard.take();
+        drop(old);
+        if take_handle_recycle_reopen_fault_for_test() {
+            return Err(Error::StoreHandleRecycleFailed {
+                path: self.path.display().to_string(),
+                reason: "injected reopen failure (test seam)".to_string(),
+            });
+        }
+        let reopened = Self::open_hook_suppressed(|| redb::Database::open(&self.path));
+        match reopened {
+            Ok(Ok(fresh)) => {
+                *db_guard = Some(fresh);
+                Ok(recycle_started.elapsed().as_micros() as u64)
+            }
+            Ok(Err(err)) => Err(Error::StoreHandleRecycleFailed {
+                path: self.path.display().to_string(),
+                reason: err.to_string(),
+            }),
+            Err(_) => Err(Error::StoreHandleRecycleFailed {
+                path: self.path.display().to_string(),
+                reason: "reopen panicked; store may be truncated or corrupt".to_string(),
+            }),
+        }
     }
 
     /// Fraction of the on-disk file that is free/fragmented pages (dead space):
@@ -2546,7 +3111,7 @@ impl RedbPersistence {
         meta_table
             .get(key.as_str())
             .map_err(Self::storage_error)?
-            .map(|value| Self::decode(value.value()))
+            .map(|value| Self::decode_table_meta_versioned(value.value()).map(|(meta, _)| meta))
             .transpose()
     }
 
@@ -2730,10 +3295,18 @@ impl RedbPersistence {
     }
 
     fn rel_row_key(row: &VersionedRow) -> Vec<u8> {
+        Self::rel_row_key_from_parts(row.row_id, row.created_tx, row.lsn)
+    }
+
+    /// The same key `rel_row_key` derives from a `VersionedRow`, built from
+    /// the raw identity parts directly — for a scoped prune, which has the
+    /// pruned version's `(row_id, created_tx, lsn)` in hand without needing
+    /// the whole row.
+    fn rel_row_key_from_parts(row_id: RowId, created_tx: TxId, lsn: Lsn) -> Vec<u8> {
         let mut key = Vec::with_capacity(24);
-        key.extend_from_slice(&row.row_id.0.to_be_bytes());
-        key.extend_from_slice(&row.created_tx.0.to_be_bytes());
-        key.extend_from_slice(&row.lsn.0.to_be_bytes());
+        key.extend_from_slice(&row_id.0.to_be_bytes());
+        key.extend_from_slice(&created_tx.0.to_be_bytes());
+        key.extend_from_slice(&lsn.0.to_be_bytes());
         key
     }
 
@@ -2893,6 +3466,36 @@ impl RedbPersistence {
         let (value, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
             .map_err(|err| Error::Other(format!("bincode decode error: {err}")))?;
         Ok(value)
+    }
+
+    /// Decode one `TableMeta` blob, trying the CURRENT layout first and
+    /// falling back to the exact `v1.0.0` layout on the SPECIFIC decode
+    /// failure that layout produces. Returns whether the legacy fallback
+    /// fired, so callers can refuse (`Database::open`) or proceed
+    /// (`contextdb migrate`) accordingly.
+    ///
+    /// bincode's struct-as-tuple encoding carries no field-count marker, so
+    /// a `Vec<ColumnDef>`/`TableMeta` decoder that optimistically reads past
+    /// its OWN declared trailing fields does not cleanly stop at "no more
+    /// fields for me" — it keeps consuming bytes that actually belong to the
+    /// NEXT `ColumnDef` (or the next `TableMeta` field), and only surfaces an
+    /// error once one of those borrowed bytes fails to satisfy the type it's
+    /// forced into (observed as `InvalidBooleanValue` when a borrowed length
+    /// or variant-tag byte lands on a `bool` field). The current
+    /// `TableMeta`/`ColumnDef` `Deserialize` impls' own trailing-field
+    /// `unwrap_or_default()` therefore only protects a genuinely SHORTER
+    /// CURRENT-shaped payload (e.g. one written before the most recent
+    /// additive field) — never a payload from a release whose `ColumnDef`
+    /// had fewer fields than today's, which is exactly the `v1.0.0` case
+    /// this fallback exists for.
+    fn decode_table_meta_versioned(bytes: &[u8]) -> Result<(TableMeta, bool)> {
+        match Self::decode::<TableMeta>(bytes) {
+            Ok(meta) => Ok((meta, false)),
+            Err(_) => {
+                let legacy: LegacyTableMetaV1 = Self::decode(bytes)?;
+                Ok((legacy.into(), true))
+            }
+        }
     }
 
     fn storage_error(err: impl std::fmt::Display) -> Error {

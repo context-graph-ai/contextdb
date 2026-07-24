@@ -914,6 +914,98 @@ fn sql_01_default_now_produces_timestamp() {
 }
 
 #[test]
+fn sql_01b_default_integer_literal_applies_on_omitted_insert() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE items (id UUID PRIMARY KEY, qty INTEGER DEFAULT 5)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO items (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT qty FROM items WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Int64(5));
+}
+
+#[test]
+fn sql_01c_default_real_literal_applies_on_omitted_insert() {
+    // This is docs/query-language.md's own canonical `tasks` example column:
+    // `confidence REAL DEFAULT 0.0`.
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE tasks (id UUID PRIMARY KEY, confidence REAL DEFAULT 0.0)",
+        &empty(),
+    )
+    .unwrap();
+
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO tasks (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(id))]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT confidence FROM tasks WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Float64(0.0));
+}
+
+#[test]
+fn sql_01d_numeric_defaults_survive_persisted_reopen() {
+    // The bug is in the PERSISTED representation of the default (the string
+    // written into table metadata), not just the in-session Expr. Prove the
+    // fix holds after a real close/reopen round-trip through the on-disk
+    // table metadata, not only against the freshly-created in-memory table.
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("sql_01d.db");
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.execute(
+            "CREATE TABLE tasks (id UUID PRIMARY KEY, confidence REAL DEFAULT 0.0, qty INTEGER DEFAULT 5)",
+            &empty(),
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+
+    let reopened = Database::open(&db_path).unwrap();
+    let id = Uuid::new_v4();
+    reopened
+        .execute(
+            "INSERT INTO tasks (id) VALUES ($id)",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+
+    let result = reopened
+        .execute(
+            "SELECT confidence, qty FROM tasks WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::Float64(0.0));
+    assert_eq!(result.rows[0][1], Value::Int64(5));
+}
+
+#[test]
 fn sql_02_edge_insert_routes_to_graph_once() {
     let db = Database::open_memory();
     db.execute(
@@ -5636,7 +5728,7 @@ fn con_03_backward_compat_column_def_serde() {
 }
 
 #[test]
-fn con_04_composite_unique_duplicate_is_noop() {
+fn con_04_composite_unique_duplicate_is_refused() {
     let db = Database::open_memory();
     db.execute(
         "CREATE TABLE memberships (id UUID PRIMARY KEY, org_id UUID NOT NULL, email TEXT NOT NULL, UNIQUE (org_id, email))",
@@ -5654,18 +5746,27 @@ fn con_04_composite_unique_duplicate_is_noop() {
     )
     .unwrap();
 
-    db.execute(
-        "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("org_id", Value::Uuid(Uuid::from_u128(1))),
-            ("email", Value::Text("alice@example.com".into())),
-        ]),
-    )
-    .unwrap();
+    let err = db
+        .execute(
+            "INSERT INTO memberships (id, org_id, email) VALUES ($id, $org_id, $email)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("org_id", Value::Uuid(Uuid::from_u128(1))),
+                ("email", Value::Text("alice@example.com".into())),
+            ]),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::UniqueViolation { table, .. } if table == "memberships"),
+        "expected Error::UniqueViolation naming table `memberships`, got {err:?}"
+    );
 
     let rows = db.scan("memberships", db.snapshot()).unwrap();
-    assert_eq!(rows.len(), 1, "duplicate composite tuple must be a no-op");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the refused duplicate must not create a second row"
+    );
 }
 
 #[test]

@@ -19,23 +19,23 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
             "crates/contextdb-engine/tests/sql_surface_tests.rs".to_string(),
             888u32,
         ),
-        ("tests/acceptance/query_surface.rs".to_string(), 685u32),
+        ("tests/acceptance/query_surface.rs".to_string(), 690u32),
         (
             "benches/indexed_scan_filter_entity_list.rs".to_string(),
             15u32,
         ),
-        ("tests/acceptance/query_surface.rs".to_string(), 1115u32),
+        ("tests/acceptance/query_surface.rs".to_string(), 1120u32),
         (
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
-            1970u32,
+            1994u32,
         ),
         (
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
-            1996u32,
+            2020u32,
         ),
         (
             "tests/integration/indexed_scan_filter_tests.rs".to_string(),
-            2896u32,
+            2920u32,
         ),
         ("tests/integration/retention_tests.rs".to_string(), 1652u32),
         ("tests/integration/retention_tests.rs".to_string(), 1698u32),

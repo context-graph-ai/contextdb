@@ -76,6 +76,7 @@ fn acl_denied_display(table: &str, row_id: &RowId, principal: &Principal) -> Str
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("table not found: {0}")]
     TableNotFound(String),
@@ -177,7 +178,7 @@ pub enum Error {
         sort_key: Box<str>,
     },
     #[error(
-        "legacy vector store detected (format marker {found_format_marker:?}); rebuild required for release {expected_release} - sync from a 1.0+ peer or recreate the schema and reimport"
+        "legacy vector store detected (format marker {found_format_marker:?}); current release is {expected_release}. Run `contextdb migrate <path>` to migrate it in place (writes a `.bak` backup first, before anything is changed) — or sync from a 1.0+ peer, or recreate the schema on a fresh root and reimport the data"
     )]
     LegacyVectorStoreDetected {
         found_format_marker: String,
@@ -216,7 +217,7 @@ pub enum Error {
     #[error("full-text search (WHERE column MATCH) is not supported")]
     FullTextSearchNotSupported,
     #[error(
-        "ORDER BY requires a column reference or a SELECT-list alias naming one; expression sort keys are not supported"
+        "ORDER BY requires a column reference, a SELECT-list alias naming one, COALESCE(...), or arithmetic (+, -, *, /); this sort key expression is not supported"
     )]
     OrderByExpressionNotSupported,
     #[error("parse error: {0}")]
@@ -394,6 +395,14 @@ pub enum Error {
     },
     #[error("work ledger: input of job {job_id} is a blob_ref; route it to the blob resolver")]
     InputRequiresBlobResolver { job_id: String },
+    /// A job's ledger-carried input copies are gone: they aged out under
+    /// `work_inputs`' declared retention window before the job was executed.
+    /// Distinct from a job with no ledger inputs at all -- that job's input
+    /// reference names a different kind. A worker reaching this must see a
+    /// typed refusal and record a failure; it must never execute on
+    /// silently-empty input.
+    #[error("work ledger: input of job {job_id} expired under work_inputs' retention window")]
+    WorkInputExpired { job_id: String },
     /// A push was interrupted after its batch left the edge, and the hub could
     /// not be reached to confirm whether the batch landed. The outcome is
     /// INDETERMINATE — the data may or may not have committed on the hub — so
@@ -401,6 +410,17 @@ pub enum Error {
     /// push watermark is left unadvanced; a later push reconciles idempotently.
     #[error("sync push unconfirmed: {detail}")]
     SyncPushUnconfirmed { detail: String },
+    /// A compaction's internal handle recycle (close then reopen the same
+    /// on-disk file, to release in-process allocator state a file-level
+    /// compact does not) closed the old handle successfully but could not
+    /// reopen it. The on-disk file itself is untouched by the recycle step
+    /// (compaction already finished before this ran), so it stays intact and
+    /// openable; this store instance is left closed and must be reopened
+    /// fresh by the caller.
+    #[error(
+        "store handle recycle failed for {path}: {reason} (on-disk file is intact; reopen fresh)"
+    )]
+    StoreHandleRecycleFailed { path: String, reason: String },
     #[error("{0}")]
     Other(String),
 }

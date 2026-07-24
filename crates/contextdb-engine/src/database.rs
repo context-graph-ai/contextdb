@@ -1,4 +1,7 @@
-use crate::composite_store::{ApplyPhasePause, ChangeLogEntry, CompositeStore};
+use crate::composite_store::{
+    ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,
+    record_change_log_entries,
+};
 use crate::executor::{apply_on_conflict_updates, execute_plan, validate_plan_columns};
 use crate::persistence::RedbPersistence;
 use crate::persistent_store::PersistentCompositeStore;
@@ -10,8 +13,8 @@ use crate::rank_formula::{FormulaEvalError, RankFormula};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
-    NaturalKey, RowChange, VectorChange, natural_key_column_for_meta, natural_key_columns_for_meta,
-    natural_key_from_row_values,
+    NaturalKey, RowChange, SyncAdoption, VectorChange, natural_key_column_for_meta,
+    natural_key_columns_for_meta, natural_key_from_row_values,
 };
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor};
@@ -55,6 +58,22 @@ const MIN_DISK_WRITE_HEADROOM_BYTES: u64 = 1024;
 // proportional to a batch, never a second whole-table copy.
 const EXPORT_BATCH_SIZE: usize = 1024;
 const EXPORT_NODE_BATCH_SIZE: usize = 256;
+/// Sentinel `sync_source_lsn` sidecar value meaning "this row's arrival is
+/// exactly its own commit LSN on the accepting node" -- written for a
+/// STAMPLESS incoming row (one whose sender never had an established
+/// arrival) instead of a `current_lsn()` sample taken before this row's own
+/// commit. A sampled value goes stale the instant a concurrent apply commits
+/// first: two stampless rows sampled at the same pre-commit instant would
+/// otherwise freeze the SAME arrival even though they land at different
+/// committed positions, so equal-arrival arbitration (`sync_latest_wins_
+/// incoming`) would let a peer holding the first value refuse the true later
+/// one -- fleet divergence. The sentinel makes the sidecar exact by
+/// construction: it always resolves (via `resolve_sync_source_lsn`) to
+/// whatever LSN the row's OWN commit actually lands at, never a value
+/// sampled before that commit was ordered. It never crosses the wire -- the
+/// serve side (`Database::changes_since_with_arrivals`) resolves it to a
+/// concrete LSN before a peer ever sees it.
+const SYNC_SOURCE_LSN_OWN_COMMIT: Lsn = Lsn(u64::MAX);
 
 mod cron;
 pub(crate) mod event_bus;
@@ -535,11 +554,36 @@ pub struct Database {
     vector_store: Arc<VectorStore>,
     vector_schema_gates: Arc<VectorSchemaGates>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+    /// Per-table shadow of `change_log`'s own `RowInsert`/`RowDelete`
+    /// entries, and a global LSN reference count over every entry kind --
+    /// see `ChangeLogTableIndex`/`ChangeLogLsnRefcounts` on
+    /// `composite_store` for why these exist and how they stay in lockstep.
+    change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
+    change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     persistence: Option<Arc<RedbPersistence>>,
     open_registry_path: Mutex<Option<PathBuf>>,
     operation_gate: Arc<RwLock<()>>,
     apply_phase_pause: Arc<ApplyPhasePause>,
+    /// Test-only pause point in a sync apply's per-row loop, immediately
+    /// before the changeset's terminal commit -- after every row (including
+    /// a stampless row's sentinel-stamped provenance sidecar write) has been
+    /// staged into the transaction's write set, but before the commit that
+    /// assigns this changeset's own LSN. Distinct from `apply_phase_pause`
+    /// (which fires INSIDE an already-committing transaction, holding the
+    /// commit lock): this fires before commit-lock acquisition, so a second,
+    /// independent apply can run a full commit while this one is paused
+    /// here -- exactly the interleaving a same-instant-sampled, different-
+    /// commit-order race needs to reproduce deterministically. Armed
+    /// globally by `Database::pause_before_sync_apply_commit_for_test`, but
+    /// only actually STOPS a thread that separately marked itself via
+    /// `Database::mark_this_thread_for_sync_apply_pre_commit_pause_for_test`
+    /// (see `SYNC_APPLY_PRE_COMMIT_PAUSE_ARMED_HERE`) -- an unmarked thread
+    /// passes this checkpoint unconditionally even while armed, so a test
+    /// can pause exactly one concurrent apply while a second, independent
+    /// one commits normally on another thread. The production path reads
+    /// state that is never armed outside a test.
+    sync_apply_pre_commit_pause: Arc<ApplyPhasePause>,
     relational: MemRelationalExecutor<DynStore>,
     graph: MemGraphExecutor<DynStore>,
     vector: MemVectorExecutor<DynStore>,
@@ -571,6 +615,43 @@ pub struct Database {
     pending_commit_metadata: Mutex<HashMap<TxId, PendingCommitMetadata>>,
     disk_limit: AtomicU64,
     disk_limit_startup_ceiling: AtomicU64,
+    /// Engine open-config for the engine's OWN durable trigger-audit history:
+    /// an in-process, non-persisted retention window in seconds, defaulting
+    /// to [`TRIGGER_AUDIT_RETENTION`]. Deliberately NOT backed by the redb
+    /// config store -- it is caller policy for this handle's lifetime only,
+    /// the same way a disk limit or memory ceiling is caller policy, never a
+    /// stored declaration, DDL surface, or transported value. Shared (like
+    /// [`Self::auto_compact_min_interval`]), not per-handle, and re-read per
+    /// tick by the maintenance loop's [`MaintenanceContext`] -- a declared
+    /// override reaches an ALREADY-RUNNING engine-owned loop, not only a
+    /// loop spawned after the setter call.
+    trigger_audit_retention_secs: Arc<AtomicU64>,
+    /// Every read snapshot currently entitled to resolve a version — see
+    /// [`SnapshotFloorRegistry`]. Shared (not per-handle) so a pin taken
+    /// through one derived handle is honored by cleanup running through
+    /// another handle onto the same underlying database.
+    snapshot_registry: Arc<SnapshotFloorRegistry>,
+    /// Engine open-config: `true` when this database's maintenance is
+    /// `MaintenancePolicy::CallerDriven`. Shared, not per-handle, so the
+    /// policy is a property of the database, not of one handle onto it.
+    maintenance_caller_driven: Arc<AtomicBool>,
+    /// When the last maintenance cycle actually ran (engine-owned tick or a
+    /// caller's own `run_maintenance_cycle` call), for the caller-driven
+    /// backlog warning's "has a tick interval elapsed" check.
+    last_maintenance_cycle_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Throttle for the caller-driven backlog warning, so a busy caller that
+    /// never drives a cycle gets ONE warning per elapsed interval, not one
+    /// per commit.
+    caller_driven_backlog_warned_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// When an automatic (threshold-gated) or explicit (`compact_now`) redb
+    /// compaction last actually ran on this database — see
+    /// [`AUTO_COMPACT_MIN_INTERVAL`]. Shared, not per-handle: a compaction
+    /// run through one derived handle must throttle the automatic path on
+    /// every other handle onto the same database too.
+    last_auto_compact_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Engine open-config, test-only override of [`AUTO_COMPACT_MIN_INTERVAL`]
+    /// — see `__set_auto_compact_min_interval_for_test`.
+    auto_compact_min_interval: Arc<Mutex<Duration>>,
     sync_watermark: Arc<AtomicLsn>,
     closed: AtomicBool,
     resource_closed: Arc<AtomicBool>,
@@ -979,6 +1060,27 @@ fn closed_database_error() -> Error {
     Error::Other("database handle is closed".to_string())
 }
 
+impl Database {
+    /// A snapshot-in-time read of "is this handle closed right now" — reads
+    /// the SAME two atomics `open_operation` checks, but takes NO lock and
+    /// holds nothing: unlike `open_operation`'s guard, this cannot be held
+    /// across a park/wait. Exists ONLY to let a `Result`-returning surface
+    /// reject an ALREADY-closed handle before doing any work that would
+    /// otherwise panic on it (`execute`'s snapshot-registration pre-flight,
+    /// which resolves through the panicking public `Database::snapshot`) —
+    /// never as a substitute for `open_operation`'s own real guard, whose
+    /// `operation_gate` read lock is exactly what a parked waiter (e.g. a
+    /// `BEGIN` waiting on an in-flight trigger callback) must NOT hold for
+    /// the duration of its wait, since `close()` needs that gate's WRITE
+    /// lock to ever complete. Racing this check against a close in
+    /// progress is fine either way: a `false` here just means the function
+    /// proceeds to its own real, later `open_operation()`/wait logic, which
+    /// resolves the race correctly either way.
+    fn already_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst) || self.resource_closed.load(Ordering::SeqCst)
+    }
+}
+
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Database")
@@ -1092,12 +1194,44 @@ pub struct MaintenanceStatus {
     pub running: bool,
     /// This database holds at least one table that declares RETAIN.
     pub retention_enabled: bool,
-    /// This database holds at least one currency table (see
-    /// [`VERSION_COMPACTION_TABLES`]).
+    /// This database holds at least one table that declares `HISTORY
+    /// CURRENT ONLY` — declaration-driven, not a fixed table-name list.
     pub currency_compaction_enabled: bool,
     /// Loops spawned for this database. Both jobs share ONE loop, so this is
     /// 1 whenever anything is maintained and 0 when nothing is.
     pub active_maintenance_loops: usize,
+    /// Whether this database's maintenance is engine-owned (the default) or
+    /// handed to the caller — see [`MaintenancePolicy`].
+    pub policy: MaintenancePolicy,
+}
+
+/// Whether a database's maintenance loop is owned by the engine or handed to
+/// the caller.
+///
+/// `EngineOwned` (the default) is what every database gets until a caller
+/// asks otherwise: the engine spawns its own background thread the moment
+/// anything is declared (a `RETAIN` window, `HISTORY CURRENT ONLY`, a
+/// durable trigger-audit history), and stops it the moment nothing is.
+///
+/// `CallerDriven` hands the schedule to the host: the engine spawns ZERO
+/// threads for this database, however much is declared, and the caller is
+/// expected to drive `Database::run_maintenance_cycle` itself. A caller that
+/// declares something and then never calls it does not fail silently: the
+/// engine warns once, lazily, the next time a commit touches a declared
+/// table after a full tick interval has passed with no cycle call (there is
+/// no watchdog thread to emit the warning otherwise — `CallerDriven` means
+/// zero threads, not "zero threads except a warning one").
+///
+/// This is engine OPEN-CONFIG, exactly like [`Database::trigger_audit_
+/// retention`]: it lives on this in-process handle only, is never written to
+/// the redb config store, and is never a DDL surface or a transported value.
+/// A fresh handle reopened on the same path with no call to the setter is
+/// `EngineOwned` again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaintenancePolicy {
+    #[default]
+    EngineOwned,
+    CallerDriven,
 }
 
 /// Everything one maintenance cycle did: generic retention, currency version
@@ -1107,6 +1241,13 @@ pub struct MaintenanceReport {
     pub pruning: PruningReport,
     pub currency: CurrencyCompactionReport,
     pub pruned_trigger_audit_rows: u64,
+    /// The rare, interval-gated automatic compaction attempt this cycle made
+    /// (see [`AUTO_COMPACT_MIN_INTERVAL`]) — `ran=false` on almost every
+    /// cycle. Separate from, and never counted in, `currency.redb_compacted`
+    /// / `pruning.compacted`, which now describe ONLY what those two scoped
+    /// passes decided on their own (currency never compacts at all;
+    /// retention keeps its existing per-cycle decision, unchanged).
+    pub compaction: CompactionReport,
 }
 
 /// An honest per-table size answer: an ESTIMATE of the table's live bytes plus
@@ -1120,6 +1261,216 @@ pub struct TableSizeEstimate {
     pub estimated_live_bytes: u64,
     pub row_count: u64,
     pub whole_file_bytes: Option<u64>,
+}
+
+/// Every read snapshot currently entitled to resolve a version, keyed by a
+/// registration token. Version cleanup consults EVERY registered snapshot
+/// (not merely the lowest) and defers any version visible to ANY of them to
+/// a later cycle, rather than physically removing it out from under a live
+/// reader.
+///
+/// Two classes of caller register here:
+/// - Every top-level statement execution (`execute`, `execute_in_tx`, and
+///   `execute_at_snapshot` riding through `execute`) registers its own
+///   snapshot for exactly that call's duration -- this closes the
+///   mid-statement race with the autonomous maintenance thread: a long read
+///   resolving rows later in the same statement can no longer have a version
+///   vanish underneath it.
+/// - `Database::pin_snapshot` registers a snapshot for as long as the
+///   returned guard lives, for a caller that holds a `SnapshotId` ACROSS
+///   separate calls (the shape `execute_at_snapshot` alone cannot protect,
+///   since a bare `SnapshotId` is a plain `Copy` value the engine has no way
+///   to know is still wanted once a call returns).
+#[derive(Default)]
+struct SnapshotFloorRegistry {
+    next_token: AtomicU64,
+    /// The registered set AND the in-flight removal pass marker, under ONE
+    /// lock -- a registration and a pass's registered-set/watermark sample
+    /// can never interleave un-observed. (A previous design guarded these
+    /// under two SEPARATE `Mutex`es and only claimed to share one; a
+    /// `register` between the pass's sample and its persisted removal could
+    /// land un-accounted-for and then return, promising protection the
+    /// SAME in-flight pass was still free to violate.)
+    state: Mutex<SnapshotFloorState>,
+    /// Wakes a `register` call blocked in the `while` loop below when a
+    /// pass's `ActiveRemovalPassGuard` drops.
+    pass_finished: Condvar,
+    /// Test-only pause point between a removal pass's registered-set/
+    /// watermark sample (via `begin_removal_pass`) and its persisted
+    /// removal -- armed only by
+    /// `Database::pause_after_currency_floor_sample_for_test`; the
+    /// production path's `maybe_pause` reads state that is never armed
+    /// outside a test, so it is an immediate no-op there. Same
+    /// `ApplyPhasePause`/`ApplyPhasePauseGuard` shape as the sync-apply
+    /// pause seams -- real cross-thread wait/release is needed here (a
+    /// `pin_snapshot` call on another thread must observe the pass as
+    /// genuinely in progress), which a same-thread injection flag alone
+    /// cannot provide.
+    removal_pass_test_pause: Arc<ApplyPhasePause>,
+}
+
+#[derive(Default)]
+struct SnapshotFloorState {
+    active: HashMap<u64, SnapshotId>,
+    /// `Some(pass)` while a version-cleanup removal pass is in flight;
+    /// `None` means no pass is active. Set by `begin_removal_pass` the
+    /// moment a pass samples its registered set and watermark; cleared (and
+    /// `pass_finished` notified) only by `ActiveRemovalPassGuard`'s `Drop`
+    /// -- covering every exit path (success, an early return, or a
+    /// `?`-propagated error) uniformly, so a pass can never leave this
+    /// marker stuck.
+    active_pass: Option<ActiveRemovalPass>,
+}
+
+/// One in-flight removal pass's own sampled marker -- captured ONCE, at the
+/// moment `begin_removal_pass` locks `SnapshotFloorState`, and never
+/// updated for the rest of the pass. The registered-snapshot set itself is
+/// NOT duplicated here: it lives solely on `ActiveRemovalPassGuard` (the
+/// pass's own deferral loop reads it from there), so this marker carries
+/// only what `register`'s blocking rule needs.
+#[derive(Clone, Copy)]
+struct ActiveRemovalPass {
+    /// The highest-committed `TxId` at the moment this pass began
+    /// (`Database::committed_watermark`, threaded in by the caller under
+    /// the SAME commit-lock hold the whole pass runs inside -- see
+    /// `compact_currency_versions_inner`). Used ONLY to decide whether a
+    /// registration racing in DURING this pass needs to block -- see
+    /// `SnapshotFloorRegistry::register`'s blocking rule.
+    watermark: TxId,
+}
+
+impl SnapshotFloorRegistry {
+    fn register(self: &Arc<Self>, snapshot: SnapshotId) -> SnapshotRegistration {
+        let mut state = self.state.lock();
+        while let Some(pass) = &state.active_pass {
+            // Blocking rule: this pass can only ever prune a version
+            // superseded AT OR BEFORE its own sampled `watermark` -- every
+            // row it can see was committed under the SAME commit-lock hold
+            // that produced `watermark` (`compact_currency_versions_inner`
+            // runs entirely inside `with_commit_lock`, so nothing commits
+            // in between). A registration for a snapshot STRICTLY AFTER
+            // `watermark` can therefore never resolve a version this pass
+            // might remove (its `deleted_tx` is `<= watermark < snapshot`,
+            // so `VersionedRow::visible_at` is false regardless), and may
+            // register immediately. A snapshot AT OR BEFORE `watermark`
+            // might be exactly what this pass is deciding about, and this
+            // pass's own deferral only consulted the registered set at ITS
+            // start -- which cannot already include a registration racing
+            // in now -- so it must wait for the pass to finish rather than
+            // register onto a sample that will never account for it.
+            if snapshot.0 > pass.watermark.0 {
+                break;
+            }
+            self.pass_finished.wait(&mut state);
+        }
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
+        state.active.insert(token, snapshot);
+        drop(state);
+        SnapshotRegistration {
+            registry: self.clone(),
+            token,
+        }
+    }
+
+    /// Begin a removal pass: clone the currently-registered snapshot set
+    /// (sorted) and record `watermark` (the committed watermark the caller
+    /// already sampled via `Database::committed_watermark`, under the same
+    /// commit-lock hold the whole pass runs inside) as this pass's own,
+    /// atomically with each other under `state`'s single lock -- a
+    /// registration can never land between these two reads un-observed.
+    /// Returns a guard that clears the marker and wakes every blocked
+    /// `register` on drop -- hold it for the pass's FULL duration,
+    /// including its persisted removal, so a late registration can never
+    /// land on a sample the pass no longer accounts for. See
+    /// `SnapshotFloorState::active_pass`'s doc comment.
+    fn begin_removal_pass(self: &Arc<Self>, watermark: TxId) -> ActiveRemovalPassGuard {
+        let mut state = self.state.lock();
+        let mut registered_snapshots: Vec<SnapshotId> = state.active.values().copied().collect();
+        registered_snapshots.sort_unstable();
+        state.active_pass = Some(ActiveRemovalPass { watermark });
+        drop(state);
+        ActiveRemovalPassGuard {
+            registry: self.clone(),
+            registered_snapshots,
+        }
+    }
+}
+
+/// RAII marker for one in-progress version-cleanup removal pass -- see
+/// `SnapshotFloorRegistry::begin_removal_pass`.
+struct ActiveRemovalPassGuard {
+    registry: Arc<SnapshotFloorRegistry>,
+    /// This pass's own sorted snapshot of the registered set at the moment
+    /// it began -- see `ActiveRemovalPass::registered_snapshots`. Exposed
+    /// via `Self::registered_snapshots` so the pass's deferral loop
+    /// consults the EXACT SAME set `register`'s blocking rule was computed
+    /// against.
+    registered_snapshots: Vec<SnapshotId>,
+}
+
+impl ActiveRemovalPassGuard {
+    /// Every snapshot registered when this pass began, sorted ascending.
+    fn registered_snapshots(&self) -> &[SnapshotId] {
+        &self.registered_snapshots
+    }
+}
+
+impl Drop for ActiveRemovalPassGuard {
+    fn drop(&mut self) {
+        self.registry.state.lock().active_pass = None;
+        self.registry.pass_finished.notify_all();
+    }
+}
+
+/// RAII handle for one registered read snapshot. Unregisters on drop,
+/// whether that is the end of one statement's execution or the caller
+/// dropping a held [`SnapshotPin`].
+struct SnapshotRegistration {
+    registry: Arc<SnapshotFloorRegistry>,
+    token: u64,
+}
+
+impl Drop for SnapshotRegistration {
+    fn drop(&mut self) {
+        self.registry.state.lock().active.remove(&self.token);
+    }
+}
+
+/// Whether ANY snapshot in `registered_snapshots` (sorted ascending) is
+/// still entitled to see `row` -- the generalization of
+/// [`VersionedRow::visible_at`] to a full registered set rather than one
+/// floor value. The smallest registered snapshot at or after
+/// `row.created_tx` is the only candidate worth checking: a LARGER
+/// registered snapshot can only ever have an EQUAL or LATER
+/// `row.deleted_tx` comparison point, never an earlier one, so if the
+/// smallest such candidate cannot see the row, no larger one can either --
+/// this makes the check `O(log n)` per version (a binary search) rather
+/// than `O(n)`.
+fn any_registered_snapshot_sees(registered_snapshots: &[SnapshotId], row: &VersionedRow) -> bool {
+    let created = row.created_tx.0;
+    let idx = registered_snapshots.partition_point(|s| s.0 < created);
+    match registered_snapshots.get(idx) {
+        Some(candidate) => row.deleted_tx.is_none_or(|deleted| candidate.0 < deleted.0),
+        None => false,
+    }
+}
+
+/// A read snapshot held across separate calls. While this guard lives,
+/// version cleanup defers any version still visible at the pinned snapshot
+/// to a later cycle, exactly as it does for an in-flight statement.
+///
+/// Without a pin, a `SnapshotId` obtained from [`Database::snapshot`] and
+/// reused in a LATER [`Database::execute_at_snapshot`] call is invisible to
+/// the engine between the two calls: a cleanup cycle that runs in between
+/// may reclaim a version that snapshot was entitled to see, and the later
+/// call then silently returns fewer rows than it should — never a wrong
+/// value, never an error, just missing data. This is the documented boundary
+/// on a table declaring `HISTORY CURRENT ONLY`; a table that declares
+/// nothing keeps every version, so it never arises there. Pin the snapshot
+/// for as long as you intend to reuse it if the table matters.
+pub struct SnapshotPin<'a> {
+    _database: &'a Database,
+    _registration: SnapshotRegistration,
 }
 
 /// Whether a maintenance cycle's currency pass runs unconditionally (an
@@ -1142,10 +1493,21 @@ pub(crate) struct MaintenanceContext {
     accountant: Arc<MemoryAccountant>,
     persistence: Option<Arc<RedbPersistence>>,
     change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+    change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
+    change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     trigger: Arc<trigger::TriggerState>,
     tx_mgr: Arc<TransactionManager<DynStore>>,
     sync_watermark: Arc<AtomicLsn>,
-    trigger_audit_retention: Duration,
+    /// Shared with `Database::trigger_audit_retention_secs` (same `Arc`,
+    /// cloned at context-build time) and re-read on every
+    /// `run_trigger_audit_retention` call, so a declared override reaches
+    /// this already-spawned loop's next tick -- not only a loop spawned
+    /// after the setter runs. See that field's doc comment.
+    trigger_audit_retention_secs: Arc<AtomicU64>,
+    snapshot_registry: Arc<SnapshotFloorRegistry>,
+    last_maintenance_cycle_at: Arc<Mutex<Option<std::time::Instant>>>,
+    last_auto_compact_at: Arc<Mutex<Option<std::time::Instant>>>,
+    auto_compact_min_interval: Arc<Mutex<Duration>>,
 }
 
 impl MaintenanceContext {
@@ -1154,6 +1516,49 @@ impl MaintenanceContext {
             .as_ref()
             .and_then(|persistence| std::fs::metadata(persistence.path()).ok())
             .map(|meta| meta.len())
+    }
+
+    /// The optional, MUCH RARER automatic compaction path — see
+    /// [`AUTO_COMPACT_MIN_INTERVAL`]'s own doc comment for why this exists
+    /// separately from any scoped cleanup pass's own compact decision.
+    /// Fires at most once per configured interval, and only when the
+    /// fragmentation ratio is STILL at or above the shared threshold at the
+    /// moment this runs (sampled fresh here, after whatever this cycle's
+    /// own scoped passes already did) — never inside a commit lock, since
+    /// this is called from `run_cycle` after both `run_pruning` and
+    /// `run_currency` have already returned.
+    fn maybe_auto_compact(&self) -> Result<CompactionReport> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(CompactionReport::default());
+        };
+        let min_interval = *self.auto_compact_min_interval.lock();
+        let due = self
+            .last_auto_compact_at
+            .lock()
+            .is_none_or(|at| at.elapsed() >= min_interval);
+        if !due {
+            return Ok(CompactionReport::default());
+        }
+        let fragmentation_before = persistence.fragmentation_ratio().unwrap_or(0.0);
+        if fragmentation_before < REDB_COMPACT_FRAGMENTATION_THRESHOLD {
+            return Ok(CompactionReport::default());
+        }
+        let bytes_before = self.file_bytes();
+        let start = Instant::now();
+        let handle_recycle_micros = persistence.compact()?;
+        let duration_micros = start.elapsed().as_micros() as u64;
+        *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+        let bytes_after = self.file_bytes();
+        Ok(CompactionReport {
+            ran: true,
+            duration_micros,
+            bytes_before,
+            bytes_after,
+            file_shrank: matches!((bytes_before, bytes_after), (Some(b), Some(a)) if a < b),
+            fragmentation_before,
+            handle_recycled: true,
+            handle_recycle_micros,
+        })
     }
 
     /// Generic retention, then — once the rows are gone — the compaction
@@ -1220,36 +1625,104 @@ impl MaintenanceContext {
         Ok(report)
     }
 
+    /// Every table that DECLARES `HISTORY CURRENT ONLY` right now, whether it
+    /// was created here, arrived on reopen, or arrived over synced DDL. The
+    /// declaration-driven replacement for the hardcoded `VERSION_COMPACTION_
+    /// TABLES` list: eligibility is a property of what a table declared, not
+    /// of its name.
+    fn version_cleanup_eligible_tables(&self) -> Vec<String> {
+        let mut tables: Vec<String> = self
+            .relational
+            .table_meta
+            .read()
+            .iter()
+            .filter(|(_, meta)| meta.history_policy == Some(HistoryPolicy::CurrentOnly))
+            .map(|(name, _)| name.clone())
+            .collect();
+        tables.sort();
+        tables
+    }
+
+    /// The scoped cleanup pass ONLY — this never calls `persistence.compact()`
+    /// itself. A scoped, O(pruned) pass and an O(whole-file) compaction are
+    /// different-shaped costs; coupling them here made steady-state churn on
+    /// a small file (where routine superseded-version debris is a large
+    /// fraction of a small file) retrigger a full-file rewrite on every
+    /// cycle, which is exactly the per-cycle-compaction cost the
+    /// version-cleanup scaling bench measures and bounds separately from the
+    /// scoped pass's own cost. Compaction is now EITHER an explicit operator
+    /// action (`Database::compact_now`, `.maintenance compact`) or the much
+    /// rarer, interval-gated automatic path `run_cycle` drives separately
+    /// (`MaintenanceContext::maybe_auto_compact`) — see
+    /// [`AUTO_COMPACT_MIN_INTERVAL`].
     fn run_currency(&self, gate: CurrencyGate) -> Result<CurrencyCompactionReport> {
+        let eligible = self.version_cleanup_eligible_tables();
+        let tables = eligible.iter().map(String::as_str).collect::<Vec<_>>();
         if gate == CurrencyGate::Scheduled
             && !currency_compaction_pending(
                 &self.relational,
-                VERSION_COMPACTION_TABLES,
+                &tables,
                 CURRENCY_COMPACTION_SUPERSEDED_THRESHOLD,
             )
         {
             return Ok(CurrencyCompactionReport::default());
         }
-        let mut report = self.tx_mgr.with_commit_lock(|| {
-            compact_currency_versions_inner(
-                &self.relational,
-                &self.graph,
-                &self.vector,
-                self.accountant.as_ref(),
-                self.persistence.as_ref(),
-                &self.change_log,
-                VERSION_COMPACTION_TABLES,
-            )
-        })?;
-        if report.pruned_versions > 0
-            && let Some(persistence) = self.persistence.as_ref()
-            && persistence.fragmentation_ratio().unwrap_or(0.0)
-                >= REDB_COMPACT_FRAGMENTATION_THRESHOLD
-        {
-            persistence.compact()?;
-            report.redb_compacted = true;
-        }
-        Ok(report)
+        // Timed INSIDE the closure, from the first instruction that runs once
+        // `with_commit_lock` has actually granted the lock -- never before it.
+        // Timing from before the call measures however long this thread
+        // waited to ACQUIRE the lock plus the hold itself, which is a
+        // different, larger number that can make a quiet database look like
+        // an expensive hold when the pass itself was instant.
+        self.tx_mgr
+            .with_commit_lock(|| -> Result<CurrencyCompactionReport> {
+                let hold_start = Instant::now();
+                let mut report = compact_currency_versions_inner(
+                    &self.relational,
+                    &self.graph,
+                    &self.vector,
+                    self.accountant.as_ref(),
+                    self.persistence.as_ref(),
+                    &self.change_log,
+                    &self.change_log_table_index,
+                    &self.change_log_lsn_refcounts,
+                    &self.tx_mgr,
+                    &self.snapshot_registry,
+                    &tables,
+                )?;
+                report.commit_lock_hold_micros = hold_start.elapsed().as_micros() as u64;
+                Ok(report)
+            })
+    }
+
+    /// Test-only twin of `run_currency`: the identical real mechanism
+    /// (`compact_currency_versions_inner`), unconditionally (no scheduled
+    /// gate), over a CALLER-SUPPLIED table list instead of the declared
+    /// eligibility set `run_currency` computes. `run_currency` above is
+    /// untouched -- this exists so a test can exercise the real pass against
+    /// a table shape it has not declared `HISTORY CURRENT ONLY` on (yet), with
+    /// zero change to production behavior. Also never compacts -- see
+    /// `run_currency`'s own doc comment.
+    fn run_currency_for_tables(&self, tables: &[&str]) -> Result<CurrencyCompactionReport> {
+        // Hold-only timing -- see the comment in `run_currency` above.
+        self.tx_mgr
+            .with_commit_lock(|| -> Result<CurrencyCompactionReport> {
+                let hold_start = Instant::now();
+                let mut report = compact_currency_versions_inner(
+                    &self.relational,
+                    &self.graph,
+                    &self.vector,
+                    self.accountant.as_ref(),
+                    self.persistence.as_ref(),
+                    &self.change_log,
+                    &self.change_log_table_index,
+                    &self.change_log_lsn_refcounts,
+                    &self.tx_mgr,
+                    &self.snapshot_registry,
+                    tables,
+                )?;
+                report.commit_lock_hold_micros = hold_start.elapsed().as_micros() as u64;
+                Ok(report)
+            })
     }
 
     /// The engine's own durable trigger-audit history is the first internal
@@ -1258,9 +1731,8 @@ impl MaintenanceContext {
     /// keeps its own bounded semantics and is never touched here.
     fn run_trigger_audit_retention(&self) -> Result<u64> {
         let now = Wallclock::now();
-        let cutoff = now
-            .0
-            .saturating_sub(self.trigger_audit_retention.as_millis() as u64);
+        let window = Duration::from_secs(self.trigger_audit_retention_secs.load(Ordering::SeqCst));
+        let cutoff = now.0.saturating_sub(window.as_millis() as u64);
         match self.persistence.as_ref() {
             Some(persistence) => persistence.prune_trigger_audit_history(cutoff),
             None => {
@@ -1276,10 +1748,20 @@ impl MaintenanceContext {
         let pruning = self.run_pruning()?;
         let pruned_trigger_audit_rows = self.run_trigger_audit_retention()?;
         let currency = self.run_currency(gate)?;
+        // The rare, interval-gated automatic compaction path -- see
+        // `maybe_auto_compact`'s own doc comment. Runs LAST, after every
+        // scoped pass this cycle already did its own work, and (like every
+        // compact call) outside any commit lock.
+        let compaction = self.maybe_auto_compact()?;
+        // Recorded whether this cycle reclaimed anything or not -- a caller
+        // that dutifully drives an empty cycle is still driving, and must
+        // never trip the caller-driven backlog warning.
+        *self.last_maintenance_cycle_at.lock() = Some(std::time::Instant::now());
         Ok(MaintenanceReport {
             pruning,
             currency,
             pruned_trigger_audit_rows,
+            compaction,
         })
     }
 }
@@ -1291,13 +1773,15 @@ fn log_maintenance_cycle(report: &MaintenanceReport) {
         && report.currency.pruned_versions == 0
         && report.pruned_trigger_audit_rows == 0
         && report.pruning.future_dated_rows == 0
+        && !report.compaction.ran
     {
         return;
     }
     println!(
         "maintenance_cycle pruned_rows={} reclaimed_bytes={} compacted={} file_shrank={} \
          future_dated_rows={} future_dated_tables={} trigger_audit_rows={} \
-         currency_versions={} currency_redb_compacted={}",
+         currency_versions={} currency_redb_compacted={} auto_compact_ran={} \
+         auto_compact_micros={}",
         report.pruning.pruned_rows,
         report.pruning.reclaimed_bytes,
         report.pruning.compacted,
@@ -1307,6 +1791,8 @@ fn log_maintenance_cycle(report: &MaintenanceReport) {
         report.pruned_trigger_audit_rows,
         report.currency.pruned_versions,
         report.currency.redb_compacted,
+        report.compaction.ran,
+        report.compaction.duration_micros,
     );
 }
 
@@ -1322,20 +1808,80 @@ thread_local! {
     /// production path reads a thread-local that is never set — production-dead,
     /// following the existing `__inject_*_for_test` precedent.
     static RETENTION_PEER_PERSIST_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Test-only injection seam, same shape as
+    /// [`RETENTION_PEER_PERSIST_FAULT`]: when armed, the NEXT version-cleanup
+    /// pass on this thread fails immediately before its persisted rewrite,
+    /// after the in-memory change log has already been filtered -- so a test
+    /// can assert whether that ordering leaves memory ahead of disk on a
+    /// failed cycle. Armed only by
+    /// `Database::__arm_currency_compaction_persist_fault_for_test`; default
+    /// off, so production reads a thread-local that is never set.
+    static CURRENCY_COMPACTION_PERSIST_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Test-only race seam: when armed, `execute`/`execute_in_tx` close
+    /// their own database synchronously in the gap between the
+    /// `already_closed` pre-check and the fallible snapshot registration
+    /// just after it -- deterministically simulating a close that lands in
+    /// that exact window, on the SAME thread, no real concurrency needed.
+    /// Lets a test prove the registration's own fallible form catches a
+    /// close in this window instead of panicking, without depending on a
+    /// second thread ever winning a real race. Armed only by
+    /// `Database::__arm_close_in_snapshot_registration_race_window_for_test`;
+    /// default off.
+    static CLOSE_IN_SNAPSHOT_REGISTRATION_RACE_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Test-only, THREAD-LOCAL pause selector: when set on the calling
+    /// thread, that thread's NEXT sync-apply pre-commit checkpoint
+    /// (`sync_apply_pre_commit_pause`) actually pauses; a thread that never
+    /// sets this reads `false` and passes the SAME checkpoint unconditionally
+    /// -- even while the shared `ApplyPhasePause` is globally armed. This is
+    /// what lets a test pause exactly one concurrent sync apply while a
+    /// second, independent apply on another thread commits normally, proving
+    /// an ordering race deterministically. Armed only by
+    /// `Database::mark_this_thread_for_sync_apply_pre_commit_pause_for_test`,
+    /// consumed (reset to `false`) the moment the checkpoint reads it;
+    /// default off, so production reads a thread-local that is never set.
+    static SYNC_APPLY_PRE_COMMIT_PAUSE_ARMED_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// High-churn "currency" tables whose rows are rewritten every poll cadence via
-/// `INSERT … ON CONFLICT DO UPDATE`. Each update mints a new MVCC version and
-/// tombstones the prior one, and nothing ever reclaims the superseded versions,
-/// so a long-running fleet node accumulates hundreds of thousands of physical
-/// versions for a handful of live rows (observed: 248,996 `work_capabilities`
-/// versions in a 365MB debris ledger for ~10 live rows). Version compaction
-/// (`Database::compact_currency_versions`) collapses each logical row back to
-/// its single current version for exactly these tables. They are all
-/// `LatestWins` (or immutable-key) under sync, so only the latest version has
-/// any consumer value — see the sync-safety argument on `compact_currency_versions`.
-pub(crate) const VERSION_COMPACTION_TABLES: &[&str] =
-    &["work_capabilities", "work_node_contacts", "peer_directory"];
+/// Consume the armed currency-compaction injection flag, if any. Reads a
+/// thread-local that is never set outside a test, so the production path
+/// takes the `false` arm.
+fn take_currency_compaction_persist_fault_for_test() -> bool {
+    CURRENCY_COMPACTION_PERSIST_FAULT.with(|f| f.replace(false))
+}
+
+/// Consume the armed snapshot-registration race-window seam, if any. Reads
+/// a thread-local that is never set outside a test, so the production path
+/// takes the `false` arm.
+fn take_close_in_snapshot_registration_race_window_for_test() -> bool {
+    CLOSE_IN_SNAPSHOT_REGISTRATION_RACE_WINDOW.with(|f| f.replace(false))
+}
+
+/// Consume the armed thread-local sync-apply pre-commit pause selector, if
+/// any. Reads a thread-local that is never set outside a test, so the
+/// production path takes the `false` arm on every thread.
+fn take_sync_apply_pre_commit_pause_armed_here_for_test() -> bool {
+    SYNC_APPLY_PRE_COMMIT_PAUSE_ARMED_HERE.with(|f| f.replace(false))
+}
+
+// Version-cleanup eligibility is DECLARED per table (`HISTORY CURRENT ONLY`),
+// not a hardcoded table-name list -- see `Database::version_cleanup_eligible_
+// tables`/`has_version_cleanup_tables`. High-churn tables rewritten every poll
+// cadence via `INSERT … ON CONFLICT DO UPDATE` mint a new MVCC version and
+// tombstone the prior one on every write, and nothing reclaims the superseded
+// versions of a table that declares nothing, so a long-running fleet node can
+// accumulate hundreds of thousands of physical versions for a handful of live
+// rows (observed: 248,996 `work_capabilities` versions in a 365MB debris
+// ledger for ~10 live rows). Version cleanup (`Database::compact_currency_
+// versions`) collapses each logical row of a DECLARED table back to its
+// single current version. The three built-in currency tables (`work_
+// capabilities`, `peer_directory`, `work_node_contacts`) declare `HISTORY
+// CURRENT ONLY` in their own `CREATE TABLE` text now, alongside the `SYNC
+// CONFLICT KEEP LATEST` (or `SYNC OFF`) that made reclaiming their history
+// safe in the first place — see the sync-safety argument on
+// `compact_currency_versions`.
 
 /// Reclaim freed pages with a full redb `compact()` after a version-compaction
 /// pass once at least this fraction of the file is dead space. A first pass over
@@ -1343,6 +1889,61 @@ pub(crate) const VERSION_COMPACTION_TABLES: &[&str] =
 /// state stays well below it (freed pages are reused in place), so compaction is
 /// rare, not per-cycle.
 pub const REDB_COMPACT_FRAGMENTATION_THRESHOLD: f64 = 0.5;
+
+/// Everything one operator-visible redb compaction produced: how long the
+/// full-file rewrite took, the file's size before and after, whether it
+/// actually shrank, and the fragmentation ratio that led to it. `ran=false`
+/// (every other field at its zero value) means nothing happened this call —
+/// either there is no file to compact (an in-memory database) or, for the
+/// gated automatic path (see [`AUTO_COMPACT_MIN_INTERVAL`]), the threshold
+/// and the minimum interval were not BOTH satisfied.
+///
+/// Compaction is O(whole file) — it rewrites every live page, unlike the
+/// O(pruned) scoped cleanup passes ([`CurrencyCompactionReport`],
+/// [`PruningReport`]) that free the pages compaction later reclaims. The
+/// two are DELIBERATELY separate operations reported through separate
+/// receipts: a scoped cleanup pass never blocks on a full-file rewrite, and
+/// an operator asking "did compaction run, and what did it cost" reads
+/// this report, not a cleanup pass's.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactionReport {
+    pub ran: bool,
+    pub duration_micros: u64,
+    pub bytes_before: Option<u64>,
+    pub bytes_after: Option<u64>,
+    pub file_shrank: bool,
+    pub fragmentation_before: f64,
+    /// Whether the redb handle was closed and reopened as part of this
+    /// compaction — see `RedbPersistence::compact`'s doc comment for why
+    /// this is bundled into every compaction rather than left optional: a
+    /// file-level compact alone does not release the in-process
+    /// allocator/region bookkeeping redb retains from a database's
+    /// historical peak size, so it does not by itself restore steady-state
+    /// write cost, only file size. `false` only when compaction did not run
+    /// at all (`ran == false`).
+    pub handle_recycled: bool,
+    /// The recycle's own duration in microseconds, reported separately from
+    /// `duration_micros` (which covers the whole compaction, recycle
+    /// included) — the same convention this bench and the maintenance
+    /// receipts already use for every compaction-adjacent cost.
+    pub handle_recycle_micros: u64,
+}
+
+/// Minimum time between AUTOMATIC redb compactions the engine-owned
+/// maintenance tick can trigger on its own. Currency-table version cleanup
+/// (`compact_currency_versions`/`Database::run_maintenance_cycle`) NEVER
+/// triggers `persistence.compact()` itself — a scoped, O(pruned) cleanup
+/// pass and an O(whole-file) compaction are different-shaped costs, and
+/// coupling them made steady-state churn on a small file (where routine
+/// superseded-version debris is a large fraction of a small file, so the
+/// SAME conservative [`REDB_COMPACT_FRAGMENTATION_THRESHOLD`] crosses on
+/// every cycle) retrigger a full-file rewrite every tick — the exact
+/// per-cycle-compaction cost the version-cleanup scaling bench measures and
+/// bounds separately from the scoped pass's own cost. An operator who wants
+/// compaction NOW has [`Database::compact_now`] (`.maintenance compact`),
+/// which has no interval gate at all; this constant only throttles the
+/// engine's OWN unattended background attempt.
+pub const AUTO_COMPACT_MIN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// A worker whose clock runs ahead of the holder's stamps its rows in the
 /// future. Drift within this much is ordinary fleet skew: the row ages
@@ -1382,6 +1983,78 @@ pub struct CurrencyCompactionReport {
     pub compacted_tables: Vec<String>,
     /// Whether a redb file compaction ran to reclaim the freed pages.
     pub redb_compacted: bool,
+    /// Every SURVIVOR key this pass rewrote to disk that it did not need to
+    /// touch: every vector, every physical adjacency-table write (each edge
+    /// writes BOTH the forward and reverse redb tables, so this counts 2 per
+    /// edge -- see `edge_keys_rewritten`), and every surviving relational
+    /// row / change-log entry of a compacted table -- `all_vectors.len() +
+    /// (2 * all_edges.len()) + (surviving rows of the compacted tables) +
+    /// surviving_change_log.len()`, counted where `compact_currency_versions_
+    /// inner` already holds those populations, so this is pure counting of
+    /// existing work, never a behavior change. A scoped, point-removal pass
+    /// touches ONLY the pruned keys, so this reads 0 once that lands; today
+    /// it reads the size of the whole compacted neighborhood on every pass
+    /// (`rewrite_pruned_state`/`rewrite_change_log` rewrite wholesale).
+    pub keys_rewritten: u64,
+    /// The vector-population component of `keys_rewritten`: every
+    /// vector-store entry in the WHOLE database this pass rewrote to disk,
+    /// whether or not any compacted table itself carries a vector column.
+    /// Broken out because a proportionality claim about vectors specifically
+    /// needs its own number -- a scoped pass reads 0 here whenever none of
+    /// the compacted tables carry a vector column, and a nonzero count here
+    /// for a compacted table that does not itself hold vectors is exactly
+    /// the "cleanup rewrote an unrelated population" defect.
+    pub vector_keys_rewritten: u64,
+    /// The graph-edge component of `keys_rewritten`: every PHYSICAL redb key
+    /// this pass rewrote for the adjacency population. `rewrite_pruned_state`
+    /// writes each edge into BOTH `graph_fwd` and `graph_rev` (a forward key
+    /// and a reverse key per edge), so this counts 2 per edge in the WHOLE
+    /// database, not the edge count itself -- undercounting by half would
+    /// understate the real disk work this pass did. Row-version cleanup has
+    /// no business ever opening the graph tables -- edge identity is
+    /// self-owned and no currency table carries edges -- so this reads 0
+    /// unconditionally, scoped mechanism or not; a nonzero reading here is
+    /// itself the defect.
+    pub edge_keys_rewritten: u64,
+    /// Wall-clock microseconds this pass held the commit lock -- the writer
+    /// stall a concurrent commit waits behind. Timed from the FIRST
+    /// instruction inside the `with_commit_lock` closure in
+    /// `MaintenanceContext::run_currency`/`run_currency_for_tables` (i.e.
+    /// from the moment the lock is actually granted), deliberately excluding
+    /// however long this thread waited to acquire it -- a busy database
+    /// timed from before the call would inflate this number with queueing
+    /// delay that has nothing to do with what the pass itself cost.
+    pub commit_lock_hold_micros: u64,
+    /// Wall-clock microseconds the follow-on redb file compaction took, when
+    /// one ran (`redb_compacted`) -- reported SEPARATELY from
+    /// `commit_lock_hold_micros` on purpose: compaction runs OUTSIDE the
+    /// commit lock (redb's compact needs `&mut` and must not run while a
+    /// txn is outstanding), so it is not writer-stall time, and conflating
+    /// the two would misreport the first pass over an accumulated debris
+    /// ledger as a single, much larger writer stall than it actually was.
+    /// 0 whenever `redb_compacted` is false.
+    pub redb_compact_micros: u64,
+    /// How many DISTINCT tables' full row-version history this pass cloned
+    /// into memory to do its work -- `relational_store.tables.read().
+    /// clone()` deep-clones every table sharing the database today, not
+    /// just the eligible ones named in `tables`, so this reads the WHOLE
+    /// table count regardless of how few are actually compaction-eligible.
+    /// Once the in-memory clone is scoped to just the eligible tables, this
+    /// reads `tables.len()` (or fewer, for tables absent from this
+    /// database) instead.
+    pub tables_in_memory_snapshot: u64,
+    /// Commit-index entries this pass removed, candidate-only: an LSN this
+    /// pass affected whose change-log entries are now all gone AND that
+    /// `retained_commit_index_after_prune`'s own floor no longer needs. 0
+    /// when nothing qualified this cycle — heartbeat churn on a declared
+    /// table would otherwise leave the commit index growing forever, since
+    /// nothing else in version cleanup ever touched it.
+    pub commit_index_keys_removed: u64,
+    /// Superseded versions left in place this cycle because a registered
+    /// reader's snapshot (an in-flight statement, or a caller-held
+    /// `SnapshotPin`) can still resolve to them. Reclaimed on a later cycle
+    /// once no registered reader still needs them.
+    pub versions_deferred_for_readers: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1676,6 +2349,8 @@ impl Database {
         vector_store: Arc<VectorStore>,
         hnsw: Arc<OnceLock<parking_lot::RwLock<Option<HnswIndex>>>>,
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+        change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
+        change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         persistence: Option<Arc<RedbPersistence>>,
         open_registry_path: Option<PathBuf>,
@@ -1694,11 +2369,14 @@ impl Database {
             vector_store: vector_store.clone(),
             vector_schema_gates: Arc::new(VectorSchemaGates::default()),
             change_log,
+            change_log_table_index,
+            change_log_lsn_refcounts,
             ddl_log,
             persistence,
             open_registry_path: Mutex::new(open_registry_path),
             operation_gate: Arc::new(RwLock::new(())),
             apply_phase_pause,
+            sync_apply_pre_commit_pause: Arc::new(ApplyPhasePause::new()),
             relational: MemRelationalExecutor::new(relational, tx_mgr.clone()),
             graph: MemGraphExecutor::new(graph, tx_mgr.clone()),
             vector: MemVectorExecutor::new_with_accountant(
@@ -1730,6 +2408,15 @@ impl Database {
             pending_commit_metadata: Mutex::new(HashMap::new()),
             disk_limit: AtomicU64::new(disk_limit.unwrap_or(0)),
             disk_limit_startup_ceiling: AtomicU64::new(disk_limit_startup_ceiling.unwrap_or(0)),
+            trigger_audit_retention_secs: Arc::new(AtomicU64::new(
+                TRIGGER_AUDIT_RETENTION.as_secs(),
+            )),
+            snapshot_registry: Arc::new(SnapshotFloorRegistry::default()),
+            maintenance_caller_driven: Arc::new(AtomicBool::new(false)),
+            last_maintenance_cycle_at: Arc::new(Mutex::new(None)),
+            caller_driven_backlog_warned_at: Arc::new(Mutex::new(None)),
+            last_auto_compact_at: Arc::new(Mutex::new(None)),
+            auto_compact_min_interval: Arc::new(Mutex::new(AUTO_COMPACT_MIN_INTERVAL)),
             sync_watermark: Arc::new(AtomicLsn::new(Lsn(0))),
             closed: AtomicBool::new(false),
             resource_closed: Arc::new(AtomicBool::new(false)),
@@ -1836,6 +2523,7 @@ impl Database {
                 Arc::new(CorePlugin),
                 Arc::new(MemoryAccountant::no_limit()),
                 None,
+                false,
             )?;
             db.plugin.on_open()?;
             db
@@ -1843,7 +2531,7 @@ impl Database {
         let db = db.with_access_constraints(access);
         db.start_cron_tickler_if_schedules_present();
         db.load_retention_sync_peer();
-        db.start_maintenance_if_eligible();
+        db.reconcile_maintenance_thread();
         Ok(db)
     }
 
@@ -1887,11 +2575,14 @@ impl Database {
             vector_store: self.vector_store.clone(),
             vector_schema_gates: self.vector_schema_gates.clone(),
             change_log: self.change_log.clone(),
+            change_log_table_index: self.change_log_table_index.clone(),
+            change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),
             persistence: self.persistence.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),
             apply_phase_pause: self.apply_phase_pause.clone(),
+            sync_apply_pre_commit_pause: self.sync_apply_pre_commit_pause.clone(),
             relational: MemRelationalExecutor::new(
                 self.relational_store.clone(),
                 self.tx_mgr.clone(),
@@ -1930,6 +2621,13 @@ impl Database {
             disk_limit_startup_ceiling: AtomicU64::new(
                 self.disk_limit_startup_ceiling.load(Ordering::SeqCst),
             ),
+            trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
+            snapshot_registry: self.snapshot_registry.clone(),
+            maintenance_caller_driven: self.maintenance_caller_driven.clone(),
+            last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
+            caller_driven_backlog_warned_at: self.caller_driven_backlog_warned_at.clone(),
+            last_auto_compact_at: self.last_auto_compact_at.clone(),
+            auto_compact_min_interval: self.auto_compact_min_interval.clone(),
             sync_watermark: self.sync_watermark.clone(),
             closed: AtomicBool::new(false),
             resource_closed: self.resource_closed.clone(),
@@ -1959,6 +2657,7 @@ impl Database {
         plugin: Arc<dyn DatabasePlugin>,
         mut accountant: Arc<MemoryAccountant>,
         startup_disk_limit: Option<u64>,
+        allow_legacy_table_meta_layout: bool,
     ) -> Result<Self> {
         let canonical_path = canonical_database_path(path.as_ref())?;
         let (registry_reservation, persistence) =
@@ -1978,6 +2677,21 @@ impl Database {
         };
 
         let all_meta = persistence.load_all_table_meta()?;
+        // A table whose meta only decoded via the pre-`contextdb migrate`
+        // v1.0.0 layout (fewer `TableMeta`/`ColumnDef` fields than today)
+        // means this WHOLE root predates the current schema layout — refuse
+        // loudly here rather than silently loading it, UNLESS the caller is
+        // the migrate command itself (`Database::open_legacy_for_migration`),
+        // which exists specifically to read past this refusal.
+        if !allow_legacy_table_meta_layout && persistence.used_legacy_table_meta_layout() {
+            return Err(Error::LegacyVectorStoreDetected {
+                found_format_marker: format!(
+                    "{} (legacy table/column schema layout)",
+                    crate::persistence::CURRENT_FORMAT_VERSION
+                ),
+                expected_release: crate::persistence::CURRENT_FORMAT_VERSION.to_string(),
+            });
+        }
 
         let relational = Arc::new(RelationalStore::new());
         let mut sanitized_row_tables = HashSet::new();
@@ -2116,7 +2830,11 @@ impl Database {
             .max(ddl_max_lsn);
         relational.set_next_row_id(RowId(max_row_id.0.saturating_add(1)));
 
+        let (initial_table_index, initial_lsn_refcounts) =
+            build_change_log_aux_indexes(&loaded_change_log);
         let change_log = Arc::new(RwLock::new(loaded_change_log));
+        let change_log_table_index = Arc::new(RwLock::new(initial_table_index));
+        let change_log_lsn_refcounts = Arc::new(RwLock::new(initial_lsn_refcounts));
         let ddl_log = Arc::new(RwLock::new(loaded_ddl_log));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let composite = CompositeStore::new_with_apply_phase_pause(
@@ -2124,6 +2842,8 @@ impl Database {
             graph.clone(),
             vector.clone(),
             change_log.clone(),
+            change_log_table_index.clone(),
+            change_log_lsn_refcounts.clone(),
             ddl_log.clone(),
             accountant.clone(),
             apply_phase_pause.clone(),
@@ -2152,6 +2872,8 @@ impl Database {
             vector,
             hnsw,
             change_log,
+            change_log_table_index,
+            change_log_lsn_refcounts,
             ddl_log,
             Some(persistence),
             Some(registry_reservation.disarm()),
@@ -2189,6 +2911,8 @@ impl Database {
         let hnsw = Arc::new(OnceLock::new());
         let vector = Arc::new(VectorStore::new(hnsw.clone()));
         let change_log = Arc::new(RwLock::new(Vec::new()));
+        let change_log_table_index = Arc::new(RwLock::new(ChangeLogTableIndex::new()));
+        let change_log_lsn_refcounts = Arc::new(RwLock::new(ChangeLogLsnRefcounts::new()));
         let ddl_log = Arc::new(RwLock::new(Vec::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let trigger = Arc::new(TriggerState::new());
@@ -2197,6 +2921,8 @@ impl Database {
             graph.clone(),
             vector.clone(),
             change_log.clone(),
+            change_log_table_index.clone(),
+            change_log_lsn_refcounts.clone(),
             ddl_log.clone(),
             accountant.clone(),
             apply_phase_pause.clone(),
@@ -2211,6 +2937,8 @@ impl Database {
             vector,
             hnsw,
             change_log,
+            change_log_table_index,
+            change_log_lsn_refcounts,
             ddl_log,
             None,
             None,
@@ -2579,7 +3307,51 @@ impl Database {
         let _operation =
             self.open_operation_after_public_tx_control_wait_for_tx("commit", Some(tx))?;
         let _user_commit = self.enter_user_commit_callback_scope();
-        self.commit_with_source(tx, CommitSource::User)
+        let result = self.commit_with_source(tx, CommitSource::User);
+        if result.is_ok() {
+            self.maybe_warn_caller_driven_backlog();
+        }
+        result
+    }
+
+    /// `CallerDriven` maintenance means the engine spawns no thread of its
+    /// own, so nothing else ever notices a caller who declared retention or
+    /// version-history cleanup and then never drives a cycle. Rather than
+    /// fail silently, the NEXT commit after a full tick interval has elapsed
+    /// with no cycle call logs one warning -- throttled to at most once per
+    /// interval, so a caller that never drives a cycle is not warned on
+    /// every single commit.
+    fn maybe_warn_caller_driven_backlog(&self) {
+        if !self.maintenance_caller_driven.load(Ordering::SeqCst) {
+            return;
+        }
+        if !(self.has_version_cleanup_tables()
+            || self.has_retained_tables()
+            || self.has_durable_trigger_audit())
+        {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let overdue = match *self.last_maintenance_cycle_at.lock() {
+            Some(at) => now.duration_since(at) >= MAINTENANCE_TICK,
+            None => true,
+        };
+        if !overdue {
+            return;
+        }
+        let mut warned_at = self.caller_driven_backlog_warned_at.lock();
+        if warned_at.is_some_and(|at| now.duration_since(at) < MAINTENANCE_TICK) {
+            return;
+        }
+        *warned_at = Some(now);
+        drop(warned_at);
+        tracing::warn!(
+            name: "caller_driven_maintenance_backlog",
+            target: "maintenance",
+            "this database declares retention, HISTORY CURRENT ONLY, or a durable trigger \
+             audit, and its maintenance policy is CallerDriven, but no run_maintenance_cycle \
+             call has landed in over a tick interval -- declared cleanup is not being reclaimed"
+        );
     }
 
     pub fn rollback(&self, tx: TxId) -> Result<()> {
@@ -2637,6 +3409,47 @@ impl Database {
     }
 
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        // Checked BEFORE the snapshot registration below: `snapshot_for_read`
+        // resolves through the public `Database::snapshot`, which panics on a
+        // closed handle (`assert_open_operation`) by design for a caller that
+        // asks for a snapshot directly. `execute` is a `Result`-returning
+        // surface, never a panicking one -- a scoped view whose owner has
+        // closed must see the same typed closed-handle error every other
+        // `execute` path already returns, not a panic. Deliberately a
+        // LOCK-FREE check (`already_closed`, not `open_operation`): this
+        // function's own later logic can legitimately PARK a caller waiting
+        // on an in-flight trigger callback (e.g. `BEGIN` under contention),
+        // and `close()` needs `operation_gate`'s write lock to ever
+        // complete -- holding its read lock here across that wait would
+        // deadlock close() against the parked caller. This check narrows,
+        // but does not by itself close, the race: a close landing between
+        // THIS check and the snapshot registration just below is caught
+        // there instead, by that call's own fallible form
+        // (`try_snapshot_for_read`), not by anything later in this
+        // function -- the registration precedes every one of this
+        // function's own `open_operation()?` calls, so those cannot be
+        // what catches a close in this specific window.
+        if self.already_closed() {
+            return Err(closed_database_error());
+        }
+        // Test-only race seam: deterministically simulates a close landing
+        // in the window this comment block describes, on this same thread.
+        // See `CLOSE_IN_SNAPSHOT_REGISTRATION_RACE_WINDOW`'s own doc
+        // comment; production-dead, reads a thread-local that is never set.
+        if take_close_in_snapshot_registration_race_window_for_test() {
+            self.close()
+                .expect("test-only synchronous close in the race window must succeed");
+        }
+        // Registered for exactly this call's duration -- see
+        // `SnapshotFloorRegistry`'s doc comment. Covers `execute_at_snapshot`
+        // too, since it runs through this same function under an override.
+        // `try_snapshot_for_read`, not the panicking `snapshot_for_read`:
+        // a close landing between the `already_closed` check above and this
+        // line must still surface as the typed closed-handle error.
+        let Some(read_snapshot) = self.try_snapshot_for_read() else {
+            return Err(closed_database_error());
+        };
+        let _snapshot_registration = self.snapshot_registry.register(read_snapshot);
         let cached = self.cached_statement(sql);
         let parsed_stmt;
         let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
@@ -3166,6 +3979,25 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
+        // Checked BEFORE the snapshot registration below -- see `execute`'s
+        // own identical, deliberately LOCK-FREE guard for why (`already_
+        // closed`, never `open_operation`, which this function's own later
+        // `open_operation_after_*` calls must remain free to acquire without
+        // a pre-held read lock from here deadlocking a racing `close()`).
+        // Narrows, but does not by itself close, the race -- a close landing
+        // between this check and the registration just below is caught
+        // there instead (`try_snapshot_for_read`), not by anything later in
+        // this function.
+        if self.already_closed() {
+            return Err(closed_database_error());
+        }
+        // Registered for exactly this call's duration -- see
+        // `SnapshotFloorRegistry`'s doc comment on `execute`. Fallible form,
+        // same reason as `execute`'s own identical line.
+        let Some(read_snapshot) = self.try_snapshot_for_read() else {
+            return Err(closed_database_error());
+        };
+        let _snapshot_registration = self.snapshot_registry.register(read_snapshot);
         let cached = self.cached_statement(sql);
         let parsed_stmt;
         let (stmt, cached_plan) = if let Some(cached) = cached.as_ref() {
@@ -4023,6 +4855,12 @@ impl Database {
                         }
                         meta.sync_direction = Some(*direction);
                     }
+                    AlterAction::SetHistory(policy) => {
+                        meta.history_policy = Some(*policy);
+                    }
+                    AlterAction::SetSyncConflict(policy) => {
+                        meta.conflict_policy = Some(*policy);
+                    }
                 }
                 Some(DdlChange::AlterTable {
                     name: at.table.clone(),
@@ -4448,6 +5286,25 @@ impl Database {
         self.tx_mgr.commit_index_snapshot().range(..lsn).count()
     }
 
+    /// Test-introspection: a sorted copy of `change_log_table_index`'s own
+    /// `(lsn, row_id)` coordinates for one table -- the per-table shadow a
+    /// scoped cleanup/retention pass reads instead of scanning the whole
+    /// change log. Sorted so a caller can compare it against a
+    /// content-derived multiset without depending on internal ordering.
+    /// Production-dead -- nothing but tests reads it.
+    #[doc(hidden)]
+    pub fn __change_log_table_index_for_test(&self, table: &str) -> Vec<(Lsn, RowId)> {
+        let _operation = self.assert_open_operation();
+        let mut coords = self
+            .change_log_table_index
+            .read()
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        coords.sort_by_key(|(lsn, row_id)| (*lsn, *row_id));
+        coords
+    }
+
     fn set_sync_row_source_lsn(
         &self,
         tx: TxId,
@@ -4769,18 +5626,15 @@ impl Database {
             )?;
         }
 
-        // A composite UNIQUE duplicate is a silent no-op on a plain insert
-        // (allow_duplicate_unique_noop); a composite PRIMARY KEY duplicate is a
-        // hard error, exactly like the single-column primary key above. Same
-        // probe, different no-op policy per tuple.
+        // A multi-column UNIQUE violation is a loud constraint error on every
+        // INSERT path, exactly like a composite PRIMARY KEY duplicate (never
+        // the single-column no-op-on-plain-insert convention
+        // `allow_duplicate_unique_noop` governs below) — standard SQL never
+        // silently drops a row on a UNIQUE violation. Same probe, one no-op
+        // policy for both composite forms.
         let composite_pk =
             (meta.primary_key_columns.len() >= 2).then_some(&meta.primary_key_columns);
-        for (unique_constraint, allow_noop) in meta
-            .unique_constraints
-            .iter()
-            .map(|tuple| (tuple, allow_duplicate_unique_noop))
-            .chain(composite_pk.map(|tuple| (tuple, false)))
-        {
+        for unique_constraint in meta.unique_constraints.iter().chain(composite_pk) {
             let mut candidate_values = Vec::with_capacity(unique_constraint.len());
             let mut has_null = false;
 
@@ -4828,15 +5682,16 @@ impl Database {
                     .map(|existing| existing.row_id)
                     .collect()
             };
-            // Report composite UNIQUE violations using the first column name,
-            // matching the plan's single-column error convention.
-            let column_label = unique_constraint.first().map(|s| s.as_str()).unwrap_or("");
+            // Report a composite UNIQUE violation naming every column of the
+            // constraint, not just the first — the caller needs the whole
+            // tuple to know which declared constraint fired.
+            let column_label = unique_constraint.join(", ");
             self.merge_unique_conflict(
                 tx,
                 table,
-                column_label,
+                &column_label,
                 &matching_row_ids,
-                allow_noop,
+                false,
                 &mut duplicate_unique_row_id,
             )?;
         }
@@ -10019,12 +10874,35 @@ impl Database {
         self.relational_store.table_meta(table)
     }
 
+    /// Whether `table` has a single-column index covering `column`. A
+    /// declared `PRIMARY KEY`/`UNIQUE` column is auto-indexed at
+    /// `CREATE`/`ALTER` time and always answers `true`; a bare `id`-named
+    /// column with neither declaration is NOT auto-indexed, so this can
+    /// answer `false` for it. Exposed so a caller resolving sync eligibility
+    /// on the `id`-column fallback (see `natural_key_columns_for_meta`) can
+    /// require the SAME covering index the apply side's exact-key probe
+    /// already hard-errors without, rather than trusting the column's name
+    /// alone.
+    pub fn column_has_covering_index(&self, table: &str, column: &str) -> bool {
+        let _operation = self.assert_open_operation();
+        self.index_covers_column(table, column)
+    }
+
     /// Execute a query at a specific snapshot.
     ///
     /// Relational reads and `GRAPH_TABLE` traversal inside the query see state
     /// at or before `snapshot`. Under constrained handles, explicit anchor
     /// reads at the pinned snapshot return typed visibility errors for rows
     /// hidden by context, scope-label, or ACL gates at that snapshot.
+    ///
+    /// This ONE call is protected against version cleanup for its own
+    /// duration: `execute` registers `snapshot` in the engine's read-snapshot
+    /// registry for exactly this call, so a superseded version this call
+    /// still needs cannot vanish while it runs. That protection ends when
+    /// this call returns. Reusing the SAME `snapshot` value in a LATER call
+    /// is not automatically protected — see [`Database::pin_snapshot`] if you
+    /// need to hold a snapshot across separate calls on a table declaring
+    /// `HISTORY CURRENT ONLY`.
     pub fn execute_at_snapshot(
         &self,
         sql: &str,
@@ -10032,6 +10910,36 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<QueryResult> {
         self.with_snapshot_override(snapshot, || self.execute(sql, params))
+    }
+
+    /// Hold `snapshot` across separate calls: while the returned guard lives,
+    /// version cleanup defers any version still visible at `snapshot` to a
+    /// later cycle rather than reclaiming it. Drop the guard when you are
+    /// done — a version deferred only because of a pin is reclaimed on the
+    /// next cycle after the pin releases.
+    ///
+    /// Needed only for a table declaring `HISTORY CURRENT ONLY`: a table
+    /// that keeps every version (the default) is never affected by cleanup,
+    /// so a snapshot over it needs no pin. Without a pin, calling
+    /// [`Database::execute_at_snapshot`] twice with the same `snapshot` and a
+    /// cleanup cycle in between may silently return fewer rows the second
+    /// time — not a wrong value, not an error, just a version cleanup already
+    /// reclaimed because nothing told the engine this snapshot was still
+    /// wanted.
+    ///
+    /// Protection begins when this call RETURNS: if a removal pass is
+    /// already mid-flight for versions older than `snapshot` when this is
+    /// called, this call blocks until that pass finishes (bounded by one
+    /// pass duration), and only then registers -- so the NEXT cleanup cycle
+    /// honors the pin. Versions already reclaimed BEFORE this call runs
+    /// cannot come back — that is the pre-existing, documented unpinned-
+    /// held-snapshot boundary above, unchanged. A pin whose `snapshot` is
+    /// not older than any in-flight pass's own floor never blocks.
+    pub fn pin_snapshot(&self, snapshot: SnapshotId) -> SnapshotPin<'_> {
+        SnapshotPin {
+            _database: self,
+            _registration: self.snapshot_registry.register(snapshot),
+        }
     }
 
     pub(crate) fn with_snapshot_override<T>(
@@ -10059,6 +10967,31 @@ impl Database {
 
     pub(crate) fn snapshot_for_read(&self) -> SnapshotId {
         SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or_else(|| self.snapshot()))
+    }
+
+    /// Fallible sibling of `snapshot_for_read`, for a caller that must not
+    /// panic on a closed handle: an override snapshot is always returned (it
+    /// requires no live operation to read), otherwise `None` if the handle
+    /// is closed right now, or `Some` from a direct, lock-free
+    /// `tx_mgr.snapshot()` call — deliberately bypassing `snapshot`'s own
+    /// `assert_open_operation` (which panics, and which takes
+    /// `operation_gate`'s read lock; see `already_closed`'s own doc comment
+    /// for why a lock-holding check cannot sit ahead of a park/wait here).
+    /// `execute`/`execute_in_tx` re-check with THIS, not `already_closed`
+    /// again, immediately before registering a read snapshot: a close that
+    /// lands in the narrow window between their own earlier `already_closed`
+    /// check and this call must still surface as the typed closed-handle
+    /// error, never a panic.
+    pub(crate) fn try_snapshot_for_read(&self) -> Option<SnapshotId> {
+        SNAPSHOT_OVERRIDE.with(|cell| {
+            if let Some(snapshot) = *cell.borrow() {
+                return Some(snapshot);
+            }
+            if self.already_closed() {
+                return None;
+            }
+            Some(self.tx_mgr.snapshot())
+        })
     }
 
     pub(crate) fn vector_schema_read(&self, index: &VectorIndexRef) -> VectorSchemaReadGuard {
@@ -10429,6 +11362,73 @@ impl Database {
         self.maintenance_context().run_cycle(CurrencyGate::Always)
     }
 
+    /// Explicit operator compaction (`.maintenance compact`): reclaim freed
+    /// pages with a full redb `compact()` right now, unconditionally — no
+    /// fragmentation threshold, no [`AUTO_COMPACT_MIN_INTERVAL`] gate. This
+    /// is the deliberate, on-demand counterpart to the rare automatic path
+    /// the maintenance tick can ALSO take on its own
+    /// (`MaintenanceContext::maybe_auto_compact`); calling this also resets
+    /// that path's own interval clock, so the tick does not immediately
+    /// redo the same work this call already did. A no-op (`ran=false`) on
+    /// an in-memory database, which has no file to compact.
+    ///
+    /// Restores BOTH file size and steady-state per-transaction write cost
+    /// for a store under its DECLARED-FROM-THE-START maintenance regime:
+    /// internally, this closes and reopens the underlying store handle
+    /// after the file-level compaction finishes, releasing in-process
+    /// allocator state redb otherwise keeps sized to the database's
+    /// historical peak — a file-level compact alone shrinks the file and
+    /// normalizes the btree but leaves that state behind, so a
+    /// long-churned store's steady-state commit cost stays elevated even
+    /// on an already-minimal file. A long-running embedded consumer cannot
+    /// process-restart to clear that state itself, so this call does it on
+    /// the consumer's behalf, under the same lock that already serializes
+    /// every other access to the store — no caller can observe an
+    /// intermediate closed state. On a reopen failure the on-disk file is
+    /// untouched (nothing more is written after the file-level compact
+    /// finishes) and this `Database`'s persistence is left closed; a fresh
+    /// `Database::open` on the same path recovers every row.
+    ///
+    /// A RETROFIT root — a table that accumulated a very large amount of
+    /// history BEFORE ever being compacted — is a distinct scenario the
+    /// version-cleanup-scaling bench's A2 arm measures directly; see its
+    /// own comments for the current state of that investigation.
+    pub fn compact_now(&self) -> Result<CompactionReport> {
+        let _operation = self.assert_open_operation();
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(CompactionReport::default());
+        };
+        let fragmentation_before = persistence.fragmentation_ratio().unwrap_or(0.0);
+        let bytes_before = self.disk_file_size();
+        let start = Instant::now();
+        let handle_recycle_micros = persistence.compact()?;
+        let duration_micros = start.elapsed().as_micros() as u64;
+        *self.last_auto_compact_at.lock() = Some(std::time::Instant::now());
+        let bytes_after = self.disk_file_size();
+        Ok(CompactionReport {
+            ran: true,
+            duration_micros,
+            bytes_before,
+            bytes_after,
+            file_shrank: matches!((bytes_before, bytes_after), (Some(b), Some(a)) if a < b),
+            fragmentation_before,
+            handle_recycled: true,
+            handle_recycle_micros,
+        })
+    }
+
+    /// Test-only override of [`AUTO_COMPACT_MIN_INTERVAL`], the same
+    /// pattern as `__set_currency_maintenance_interval`: production never
+    /// calls this, so the shipped default always governs the real automatic
+    /// path. Lets a test prove BOTH halves deterministically, with no
+    /// sleeps — a huge interval proves suppression (a second qualifying
+    /// cycle right after the first must not recompact), and a zero interval
+    /// proves the gate fires again the moment it is next due.
+    #[doc(hidden)]
+    pub fn __set_auto_compact_min_interval_for_test(&self, interval: Duration) {
+        *self.auto_compact_min_interval.lock() = interval;
+    }
+
     /// What the engine-owned maintenance loop is doing for this database.
     pub fn maintenance_status(&self) -> MaintenanceStatus {
         let _operation = self.assert_open_operation();
@@ -10436,17 +11436,71 @@ impl Database {
         MaintenanceStatus {
             running: active_maintenance_loops > 0,
             retention_enabled: self.has_retained_tables(),
-            currency_compaction_enabled: self.has_currency_compaction_tables(),
+            currency_compaction_enabled: self.has_version_cleanup_tables(),
             active_maintenance_loops,
+            policy: self.maintenance_policy(),
         }
     }
 
+    /// Whether this database's maintenance is engine-owned or handed to the
+    /// caller. See [`MaintenancePolicy`].
+    pub fn maintenance_policy(&self) -> MaintenancePolicy {
+        if self.maintenance_caller_driven.load(Ordering::SeqCst) {
+            MaintenancePolicy::CallerDriven
+        } else {
+            MaintenancePolicy::EngineOwned
+        }
+    }
+
+    /// Declare who owns this database's maintenance schedule. Switching TO
+    /// `CallerDriven` stops any thread currently running for this database;
+    /// switching TO `EngineOwned` starts one if anything is declared. Engine
+    /// open-config only — see [`MaintenancePolicy`]'s own doc comment.
+    pub fn set_maintenance_policy(&self, policy: MaintenancePolicy) {
+        let _operation = self.assert_open_operation();
+        self.maintenance_caller_driven
+            .store(policy == MaintenancePolicy::CallerDriven, Ordering::SeqCst);
+        self.reconcile_maintenance_thread();
+    }
+
     /// The retention window applied to the engine's OWN durable trigger-audit
-    /// history. A shipped default: a consumer that configures nothing still
-    /// gets a bounded table.
+    /// history: the operator's declared window if one was set via
+    /// [`Database::set_trigger_audit_retention`] on THIS handle, else the
+    /// shipped default. A consumer that configures nothing still gets a
+    /// bounded table.
+    ///
+    /// This is engine OPEN-CONFIG, not a stored declaration: it lives only on
+    /// this in-process handle, the same way a disk limit or memory ceiling
+    /// does, and is never written to the redb config store, never a DDL
+    /// surface, and never transported. A fresh [`Database`] opened on the
+    /// same path with no call to the setter reports the shipped default --
+    /// see `trigger_audit_retention_config_tests.rs` for the pinning test.
+    ///
+    /// The maintenance pass itself (`Database::maintenance_context`'s
+    /// `trigger_audit_retention_secs` field, the same shared `Arc` this
+    /// handle stores) re-reads exactly this value on every tick, so a
+    /// declared override is honored by the real cycle -- including a
+    /// cycle running on a loop already spawned before this setter was
+    /// called -- not only by this getter.
     pub fn trigger_audit_retention(&self) -> Option<Duration> {
         let _operation = self.assert_open_operation();
-        Some(TRIGGER_AUDIT_RETENTION)
+        Some(Duration::from_secs(
+            self.trigger_audit_retention_secs.load(Ordering::SeqCst),
+        ))
+    }
+
+    /// Declare the retention window for the engine's OWN durable trigger-
+    /// audit history, as installation-scope operator policy -- not a
+    /// per-table DDL axis (there is no user table to attach `RETAIN` to).
+    /// A runtime setter on this handle's open-config ONLY: it never writes to
+    /// the redb config store, so it does not survive this handle closing and
+    /// a fresh [`Database`] being opened on the same path. Read back by
+    /// [`Database::trigger_audit_retention`].
+    pub fn set_trigger_audit_retention(&self, window: Duration) -> Result<()> {
+        let _operation = self.open_operation()?;
+        self.trigger_audit_retention_secs
+            .store(window.as_secs(), Ordering::SeqCst);
+        Ok(())
     }
 
     /// An honest size answer for one table: estimated live bytes, exact live
@@ -10599,16 +11653,52 @@ impl Database {
         RETENTION_PEER_PERSIST_FAULT.with(|f| f.set(true));
     }
 
+    /// Arm the one-shot test injection seam: the NEXT version-cleanup pass
+    /// (`compact_currency_versions` / a maintenance cycle's currency pass) on
+    /// THIS thread fails right after the in-memory change log has been
+    /// filtered but before either persisted rewrite runs. Production-dead --
+    /// nothing but tests calls it.
+    #[doc(hidden)]
+    pub fn __arm_currency_compaction_persist_fault_for_test(&self) {
+        CURRENCY_COMPACTION_PERSIST_FAULT.with(|f| f.set(true));
+    }
+
+    /// Arm the one-shot test injection seam: the NEXT `compact_now`/
+    /// `MaintenanceContext::maybe_auto_compact` call's post-compact handle
+    /// recycle (close the store's redb handle, then reopen the same
+    /// already-compacted file) fails its reopen — the file-level compaction
+    /// itself still runs and still succeeds; only the reopen fails. Lets a
+    /// test assert the on-disk file stays intact and a fresh `Database::open`
+    /// on the same path recovers every row. Production-dead — nothing but a
+    /// test calls it.
+    #[doc(hidden)]
+    pub fn __arm_handle_recycle_reopen_fault_for_test(&self) {
+        crate::persistence::arm_handle_recycle_reopen_fault_for_test();
+    }
+
+    /// Arm the one-shot test race seam: the NEXT `execute` call on THIS
+    /// thread closes its own database synchronously in the gap between the
+    /// `already_closed` pre-check and the fallible snapshot registration —
+    /// deterministically simulating a close landing in that exact window,
+    /// on the SAME thread. Lets a test prove the registration's fallible
+    /// form catches it instead of panicking, without needing a second
+    /// thread to ever actually win a real race. Production-dead — nothing
+    /// but a test calls it.
+    #[doc(hidden)]
+    pub fn __arm_close_in_snapshot_registration_race_window_for_test(&self) {
+        CLOSE_IN_SNAPSHOT_REGISTRATION_RACE_WINDOW.with(|f| f.set(true));
+    }
+
     /// Consume the armed injection flag, if any. Reads a thread-local that is
     /// never set outside a test, so the production path takes the `false` arm.
     fn take_retention_peer_persist_fault_for_test(&self) -> bool {
         RETENTION_PEER_PERSIST_FAULT.with(|f| f.replace(false))
     }
 
-    /// Collapse the high-churn currency tables (see [`VERSION_COMPACTION_TABLES`])
-    /// back to one live version per logical row, dropping superseded MVCC
-    /// versions and their change-log entries in lockstep, then — if dead pages
-    /// now dominate the file — reclaim them with a redb compaction. Provably
+    /// Collapse every table that declares `HISTORY CURRENT ONLY` back to one
+    /// live version per logical row, dropping superseded MVCC versions and
+    /// their change-log entries in lockstep, then — if dead pages now
+    /// dominate the file — reclaim them with a redb compaction. Provably
     /// sync-safe (see `compact_currency_versions_inner`): every `changes_since`
     /// consumer still converges to current truth across a prune.
     pub fn compact_currency_versions(&self) -> Result<CurrencyCompactionReport> {
@@ -10618,14 +11708,143 @@ impl Database {
             .run_currency(CurrencyGate::Always)
     }
 
-    /// True when this database holds any compaction-eligible currency table.
-    /// Non-fabric consumers (cg and every other) never install these, so they
-    /// never get a maintenance thread.
-    fn has_currency_compaction_tables(&self) -> bool {
-        let tables = self.relational_store.tables.read();
-        VERSION_COMPACTION_TABLES
+    /// Test-only entry point mirroring `compact_currency_versions`, over a
+    /// CALLER-SUPPLIED table list rather than the declared eligibility set.
+    /// Production-dead -- nothing but tests calls it, and it runs the exact
+    /// unmodified real mechanism (`compact_currency_versions_inner`); the
+    /// production entry point above is untouched. Lets a test exercise the
+    /// real pass against a table shape it has not declared `HISTORY CURRENT
+    /// ONLY` on (yet) — for example a vector-bearing table.
+    #[doc(hidden)]
+    pub fn __compact_currency_versions_for_tables_for_test(
+        &self,
+        tables: &[&str],
+    ) -> Result<CurrencyCompactionReport> {
+        let _operation = self.assert_open_operation();
+        let _guard = self.pruning_guard.lock();
+        self.maintenance_context().run_currency_for_tables(tables)
+    }
+
+    /// Test-introspection surface: a content fingerprint over the full
+    /// vector and graph-adjacency populations AS PERSISTED ON DISK,
+    /// independent of iteration order. Used to prove a maintenance pass that
+    /// has no business touching these tables left their persisted contents
+    /// byte-identical -- a moved byte here means a population was rewritten
+    /// with no reason to be. Reads back the redb-backed `vector_entries`,
+    /// `graph_fwd`, and `graph_rev` tables through
+    /// [`RedbPersistence::load_vectors`] /
+    /// [`RedbPersistence::load_forward_edges`] /
+    /// [`RedbPersistence::load_reverse_edges`] -- the in-memory `VectorStore`
+    /// / `GraphStore` populations are a cache in front of that persisted
+    /// state, so hashing them instead would prove nothing about whether the
+    /// FILE was rewritten, only about the cache. On an in-memory database
+    /// (no persistence layer) this falls back to the in-memory populations,
+    /// since there is no persisted state to read; that fallback earns no
+    /// on-disk-bytes guarantee and this bench never exercises it.
+    /// Production-dead: pure read-only observation, no behavior change.
+    #[doc(hidden)]
+    pub fn __vector_and_graph_fingerprint_for_test(&self) -> (String, String) {
+        let Some(persistence) = self.persistence.as_ref() else {
+            let mut vector_lines: Vec<String> = self
+                .vector_store
+                .all_entries()
+                .iter()
+                .map(|entry| format!("{entry:?}"))
+                .collect();
+            vector_lines.sort();
+            let vector_hash = blake3::hash(vector_lines.join("\n").as_bytes())
+                .to_hex()
+                .to_string();
+            let mut edge_lines: Vec<String> = self
+                .graph_store
+                .forward_adj
+                .read()
+                .values()
+                .flat_map(|entries| entries.iter())
+                .map(|entry| format!("{entry:?}"))
+                .collect();
+            edge_lines.sort();
+            let edge_hash = blake3::hash(edge_lines.join("\n").as_bytes())
+                .to_hex()
+                .to_string();
+            return (vector_hash, edge_hash);
+        };
+
+        let mut vector_lines: Vec<String> = persistence
+            .load_vectors()
+            .expect("read the persisted vector_entries table")
             .iter()
-            .any(|name| tables.contains_key(*name))
+            .map(|entry| format!("{entry:?}"))
+            .collect();
+        vector_lines.sort();
+        let vector_hash = blake3::hash(vector_lines.join("\n").as_bytes())
+            .to_hex()
+            .to_string();
+
+        let mut edge_lines: Vec<String> = persistence
+            .load_forward_edges()
+            .expect("read the persisted graph_fwd table")
+            .iter()
+            .map(|entry| format!("fwd:{entry:?}"))
+            .collect();
+        edge_lines.extend(
+            persistence
+                .load_reverse_edges()
+                .expect("read the persisted graph_rev table")
+                .iter()
+                .map(|entry| format!("rev:{entry:?}")),
+        );
+        edge_lines.sort();
+        let edge_hash = blake3::hash(edge_lines.join("\n").as_bytes())
+            .to_hex()
+            .to_string();
+        (vector_hash, edge_hash)
+    }
+
+    /// Test-introspection surface: the PHYSICAL row-version count a table
+    /// holds in memory right now -- every superseded version plus every
+    /// keeper, as opposed to `SELECT COUNT(*)`'s LIVE row count. This is
+    /// the disk-bounded-ness measurement's ground truth: a currency table
+    /// with 10 live rows can still hold hundreds of thousands of physical
+    /// versions between compaction cycles. Production-dead: pure read-only
+    /// observation, no behavior change.
+    #[doc(hidden)]
+    pub fn __physical_version_count_for_test(&self, table: &str) -> usize {
+        self.relational_store
+            .tables
+            .read()
+            .get(table)
+            .map(|rows| rows.len())
+            .unwrap_or(0)
+    }
+
+    /// Test-introspection surface: the PHYSICAL vector-entry count across
+    /// the whole database right now -- every superseded/tombstoned entry
+    /// plus every live one, mirroring `__physical_version_count_for_test`
+    /// for the vector population (`VectorStore::all_entries` returns every
+    /// entry ever inserted, not just live ones -- verified by reading its
+    /// source, which applies no `deleted_tx` filter). Production-dead:
+    /// pure read-only observation, no behavior change.
+    #[doc(hidden)]
+    pub fn __vector_entry_count_for_test(&self) -> usize {
+        self.vector_store.all_entries().len()
+    }
+
+    /// True when any table on this database declares `HISTORY CURRENT ONLY`,
+    /// whether it was created here, arrived from disk on reopen, or arrived
+    /// over synced DDL — the mirror of `has_retained_tables` for the
+    /// version-history axis. Maintenance is declaration-driven: a database
+    /// that declares no `RETAIN` window, no `HISTORY CURRENT ONLY`, and holds
+    /// no durable trigger-audit history starts no maintenance thread at all
+    /// (see [`Self::reconcile_maintenance_thread`]); one that declares any
+    /// of those and wants to own its own schedule calls `pause_maintenance`
+    /// and drives `run_maintenance_cycle` itself.
+    fn has_version_cleanup_tables(&self) -> bool {
+        self.relational_store
+            .table_meta
+            .read()
+            .values()
+            .any(|meta| meta.history_policy == Some(HistoryPolicy::CurrentOnly))
     }
 
     /// True when any table declares RETAIN, whether it was created here or
@@ -10652,10 +11871,21 @@ impl Database {
             accountant: self.accountant.clone(),
             persistence: self.persistence.clone(),
             change_log: self.change_log.clone(),
+            change_log_table_index: self.change_log_table_index.clone(),
+            change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             trigger: self.trigger.clone(),
             tx_mgr: self.tx_mgr.clone(),
+            snapshot_registry: self.snapshot_registry.clone(),
+            last_maintenance_cycle_at: self.last_maintenance_cycle_at.clone(),
+            last_auto_compact_at: self.last_auto_compact_at.clone(),
+            auto_compact_min_interval: self.auto_compact_min_interval.clone(),
             sync_watermark: self.sync_watermark.clone(),
-            trigger_audit_retention: TRIGGER_AUDIT_RETENTION,
+            // Shared with the Database handle (same `Arc`), not a snapshot:
+            // `run_trigger_audit_retention` re-reads this every tick, so a
+            // declared override reaches this context's loop for the rest of
+            // its life, including a loop that was already running before
+            // the setter was called.
+            trigger_audit_retention_secs: self.trigger_audit_retention_secs.clone(),
         }
     }
 
@@ -10689,12 +11919,30 @@ impl Database {
         }
     }
 
-    pub(crate) fn start_maintenance_if_eligible(&self) {
-        let eligible = self.has_currency_compaction_tables()
+    pub(crate) fn reconcile_maintenance_thread(&self) {
+        if self.maintenance_caller_driven.load(Ordering::SeqCst) {
+            // CallerDriven: never spawn, however much is declared -- the
+            // host owns the schedule and drives `run_maintenance_cycle`
+            // itself. If a thread is somehow still running (the policy just
+            // switched away from EngineOwned), stop it.
+            if self.__maintenance_thread_running() {
+                self.stop_pruning_thread();
+            }
+            return;
+        }
+        let eligible = self.has_version_cleanup_tables()
             || self.has_retained_tables()
             || self.has_durable_trigger_audit();
-        if eligible && !self.__maintenance_thread_running() {
+        let running = self.__maintenance_thread_running();
+        if eligible && !running {
             self.spawn_maintenance(MAINTENANCE_TICK);
+        } else if !eligible && running {
+            // The last declaration left (an ALTER dropped the only RETAIN
+            // window, the only HISTORY CURRENT ONLY table was dropped, ...):
+            // stop the loop rather than leaving it ticking forever over
+            // nothing to maintain. `start_maintenance_if_eligible`'s old
+            // start-only shape never did this.
+            self.stop_pruning_thread();
         }
     }
 
@@ -11235,11 +12483,39 @@ impl Database {
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
     ) -> Result<Self> {
-        let db = Self::open_loaded(path, plugin, Arc::new(MemoryAccountant::no_limit()), None)?;
+        let db = Self::open_loaded(
+            path,
+            plugin,
+            Arc::new(MemoryAccountant::no_limit()),
+            None,
+            false,
+        )?;
         db.plugin.on_open()?;
         db.start_cron_tickler_if_schedules_present();
         db.load_retention_sync_peer();
-        db.start_maintenance_if_eligible();
+        db.reconcile_maintenance_thread();
+        Ok(db)
+    }
+
+    /// Load a root whose on-disk table/column schema predates this release's
+    /// `TableMeta`/`ColumnDef` layout — what the ordinary [`Self::open`]
+    /// path refuses with `Error::LegacyVectorStoreDetected` — so `contextdb
+    /// migrate` can read every row, edge, and vector out of it. This is the
+    /// ONLY entry point that reads past that refusal; every other opener
+    /// still refuses a schema-level-legacy root rather than silently loading
+    /// it. The returned handle is otherwise a normal, fully-populated
+    /// `Database` — callers typically pull `changes_since(Lsn(0))` off it to
+    /// get every live row/edge/vector/DDL statement, then apply that onto a
+    /// fresh current-format root.
+    pub fn open_legacy_for_migration(path: impl AsRef<Path>) -> Result<Self> {
+        let db = Self::open_loaded(
+            path,
+            Arc::new(CorePlugin),
+            Arc::new(MemoryAccountant::no_limit()),
+            None,
+            true,
+        )?;
+        db.plugin.on_open()?;
         Ok(db)
     }
 
@@ -11262,11 +12538,11 @@ impl Database {
         if path.as_os_str() == ":memory:" {
             return Self::open_memory_with_plugin_and_accountant(plugin, accountant);
         }
-        let db = Self::open_loaded(path, plugin, accountant, startup_disk_limit)?;
+        let db = Self::open_loaded(path, plugin, accountant, startup_disk_limit, false)?;
         db.plugin.on_open()?;
         db.start_cron_tickler_if_schedules_present();
         db.load_retention_sync_peer();
-        db.start_maintenance_if_eligible();
+        db.reconcile_maintenance_thread();
         Ok(db)
     }
 
@@ -11907,6 +13183,53 @@ impl Database {
         Ok(())
     }
 
+    /// The pull cursor bound to the specific store that issued it —
+    /// `(source incarnation, lsn)` — loaded as ONE record so a crash between
+    /// persisting the two halves separately can never pair a NEW cursor with
+    /// the OLD source (or vice versa) after a restart. `None` on a database
+    /// with no persistence, or one that has never completed a pull.
+    pub fn persisted_sync_pull_cursor(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Option<(Incarnation, Lsn)>> {
+        let _operation = self.open_operation()?;
+        let Some(persistence) = &self.persistence else {
+            return Ok(None);
+        };
+        let key = tenant_id.config_key("sync_pull_cursor");
+        match persistence.load_config_value::<(String, u64)>(&key)? {
+            Some((hex, lsn)) => {
+                let source = Incarnation::from_hex(&hex).ok_or_else(|| Error::StoreCorrupted {
+                    path: key.clone(),
+                    reason: format!(
+                        "persisted sync pull cursor source is not valid hex: {hex} — {}",
+                        RedbPersistence::CORRUPT_STORE_NEXT_STEP
+                    ),
+                })?;
+                Ok(Some((source, Lsn(lsn))))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the pull cursor's `(source incarnation, lsn)` pair as ONE
+    /// record (see [`Self::persisted_sync_pull_cursor`]).
+    pub fn persist_sync_pull_cursor(
+        &self,
+        tenant_id: &TenantId,
+        source: Incarnation,
+        watermark: Lsn,
+    ) -> Result<()> {
+        let _operation = self.open_operation()?;
+        if let Some(persistence) = &self.persistence {
+            persistence.flush_config_value(
+                &tenant_id.config_key("sync_pull_cursor"),
+                &(source.to_hex(), watermark.0),
+            )?;
+        }
+        Ok(())
+    }
+
     /// This database life's sync incarnation for `tenant_id`, minted the first
     /// time it is asked for and stable thereafter. A file-backed database
     /// persists it as a config value, so a plain reopen loads the same one; a
@@ -11926,7 +13249,10 @@ impl Database {
             match persistence.load_config_value::<String>(&key)? {
                 Some(hex) => Incarnation::from_hex(&hex).ok_or_else(|| Error::StoreCorrupted {
                     path: key.clone(),
-                    reason: format!("persisted sync incarnation is not valid hex: {hex}"),
+                    reason: format!(
+                        "persisted sync incarnation is not valid hex: {hex} — {}",
+                        RedbPersistence::CORRUPT_STORE_NEXT_STEP
+                    ),
                 })?,
                 None => {
                     let minted = Incarnation::mint();
@@ -12637,12 +13963,39 @@ impl Database {
                     // pre-adoption default. Keeping the old policy here can
                     // over-charge (a keep-latest projection charges an update a
                     // keep-first apply skips) or under-charge (the reverse).
+                    // For one of the four engine-owned built-in ledger tables
+                    // the real apply now PRESERVES a silent axis rather than
+                    // clearing it (`engine_owned_merged_policy`) -- mirrored
+                    // here too, so this projection never tells a LATER DDL in
+                    // the same batch (against the same table) that an axis
+                    // was cleared when the real apply will not clear it.
                     Some(meta) => {
-                        meta.conflict_policy = incoming.conflict_policy;
-                        meta.sync_direction = incoming.sync_direction;
-                        meta.default_ttl_seconds = incoming.default_ttl_seconds;
-                        meta.sync_safe = incoming.sync_safe;
-                        meta.retain_declared_unit = incoming.retain_declared_unit;
+                        let merged =
+                            crate::executor::engine_owned_merged_policy(name, meta, &incoming);
+                        let (conflict, direction, ttl, sync_safe, unit, history) = match merged {
+                            Some(merged) => (
+                                merged.conflict_policy,
+                                merged.sync_direction,
+                                merged.default_ttl_seconds,
+                                merged.sync_safe,
+                                merged.retain_declared_unit,
+                                merged.history_policy,
+                            ),
+                            None => (
+                                incoming.conflict_policy,
+                                incoming.sync_direction,
+                                incoming.default_ttl_seconds,
+                                incoming.sync_safe,
+                                incoming.retain_declared_unit,
+                                incoming.history_policy,
+                            ),
+                        };
+                        meta.conflict_policy = conflict;
+                        meta.sync_direction = direction;
+                        meta.default_ttl_seconds = ttl;
+                        meta.sync_safe = sync_safe;
+                        meta.retain_declared_unit = unit;
+                        meta.history_policy = history;
                     }
                     None => {
                         projected.insert(name.clone(), incoming);
@@ -13010,6 +14363,7 @@ impl Database {
         &self,
         changes: &ChangeSet,
         policies: &ConflictPolicies,
+        adoption: SyncAdoption,
     ) -> Result<()> {
         if changes.ddl.is_empty() {
             return Ok(());
@@ -13062,6 +14416,7 @@ impl Database {
                 &mut incoming_fk_values,
                 &mut deleted_committed_fk_row_ids,
                 policies,
+                adoption,
             )?;
 
             self.preflight_sync_trigger_data_gate(
@@ -13213,6 +14568,8 @@ impl Database {
         // applied, exactly as the local CREATE and ALTER paths refuse it.
         refuse_undeliverable_promise_sync_ddl(projected, change)?;
         refuse_keyless_sync_safe_sync_ddl(projected, change)?;
+        refuse_engine_owned_policy_sync_ddl(projected, change)?;
+        refuse_reclaimed_history_sync_ddl(change)?;
         match change {
             DdlChange::CreateTable {
                 name,
@@ -13532,6 +14889,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn preflight_sync_foreign_keys_against_lsn_prefix(
         &self,
         rows: &[RowChange],
@@ -13540,6 +14898,7 @@ impl Database {
         incoming_values: &mut HashMap<String, Vec<HashMap<String, Value>>>,
         deleted_committed_row_ids: &mut HashMap<String, HashSet<RowId>>,
         policies: &ConflictPolicies,
+        adoption: SyncAdoption,
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -13631,7 +14990,13 @@ impl Database {
                 )?
             {
                 if !replaces_incoming_prefix
-                    && !self.sync_row_applies_over_committed(row, &committed, policy)
+                    && !self.sync_row_applies_over_committed(
+                        row,
+                        &committed,
+                        policy,
+                        Some(row.lsn),
+                        adoption,
+                    )
                 {
                     continue;
                 }
@@ -13936,6 +15301,8 @@ impl Database {
         row: &RowChange,
         committed: &VersionedRow,
         policy: ConflictPolicy,
+        incoming_arrival: Option<Lsn>,
+        adoption: SyncAdoption,
     ) -> bool {
         match policy {
             ConflictPolicy::InsertIfNotExists | ConflictPolicy::ServerWins => false,
@@ -13944,28 +15311,61 @@ impl Database {
                 let committed_source = self
                     .relational_store
                     .sync_source_lsn(&row.table, committed.row_id);
-                self.sync_latest_wins_incoming(row, committed, committed_source)
+                self.sync_latest_wins_incoming(
+                    row,
+                    committed,
+                    committed_source,
+                    incoming_arrival,
+                    adoption,
+                )
             }
         }
     }
 
     /// LatestWins per-row comparison. `committed_source` is the row's stored
     /// sync provenance LSN (the sidecar), resolved once by the caller so the
-    /// hot apply path performs a single sidecar probe per row. The row's
-    /// provenance is anchored at its first sync-apply and is intentionally NOT
-    /// the receiver's drifted commit LSN, so a genuinely-newer same-provenance
-    /// update wins regardless of how far the receiver's commit clock has run
-    /// ahead — and a downstream reader's echo (carrying the reader's inflated
-    /// clock) cannot raise it.
+    /// hot apply path performs a single sidecar probe per row.
+    ///
+    /// `incoming_arrival` is the incoming row's own ordering position — the
+    /// value some earlier ACCEPTING node stamped for it, never the sender's
+    /// own unrelated local clock (see `resolve_incoming_arrival`). `None`
+    /// means the incoming row carries no established fleet-lineage ordering
+    /// at all (freshly authored at the sender, never before synced anywhere),
+    /// in which case THIS node is the one ordering it: it always wins,
+    /// unconditionally, over whatever is already held — comparing it against
+    /// `committed_lsn` would compare two machines' unrelated clocks, which is
+    /// the defect this rule exists to close. When an arrival IS carried, it is
+    /// compared against the stored position exactly as before: equal-or-lower
+    /// is a stale echo (the caller treats that as a silent no-op, never a
+    /// conflict), strictly higher wins — UNLESS `adoption` is
+    /// `ReadoptingSource` and `committed_source` is established: the stored
+    /// position was minted by a source this store just stopped addressing
+    /// (see [`SyncAdoption`]), so it is incomparable to the incoming arrival
+    /// from the newly adopted one, and the served value wins unconditionally.
+    /// `committed_source` being absent means the current committed value is
+    /// either purely local or has been locally edited since its last sync
+    /// (a local write always clears the sidecar — see
+    /// `Self::sync_source_lsn_updates`), so it is never treated as
+    /// unconditionally stale even during re-adoption: it falls through to the
+    /// same numeric comparison the stable path uses.
     fn sync_latest_wins_incoming(
         &self,
         row: &RowChange,
         committed: &VersionedRow,
         committed_source: Option<Lsn>,
+        incoming_arrival: Option<Lsn>,
+        adoption: SyncAdoption,
     ) -> bool {
-        let committed_lsn = committed_source.unwrap_or(committed.lsn);
-        if row.lsn != committed_lsn {
-            return row.lsn > committed_lsn;
+        let Some(arrival) = incoming_arrival else {
+            return true;
+        };
+        if adoption == SyncAdoption::ReadoptingSource && committed_source.is_some() {
+            return true;
+        }
+        let committed_lsn =
+            Self::resolve_sync_source_lsn(committed_source, committed.lsn).unwrap_or(committed.lsn);
+        if arrival != committed_lsn {
+            return arrival > committed_lsn;
         }
         for (col, incoming_val) in &row.values {
             if let (Value::TxId(incoming_tx), Some(Value::TxId(local_tx))) =
@@ -13982,10 +15382,47 @@ impl Database {
         row.values == committed.values
     }
 
+    /// Resolve the ordering position an incoming row carries, from a per-row
+    /// arrival map keyed by the row's own `.lsn` (rows sharing an `.lsn` share
+    /// one accepted commit and its fate, so the key is never ambiguous within
+    /// one changeset). A row whose `.lsn` is absent from `arrivals` is the
+    /// LEGACY path every direct/engine-only caller of `apply_changes` gets:
+    /// its own `.lsn` IS its arrival, unchanged from before this concept
+    /// existed. An entry present but mapped to `None` is the real, wire-driven
+    /// case: the sender carries no established ordering position for this row
+    /// at all.
+    fn resolve_incoming_arrival(
+        row: &RowChange,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+    ) -> Option<Lsn> {
+        match arrivals.get(&row.lsn) {
+            Some(explicit) => *explicit,
+            None => Some(row.lsn),
+        }
+    }
+
+    /// Resolve one `sync_source_lsn` sidecar reading against the row version
+    /// it was read alongside. The sentinel (`SYNC_SOURCE_LSN_OWN_COMMIT`)
+    /// always means "this row's own committed LSN", so it resolves to
+    /// `own_committed_lsn` -- the `.lsn` of the SAME committed row version
+    /// the sidecar lookup was keyed by. Any other stored value, or `None`
+    /// (no sidecar entry at all), passes through unchanged. Every reader of
+    /// the sidecar must call this before treating the value as a real
+    /// arrival; seeing the raw sentinel anywhere outside `set_sync_row_
+    /// source_lsn`'s own write path and this resolver is a bug.
+    fn resolve_sync_source_lsn(stored: Option<Lsn>, own_committed_lsn: Lsn) -> Option<Lsn> {
+        match stored {
+            Some(SYNC_SOURCE_LSN_OWN_COMMIT) => Some(own_committed_lsn),
+            other => other,
+        }
+    }
+
     fn projected_sync_incoming_values_for_applied_rows(
         &self,
         rows: &[RowChange],
         policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
     ) -> Result<ProjectedSyncApply> {
         let snapshot = self.snapshot();
         let mut projected_rows = Vec::<ProjectedSyncRow>::new();
@@ -14056,18 +15493,23 @@ impl Database {
                     )?
                     .is_none(),
                 Some(local) => {
-                    self.sync_row_applies_over_committed(row, local, policy)
-                        && self
-                            .sync_upsert_constraint_error_for_values(
-                                &row.table,
-                                &values,
-                                local,
-                                &projected_rows_cache,
-                                deleted_committed_row_ids
-                                    .get(&row.table)
-                                    .unwrap_or(&empty_deleted),
-                            )?
-                            .is_none()
+                    self.sync_row_applies_over_committed(
+                        row,
+                        local,
+                        policy,
+                        Self::resolve_incoming_arrival(row, arrivals),
+                        adoption,
+                    ) && self
+                        .sync_upsert_constraint_error_for_values(
+                            &row.table,
+                            &values,
+                            local,
+                            &projected_rows_cache,
+                            deleted_committed_row_ids
+                                .get(&row.table)
+                                .unwrap_or(&empty_deleted),
+                        )?
+                        .is_none()
                 }
             };
             if !applies {
@@ -14782,6 +16224,51 @@ impl Database {
         }
     }
 
+    /// Same as [`Self::changes_since`], but additionally returns each row's
+    /// own arrival: this store's sync provenance sidecar for it
+    /// (`sync_source_lsn`), `None` when none exists — content this store
+    /// authored itself, never yet ordered anywhere else in the fleet. Keyed
+    /// by each row's own `.lsn` — the one channel `arrival` crosses the wire
+    /// on ([`crate::sync_types::RowChange`] itself carries no such field) and
+    /// back into [`Self::apply_synced_changes`]. Resolved by a fresh
+    /// point-lookup per row rather than threaded through `changes_since`'s own
+    /// change-log walk, so this covers every one of its internal paths
+    /// (change-log replay AND the post-restart persisted-state fallback)
+    /// uniformly, at the cost of one extra lookup per row.
+    pub fn changes_since_with_arrivals(
+        &self,
+        since_lsn: Lsn,
+    ) -> (ChangeSet, HashMap<Lsn, Option<Lsn>>) {
+        let changes = self.changes_since(since_lsn);
+        let snapshot = self.snapshot();
+        let empty_skip_deleted = HashSet::new();
+        let mut arrivals = HashMap::new();
+        for row in &changes.rows {
+            if row.deleted || arrivals.contains_key(&row.lsn) {
+                continue;
+            }
+            let arrival = self
+                .visible_row_by_natural_key(
+                    &row.table,
+                    &row.natural_key,
+                    snapshot,
+                    &empty_skip_deleted,
+                )
+                .ok()
+                .flatten()
+                .and_then(|versioned| {
+                    self.relational_store
+                        .sync_source_lsn(&row.table, versioned.row_id)
+                });
+            // The sentinel never crosses the wire: resolve it to this row's
+            // own committed position before a peer ever sees it (the wire
+            // format itself is unchanged -- see `SYNC_SOURCE_LSN_OWN_COMMIT`).
+            let arrival = Self::resolve_sync_source_lsn(arrival, row.lsn);
+            arrivals.insert(row.lsn, arrival);
+        }
+        (changes, arrivals)
+    }
+
     /// Returns the current LSN of this database.
     pub fn current_lsn(&self) -> Lsn {
         let _operation = self.assert_open_operation();
@@ -14806,6 +16293,52 @@ impl Database {
     pub fn pause_after_relational_apply_for_test(&self) -> ApplyPhasePauseGuard {
         let _operation = self.assert_open_operation();
         let inner = self.apply_phase_pause.clone();
+        let generation = inner.arm();
+        ApplyPhasePauseGuard { inner, generation }
+    }
+
+    /// Test-only: arm the sync-apply pre-commit checkpoint (see
+    /// `sync_apply_pre_commit_pause`'s doc comment for the exact boundary --
+    /// after every row/edge/vector mutation for a changeset has been
+    /// staged, but immediately before the commit that assigns that
+    /// changeset's own LSN; a DIFFERENT boundary from
+    /// `pause_after_relational_apply_for_test`, which fires INSIDE an
+    /// already-committing transaction, holding the commit lock). Call this
+    /// on any thread (typically the test's main thread) to arm the shared
+    /// mechanism, then call `Self::mark_this_thread_for_sync_apply_pre_
+    /// commit_pause_for_test` on EACH thread that should actually stop
+    /// there -- a thread that never marks itself passes this checkpoint
+    /// unconditionally even while armed, so a test can pause exactly one
+    /// concurrent apply while a second, unmarked apply on another thread
+    /// commits normally.
+    pub fn pause_before_sync_apply_commit_for_test(&self) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
+        let inner = self.sync_apply_pre_commit_pause.clone();
+        let generation = inner.arm();
+        ApplyPhasePauseGuard { inner, generation }
+    }
+
+    /// Test-only: mark the CALLING thread so its next sync-apply pre-commit
+    /// checkpoint actually pauses once `pause_before_sync_apply_commit_for_
+    /// test` has armed the shared mechanism. Thread-local and one-shot
+    /// (consumed the moment the checkpoint reads it) -- must be called on
+    /// the same thread that will perform the paused `apply_changes`/
+    /// `apply_synced_changes` call.
+    pub fn mark_this_thread_for_sync_apply_pre_commit_pause_for_test(&self) {
+        let _operation = self.assert_open_operation();
+        SYNC_APPLY_PRE_COMMIT_PAUSE_ARMED_HERE.with(|f| f.set(true));
+    }
+
+    /// Test-only: pause a version-cleanup removal pass (`compact_currency_
+    /// versions`/`compact_currency_versions_inner`) immediately after it
+    /// samples its registered-snapshot set and committed watermark, before
+    /// it applies any persisted removal -- see `SnapshotFloorRegistry::
+    /// begin_removal_pass`. Lets a test prove a concurrent `pin_snapshot`
+    /// call genuinely blocks while a pass is mid-flight, rather than racing
+    /// past it.
+    pub fn pause_after_currency_floor_sample_for_test(&self) -> ApplyPhasePauseGuard {
+        let _operation = self.assert_open_operation();
+        let inner = self.snapshot_registry.removal_pass_test_pause.clone();
         let generation = inner.arm();
         ApplyPhasePauseGuard { inner, generation }
     }
@@ -15059,8 +16592,40 @@ impl Database {
     /// Applies a ChangeSet to this database with the given conflict policies.
     pub fn apply_changes(
         &self,
+        changes: ChangeSet,
+        policies: &ConflictPolicies,
+    ) -> Result<ApplyResult> {
+        self.apply_changes_impl(changes, policies, &HashMap::new(), SyncAdoption::Continuing)
+    }
+
+    /// Apply a synced changeset carrying explicit per-row arrival positions —
+    /// each row's ordering position on the node that ACCEPTED it, keyed by the
+    /// row's own `.lsn` (see [`Self::resolve_incoming_arrival`]). This is the
+    /// entry point the sync transport (`contextdb-server`) calls; every other
+    /// caller keeps using [`Self::apply_changes`], which is unaffected (an
+    /// empty `arrivals` map is the legacy behavior: each row's own `.lsn` IS
+    /// its arrival, exactly as before this concept existed).
+    ///
+    /// `adoption` distinguishes a continuing pull from the full re-fetch a
+    /// client issues right after its cursor's source changed — see
+    /// [`SyncAdoption`] for why the two arbitrate differently under
+    /// `ConflictPolicy::LatestWins`.
+    pub fn apply_synced_changes(
+        &self,
+        changes: ChangeSet,
+        policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
+    ) -> Result<ApplyResult> {
+        self.apply_changes_impl(changes, policies, arrivals, adoption)
+    }
+
+    fn apply_changes_impl(
+        &self,
         mut changes: ChangeSet,
         policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
     ) -> Result<ApplyResult> {
         let _operation = self.open_operation_after_public_tx_control_wait("apply_changes")?;
         // Per I14: the whole batch takes the index-maintenance lock once.
@@ -15107,7 +16672,7 @@ impl Database {
                 }
             }
         }
-        self.preflight_sync_ddl_mixed_apply(&changes, policies)?;
+        self.preflight_sync_ddl_mixed_apply(&changes, policies, adoption)?;
         self.preflight_sync_apply_trigger_ready(&changes)?;
         let _sync_trigger_gate = self.enter_sync_apply_trigger_gate_bypass();
 
@@ -15120,7 +16685,8 @@ impl Database {
                 new_lsn: self.current_lsn(),
             };
             for group in lsn_groups {
-                let result = self.apply_changes_single_lsn_group(group, policies)?;
+                let result =
+                    self.apply_changes_single_lsn_group(group, policies, arrivals, adoption)?;
                 total.applied_rows += result.applied_rows;
                 total.skipped_rows += result.skipped_rows;
                 total.conflicts.extend(result.conflicts);
@@ -15135,6 +16701,8 @@ impl Database {
                 .next()
                 .expect("split_by_data_lsn always returns at least one group"),
             policies,
+            arrivals,
+            adoption,
         )
     }
 
@@ -15215,6 +16783,8 @@ impl Database {
         &self,
         changes: ChangeSet,
         policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
     ) -> Result<ApplyResult> {
         let mut tx = self.begin()?;
         let commit_each_row = false;
@@ -15307,6 +16877,26 @@ impl Database {
                             // adoption the AlterTable path performs, so a hub does
                             // not silently keep its own default over an edge's
                             // declared conflict policy, direction, or retention.
+                            //
+                            // For one of the four engine-owned built-in ledger
+                            // tables this is the byte-identical mutation door
+                            // the AlterTable mirror refuses: adopting an
+                            // arriving policy axis WHOLESALE would let a
+                            // hand-crafted (or unguarded-older-binary)
+                            // `CreateTable` land the exact change the
+                            // AlterTable path is refused for, just spelled as
+                            // a create. `engine_owned_merged_policy` computes
+                            // the SAME preserve-or-canonical merge the
+                            // AlterTable arm applies (a silent axis PRESERVES
+                            // the current declared value; an axis the arriving
+                            // shape carries is at this point guaranteed to
+                            // already equal canonical — a differing explicit
+                            // value is refused before apply is ever reached,
+                            // at the preflight
+                            // `refuse_engine_owned_policy_sync_ddl`, which
+                            // judges this exact adopt shape too). `None` for a
+                            // plain operator table falls through to the
+                            // existing verbatim-adoption behavior.
                             let incoming = rough_sync_table_meta(
                                 &columns,
                                 &constraints,
@@ -15314,35 +16904,82 @@ impl Database {
                                 &composite_foreign_keys,
                                 &composite_unique,
                             );
-                            if let Some(mut meta) = self.table_meta(&name)
-                                && (meta.conflict_policy != incoming.conflict_policy
-                                    || meta.sync_direction != incoming.sync_direction
-                                    || meta.default_ttl_seconds != incoming.default_ttl_seconds
-                                    || meta.sync_safe != incoming.sync_safe
-                                    || meta.retain_declared_unit != incoming.retain_declared_unit)
-                            {
-                                let old_meta = meta.clone();
-                                meta.conflict_policy = incoming.conflict_policy;
-                                meta.sync_direction = incoming.sync_direction;
-                                meta.default_ttl_seconds = incoming.default_ttl_seconds;
-                                meta.sync_safe = incoming.sync_safe;
-                                meta.retain_declared_unit = incoming.retain_declared_unit;
-                                let meta = self.replace_table_meta_and_refresh_auto_indexes(
-                                    &name, &old_meta, meta,
-                                )?;
-                                self.persist_table_meta(&name, &meta)?;
-                                // Relay the adoption onward: allocate an LSN and
-                                // log an AlterTable so a DIFFERENT edge pulling
-                                // later receives the declared policy/direction/
-                                // retention instead of the hub's older undeclared
-                                // CreateTable. Without this the declaration stops
-                                // at the hub. Mirrors the AlterTable door.
-                                self.allocate_ddl_lsn(|lsn| {
-                                    self.log_alter_table_ddl(&name, &meta, lsn)
-                                })?;
-                                self.clear_statement_cache();
-                                table_meta_cache.remove(&name);
-                                applied_rows_cache.remove(&name);
+                            if let Some(mut meta) = self.table_meta(&name) {
+                                let engine_owned_merged =
+                                    crate::executor::engine_owned_merged_policy(
+                                        &name, &meta, &incoming,
+                                    );
+                                let (
+                                    new_conflict,
+                                    new_direction,
+                                    new_ttl,
+                                    new_sync_safe,
+                                    new_unit,
+                                    new_history,
+                                ) = match &engine_owned_merged {
+                                    Some(merged) => (
+                                        merged.conflict_policy,
+                                        merged.sync_direction,
+                                        merged.default_ttl_seconds,
+                                        merged.sync_safe,
+                                        merged.retain_declared_unit,
+                                        merged.history_policy,
+                                    ),
+                                    None => (
+                                        incoming.conflict_policy,
+                                        incoming.sync_direction,
+                                        incoming.default_ttl_seconds,
+                                        incoming.sync_safe,
+                                        incoming.retain_declared_unit,
+                                        incoming.history_policy,
+                                    ),
+                                };
+                                if meta.conflict_policy != new_conflict
+                                    || meta.sync_direction != new_direction
+                                    || meta.default_ttl_seconds != new_ttl
+                                    || meta.sync_safe != new_sync_safe
+                                    || meta.retain_declared_unit != new_unit
+                                    || meta.history_policy != new_history
+                                {
+                                    let old_meta = meta.clone();
+                                    meta.conflict_policy = new_conflict;
+                                    meta.sync_direction = new_direction;
+                                    meta.default_ttl_seconds = new_ttl;
+                                    meta.sync_safe = new_sync_safe;
+                                    meta.retain_declared_unit = new_unit;
+                                    meta.history_policy = new_history;
+                                    // Refused on the projected post-adoption shape
+                                    // before any of it is written — the preflight
+                                    // (`refuse_reclaimed_history_sync_ddl`) already
+                                    // gated this changeset, but this door also
+                                    // installs the SAME field through the adopt
+                                    // back door, so it asks the identical question
+                                    // again rather than trusting the preflight
+                                    // alone (defense in depth: the SAME shape, the
+                                    // SAME function, matching R2's parse-time
+                                    // refusal precedent of asking at every door
+                                    // that can produce the combination).
+                                    crate::executor::refuse_reclaimed_history_under_keep_first(
+                                        &name, &meta,
+                                    )?;
+                                    let meta = self.replace_table_meta_and_refresh_auto_indexes(
+                                        &name, &old_meta, meta,
+                                    )?;
+                                    self.persist_table_meta(&name, &meta)?;
+                                    // Relay the adoption onward: allocate an LSN and
+                                    // log an AlterTable so a DIFFERENT edge pulling
+                                    // later receives the declared policy/direction/
+                                    // retention instead of the hub's older undeclared
+                                    // CreateTable. Without this the declaration stops
+                                    // at the hub. Mirrors the AlterTable door.
+                                    self.allocate_ddl_lsn(|lsn| {
+                                        self.log_alter_table_ddl(&name, &meta, lsn)
+                                    })?;
+                                    self.clear_statement_cache();
+                                    self.reconcile_maintenance_thread();
+                                    table_meta_cache.remove(&name);
+                                    applied_rows_cache.remove(&name);
+                                }
                             }
                             continue;
                         }
@@ -15581,6 +17218,19 @@ impl Database {
                         }
                         if !vector_shape_changed && let Some(mut meta) = self.table_meta(&name) {
                             let old_meta = meta.clone();
+                            // Computed BEFORE `incoming`'s column/constraint
+                            // fields are moved out below -- `engine_owned_
+                            // merged_policy` only reads `incoming`'s policy
+                            // fields, but borrowing the whole struct after a
+                            // partial move is illegal, so this is captured
+                            // while `incoming` is still whole. `Some` only
+                            // for one of the four engine-owned built-in
+                            // ledger tables; `None` (a plain operator table)
+                            // falls through to the existing verbatim-adoption
+                            // behavior below.
+                            let engine_owned_merged = crate::executor::engine_owned_merged_policy(
+                                &name, &old_meta, &incoming,
+                            );
                             for incoming_column in incoming.columns {
                                 if let Some(existing_column) = meta
                                     .columns
@@ -15599,22 +17249,59 @@ impl Database {
                             if !incoming.composite_foreign_keys.is_empty() {
                                 meta.composite_foreign_keys = incoming.composite_foreign_keys;
                             }
-                            // Retention and direction ride the full constraint
-                            // set every AlterTable emitter carries, so the
+                            // Retention, direction, conflict, and history ride
+                            // the full constraint set every AlterTable emitter
+                            // carries, whether or not that specific axis
+                            // changed -- so for a PLAIN operator table the
                             // receiver takes the writer's post-alter policy
-                            // verbatim — a changed direction, a newly declared
-                            // window, or a dropped one. Reconstructed from the
-                            // arriving constraints exactly as CreateTable is,
-                            // closing the same gap on the ALTER door.
-                            meta.default_ttl_seconds = incoming.default_ttl_seconds;
-                            meta.sync_safe = incoming.sync_safe;
-                            meta.retain_declared_unit = incoming.retain_declared_unit;
-                            meta.sync_direction = incoming.sync_direction;
-                            meta.conflict_policy = incoming.conflict_policy;
+                            // verbatim: a changed direction, a newly declared
+                            // window, or a dropped one. For one of the four
+                            // engine-owned built-in ledger tables that verbatim
+                            // adoption is exactly the defect this closes: a
+                            // wire shape SILENT on an axis (a dropped RETAIN,
+                            // or a half-healed peer's own in-progress reconcile
+                            // that has not reached this axis yet) must PRESERVE
+                            // the table's current declared value rather than
+                            // clear it, and an axis it DOES carry is at this
+                            // point guaranteed to already equal the canonical
+                            // value -- a differing explicit value is refused
+                            // before apply is ever reached, at the preflight
+                            // (`refuse_engine_owned_policy_sync_ddl`).
+                            // `engine_owned_merged_policy` is the SAME merge
+                            // the CreateTable adopt branch performs, so both
+                            // doors land on the identical shape.
+                            if let Some(merged) = engine_owned_merged {
+                                meta.default_ttl_seconds = merged.default_ttl_seconds;
+                                meta.sync_safe = merged.sync_safe;
+                                meta.retain_declared_unit = merged.retain_declared_unit;
+                                meta.sync_direction = merged.sync_direction;
+                                meta.conflict_policy = merged.conflict_policy;
+                                meta.history_policy = merged.history_policy;
+                            } else {
+                                meta.default_ttl_seconds = incoming.default_ttl_seconds;
+                                meta.sync_safe = incoming.sync_safe;
+                                meta.retain_declared_unit = incoming.retain_declared_unit;
+                                meta.sync_direction = incoming.sync_direction;
+                                meta.conflict_policy = incoming.conflict_policy;
+                                meta.history_policy = incoming.history_policy;
+                            }
+                            // The same refusal every local door applies runs
+                            // here too, before any of the projected shape is
+                            // written — defense in depth alongside the
+                            // preflight (`refuse_reclaimed_history_sync_ddl`).
+                            crate::executor::refuse_reclaimed_history_under_keep_first(
+                                &name, &meta,
+                            )?;
                             let meta = self.replace_table_meta_and_refresh_auto_indexes(
                                 &name, &old_meta, meta,
                             )?;
                             self.persist_table_meta(&name, &meta)?;
+                            // The shipped defect this closes: an arriving
+                            // AlterTable never called this, so a RETAIN (or
+                            // now HISTORY CURRENT ONLY) declaration arriving
+                            // over sync on an existing table did not arm
+                            // maintenance until the next reopen.
+                            self.reconcile_maintenance_thread();
                         }
                         self.clear_statement_cache();
                         table_meta_cache.remove(&name);
@@ -15748,14 +17435,18 @@ impl Database {
             let _ = self.rollback(tx);
             return Err(err);
         }
-        let projected_sync_apply =
-            match self.projected_sync_incoming_values_for_applied_rows(&changes.rows, policies) {
-                Ok(projection) => projection,
-                Err(err) => {
-                    let _ = self.rollback(tx);
-                    return Err(err);
-                }
-            };
+        let projected_sync_apply = match self.projected_sync_incoming_values_for_applied_rows(
+            &changes.rows,
+            policies,
+            arrivals,
+            adoption,
+        ) {
+            Ok(projection) => projection,
+            Err(err) => {
+                let _ = self.rollback(tx);
+                return Err(err);
+            }
+        };
         let vector_tables = changes
             .vectors
             .iter()
@@ -15917,6 +17608,24 @@ impl Database {
                     row_meta.as_ref(),
                 )
             {
+                // The content is unchanged, but a row arriving WITH an
+                // established arrival is now KNOWN to be at that fleet
+                // position — even on its first appearance in this node's own
+                // provenance sidecar (e.g. this node authored the row
+                // directly, and only now receives the identical value back
+                // through sync). Recording it here is what lets a LATER,
+                // genuinely newer arrival be judged against the fleet's own
+                // ordering instead of this node's unrelated local clock.
+                // Never done when the incoming carries no arrival: there is
+                // nothing established to record.
+                if matches!(policy, ConflictPolicy::LatestWins)
+                    && let Some(arrival) = Self::resolve_incoming_arrival(&row, arrivals)
+                    && let Err(err) =
+                        self.set_sync_row_source_lsn(tx, &row.table, local.row_id, arrival)
+                {
+                    let _ = self.rollback(tx);
+                    return Err(err);
+                }
                 if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
                     consume_vector_row_group(
                         &vector_row_ids,
@@ -16075,8 +17784,24 @@ impl Database {
 
                     match self.insert_row_for_sync(tx, &row.table, values.clone(), row.created_at) {
                         Ok(new_row_id) => {
+                            // The row's provenance sidecar takes the incoming
+                            // row's arrival when it carries one (a value
+                            // already established somewhere in the fleet);
+                            // otherwise this node is the one ordering it, so
+                            // the sidecar takes THIS node's own accepting
+                            // position — never the sender's unrelated local
+                            // clock (`row.lsn`), which is exactly the
+                            // cross-sender defect this stamp must not
+                            // reintroduce. A stampless row gets the SENTINEL,
+                            // never a `current_lsn()` sample: this insert's
+                            // own commit has not happened yet, and a
+                            // concurrent apply's commit landing first would
+                            // make a sampled value stale before this one even
+                            // commits (see `SYNC_SOURCE_LSN_OWN_COMMIT`).
+                            let source_lsn = Self::resolve_incoming_arrival(&row, arrivals)
+                                .unwrap_or(SYNC_SOURCE_LSN_OWN_COMMIT);
                             if let Err(err) =
-                                self.set_sync_row_source_lsn(tx, &row.table, new_row_id, row.lsn)
+                                self.set_sync_row_source_lsn(tx, &row.table, new_row_id, source_lsn)
                             {
                                 let _ = self.rollback(tx);
                                 return Err(err);
@@ -16153,18 +17878,30 @@ impl Database {
                 }
                 (Some(local), ConflictPolicy::LatestWins) => {
                     // Resolve the row's stored provenance once: it feeds the
-                    // win/lose comparison and, on apply, is re-stamped unchanged
-                    // so the upsert's internal delete (which clears the sidecar)
-                    // does not drop the anchor. A single sidecar probe per row
-                    // keeps the hot apply path allocation- and double-probe-free.
+                    // win/lose comparison and, on apply, seeds the fallback
+                    // used when the incoming row itself carries no arrival.
+                    // A single sidecar probe per row keeps the hot apply path
+                    // allocation- and double-probe-free.
                     let committed_source = self
                         .relational_store
                         .sync_source_lsn(&row.table, local.row_id);
-                    let incoming_wins =
-                        self.sync_latest_wins_incoming(&row, &local, committed_source);
+                    let incoming_arrival = Self::resolve_incoming_arrival(&row, arrivals);
+                    let incoming_wins = self.sync_latest_wins_incoming(
+                        &row,
+                        &local,
+                        committed_source,
+                        incoming_arrival,
+                        adoption,
+                    );
 
                     if !incoming_wins {
-                        result.skipped_rows += 1;
+                        // A stale echo: an ordering position at or below the
+                        // one already stored. Not a conflict — nothing was
+                        // refused, there is simply nothing new — and not
+                        // skipped either, so this is a complete no-op on the
+                        // receipt. The vector bookkeeping still needs to
+                        // consume this row's slot to keep the vector-row index
+                        // aligned with the rows that carry one.
                         if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
                             consume_failed_vector_row_group(
                                 &vector_row_ids,
@@ -16172,11 +17909,11 @@ impl Database {
                                 &mut failed_row_ids,
                             );
                         }
-                        result.conflicts.push(Conflict {
-                            natural_key: row.natural_key.clone(),
-                            resolution: ConflictPolicy::LatestWins,
-                            reason: Some("latest_wins_local_lsn_newer_or_equal".to_string()),
-                        });
+                        if commit_each_row {
+                            self.commit_with_source(tx, CommitSource::SyncPull)?;
+                            tx = self.begin()?;
+                        }
+                        continue;
                     } else {
                         // State machine conflict detection
                         if let Some(meta) = self.table_meta(&row.table)
@@ -16270,22 +18007,29 @@ impl Database {
                                     }
                                     continue;
                                 }
-                                // Re-stamp the EXISTING provenance (anchored at
-                                // first sync-apply), not this update's emission
-                                // LSN. The upsert internally deletes+reinserts the
-                                // row, which clears the sidecar; writing the frozen
-                                // value back preserves the anchor. Moving it to the
-                                // emission LSN is what let a downstream reader's
-                                // echo (carrying the reader's inflated clock) poison
-                                // the anchor and strand the writer.
-                                if let Some(source_lsn) = committed_source
-                                    && let Err(err) = self.set_sync_row_source_lsn(
-                                        tx,
-                                        &row.table,
-                                        local.row_id,
-                                        source_lsn,
-                                    )
-                                {
+                                // Re-stamp the sidecar with the WINNING
+                                // arrival: the incoming row's own established
+                                // position when it carries one, or this node's
+                                // own accepting position when it does not (the
+                                // role-free stamping rule — see
+                                // `resolve_incoming_arrival`). The upsert
+                                // internally deletes+reinserts the row, which
+                                // clears the sidecar, so it must be written
+                                // back here regardless. Freezing this at the
+                                // OLD stored value (the prior behavior) is
+                                // exactly the bug: it left a later, genuinely
+                                // newer arrival with nothing correct to compare
+                                // against once this update landed. A stampless
+                                // row gets the SENTINEL, never a `current_lsn()`
+                                // sample -- see `SYNC_SOURCE_LSN_OWN_COMMIT`.
+                                let source_lsn =
+                                    incoming_arrival.unwrap_or(SYNC_SOURCE_LSN_OWN_COMMIT);
+                                if let Err(err) = self.set_sync_row_source_lsn(
+                                    tx,
+                                    &row.table,
+                                    local.row_id,
+                                    source_lsn,
+                                ) {
                                     let _ = self.rollback(tx);
                                     return Err(err);
                                 }
@@ -16372,8 +18116,16 @@ impl Database {
                         Ok(_upsert_result) => {
                             // Re-stamp the frozen provenance the upsert just
                             // cleared; an EdgeWins update does not move the anchor
-                            // (see the LatestWins arm).
-                            if let Some(source_lsn) = committed_source
+                            // (see the LatestWins arm). Resolved against `local.lsn`
+                            // (the row's OWN committed position BEFORE this upsert)
+                            // rather than re-persisted raw: if `committed_source` held
+                            // the sentinel, blindly re-writing it would let the anchor
+                            // silently drift forward to this upsert's NEW commit LSN
+                            // instead of staying pinned at the position it actually
+                            // arrived at -- exactly the "does not move the anchor"
+                            // contract this comment already promises.
+                            if let Some(source_lsn) =
+                                Self::resolve_sync_source_lsn(committed_source, local.lsn)
                                 && let Err(err) = self.set_sync_row_source_lsn(
                                     tx,
                                     &row.table,
@@ -16501,6 +18253,17 @@ impl Database {
         } else {
             Some(self.sync_pull_trigger_audit_projection(&trigger_ddl)?)
         };
+
+        // Test-only pause: every row in this changeset is already staged
+        // (any stampless row's sidecar carries the sentinel, not a sampled
+        // `current_lsn()`), but this changeset has not yet entered the
+        // commit-lock-protected commit below. Thread-local-gated so a test
+        // can pause exactly ONE concurrent apply here while a second,
+        // unmarked apply on another thread passes straight through and
+        // commits normally -- see `sync_apply_pre_commit_pause`'s doc comment.
+        if take_sync_apply_pre_commit_pause_armed_here_for_test() {
+            self.sync_apply_pre_commit_pause.maybe_pause();
+        }
 
         self.commit_with_source_and_sync_ddl_and_trigger_audit_projection(
             tx,
@@ -17498,13 +19261,25 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
     let accountant = ctx.accountant.as_ref();
     let persistence = ctx.persistence.as_ref();
     let change_log = &ctx.change_log;
+    let change_log_table_index = &ctx.change_log_table_index;
+    let change_log_lsn_refcounts = &ctx.change_log_lsn_refcounts;
     let tx_mgr = ctx.tx_mgr.as_ref();
     let now = Wallclock::now();
     let metas = relational_store.table_meta.read().clone();
     let mut pruned_versions_by_table: HashMap<String, Vec<(RowId, TxId)>> = HashMap::new();
     let mut pruned_live_row_ids = HashSet::new();
     let mut pruned_node_ids = HashSet::new();
-    let mut pruned_change_keys: HashSet<(String, RowId, Lsn)> = HashSet::new();
+    // Grouped by table -- see `compact_currency_versions_inner`'s identical
+    // choice.
+    let mut pruned_change_keys: HashMap<String, HashSet<(RowId, Lsn)>> = HashMap::new();
+    // The full relational key of every pruned version, in hand from the row
+    // already being walked -- no scan is needed later to find it (see
+    // `RedbPersistence::prune_versions_scoped`).
+    let mut row_keys: Vec<(String, RowId, TxId, Lsn)> = Vec::new();
+    // A row whose LIVE version is pruned here loses its one sync-source-lsn
+    // tracking row too -- looked up by key rather than the table-wide scan
+    // `retain_sync_source_lsns_for_table_rows` used to need.
+    let mut orphaned_source_lsn_rows: Vec<(String, RowId)> = Vec::new();
     let mut released_row_bytes = 0usize;
     let mut blocked = Vec::new();
 
@@ -17582,7 +19357,11 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             // unconfirmed SYNC SAFE row, which means a pruned row is a
             // confirmed row and an unconfirmed backlog's entries are never in
             // this set. One rule, enforced at one place.
-            pruned_change_keys.insert((table_name.clone(), row.row_id, row.lsn));
+            pruned_change_keys
+                .entry(table_name.clone())
+                .or_default()
+                .insert((row.row_id, row.lsn));
+            row_keys.push((table_name.clone(), row.row_id, row.created_tx, row.lsn));
             released_row_bytes = released_row_bytes.saturating_add(estimate_row_bytes_for_meta(
                 &row.values,
                 meta,
@@ -17590,6 +19369,7 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             ));
             if row.deleted_tx.is_none() {
                 pruned_live_row_ids.insert(row.row_id);
+                orphaned_source_lsn_rows.push((table_name.clone(), row.row_id));
                 if let Some(Value::Uuid(id)) = row.values.get("id") {
                     pruned_node_ids.insert(*id);
                 }
@@ -17621,69 +19401,103 @@ fn prune_expired_rows(ctx: &MaintenanceContext, sync_watermark: Lsn) -> Result<P
             )
         })
         .collect::<HashMap<_, _>>();
-    let post_prune_table_rows = pruned_versions_by_table_sets
-        .iter()
-        .map(|(table_name, versions)| {
-            let rows = table_snapshot
-                .get(table_name)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|row| !versions.contains(&(row.row_id, row.created_tx)))
-                .collect::<Vec<_>>();
-            (table_name.clone(), rows)
-        })
-        .collect::<HashMap<_, _>>();
-    let post_prune_vectors = vector_store
-        .all_entries()
-        .into_iter()
-        .filter(|entry| !pruned_live_row_ids.contains(&entry.row_id))
-        .collect::<Vec<_>>();
-    let post_prune_edges = graph_store
-        .forward_adj
-        .read()
-        .values()
-        .flat_map(|entries| entries.iter().cloned())
-        .filter(|entry| {
-            !pruned_node_ids.contains(&entry.source) && !pruned_node_ids.contains(&entry.target)
-        })
-        .collect::<Vec<_>>();
+    // The vectors and edges being REMOVED (a row whose LIVE version just
+    // aged out), not the wholesale "everything that survives" set the old
+    // full-rewrite path needed — `prune_vectors_and_edges_scoped` takes
+    // exactly what to remove.
+    let removed_vectors: Vec<VectorEntry> = if pruned_live_row_ids.is_empty() {
+        Vec::new()
+    } else {
+        vector_store
+            .all_entries()
+            .into_iter()
+            .filter(|entry| pruned_live_row_ids.contains(&entry.row_id))
+            .collect()
+    };
+    let removed_edges: Vec<AdjEntry> = if pruned_node_ids.is_empty() {
+        Vec::new()
+    } else {
+        graph_store
+            .forward_adj
+            .read()
+            .values()
+            .flat_map(|entries| entries.iter().cloned())
+            .filter(|entry| {
+                pruned_node_ids.contains(&entry.source) || pruned_node_ids.contains(&entry.target)
+            })
+            .collect()
+    };
 
-    // The rows are leaving, so the change-log entries that referenced them
-    // leave in the SAME commit. Without this the log kept an entry for every
-    // write ever made — the rows aged out while their history did not, and the
-    // file grew linearly under steady churn however little data was live.
-    // Prune the in-memory log first and keep the survivors to rewrite
-    // persistence with, so memory and disk agree; CHANGE-LOG-FIRST for the same
-    // crash-safety reason the currency path documents.
-    let surviving_change_log = {
-        let mut log = change_log.write();
-        log.retain(|entry| !change_entry_references_pruned_version(entry, &pruned_change_keys));
-        log.clone()
+    // Bounded to the tables THIS pass touches, never the whole change log
+    // -- matching the cleanup path's own fix (`count_pruned_change_log_
+    // entries`/`change_log_table_index`). Persist-then-mutate: nothing here
+    // mutates `change_log` itself; a failed persisted removal below must
+    // never leave memory ahead of what is durably on disk.
+    let pruned_change_keys_vec: Vec<(String, RowId, Lsn)> = pruned_change_keys
+        .iter()
+        .flat_map(|(table, keys)| {
+            keys.iter()
+                .map(move |(row_id, lsn)| (table.clone(), *row_id, *lsn))
+        })
+        .collect();
+    let (_pruned_change_log_entries, removed_lsn_counts) = {
+        let table_index = change_log_table_index.read();
+        count_pruned_change_log_entries(&table_index, &pruned_change_keys)
     };
 
     if let Some(persistence) = persistence {
-        persistence.rewrite_change_log(&surviving_change_log)?;
-        persistence.rewrite_pruned_state(
-            &post_prune_table_rows,
-            &post_prune_vectors,
-            &post_prune_edges,
+        // Point-removes in ONE redb write transaction: exactly the pruned
+        // row versions, the change-log entries that referenced them
+        // (change-log-first WITHIN that transaction, exactly as the cleanup
+        // path's fix), and the sync-source-lsn rows orphaned by a row whose
+        // whole lifetime just ended. Nothing else is read or rewritten.
+        persistence.prune_versions_scoped(
+            &row_keys,
+            &pruned_change_keys_vec,
+            &orphaned_source_lsn_rows,
         )?;
+        if !removed_vectors.is_empty() || !removed_edges.is_empty() {
+            persistence.prune_vectors_and_edges_scoped(&removed_vectors, &removed_edges)?;
+        }
     }
 
-    // The commit index holds one entry per commit and nothing removed them, so
-    // it grew with every write forever — after the change log was bounded it
-    // was the only remaining per-write term in the file. Trim it LAST, and
-    // deliberately: over-retention is the safe failure direction (spare entries
-    // are inert), whereas an index trimmed before the rows left could make a
-    // still-present row invisible until the next reopen rebuilt it.
-    let retained_commit_index = retained_commit_index_after_prune(tx_mgr, &surviving_change_log);
-    let pruned_commit_index_entries = tx_mgr.replace_commit_index(retained_commit_index.clone());
-    if pruned_commit_index_entries > 0
-        && let Some(persistence) = persistence
-    {
-        persistence.rewrite_commit_index(&retained_commit_index)?;
+    // Commit-index candidate-only removal, shared with the cleanup path —
+    // see the function doc. Over-retention remains the deliberate safe
+    // direction: a candidate not yet proven safe by `scoped_commit_index_
+    // removal`'s own floor computation simply is not removed.
+    let affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
+    let commit_index_candidates = {
+        let lsn_refcounts = change_log_lsn_refcounts.read();
+        scoped_commit_index_removal(
+            tx_mgr,
+            persistence,
+            &lsn_refcounts,
+            &removed_lsn_counts,
+            &affected_lsns,
+        )?
+    };
+
+    // Only now, with every persisted step behind us, does memory follow —
+    // scoped to a suffix of `change_log` (see
+    // `remove_pruned_change_log_entries`), never the whole Vec.
+    if let Some(min_affected_lsn) = affected_lsns.iter().min().copied() {
+        remove_pruned_change_log_entries(
+            &mut change_log.write(),
+            &pruned_change_keys,
+            min_affected_lsn,
+        );
     }
+    remove_pruned_from_table_index(&mut change_log_table_index.write(), &pruned_change_keys);
+    apply_removed_lsn_counts(&mut change_log_lsn_refcounts.write(), &removed_lsn_counts);
+    // The REAL count: `tx_mgr`'s own in-memory removal, not the persisted
+    // side effect's count (which reads 0 on an in-memory database even
+    // though the in-memory index genuinely shrinks -- see
+    // `scoped_commit_index_removal`'s own doc comment).
+    let pruned_commit_index_entries = if commit_index_candidates.is_empty() {
+        0
+    } else {
+        tx_mgr.remove_commit_index_entries(&commit_index_candidates)
+    };
 
     for (table_name, versions) in &pruned_versions_by_table_sets {
         relational_store.remove_row_versions(table_name, versions);
@@ -17754,48 +19568,84 @@ fn checked_prune_expired_rows(
     prune_expired_rows(ctx, sync_watermark)
 }
 
-/// The commit-index entries a prune must KEEP.
+/// Commit-index candidate-only removal, shared by version cleanup and
+/// retention: only the LSNs THIS PASS affected (`affected_lsns`) are
+/// candidates, and only those still unreferenced after this pass AND not
+/// the ANCHOR are actually removable — never a rebuild of the whole index.
 ///
-/// `snapshot_at` is a FLOOR lookup (`range(..=lsn).next_back()`), and the delete
-/// arms of `changes_since` resolve `snapshot_at(lsn - 1)` — they ask about the
-/// LSN BELOW their own entry. So retaining only the surviving change log's own
-/// LSNs would leave the OLDEST surviving delete resolving against nothing,
-/// degrading to an all-invisible snapshot that silently drops it from the
-/// changeset. The kept set is therefore every surviving entry PLUS the ANCHOR:
-/// the greatest entry strictly below the lowest LSN any consumer can name.
+/// `lsn_refcounts` is the maintained global "how many change-log entries of
+/// any kind still name this LSN" map (see `ChangeLogLsnRefcounts`), read
+/// BEFORE this pass's own removal; `removed_lsn_counts` is this pass's own
+/// per-LSN removal count (small, bounded to the tables it touched — see
+/// `count_pruned_change_log_entries`). Neither is cloned: "is `lsn` still
+/// covered after this pass" is the O(log n) pre-pass count minus this
+/// pass's own (small) delta, and "what is the lowest LSN still covered"
+/// (the floor) starts from `lsn_refcounts.keys().next()` — a `BTreeMap`
+/// first-key lookup — and only walks forward if THAT exact key is itself
+/// being fully removed this pass (rare: it means the earliest entry in the
+/// WHOLE change log belongs to a table this pass is cleaning), never a
+/// scan of the whole map otherwise. The floor matters because
+/// `changes_since`'s delete arms resolve `snapshot_at(lsn - 1)` — they ask
+/// about the LSN BELOW their own entry — so keeping only the still-covered
+/// LSNs would leave the oldest surviving delete resolving against nothing;
+/// the ANCHOR (the greatest commit-index entry strictly below the floor,
+/// found via [`TransactionManager::commit_index_floor_below`] — a targeted
+/// range query, never a clone of the whole index) closes that gap. When
+/// nothing in the change log survives at all there is no floor to derive;
+/// the anchor falls back to the single most recent commit-index entry
+/// instead ([`TransactionManager::commit_index_last`]) — the index is
+/// never trimmed to empty, because an empty index answers `TxId(0)` for
+/// every lookup and would hide the whole database.
 ///
-/// When the prune expired everything the surviving log is empty and there is no
-/// floor to derive; the index is never trimmed to empty, because an empty index
-/// answers `TxId(0)` for every lookup and would hide the whole database. The
-/// most recent entry is kept as the anchor instead.
-fn retained_commit_index_after_prune(
+/// Persist-then-mutate: the PERSISTED removal runs here (and can fail) —
+/// this is a side effect only, and returns ONLY the candidate LSN list, not
+/// a count. The caller must not report the persisted side effect's own
+/// count as "how many entries this pass removed": that count is `0` on an
+/// in-memory database (no persistence to remove from at all) even though
+/// the in-memory index genuinely shrinks, so the caller derives the real
+/// count from `tx_mgr.remove_commit_index_entries`'s OWN return value,
+/// AFTER actually mutating memory with the candidates returned here —
+/// applies to an in-memory database too, since the commit index is
+/// `TransactionManager` state, not persistence state, and grows with every
+/// commit whether or not this database has a file.
+fn scoped_commit_index_removal(
     tx_mgr: &TransactionManager<DynStore>,
-    surviving_change_log: &[ChangeLogEntry],
-) -> BTreeMap<Lsn, TxId> {
-    let index = tx_mgr.commit_index_snapshot();
-    let surviving_lsns = surviving_change_log
-        .iter()
-        .map(|entry| entry.lsn())
-        .collect::<BTreeSet<_>>();
-
-    let Some(floor) = surviving_lsns.iter().next().copied() else {
-        return index
-            .iter()
-            .next_back()
-            .map(|(lsn, tx)| (*lsn, *tx))
-            .into_iter()
-            .collect();
-    };
-
-    let mut retained = index
-        .iter()
-        .filter(|(lsn, _)| surviving_lsns.contains(lsn))
-        .map(|(lsn, tx)| (*lsn, *tx))
-        .collect::<BTreeMap<_, _>>();
-    if let Some((anchor_lsn, anchor_tx)) = index.range(..floor).next_back() {
-        retained.insert(*anchor_lsn, *anchor_tx);
+    persistence: Option<&Arc<RedbPersistence>>,
+    lsn_refcounts: &ChangeLogLsnRefcounts,
+    removed_lsn_counts: &HashMap<Lsn, u64>,
+    affected_lsns: &HashSet<Lsn>,
+) -> Result<Vec<Lsn>> {
+    if affected_lsns.is_empty() {
+        return Ok(Vec::new());
     }
-    retained
+    let still_covered = |lsn: Lsn| -> bool {
+        lsn_refcounts.get(&lsn).copied().unwrap_or(0)
+            > removed_lsn_counts.get(&lsn).copied().unwrap_or(0)
+    };
+    let floor_after = match lsn_refcounts.keys().next().copied() {
+        Some(current_floor) if still_covered(current_floor) => Some(current_floor),
+        Some(current_floor) => lsn_refcounts
+            .range(current_floor..)
+            .find(|(lsn, _)| still_covered(**lsn))
+            .map(|(lsn, _)| *lsn),
+        None => None,
+    };
+    let anchor_lsn = match floor_after {
+        Some(floor) => tx_mgr.commit_index_floor_below(floor).map(|(lsn, _)| lsn),
+        None => tx_mgr.commit_index_last().map(|(lsn, _)| lsn),
+    };
+    let candidates: Vec<Lsn> = affected_lsns
+        .iter()
+        .filter(|lsn| !still_covered(**lsn) && Some(**lsn) != anchor_lsn)
+        .copied()
+        .collect();
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+    if let Some(persistence) = persistence {
+        persistence.remove_commit_index_entries_scoped(&candidates)?;
+    }
+    Ok(candidates)
 }
 
 /// Whether a change-log entry names one of the pruned `(table, row_id, lsn)`
@@ -17803,7 +19653,7 @@ fn retained_commit_index_after_prune(
 /// relational version; edge/vector entries never do.
 fn change_entry_references_pruned_version(
     entry: &ChangeLogEntry,
-    pruned: &HashSet<(String, RowId, Lsn)>,
+    pruned_by_table: &HashMap<String, HashSet<(RowId, Lsn)>>,
 ) -> bool {
     match entry {
         ChangeLogEntry::RowInsert {
@@ -17811,8 +19661,123 @@ fn change_entry_references_pruned_version(
         }
         | ChangeLogEntry::RowDelete {
             table, row_id, lsn, ..
-        } => pruned.contains(&(table.clone(), *row_id, *lsn)),
+        } => pruned_by_table
+            .get(table)
+            .is_some_and(|set| set.contains(&(*row_id, *lsn))),
         _ => false,
+    }
+}
+
+/// Build both change-log aux structures from a freshly loaded change log at
+/// `Database::open` — a one-time O(log length) cost at startup (never
+/// per-cycle), reusing the SAME per-entry logic
+/// `CompositeStore::apply_exact_with_log_entries` uses at append, so the two
+/// choke points can never disagree about which entries populate the index.
+fn build_change_log_aux_indexes(
+    log: &[ChangeLogEntry],
+) -> (ChangeLogTableIndex, ChangeLogLsnRefcounts) {
+    let mut table_index = ChangeLogTableIndex::new();
+    let mut lsn_refcounts = ChangeLogLsnRefcounts::new();
+    record_change_log_entries(&mut table_index, &mut lsn_refcounts, log);
+    (table_index, lsn_refcounts)
+}
+
+/// Count exactly how many change-log entries reference a pruned version,
+/// bounded to the tables THIS pass touches — via `change_log_table_index`
+/// (each affected table's own `(lsn, row_id)` shadow, multiplicities
+/// preserved: a superseding commit's `RowDelete` shares its `lsn` with its
+/// own `RowInsert`, so one pruned key can legitimately match two entries —
+/// see the type's own doc comment) — never the whole change log, so an
+/// unrelated table's entries sharing the log are never visited to answer
+/// this. Also returns the per-LSN breakdown (`removed_lsn_counts`), which
+/// `scoped_commit_index_removal` needs to know which LSNs the change log
+/// still covers after this pass.
+fn count_pruned_change_log_entries(
+    change_log_table_index: &ChangeLogTableIndex,
+    pruned_by_table: &HashMap<String, HashSet<(RowId, Lsn)>>,
+) -> (u64, HashMap<Lsn, u64>) {
+    let mut total = 0u64;
+    let mut removed_lsn_counts: HashMap<Lsn, u64> = HashMap::new();
+    for (table, pruned_set) in pruned_by_table {
+        let Some(coords) = change_log_table_index.get(table) else {
+            continue;
+        };
+        for (lsn, row_id) in coords {
+            if pruned_set.contains(&(*row_id, *lsn)) {
+                total += 1;
+                *removed_lsn_counts.entry(*lsn).or_insert(0) += 1;
+            }
+        }
+    }
+    (total, removed_lsn_counts)
+}
+
+/// Physically remove every change-log entry naming a pruned version from
+/// `change_log`'s Vec, starting the scan at the lowest LSN any pruned
+/// version could possibly touch rather than at position zero. `change_log`
+/// is APPENDED in strictly non-decreasing LSN order (one writer, one
+/// commit lock, entries pushed in commit order — see
+/// `CompositeStore::apply_exact_with_log_entries`), so a binary search
+/// finds exactly where "could possibly match" begins, and everything
+/// before it is provably untouched: never read, never moved. This is what
+/// makes a scoped pass's physical removal track "how much of the log came
+/// at or after what THIS pass is cleaning," not "how big the database's
+/// unrelated history is" — an unrelated table's writes that happened
+/// BEFORE the earliest pruned version, however many, cost nothing here.
+/// Order-preserving (matches `Vec::retain`'s own guarantee), just scoped to
+/// a suffix instead of the whole Vec.
+fn remove_pruned_change_log_entries(
+    change_log: &mut Vec<ChangeLogEntry>,
+    pruned_by_table: &HashMap<String, HashSet<(RowId, Lsn)>>,
+    min_affected_lsn: Lsn,
+) {
+    let start = change_log.partition_point(|entry| entry.lsn() < min_affected_lsn);
+    let mut write = start;
+    for read in start..change_log.len() {
+        if change_entry_references_pruned_version(&change_log[read], pruned_by_table) {
+            continue;
+        }
+        if write != read {
+            change_log.swap(write, read);
+        }
+        write += 1;
+    }
+    change_log.truncate(write);
+}
+
+/// Drop the pruned `(lsn, row_id)` coordinates from the affected tables'
+/// own shadow — bounded to those tables' own entries, never the whole
+/// index.
+fn remove_pruned_from_table_index(
+    change_log_table_index: &mut ChangeLogTableIndex,
+    pruned_by_table: &HashMap<String, HashSet<(RowId, Lsn)>>,
+) {
+    for (table, pruned_set) in pruned_by_table {
+        if let Some(coords) = change_log_table_index.get_mut(table) {
+            coords.retain(|(lsn, row_id)| !pruned_set.contains(&(*row_id, *lsn)));
+        }
+    }
+}
+
+/// Decrement the global LSN refcount by exactly what this pass removed —
+/// bounded to `removed_lsn_counts` (the LSNs THIS pass touched), never a
+/// scan of the whole map. A count reaching zero means the change log no
+/// longer covers that LSN at all, so the key is dropped rather than left
+/// at zero (an absent key IS "not covered," matching
+/// `scoped_commit_index_removal`'s `still_covered` check).
+fn apply_removed_lsn_counts(
+    lsn_refcounts: &mut ChangeLogLsnRefcounts,
+    removed_lsn_counts: &HashMap<Lsn, u64>,
+) {
+    for (lsn, removed) in removed_lsn_counts {
+        if let std::collections::btree_map::Entry::Occupied(mut slot) = lsn_refcounts.entry(*lsn) {
+            let remaining = slot.get().saturating_sub(*removed);
+            if remaining == 0 {
+                slot.remove();
+            } else {
+                *slot.get_mut() = remaining;
+            }
+        }
     }
 }
 
@@ -17831,21 +19796,80 @@ fn change_entry_references_pruned_version(
 /// pull, or watermark-regressed re-push — still reconstructs the current row and
 /// converges to current truth. These tables are all `LatestWins`, so the dropped
 /// intermediate versions had no consumer value: a peer applies only the latest.
+#[allow(clippy::too_many_arguments)]
 fn compact_currency_versions_inner(
     relational_store: &Arc<RelationalStore>,
-    graph_store: &Arc<GraphStore>,
+    _graph_store: &Arc<GraphStore>,
     vector_store: &Arc<VectorStore>,
     accountant: &MemoryAccountant,
     persistence: Option<&Arc<RedbPersistence>>,
     change_log: &Arc<RwLock<Vec<ChangeLogEntry>>>,
+    change_log_table_index: &Arc<RwLock<ChangeLogTableIndex>>,
+    change_log_lsn_refcounts: &Arc<RwLock<ChangeLogLsnRefcounts>>,
+    tx_mgr: &Arc<TransactionManager<DynStore>>,
+    snapshot_registry: &Arc<SnapshotFloorRegistry>,
     tables: &[&str],
 ) -> Result<CurrencyCompactionReport> {
+    // This pass's own sampled state: the committed watermark right now, and
+    // (inside `begin_removal_pass`, atomically with each other) every
+    // currently-registered reader's snapshot (an in-flight statement, or a
+    // caller-held `SnapshotPin`). A superseded version still visible to ANY
+    // of those registered snapshots is deferred to a later cycle instead of
+    // being physically removed out from under that reader -- see
+    // `any_registered_snapshot_sees`. `tx_mgr.current_tx_max()` is read here
+    // under the same commit-lock hold this whole pass runs inside (both call
+    // sites wrap `compact_currency_versions_inner` in `with_commit_lock`), so
+    // no commit can land between this sample and the registered-set sample
+    // `begin_removal_pass` takes next -- every version this pass ends up
+    // pruning was therefore superseded AT OR BEFORE `watermark`, which is
+    // exactly what `SnapshotFloorRegistry::register`'s blocking rule relies
+    // on.
+    let watermark = tx_mgr.current_tx_max();
+    // Records the sampled registered set and watermark as an in-progress
+    // removal pass for the rest of this function's duration (held through
+    // every return path, success or error, via `Drop`): a `pin_snapshot`
+    // call racing in AFTER this sample but BEFORE this pass's removals are
+    // fully applied must not silently miss the version it is entitled to
+    // see -- see `SnapshotFloorRegistry::register`'s blocking rule.
+    let active_removal_pass = snapshot_registry.begin_removal_pass(watermark);
+    // Test-only: lets a test pause HERE, between the registered-set/watermark
+    // sample above and the removal work below, to prove a concurrent
+    // `pin_snapshot` blocks while this pass is genuinely in flight.
+    snapshot_registry.removal_pass_test_pause.maybe_pause();
     let metas = relational_store.table_meta.read().clone();
-    let table_snapshot = relational_store.tables.read().clone();
+    // Eligible-tables-only: read (and clone) only the DECLARED tables' row
+    // histories, not `relational_store.tables.read().clone()` (every table
+    // sharing the database, eligible or not). `tables_in_memory_snapshot`
+    // below is this scoped count, never inflated by unrelated tables merely
+    // sharing the file.
+    let table_snapshot: HashMap<String, Vec<VersionedRow>> = {
+        let guard = relational_store.tables.read();
+        tables
+            .iter()
+            .filter_map(|name| {
+                guard
+                    .get(*name)
+                    .map(|rows| ((*name).to_string(), rows.clone()))
+            })
+            .collect()
+    };
 
     let mut pruned_versions_by_table: HashMap<String, HashSet<(RowId, TxId)>> = HashMap::new();
-    let mut pruned_change_keys: HashSet<(String, RowId, Lsn)> = HashSet::new();
+    // Grouped by table (not a flat `(table, row_id, lsn)` set): every
+    // per-entry lookup below is then a borrow-based `HashMap` lookup with
+    // no `String` allocation, and `count_pruned_change_log_entries`/
+    // `remove_pruned_change_log_entries` can walk one table's own entries
+    // at a time.
+    let mut pruned_change_keys: HashMap<String, HashSet<(RowId, Lsn)>> = HashMap::new();
+    // The full relational key of every pruned version, in hand from the row
+    // already being walked -- no scan is needed later to find it.
+    let mut row_keys: Vec<(String, RowId, TxId, Lsn)> = Vec::new();
+    // The same versions' identity, for matching a vector copy attached to a
+    // released row version: a vector write shares its row's `created_tx`/
+    // `lsn` (same commit), so this triple names it exactly.
+    let mut pruned_row_identities: HashSet<(RowId, TxId, Lsn)> = HashSet::new();
     let mut released_row_bytes = 0usize;
+    let mut versions_deferred_for_readers = 0u64;
 
     for table in tables {
         let table = *table;
@@ -17869,11 +19893,27 @@ fn compact_currency_versions_inner(
             if keeper_lsn.get(&row.row_id).copied() == Some(row.lsn) {
                 continue;
             }
+            // A superseded version still visible to ANY registered reader
+            // (an in-flight statement, or a caller-held `SnapshotPin`) is
+            // deferred to a later cycle rather than physically removed out
+            // from under it -- checked against every snapshot this pass
+            // sampled, not merely the lowest, so a version between two
+            // registered snapshots (visible to the higher one but not the
+            // lower) is still protected.
+            if any_registered_snapshot_sees(active_removal_pass.registered_snapshots(), row) {
+                versions_deferred_for_readers = versions_deferred_for_readers.saturating_add(1);
+                continue;
+            }
             pruned_versions_by_table
                 .entry(table.to_string())
                 .or_default()
                 .insert((row.row_id, row.created_tx));
-            pruned_change_keys.insert((table.to_string(), row.row_id, row.lsn));
+            pruned_change_keys
+                .entry(table.to_string())
+                .or_default()
+                .insert((row.row_id, row.lsn));
+            row_keys.push((table.to_string(), row.row_id, row.created_tx, row.lsn));
+            pruned_row_identities.insert((row.row_id, row.created_tx, row.lsn));
             if let Some(meta) = metas.get(table) {
                 released_row_bytes = released_row_bytes
                     .saturating_add(estimate_row_bytes_for_meta(&row.values, meta, false));
@@ -17886,49 +19926,148 @@ fn compact_currency_versions_inner(
         .map(|versions| versions.len() as u64)
         .sum();
     if pruned_version_count == 0 {
-        return Ok(CurrencyCompactionReport::default());
+        return Ok(CurrencyCompactionReport {
+            tables_in_memory_snapshot: table_snapshot.len() as u64,
+            versions_deferred_for_readers,
+            ..CurrencyCompactionReport::default()
+        });
     }
 
-    let post_prune_table_rows: HashMap<String, Vec<VersionedRow>> = pruned_versions_by_table
-        .iter()
-        .map(|(table, versions)| {
-            let rows = table_snapshot
-                .get(table)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|row| !versions.contains(&(row.row_id, row.created_tx)))
-                .collect::<Vec<_>>();
-            (table.clone(), rows)
-        })
-        .collect();
-
-    // Prune the in-memory change log first; keep the survivors to rewrite
-    // persistence with, so memory and disk agree.
-    let (surviving_change_log, pruned_change_log_entries) = {
-        let mut log = change_log.write();
-        let before = log.len();
-        log.retain(|entry| !change_entry_references_pruned_version(entry, &pruned_change_keys));
-        let removed = (before - log.len()) as u64;
-        (log.clone(), removed)
+    // Vector copies attached to a released row version are part of the
+    // reclaim set too: a declared vector-bearing table would otherwise stay
+    // unbounded while this report claims success. Scoped to exactly the
+    // vector columns of the tables THIS pass touches (`entries_for_index`
+    // per column), never the whole vector store: `all_entries()` scans
+    // every index across the whole database, which would make an unrelated
+    // vector-bearing table's population show up in this pass's own
+    // commit-lock hold time -- precisely the proportional-to-ballast cost
+    // this rewrite exists to remove.
+    // Edges are NOT touched: edge identity is self-owned (`source`, `target`,
+    // `edge_type` plus its own `created_tx`/`lsn`), versioned by no
+    // relational row, so cleanup neither needs nor claims edge boundedness
+    // (see `prune_vectors_and_edges_scoped`'s doc comment).
+    let released_vectors: Vec<VectorEntry> = if pruned_row_identities.is_empty() {
+        Vec::new()
+    } else {
+        let mut candidates = Vec::new();
+        for table in tables {
+            let Some(meta) = metas.get(*table) else {
+                continue;
+            };
+            for column in &meta.columns {
+                if !matches!(column.column_type, ColumnType::Vector(_)) {
+                    continue;
+                }
+                let index_ref = VectorIndexRef::new(*table, column.name.clone());
+                if let Ok(entries) = vector_store.entries_for_index(&index_ref) {
+                    candidates.extend(entries);
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|entry| {
+                pruned_row_identities.contains(&(entry.row_id, entry.created_tx, entry.lsn))
+            })
+            .collect()
     };
 
+    // Bounded to the tables THIS pass touches (`count_pruned_change_log_
+    // entries` walks each affected table's own `change_log_table_index`
+    // shadow, never the whole change log) -- persist-then-mutate: nothing
+    // here mutates `change_log` itself; the in-memory `Vec` is actually
+    // mutated further down, after every persisted step has succeeded.
+    let pruned_change_keys_vec: Vec<(String, RowId, Lsn)> = pruned_change_keys
+        .iter()
+        .flat_map(|(table, keys)| {
+            keys.iter()
+                .map(move |(row_id, lsn)| (table.clone(), *row_id, *lsn))
+        })
+        .collect();
+    let (pruned_change_log_entries, removed_lsn_counts) = {
+        let table_index = change_log_table_index.read();
+        count_pruned_change_log_entries(&table_index, &pruned_change_keys)
+    };
+
+    let mut vector_keys_rewritten = 0u64;
     if let Some(persistence) = persistence {
-        // CHANGE-LOG-FIRST for crash-safety (see the doc comment above).
-        persistence.rewrite_change_log(&surviving_change_log)?;
-        // Only the compacted relational tables are rewritten; vectors and edges
-        // are unchanged, but `rewrite_pruned_state` rewrites those wholesale, so
-        // pass the full current sets through untouched.
-        let all_vectors = vector_store.all_entries();
-        let all_edges = graph_store
-            .forward_adj
-            .read()
-            .values()
-            .flat_map(|entries| entries.iter().cloned())
-            .collect::<Vec<_>>();
-        persistence.rewrite_pruned_state(&post_prune_table_rows, &all_vectors, &all_edges)?;
+        // Test-only injection seam (`__arm_currency_compaction_persist_fault_
+        // for_test`): fails the pass HERE -- after the in-memory change log
+        // above has already been filtered, but before the persisted removal
+        // runs. Production-dead; reads a thread-local that is never set
+        // outside a test.
+        if take_currency_compaction_persist_fault_for_test() {
+            return Err(Error::Other(
+                "injected persistence failure mid version-cleanup pass (test seam)".to_string(),
+            ));
+        }
+        // Point-removes in ONE redb write transaction: exactly the pruned row
+        // versions and exactly the change-log entries that referenced them
+        // (change-log-first WITHIN that one transaction). Nothing else is
+        // read or rewritten -- no wholesale rewrite of surviving rows,
+        // vectors, or edges. Cleanup never touches sync-source-lsn tracking:
+        // a currency table's row_id STAYS live (only superseded versions are
+        // pruned), so its one source-lsn entry is untouched by construction.
+        let stats = persistence.prune_versions_scoped(&row_keys, &pruned_change_keys_vec, &[])?;
+        vector_keys_rewritten = stats.vector_keys_removed;
+        if !released_vectors.is_empty() {
+            // Vector/edge pruning in a SEPARATE redb transaction, independent
+            // from the row/version-cleanup transaction above.
+            let vector_stats =
+                persistence.prune_vectors_and_edges_scoped(&released_vectors, &[])?;
+            vector_keys_rewritten += vector_stats.vector_keys_removed;
+        }
     }
 
+    // Commit-index candidate-only removal in a THIRD independent redb transaction,
+    // after row/version pruning and vector/edge pruning above. Shared with retention;
+    // see the function doc. `removed_lsn_counts` (this pass's own, small) is
+    // checked against `change_log_lsn_refcounts` (the pre-pass global count)
+    // under a single read guard -- neither is cloned.
+    let affected_lsns: HashSet<Lsn> = removed_lsn_counts.keys().copied().collect();
+    let commit_index_candidates = {
+        let lsn_refcounts = change_log_lsn_refcounts.read();
+        scoped_commit_index_removal(
+            tx_mgr,
+            persistence,
+            &lsn_refcounts,
+            &removed_lsn_counts,
+            &affected_lsns,
+        )?
+    };
+
+    // Only after all persisted steps succeed does memory follow. The persisted
+    // work is split across multiple independent redb transactions: row/version
+    // pruning (line 19694, 19698) and commit-index removal (line 19710).
+    // Each transaction is scoped to only the affected entries — never touching
+    // unrelated data. If any transaction fails (lines 19694, 19698, or 19710
+    // return Err), the function returns early without updating memory, and the
+    // next maintenance cycle will re-attempt the same work. Between-transaction
+    // failures leave only benign over-retention (persisted data ahead of what's
+    // in the memory snapshot) — the next cycle re-prunes and completes the
+    // cleanup. The test seam (line 19682) can inject a failure BEFORE
+    // prune_versions_scoped to test idempotency. The physical memory removal is
+    // scoped to a suffix of `change_log` (see `remove_pruned_change_log_entries`),
+    // never the whole Vec.
+    if let Some(min_affected_lsn) = affected_lsns.iter().min().copied() {
+        remove_pruned_change_log_entries(
+            &mut change_log.write(),
+            &pruned_change_keys,
+            min_affected_lsn,
+        );
+    }
+    remove_pruned_from_table_index(&mut change_log_table_index.write(), &pruned_change_keys);
+    apply_removed_lsn_counts(&mut change_log_lsn_refcounts.write(), &removed_lsn_counts);
+    // The REAL count: `tx_mgr`'s own in-memory removal, not the persisted
+    // side effect's count -- see `scoped_commit_index_removal`'s own doc
+    // comment (this is the discrepancy `version_cleanup_shrinks_the_commit_
+    // index_to_reachable_entries` caught: an in-memory database's persisted
+    // count is always 0 even though the in-memory index genuinely shrinks).
+    let commit_index_keys_removed = if commit_index_candidates.is_empty() {
+        0
+    } else {
+        tx_mgr.remove_commit_index_entries(&commit_index_candidates)
+    };
     for (table, versions) in &pruned_versions_by_table {
         relational_store.remove_row_versions(table, versions);
         if let Some(meta) = metas.get(table) {
@@ -17937,16 +20076,32 @@ fn compact_currency_versions_inner(
             }
         }
     }
-    accountant.release(released_row_bytes);
+    let released_vector_bytes = if released_vectors.is_empty() {
+        0
+    } else {
+        vector_store.prune_superseded_versions(&pruned_row_identities)
+    };
+    accountant.release(released_row_bytes.saturating_add(released_vector_bytes));
 
     let mut compacted_tables: Vec<String> = pruned_versions_by_table.keys().cloned().collect();
     compacted_tables.sort();
     Ok(CurrencyCompactionReport {
         pruned_versions: pruned_version_count,
         pruned_change_log_entries,
-        reclaimed_bytes: released_row_bytes as u64,
+        reclaimed_bytes: released_row_bytes.saturating_add(released_vector_bytes) as u64,
         compacted_tables,
         redb_compacted: false,
+        // A scoped, point-removal pass touches only the pruned keys, so a
+        // survivor is never rewritten -- this reads 0 by construction now
+        // that the wholesale rewrite is gone.
+        keys_rewritten: 0,
+        vector_keys_rewritten,
+        edge_keys_rewritten: 0,
+        commit_lock_hold_micros: 0,
+        redb_compact_micros: 0,
+        commit_index_keys_removed,
+        tables_in_memory_snapshot: table_snapshot.len() as u64,
+        versions_deferred_for_readers,
     })
 }
 
@@ -19305,6 +21460,17 @@ fn constraint_declares_conflict_policy(constraint: &str) -> Option<ConflictPolic
     .find(|policy| policy.declared_clause() == Some(normalized.as_str()))
 }
 
+/// The version-history policy a synced DDL constraint declares — so the
+/// receiving machine reconstructs the SAME declaration the writer made
+/// rather than a defaulted one, mirroring `constraint_declares_conflict_policy`.
+fn constraint_declares_history_policy(constraint: &str) -> Option<HistoryPolicy> {
+    let upper = constraint.to_ascii_uppercase();
+    let normalized = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+    [HistoryPolicy::All, HistoryPolicy::CurrentOnly]
+        .into_iter()
+        .find(|policy| policy.declared_clause() == normalized.as_str())
+}
+
 /// The retention window a synced DDL constraint declares — seconds plus the
 /// unit it was written in — so the receiving machine reconstructs the SAME
 /// declaration the writer made rather than a defaulted one.
@@ -19421,6 +21587,157 @@ fn refuse_undeliverable_promise_sync_ddl(
     crate::executor::refuse_promise_with_no_delivery(name, sync_safe, direction)
 }
 
+/// Refuse arriving table DDL declaring `HISTORY CURRENT ONLY` under keep-first
+/// delivery, on BOTH the CreateTable (fresh or adopting an existing table)
+/// and AlterTable arrival paths — exactly as the local CREATE and ALTER
+/// doors refuse it. `alter_table_ddl_change` always carries a table's FULL
+/// current declared constraint set on every emitted AlterTable (not only
+/// what one ALTER statement changed — see its own doc comment), so
+/// `rough_sync_table_meta`'s reconstruction from `constraints` already IS the
+/// post-change shape for both a fresh CreateTable and an arriving AlterTable;
+/// no separate adopt-branch projection is needed here. Returns before any
+/// projection or apply work, so a refused statement leaves existing metadata
+/// untouched — matching `refuse_undeliverable_promise_sync_ddl` and
+/// `refuse_keyless_sync_safe_sync_ddl`, which this sits alongside.
+fn refuse_reclaimed_history_sync_ddl(change: &DdlChange) -> Result<()> {
+    let (name, incoming) = match change {
+        DdlChange::CreateTable {
+            name,
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        }
+        | DdlChange::AlterTable {
+            name,
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        } => (
+            name,
+            rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            ),
+        ),
+        _ => return Ok(()),
+    };
+    crate::executor::refuse_reclaimed_history_under_keep_first(name, &incoming)
+}
+
+/// Refuse arriving DDL that would move one of the four engine-owned built-in
+/// ledger tables ([`crate::executor::ENGINE_OWNED_LEDGER_TABLES`]) away from
+/// its declared policy -- the arriving-DDL mirror of
+/// [`crate::executor::refuse_engine_owned_policy_mutation`], guarding the
+/// same four tables against a peer that produced the mutation the local
+/// door refuses (an unguarded/older binary, or a hand-crafted changeset;
+/// under a fixed engine no local commit can reach this door with an
+/// off-canonical value at all). Judges THREE shapes, all of which land on the
+/// SAME `TableMeta` policy fields at apply (`database.rs`'s `AlterTable` arm
+/// and its `CreateTable`-ADOPT arm for a table that already exists in
+/// `projected` -- see [`crate::executor::engine_owned_merged_policy`]):
+///
+/// - An `AlterTable` against one of the four names.
+/// - A `CreateTable` naming one of the four when `projected` already carries
+///   that table -- i.e. it will go through the adopt branch, not a fresh
+///   create.
+/// - A `CreateTable` naming one of the four when `projected` does NOT yet
+///   carry that table -- i.e. a fresh create. This guards against a peer
+///   that issues DROP + CREATE to circumvent the adopting-existing-table
+///   check and land an off-policy shape under a reserved name.
+///
+/// Only refuses on an axis the arriving DDL EXPLICITLY declares a
+/// non-canonical value for -- delegated to
+/// [`crate::executor::refuse_engine_owned_policy_axes`], the same axis check
+/// all three shapes ask. `alter_table_ddl_change` bakes a table's FULL
+/// currently-declared shape into every emitted AlterTable (see
+/// `refuse_reclaimed_history_sync_ddl`'s doc comment), and the adopt branch's
+/// own arriving `CreateTable` carries the writer's full declared shape the
+/// same way -- but a table's own multi-step self-heal
+/// (`install_work_ledger_schema`'s work_capabilities reconcile sets SYNC
+/// CONFLICT, then HISTORY, as two separate committed ALTERs) can commit --
+/// and so sync -- a snapshot where one axis is already healed and the other
+/// has not been reached yet. That in-progress snapshot must sync on, not be
+/// refused, so a receiving edge can run its OWN installer to finish healing
+/// it; an axis the arriving DDL is simply silent on is never judged here --
+/// the residual silent case is what
+/// [`crate::executor::engine_owned_merged_policy`] preserves at apply,
+/// rather than clearing it to the incoming shape's absence.
+///
+/// For fresh CreateTable of a reserved name, ADDITIONALLY checks the column
+/// shape via [`crate::executor::refuse_engine_owned_reserved_name_shape_wire`],
+/// mirroring the local CREATE TABLE door's column-shape guard for reserved
+/// names.
+fn refuse_engine_owned_policy_sync_ddl(
+    projected: &HashMap<String, TableMeta>,
+    change: &DdlChange,
+) -> Result<()> {
+    match change {
+        DdlChange::AlterTable {
+            name,
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        } => {
+            let incoming = rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            );
+            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)
+        }
+        DdlChange::CreateTable {
+            name,
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        } if projected.contains_key(name) => {
+            let incoming = rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            );
+            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)
+        }
+        DdlChange::CreateTable {
+            name,
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        } if crate::executor::ENGINE_OWNED_LEDGER_TABLES.contains(&name.as_str()) => {
+            // Fresh create of a reserved table (not in projected) -- guard both
+            // the column shape and the policy axes, exactly like the local
+            // CREATE TABLE door does.
+            crate::executor::refuse_engine_owned_reserved_name_shape_wire(name, columns)?;
+            let incoming = rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            );
+            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn rough_sync_table_meta(
     columns: &[(String, String)],
     constraints: &[String],
@@ -19480,6 +21797,9 @@ fn rough_sync_table_meta(
         conflict_policy: constraints
             .iter()
             .find_map(|constraint| constraint_declares_conflict_policy(constraint)),
+        history_policy: constraints
+            .iter()
+            .find_map(|constraint| constraint_declares_history_policy(constraint)),
     };
     meta.indexes = crate::executor::auto_indexes_for_table_meta(&meta);
     meta
@@ -19799,6 +22119,16 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
         constraints.push(retain_clause_from_meta(meta, ttl_seconds));
     }
 
+    // The version-history policy travels the same way: rendered only when
+    // declared, so a receiving machine reconstructs the SAME declaration the
+    // writer made (never a defaulted one) on both a fresh CreateTable and a
+    // synced-in AlterTable, whose emitter carries this table's full current
+    // constraint set (`alter_table_ddl_change`), not only what one ALTER
+    // statement changed.
+    if let Some(policy) = meta.history_policy {
+        constraints.push(policy.declared_clause().to_string());
+    }
+
     // The direction travels with the definition, as its own constraint string,
     // so the receiving machine honors the policy that was declared rather than
     // one nobody wrote.
@@ -19902,6 +22232,13 @@ pub(crate) fn retain_and_propagate_clauses_from_meta(meta: &TableMeta) -> Vec<St
 
     if let Some(ttl_seconds) = meta.default_ttl_seconds {
         clauses.push(retain_clause_from_meta(meta, ttl_seconds));
+    }
+
+    // Rendered only when it was DECLARED, so `.schema` gives the declaration
+    // back as it was written, right after RETAIN and before the sync
+    // clauses: row-lifetime -> history-depth -> travel -> arbitration.
+    if let Some(policy) = meta.history_policy {
+        clauses.push(policy.declared_clause().to_string());
     }
 
     // Rendered only when it was DECLARED, so `.schema` gives the declaration

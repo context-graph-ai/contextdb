@@ -8,9 +8,54 @@ use contextdb_tx::{WriteSet, WriteSetApplicator};
 use contextdb_vector::VectorStore;
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Per-table shadow of a table's own `RowInsert`/`RowDelete` change-log
+/// entries -- `(lsn, row_id)` pairs, in APPEND ORDER, duplicates preserved
+/// (a superseding commit emits a `RowDelete` at the SAME `lsn` as its own
+/// `RowInsert`, so one pruned `(table, row_id, lsn)` key can legitimately
+/// match two entries -- see `change_entry_references_pruned_version`) --
+/// kept in lockstep with `change_log` itself at every choke point that
+/// touches it (append here, load-from-disk in `Database::open`, and
+/// point-removal in the version-cleanup/retention passes) so a scoped pass
+/// can find and count exactly ONE table's own entries without visiting
+/// every OTHER table's entries sharing the same global change-log `Vec`.
+/// See `change_log_table_index_consistency_tests.rs`.
+pub(crate) type ChangeLogTableIndex = HashMap<TableName, Vec<(Lsn, RowId)>>;
+
+/// How many change-log entries of ANY kind (row, edge, or vector) currently
+/// name a given commit LSN, maintained in lockstep with `change_log` the
+/// same way `ChangeLogTableIndex` is. Lets a scoped pass answer "does any
+/// change-log entry still cover this LSN" and "what is the lowest LSN still
+/// covered" without visiting the whole log (`BTreeMap` so the floor is a
+/// cheap first-key lookup, not a scan).
+pub(crate) type ChangeLogLsnRefcounts = BTreeMap<Lsn, u64>;
+
+/// Record newly-appended entries into both aux structures, in the SAME
+/// order they land in `change_log` -- called once, right where
+/// `change_log` itself is extended, so the two never observe a different
+/// view of "what has been appended so far."
+pub(crate) fn record_change_log_entries(
+    table_index: &mut ChangeLogTableIndex,
+    lsn_refcounts: &mut ChangeLogLsnRefcounts,
+    entries: &[ChangeLogEntry],
+) {
+    for entry in entries {
+        *lsn_refcounts.entry(entry.lsn()).or_insert(0) += 1;
+        if let ChangeLogEntry::RowInsert { table, row_id, lsn }
+        | ChangeLogEntry::RowDelete {
+            table, row_id, lsn, ..
+        } = entry
+        {
+            table_index
+                .entry(table.clone())
+                .or_default()
+                .push((*lsn, *row_id));
+        }
+    }
+}
 
 pub(crate) type SyncSourceLsnClear = (TableName, RowId);
 pub(crate) type SyncSourceLsnSet = (TableName, RowId, Lsn);
@@ -70,12 +115,14 @@ pub struct CompositeStore {
     pub graph: Arc<GraphStore>,
     pub vector: Arc<VectorStore>,
     pub change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+    pub change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
+    pub change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
     accountant: Arc<contextdb_core::MemoryAccountant>,
     apply_phase_pause: Arc<ApplyPhasePause>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ApplyPhasePause {
     state: Mutex<ApplyPhasePauseState>,
     waiters: Condvar,
@@ -129,7 +176,7 @@ impl ApplyPhasePause {
         }
     }
 
-    fn maybe_pause(&self) {
+    pub(crate) fn maybe_pause(&self) {
         let mut state = self.state.lock();
         if !state.armed || state.released {
             return;
@@ -147,11 +194,14 @@ impl ApplyPhasePause {
 }
 
 impl CompositeStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
         vector: Arc<VectorStore>,
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+        change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
+        change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         accountant: Arc<contextdb_core::MemoryAccountant>,
     ) -> Self {
@@ -160,17 +210,22 @@ impl CompositeStore {
             graph,
             vector,
             change_log,
+            change_log_table_index,
+            change_log_lsn_refcounts,
             ddl_log,
             accountant,
             Arc::new(ApplyPhasePause::new()),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_apply_phase_pause(
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
         vector: Arc<VectorStore>,
         change_log: Arc<RwLock<Vec<ChangeLogEntry>>>,
+        change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
+        change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         accountant: Arc<contextdb_core::MemoryAccountant>,
         apply_phase_pause: Arc<ApplyPhasePause>,
@@ -180,6 +235,8 @@ impl CompositeStore {
             graph,
             vector,
             change_log,
+            change_log_table_index,
+            change_log_lsn_refcounts,
             ddl_log,
             accountant,
             apply_phase_pause,
@@ -368,6 +425,11 @@ impl CompositeStore {
         if !set_source_lsns.is_empty() {
             self.relational.set_sync_source_lsns(set_source_lsns);
         }
+        record_change_log_entries(
+            &mut self.change_log_table_index.write(),
+            &mut self.change_log_lsn_refcounts.write(),
+            &log_entries,
+        );
         self.change_log.write().extend(log_entries);
         Ok(())
     }

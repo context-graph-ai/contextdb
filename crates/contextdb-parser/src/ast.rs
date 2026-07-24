@@ -340,6 +340,10 @@ pub struct CreateTable {
     /// `None` means it named no policy, and the engine applies its
     /// non-overwriting default (keep-first).
     pub conflict_policy: Option<contextdb_core::ConflictPolicy>,
+    /// The version-history clause the declaration wrote, when it wrote one.
+    /// `None` means it named no policy, and the engine applies
+    /// [`contextdb_core::DEFAULT_HISTORY_POLICY`] (keep every version).
+    pub history: Option<contextdb_core::HistoryPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,6 +386,8 @@ pub enum AlterAction {
     },
     SetSyncDirection(contextdb_core::SyncDirection),
     DropRetain,
+    SetHistory(contextdb_core::HistoryPolicy),
+    SetSyncConflict(contextdb_core::ConflictPolicy),
 }
 
 #[derive(Debug, Clone)]

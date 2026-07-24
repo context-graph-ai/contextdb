@@ -220,6 +220,7 @@ pub struct CreateTablePlan {
     pub retain: Option<RetainOption>,
     pub sync_direction: Option<contextdb_core::SyncDirection>,
     pub conflict_policy: Option<contextdb_core::ConflictPolicy>,
+    pub history: Option<contextdb_core::HistoryPolicy>,
 }
 
 #[derive(Debug, Clone)]

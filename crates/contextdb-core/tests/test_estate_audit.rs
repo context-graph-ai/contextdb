@@ -58,6 +58,19 @@ const SLEEP_RATCHET: &[(&str, usize)] = &[
     ("tests/integration/retention_tests.rs", 3),
     ("tests/integration/sync_relay_trigger_tables_tests.rs", 1),
     ("tests/integration/sync_server_nonblocking_apply.rs", 4),
+    // Explicitly approved exception: this test drives the REAL engine-owned
+    // maintenance thread (not `run_maintenance_cycle()`), which by
+    // construction cannot observe `Wallclock::test_clock_guard` -- the mock
+    // clock is thread-local to the calling test thread and the background
+    // thread is spawned by the engine, outside the test's control (see the
+    // module doc). The bounded state-polled wait is the same pattern already
+    // ratcheted once for the identical class of test in
+    // `crates/contextdb-engine/src/database.rs` (see
+    // `SRC_TEST_SLEEP_RATCHET` below).
+    (
+        "tests/integration/trigger_audit_retention_config_tests.rs",
+        1,
+    ),
 ];
 
 /// Test files allowed to read the raw system clock (`SystemTime::now(` or
@@ -66,7 +79,9 @@ const SLEEP_RATCHET: &[(&str, usize)] = &[
 const RAW_CLOCK_RATCHET: &[(&str, usize)] = &[
     // Counts are NEEDLE OCCURRENCES, not sites: a read written as
     // `SystemTime::now().duration_since(std::time::UNIX_EPOCH)` contributes 2.
-    ("crates/contextdb-cli/tests/corrupt_store_open_tests.rs", 2),
+    // `crates/contextdb-cli/tests/corrupt_store_open_tests.rs` used to carry
+    // 2 (a scratch-dir naming site); removed in favor of `tempfile`, which
+    // needs no raw clock read at all — lowered to 0 (absent from this list).
     ("crates/contextdb-engine/tests/sql_surface_tests.rs", 4),
     ("tests/integration/retention_tests.rs", 2),
 ];

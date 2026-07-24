@@ -1,6 +1,7 @@
 use crate::{HnswIndex, quantized::StoredVectorEntry};
 use contextdb_core::{
-    Error, MemoryAccountant, Result, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuantization,
+    Error, Lsn, MemoryAccountant, Result, RowId, TxId, VectorEntry, VectorIndexRef,
+    VectorQuantization,
 };
 use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
@@ -934,6 +935,46 @@ impl VectorStore {
                 });
                 drop(vectors);
                 state.clear_hnsw(accountant);
+            }
+            released
+        })
+    }
+
+    /// Remove exactly the named SUPERSEDED vector-entry versions -- the
+    /// vector copy attached to a relational row VERSION that version cleanup
+    /// released, identified by `(row_id, created_tx, lsn)` (the same triple
+    /// that names the row version), so the row's CURRENT vector entry (a
+    /// different `created_tx`/`lsn`) is never touched. This is the
+    /// counterpart of `prune_row_ids`, which removes EVERY entry for a row
+    /// whose live version is entirely gone (retention); this removes only
+    /// specific superseded copies while the row stays live, so it never
+    /// touches the HNSW graph -- a superseded copy was already excluded from
+    /// (or removed from) the live search structure at the write that
+    /// superseded it, exactly as its row version was.
+    ///
+    /// Returns the estimated bytes released; matching `prune_row_ids`'s
+    /// contract, the CALLER releases them on the shared accountant (this
+    /// never releases internally, so a caller summing several populations
+    /// into one `accountant.release(...)` call never double-releases).
+    pub fn prune_superseded_versions(
+        &self,
+        versions: &std::collections::HashSet<(RowId, TxId, Lsn)>,
+    ) -> usize {
+        if versions.is_empty() {
+            return 0;
+        }
+        self.with_bulk_maintenance(|| {
+            let mut released = 0usize;
+            for state in self.registry.read().values() {
+                let mut vectors = state.vectors.write();
+                vectors.retain(|entry| {
+                    if versions.contains(&(entry.row_id, entry.created_tx, entry.lsn)) {
+                        released = released.saturating_add(entry.estimated_bytes());
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
             released
         })

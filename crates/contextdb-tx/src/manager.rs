@@ -398,6 +398,23 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         (before.saturating_sub(commit_index.len())) as u64
     }
 
+    /// Remove exactly the named entries, candidate-only — the scoped
+    /// counterpart of `replace_commit_index`: a version-cleanup pass that
+    /// only touched a handful of LSNs removes only those candidates (each
+    /// already proven safe to drop by the caller's own floor computation,
+    /// e.g. `retained_commit_index_after_prune`), never re-derives the whole
+    /// index. Returns how many of the named entries were actually present.
+    pub fn remove_commit_index_entries(&self, lsns: &[Lsn]) -> u64 {
+        let mut commit_index = self.commit_index.lock();
+        let mut removed = 0u64;
+        for lsn in lsns {
+            if commit_index.remove(lsn).is_some() {
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+
     /// A copy of the commit index, for a caller computing a retention floor.
     pub fn commit_index_snapshot(&self) -> BTreeMap<Lsn, TxId> {
         self.commit_index
@@ -405,6 +422,40 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             .iter()
             .map(|(lsn, tx)| (*lsn, *tx))
             .collect()
+    }
+
+    /// The single commit-index entry immediately below `lsn` (exclusive), if
+    /// any — a targeted range query that never clones the whole index,
+    /// unlike [`Self::commit_index_snapshot`]. Used by a scoped
+    /// cleanup/retention pass to find its anchor entry (the fallback a
+    /// query below the lowest still-nameable LSN resolves against) without
+    /// paying for the whole index's size, which — unlike the change log a
+    /// scoped pass actually cleans — is never itself scoped to the
+    /// cleaned table.
+    pub fn commit_index_floor_below(&self, lsn: Lsn) -> Option<(Lsn, TxId)> {
+        self.commit_index
+            .lock()
+            .range(..lsn)
+            .next_back()
+            .map(|(lsn, tx)| (*lsn, *tx))
+    }
+
+    /// The single most recent commit-index entry, if any — the same
+    /// targeted-lookup rationale as [`Self::commit_index_floor_below`],
+    /// used for the degenerate "nothing in the change log survives" anchor
+    /// fallback.
+    pub fn commit_index_last(&self) -> Option<(Lsn, TxId)> {
+        self.commit_index
+            .lock()
+            .iter()
+            .next_back()
+            .map(|(lsn, tx)| (*lsn, *tx))
+    }
+
+    /// Whether `lsn` is currently present in the commit index — a targeted
+    /// point lookup, never a clone of the whole index.
+    pub fn commit_index_contains(&self, lsn: Lsn) -> bool {
+        self.commit_index.lock().contains_key(&lsn)
     }
 
     /// Entry count and the lowest LSN still retained. `Lsn(0)` when the index

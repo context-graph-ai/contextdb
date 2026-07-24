@@ -129,6 +129,37 @@ impl ConflictPolicy {
 /// opt-in for last-writer-wins current-state semantics.
 pub const DEFAULT_CONFLICT_POLICY: ConflictPolicy = ConflictPolicy::InsertIfNotExists;
 
+/// How much of each live row's version history a table keeps. `HISTORY ALL`
+/// ([`Self::All`]) keeps every superseded version; `HISTORY CURRENT ONLY`
+/// ([`Self::CurrentOnly`]) declares that only the current version of a row has
+/// consumer value, so superseded versions may be reclaimed. It lives here,
+/// next to the [`TableMeta`] that persists it, for the same reason the
+/// conflict policy does: the DDL words, the stored declaration, and the
+/// maintenance pass that honors it must never drift into two different enums.
+///
+/// This says nothing about how long a ROW lives: row lifetime is the separate
+/// `RETAIN` declaration, and neither implies the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryPolicy {
+    All,
+    CurrentOnly,
+}
+
+impl HistoryPolicy {
+    /// The DDL clause that DECLARES this policy — the same words an operator
+    /// writes, so `.schema` gives the declaration back verbatim.
+    pub fn declared_clause(self) -> &'static str {
+        match self {
+            HistoryPolicy::All => "HISTORY ALL",
+            HistoryPolicy::CurrentOnly => "HISTORY CURRENT ONLY",
+        }
+    }
+}
+
+/// The version-history policy a table gets when its declaration named none:
+/// keep every version. Reclaiming history is always an explicit opt-in.
+pub const DEFAULT_HISTORY_POLICY: HistoryPolicy = HistoryPolicy::All;
+
 /// The direction a table gets when its declaration named none: two-way, the
 /// engine default and the recovery contract.
 pub const DEFAULT_SYNC_DIRECTION: SyncDirection = SyncDirection::Both;
@@ -181,6 +212,70 @@ pub struct TableMeta {
     /// instead of a uniform rule it hardcodes.
     #[serde(default)]
     pub conflict_policy: Option<ConflictPolicy>,
+    /// The version-history policy this table DECLARED, when it declared one
+    /// at all. `None` means the declaration named none and the table gets
+    /// [`DEFAULT_HISTORY_POLICY`]. Kept as an option rather than collapsed to
+    /// the default so `.schema` renders back exactly what was written.
+    #[serde(default)]
+    pub history_policy: Option<HistoryPolicy>,
+}
+
+/// Whether a decode error on a trailing, defaultable field is genuinely "the
+/// on-disk payload legitimately ends here" rather than real corruption.
+///
+/// `bincode` (the ONLY wire format `TableMeta`'s and `ColumnDef`'s hand-written
+/// positional `Deserialize` impls are used with -- see
+/// `contextdb-engine/src/persistence.rs`) is not self-describing: a struct is
+/// encoded as its fields back to back with no length prefix and no framing,
+/// so a `SeqAccess` has no `Ok(None)` end-of-sequence signal the way a
+/// self-describing format (JSON, for instance) does. When the byte stream
+/// genuinely ends before a trailing field's bytes were ever written, decoding
+/// that field does not return `Ok(None)`; it hard-fails, because bincode
+/// cannot tell "the writer wrote fewer fields" from "the stream is
+/// truncated". `bincode::error::DecodeError::UnexpectedEnd`'s `Display`
+/// deliberately falls back to `Debug` (bincode 2.0.1's `error.rs` has a
+/// literal `// TODO: Improve this?` above `write!(f, "{:?}", self)`), so the
+/// variant name is the only stable text this generic, deserializer-agnostic
+/// code can match against -- this impl is generic over `D: Deserializer<'de>`
+/// and cannot add a `'static` bound to downcast the concrete error type
+/// inside a fixed-signature trait method (`Visitor::visit_seq`).
+///
+/// This is a genuine ambiguity, not a false positive waiting to happen: a
+/// stream truncated mid-field (real corruption) can ALSO manifest as
+/// `UnexpectedEnd`. The tradeoff deliberately favors backward compatibility
+/// (every trailing field this struct has ever grown must keep loading an
+/// older data root) over rejecting that rarer, indistinguishable corruption
+/// case -- matching the pre-existing (if previously unrealized) intent of
+/// every `.unwrap_or_default()` call on a trailing field here.
+fn is_bincode_tail_truncation<E: std::fmt::Display>(err: &E) -> bool {
+    err.to_string().contains("UnexpectedEnd")
+}
+
+/// Decode ONE trailing, defaultable field of a hand-written positional
+/// sequence decode. Once the tail has genuinely run out (`tail_exhausted`),
+/// every LATER trailing field is also absent by construction -- bincode has
+/// no way to omit one field except by truncating everything after it -- so
+/// this stops calling `next_element` entirely rather than retrying on an
+/// already-exhausted `SeqAccess` (unspecified behavior once one call has
+/// errored). `Ok(None)` (the genuine end-of-sequence signal a self-describing
+/// format like JSON's map/seq access CAN give) still defaults exactly as the
+/// original `.unwrap_or_default()` calls did.
+fn decode_tail_field<'de, A, T>(seq: &mut A, tail_exhausted: &mut bool) -> Result<T, A::Error>
+where
+    A: serde::de::SeqAccess<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    if *tail_exhausted {
+        return Ok(T::default());
+    }
+    match seq.next_element::<T>() {
+        Ok(value) => Ok(value.unwrap_or_default()),
+        Err(err) if is_bincode_tail_truncation(&err) => {
+            *tail_exhausted = true;
+            Ok(T::default())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // Custom `Deserialize` that tolerates prior on-disk `TableMeta` encoded
@@ -215,6 +310,21 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let state_machine = seq
                     .next_element::<Option<StateMachineConstraint>>()?
                     .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                // Fields from here through `indexes` keep the ORIGINAL
+                // hard-fail-on-missing behavior (`.unwrap_or_default()` on a
+                // propagated decode error, which bincode always returns
+                // rather than the `Ok(None)` this pattern was written to
+                // assume — see `is_bincode_tail_truncation`'s doc comment).
+                // This is a DELIBERATE, pre-existing, tested floor (`pr02_
+                // legacy_table_meta_bincode_fails_loudly` /
+                // `table_meta_bincode_legacy_payload_without_indexes_fails_
+                // loudly`): a payload predating `indexes` is "too old" and
+                // must refuse to load rather than silently pretend a default
+                // shape, exactly as an old `ColumnDef` predating `immutable`
+                // must (`sc01_bincode_legacy_column_def_payload_fails_
+                // loudly`). Genuine short-tail TOLERANCE is scoped to ONLY
+                // the two NEWEST fields (`conflict_policy`, `history_policy`)
+                // below, which is the specific gap this run's tests pin.
                 let dag_edge_types = seq.next_element::<Vec<String>>()?.unwrap_or_default();
                 let unique_constraints =
                     seq.next_element::<Vec<Vec<String>>>()?.unwrap_or_default();
@@ -224,11 +334,6 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     .unwrap_or_default();
                 let default_ttl_seconds = seq.next_element::<Option<u64>>()?.unwrap_or_default();
                 let sync_safe = seq.next_element::<bool>()?.unwrap_or_default();
-                // Ok(None) at a declared-length tail is legitimate serde
-                // behavior (declared-length sequence exhausted). Decode
-                // errors, in contrast, indicate corruption or incompatible
-                // on-disk payloads and must propagate rather than silently
-                // default.
                 let expires_column = seq.next_element::<Option<String>>()?.unwrap_or_default();
                 let indexes = seq.next_element::<Vec<IndexDecl>>()?.unwrap_or_default();
                 let composite_foreign_keys = seq
@@ -241,9 +346,17 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     .next_element::<Option<RetainUnit>>()?
                     .unwrap_or_default();
                 let primary_key_columns = seq.next_element::<Vec<String>>()?.unwrap_or_default();
-                let conflict_policy = seq
-                    .next_element::<Option<ConflictPolicy>>()?
-                    .unwrap_or_default();
+                // The genuine short-tail tolerance: a payload that predates
+                // `conflict_policy` and/or `history_policy` (both newer than
+                // the `indexes` floor above) decodes cleanly with the
+                // missing ones reported as undeclared, matching the intent
+                // every OTHER `.unwrap_or_default()` above already stated
+                // but bincode never actually honored.
+                let mut tail_exhausted = false;
+                let conflict_policy =
+                    decode_tail_field::<_, Option<ConflictPolicy>>(&mut seq, &mut tail_exhausted)?;
+                let history_policy =
+                    decode_tail_field::<_, Option<HistoryPolicy>>(&mut seq, &mut tail_exhausted)?;
                 Ok(TableMeta {
                     columns,
                     immutable,
@@ -261,6 +374,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     retain_declared_unit,
                     primary_key_columns,
                     conflict_policy,
+                    history_policy,
                 })
             }
 
@@ -284,6 +398,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 let mut retain_declared_unit: Option<Option<RetainUnit>> = None;
                 let mut primary_key_columns: Option<Vec<String>> = None;
                 let mut conflict_policy: Option<Option<ConflictPolicy>> = None;
+                let mut history_policy: Option<Option<HistoryPolicy>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -305,6 +420,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                         "retain_declared_unit" => retain_declared_unit = Some(map.next_value()?),
                         "primary_key_columns" => primary_key_columns = Some(map.next_value()?),
                         "conflict_policy" => conflict_policy = Some(map.next_value()?),
+                        "history_policy" => history_policy = Some(map.next_value()?),
                         _ => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
@@ -329,6 +445,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                     retain_declared_unit: retain_declared_unit.unwrap_or_default(),
                     primary_key_columns: primary_key_columns.unwrap_or_default(),
                     conflict_policy: conflict_policy.unwrap_or_default(),
+                    history_policy: history_policy.unwrap_or_default(),
                 })
             }
         }
@@ -350,6 +467,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
             "retain_declared_unit",
             "primary_key_columns",
             "conflict_policy",
+            "history_policy",
         ];
         deserializer.deserialize_struct("TableMeta", FIELDS, TableMetaVisitor)
     }
@@ -564,16 +682,22 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 let primary_key = seq
                     .next_element::<bool>()?
                     .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+                // Every field from here on keeps the ORIGINAL hard-fail-on-
+                // missing behavior: this is `ColumnDef`'s OWN deliberate,
+                // pre-existing, tested floor
+                // (`sc01_bincode_legacy_column_def_payload_fails_loudly`) —
+                // silently defaulting `immutable` (or any field after it) to
+                // its zero value on a genuinely older payload would let a
+                // corrupt or pre-`immutable` payload pose as a non-immutable
+                // column, defeating the flag's own protection. Not touched
+                // by this run: the short-tail tolerance work here is scoped
+                // to `TableMeta.conflict_policy`/`history_policy` only.
                 let unique = seq.next_element::<bool>()?.unwrap_or_default();
                 let default = seq.next_element::<Option<String>>()?.unwrap_or_default();
                 let references = seq
                     .next_element::<Option<ForeignKeyReference>>()?
                     .unwrap_or_default();
                 let expires = seq.next_element::<bool>()?.unwrap_or_default();
-                // Trailing field. `Ok(None)` means the declared-length seq
-                // ended naturally (legitimate for JSON paths). Decode errors
-                // propagate — silently defaulting to `false` would let a
-                // corrupt payload pose as a non-immutable column.
                 let immutable = seq.next_element::<bool>()?.unwrap_or_default();
                 let quantization = seq
                     .next_element::<VectorQuantization>()?

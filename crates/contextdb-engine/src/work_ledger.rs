@@ -99,19 +99,35 @@ const CREATE_WORK_CANCELLATIONS: &str = "CREATE TABLE work_cancellations (\
      reason TEXT, \
      cancelled_at TIMESTAMP NOT NULL)";
 
+// `work_inputs` is keep-first and it syncs, so it is not itself eligible for
+// `HISTORY CURRENT ONLY` (its rows are immutable copies with no superseded
+// versions to reclaim); its family member here is row LIFETIME, `RETAIN`.
+// Retiring inputs on a window turns the pre-existing silent-empty read at
+// `materialize_inputs` (a job whose ledger inputs aged out previously read
+// back as "no rows", indistinguishable from a job with no ledger inputs at
+// all) into a reachable production path -- `materialize_inputs` must be
+// taught to distinguish the two and return `Error::WorkInputExpired` rather
+// than an empty `ExecutionInputs`.
 const CREATE_WORK_INPUTS: &str = "CREATE TABLE work_inputs (\
      input_key TEXT PRIMARY KEY, \
      job_id TEXT NOT NULL, \
      seq INTEGER NOT NULL, \
-     payload TEXT NOT NULL)";
+     payload TEXT NOT NULL) RETAIN 7 DAYS";
 
+// A current-truth registry, re-advertised on a cadence (only the newest
+// advertisement per node has consumer value), so it declares its own
+// eligibility in its own DDL rather than riding a hardcoded table-name list:
+// `HISTORY CURRENT ONLY` reclaims superseded advertisements, and the
+// `SYNC CONFLICT KEEP LATEST` it already gets programmatically (see
+// `work_ledger_conflict_policy_entries` below) is declared here too, so the
+// stored meta and the runtime arbitration agree and `.schema` is honest.
 const CREATE_WORK_CAPABILITIES: &str = "CREATE TABLE work_capabilities (\
      capability_key TEXT PRIMARY KEY, \
      node_id TEXT NOT NULL, \
      capability_id TEXT NOT NULL, \
      tags JSON NOT NULL, \
      detail JSON, \
-     advertised_at TIMESTAMP NOT NULL)";
+     advertised_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST";
 
 /// Materialized input chunks: (sequence number, payload bytes).
 pub type ExecutionInputs = Vec<(i64, Vec<u8>)>;
@@ -676,11 +692,49 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
         }
         db.execute(create, &HashMap::new())?;
     }
+    // A root created BEFORE `work_capabilities` declared its own HISTORY /
+    // SYNC CONFLICT clauses (this installer is idempotent-by-absence, so an
+    // existing table is never re-created) would otherwise silently lose
+    // version-cleanup eligibility the moment the hardcoded table-name list
+    // it used to ride is gone. Reconcile via the SAME `ALTER TABLE` an
+    // operator would type -- no bespoke migration -- so an upgraded root
+    // keeps cleaning itself. Order matters: KEEP LATEST first, so the table
+    // is never observed keep-first while HISTORY CURRENT ONLY is declared
+    // (the combination `refuse_reclaimed_history_under_keep_first` refuses).
+    if existing.iter().any(|name| name == "work_capabilities")
+        && let Some(meta) = db.table_meta("work_capabilities")
+    {
+        if meta.conflict_policy != Some(ConflictPolicy::LatestWins) {
+            db.execute(
+                "ALTER TABLE work_capabilities SET SYNC CONFLICT KEEP LATEST",
+                &HashMap::new(),
+            )?;
+        }
+        if meta.history_policy != Some(contextdb_core::HistoryPolicy::CurrentOnly) {
+            db.execute(
+                "ALTER TABLE work_capabilities SET HISTORY CURRENT ONLY",
+                &HashMap::new(),
+            )?;
+        }
+    }
+    // A root created BEFORE `work_inputs` declared its own `RETAIN 7 DAYS`
+    // (this installer is idempotent-by-absence, so an existing table is
+    // never re-created) would otherwise keep every input copy forever --
+    // the exact unbounded-debris class this installer exists to bound, just
+    // on the one table an upgraded operator never got the chance to
+    // opt out of. Reconcile via the same `ALTER TABLE` an operator would
+    // type, mirroring the `work_capabilities` reconcile above.
+    if existing.iter().any(|name| name == "work_inputs")
+        && let Some(meta) = db.table_meta("work_inputs")
+        && meta.default_ttl_seconds.is_none()
+    {
+        db.execute("ALTER TABLE work_inputs SET RETAIN 7 DAYS", &HashMap::new())?;
+    }
     // Installing the capability registry makes this database compaction-eligible;
     // start the engine-owned maintenance loop now so a fresh node self-bounds
     // within its first session (a reopen is covered by the open-time hook).
     // No-op if it is already running.
-    db.start_maintenance_if_eligible();
+    db.reconcile_maintenance_thread();
     Ok(())
 }
 
@@ -1513,8 +1567,10 @@ pub fn materialize_inputs(
     node_id: &str,
     policy: &MovementPolicy,
 ) -> Result<ExecutionInputs> {
-    if let Some(job) = job_row(db, job_id)? {
-        if !policy.permits_input_read(&job, node_id) {
+    let job = job_row(db, job_id)?;
+    let mut declares_ledger_input = false;
+    if let Some(job) = &job {
+        if !policy.permits_input_read(job, node_id) {
             return Err(Error::Other(format!(
                 "work ledger: the movement policy does not permit node {node_id} to read the \
                  input of job {job_id}"
@@ -1533,6 +1589,10 @@ pub fn materialize_inputs(
                 job_id: job_id.to_string(),
             });
         }
+        declares_ledger_input = job
+            .input_refs
+            .iter()
+            .any(|input_ref| input_ref.kind == REF_KIND_LEDGER_INPUT);
     }
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), text(job_id));
@@ -1552,6 +1612,16 @@ pub fn materialize_inputs(
         })
         .collect::<Result<_>>()?;
     inputs.sort_by_key(|(seq, _)| *seq);
+    // Distinct from a job that never declared ledger input at all: this job's
+    // reference NAMES the ledger-input kind, but `work_inputs`' declared
+    // `RETAIN` window (see `CREATE_WORK_INPUTS`) has already aged its rows
+    // out. Silently returning empty here would let a worker execute on
+    // silently-empty input; a typed refusal makes the gap unmistakable.
+    if inputs.is_empty() && declares_ledger_input {
+        return Err(Error::WorkInputExpired {
+            job_id: job_id.to_string(),
+        });
+    }
     Ok(inputs)
 }
 

@@ -69,8 +69,9 @@ pub use database::{
     CascadeReport, Database, ExportReport, IndexCandidate, QueryResult, QueryTrace,
 };
 pub use database::{
-    MaintenanceReport, MaintenanceStatus, PruningReport, REDB_COMPACT_FRAGMENTATION_THRESHOLD,
-    RETENTION_CLOCK_SKEW_TOLERANCE, TableSizeEstimate,
+    CompactionReport, MaintenancePolicy, MaintenanceReport, MaintenanceStatus, PruningReport,
+    REDB_COMPACT_FRAGMENTATION_THRESHOLD, RETENTION_CLOCK_SKEW_TOLERANCE, SnapshotPin,
+    TableSizeEstimate,
 };
 pub use database::{SearchResult, SemanticQuery};
 pub use sync::{ChangeApplication, ChangeTracking};

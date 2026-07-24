@@ -7,17 +7,41 @@ use crate::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_core::{Result, Value};
 use std::collections::HashMap;
 
+// Node-keyed, latest-wins by its own documented contract (see
+// `register_peer_ticket`'s upsert and `peer_directory_conflict_policy_entries`
+// below) — a current-truth registry, so it declares its own version-cleanup
+// eligibility in its own DDL rather than riding a hardcoded table-name list.
 const CREATE_PEER_DIRECTORY: &str = "CREATE TABLE peer_directory (\
      node_id TEXT PRIMARY KEY, \
      ticket TEXT NOT NULL, \
-     enrolled_at TIMESTAMP NOT NULL)";
+     enrolled_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST";
 
-/// Create the `peer_directory` table if absent.
+/// Create the `peer_directory` table if absent. A root created before this
+/// table declared its own HISTORY / SYNC CONFLICT clauses is reconciled via
+/// the same `ALTER TABLE` an operator would type (KEEP LATEST before HISTORY
+/// CURRENT ONLY, so the table is never observed keep-first while the
+/// declaration is in force) — matching `install_work_ledger_schema`'s
+/// reconciliation of `work_capabilities`.
 pub fn install_peer_directory_schema(db: &Database) -> Result<()> {
-    if db.table_names().iter().any(|name| name == "peer_directory") {
+    if !db.table_names().iter().any(|name| name == "peer_directory") {
+        db.execute(CREATE_PEER_DIRECTORY, &HashMap::new())?;
         return Ok(());
     }
-    db.execute(CREATE_PEER_DIRECTORY, &HashMap::new())?;
+    let Some(meta) = db.table_meta("peer_directory") else {
+        return Ok(());
+    };
+    if meta.conflict_policy != Some(ConflictPolicy::LatestWins) {
+        db.execute(
+            "ALTER TABLE peer_directory SET SYNC CONFLICT KEEP LATEST",
+            &HashMap::new(),
+        )?;
+    }
+    if meta.history_policy != Some(contextdb_core::HistoryPolicy::CurrentOnly) {
+        db.execute(
+            "ALTER TABLE peer_directory SET HISTORY CURRENT ONLY",
+            &HashMap::new(),
+        )?;
+    }
     Ok(())
 }
 

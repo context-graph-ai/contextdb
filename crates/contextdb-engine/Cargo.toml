@@ -196,3 +196,8 @@ path = "../../benches/sigterm_drain_in_flight_persistence.rs"
 name = "trigger_throughput"
 harness = false
 path = "../../benches/trigger_throughput.rs"
+
+[[bench]]
+name = "version_cleanup_scaling"
+harness = false
+path = "../../benches/version_cleanup_scaling.rs"

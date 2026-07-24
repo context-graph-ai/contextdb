@@ -24,6 +24,7 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             retain: ct.retain.clone(),
             sync_direction: ct.sync_direction,
             conflict_policy: ct.conflict_policy,
+            history: ct.history,
         })),
         Statement::AlterTable(at) => Ok(PhysicalPlan::AlterTable(AlterTablePlan {
             table: at.table.clone(),
@@ -332,11 +333,16 @@ fn plan_select_body(
             .iter()
             .map(|item| {
                 let expr = resolve_order_by_output_alias(&item.expr, &body.columns);
-                // `Sort` reads a sort key by pulling a column out of a row, so
-                // anything that is not a column reference cannot be evaluated.
-                // Refuse it here rather than let the comparator treat every row
-                // as equal and hand back a silently unsorted result.
-                if !matches!(expr, Expr::Column(_)) {
+                // A plain column reference always evaluates; a function call
+                // MAY (the engine's plan-time validator, `validate_sort_key`,
+                // is the actual authority on which function names it
+                // evaluates — e.g. `COALESCE` and the desugared `+`/`-`/`*`/
+                // `/` arithmetic forms — and refuses anything else with the
+                // same typed error). Anything else here cannot be evaluated
+                // at all: refuse it rather than let the comparator treat
+                // every row as equal and hand back a silently unsorted
+                // result.
+                if !matches!(expr, Expr::Column(_) | Expr::FunctionCall { .. }) {
                     return Err(Error::OrderByExpressionNotSupported);
                 }
                 Ok(SortKey {

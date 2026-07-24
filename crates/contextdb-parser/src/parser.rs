@@ -1088,6 +1088,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut retain = None;
     let mut sync_direction = None;
     let mut conflict_policy = None;
+    let mut history = None;
 
     for p in pair.into_inner() {
         match p.as_rule() {
@@ -1195,6 +1196,12 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
                         }
                         conflict_policy = Some(build_sync_conflict_option(opt)?);
                     }
+                    Rule::history_option => {
+                        if history.is_some() {
+                            return Err(Error::ParseError("duplicate HISTORY clause".to_string()));
+                        }
+                        history = Some(build_history_option(opt)?);
+                    }
                     other => return Err(unexpected_rule(other, "build_create_table.table_option")),
                 }
             }
@@ -1226,6 +1233,17 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     if immutable && retain.is_some() {
         return Err(Error::ParseError(
             "IMMUTABLE and RETAIN are mutually exclusive".to_string(),
+        ));
+    }
+
+    // An immutable table never supersedes a row, so it has no version history
+    // to reclaim: the clause has nothing to act on and its presence means the
+    // author expected something else.
+    if immutable && history == Some(contextdb_core::HistoryPolicy::CurrentOnly) {
+        return Err(Error::ParseError(
+            "IMMUTABLE and HISTORY CURRENT ONLY are mutually exclusive: an immutable table \
+             never supersedes a row, so it has no version history to reclaim"
+                .to_string(),
         ));
     }
 
@@ -1315,7 +1333,20 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
         retain,
         sync_direction,
         conflict_policy,
+        history,
     })
+}
+
+fn build_history_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::HistoryPolicy> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| Error::ParseError("invalid HISTORY clause".to_string()))?;
+    match inner.as_rule() {
+        Rule::history_all => Ok(contextdb_core::HistoryPolicy::All),
+        Rule::history_current_only => Ok(contextdb_core::HistoryPolicy::CurrentOnly),
+        other => Err(unexpected_rule(other, "build_history_option")),
+    }
 }
 
 fn build_alter_table(pair: Pair<'_, Rule>) -> Result<AlterTable> {
@@ -1398,12 +1429,30 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
             })
         }
         Rule::drop_retain_action => Ok(AlterAction::DropRetain),
+        Rule::set_history_action => {
+            let clause = action
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::history_option)
+                .ok_or_else(|| Error::ParseError("SET HISTORY missing a policy".to_string()))?;
+            Ok(AlterAction::SetHistory(build_history_option(clause)?))
+        }
         Rule::set_sync_direction_action => {
             let clause = action
                 .into_inner()
                 .find(|part| part.as_rule() == Rule::sync_direction_option)
                 .ok_or_else(|| Error::ParseError("SET SYNC missing a direction".to_string()))?;
             Ok(AlterAction::SetSyncDirection(build_sync_direction_option(
+                clause,
+            )?))
+        }
+        Rule::set_sync_conflict_action => {
+            let clause = action
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::sync_conflict_option)
+                .ok_or_else(|| {
+                    Error::ParseError("SET SYNC CONFLICT missing a policy".to_string())
+                })?;
+            Ok(AlterAction::SetSyncConflict(build_sync_conflict_option(
                 clause,
             )?))
         }
@@ -1862,25 +1911,67 @@ fn build_scope_label_split(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint>
 }
 
 fn find_keyword_outside_strings(raw: &str, keyword: &str) -> Option<usize> {
+    fn is_word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
     let bytes = raw.as_bytes();
     let keyword = keyword.as_bytes();
     let mut i = 0;
     let mut in_string = false;
     while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                i += 2;
-                continue;
+        if in_string {
+            if bytes[i] == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
             }
-            in_string = !in_string;
             i += 1;
             continue;
         }
-        if !in_string
-            && i + keyword.len() <= bytes.len()
+        // A SQL comment is legal wherever whitespace is legal between two
+        // tokens of this rule — the grammar's implicit `WHITESPACE` rule
+        // covers both comment forms. Skip its content entirely so a comment
+        // that merely CONTAINS the keyword as a substring (e.g. the English
+        // word "rewrite" or "overwrite") can never be mistaken for the real
+        // keyword token, regardless of where the comment sits.
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if i + keyword.len() <= bytes.len()
             && bytes[i..i + keyword.len()].eq_ignore_ascii_case(keyword)
         {
-            return Some(i);
+            // Word-boundary check: a match must not sit inside a longer run
+            // of identifier-like characters (e.g. `WRITEX`) — unreachable
+            // in practice for this grammar's label lists (every label is a
+            // quoted `string`, never a bare identifier, so a keyword
+            // substring can never land INSIDE one), but kept so this is a
+            // genuine keyword match rather than a substring one.
+            let before_ok = i == 0 || !is_word_byte(bytes[i - 1]);
+            let after_idx = i + keyword.len();
+            let after_ok = after_idx >= bytes.len() || !is_word_byte(bytes[after_idx]);
+            if before_ok && after_ok {
+                return Some(i);
+            }
         }
         i += 1;
     }

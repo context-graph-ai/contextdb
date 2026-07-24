@@ -38,6 +38,10 @@ pub(crate) fn execute_plan(
                     reason: "acl_grants cannot itself declare ACL-protected columns".to_string(),
                 });
             }
+            // Refused before anything else is validated: a consumer typing
+            // one of the four engine-owned reserved names with any other
+            // column shape never gets far enough to build a half-made table.
+            refuse_engine_owned_reserved_name_shape(&p.name, &p.columns)?;
             // The contradiction is refused before anything is created, so a
             // rejected declaration never leaves a half-made table behind.
             refuse_promise_with_no_delivery(
@@ -152,8 +156,21 @@ pub(crate) fn execute_plan(
                 retain_declared_unit: p.retain.as_ref().map(|retain| retain.declared_unit),
                 primary_key_columns: p.primary_key_columns.clone(),
                 conflict_policy: p.conflict_policy,
+                history_policy: p.history,
             };
+            // The policy half of the reserved-name door (the column-shape
+            // half already ran above): an EXPLICIT axis this local CREATE
+            // declares that differs from one of the four tables' canonical
+            // policy is refused, exactly like the local ALTER door and the
+            // sync-apply doors judge the identical question -- silence is
+            // still tolerated (a legacy pre-declaration root, or this file's
+            // own reconcile-heal tests, construct exactly that shape).
+            refuse_engine_owned_policy_axes(&p.name, &meta)?;
             refuse_sync_safe_without_key(&p.name, &meta)?;
+            // Refused before anything is created: a table that both
+            // delivers and arbitrates non-overwriting must not declare
+            // HISTORY CURRENT ONLY (see the door's shared doc comment).
+            refuse_reclaimed_history_under_keep_first(&p.name, &meta)?;
             let candidate_meta = meta.clone();
             validate_exact_constraint_keys_for_meta(&p.name, &meta)?;
             validate_single_column_foreign_keys_for_meta(&p.name, &meta, |parent| {
@@ -216,7 +233,7 @@ pub(crate) fn execute_plan(
                     Ok(())
                 })?;
                 db.clear_statement_cache();
-                db.start_maintenance_if_eligible();
+                db.reconcile_maintenance_thread();
                 return Ok(QueryResult::empty_with_affected(0));
             } else {
                 db.allocate_ddl_lsn(|lsn| {
@@ -236,7 +253,7 @@ pub(crate) fn execute_plan(
                 })?;
             }
             db.clear_statement_cache();
-            db.start_maintenance_if_eligible();
+            db.reconcile_maintenance_thread();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::DropTable(name) => {
@@ -680,6 +697,13 @@ pub(crate) fn execute_plan(
                     // Refused before the write lock is taken, so a rejected
                     // ALTER applies no part of itself — not the new window,
                     // not the SYNC SAFE flag.
+                    refuse_engine_owned_policy_mutation(
+                        &p.table,
+                        EngineOwnedMutation::Retain {
+                            window: Some((*duration_seconds, *declared_unit)),
+                            sync_safe: *sync_safe,
+                        },
+                    )?;
                     if *sync_safe {
                         let existing = db.table_meta(&p.table).ok_or_else(|| {
                             Error::Other(format!("table '{}' not found", p.table))
@@ -705,6 +729,15 @@ pub(crate) fn execute_plan(
                     table_meta.retain_declared_unit = Some(*declared_unit);
                 }
                 AlterAction::DropRetain => {
+                    // Refused before the write lock, matching SET RETAIN's
+                    // own comment.
+                    refuse_engine_owned_policy_mutation(
+                        &p.table,
+                        EngineOwnedMutation::Retain {
+                            window: None,
+                            sync_safe: false,
+                        },
+                    )?;
                     let mut meta = store.table_meta.write();
                     let table_meta = meta
                         .get_mut(&p.table)
@@ -713,9 +746,65 @@ pub(crate) fn execute_plan(
                     table_meta.sync_safe = false;
                     table_meta.retain_declared_unit = None;
                 }
+                AlterAction::SetHistory(policy) => {
+                    // Refused before the write lock, matching SET RETAIN's
+                    // own comment: a rejected ALTER applies no part of
+                    // itself. Projects the post-change meta (existing table,
+                    // history swapped for the new declaration) so the same
+                    // question is asked as at CREATE.
+                    let existing = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    let projected = TableMeta {
+                        history_policy: Some(*policy),
+                        ..existing
+                    };
+                    refuse_engine_owned_policy_mutation(
+                        &p.table,
+                        EngineOwnedMutation::History(*policy),
+                    )?;
+                    refuse_reclaimed_history_under_keep_first(&p.table, &projected)?;
+                    let mut meta = store.table_meta.write();
+                    let table_meta = meta
+                        .get_mut(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    table_meta.history_policy = Some(*policy);
+                }
+                AlterAction::SetSyncConflict(policy) => {
+                    // The mirror guard: narrowing an already-declared HISTORY
+                    // CURRENT ONLY table BACK to keep-first arbitration while
+                    // it still delivers is exactly the CREATE-time hazard
+                    // arriving through the back door, so it is refused here
+                    // too, before the write lock.
+                    let existing = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    let projected = TableMeta {
+                        conflict_policy: Some(*policy),
+                        ..existing
+                    };
+                    refuse_engine_owned_policy_mutation(
+                        &p.table,
+                        EngineOwnedMutation::SyncConflict(*policy),
+                    )?;
+                    refuse_reclaimed_history_under_keep_first(&p.table, &projected)?;
+                    let mut meta = store.table_meta.write();
+                    let table_meta = meta
+                        .get_mut(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    table_meta.conflict_policy = Some(*policy);
+                }
                 AlterAction::SetSyncDirection(direction) => {
                     // Refused before the write lock, for the same reason: a
-                    // rejected ALTER applies no part of itself.
+                    // rejected ALTER applies no part of itself -- an
+                    // operator's own `SET SYNC ...` on one of the four
+                    // engine-owned tables is engine policy exactly like
+                    // `SET RETAIN` / `SET HISTORY` / `SET SYNC CONFLICT`
+                    // already are.
+                    refuse_engine_owned_policy_mutation(
+                        &p.table,
+                        EngineOwnedMutation::SyncDirection(*direction),
+                    )?;
                     let existing = db
                         .table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
@@ -724,6 +813,15 @@ pub(crate) fn execute_plan(
                         existing.sync_safe,
                         Some(*direction),
                     )?;
+                    // R3: widening this table's direction into delivery
+                    // while it still carries HISTORY CURRENT ONLY under
+                    // keep-first arbitration recreates the CREATE-time
+                    // hazard after the fact.
+                    let projected = TableMeta {
+                        sync_direction: Some(*direction),
+                        ..existing
+                    };
+                    refuse_reclaimed_history_under_keep_first(&p.table, &projected)?;
                     let mut meta = store.table_meta.write();
                     let table_meta = meta
                         .get_mut(&p.table)
@@ -738,13 +836,15 @@ pub(crate) fn execute_plan(
                     AlterAction::AddColumn(_)
                         | AlterAction::SetRetain { .. }
                         | AlterAction::DropRetain
+                        | AlterAction::SetHistory(_)
+                        | AlterAction::SetSyncConflict(_)
                 ) {
                     db.persist_table_rows(&p.table)?;
                 }
                 db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn))?;
             }
             db.clear_statement_cache();
-            db.start_maintenance_if_eligible();
+            db.reconcile_maintenance_thread();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
@@ -1576,29 +1676,44 @@ pub(crate) fn execute_plan(
                 input_result.trace.sort_elided = true;
                 return Ok(input_result);
             }
-            // Resolve every sort key to a column index ONCE, before a single
-            // pair is compared: the comparator cannot return an error, so an
-            // unresolved key would otherwise be swallowed as `Ordering::Equal`
-            // and the caller would get rows in storage order with no signal.
-            // Plan-time validation has already proven these resolve; this call
-            // is the sort's own index lookup, sharing one implementation with
-            // the validator so the two can never disagree.
-            let key_indexes = keys
+            // Evaluate every sort key for every row ONCE, before a single pair
+            // is compared: the comparator cannot return an error, so an
+            // evaluation failure would otherwise be swallowed as
+            // `Ordering::Equal` and the caller would get rows in storage
+            // order with no signal. Plan-time validation
+            // (`validate_sort_key`) has already proven each key is a
+            // supported, resolvable expression; this is the sort's own
+            // evaluation of that identical expression, sharing the same
+            // column-resolution rule (`resolve_query_result_column`) so the
+            // two can never disagree.
+            let sort_values = input_result
+                .rows
                 .iter()
-                .map(|key| resolve_sort_key_index(&input_result.columns, input, key))
+                .map(|row| {
+                    keys.iter()
+                        .map(|key| {
+                            eval_query_result_expr(&key.expr, row, &input_result.columns, params)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
                 .collect::<Result<Vec<_>>>()?;
 
-            input_result.rows.sort_by(|left, right| {
-                for (key, index) in keys.iter().zip(&key_indexes) {
-                    let left_value = left.get(*index).cloned().unwrap_or(Value::Null);
-                    let right_value = right.get(*index).cloned().unwrap_or(Value::Null);
-                    let ordering = compare_sort_values(&left_value, &right_value, key.direction);
+            let mut order: Vec<usize> = (0..input_result.rows.len()).collect();
+            order.sort_by(|&a, &b| {
+                for (i, key) in keys.iter().enumerate() {
+                    let ordering =
+                        compare_sort_values(&sort_values[a][i], &sort_values[b][i], key.direction);
                     if ordering != Ordering::Equal {
                         return ordering;
                     }
                 }
                 Ordering::Equal
             });
+            let unsorted_rows = input_result.rows;
+            input_result.rows = order
+                .into_iter()
+                .map(|i| unsorted_rows[i].clone())
+                .collect();
             // Preserve data-source trace labels through the post-read sort.
             // A plain `Scan` child gets relabeled to `Sort` to match the
             // plan's ORDER BY-without-index expectations.
@@ -1615,10 +1730,23 @@ pub(crate) fn execute_plan(
         }
         PhysicalPlan::Filter { input, predicate } => {
             let mut input_result = execute_plan(db, input, params, tx)?;
-            input_result.rows.retain(|row| {
-                query_result_row_matches(row, &input_result.columns, predicate, params)
-                    .unwrap_or(false)
-            });
+            // A genuine evaluation error (e.g. dividing by zero, negating a
+            // non-numeric value) must fail the statement, never be treated
+            // as "row excluded" — the same contract `filter_rows_by_predicate`
+            // already enforces for a plain scan's pushed-down predicate, and
+            // the join's own `?`-propagating match loop below already holds
+            // for `JOIN ON`. This is the CTE/derived-table WHERE path (a
+            // `Filter` node over an arbitrary input), so it goes through a
+            // fallible loop rather than `Vec::retain`, which cannot propagate
+            // an `Err`.
+            let unfiltered_rows = input_result.rows;
+            let mut kept = Vec::with_capacity(unfiltered_rows.len());
+            for row in unfiltered_rows {
+                if query_result_row_matches(&row, &input_result.columns, predicate, params)? {
+                    kept.push(row);
+                }
+            }
+            input_result.rows = kept;
             Ok(input_result)
         }
         PhysicalPlan::Distinct { input } => {
@@ -2362,14 +2490,7 @@ fn exec_delete(
         .map(|expr| collect_simple_equality_predicates(expr, params, false))
         .transpose()?
         .flatten();
-    let matched: Vec<_> = rows
-        .into_iter()
-        .filter(|r| {
-            resolved_where
-                .as_ref()
-                .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
-        })
-        .collect();
+    let matched = filter_rows_by_predicate(rows, resolved_where.as_ref(), params)?;
 
     for row in &matched {
         db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
@@ -2647,13 +2768,7 @@ fn exec_update(
     let matched: Vec<_> = if direct_unique_lookup_exhausts_where {
         rows
     } else {
-        rows.into_iter()
-            .filter(|r| {
-                resolved_where
-                    .as_ref()
-                    .is_none_or(|w| row_matches(r, w, params).unwrap_or(false))
-            })
-            .collect()
+        filter_rows_by_predicate(rows, resolved_where.as_ref(), params)?
     };
 
     if direct_unique_update && trigger_callback_bound && !has_vector_columns {
@@ -2966,15 +3081,38 @@ const PREDICATE_PSEUDO_COLUMN: &str = "row_id";
 ///
 /// Precedence matches `CREATE INDEX` (TableNotFound before ColumnNotFound): an
 /// absent table is left to the scan/DML path that reports it.
-fn validate_predicate_columns(db: &Database, table: &str, predicate: &Expr) -> Result<()> {
+fn validate_predicate_columns(
+    db: &Database,
+    table: &str,
+    alias: Option<&str>,
+    predicate: &Expr,
+) -> Result<()> {
     let Some(meta) = db.table_meta(table) else {
         return Ok(());
     };
-    check_predicate_columns_declared(table, &meta, predicate)
+    check_predicate_columns_declared(table, alias, &meta, predicate)
 }
 
-fn check_predicate_columns_declared(table: &str, meta: &TableMeta, expr: &Expr) -> Result<()> {
+fn check_predicate_columns_declared(
+    table: &str,
+    alias: Option<&str>,
+    meta: &TableMeta,
+    expr: &Expr,
+) -> Result<()> {
     walk_predicate_columns(expr, &mut |column_ref| {
+        // A qualifier is only legal when it names THIS scan's own table or
+        // its alias — a single-table scan has no other relation in scope, so
+        // any other qualifier is unrecognized even when the bare column name
+        // it qualifies is real on this table.
+        if let Some(qualifier) = &column_ref.table
+            && qualifier != table
+            && Some(qualifier.as_str()) != alias
+        {
+            return Err(Error::ColumnNotFound {
+                table: table.to_string(),
+                column: column_ref.column.clone(),
+            });
+        }
         if column_ref.column == PREDICATE_PSEUDO_COLUMN
             || meta
                 .columns
@@ -3052,17 +3190,17 @@ pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Resul
     match plan {
         PhysicalPlan::Scan {
             table,
+            alias,
             filter: Some(predicate),
-            ..
-        } => validate_predicate_columns(db, table, predicate)?,
+        } => validate_predicate_columns(db, table, alias.as_deref(), predicate)?,
         PhysicalPlan::Delete(p) => {
             if let Some(predicate) = &p.where_clause {
-                validate_predicate_columns(db, &p.table, predicate)?;
+                validate_predicate_columns(db, &p.table, None, predicate)?;
             }
         }
         PhysicalPlan::Update(p) => {
             if let Some(predicate) = &p.where_clause {
-                validate_predicate_columns(db, &p.table, predicate)?;
+                validate_predicate_columns(db, &p.table, None, predicate)?;
             }
         }
         PhysicalPlan::Filter { input, predicate } => {
@@ -3075,12 +3213,27 @@ pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Resul
             validate_plan_columns(db, input)?;
             if let Some(columns) = plan_output_columns(db, input) {
                 for key in keys {
-                    resolve_sort_key_index(&columns, input, key)?;
+                    validate_sort_key(&columns, input, key)?;
                 }
             }
         }
-        PhysicalPlan::Project { input, .. }
-        | PhysicalPlan::Distinct { input }
+        PhysicalPlan::Project { input, columns } => {
+            validate_plan_columns(db, input)?;
+            // GraphBfs's `COLUMNS (...)` aliasing is not tracked by
+            // `plan_output_columns` at all (it always reports the fixed
+            // `{alias}.id` / `id` / `depth` shape, never the query's own
+            // aliases), so a Project sitting over a GraphBfs subtree is left
+            // unchecked here rather than rejecting valid GRAPH_TABLE column
+            // aliases as unknown.
+            if !plan_contains_graph_bfs(input)
+                && let Some(input_columns) = plan_output_columns(db, input)
+            {
+                for column in columns {
+                    validate_filter_predicate_columns(&input_columns, input, &column.expr)?;
+                }
+            }
+        }
+        PhysicalPlan::Distinct { input }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::MaterializeCte { input, .. } => validate_plan_columns(db, input)?,
         PhysicalPlan::Join {
@@ -3128,30 +3281,38 @@ pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Resul
     Ok(())
 }
 
-/// Resolve one ORDER BY key to an index into `columns`, reporting the unknown
-/// and ambiguous cases the way every other column error in the engine reads.
-fn resolve_sort_key_index(
+/// Whether an ORDER BY key expression is a supported, evaluated form: a
+/// plain column, or a function call this engine already evaluates for a
+/// SELECT list (`COALESCE`, and the desugared `+`/`-`/`*`/`/` arithmetic
+/// forms). Any other shape stays a typed refusal rather than a silent
+/// no-op sort.
+fn sort_key_expr_supported(expr: &Expr) -> bool {
+    matches!(expr, Expr::Column(_))
+        || matches!(expr, Expr::FunctionCall { name, .. } if is_known_scalar_function(name))
+}
+
+fn is_known_scalar_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "__add" | "__sub" | "__mul" | "__div" | "coalesce" | "now"
+    )
+}
+
+/// Validate one ORDER BY key at plan time: the expression shape must be one
+/// the runtime sort actually evaluates, and every column it references must
+/// resolve — reporting the unknown/ambiguous cases the way every other
+/// column error in the engine reads. The runtime sort evaluates the
+/// identical expression per row (see the `PhysicalPlan::Sort` executor arm),
+/// sharing this same column-resolution rule so the two can never disagree.
+fn validate_sort_key(
     columns: &[String],
     input: &PhysicalPlan,
     key: &contextdb_planner::SortKey,
-) -> Result<usize> {
-    let Expr::Column(column_ref) = &key.expr else {
+) -> Result<()> {
+    if !sort_key_expr_supported(&key.expr) {
         return Err(Error::OrderByExpressionNotSupported);
-    };
-    match resolve_query_result_column(columns, column_ref) {
-        QueryResultColumn::Found(idx) => Ok(idx),
-        // Report against the same table name CREATE INDEX and the WHERE path
-        // use, so one unknown column reads the same way wherever it is named.
-        QueryResultColumn::NotFound => Err(Error::ColumnNotFound {
-            table: column_ref
-                .table
-                .clone()
-                .or_else(|| plan_anchor_table(input))
-                .unwrap_or_else(|| "<query>".to_string()),
-            column: column_ref.column.clone(),
-        }),
-        other => Err(query_result_column_error(column_ref, &other)),
     }
+    validate_filter_predicate_columns(columns, input, &key.expr)
 }
 
 /// The columns a plan node yields, derived from the catalog without running it.
@@ -3289,66 +3450,147 @@ fn plan_anchor_table(plan: &PhysicalPlan) -> Option<String> {
     }
 }
 
-/// Reject a post-scan predicate — the `WHERE` of a join or of a CTE-sourced
-/// SELECT — that names a column its input does not produce.
+fn is_predicate_pseudo_column(name: &str) -> bool {
+    name == PREDICATE_PSEUDO_COLUMN || name == "*"
+}
+
+/// The relation names (real table names and declared aliases) that may
+/// legally qualify a column reference against this plan node's output —
+/// used only to check that an explicit qualifier (`t.col`) names something
+/// actually in scope. A shape this helper does not model returns an empty
+/// list, which is safe: callers only consult it alongside a column list for
+/// that same shape (`plan_output_columns`), so an unmodeled shape already
+/// skips the check entirely rather than reaching here.
+fn known_relation_names(plan: &PhysicalPlan) -> Vec<String> {
+    match plan {
+        PhysicalPlan::Scan { table, alias, .. } => {
+            vec![alias.clone().unwrap_or_else(|| table.clone())]
+        }
+        PhysicalPlan::IndexScan { table, .. } => vec![table.clone()],
+        // The vector table's own name is always a valid qualifier, but a
+        // qualifier from the CANDIDATE subtree (e.g. a join alias feeding
+        // the vector search) is equally valid — union both rather than
+        // picking one, since this is only ever consulted as a permissive
+        // whitelist alongside a column list for the same shape.
+        PhysicalPlan::VectorSearch {
+            table, candidates, ..
+        }
+        | PhysicalPlan::HnswSearch {
+            table, candidates, ..
+        } => {
+            let mut names = vec![table.clone()];
+            if let Some(candidates) = candidates {
+                names.extend(known_relation_names(candidates));
+            }
+            names
+        }
+        PhysicalPlan::Join {
+            left,
+            right,
+            left_alias,
+            right_alias,
+            ..
+        } => {
+            let mut names = known_relation_names(left);
+            if let Some(alias) = left_alias {
+                names.push(alias.clone());
+            }
+            names.push(
+                right_alias
+                    .clone()
+                    .unwrap_or_else(|| right_table_name(right)),
+            );
+            names
+        }
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::Project { input, .. } => known_relation_names(input),
+        PhysicalPlan::CteRef { name } => vec![name.clone()],
+        PhysicalPlan::Union { inputs, .. } => {
+            inputs.iter().flat_map(known_relation_names).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a plan subtree contains a `GraphBfs` node anywhere beneath it —
+/// used to skip a validator wherever `plan_output_columns` cannot be
+/// trusted for the shape (GraphBfs's `COLUMNS (...)` aliasing is not
+/// modeled there at all; see `plan_output_columns`'s `GraphBfs` arm).
+fn plan_contains_graph_bfs(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::GraphBfs { .. } => true,
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Distinct { input }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::MaterializeCte { input, .. }
+        | PhysicalPlan::Project { input, .. } => plan_contains_graph_bfs(input),
+        PhysicalPlan::Join { left, right, .. } => {
+            plan_contains_graph_bfs(left) || plan_contains_graph_bfs(right)
+        }
+        PhysicalPlan::Union { inputs, .. } => inputs.iter().any(plan_contains_graph_bfs),
+        PhysicalPlan::Pipeline(plans) => plans.iter().any(plan_contains_graph_bfs),
+        _ => false,
+    }
+}
+
+/// Reject a post-scan predicate/expression — the `WHERE` of a join or of a
+/// CTE-sourced SELECT, an ORDER BY key, or a SELECT-list expression — that
+/// names a column its input does not produce, or that carries an explicit
+/// qualifier naming no relation in scope.
 ///
-/// The single-table path is guarded at the scan against the declared schema,
-/// but a join or a CTE source plans its `WHERE` as a `Filter` node instead, and
-/// that node's row matcher discards evaluation errors (`unwrap_or(false)`). So
-/// the same typo that is an error on a plain SELECT silently returned zero rows
-/// here. The input's own column list is the authority: it is what the predicate
+/// The single-table WHERE path is guarded directly at the scan against the
+/// declared schema (`check_predicate_columns_declared`); everything reaching
+/// here plans as a `Filter` / `Sort` / `Project` / `Join` node instead, over
+/// an input whose own column list is the authority for what the expression
 /// will actually be evaluated against.
+///
+/// An UNqualified reference matches any column with that bare name. A
+/// QUALIFIED reference matches its exact qualified name, or — only once the
+/// qualifier itself is confirmed to name a real relation in this scope via
+/// `known_relation_names` — a column carrying that bare name with no
+/// qualifier of its own (nothing else claims it, so the reference's
+/// qualifier cannot contradict it). What it must never do is match a column
+/// qualified to a DIFFERENT relation, or accept a qualifier that names no
+/// relation at all: a join's OUTPUT list is fully qualified, so rejecting
+/// the cross-table match is what makes `... JOIN s ... WHERE s.b = 1` name
+/// `s` when `b` lives only on `t`; a join's ON-CONDITION list qualifies only
+/// the names that COLLIDE across the two sides, leaving the rest bare — so
+/// accepting the unqualified match (for a REAL qualifier) is what keeps
+/// `ON decisions.id = outcomes.decision_id` working, where `decision_id` is
+/// unique and therefore stays bare — while a qualifier naming no relation in
+/// scope at all (a typo'd alias) is rejected rather than silently resolving
+/// through that same bare-name fallback.
 fn validate_filter_predicate_columns(
     input_columns: &[String],
     input: &PhysicalPlan,
-    predicate: &Expr,
+    expr: &Expr,
 ) -> Result<()> {
-    walk_predicate_columns(predicate, &mut |column_ref| {
-        if column_ref.column == PREDICATE_PSEUDO_COLUMN
-            || filter_column_is_resolvable(input_columns, column_ref)
-        {
+    let known_relations = known_relation_names(input);
+    walk_predicate_columns(expr, &mut |column_ref| {
+        if is_predicate_pseudo_column(&column_ref.column) {
             return Ok(());
         }
-        Err(Error::ColumnNotFound {
-            table: column_ref
-                .table
-                .clone()
-                .or_else(|| plan_anchor_table(input))
-                .unwrap_or_else(|| "<query>".to_string()),
-            column: column_ref.column.clone(),
-        })
+        match resolve_query_result_column_scoped(input_columns, column_ref, &known_relations) {
+            QueryResultColumn::Found(_) => Ok(()),
+            QueryResultColumn::Ambiguous => Err(Error::PlanError(format!(
+                "ambiguous column reference: {}",
+                column_ref.column
+            ))),
+            QueryResultColumn::NotFound => Err(Error::ColumnNotFound {
+                table: column_ref
+                    .table
+                    .clone()
+                    .or_else(|| plan_anchor_table(input))
+                    .unwrap_or_else(|| "<query>".to_string()),
+                column: column_ref.column.clone(),
+            }),
+        }
     })
-}
-
-/// Whether a column reference can resolve against the columns an input yields.
-///
-/// An UNqualified reference matches any column with that bare name, exactly as
-/// the row evaluator does.
-///
-/// A QUALIFIED reference matches its exact qualified name, or a column carrying
-/// that bare name with NO qualifier of its own — nothing claims such a column,
-/// so the reference's qualifier cannot contradict it. What it must never do is
-/// match a column qualified to a DIFFERENT table: `s.b` may not resolve to
-/// `t.b` just because both end in `b`.
-///
-/// Both halves are load-bearing, and each is pinned by a test that the other
-/// rule breaks. A join's OUTPUT list is fully qualified, so rejecting the
-/// cross-table match is what makes `... JOIN s ... WHERE s.b = 1` name `s` when
-/// `b` lives only on `t`. A join's ON-CONDITION list qualifies only the names
-/// that COLLIDE across the two sides, leaving the rest bare — so accepting the
-/// unqualified match is what keeps `ON decisions.id = outcomes.decision_id`
-/// working, where `decision_id` is unique and therefore stays bare.
-fn filter_column_is_resolvable(input_columns: &[String], column_ref: &ColumnRef) -> bool {
-    let Some(table) = &column_ref.table else {
-        return input_columns.iter().any(|name| {
-            name == &column_ref.column
-                || name.rsplit('.').next() == Some(column_ref.column.as_str())
-        });
-    };
-    let qualified = format!("{table}.{}", column_ref.column);
-    input_columns
-        .iter()
-        .any(|name| name == &qualified || name == &column_ref.column)
 }
 
 fn exec_create_index(
@@ -4270,19 +4512,42 @@ fn resolve_simple_rhs(expr: &Expr, params: &HashMap<String, Value>) -> Option<Va
             let b = resolve_simple_rhs(&args[1], params)?;
             match (a, b, name.as_str()) {
                 (Value::Int64(x), Value::Int64(y), "__add") => {
-                    Some(Value::Int64(x.wrapping_add(y)))
+                    // Use checked_add to avoid overflow. Return None on error, which causes
+                    // the index predicate classification to fail and the predicate to
+                    // fall back to residual filtering (same pattern as __div).
+                    x.checked_add(y).map(Value::Int64)
                 }
                 (Value::Int64(x), Value::Int64(y), "__sub") => {
-                    Some(Value::Int64(x.wrapping_sub(y)))
+                    // Use checked_sub to avoid overflow. Return None on error, which causes
+                    // the index predicate classification to fail and the predicate to
+                    // fall back to residual filtering (same pattern as __div).
+                    x.checked_sub(y).map(Value::Int64)
                 }
                 (Value::Int64(x), Value::Int64(y), "__mul") => {
-                    Some(Value::Int64(x.wrapping_mul(y)))
+                    // Use checked_mul to avoid overflow. Return None on error, which causes
+                    // the index predicate classification to fail and the predicate to
+                    // fall back to residual filtering (same pattern as __div).
+                    x.checked_mul(y).map(Value::Int64)
                 }
-                (Value::Int64(x), Value::Int64(y), "__div") if y != 0 => Some(Value::Int64(x / y)),
+                (Value::Int64(x), Value::Int64(y), "__div") => {
+                    // Use checked_div to avoid panic on overflow (e.g., i64::MIN / -1)
+                    // or division by zero. Return None on error, which causes the
+                    // index predicate classification to fail and the predicate to
+                    // fall back to residual filtering.
+                    x.checked_div(y).map(Value::Int64)
+                }
                 (Value::Float64(x), Value::Float64(y), "__add") => Some(Value::Float64(x + y)),
                 (Value::Float64(x), Value::Float64(y), "__sub") => Some(Value::Float64(x - y)),
                 (Value::Float64(x), Value::Float64(y), "__mul") => Some(Value::Float64(x * y)),
-                (Value::Float64(x), Value::Float64(y), "__div") => Some(Value::Float64(x / y)),
+                (Value::Float64(x), Value::Float64(y), "__div") => {
+                    // Avoid silently producing inf/NaN on division by zero; return None
+                    // to cause the index predicate classification to fail.
+                    if y == 0.0 {
+                        None
+                    } else {
+                        Some(Value::Float64(x / y))
+                    }
+                }
                 _ => None,
             }
         }
@@ -4654,9 +4919,7 @@ fn execute_index_scan(
             .map(|filter| is_anchor_shape_index_pick(db, table, pick, filter, params))
             .unwrap_or(false);
     if anchor_shape {
-        if let Some(filter) = residual_filter {
-            out.retain(|row| row_matches(row, filter, params).unwrap_or(false));
-        }
+        out = filter_rows_by_predicate(out, residual_filter, params)?;
         out = db.filter_rows_for_anchor_read_in_tx(tx, table, out, snapshot)?;
     } else {
         out = db.filter_rows_for_read_in_tx(tx, table, out, snapshot)?;
@@ -5112,10 +5375,7 @@ fn materialize_rows(
     params: &HashMap<String, Value>,
     schema_columns: Option<&[String]>,
 ) -> Result<QueryResult> {
-    let filtered: Vec<VersionedRow> = rows
-        .into_iter()
-        .filter(|r| filter.is_none_or(|f| row_matches(r, f, params).unwrap_or(false)))
-        .collect();
+    let filtered = filter_rows_by_predicate(rows, filter, params)?;
 
     let keys = if let Some(schema_columns) = schema_columns {
         schema_columns.to_vec()
@@ -5266,6 +5526,31 @@ pub(crate) fn row_matches(
     params: &HashMap<String, Value>,
 ) -> Result<bool> {
     Ok(eval_bool_expr(row, expr, params)?.unwrap_or(false))
+}
+
+/// Filter `rows` by an optional predicate, propagating a genuine evaluation
+/// error (e.g. negating a non-numeric column) as a statement error instead
+/// of discarding it as "row excluded". `row_matches` already returns
+/// `Result<bool>` correctly — NULL-as-false is folded to `Ok(false)` inside
+/// `eval_bool_expr`, which is correct SQL — every call site here used to
+/// throw the `Err` away via `.unwrap_or(false)`, so a predicate that failed
+/// to evaluate silently excluded every row it touched instead of failing the
+/// statement.
+fn filter_rows_by_predicate(
+    rows: Vec<VersionedRow>,
+    predicate: Option<&Expr>,
+    params: &HashMap<String, Value>,
+) -> Result<Vec<VersionedRow>> {
+    let Some(predicate) = predicate else {
+        return Ok(rows);
+    };
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row_matches(&row, predicate, params)? {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
 }
 
 fn eval_expr_value(
@@ -5543,12 +5828,22 @@ fn eval_bool_expr(
         // A boolean literal is a legal predicate anywhere a predicate is
         // legal (`ON TRUE`, `WHERE FALSE`), per standard SQL.
         Expr::Literal(Literal::Bool(value)) => Ok(Some(*value)),
-        Expr::FunctionCall { .. } => match eval_expr_value(row, expr, params)? {
+        // A bare boolean column (`WHERE flag` means `WHERE flag = TRUE`), a
+        // boolean `$param`, a literal `NULL` predicate (`WHERE NULL` is
+        // standard SQL for "match nothing"), and a boolean-returning function
+        // call all reduce to a value first. A NULL value excludes the row —
+        // the same NULL-as-false semantics every other shape in this match
+        // already uses — and a genuinely non-boolean value is an evaluation
+        // error, never a silent exclusion.
+        Expr::Column(_)
+        | Expr::Parameter(_)
+        | Expr::Literal(Literal::Null)
+        | Expr::FunctionCall { .. } => match eval_expr_value(row, expr, params)? {
             Value::Bool(value) => Ok(Some(value)),
             Value::Null => Ok(None),
-            _ => Err(Error::PlanError(format!(
-                "unsupported WHERE expression: {:?}",
-                expr
+            other => Err(Error::PlanError(format!(
+                "WHERE expression must be boolean, got {:?}: {:?}",
+                other, expr
             ))),
         },
         _ => Err(Error::PlanError(format!(
@@ -5737,33 +6032,42 @@ fn eval_arithmetic(name: &str, args: &[Value]) -> Result<Value> {
         )));
     };
 
+    // Standard SQL NULL propagation: a NULL operand makes the whole
+    // arithmetic expression NULL, for every one of the four operators —
+    // never the generic "expects numeric arguments" refusal the type-pair
+    // match would otherwise produce, and (for division specifically) never
+    // the division-by-zero error below.
+    if *left == Value::Null || *right == Value::Null {
+        return Ok(Value::Null);
+    }
+
     match (left, right) {
         (Value::Int64(left), Value::Int64(right)) => match name {
-            "__add" => Ok(Value::Int64(left + right)),
-            "__sub" => Ok(Value::Int64(left - right)),
-            "__mul" => Ok(Value::Int64(left * right)),
-            "__div" => Ok(Value::Int64(left / right)),
+            "__add" => checked_add_i64(*left, *right),
+            "__sub" => checked_sub_i64(*left, *right),
+            "__mul" => checked_mul_i64(*left, *right),
+            "__div" => checked_div_i64(*left, *right),
             _ => Err(Error::PlanError(format!("unknown function: {}", name))),
         },
         (Value::Float64(left), Value::Float64(right)) => match name {
             "__add" => Ok(Value::Float64(left + right)),
             "__sub" => Ok(Value::Float64(left - right)),
             "__mul" => Ok(Value::Float64(left * right)),
-            "__div" => Ok(Value::Float64(left / right)),
+            "__div" => checked_div_f64(*left, *right),
             _ => Err(Error::PlanError(format!("unknown function: {}", name))),
         },
         (Value::Int64(left), Value::Float64(right)) => match name {
             "__add" => Ok(Value::Float64(*left as f64 + right)),
             "__sub" => Ok(Value::Float64(*left as f64 - right)),
             "__mul" => Ok(Value::Float64(*left as f64 * right)),
-            "__div" => Ok(Value::Float64(*left as f64 / right)),
+            "__div" => checked_div_f64(*left as f64, *right),
             _ => Err(Error::PlanError(format!("unknown function: {}", name))),
         },
         (Value::Float64(left), Value::Int64(right)) => match name {
             "__add" => Ok(Value::Float64(left + *right as f64)),
             "__sub" => Ok(Value::Float64(left - *right as f64)),
             "__mul" => Ok(Value::Float64(left * *right as f64)),
-            "__div" => Ok(Value::Float64(left / *right as f64)),
+            "__div" => checked_div_f64(*left, *right as f64),
             _ => Err(Error::PlanError(format!("unknown function: {}", name))),
         },
         _ => Err(Error::PlanError(format!(
@@ -5771,6 +6075,51 @@ fn eval_arithmetic(name: &str, args: &[Value]) -> Result<Value> {
             name
         ))),
     }
+}
+
+/// Integer addition, raising the standard-SQL out-of-range error on overflow
+/// instead of panicking the process or silently wrapping.
+fn checked_add_i64(left: i64, right: i64) -> Result<Value> {
+    left.checked_add(right)
+        .map(Value::Int64)
+        .ok_or_else(|| Error::PlanError("integer out of range".to_string()))
+}
+
+/// Integer subtraction, raising the standard-SQL out-of-range error on overflow
+/// instead of panicking the process or silently wrapping.
+fn checked_sub_i64(left: i64, right: i64) -> Result<Value> {
+    left.checked_sub(right)
+        .map(Value::Int64)
+        .ok_or_else(|| Error::PlanError("integer out of range".to_string()))
+}
+
+/// Integer multiplication, raising the standard-SQL out-of-range error on overflow
+/// instead of panicking the process or silently wrapping.
+fn checked_mul_i64(left: i64, right: i64) -> Result<Value> {
+    left.checked_mul(right)
+        .map(Value::Int64)
+        .ok_or_else(|| Error::PlanError("integer out of range".to_string()))
+}
+
+/// Integer division, refusing a zero divisor with the standard-SQL wording
+/// instead of panicking the process (`i64::MIN / -1` is refused the same
+/// way, as the one other case integer division cannot represent).
+fn checked_div_i64(left: i64, right: i64) -> Result<Value> {
+    if right == 0 {
+        return Err(Error::PlanError("division by zero".to_string()));
+    }
+    left.checked_div(right)
+        .map(Value::Int64)
+        .ok_or_else(|| Error::PlanError(format!("integer overflow: {left} / {right}")))
+}
+
+/// Float division, refusing a zero divisor with the standard-SQL wording
+/// rather than silently producing `inf`/`NaN`.
+fn checked_div_f64(left: f64, right: f64) -> Result<Value> {
+    if right == 0.0 {
+        return Err(Error::PlanError("division by zero".to_string()));
+    }
+    Ok(Value::Float64(left / right))
 }
 
 fn eval_function_in_row_context(
@@ -6210,6 +6559,38 @@ fn resolve_query_result_column(
     }
 }
 
+/// `resolve_query_result_column`, additionally requiring an explicit
+/// qualifier to name a real relation in `known_relations` before it is
+/// allowed to fall back to a bare-name match — checked BEFORE the
+/// exact-qualified-name lookup so a bogus qualifier can never coincidentally
+/// resolve. Used by the plan-time validators; the runtime evaluators call
+/// `resolve_query_result_column` directly and keep its historical bare-name
+/// fallback for the handful of plan shapes (see `plan_contains_graph_bfs`)
+/// the static validators deliberately do not check at all.
+fn resolve_query_result_column_scoped(
+    input_columns: &[String],
+    column_ref: &ColumnRef,
+    known_relations: &[String],
+) -> QueryResultColumn {
+    if let Some(table) = &column_ref.table {
+        let qualified = format!("{table}.{}", column_ref.column);
+        if let Some(idx) = input_columns.iter().position(|name| name == &qualified) {
+            return QueryResultColumn::Found(idx);
+        }
+        if !known_relations.iter().any(|name| name == table) {
+            return QueryResultColumn::NotFound;
+        }
+    }
+    resolve_query_result_column(input_columns, column_ref)
+}
+
+// Kept as `PlanError`, NOT `ColumnNotFound`: this runtime fallback is shared
+// with GRAPH_TABLE `COLUMNS (...)` projections (a graph node property, not a
+// table column), whose existing "project column not found" wording is
+// pinned elsewhere and out of scope here. An ordinary table SELECT-list's
+// unknown column is caught earlier, at plan time, by the dedicated
+// `ColumnNotFound` check in `validate_plan_columns`'s `Project` arm — this
+// fallback is unreachable for that shape.
 fn query_result_column_error(column_ref: &ColumnRef, resolution: &QueryResultColumn) -> Error {
     match resolution {
         QueryResultColumn::Ambiguous => {
@@ -7762,6 +8143,15 @@ fn apply_missing_column_defaults(
             continue;
         };
         let value = evaluate_stored_default_expr(default)?;
+        // A bare numeric default ("0", "5") is ambiguous between INTEGER and
+        // REAL at the string level -- `REAL DEFAULT 0.0` and `INTEGER DEFAULT
+        // 0` both stringify to "0". `evaluate_stored_default_expr` returns
+        // the natural parse (Int64), so widen to Float64 here where the
+        // column's declared type is known.
+        let value = match (&column.column_type, &value) {
+            (ColumnType::Real, Value::Int64(n)) => Value::Float64(*n as f64),
+            _ => value,
+        };
         values.insert(
             column.name.clone(),
             coerce_value_for_column(db, table, &column.name, value, current_tx_max, active_tx)?,
@@ -7824,6 +8214,20 @@ fn evaluate_stored_default_expr(default: &str) -> Result<Value> {
             .parse::<bool>()
             .map_err(|err| Error::Other(format!("invalid stored bool default '{value}': {err}")))?;
         return Ok(Value::Bool(parsed));
+    }
+    // `stored_default_expr` serializes INTEGER and REAL defaults as a bare
+    // number ("5", "0", "3.5"), not the wrapped `Literal(Integer(..))` /
+    // `Literal(Real(..))` shape the branches above accept -- so this is the
+    // shape every table written by this engine actually has on disk,
+    // including tables created before this fix (read-side tolerance heals
+    // them; no migration needed). Try an integer parse first so a
+    // round-numbered value keeps its exact integer representation; a
+    // decimal or exponent falls through to the float parse.
+    if let Ok(parsed) = default.parse::<i64>() {
+        return Ok(Value::Int64(parsed));
+    }
+    if let Ok(parsed) = default.parse::<f64>() {
+        return Ok(Value::Float64(parsed));
     }
 
     Err(Error::Other(format!(
@@ -7931,6 +8335,491 @@ pub(crate) fn refuse_sync_safe_without_key_for(table: &str, meta: &TableMeta) ->
              no key."
         ),
     })
+}
+
+/// `HISTORY CURRENT ONLY` declares that only a row's CURRENT version has
+/// consumer value, so superseded versions may be reclaimed. That is only
+/// safe when this table cannot hand a peer a stale "first" value: a machine
+/// that PULLS this table under `SYNC CONFLICT KEEP FIRST` (declared or
+/// defaulted — [`DEFAULT_CONFLICT_POLICY`] is keep-first) files whatever
+/// value it receives as the FIRST value it has ever seen for that key. Once
+/// this table has reclaimed history, the only value left to send IS the
+/// newest one — so a puller under keep-first arbitration silently accepts a
+/// stale, wrong "first" value.
+///
+/// The hazard is conditioned on `SyncDirection::delivers()`, not on the
+/// policy alone: a table that never sends anywhere (`SYNC OFF` / `SYNC PULL
+/// ONLY`) has no puller and so no hazard, whatever its conflict policy reads.
+///
+/// Takes the POST-change [`TableMeta`] so every door that can produce the
+/// combination — local `CREATE TABLE`, the `SET HISTORY` / `SET SYNC
+/// CONFLICT` / `SET SYNC ...` ALTER arms, an arriving `CreateTable` (fresh or
+/// adopting an existing table), and an arriving `AlterTable` — asks the same
+/// question about the same projected shape.
+pub(crate) fn refuse_reclaimed_history_under_keep_first(
+    table: &str,
+    meta: &TableMeta,
+) -> Result<()> {
+    if meta.history_policy != Some(HistoryPolicy::CurrentOnly) {
+        return Ok(());
+    }
+    if !effective_sync_direction(meta).delivers() {
+        return Ok(());
+    }
+    let conflict = meta.conflict_policy.unwrap_or(DEFAULT_CONFLICT_POLICY);
+    if conflict != ConflictPolicy::InsertIfNotExists {
+        return Ok(());
+    }
+    Err(Error::SchemaInvalid {
+        reason: format!(
+            "table '{table}': HISTORY CURRENT ONLY needs SYNC CONFLICT KEEP LATEST. \
+             Reclaiming superseded versions leaves only the newest value, and a machine that \
+             pulls this table under SYNC CONFLICT KEEP FIRST (the default when no conflict \
+             clause is declared) would file that newest value as the FIRST value for its key. \
+             Declare SYNC CONFLICT KEEP LATEST if the table carries current truth, or SYNC OFF \
+             if it never leaves this machine."
+        ),
+    })
+}
+
+/// The four built-in ledger tables whose `RETAIN` / `HISTORY` / `SYNC
+/// CONFLICT` clauses are declared exactly once, by the engine itself, in
+/// their own `CREATE TABLE` text -- never by an operator. The engine's own
+/// bookkeeping depends on each staying at its declared shape: `work_inputs`'
+/// `RETAIN` window is what keeps ledger-carried input copies bounded (a
+/// dropped or widened window reopens the unbounded-debris class
+/// `install_work_ledger_schema` exists to close -- see
+/// [`crate::work_ledger::run_input_retention`]'s doc comment); the three
+/// built-in CURRENCY tables' `HISTORY CURRENT ONLY` plus their `SYNC
+/// CONFLICT KEEP LATEST` (or `SYNC OFF`) is what makes
+/// `Database::compact_currency_versions` safe to reclaim their superseded
+/// versions at all (see `database.rs`'s "three built-in currency tables"
+/// note). See [`engine_owned_ledger_policy`] for the declared shape each one
+/// is held to, and [`refuse_engine_owned_policy_mutation`] for the door.
+pub(crate) const ENGINE_OWNED_LEDGER_TABLES: [&str; 4] = [
+    "work_inputs",
+    "work_capabilities",
+    "peer_directory",
+    "work_node_contacts",
+];
+
+/// The `RETAIN` / `HISTORY` / `SYNC CONFLICT` / `SYNC ...` / `SYNC SAFE`
+/// shape the engine itself declares for one of [`ENGINE_OWNED_LEDGER_TABLES`],
+/// mirrored by hand from each table's own `CREATE TABLE` text
+/// (`work_ledger::CREATE_WORK_INPUTS`, `CREATE_WORK_CAPABILITIES`;
+/// `peer_directory::CREATE_PEER_DIRECTORY`;
+/// `contextdb_server::work_ledger::CREATE_WORK_NODE_CONTACTS` -- one crate
+/// up from here and so not importable as a constant; keep these two literal
+/// shapes in agreement by hand if either DDL string ever changes). None of
+/// the four declares `SYNC SAFE`, so `sync_safe` is `false` for all of them;
+/// `direction` is `None` (undeclared, so [`DEFAULT_SYNC_DIRECTION`] governs)
+/// for every table except `work_node_contacts`, which declares `SYNC OFF`.
+pub(crate) struct EngineOwnedLedgerPolicy {
+    pub(crate) retain: Option<(u64, RetainUnit)>,
+    pub(crate) history: Option<HistoryPolicy>,
+    pub(crate) conflict: Option<ConflictPolicy>,
+    pub(crate) direction: Option<SyncDirection>,
+    pub(crate) sync_safe: bool,
+}
+
+/// `None` for any table name outside [`ENGINE_OWNED_LEDGER_TABLES`].
+pub(crate) fn engine_owned_ledger_policy(table: &str) -> Option<EngineOwnedLedgerPolicy> {
+    if !ENGINE_OWNED_LEDGER_TABLES.contains(&table) {
+        return None;
+    }
+    match table {
+        "work_inputs" => Some(EngineOwnedLedgerPolicy {
+            retain: Some((7 * 24 * 60 * 60, RetainUnit::Days)),
+            history: None,
+            conflict: None,
+            direction: None,
+            sync_safe: false,
+        }),
+        "work_capabilities" | "peer_directory" => Some(EngineOwnedLedgerPolicy {
+            retain: None,
+            history: Some(HistoryPolicy::CurrentOnly),
+            conflict: Some(ConflictPolicy::LatestWins),
+            direction: None,
+            sync_safe: false,
+        }),
+        "work_node_contacts" => Some(EngineOwnedLedgerPolicy {
+            retain: None,
+            history: Some(HistoryPolicy::CurrentOnly),
+            conflict: None,
+            direction: Some(SyncDirection::None),
+            sync_safe: false,
+        }),
+        _ => unreachable!("ENGINE_OWNED_LEDGER_TABLES and this match must name the same tables"),
+    }
+}
+
+/// Refuses an EXPLICIT engine-owned policy axis the arriving shape carries
+/// that differs from [`engine_owned_ledger_policy`]'s canonical value for
+/// `table` -- `Ok` for any table outside [`ENGINE_OWNED_LEDGER_TABLES`], `Ok`
+/// for an axis the incoming shape is silent on (silence is never judged
+/// here -- see [`engine_owned_merged_policy`] for why), and `Ok` for an axis
+/// that verbatim-restates the canonical value (a half-healed peer's own
+/// in-progress reconcile, or a fully healed peer's real push, must
+/// interoperate). Shared by THREE doors that can produce the mutation the
+/// local ALTER door ([`refuse_engine_owned_policy_mutation`]) refuses: the
+/// arriving `AlterTable` mirror and the arriving `CreateTable` ADOPT arm for a
+/// table that already exists locally (`database.rs`'s adopt branch overwrites
+/// the SAME fields an `AlterTable` does, so it must ask the identical
+/// question), plus the LOCAL fresh `CREATE TABLE` door
+/// ([`refuse_engine_owned_reserved_name_shape`]'s policy half, in
+/// `execute_plan`'s `CreateTable` arm) for a consumer typing one of the four
+/// reserved names directly.
+pub(crate) fn refuse_engine_owned_policy_axes(table: &str, incoming: &TableMeta) -> Result<()> {
+    let Some(canonical) = engine_owned_ledger_policy(table) else {
+        return Ok(());
+    };
+    if let Some(retain) = incoming
+        .default_ttl_seconds
+        .zip(incoming.retain_declared_unit)
+        && Some(retain) != canonical.retain
+    {
+        return Err(engine_owned_policy_refusal(table, "RETAIN"));
+    }
+    if let Some(history) = incoming.history_policy
+        && Some(history) != canonical.history
+    {
+        return Err(engine_owned_policy_refusal(table, "HISTORY"));
+    }
+    if let Some(conflict) = incoming.conflict_policy
+        && Some(conflict) != canonical.conflict
+    {
+        return Err(engine_owned_policy_refusal(table, "SYNC CONFLICT"));
+    }
+    if let Some(direction) = incoming.sync_direction
+        && Some(direction) != canonical.direction
+    {
+        return Err(engine_owned_policy_refusal(table, "SYNC"));
+    }
+    if incoming.sync_safe && !canonical.sync_safe {
+        return Err(engine_owned_policy_refusal(table, "SYNC SAFE"));
+    }
+    Ok(())
+}
+
+/// The exact `(name, data type, is primary key)` column shape one of
+/// [`ENGINE_OWNED_LEDGER_TABLES`] declares in its own `CREATE TABLE` text, in
+/// declaration order -- mirrored by hand for the same reason
+/// [`engine_owned_ledger_policy`] is (`work_node_contacts` is
+/// `contextdb-server`'s table and its DDL constant is not importable from
+/// here; keep this in agreement with `CREATE_WORK_INPUTS` /
+/// `CREATE_WORK_CAPABILITIES` / `CREATE_PEER_DIRECTORY` /
+/// `contextdb_server::work_ledger::CREATE_WORK_NODE_CONTACTS` by hand if any
+/// of those four DDL strings ever changes). `None` for any table name outside
+/// the four.
+fn engine_owned_reserved_table_columns(
+    table: &str,
+) -> Option<&'static [(&'static str, DataType, bool)]> {
+    const WORK_INPUTS: &[(&str, DataType, bool)] = &[
+        ("input_key", DataType::Text, true),
+        ("job_id", DataType::Text, false),
+        ("seq", DataType::Integer, false),
+        ("payload", DataType::Text, false),
+    ];
+    const WORK_CAPABILITIES: &[(&str, DataType, bool)] = &[
+        ("capability_key", DataType::Text, true),
+        ("node_id", DataType::Text, false),
+        ("capability_id", DataType::Text, false),
+        ("tags", DataType::Json, false),
+        ("detail", DataType::Json, false),
+        ("advertised_at", DataType::Timestamp, false),
+    ];
+    const PEER_DIRECTORY: &[(&str, DataType, bool)] = &[
+        ("node_id", DataType::Text, true),
+        ("ticket", DataType::Text, false),
+        ("enrolled_at", DataType::Timestamp, false),
+    ];
+    const WORK_NODE_CONTACTS: &[(&str, DataType, bool)] = &[
+        ("node_id", DataType::Text, true),
+        ("last_contact_ms", DataType::Timestamp, false),
+    ];
+    match table {
+        "work_inputs" => Some(WORK_INPUTS),
+        "work_capabilities" => Some(WORK_CAPABILITIES),
+        "peer_directory" => Some(PEER_DIRECTORY),
+        "work_node_contacts" => Some(WORK_NODE_CONTACTS),
+        _ => None,
+    }
+}
+
+/// Validates that arriving wire-format columns for a fresh CREATE of one of the
+/// four engine-owned reserved tables match the canonical column structure --
+/// the mirror of [`refuse_engine_owned_reserved_name_shape`] for wire format
+/// instead of AST ColumnDef. `Ok` for any table outside
+/// [`ENGINE_OWNED_LEDGER_TABLES`], `Ok` for a canonical match, `Err` for a
+/// structural mismatch.
+pub(crate) fn refuse_engine_owned_reserved_name_shape_wire(
+    table: &str,
+    columns: &[(String, String)],
+) -> Result<()> {
+    let Some(canonical) = engine_owned_reserved_table_columns(table) else {
+        return Ok(());
+    };
+
+    if columns.len() != canonical.len() {
+        return Err(Error::SchemaInvalid {
+            reason: format!(
+                "table '{table}' is engine-owned infrastructure, not an operator table: its column \
+                 shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
+                 engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
+                 (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
+                 consumer types directly -- choose a different name for a table of your own.",
+                engine_owned_reserved_name_installer(table)
+            ),
+        });
+    }
+
+    for (column, (canonical_name, canonical_type, canonical_primary_key)) in
+        columns.iter().zip(canonical.iter())
+    {
+        let (wire_name, wire_type_str) = column;
+        if wire_name != canonical_name {
+            return Err(Error::SchemaInvalid {
+                reason: format!(
+                    "table '{table}' is engine-owned infrastructure, not an operator table: its column \
+                     shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
+                     engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
+                     (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
+                     consumer types directly -- choose a different name for a table of your own.",
+                    engine_owned_reserved_name_installer(table)
+                ),
+            });
+        }
+
+        let wire_type_upper = wire_type_str.to_ascii_uppercase();
+        let wire_primary_key = wire_type_upper.contains("PRIMARY KEY");
+
+        let canonical_type_matches = match canonical_type {
+            DataType::Text => wire_type_upper.starts_with("TEXT"),
+            DataType::Integer => {
+                wire_type_upper.starts_with("INTEGER") || wire_type_upper.starts_with("INT")
+            }
+            DataType::Json => wire_type_upper.starts_with("JSON"),
+            DataType::Timestamp => wire_type_upper.starts_with("TIMESTAMP"),
+            _ => false,
+        };
+
+        if !canonical_type_matches || wire_primary_key != *canonical_primary_key {
+            return Err(Error::SchemaInvalid {
+                reason: format!(
+                    "table '{table}' is engine-owned infrastructure, not an operator table: its column \
+                     shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
+                     engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
+                     (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
+                     consumer types directly -- choose a different name for a table of your own.",
+                    engine_owned_reserved_name_installer(table)
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// The function name of the installer that owns one of
+/// [`ENGINE_OWNED_LEDGER_TABLES`], named in
+/// [`refuse_engine_owned_reserved_name_shape`]'s refusal message.
+fn engine_owned_reserved_name_installer(table: &str) -> &'static str {
+    match table {
+        "work_inputs" | "work_capabilities" => "install_work_ledger_schema",
+        "peer_directory" => "install_peer_directory_schema",
+        "work_node_contacts" => "install_node_contacts_schema",
+        _ => "the owning installer",
+    }
+}
+
+/// The column-shape half of the reserved-name door: refuses a LOCAL `CREATE
+/// TABLE` of one of the four [`ENGINE_OWNED_LEDGER_TABLES`] names whose
+/// columns do not structurally match ([`engine_owned_reserved_table_columns`])
+/// the shape the owning installer's own `CREATE TABLE` text declares. `Ok`
+/// for any other table name.
+///
+/// This is deliberately a COLUMN check only, run independently of
+/// [`refuse_engine_owned_policy_axes`] (the policy half, run separately once
+/// the projected `TableMeta` exists): a create that restates the exact
+/// canonical columns but is silent on RETAIN / HISTORY / SYNC CONFLICT / SYNC
+/// still passes here -- that is exactly the shape a pre-declaration legacy
+/// root (or this round's own reconcile-heal tests, which construct that
+/// legacy root directly through this same local `CREATE TABLE` path) needs to
+/// keep working. What this check closes is different: before it existed,
+/// fresh LOCAL creation of one of these four names was entirely unguarded --
+/// neither door in this file nor its sync-apply mirrors judge a `CreateTable`
+/// for a table that does not yet exist locally, so a consumer could hand any
+/// column shape at all to a reserved name (see
+/// `engine_owned_ledger_policy_tests.rs`'s
+/// `drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile`
+/// doc comment, which named this as a separately tracked gap when the sync
+/// side's fresh-create door was scoped).
+fn refuse_engine_owned_reserved_name_shape(
+    table: &str,
+    columns: &[contextdb_parser::ast::ColumnDef],
+) -> Result<()> {
+    let Some(canonical) = engine_owned_reserved_table_columns(table) else {
+        return Ok(());
+    };
+    let matches_canonical = columns.len() == canonical.len()
+        && columns
+            .iter()
+            .zip(canonical.iter())
+            .all(|(column, (name, data_type, primary_key))| {
+                column.name == *name
+                    && column.data_type == *data_type
+                    && column.primary_key == *primary_key
+            });
+    if matches_canonical {
+        return Ok(());
+    }
+    Err(Error::SchemaInvalid {
+        reason: format!(
+            "table '{table}' is engine-owned infrastructure, not an operator table: its column \
+             shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
+             engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
+             (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
+             consumer types directly -- choose a different name for a table of your own.",
+            engine_owned_reserved_name_installer(table)
+        ),
+    })
+}
+
+/// The policy axes an engine-owned built-in ledger table
+/// ([`ENGINE_OWNED_LEDGER_TABLES`]) should carry after an arriving sync DDL
+/// that can legally touch its policy -- the `AlterTable` mirror and the
+/// `CreateTable` ADOPT arm, both gated by [`refuse_engine_owned_policy_axes`]
+/// before this merge ever runs, so `incoming`'s axes are at this point either
+/// silent or already equal to canonical. An axis `incoming` is SILENT on
+/// (`None`, or `false` for `sync_safe`, which has no explicit-off spelling)
+/// PRESERVES `current`'s value rather than clearing it -- the fix for the
+/// defect where the writer's full post-DDL shape, baked by every emitter
+/// whether or not that specific axis changed, was taken verbatim and so a
+/// silent/dropped axis landed as cleared. An axis `incoming` DOES carry
+/// adopts verbatim, which is a no-op when `current` already matches (the
+/// common case) and a heal when `current` predates the declaration (a
+/// legacy root converging through a peer's push, exactly as a local
+/// reconcile `ALTER` heals it). `None` for any table outside
+/// [`ENGINE_OWNED_LEDGER_TABLES`] -- callers keep the existing full-overwrite
+/// behavior there.
+pub(crate) struct EngineOwnedMergedPolicy {
+    pub(crate) default_ttl_seconds: Option<u64>,
+    pub(crate) retain_declared_unit: Option<RetainUnit>,
+    pub(crate) history_policy: Option<HistoryPolicy>,
+    pub(crate) conflict_policy: Option<ConflictPolicy>,
+    pub(crate) sync_direction: Option<SyncDirection>,
+    pub(crate) sync_safe: bool,
+}
+
+pub(crate) fn engine_owned_merged_policy(
+    table: &str,
+    current: &TableMeta,
+    incoming: &TableMeta,
+) -> Option<EngineOwnedMergedPolicy> {
+    engine_owned_ledger_policy(table)?;
+    Some(EngineOwnedMergedPolicy {
+        default_ttl_seconds: incoming.default_ttl_seconds.or(current.default_ttl_seconds),
+        retain_declared_unit: incoming
+            .retain_declared_unit
+            .or(current.retain_declared_unit),
+        history_policy: incoming.history_policy.or(current.history_policy),
+        conflict_policy: incoming.conflict_policy.or(current.conflict_policy),
+        sync_direction: incoming.sync_direction.or(current.sync_direction),
+        sync_safe: incoming.sync_safe || current.sync_safe,
+    })
+}
+
+/// What an `ALTER TABLE` is asking to change, on the one axis
+/// [`refuse_engine_owned_policy_mutation`] checks at a time. `Retain { window:
+/// None, .. }` is `DROP RETAIN`; `Retain { window: Some(..), .. }` is `SET
+/// RETAIN`. The `sync_safe` field of the mutation captures whether the
+/// statement included the SYNC SAFE flag, so the refusal gate can check it
+/// against the canonical `sync_safe` axis alongside the window. `SyncDirection`
+/// is `SET SYNC ...` (the `AlterAction::SetSyncDirection` arm) -- for a table
+/// whose canonical shape declares no direction at all (`None`, i.e. the
+/// default governs; every engine-owned table except `work_node_contacts`),
+/// ANY explicit `SET SYNC` differs from that canonical `None` and refuses;
+/// `work_node_contacts` alone tolerates the one value it declares,
+/// `SET SYNC OFF`, as a verbatim restatement.
+pub(crate) enum EngineOwnedMutation {
+    Retain {
+        window: Option<(u64, RetainUnit)>,
+        sync_safe: bool,
+    },
+    History(HistoryPolicy),
+    SyncConflict(ConflictPolicy),
+    SyncDirection(SyncDirection),
+}
+
+/// Refuse an `ALTER TABLE` that would move one of the four engine-owned
+/// built-in ledger tables ([`ENGINE_OWNED_LEDGER_TABLES`]) away from the
+/// policy the engine declared for it. `Ok` for any other table, and `Ok` for
+/// a mutation that only RESTATES the table's own declared shape verbatim --
+/// the installers' own reconcile arms (`install_work_ledger_schema`,
+/// `install_peer_directory_schema`,
+/// `contextdb_server::work_ledger::install_node_contacts_schema`) heal a
+/// legacy pre-declaration root by issuing exactly that restatement one axis
+/// at a time, and must keep working underneath this door -- see those
+/// functions' own doc comments for why `default_ttl_seconds.is_none()` (or
+/// the equivalent gap on `history_policy` / `conflict_policy`) can now only
+/// mean "this root predates the declaration," never "an operator dropped
+/// it," now that this door is shut.
+///
+/// This is the same door pattern as
+/// [`refuse_reclaimed_history_under_keep_first`]: called before the write
+/// lock is taken, so a refused ALTER applies no part of itself -- not even
+/// the accompanying `SYNC SAFE` flag on a `SET RETAIN`.
+pub(crate) fn refuse_engine_owned_policy_mutation(
+    table: &str,
+    mutation: EngineOwnedMutation,
+) -> Result<()> {
+    let Some(canonical) = engine_owned_ledger_policy(table) else {
+        return Ok(());
+    };
+    let clause = match mutation {
+        EngineOwnedMutation::Retain { window, sync_safe } => {
+            if window != canonical.retain {
+                "RETAIN"
+            } else if sync_safe && !canonical.sync_safe {
+                "SYNC SAFE"
+            } else {
+                return Ok(());
+            }
+        }
+        EngineOwnedMutation::History(policy) if Some(policy) != canonical.history => "HISTORY",
+        EngineOwnedMutation::SyncConflict(policy) if Some(policy) != canonical.conflict => {
+            "SYNC CONFLICT"
+        }
+        EngineOwnedMutation::SyncDirection(direction) if Some(direction) != canonical.direction => {
+            "SYNC"
+        }
+        _ => return Ok(()),
+    };
+    Err(engine_owned_policy_refusal(table, clause))
+}
+
+/// The message [`refuse_engine_owned_policy_mutation`] and its arriving-sync-DDL
+/// mirror in `database.rs` both raise -- one place so the two doors never
+/// drift onto different wording for the same refusal.
+pub(crate) fn engine_owned_policy_refusal(table: &str, clause: &str) -> Error {
+    let tunable_surface = if table == "work_inputs" {
+        " Tune how promptly a job's ledger-carried input copies are treated as gone via \
+          run_input_retention's grace-period argument, not this table's schema."
+    } else {
+        ""
+    };
+    Error::SchemaInvalid {
+        reason: format!(
+            "table '{table}' is engine-owned infrastructure, not an operator table: its \
+             {clause} declaration lives once, in the engine's own CREATE TABLE text for \
+             {table}, and the engine's own bookkeeping depends on it staying exactly as \
+             declared there -- changing it here would leave the engine reasoning about a \
+             shape the stored rows no longer match. {table} is (re)declared only by the \
+             installer that owns it, never by an ALTER an operator types. Declare RETAIN / \
+             HISTORY / SYNC CONFLICT on tables you create instead -- ALTER TABLE there is \
+             unrestricted.{tunable_surface}"
+        ),
+    }
 }
 
 fn expires_column_name(columns: &[contextdb_parser::ast::ColumnDef]) -> Result<Option<String>> {
@@ -9143,5 +10032,65 @@ mod tests {
             !resolved_ids.contains(&post_pin_seed),
             "post-pin seed leaked into graph filter subquery resolution"
         );
+    }
+
+    #[test]
+    fn default_01_writer_and_evaluator_agree_on_integer_shape() {
+        let stored = stored_default_expr(&Expr::Literal(Literal::Integer(5)));
+        assert_eq!(
+            stored, "5",
+            "writer must keep serializing INTEGER defaults as a bare number"
+        );
+        let value = evaluate_stored_default_expr(&stored)
+            .expect("evaluator must read back exactly what the writer stores");
+        assert_eq!(value, Value::Int64(5));
+    }
+
+    #[test]
+    fn default_02_writer_and_evaluator_agree_on_real_shape() {
+        let stored = stored_default_expr(&Expr::Literal(Literal::Real(3.5)));
+        assert_eq!(
+            stored, "3.5",
+            "writer must keep serializing REAL defaults as a bare number"
+        );
+        let value = evaluate_stored_default_expr(&stored)
+            .expect("evaluator must read back exactly what the writer stores");
+        assert_eq!(value, Value::Float64(3.5));
+    }
+
+    #[test]
+    fn default_02b_whole_number_real_default_widens_to_float_for_the_column() {
+        // `REAL DEFAULT 0.0` (docs/query-language.md's own canonical `tasks`
+        // example) round-trips through the writer as the bare string "0" --
+        // indistinguishable at the string level from an INTEGER default of 0.
+        // evaluate_stored_default_expr alone can only return the natural
+        // numeric parse (Int64); it takes the column's declared type, applied
+        // by the caller that fills defaults, to land on Float64. That full
+        // path is covered end to end by sql_01c/sql_01d in
+        // sql_surface_tests.rs; here we just pin the raw evaluator's honest
+        // ambiguous-shape behavior so a future edit cannot silently start
+        // guessing REAL instead.
+        let stored = stored_default_expr(&Expr::Literal(Literal::Real(0.0)));
+        assert_eq!(stored, "0");
+        let value = evaluate_stored_default_expr(&stored)
+            .expect("evaluator must read back exactly what the writer stores");
+        assert_eq!(value, Value::Int64(0));
+    }
+
+    #[test]
+    fn default_03_evaluator_also_tolerates_the_legacy_wrapped_shape() {
+        // A data root created before this fix may hold a stored default in the
+        // wrapped `Literal(Integer(..))` / `Literal(Real(..))` shape (the shape
+        // the earlier catch-all Debug fallback could have produced, and the
+        // shape the evaluator's dedicated branches were written against). Read
+        // tolerance for that shape must not regress even though the writer
+        // never emits it going forward.
+        let int_value = evaluate_stored_default_expr("Literal(Integer(5))")
+            .expect("legacy wrapped integer shape must still be readable");
+        assert_eq!(int_value, Value::Int64(5));
+
+        let real_value = evaluate_stored_default_expr("Literal(Real(0.5))")
+            .expect("legacy wrapped real shape must still be readable");
+        assert_eq!(real_value, Value::Float64(0.5));
     }
 }

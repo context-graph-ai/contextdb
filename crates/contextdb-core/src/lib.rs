@@ -11,9 +11,9 @@ pub use memory::*;
 // crates must use fully-qualified paths at ambiguous sites.
 pub use table_meta::{
     AclRef, ColumnDef, ColumnType, CompositeForeignKey, ConflictPolicy, DEFAULT_CONFLICT_POLICY,
-    DEFAULT_SYNC_DIRECTION, ForeignKeyReference, IndexDecl, IndexKind, PropagationRule, RankPolicy,
-    RetainUnit, ScopeLabelKind, SingleColumnForeignKey, SortDirection, StateMachineConstraint,
-    SyncDirection, TableMeta, VectorQuantization,
+    DEFAULT_HISTORY_POLICY, DEFAULT_SYNC_DIRECTION, ForeignKeyReference, HistoryPolicy, IndexDecl,
+    IndexKind, PropagationRule, RankPolicy, RetainUnit, ScopeLabelKind, SingleColumnForeignKey,
+    SortDirection, StateMachineConstraint, SyncDirection, TableMeta, VectorQuantization,
 };
 pub use traits::*;
 pub use types::*;

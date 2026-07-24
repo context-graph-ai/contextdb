@@ -203,7 +203,12 @@ impl ChangeSet {
 /// resolver: an explicit override, then a multi-column primary key, then a
 /// single-column primary key, then a literal `id` column. `None` means the
 /// table has no identity and its rows are keyless-skipped from sync.
-pub(crate) fn natural_key_columns_for_meta(meta: &TableMeta) -> Option<Vec<String>> {
+///
+/// Public (not `pub(crate)`): a sync-eligibility caller outside this crate
+/// (e.g. `contextdb-server`'s push-time refusal for a keyless table with no
+/// usable identity) consumes this SAME resolver rather than re-deriving the
+/// precedence rule on its own.
+pub fn natural_key_columns_for_meta(meta: &TableMeta) -> Option<Vec<String>> {
     if let Some(column) = &meta.natural_key_column {
         return Some(vec![column.clone()]);
     }
@@ -751,6 +756,41 @@ pub struct ApplyResult {
     pub skipped_rows: usize,
     pub conflicts: Vec<Conflict>,
     pub new_lsn: Lsn,
+}
+
+/// Whether a changeset being applied is a continuing pull against a stable,
+/// already-adopted source, or a full re-fetch from LSN 0 that a client issued
+/// right after detecting that its cursor's source (the serving store's
+/// incarnation) changed — a hub wiped and rebuilt under the same transport
+/// identity, the standard recovery flow.
+///
+/// The two cases arbitrate differently under `ConflictPolicy::LatestWins`.
+/// On the stable path, a row's carried arrival is compared against this
+/// store's existing sidecar — both minted by the SAME source, so the
+/// comparison is meaningful. After a source change that comparison is
+/// meaningless: the two incarnations mint arrival numbers from unrelated,
+/// independently-reset counters, so a low arrival freshly stamped by a
+/// rebuilt hub is not "older" than a high arrival recorded under the extinct
+/// one — treating it as a stale echo would silently drop a row that reached
+/// the rebuilt hub by sync from another edge (the standard rebuild-recovery
+/// flow), breaking every-pushed-row-reaches-every-puller.
+///
+/// `ReadoptingSource` trusts the served value over any row whose CURRENT
+/// committed value is itself unmodified since its last sync (a live
+/// sidecar) — never over a row a local write has since diverged, which
+/// clears its sidecar regardless of this mode (see
+/// `Database::sync_source_lsn_updates`). A locally-authored value that was
+/// never pushed anywhere therefore never reaches the served-always-wins
+/// arm: it falls through to the same comparison the stable path uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncAdoption {
+    /// The ordinary path: this store's cursor already addresses the source
+    /// serving this changeset.
+    Continuing,
+    /// This changeset is the full re-fetch from LSN 0 issued because the
+    /// cursor's source just changed. Every row in it belongs to the newly
+    /// adopted source, for the whole duration of this apply.
+    ReadoptingSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
