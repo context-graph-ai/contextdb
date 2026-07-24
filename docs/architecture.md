@@ -227,7 +227,7 @@ pub trait DatabasePlugin: Send + Sync {
 }
 ```
 
-All methods have default no-op implementations. `CorePlugin` ships as the default and handles engine-internal concerns (subscriptions, retention pruning).
+All methods have default no-op implementations. `CorePlugin` ships as the default and handles engine-internal concerns (subscriptions). Retention pruning and version cleanup are NOT plugin-driven — they are the engine-owned maintenance loop described below.
 
 Inject a custom plugin:
 
@@ -236,6 +236,35 @@ let plugin = Arc::new(MyPlugin::new());
 let db = Database::open_with_plugin(path, plugin)?;
 // or: Database::open_memory_with_plugin(plugin)?
 ```
+
+---
+
+## Maintenance (retention + version cleanup)
+
+contextdb starts one background maintenance thread per database, and only when that database declares something to maintain: a `RETAIN` window on some table, `HISTORY CURRENT ONLY` on some table, or a durable trigger with an audit history. It ticks once a minute, does near-zero work when there is nothing to reclaim (a cheap gate reads only the in-memory table map, never the commit lock, before deciding whether a cycle is worth running), and self-starts and self-stops as declarations arrive or leave — no consumer call is required. A database that declares none of the above starts no thread at all, so an embedding consumer (a library caller that never declares `RETAIN` or `HISTORY CURRENT ONLY`) gets no background thread it did not ask for.
+
+One cycle runs two passes, in order: retention (rows past their declared `RETAIN` window) then version cleanup (superseded versions of a table declaring `HISTORY CURRENT ONLY`) — a row that expires this cycle is never version-collapsed first.
+
+**Version cleanup and a held read snapshot.** Every in-flight statement registers its own read snapshot for the call's duration, and a caller that needs to reuse a `SnapshotId` ACROSS separate calls (on a table declaring `HISTORY CURRENT ONLY`) registers it explicitly via `Database::pin_snapshot`, holding the returned guard for as long as the snapshot is still wanted. A version-cleanup pass samples every currently-registered snapshot (not merely the oldest) plus the committed watermark, atomically, once at the start of the pass, and defers any superseded version still visible to ANY of those registered snapshots to a later cycle — a version created between two registered snapshots and superseded after both is protected by the higher one even though the lower one alone would not see it. Protection begins when `pin_snapshot` RETURNS: a pin requested while a removal pass is already mid-flight, for a snapshot at or before that pass's sampled watermark, waits for the pass to finish first (bounded by one pass duration) before registering, so the pin can never return with a false promise of protection the SAME in-flight pass is still free to violate — the next cleanup cycle honors it instead. A pin for a snapshot strictly after the pass's watermark registers immediately: nothing that pass can prune was ever visible to it. Versions a pass already reclaimed before the pin is requested cannot come back; that boundary is unchanged.
+
+**The cost model.** Both passes remove exactly what they reclaim — the row versions, the change-log entries that referenced them, and (version cleanup only) the vector copies attached to a released row version — each in its own bounded, point-removal redb write transaction: row/change-log removal first, then vector/edge removal (only when there is a released vector to reclaim), then commit-index removal, up to three independent transactions per pass. Nothing else in the file is read or rewritten in any of them: a table's surviving rows, an unrelated table's rows, and every vector or edge that is not part of what is being reclaimed stay untouched. Memory only follows once every persisted transaction has succeeded; a failure between transactions leaves persisted state strictly AHEAD of the in-memory snapshot — benign over-retention, never a lost version or a corrupt change-log entry — and the next maintenance cycle re-attempts and completes the same work. Cost is proportional to what is reclaimed, never to the size of the database or to how much unrelated data (vectors, edges, other tables) shares the file. Version cleanup never opens the graph tables at all — edge identity is self-owned (`source`, `target`, `edge_type` plus its own `created_tx`/`lsn`), versioned by no relational row, so cleanup neither needs nor claims edge boundedness; a table that accumulates superseded edge copies needs its own accounting, tracked separately.
+
+**This pass-scoping is separate from — and does not replace — redb's own file compaction; the two are different-shaped costs reported through different receipts.** A scoped pass is O(what it reclaimed); a redb `compact()` rewrites the *whole file* to turn freed pages back into real file-size reduction, so it is never folded into a pass's own timing. Do not assume every prune shrinks the file: redb reuses freed pages in place, so a steady-state cycle usually reclaims bytes without the file getting smaller at all — only a compaction does that. Cross-check any file-shrink claim against a real measurement rather than assuming it from the reclaim numbers; a redb compaction has been observed to *grow* a file in at least one measured case (page reorganization overhead), so "compacted" is not a synonym for "smaller."
+
+Retention keeps its original, self-contained decision: `run_pruning_cycle_checked` samples the dead-space fraction *before* it prunes and, if that pre-prune reading is already at or over the shared threshold, compacts once, synchronously, inside that same call — reported on `PruningReport` (`compacted`, `fragmentation_before`, `file_bytes_before`/`_after`). Currency version cleanup (`compact_currency_versions`) does **not** — it never calls `compact()` itself, at any threshold, because a small file where routine superseded-version debris is a large fraction of it can cross the threshold on *every* cycle, and coupling a scoped O(pruned) pass to an O(whole-file) rewrite on every tick reintroduces the exact per-cycle cost the pass-scoping exists to remove (measured directly by the version-cleanup scaling bench). Compaction for a currency table is instead:
+
+- **An explicit operator action** — `Database::compact_now()` (`.maintenance compact` in the CLI): unconditional, on demand, no threshold, no interval gate. Returns a `CompactionReport` (`ran`, `duration_micros`, `bytes_before`/`_after`, `file_shrank`, `fragmentation_before`, `handle_recycled`, `handle_recycle_micros`).
+- **A much rarer automatic path** — `Database::run_maintenance_cycle`'s engine-owned tick checks the threshold *and* a minimum interval (`AUTO_COMPACT_MIN_INTERVAL`, one hour by default) after every scheduled cycle's own passes have already run, outside any commit lock; it fires at most once per interval regardless of how many cycles cross the threshold in between. Its result rides `MaintenanceReport.compaction` — the same `CompactionReport` shape, separate from `currency.redb_compacted` (which now always reads `false`: it describes only what the scoped currency pass itself decided, which is nothing).
+
+**Compaction restores file size AND steady-state write cost.** A file-level redb `compact()` shrinks the file and fully normalizes its on-disk btree, but redb also retains in-process allocator/region bookkeeping sized to the database's historical peak allocation, and a file-level compact does not reset that on its own. So `RedbPersistence::compact` — the one function both the explicit and automatic paths call — closes the store's redb handle and reopens the same file immediately after the file-level compaction finishes, under the same lock that already serializes every other access to the store; no caller can observe an intermediate closed state. This is what `handle_recycled`/`handle_recycle_micros` report, timed separately from the file-level compaction itself. A long-running embedded consumer has no other opportunity to clear that in-process state — it cannot process-restart — so compaction does it on the consumer's behalf every time. On a reopen failure the on-disk file is untouched (nothing more is written to it after the file-level compact finishes) and the store is left closed; a fresh `Database::open` on the same path recovers every row.
+
+A deliberate working-headroom margin between the shrink and the recycle was tried and measured NOT to help: redb's own close-time bookkeeping (`Drop for redb::Database`'s `ensure_allocator_state_table_and_trim`) regrows a maximally-shrunk file to roughly the same final size whether or not a margin was left beforehand, so the margin only cost two extra write transactions for no measured benefit — removed.
+
+**A store under its DECLARED-FROM-THE-START maintenance regime meets the steady-state ceiling immediately, on its very first post-compact cycle** — every measurement of a table that has always had `HISTORY CURRENT ONLY` declared, compacted regularly, shows no elevated window at all. **A RETROFIT root — a table carrying a large amount of history accumulated BEFORE it was ever compacted even once — pays one real, but strictly one-time and single-cycle, elevated cost right after its first compaction**, confirmed directly (the version-cleanup-scaling bench's A2 arm, and its own `run_a2_retrofit_recipe`): the cycle immediately following a retrofit root's first-ever compaction runs measurably slower than the declared-from-the-start regime, but the very NEXT cycle already drops back into the normal few-millisecond range, and a second `compact_now()` run after that real write activity — never a special mechanism, just calling the same explicit operator action again — fully restores the identical regime a declared-from-the-start table has from the start. The honest operational guidance for a retrofit root: run `.maintenance compact` once to reclaim space, expect one elevated cycle immediately after, and run it a second time once some normal write activity has occurred to lock in the restored steady-state cost — this is the ordinary explicit action used twice, not a distinct maintenance mode.
+
+**Eligibility is declared, not named.** A table is version-cleanup-eligible because it declares `HISTORY CURRENT ONLY`, never because of its name. The three built-in fabric tables (`work_capabilities`, `peer_directory`, `work_node_contacts`) declare it in their own `CREATE TABLE` text like any other table would.
+
+**Those three tables' declared policy, plus `work_inputs`' `RETAIN 7 DAYS`, is engine-owned, not operator policy.** All four are built-in work-fabric tables (see the [work-fabric skill](../skills/work-fabric/SKILL.md)) whose own bookkeeping depends on staying at the shape declared in their own `CREATE TABLE` text: `work_inputs`' retention window is what keeps ledger-carried input copies bounded, and the three currency tables' `HISTORY CURRENT ONLY` plus their `SYNC CONFLICT KEEP LATEST` (or `SYNC OFF`) is what makes version-cleanup safe to reclaim their superseded rows at all. A locally-typed `ALTER TABLE` refuses any `RETAIN` / `HISTORY` / `SYNC CONFLICT` / `SYNC ...` / `SYNC SAFE` change to one of these four tables outright, with a message naming the table as engine-owned infrastructure — including `SET SYNC ...` (`work_node_contacts`' own `SYNC OFF` declaration is guarded on this axis exactly like the others). A locally-typed `CREATE TABLE` of one of these four names is guarded too: it refuses unless the declared columns structurally match the owning installer's own `CREATE TABLE` text, and refuses an explicit non-canonical policy clause the same way the ALTER door does — a table under any other name remains entirely unrestricted, and this is the ONLY restriction fresh creation of one of the four names carries (silence on policy, i.e. the pre-declaration legacy shape, still passes). An arriving sync DDL is held to the identical shape by THREE guards because a peer's own DDL always carries the table's FULL current shape, whether or not a given axis actually changed: an EXPLICIT differing value — spelled as an `AlterTable`, as a `CreateTable` adopting an already-existing table, or as a fresh `CreateTable` of a reserved name (guarding against DROP + CREATE circumvention) — is refused atomically for the whole batch before any of it is written; an axis the arriving DDL is simply SILENT on PRESERVES the table's current declared value instead of being read as an implicit clear, which is what lets a half-healed peer's own in-progress multi-step reconcile interoperate. This is not a workaround for a missing knob: an installer (or a peer) that only ever heals a legacy root back to its own declared shape needs no exception, because a healing call always restates that same declared shape verbatim, and a verbatim restatement always applies — locally, and over sync.
 
 `pre_commit` can reject a transaction by returning `Err`. `post_commit` fires after the write is durable. Downstream applications use contextdb as a library and accept `Database` via dependency injection — they are database **users**, not plugin authors.
 
@@ -289,12 +318,24 @@ instead of parsing memory operation tags.
 
 ## Sync
 
-The wire protocol is currently `PROTOCOL_VERSION = 5`. The ALPN identifier
+The wire protocol is currently `PROTOCOL_VERSION = 6`. The ALPN identifier
 deliberately stays `contextdb.sync.v4` — it names the transport framing, which is
 unchanged; payload version skew is caught by the envelope check below, not the ALPN.
 The server reports the supported protocol version in `contextdb-server --version`
 and in its INFO logs; mismatched envelopes are rejected instead of being
 partially applied.
+
+Version 6 added exactly two fields, nothing else on the wire moved:
+`WireRowChange.arrival` (the row's ordering position on the node that
+accepted it) and `PullResponse.source` (the serving store's per-tenant
+incarnation) — see "Arrival Ordering" and "Pull Cursors Are Bound To Their
+Serving Store" below. A version-mismatched peer is refused loudly on push,
+pull, and the dedicated status exchange: no rows move, no watermark advances
+on either side, and the error names the remedy (upgrade both ends) rather
+than just the two version numbers. A mixed fleet simply stops syncing until
+every participant is on the same release — nothing is lost in the meantime,
+because a refused exchange never advances a watermark it would otherwise
+have earned.
 
 ### Deployment Topology
 
@@ -340,6 +381,33 @@ Both communicate over per-tenant sync channels: `sync.{tenant_id}.push` / `sync.
 - On pull: requests all changes since the pull watermark
 - After restart: `full_state_snapshot` fallback rebuilds from current state (the ephemeral change log is lost)
 
+**A table needs a sync identity to sync.** A row is told apart from another
+row of the same table by its identity: a declared `PRIMARY KEY`
+(single-column or table-level `PRIMARY KEY (a, b, ...)`), or failing that, an
+indexed `id` column as a fallback. A table declaring neither has no way to
+tell one row from another across the wire — this is a **keyless table**.
+
+A keyless table that would never leave the machine anyway (`SYNC OFF`) is
+unaffected; it was never eligible to sync either way. But a keyless table
+that WOULD sync (any other direction — the default is `SYNC TWO WAY`) makes
+`push()` refuse loudly with `Error::SyncError`, naming the three ways to fix
+it, rather than silently reporting success while that table's rows never
+actually cross the wire:
+
+```
+table 'events' has no usable sync identity — no declared PRIMARY KEY and no
+indexed `id`-column fallback — so its rows cannot be told apart across the
+wire. Push refuses rather than silently omitting them while reporting
+success. Fix one of: declare a PRIMARY KEY on 'events'; add an indexed `id`
+column as the fallback identity; or declare 'events' SYNC OFF.
+```
+
+This is a covering-index requirement in spirit: a table an application means
+to sync must declare an identity, the same way a table meant to be looked up
+efficiently declares an index. There is no silent partial-sync mode — either
+the table can be synced (it has an identity) or it explicitly opts out
+(`SYNC OFF`); nothing in between quietly drops rows.
+
 ### Conflict Resolution
 
 Per-table configurable policies:
@@ -365,6 +433,44 @@ about it, which a receiver that cannot see the row has no basis to claim, and th
 name the hidden row's natural key, disclosing the very existence the access boundary exists to
 hide. So "identical content is a no-op" is a statement about rows within visible scope; a hidden
 row is refused outright, whatever it contains.
+
+#### Arrival Ordering
+
+`LatestWins` arbitrates on **one clock: the accepting node's own ordering of arrivals** — never
+two machines' independent LSN counters. Each row's wire form carries `arrival`: the ordering
+position some node already gave it, or absent when the sender itself authored the row fresh and
+never yet synced it anywhere. The rule:
+
+- byte-identical values → no-op (the ordinary re-delivery case above);
+- the incoming row carries no arrival → this accepting node is the one ordering it, so it always
+  wins over whatever is already held, regardless of the sender's own local clock;
+- the incoming row carries an arrival at or below the position already stored for that row → a
+  stale echo — a no-op, never a conflict and never counted as skipped;
+- the incoming row carries a strictly higher arrival → it wins.
+
+The winner is therefore always the mutation the accepting node took last — never the row from
+whichever machine happened to have run more local writes first. `arrival` is minted from the
+accepting node's own commit LSN (the same value already restored monotonically at open — no new
+counter, no new durable table) and is re-stamped forward on every winning apply, so a later
+relay of the same row carries the position the FLEET actually agrees on, not the sender's own
+unrelated counter. A row accepted without an established position takes EXACTLY its own commit
+position on the accepting node — never a value sampled before that commit was ordered, so two
+rows accepted around the same instant can never be minted the same arrival only to land at two
+different committed positions.
+
+#### Pull Cursors Are Bound To Their Serving Store
+
+A pull cursor is only ever compared against the history of the store that issued it. The puller
+persists `(source incarnation, lsn)` as one record — never a bare `Lsn` — so a page served by a
+store other than the one the cursor addresses is discarded unapplied, the cursor resets to
+`Lsn(0)`, and the client fully re-pulls the new store's history. This covers two operator-facing
+scenarios a bare watermark cannot: pointing an edge at a different endpoint for the same tenant,
+and a hub wiped and rebuilt under the same transport identity. A mid-pull source change (the
+serving store changes between two pages of one paged pull) discards only the mismatched page —
+whatever already applied from earlier pages, and their cursor advance, stands. The existing
+stale-restore guard (fires when the new store's clock is numerically BEHIND the old cursor) is
+unaffected and still applies; source binding closes the complementary case where the new store is
+numerically AHEAD but holds real history below the old cursor.
 
 ### Transport
 
@@ -455,7 +561,30 @@ opaque, content-addressed bytes between nodes:
   to the requested `BlobHash` ever reach the sink. Errors are a matchable
   `ResolveError`: `Unentitled`, `PolicyForbidden`, `HashMismatch`,
   `HolderUnreachable`, `LocalStoreUnavailable`, `BlobNotFound`,
-  `TransferAborted`, `SinkWrite`.
+  `TransferAborted`, `SinkWrite`, `FetchTimedOut`.
+- **Fetch deadline**: the whole `resolve_blob_ref` attempt — dial, the
+  holder's tag bookkeeping, and the verified transfer loop — is bounded by a
+  declared `BlobFetchPolicy { fetch_deadline_ms }` (documented default:
+  `120_000`, i.e. 120s). Set it per instance with
+  `blob_store.set_fetch_policy(BlobFetchPolicy { fetch_deadline_ms: 30_000 })`
+  before calling `resolve_blob_ref`. The bound is enforced by spawning the
+  fetch and timing out the JOIN, not the future being awaited directly, and
+  the abandoned fetch is aborted at the next yield point — a fetch that
+  never yields continues occupying its worker thread until it completes, it
+  is not preempted. **This bound is runtime-shape-dependent, not
+  unconditional:** on a MULTI-THREAD tokio runtime the caller genuinely
+  returns within the declared timeout regardless of the fetch's internal
+  behavior, because a non-yielding spawned task can only occupy the one
+  worker thread it landed on, leaving the timer free to fire on another
+  thread. On a CURRENT-THREAD runtime there is only one OS thread total, so
+  a spawned fetch that never cooperatively yields starves that thread
+  entirely — including the timer backing this very deadline — and the
+  caller does NOT return within the bound until the fetch itself yields or
+  completes. Dropping the `resolve_blob_ref` future early (e.g. because ITS
+  OWN caller applied a shorter outer timeout) has the same multi-thread-only
+  guarantee, so a current-thread runtime is never left waiting
+  un-cancellably by this mechanism alone — choose a multi-thread runtime
+  when this deadline must hold regardless of a peer's behavior.
 - **Reclaim**: `reclaim_unreferenced(now_ms, grace_ms)` frees a blob once every
   job referencing it is terminal past the grace window (or once no job
   references it at all). A later resolve attempt against a reclaimed blob
@@ -519,31 +648,59 @@ let bytes_written = blob_store
 ### Upgrading the store format
 
 The on-disk store carries a format-version marker (current: `1.0.0`). Opening a
-data root written by an incompatible older format fails closed with
-`LegacyVectorStoreDetected` rather than silently corrupting or misreading it.
+data root written by an incompatible older release — either the top-level
+marker doesn't match, or the marker matches but the underlying
+`TableMeta`/`ColumnDef` row-meta layout still predates this release (see
+`v1.0.0`, below) — fails closed with `LegacyVectorStoreDetected` rather than
+silently corrupting or misreading it. The error names the recovery command:
 
-There is no automated in-place migration today. The supported upgrade path is
-one of:
+```bash
+contextdb migrate ./my.db
+```
 
-- sync from a peer already running the 1.0+ format, so the new store is
-  populated by a normal sync pull instead of by reading the old file directly, or
-- recreate the schema on a fresh data root and reimport the data.
+`migrate` writes a `./my.db.bak` backup of the untouched original BEFORE
+changing anything, reads every row/edge/vector/DDL statement out of the legacy
+root through a dedicated legacy-format reader, writes it into a fresh
+current-format root, and atomically swaps it in. A second `migrate` run on the
+now-current-format path is a safe no-op; running it on a path that was never
+legacy refuses without touching the file. Sync-from-a-1.0+-peer remains an
+alternative when you would rather populate a fresh store by a normal sync pull
+than migrate the file directly.
+
+The `v1.0.0`-specific case `migrate` was built against: that release's
+`TableMeta`/`ColumnDef` structs had fewer trailing fields than today's, and
+because the on-disk struct-as-tuple encoding carries no field-count marker, a
+decoder that optimistically reads past its OWN declared fields (the pattern
+this crate uses to tolerate an OLDER, shorter *current*-shaped payload) does
+not cleanly detect "no more fields for me" on a genuinely OLDER struct shape —
+it keeps consuming bytes belonging to the next field, and only surfaces once a
+borrowed byte lands somewhere it can't satisfy. `migrate`'s legacy reader
+matches the exact old field layout instead of leaning on that same tolerance.
 
 ### Recovering a wedged or corrupt data root
 
 A corrupt or truncated store is detected on open and surfaced as
-`StoreCorrupted`, with the error message naming the next step rather than
-leaving the caller to guess. There is no in-place repair. Recovery is one of:
+`StoreCorrupted`, with the error message naming the next commands rather than
+leaving the caller to guess:
 
-- restore from a backup, or
-- restore from a healthy sync peer, or
-- remove the data-root file and let it recreate empty, then repopulate it (by
-  sync or by reimport).
+```bash
+contextdb repair ./my.db   # read-only: reports what is salvageable/diagnosable, never modifies the store
+contextdb reset ./my.db --force   # destructive: recreates a fresh, empty current-format store at the same path
+```
+
+`repair` reads the store's format marker and top-level schema layout through a
+read-only handle and reports its diagnosis (current-format and readable,
+legacy-format, or corrupt/truncated with the underlying reason) — it never
+opens the store read-write and never writes to the path, so running it is
+always safe. `reset` refuses without `--force` (see [CLI Reference](cli.md) for
+the exit code it uses); with `--force` it deletes the existing file and
+recreates an empty store, so restore anything you need from a backup or a
+healthy sync peer FIRST if the data still matters.
 
 A second `open` of a data-root file already held open by another process — same
 process or a different one — returns a database-locked error; that is the
 ownership guarantee described under Store Ownership & Concurrency, not a
-corruption signal, and doesn't call for any of the recovery steps above.
+corruption signal, and doesn't call for either command above.
 
 ---
 

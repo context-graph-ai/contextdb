@@ -2,14 +2,14 @@
 
 contextdb is primarily used as an embedded Rust library. The CLI is for exploration, debugging, and scripting against a database file.
 
-Two binaries: `contextdb-cli` (interactive client) and `contextdb-server` (sync coordinator).
+Two binaries: `contextdb` (interactive client) and `contextdb-server` (sync coordinator).
 
 ---
 
-## CLI Client (`contextdb-cli`)
+## CLI Client (`contextdb`)
 
 ```
-contextdb-cli <PATH> [OPTIONS]
+contextdb <PATH> [OPTIONS]
 ```
 
 `<PATH>` is the database file. Use `:memory:` for an in-memory (ephemeral) database.
@@ -31,12 +31,12 @@ contextdb-cli <PATH> [OPTIONS]
 For scripting and agents, `--json` turns query results into a JSON array of row objects with no row cap, and turns non-query statements (`CREATE TABLE`, `INSERT`, etc.) into a small JSON status object:
 
 ```bash
-$ echo "SELECT * FROM entities;" | contextdb-cli ./my.db --json | jq '.[0].name'
+$ echo "SELECT * FROM entities;" | contextdb ./my.db --json | jq '.[0].name'
 "sensor-1"
 ```
 
 ```bash
-$ echo "CREATE TABLE t (id UUID PRIMARY KEY);" | contextdb-cli :memory: --json
+$ echo "CREATE TABLE t (id UUID PRIMARY KEY);" | contextdb :memory: --json
 {"rows_affected":0}
 ```
 
@@ -45,21 +45,21 @@ Under `--json`, stdout is **JSON Lines**: one complete JSON document per line, o
 Every meta-command emits a document too. Each one's top-level key names its payload:
 
 ```bash
-$ echo ".tables" | contextdb-cli ./my.db --json
+$ echo ".tables" | contextdb ./my.db --json
 {"tables":["decisions","entities","intentions"]}
 ```
 
 ```bash
-$ echo ".schema decisions" | contextdb-cli ./my.db --json | jq '{pk: .primary_key, retain: .retain}'
+$ echo ".schema decisions" | contextdb ./my.db --json | jq '{pk: .primary_key, retain: .retain}'
 {"pk":["id"],"retain":{"window":30,"unit":"DAYS","seconds":2592000,"sync_safe":true}}
 ```
 
-`.schema` returns the table's declared contract as data — `columns` (each with type, nullability, key/unique/immutable flags, `references` and its `ON STATE ... PROPAGATE SET ...` clause, vector quantization, rank policy), `primary_key`, `indexes`, `state_machine`, `retain`, `sync_direction`, `conflict_policy`, `dag_edge_types` and `propagate` (all three rule kinds, including the foreign-key rules the DDL renders on their column) — plus `ddl`, the exact text the human `.schema` prints, so a snapshot/replay flow keeps working. A policy the table never declared is absent rather than filled in with a default nobody wrote.
+`.schema` returns the table's declared contract as data — `columns` (each with type, nullability, key/unique/immutable flags, `references` and its `ON STATE ... PROPAGATE SET ...` clause, vector quantization, rank policy), `primary_key`, `indexes`, `state_machine`, `retain`, `history`, `sync_direction`, `conflict_policy`, `dag_edge_types` and `propagate` (all three rule kinds, including the foreign-key rules the DDL renders on their column) — plus `ddl`, the exact text the human `.schema` prints, so a snapshot/replay flow keeps working. A policy the table never declared is absent rather than filled in with a default nobody wrote. `history` is `{"policy":"ALL"}` or `{"policy":"CURRENT_ONLY"}` when declared — an object, like `retain`, so a future windowed form can add keys without a shape break.
 
 `sync_direction` and `conflict_policy` speak a fixed vocabulary, the DDL's own clause words in lowercase — `sync_off`, `push_only`, `pull_only`, `two_way` for the direction, and `keep_first`, `keep_latest` for the two declarable policies. Two more policies exist on the engine's built-in distributed-contract tables and have no DDL clause to declare them: `server_wins` and `edge_wins`. The same words appear in `.sync direction` and `.sync policy` documents, so one concept reads the same everywhere.
 
 ```bash
-$ echo ".sync status" | contextdb-cli ./my.db --tenant-id acme --sync-endpoint <ticket> --json
+$ echo ".sync status" | contextdb ./my.db --tenant-id acme --sync-endpoint <ticket> --json
 {"sync":{"configured":true,"tenant":"acme","endpoint":"...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17}}
 ```
 
@@ -103,8 +103,8 @@ Pass `--all` to disable the cap and print every row. `--all` only affects the ta
 The simplest way to start — no server, no network:
 
 ```bash
-contextdb-cli :memory:         # ephemeral, lost on exit
-contextdb-cli ./my.db          # persisted to file
+contextdb :memory:         # ephemeral, lost on exit
+contextdb ./my.db          # persisted to file
 ```
 
 All sync commands report `Sync not configured` in this mode: `.sync status` and `.sync auto` answer and exit `0`, while the action subcommands fail (exit `1`) rather than let a script read an action that never happened as success.
@@ -116,8 +116,8 @@ To replicate with a server, provide `--tenant-id` matching the server's tenant. 
 Point the edge at the server by pasting the server's enrollment ticket into `--sync-endpoint`. The server prints its ticket to stdout on startup as `enrollment ticket: <...>` (its cryptographic identity plus reachable addresses); dial-by-key means you reach the server through that identity, not a broker address:
 
 ```bash
-contextdb-cli ./edge.db --tenant-id dev --sync-endpoint <ticket>
-contextdb-cli ./edge.db --tenant-id production --sync-endpoint <ticket>
+contextdb ./edge.db --tenant-id dev --sync-endpoint <ticket>
+contextdb ./edge.db --tenant-id production --sync-endpoint <ticket>
 ```
 
 For a file-backed edge, a bare pasted ticket is automatically rewritten to the identity-pinned form using `<db-path>.fabric-identity.key`, so `.sync status` shows the rewritten `iroh:?to=…&identity=…` spec rather than the pasted ticket — this is expected. If the endpoint is down or unreachable, sync prints one clear line, `Warning: sync endpoint unreachable: …`, rather than failing hard.
@@ -131,8 +131,82 @@ contrast, logs to stdout — see below). The default level is `ERROR`; set
 `RUST_LOG` to raise it:
 
 ```bash
-RUST_LOG=debug contextdb-cli :memory:
+RUST_LOG=debug contextdb :memory:
 ```
+
+---
+
+## Store Maintenance (`migrate` / `reset` / `repair`)
+
+Three subcommands, dispatched by literal first argument BEFORE the normal `contextdb <PATH> [OPTIONS]` parsing runs — so they never collide with a database path (a real path is never literally `migrate`, `reset`, or `repair`):
+
+```
+contextdb migrate <PATH>
+contextdb reset <PATH> --force
+contextdb repair <PATH>
+```
+
+### `migrate` — bring a legacy-format root forward in place
+
+Opening a data root written by an incompatible older release fails closed with a `LegacyVectorStoreDetected` error naming this command. `migrate` writes a `<PATH>.bak` backup of the untouched original FIRST, reads every row/edge/vector/DDL statement out of the legacy root through a dedicated legacy-format reader, writes it into a fresh current-format root, then atomically swaps it in. Rows from keyless tables (those without a PRIMARY KEY, natural_key_column, or "id" column) cannot be represented in a changeset, so their current visible state is copied separately:
+
+```bash
+contextdb migrate ./my.db
+# migrated './my.db' in place (42 rows from changeset + 3 keyless-table rows from current state); the pre-migration store is backed up at './my.db.bak'.
+```
+
+If there are no keyless tables or they are empty, the output shows only the changeset row count.
+
+Refuses (leaving the path untouched) on a root that is already current-format:
+
+```bash
+contextdb migrate ./already-current.db
+# Error: './already-current.db' is already current-format; there is nothing to migrate.
+```
+
+Running `migrate` twice on the same path is safe: the second run detects the now-current-format root and refuses as a no-op — it never re-migrates or duplicates data. If migration fails partway (writing the fresh root, or the final swap), the original path is left as it was and the `.bak` backup is still there; the error message says exactly what state things are in.
+
+### `reset --force` — recreate a wedged or corrupt root from scratch
+
+Destructive: deletes the existing file at `<PATH>` (whatever state it's in) and creates a fresh, empty current-format store in its place. Requires the explicit `--force` flag — restore anything you need from a backup or a healthy sync peer FIRST, since this is not recoverable:
+
+```bash
+contextdb reset ./wedged.db
+# Error: reset destroys the existing store, so it requires the explicit --force flag; rerun as
+# `contextdb reset ./wedged.db --force` once you've restored any data you need from a backup or
+# a healthy sync peer.
+# (exit code 2 — a usage error: nothing was attempted)
+
+contextdb reset ./wedged.db --force
+# reset './wedged.db': a fresh, empty current-format store was created.
+```
+
+### `repair` — read-only diagnosis, never modifies
+
+Reads the store's format marker and top-level schema layout through a read-only handle and reports its diagnosis — current-format-and-readable, legacy-format, or corrupt/truncated — without ever opening the store read-write or writing to the path. Safe to run on anything:
+
+```bash
+contextdb repair ./healthy.db
+# repair: './healthy.db' is current-format and its schema layout reads cleanly; nothing to
+# repair.
+
+contextdb repair ./old-format.db
+# repair: './old-format.db' is a legacy-format store (its on-disk schema layout predates this
+# release), not corrupt.
+# This report is read-only; the store was not modified. Run `contextdb migrate ./old-format.db`
+# to migrate it in place.
+
+contextdb repair ./maybe-corrupt.db
+# repair: './maybe-corrupt.db' — corrupt vector store at './maybe-corrupt.db': metadata/format
+# could not be read: ... — run `contextdb repair <path>` to see what is salvageable (it never
+# modifies the store), or `contextdb reset <path> --force` to recreate it — restore from a
+# backup or a healthy sync peer first if you need the existing data.
+# This report is read-only; the store was not modified. Run `contextdb reset
+# ./maybe-corrupt.db --force` to recreate it (after restoring any needed data from a backup or a
+# healthy sync peer).
+```
+
+`repair` never recommends `reset` where `migrate` is the right command, and vice versa — a legacy-format root is not corrupt (it just predates this release's on-disk layout), so its report points at `migrate` instead.
 
 ---
 
@@ -185,7 +259,7 @@ Every command below emits a JSON document under `--json`; `.help` is the one who
 | `.help vector` | | Show vector index syntax, `<=>` examples, `ROW_VECTOR(...)`, and vector error variants. |
 | `.quit` / `.exit` | `\q` | Exit the REPL. |
 | `.tables` | `\dt` | List all table names. |
-| `.schema <table>` | `\d <table>` | Show table DDL and constraints. Per-column `IMMUTABLE`, vector quantization, and `RANK_POLICY` clauses render alongside `NOT NULL` / `PRIMARY KEY`. Table-level `RETAIN`, `STATE MACHINE`, and `PROPAGATE` policy round-trips too — see below. |
+| `.schema <table>` | `\d <table>` | Show table DDL and constraints. Per-column `IMMUTABLE`, vector quantization, and `RANK_POLICY` clauses render alongside `NOT NULL` / `PRIMARY KEY`. Table-level `RETAIN`, `HISTORY`, `STATE MACHINE`, and `PROPAGATE` policy round-trips too — see below. |
 | `.explain <sql>` | | Show the query execution plan (useful for seeing whether vector search uses HNSW or brute-force). |
 | `.trace on` / `.trace off` | | Toggle one-line execution traces after successful SQL statements. |
 
@@ -214,7 +288,7 @@ immediately after the statement and formats for terminal inspection.
 
 ### `.schema` and Enforced Policy
 
-`.schema <table>` reflects the table's full *enforced* policy, not just column types — it round-trips `RETAIN ... [SYNC SAFE]`, `STATE MACHINE (...)`, `PROPAGATE ON EDGE ...`, and `PROPAGATE ON STATE ... [EXCLUDE VECTOR]` at the table level, plus the column-level `... ON STATE ... PROPAGATE SET ...` foreign-key form. The printed DDL re-parses and re-creates an equivalent table, so `.schema` output is a valid way to snapshot or replay a table definition.
+`.schema <table>` reflects the table's full *enforced* policy, not just column types — it round-trips `RETAIN ... [SYNC SAFE]`, `HISTORY ALL | CURRENT ONLY`, `STATE MACHINE (...)`, `PROPAGATE ON EDGE ...`, and `PROPAGATE ON STATE ... [EXCLUDE VECTOR]` at the table level, plus the column-level `... ON STATE ... PROPAGATE SET ...` foreign-key form. `HISTORY` renders only when declared, right after `RETAIN` and before the sync clauses. The printed DDL re-parses and re-creates an equivalent table, so `.schema` output is a valid way to snapshot or replay a table definition.
 
 ```
 contextdb> .schema decisions
@@ -285,7 +359,7 @@ contextdb-server --tenant-id demo
 
 Terminal 2 — client A creates data and pushes:
 ```bash
-contextdb-cli ./a.db --tenant-id demo --sync-endpoint <ticket>
+contextdb ./a.db --tenant-id demo --sync-endpoint <ticket>
 contextdb> CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);
 contextdb> INSERT INTO items VALUES ('aaa...', 'from client A');
 contextdb> .sync push
@@ -300,7 +374,7 @@ Those counts describe only rows your client can see. A row belonging to a contex
 
 Terminal 3 — client B pulls and sees the data:
 ```bash
-contextdb-cli ./b.db --tenant-id demo --sync-endpoint <ticket>
+contextdb ./b.db --tenant-id demo --sync-endpoint <ticket>
 contextdb> .sync pull
 Pulled: 1 applied, 0 skipped, 0 conflicts
 contextdb> SELECT * FROM items;
@@ -332,7 +406,7 @@ The server needs no external broker. By default, on bind it prints the enrollmen
 ```
 enrollment ticket: endpointabsdahrkdrgpw4fx3b3fbzhet7i7gfv5uvb3n4f74fkct5sjonipibabaafmrsabtlfqeaiad5q6jp42zmbacafmcaaadgwlaiaqckqci6aaaeuoaiaaaaaaaaaaaaosuiba
 To connect a client, run:
-  contextdb-cli <client-db-path> --sync-endpoint endpointabsdahrkdrgpw4fx3b3fbzhet7i7gfv5uvb3n4f74fkct5sjonipibabaafmrsabtlfqeaiad5q6jp42zmbacafmcaaadgwlaiaqckqci6aaaeuoaiaaaaaaaaaaaaosuiba --tenant-id demo
+  contextdb <client-db-path> --sync-endpoint endpointabsdahrkdrgpw4fx3b3fbzhet7i7gfv5uvb3n4f74fkct5sjonipibabaafmrsabtlfqeaiad5q6jp42zmbacafmcaaadgwlaiaqckqci6aaaeuoaiaaaaaaaaaaaaosuiba --tenant-id demo
 ```
 
 This happens at any log level. Three modes adjust it for scripting:
@@ -343,7 +417,7 @@ This happens at any log level. Three modes adjust it for scripting:
 
 ```bash
 $ contextdb-server --tenant-id demo --json
-{"dial_command":"contextdb-cli <client-db-path> --sync-endpoint endpointab...  --tenant-id demo","endpoint":"474cc91e...","enrollment_ticket":"endpointab...","tenant_id":"demo"}
+{"dial_command":"contextdb <client-db-path> --sync-endpoint endpointab...  --tenant-id demo","endpoint":"474cc91e...","enrollment_ticket":"endpointab...","tenant_id":"demo"}
 ```
 
 **The ticket is sensitive bearer enrollment material, not a public identifier.** There is no
@@ -378,7 +452,7 @@ Example — hub and edges on one LAN, immune to DHCP changes, still zero externa
 
 ```bash
 contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?identity=./hub.key&lookup=mdns"
-contextdb-cli ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=<ticket>&lookup=mdns"
+contextdb ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=<ticket>&lookup=mdns"
 ```
 
 Default conflict policy is `LatestWins`. The default log level is `ERROR`; server logs go to stdout. Set `RUST_LOG=info` to see operational logs (the ticket prints regardless). Build-time options: UPnP port mapping (better direct-connection odds through home routers) via `cargo build --release -p contextdb-server --features iroh/portmapper` — not in default builds because its dependency chain carries an MPL-licensed HTTP client; LAN mDNS lookup via `--features mdns`. Transport metrics counters are on by default (local only):
@@ -426,22 +500,22 @@ When stdin is not a terminal, the CLI runs in pipe mode — useful for scripting
 - Any error fails the run with a non-zero exit code (see [Exit Codes](#exit-codes)). The session still continues to the next statement, so one script run reports all of its errors, but the process never reports a run that hit an error as success
 
 ```bash
-echo "SELECT 1 + 1;" | contextdb-cli :memory:
+echo "SELECT 1 + 1;" | contextdb :memory:
 
-contextdb-cli ./my.db < schema.sql
+contextdb ./my.db < schema.sql
 
-echo "SELECT * FROM t;" | contextdb-cli ./my.db && echo "OK" || echo "FAILED"
+echo "SELECT * FROM t;" | contextdb ./my.db && echo "OK" || echo "FAILED"
 ```
 
 For scripts and agents that want to consume results programmatically, add `--json`:
 
 ```bash
-echo "SELECT * FROM decisions WHERE status = 'active';" | contextdb-cli ./my.db --json | jq '.[].description'
+echo "SELECT * FROM decisions WHERE status = 'active';" | contextdb ./my.db --json | jq '.[].description'
 ```
 
 ### Exit Codes
 
-Every contextdb binary — `contextdb-cli`, `contextdb-server`, and the shipped demo drivers — reports one of four codes:
+Every contextdb binary — `contextdb`, `contextdb-server`, and the shipped demo drivers — reports one of four codes:
 
 | Code | Meaning | Raised by |
 |------|---------|-----------|

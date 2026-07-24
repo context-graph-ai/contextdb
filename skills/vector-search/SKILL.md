@@ -5,7 +5,7 @@ description: Similarity search in contextdb — embedding columns, the <=> opera
 
 # Vector search in contextdb
 
-**Prerequisite:** needs the `contextdb-cli` binary. In a checkout of this repo:
+**Prerequisite:** needs the `contextdb` binary. In a checkout of this repo:
 `cargo build --release -p contextdb-cli`. Other install options: [`docs/getting-started.md`](../../docs/getting-started.md).
 
 Vectors are not a bolt-on store here. A `VECTOR(n)` column lives in the same table, the same MVCC
@@ -18,7 +18,7 @@ function** — `<=>` is the whole surface.
 ## Declare an embedding column
 
 ```bash
-contextdb-cli ./vec.db <<'SQL'
+contextdb ./vec.db <<'SQL'
 CREATE TABLE evidence (
   id UUID PRIMARY KEY,
   category TEXT,
@@ -38,7 +38,7 @@ Quantization is per column: `F32` (default), `SQ8`, `SQ4` — the knob for stora
 ## Search
 
 ```bash
-contextdb-cli ./vec.db <<'SQL'
+contextdb ./vec.db <<'SQL'
 INSERT INTO evidence (id, category, vector_text) VALUES ('11111111-1111-1111-1111-111111111111', 'A', [1.0, 0.0, 0.0, 0.0]);
 INSERT INTO evidence (id, category, vector_text) VALUES ('22222222-2222-2222-2222-222222222222', 'A', [0.9, 0.1, 0.0, 0.0]);
 INSERT INTO evidence (id, category, vector_text) VALUES ('33333333-3333-3333-3333-333333333333', 'B', [0.0, 1.0, 0.0, 0.0]);
@@ -65,7 +65,7 @@ not rank the whole table and post-filter:
 
 ```bash
 printf "SELECT id FROM evidence WHERE category = 'A' ORDER BY vector_text <=> [1.0, 0.0, 0.0, 0.0] LIMIT 5;\n" \
-  | contextdb-cli ./vec.db --json
+  | contextdb ./vec.db --json
 ```
 ```json
 [{"id":"11111111-1111-1111-1111-111111111111"},{"id":"22222222-2222-2222-2222-222222222222"}]
@@ -79,7 +79,7 @@ right side of `<=>` in `ORDER BY`:
 
 ```bash
 printf "SELECT id FROM evidence WHERE id != '11111111-1111-1111-1111-111111111111' ORDER BY vector_text <=> ROW_VECTOR('evidence', 'vector_text', '11111111-1111-1111-1111-111111111111') LIMIT 2;\n" \
-  | contextdb-cli ./vec.db
+  | contextdb ./vec.db
 ```
 
 The source vector is read from the same MVCC snapshot as candidate filtering and scoring. Scoped
@@ -100,7 +100,7 @@ Check which one is live:
 
 ```bash
 printf ".explain SELECT id FROM evidence ORDER BY vector_text <=> [1.0, 0.0, 0.0, 0.0] LIMIT 5\n" \
-  | contextdb-cli ./vec.db --json | jq -r '.explain.physical_plan'
+  | contextdb ./vec.db --json | jq -r '.explain.physical_plan'
 ```
 
 Brute force reads `Scan -> VectorSearch`; once the index switches to HNSW the same line reads
@@ -116,7 +116,7 @@ no application copies formula text into its queries.
 The joined column must be indexed.
 
 ```bash
-contextdb-cli :memory: <<'SQL'
+contextdb :memory: <<'SQL'
 CREATE TABLE outcomes (
   id UUID PRIMARY KEY,
   decision_id UUID NOT NULL,
@@ -176,7 +176,7 @@ hand-rolled-BFS stack this is ~40 lines of application code across three systems
 statement, one transaction, one process.
 
 ```bash
-contextdb-cli :memory: <<'SQL'
+contextdb :memory: <<'SQL'
 CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT NOT NULL, status TEXT NOT NULL, confidence REAL, embedding VECTOR(4));
 CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT NOT NULL, entity_type TEXT NOT NULL, properties JSON);
 CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL) DAG('DEPENDS_ON', 'BASED_ON');
@@ -214,7 +214,7 @@ The inverse ordering — graph first to narrow the neighbourhood, then vector to
 works equally well and is usually what you want when the graph is the cheaper filter:
 
 ```bash
-contextdb-cli :memory: <<'SQL'
+contextdb :memory: <<'SQL'
 CREATE TABLE edges (id UUID PRIMARY KEY, source_id UUID NOT NULL, target_id UUID NOT NULL, edge_type TEXT NOT NULL);
 CREATE TABLE observations (id UUID PRIMARY KEY, entity_id UUID, data TEXT, embedding VECTOR(4));
 
@@ -254,9 +254,11 @@ depth is 10.
   `VectorIndexDimensionMismatch`.
 - **Search routes to the column named in `ORDER BY`**, not to "the table's vector" — a two-vector
   table has two independent indexes.
-- **Opening a pre-0.3.4 store** without the named-index format marker returns
-  `LegacyVectorStoreDetected`. Recovery is deliberate: sync from a peer already on the named-index
-  format, or recreate the schema and reimport.
+- **Opening a pre-0.3.4 store** without the named-index format marker (or any older store whose
+  row/column schema layout predates the current release) returns `LegacyVectorStoreDetected`,
+  naming the recovery command: `contextdb migrate <path>` migrates it in place (backs up first,
+  never destroys the original). Syncing from a peer already on the current format, or recreating
+  the schema and reimporting, remain alternatives if you'd rather not migrate the file directly.
 - **`PROPAGATE ON STATE <s> EXCLUDE VECTOR`** drops a row out of vector results when it reaches a
   state — the declarative way to stop invalidated rows from being retrieved.
 

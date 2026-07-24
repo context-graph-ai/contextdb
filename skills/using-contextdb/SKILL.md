@@ -5,19 +5,19 @@ description: Open a contextdb database, define tables with enforced policy, run 
 
 # Using contextdb
 
-**Prerequisite:** needs the `contextdb-cli` binary. In a checkout of this repo:
+**Prerequisite:** needs the `contextdb` binary. In a checkout of this repo:
 `cargo build --release -p contextdb-cli`. Other install options (release download, `cargo
 install`): [`docs/getting-started.md`](../../docs/getting-started.md).
 
 contextdb is an embedded database — one file, one process, relational + graph + vector under one
-transaction. `contextdb-cli` is how you drive it from a shell. There is no server to start and no
+transaction. `contextdb` is how you drive it from a shell. There is no server to start and no
 schema to migrate to: **contextdb ships no built-in schema**, you create your own tables.
 
 ## Open a database
 
 ```bash
-contextdb-cli ./demo.db      # persisted; single file, crash-safe
-contextdb-cli :memory:       # ephemeral, discarded on exit
+contextdb ./demo.db      # persisted; single file, crash-safe
+contextdb :memory:       # ephemeral, discarded on exit
 ```
 
 A file has exactly one owner at a time. A second open of the same path — from this process or
@@ -35,7 +35,7 @@ the first `;` that is **not** inside a quoted string or a comment, so a real sch
 written. Anything still open when the input ends is run at that point.
 
 ```bash
-contextdb-cli ./demo.db <<'SQL'
+contextdb ./demo.db <<'SQL'
 CREATE TABLE decisions (
   id UUID PRIMARY KEY,
   description TEXT NOT NULL,
@@ -70,14 +70,21 @@ it is refused:
 
 ```bash
 echo "UPDATE decisions SET status = 'draft' WHERE id = '550e8400-e29b-41d4-a716-446655440000';" \
-  | contextdb-cli ./demo.db
+  | contextdb ./demo.db
 # stderr: Error: invalid state transition: active -> draft
 # exit:   1
 ```
 
 Other policy you can declare and the database will hold: `IMMUTABLE` columns and tables, `DAG`
-cycle prevention on an edge table, `RETAIN <n> DAYS` TTL, and `PROPAGATE` cascades along edges and
-foreign keys. See [`docs/query-language.md`](../../docs/query-language.md#table-options).
+cycle prevention on an edge table, `RETAIN <n> DAYS` TTL, `HISTORY CURRENT ONLY` to let the
+maintenance loop reclaim a row's superseded versions once it declares `SYNC CONFLICT KEEP LATEST`
+(or never syncs), and `PROPAGATE` cascades along edges and foreign keys. `RETAIN` bounds how long a
+row lives; `HISTORY` bounds how many past versions of a live row are kept — declare both on a
+status/heartbeat table that should both collapse and eventually age out. `HISTORY CURRENT ONLY` is
+refused on a table that delivers to another machine under the default (keep-first) conflict policy —
+the error names the fix. `.schema <table>` shows the declaration; reclaiming happens on the next
+maintenance cycle, not synchronously within the ALTER that declared it.
+See [`docs/query-language.md`](../../docs/query-language.md#table-options).
 
 ## Interactive REPL
 
@@ -104,21 +111,21 @@ writes nothing to stdout.
 A query is one line, a JSON array of row objects, uncapped:
 
 ```bash
-echo "SELECT id, status FROM decisions;" | contextdb-cli ./demo.db --json
+echo "SELECT id, status FROM decisions;" | contextdb ./demo.db --json
 ```
 ```json
 [{"id":"550e8400-e29b-41d4-a716-446655440000","status":"active"}]
 ```
 
 ```bash
-echo "SELECT id, status FROM decisions;" | contextdb-cli ./demo.db --json | jq -r '.[].status'
+echo "SELECT id, status FROM decisions;" | contextdb ./demo.db --json | jq -r '.[].status'
 # active
 ```
 
 A non-query statement is a small status object:
 
 ```bash
-echo "CREATE TABLE t (id UUID PRIMARY KEY);" | contextdb-cli :memory: --json
+echo "CREATE TABLE t (id UUID PRIMARY KEY);" | contextdb :memory: --json
 ```
 ```json
 {"rows_affected":0}
@@ -132,14 +139,14 @@ Meta-commands start with `.`, stay **single-line**, and take **no `;`**. Each em
 document, keyed by its payload:
 
 ```bash
-printf '.tables\n' | contextdb-cli ./demo.db --json
+printf '.tables\n' | contextdb ./demo.db --json
 ```
 ```json
 {"tables":["decisions"]}
 ```
 
 ```bash
-printf '.schema decisions\n' | contextdb-cli ./demo.db --json | jq '.state_machine'
+printf '.schema decisions\n' | contextdb ./demo.db --json | jq '.state_machine'
 ```
 ```json
 {"column":"status","transitions":{"active":["superseded"],"draft":["active","rejected"]}}
@@ -156,7 +163,7 @@ Which plan the engine chose:
 
 ```bash
 printf ".explain SELECT id FROM decisions WHERE status = 'active'\n" \
-  | contextdb-cli ./demo.db --json | jq '.explain.physical_plan'
+  | contextdb ./demo.db --json | jq '.explain.physical_plan'
 ```
 
 Full document table for `.tables` / `.schema` / `.explain` / `.trace` / the `.sync` family:
@@ -168,7 +175,7 @@ Everything that is not a result goes to **stderr** — errors, traces, `.help` �
 parseable. An error is one document:
 
 ```bash
-echo "SELECT * FROM nope;" | contextdb-cli ./demo.db --json
+echo "SELECT * FROM nope;" | contextdb ./demo.db --json
 ```
 ```json
 {"error":{"class":"sql","message":"table not found: nope","line":1}}
@@ -197,7 +204,7 @@ Precedence: a definitive error (`1`) dominates an unconfirmed push (`3`), which 
 (`0`). A usage error (`2`) is terminal at startup, so it never competes.
 
 ```bash
-echo "SELECT * FROM decisions;" | contextdb-cli ./demo.db --json > rows.json 2> errors.jsonl
+echo "SELECT * FROM decisions;" | contextdb ./demo.db --json > rows.json 2> errors.jsonl
 case $? in
   0) jq -r '.[].id' rows.json ;;
   2) echo "bad invocation — nothing ran"; cat errors.jsonl ;;

@@ -384,14 +384,14 @@ contextdb-server --tenant-id production --db-path ./server.db
 # Instance 1 (laptop app) — works offline, pushes when connected.
 # A pasted ticket is auto-pinned to this edge's identity key
 # (./local1.db.fabric-identity.key), so `.sync status` shows the rewritten spec.
-contextdb-cli ./local1.db --tenant-id production --sync-endpoint <ticket>
+contextdb ./local1.db --tenant-id production --sync-endpoint <ticket>
 contextdb> CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);
 contextdb> INSERT INTO sensors VALUES ('...', 'temp-north', 23.5);
 contextdb> .sync push
 Pushed: 1 applied, 0 skipped, 0 conflicts
 
 # Instance 2 (another machine) — pulls and gets everything, including schema
-contextdb-cli ./local2.db --tenant-id production --sync-endpoint <ticket>
+contextdb ./local2.db --tenant-id production --sync-endpoint <ticket>
 contextdb> .sync pull
 Pulled: 1 applied, 0 skipped, 0 conflicts
 contextdb> SELECT * FROM sensors;
@@ -452,6 +452,29 @@ CREATE TABLE observations (
 ```
 
 The background pruning loop handles cleanup. `SYNC SAFE` ensures no data is lost before it reaches the server.
+
+**A different shape: a status table written on a timer, never deleted.** A heartbeat or liveness
+row is upserted over and over (`INSERT ... ON CONFLICT (id) DO UPDATE`) — the row never expires
+(`RETAIN` doesn't apply), but every update mints a new physical version and nothing ever reclaimed
+the superseded ones, so a long-running node accumulates one physical version per update for a
+handful of live rows. `HISTORY CURRENT ONLY` is the declaration for exactly this case — it bounds
+version count instead of row lifetime:
+
+```sql
+CREATE TABLE node_heartbeat (
+  node_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  reported_at TIMESTAMP NOT NULL
+) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST
+```
+
+The maintenance loop collapses each `node_id` back to its single current version on the same
+cadence that prunes `RETAIN` windows. `SYNC CONFLICT KEEP LATEST` is required here because reclaiming
+history means only the newest value survives to send — a peer pulling this table under the
+non-overwriting default (`KEEP FIRST`) would otherwise file that newest value as the first value it
+has ever seen for the key. A table combining both — `RETAIN 48 HOURS HISTORY CURRENT ONLY SYNC
+CONFLICT KEEP LATEST` — both collapses to one version per key and eventually ages the row out
+entirely.
 
 ---
 

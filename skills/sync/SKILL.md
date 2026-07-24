@@ -5,7 +5,7 @@ description: Replicate contextdb across machines — start a hub, enroll an edge
 
 # Syncing contextdb across machines
 
-**Prerequisite:** needs the `contextdb-cli` and `contextdb-server` binaries. In a checkout of this
+**Prerequisite:** needs the `contextdb` and `contextdb-server` binaries. In a checkout of this
 repo: `cargo build --release -p contextdb-cli -p contextdb-server`. Other install options:
 [`docs/getting-started.md`](../../docs/getting-started.md).
 
@@ -38,7 +38,7 @@ other modes, when that shape doesn't fit:
 ```bash
 # One JSON object with the ticket and a ready-to-paste dial command; then serves.
 contextdb-server --db-path ./hub.db --tenant-id demo --json
-# {"dial_command":"contextdb-cli <client-db-path> --sync-endpoint endpointab... --tenant-id demo",
+# {"dial_command":"contextdb <client-db-path> --sync-endpoint endpointab... --tenant-id demo",
 #  "endpoint":"474cc91e...","enrollment_ticket":"endpointab...","tenant_id":"demo"}
 
 # Print the bare ticket and EXIT without serving — for reading an existing hub's identity.
@@ -68,7 +68,7 @@ identity loads exclusively from the key file — so it is not a substitute for r
 Each edge gets its own database file and the same ticket.
 
 ```bash
-contextdb-cli ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);
 INSERT INTO items (id, name) VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'from edge A');
 .sync push
@@ -89,7 +89,7 @@ than the ticket you pasted. That is expected, not a bug.
 ## 3. Pull it onto another edge
 
 ```bash
-contextdb-cli ./edge-b.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-b.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 .sync pull
 SELECT id, name FROM items;
 SQL
@@ -110,7 +110,7 @@ converged through the hub.
 ## 4. Check state
 
 ```bash
-printf '.sync status\n' | contextdb-cli ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
+printf '.sync status\n' | contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
 ```
 ```json
 {"sync":{"configured":true,"tenant":"demo","endpoint":"iroh:?to=...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17}}
@@ -119,6 +119,12 @@ printf '.sync status\n' | contextdb-cli ./edge-a.db --tenant-id demo --sync-endp
 An **LSN** is a position in the change log. The push and pull watermarks say how far each direction
 has progressed — the instrument for diagnosing lag. They arrive as JSON numbers, so you can compare
 them without parsing.
+
+The pull watermark is bound to the specific hub that issued it, not just a bare number. Repointing
+an edge at a different hub for the same tenant — a new `--sync-endpoint`, or the same endpoint
+after the hub was wiped and rebuilt — is detected automatically: the edge discards the stale cursor
+and pulls the new hub's full history from the start. This is expected and safe (a full re-pull is
+idempotent), not a sign of data loss on the old hub.
 
 If the endpoint is down, sync prints one clear line —
 `Warning: sync endpoint unreachable: …` — rather than failing hard, and `transport` reads
@@ -137,7 +143,7 @@ nothing and refused nothing, so it is counted **nowhere** — not applied, not s
 conflict. The everyday case is pulling right after you pushed:
 
 ```bash
-contextdb-cli ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 .sync push
 .sync pull
 SQL
@@ -166,7 +172,7 @@ outcome is unknown, not failed. It does **not** mean declined, and it does not m
 **Re-pushing is safe and idempotent** — the next `.sync push` reconciles cleanly.
 
 ```bash
-printf '.sync push\n' | contextdb-cli ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
+printf '.sync push\n' | contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
 case $? in
   0) echo "pushed" ;;
   1) echo 'push failed definitively — inspect the error envelope on stderr (class: sync)' ;;
@@ -200,7 +206,7 @@ Two independent axes, both per table.
 | `InsertIfNotExists` | insert if absent, skip otherwise — the right choice for append-only/immutable tables |
 
 ```bash
-contextdb-cli ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
 CREATE TABLE audit_log (id UUID PRIMARY KEY, entry TEXT) IMMUTABLE;
 .sync direction audit_log None
 .sync policy items InsertIfNotExists
@@ -211,6 +217,13 @@ SQL
 Note `LatestWins` orders by log sequence, not wall clock. Pick policy by table *class*: immutable /
 append-only tables want `InsertIfNotExists`; status rows that are a state machine want a
 deterministic total order (`ServerWins`).
+
+**A table that also declares `HISTORY CURRENT ONLY` needs `SYNC CONFLICT KEEP LATEST`
+(`LatestWins`) if it delivers anywhere** (`Push` or the default `Both`). `HISTORY CURRENT ONLY`
+reclaims superseded versions, so the only value left to send is the newest one — a puller under
+`KEEP FIRST` (the DDL default) would file that newest value as the FIRST value it has ever seen for
+the key. Declare `SYNC CONFLICT KEEP LATEST` for a current-truth table, or `SYNC OFF` if it never
+leaves this machine; the refusal names both fixes if you meet it.
 
 ## Auto-sync
 
@@ -240,7 +253,7 @@ Address lookup is separately opt-in, so a ticket survives an IP change:
 ```bash
 # hub and edges on one LAN, immune to DHCP changes, still zero external infrastructure
 contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?identity=./hub.key&lookup=mdns"
-contextdb-cli ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=$TICKET&lookup=mdns"
+contextdb ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=$TICKET&lookup=mdns"
 ```
 
 `publish=` announces this node's addresses (`n0` or a self-hosted pkarr relay); `lookup=` resolves

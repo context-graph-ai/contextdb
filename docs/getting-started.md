@@ -40,7 +40,7 @@ cargo build --release -p contextdb-cli
 ## First REPL Session
 
 ```bash
-contextdb-cli :memory:
+contextdb :memory:
 ```
 
 Try the state machine — the feature that makes contextdb different from plain SQL:
@@ -134,7 +134,7 @@ Vector search can use a schema-declared rank policy when cosine similarity is
 not the only signal. The joined column must be indexed:
 
 ```bash
-contextdb-cli :memory: <<'SQL'
+contextdb :memory: <<'SQL'
 CREATE TABLE outcomes (
   id UUID PRIMARY KEY,
   decision_id UUID NOT NULL,
@@ -208,7 +208,7 @@ CREATE TABLE decisions (
 Replace `:memory:` with a file path. Everything else works the same:
 
 ```bash
-contextdb-cli ./my.db
+contextdb ./my.db
 ```
 
 Single file. Crash-safe via redb. Reopen and your data is there.
@@ -271,7 +271,7 @@ On startup it prints an enrollment ticket and the exact command an edge runs to 
 ```text
 enrollment ticket: <ticket>
 To connect a client, run:
-  contextdb-cli <client-db-path> --sync-endpoint <ticket> --tenant-id demo
+  contextdb <client-db-path> --sync-endpoint <ticket> --tenant-id demo
 ```
 
 The ticket *is* the hub's cryptographic identity — dial-by-key. Whoever holds it can dial the hub directly, wherever it is, including from behind NAT (the edge dials out; nothing needs to be reachable on machine A). The hub only serves — you don't type SQL at it; your data lives on the edges that dial in. For scripting, three flags skip the banner: `--show-ticket` prints the bare ticket and exits, `--ticket-file <path>` writes it to a file, and `--json` emits a JSON object with `enrollment_ticket`, `dial_command`, `endpoint`, and `tenant_id`.
@@ -289,9 +289,9 @@ On each edge machine, paste the ticket, giving each its own database file:
 
 ```bash
 # machine B
-contextdb-cli edge-1.db --sync-endpoint <ticket> --tenant-id demo
+contextdb edge-1.db --sync-endpoint <ticket> --tenant-id demo
 # machine C
-contextdb-cli edge-2.db --sync-endpoint <ticket> --tenant-id demo
+contextdb edge-2.db --sync-endpoint <ticket> --tenant-id demo
 ```
 
 The ticket is pinned to each edge's identity key on first connect, so later reconnects are authenticated the same way. Two machines on one LAN sync with nothing running in the middle — no NATS, no cloud relay, no third party.

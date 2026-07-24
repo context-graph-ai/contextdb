@@ -225,7 +225,7 @@ list of files it writes.
 
 ```bash
 cargo build --release -p contextdb-cli
-./target/release/contextdb-cli :memory:
+./target/release/contextdb :memory:
 ```
 
 ```

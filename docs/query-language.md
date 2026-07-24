@@ -6,7 +6,7 @@ contextdb's query language is built on three standards:
 - **pgvector conventions** — `<=>` operator for cosine similarity in `ORDER BY`
 - **SQL/PGQ-style graph queries** — `GRAPH_TABLE(... MATCH ...)` following SQL/PGQ conventions for bounded graph traversal (not a full standard implementation)
 
-On top of these, contextdb adds **declarative policy primitives**: `IMMUTABLE`, `STATE MACHINE`, `DAG`, `RETAIN`, `SYNC`, and `PROPAGATE`. These are contextdb-specific extensions — everything else should feel familiar if you've used PostgreSQL.
+On top of these, contextdb adds **declarative policy primitives**: `IMMUTABLE`, `STATE MACHINE`, `DAG`, `RETAIN`, `HISTORY`, `SYNC`, and `PROPAGATE`. These are contextdb-specific extensions — everything else should feel familiar if you've used PostgreSQL.
 
 contextdb ships with no built-in tables or schema. You define your own tables and attach these primitives to whichever columns need them. The example tables in this reference (`documents`, `tasks`, `items`, `media`, and so on) are illustrative only — stand-ins for whatever schema you design, not something contextdb provides.
 
@@ -30,7 +30,7 @@ CREATE TABLE documents (
 ) IMMUTABLE
 ```
 
-See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, SYNC, and PROPAGATE.
+See [Table Options](#table-options) for IMMUTABLE, STATE MACHINE, DAG, RETAIN, HISTORY, SYNC, and PROPAGATE.
 
 Later examples in this reference also use a second illustrative table, `items`:
 
@@ -55,12 +55,17 @@ ALTER TABLE t DROP [COLUMN] col
 ALTER TABLE t RENAME COLUMN old TO new
 ALTER TABLE t SET RETAIN 7 DAYS [SYNC SAFE]
 ALTER TABLE t DROP RETAIN
+ALTER TABLE t SET HISTORY ALL | CURRENT ONLY
 ALTER TABLE t SET SYNC OFF | SYNC PUSH ONLY | SYNC PULL ONLY | SYNC TWO WAY
+ALTER TABLE t SET SYNC CONFLICT KEEP FIRST | KEEP LATEST
 ```
 
 A table's conflict policy is declared on the table itself with the
-`SYNC CONFLICT KEEP FIRST | KEEP LATEST` clause (see CREATE TABLE), not set
-through a separate statement.
+`SYNC CONFLICT KEEP FIRST | KEEP LATEST` clause (see CREATE TABLE), and can
+also be changed later with `ALTER TABLE t SET SYNC CONFLICT ...` above.
+There is no `DROP HISTORY`: `ALTER TABLE t SET HISTORY ALL` is the removal,
+and reads as what it does — dropping a window restores "keeps forever" (an
+absence), whereas `HISTORY ALL` is a nameable state.
 
 ### DROP TABLE
 
@@ -128,6 +133,74 @@ SELECT [DISTINCT] columns FROM table
   [ORDER BY col [ASC|DESC]]
   [USE RANK sort_key]
   [LIMIT n]
+```
+
+A `SELECT`-list column that does not exist on the table is `ColumnNotFound { table, column }` — the same class WHERE/JOIN/ORDER BY already use for an identical unknown-name failure — never `Ok` with a wrong or missing column:
+
+```sql
+SELECT nope FROM items;
+-- Err(ColumnNotFound { table: "items", column: "nope" })
+```
+
+#### Predicate Evaluation Errors
+
+A `WHERE` (or `JOIN ... ON`) predicate that fails to EVALUATE — as opposed to one that reads a `NULL` value — is a statement error, never a silently empty or partial result:
+
+```sql
+-- `tag` is TEXT; negating it cannot evaluate:
+SELECT id FROM items WHERE -tag > 0;
+-- Err(PlanError("cannot negate non-numeric value"))
+```
+
+A real `NULL` value compared with `=`, `<`, etc. is unaffected — that is standard SQL's NULL-as-false comparison semantics, and still correctly excludes the row rather than erroring:
+
+```sql
+-- `score` is NULL on this row; the row is excluded, not an error:
+SELECT id FROM items WHERE score = 5;
+```
+
+#### Column Qualifiers
+
+A qualifier naming a table that is not in scope for the query is `ColumnNotFound`, even when the bare column name it qualifies is real on some other table:
+
+```sql
+-- `x` is not `items` and is not declared as an alias anywhere in this query:
+SELECT id FROM items WHERE x.name = 'a';
+-- Err(ColumnNotFound { table: "items", column: "name" })
+```
+
+A qualifier naming the query's own table, alias, or a joined relation keeps working exactly as before:
+
+```sql
+SELECT t.id FROM items AS t WHERE t.name = 'a';
+SELECT items.id FROM items INNER JOIN tags ON items.id = tags.item_id WHERE tags.label = 'x';
+```
+
+#### Standard-SQL WHERE Forms
+
+A bare boolean column, its negation, a boolean `$param`, and a literal `NULL` are all standard SQL and all work as predicates on their own — no `= TRUE` / `= FALSE` needed:
+
+```sql
+SELECT id FROM items WHERE active;               -- active = TRUE
+SELECT id FROM items WHERE NOT active;            -- active = FALSE
+SELECT id FROM items WHERE $include_drafts;       -- boolean parameter
+SELECT id FROM items WHERE NULL;                  -- matches nothing, never an error
+```
+
+#### ORDER BY Expressions
+
+`ORDER BY` accepts a plain column or any expression form a `SELECT` list already evaluates — currently `COALESCE(...)` and the arithmetic operators (`+`, `-`, `*`, `/`):
+
+```sql
+SELECT tag FROM readings ORDER BY COALESCE(pref, fallback);
+SELECT tag FROM readings ORDER BY score + 1 DESC;
+```
+
+An expression form the engine cannot evaluate is a typed, plan-time refusal rather than a silently unsorted result:
+
+```sql
+SELECT tag FROM readings ORDER BY UPPER(tag);
+-- Err(OrderByExpressionNotSupported)
 ```
 
 ### CTEs
@@ -405,7 +478,7 @@ CREATE TABLE child (
 |------------|-------------|
 | `PRIMARY KEY` | Unique row identifier |
 | `NOT NULL` | Value required |
-| `UNIQUE` | No duplicate values (single column). A duplicate INSERT on a `UNIQUE` column is a silent no-op (returns `Ok(rows_affected=0)`), matching the composite-uniqueness contract. |
+| `UNIQUE` | No duplicate values. On a single column, a duplicate plain `INSERT` is an idempotent no-op (returns `Ok(rows_affected=0)`); a table-level multi-column `UNIQUE (col, ...)` instead refuses loudly — see [Composite Uniqueness](#composite-uniqueness). |
 | `DEFAULT expr` | Default value for inserts |
 | `REFERENCES table(col)` / `FOREIGN KEY (...) REFERENCES ...` | Foreign key — writes are rejected if the referenced row or tuple does not exist; in explicit transactions the error may surface at `COMMIT` |
 | `IMMUTABLE` | Column is audit-frozen — INSERT sets the value once; `UPDATE`, `ON CONFLICT DO UPDATE`, sync-apply mutations, and schema-altering DDL against the column are rejected with `Error::ImmutableColumn` |
@@ -456,7 +529,18 @@ CREATE TABLE edges (
 )
 ```
 
-A duplicate `(source_id, target_id, edge_type)` tuple is a silent no-op — the second INSERT returns `Ok(rows_affected=0)` and the row count is unchanged, making agent operations idempotent. Rows that share individual column values but differ in at least one constrained column are allowed. Rows with `NULL` in any constrained column do not participate in the composite uniqueness check.
+A duplicate `(source_id, target_id, edge_type)` tuple is refused with a loud, standard-SQL constraint error — `Error::UniqueViolation { table, column }`, with `column` naming every column of the constraint — never a silent `Ok`. Rows that share individual column values but differ in at least one constrained column are allowed. Rows with `NULL` in any constrained column do not participate in the composite uniqueness check.
+
+```sql
+INSERT INTO edges (id, source_id, target_id, edge_type)
+VALUES ($id, $source_id, $target_id, $edge_type);
+-- A second row with the identical (source_id, target_id, edge_type) tuple:
+INSERT INTO edges (id, source_id, target_id, edge_type)
+VALUES ($id2, $source_id, $target_id, $edge_type);
+-- Err(UniqueViolation { table: "edges", column: "source_id, target_id, edge_type" })
+```
+
+A single-column `UNIQUE` (declared on one column, not as a table-level tuple) keeps its existing idempotent-no-op convention on a plain `INSERT`: a duplicate value returns `Ok(rows_affected=0)` and leaves the row count unchanged. `ON CONFLICT ... DO UPDATE` is unaffected either way — it always updates the conflicting row rather than erroring.
 
 ### Composite Primary Key
 
@@ -558,6 +642,45 @@ ALTER TABLE scratch DROP RETAIN;
 
 `RETAIN` says only WHEN rows expire and `SYNC SAFE` says only that expiry waits on delivery. Neither decides where rows travel — that is the separate `SYNC` clause below. Writing a direction inside the retention clause (`RETAIN 24 HOURS SYNC SAFE PUSH ONLY`) is a parse error naming the clause to use instead.
 
+### HISTORY
+
+How much of each live row's *version* history a table keeps — a different axis from `RETAIN`, which says how long a *row* lives. `HISTORY ALL` (the default) keeps every superseded version. `HISTORY CURRENT ONLY` declares that only a row's current version has consumer value, so superseded versions may be reclaimed by the maintenance loop:
+
+```sql
+CREATE TABLE device_status (
+  device_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL
+) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST
+```
+
+Also settable with `ALTER TABLE`:
+
+```sql
+ALTER TABLE device_status SET HISTORY CURRENT ONLY;
+ALTER TABLE device_status SET HISTORY ALL;
+```
+
+`RETAIN` bounds rows, `HISTORY` bounds versions, and neither implies the other — `RETAIN` plus `HISTORY CURRENT ONLY` together are legal and independent: rows expire on the window, and each surviving row keeps only its current version.
+
+**The refusal.** `HISTORY CURRENT ONLY` is refused on a table that both delivers rows to another machine (`SYNC PUSH ONLY` or `SYNC TWO WAY`, the default direction) and arbitrates conflicts non-overwriting (`SYNC CONFLICT KEEP FIRST`, the default when no conflict clause is written):
+
+```sql
+CREATE TABLE device_status (
+  device_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL
+) HISTORY CURRENT ONLY
+-- refused: HISTORY CURRENT ONLY needs SYNC CONFLICT KEEP LATEST. Reclaiming
+-- superseded versions leaves only the newest value, and a machine that
+-- pulls this table under SYNC CONFLICT KEEP FIRST would file that newest
+-- value as the FIRST value for its key.
+```
+
+Two ways out: declare `SYNC CONFLICT KEEP LATEST` (the table carries current truth, so last-writer-wins is the correct arbitration), or `SYNC OFF` (the table never leaves this machine, so no peer can ever be handed a stale first value). The same refusal fires on `ALTER TABLE ... SET HISTORY CURRENT ONLY`, on `ALTER TABLE ... SET SYNC CONFLICT KEEP FIRST` narrowing an already-current-only table back to keep-first, on `ALTER TABLE ... SET SYNC ...` widening a keep-first current-only table into a delivering direction, and on an arriving definition from another machine — every door that can produce the combination refuses it, not only a local `CREATE TABLE`.
+
+`IMMUTABLE` and `HISTORY CURRENT ONLY` are refused together at parse time: an immutable table never supersedes a row, so it has no version history to reclaim.
+
+**What changes and when.** `ALTER TABLE t SET HISTORY CURRENT ONLY` on a table that has already accumulated versions is a declaration change, not an immediate data operation — the accumulated versions are reclaimed on the next maintenance cycle, not synchronously within the statement. Setting `HISTORY ALL` stops reclaiming versions from that point on; it does not restore versions already reclaimed under `HISTORY CURRENT ONLY` — the clause is not a time machine. A `STATE MACHINE` table that also declares `HISTORY CURRENT ONLY` keeps its current state and its transition constraint (enforcement is evaluated at write time against the current version), but loses the ability to read back the sequence of past states.
+
 ### SYNC
 
 Where a table's rows travel under synchronization. It applies to retained and non-retained tables alike, persists with the table definition, renders in `.schema`, and travels with the definition to other machines:
@@ -592,6 +715,21 @@ ALTER TABLE items SET SYNC PULL ONLY;
 
 `SYNC SAFE` with a direction that never delivers the table (`SYNC OFF` or `SYNC PULL ONLY`) is refused when it is written — at `CREATE`, at `ALTER`, and when the definition arrives from another machine. The promise could never be kept, so the rows would simply never expire. Plain `RETAIN` with no delivery promise may declare any direction, including `SYNC OFF` for a colocated installation that keeps one copy.
 
+**A table that syncs needs a sync identity — the covering-index requirement.** Any direction but `SYNC OFF` tells apart rows arriving from another machine by that table's declared identity: a `PRIMARY KEY` (single-column or a table-level `PRIMARY KEY (a, b, ...)`), or, failing that, an indexed `id` column as a fallback. A table with neither — a **keyless** table — has no way to do that. If a keyless table declares `SYNC OFF` this never matters, since its rows were never eligible to leave the machine either way. But a keyless table that would otherwise sync makes a push refuse loudly (`Error::SyncError`, naming all three fixes) instead of silently reporting success while that table's rows never actually cross the wire:
+
+```sql
+-- Keyless and would sync (the default SYNC TWO WAY) — push refuses:
+CREATE TABLE events (payload TEXT NOT NULL, occurred_at INTEGER NOT NULL)
+
+-- Fix one of:
+CREATE TABLE events (id UUID PRIMARY KEY, payload TEXT NOT NULL, occurred_at INTEGER NOT NULL)
+-- or
+CREATE TABLE events (payload TEXT NOT NULL, occurred_at INTEGER NOT NULL, id UUID)
+CREATE INDEX events_id_idx ON events (id)
+-- or
+CREATE TABLE events (payload TEXT NOT NULL, occurred_at INTEGER NOT NULL) SYNC OFF
+```
+
 ### SYNC CONFLICT
 
 Which value survives when the same row is written on more than one machine, or the same key is re-sent. Like the direction clause, it is declared on the table itself, persists with the definition, renders in `.schema`, and travels with the synced definition to other machines, so the durable hub honors the table's declared policy:
@@ -612,13 +750,13 @@ A table that declares no policy is `SYNC CONFLICT KEEP FIRST` — the non-overwr
 
 On a hub the policy is resolved in one order: a system table's baked policy wins first, then the table's own declaration, then the default. So an application table always gets exactly the policy it declared, while the engine's own distributed tables keep the policy their contract requires.
 
-The policy composes with the retention and direction clauses on one table:
+The policy composes with the retention, history, and direction clauses on one table:
 
 ```sql
 CREATE TABLE windows (
   id UUID PRIMARY KEY,
   body TEXT
-) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP FIRST
+) RETAIN 48 HOURS SYNC SAFE HISTORY ALL SYNC TWO WAY SYNC CONFLICT KEEP FIRST
 ```
 
 ### PROPAGATE ON EDGE
@@ -1099,5 +1237,6 @@ programmatic trace. Multi-hop or variable-length traversals report `GraphBfs`.
 | `DuplicateIndex { table, index }` | `CREATE INDEX` with a name already in use on the same table |
 | `ColumnNotIndexable { table, column, column_type }` | `CREATE INDEX` on a `JSON` or `VECTOR` column |
 | `ColumnInIndex { table, column, index }` | `ALTER TABLE ... DROP COLUMN c RESTRICT` on a column referenced by an index |
-| `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table |
+| `ColumnNotFound { table, column }` | `CREATE INDEX` naming a column that does not exist on the table — also the class every `WHERE` / `JOIN ... ON` / `ORDER BY` / `SELECT`-list unknown-column or unrecognized-qualifier reference uses (see [Column Qualifiers](#column-qualifiers) and the `SELECT` section above) |
 | `ReservedIndexName { table, name, prefix }` | `CREATE INDEX` using a name that begins with `__pk_`, `__unique_`, or `__fk_` (reserved for auto-indexes) |
+| `UniqueViolation { table, column }` | A duplicate value on a `UNIQUE` column, or a duplicate tuple on a table-level `UNIQUE (col, ...)` (`column` names every column of the constraint); also a `PRIMARY KEY` duplicate |

@@ -10,7 +10,7 @@ queue service: the **work ledger** (who is doing what) and the **media/blob plan
 work needs). They belong together because a job on the ledger can reference a `blob_ref` input, and
 resolving that reference is the blob plane's job, not the ledger's.
 
-**There is no CLI for either.** These are Rust APIs. If you are looking for a `contextdb-cli`
+**There is no CLI for either.** These are Rust APIs. If you are looking for a `contextdb`
 command, there isn't one — embed the crates: add `contextdb-engine` and `contextdb-server` to
 your `Cargo.toml` `[dependencies]` (see [`docs/getting-started.md`](../../docs/getting-started.md)
 for the exact lines), or, inside a checkout of this repo, depend on the crates in `crates/` directly.
@@ -86,6 +86,35 @@ job** — that is how a CPU-only node stays out of the way of GPU work. `claimab
 
 Inputs are either carried inline (the `&[I]` argument, small payloads) or referenced:
 `InputRef::local_path(...)` or `InputRef::blob_ref(hash)`.
+
+**Inline (`ledger_input`) inputs are NOT kept until the job is terminal.** `work_inputs` declares
+`RETAIN 7 DAYS`, so a job's ledger-carried input copies age out on that window regardless of
+whether the job was ever claimed. `materialize_inputs` distinguishes a job that never declared
+ledger input (returns `Ok` with an empty result) from one whose input aged out (returns
+`Err(Error::WorkInputExpired { job_id })`) — a worker must handle the typed refusal rather than
+executing on silently-empty input. Submit and claim promptly if the job's inputs are inline.
+
+**That `RETAIN 7 DAYS` window is engine-owned policy, not something you tune with `ALTER TABLE`
+on `work_inputs`** — nor is `work_capabilities`' (or `peer_directory`'s / `work_node_contacts`')
+`HISTORY` / `SYNC CONFLICT` / `SYNC ...` / `SYNC SAFE` declaration. All four are built-in tables
+this module and its siblings install, and each one's own bookkeeping depends on staying at the
+shape declared in its own `CREATE TABLE` text. A locally-typed `ALTER TABLE ... DROP RETAIN` /
+`SET RETAIN <other window>` / `SET HISTORY ALL` / `SET SYNC CONFLICT KEEP FIRST` / `SET SYNC ...`
+against one of these four tables refuses loudly instead of silently taking effect and then being
+silently reverted by the next installer call. You also can't get around any of this by typing your
+own `CREATE TABLE` for one of these four names: it refuses unless your columns structurally match
+the owning installer's own declaration, and unless any policy clause you DO write matches what
+that installer declares (silence on policy is fine — that is what a pre-declaration root looks
+like before its first reconcile). The identical mutation arriving from a PEER over sync is
+held to the same bar: an explicit differing value — whether spelled as an `ALTER TABLE`, as a
+`CREATE TABLE` adopting one of these tables from a peer that already has it, or as a fresh
+`CREATE TABLE` of a reserved name from a peer that has already dropped it (guarding against
+DROP + CREATE circumvention) — refuses the whole sync batch; an axis the arriving DDL is
+simply silent on preserves this table's current declared value rather than clearing it, so a
+half-healed peer converging on the same declaration interoperates instead of wedging. If your workload needs a different input-copy lifetime than 7
+days, that is not a schema knob on this table — it is `run_input_retention`'s `grace_ms`
+argument, which you call on your own
+schedule.
 
 ## Claim across machines
 

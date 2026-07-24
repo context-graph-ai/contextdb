@@ -71,11 +71,15 @@ CREATE TABLE edges (...) DAG ('DEPENDS_ON', 'BLOCKS')
 CREATE TABLE observations (...) IMMUTABLE
 ```
 
-**RETAIN** — Automatic TTL expiry with sync-safe option (rows aren't purged until synced):
+**RETAIN** — Automatic TTL expiry with sync-safe option (rows aren't purged until synced). **HISTORY**
+— the second axis: `RETAIN` bounds how long a row lives, `HISTORY CURRENT ONLY` bounds how many past
+*versions* of a still-live row are kept, so a status table rewritten on every poll cycle collapses
+back to one physical version per key instead of accumulating one forever:
 
 ```sql
 CREATE TABLE scratch (...) RETAIN 24 HOURS
 CREATE TABLE logs (...) RETAIN 90 DAYS SYNC SAFE
+CREATE TABLE device_status (...) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST
 ```
 
 **Triggers** — Host callbacks for transactional observation and
