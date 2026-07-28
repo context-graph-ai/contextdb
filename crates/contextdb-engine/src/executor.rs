@@ -813,10 +813,9 @@ pub(crate) fn execute_plan(
                         existing.sync_safe,
                         Some(*direction),
                     )?;
-                    // R3: widening this table's direction into delivery
-                    // while it still carries HISTORY CURRENT ONLY under
-                    // keep-first arbitration recreates the CREATE-time
-                    // hazard after the fact.
+                    // Widening sync direction after CREATE to include delivery
+                    // while this table still carries HISTORY CURRENT ONLY under
+                    // keep-first arbitration recreates the CREATE-time hazard.
                     let projected = TableMeta {
                         sync_direction: Some(*direction),
                         ..existing
@@ -2031,7 +2030,7 @@ fn eval_project_expr(
             match op {
                 UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
                 UnaryOp::Neg => match value {
-                    Value::Int64(v) => Ok(Value::Int64(-v)),
+                    Value::Int64(v) => checked_neg_i64(v),
                     Value::Float64(v) => Ok(Value::Float64(-v)),
                     _ => Err(Error::PlanError(
                         "cannot negate non-numeric value".to_string(),
@@ -5576,7 +5575,7 @@ fn eval_expr_value(
             match op {
                 UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
                 UnaryOp::Neg => match value {
-                    Value::Int64(v) => Ok(Value::Int64(-v)),
+                    Value::Int64(v) => checked_neg_i64(v),
                     Value::Float64(v) => Ok(Value::Float64(-v)),
                     _ => Err(Error::PlanError(
                         "cannot negate non-numeric value".to_string(),
@@ -5645,7 +5644,7 @@ pub fn resolve_expr(expr: &Expr, params: &HashMap<String, Value>) -> Result<Valu
         Expr::Column(c) => Ok(Value::Text(c.column.clone())),
         Expr::UnaryOp { op, operand } => match op {
             UnaryOp::Neg => match resolve_expr(operand, params)? {
-                Value::Int64(v) => Ok(Value::Int64(-v)),
+                Value::Int64(v) => checked_neg_i64(v),
                 Value::Float64(v) => Ok(Value::Float64(-v)),
                 _ => Err(Error::PlanError(
                     "cannot negate non-numeric value".to_string(),
@@ -5935,7 +5934,7 @@ fn eval_assignment_expr(
         }
         Expr::UnaryOp { op, operand } => match op {
             UnaryOp::Neg => match eval_assignment_expr(operand, row_values, params)? {
-                Value::Int64(value) => Ok(Value::Int64(-value)),
+                Value::Int64(value) => checked_neg_i64(value),
                 Value::Float64(value) => Ok(Value::Float64(-value)),
                 _ => Err(Error::Other(format!(
                     "unsupported expression in UPDATE SET: {:?}",
@@ -6081,6 +6080,14 @@ fn eval_arithmetic(name: &str, args: &[Value]) -> Result<Value> {
 /// instead of panicking the process or silently wrapping.
 fn checked_add_i64(left: i64, right: i64) -> Result<Value> {
     left.checked_add(right)
+        .map(Value::Int64)
+        .ok_or_else(|| Error::PlanError("integer out of range".to_string()))
+}
+
+/// Integer negation, raising the standard-SQL out-of-range error on overflow.
+fn checked_neg_i64(value: i64) -> Result<Value> {
+    value
+        .checked_neg()
         .map(Value::Int64)
         .ok_or_else(|| Error::PlanError("integer out of range".to_string()))
 }
@@ -7227,7 +7234,7 @@ fn graph_eval_values(
                 .map(|value| match op {
                     UnaryOp::Not => Ok(Value::Bool(!value_to_bool(&value))),
                     UnaryOp::Neg => match value {
-                        Value::Int64(v) => Ok(Value::Int64(-v)),
+                        Value::Int64(v) => checked_neg_i64(v),
                         Value::Float64(v) => Ok(Value::Float64(-v)),
                         _ => Err(Error::PlanError(
                             "cannot negate non-numeric graph value".to_string(),
@@ -8643,7 +8650,7 @@ fn engine_owned_reserved_name_installer(table: &str) -> &'static str {
 /// the projected `TableMeta` exists): a create that restates the exact
 /// canonical columns but is silent on RETAIN / HISTORY / SYNC CONFLICT / SYNC
 /// still passes here -- that is exactly the shape a pre-declaration legacy
-/// root (or this round's own reconcile-heal tests, which construct that
+/// root (or reconciliation tests that construct that
 /// legacy root directly through this same local `CREATE TABLE` path) needs to
 /// keep working. What this check closes is different: before it existed,
 /// fresh LOCAL creation of one of these four names was entirely unguarded --
@@ -8652,8 +8659,7 @@ fn engine_owned_reserved_name_installer(table: &str) -> &'static str {
 /// column shape at all to a reserved name (see
 /// `engine_owned_ledger_policy_tests.rs`'s
 /// `drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile`
-/// doc comment, which named this as a separately tracked gap when the sync
-/// side's fresh-create door was scoped).
+/// doc comment, which describes the same fresh-create limitation).
 fn refuse_engine_owned_reserved_name_shape(
     table: &str,
     columns: &[contextdb_parser::ast::ColumnDef],

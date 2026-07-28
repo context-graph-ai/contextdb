@@ -337,6 +337,8 @@ every participant is on the same release — nothing is lost in the meantime,
 because a refused exchange never advances a watermark it would otherwise
 have earned.
 
+Future work bumps the protocol version whenever it changes sync bytes or sync semantics. SQL, storage, CLI, or maintenance work that leaves sync unchanged does not bump the protocol.
+
 ### Deployment Topology
 
 contextdb uses a client-server sync model where every instance — client or server — runs the same database engine. There is no "replica" or "read-only copy." Each database is a full read-write contextdb that works independently offline.

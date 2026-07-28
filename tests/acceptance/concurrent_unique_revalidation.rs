@@ -960,31 +960,40 @@ fn t15_10_concurrent_insert_with_fk_and_unique_constraints_serialize() {
     )
     .unwrap();
     let reason = "sha256:fixed".to_string();
-
-    let barrier = Arc::new(Barrier::new(3));
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let barrier = Arc::clone(&barrier);
-            let reason = reason.clone();
-            handles.push(scope.spawn(move || {
-                barrier.wait();
-                db.execute(
-                    "INSERT INTO invalidations (id, decision_id, reason_hash) VALUES ($id, $decision_id, $reason_hash)",
-                    &[
-                        ("id".to_string(), Value::Uuid(Uuid::new_v4())),
-                        ("decision_id".to_string(), Value::Uuid(parent)),
-                        ("reason_hash".to_string(), Value::Text(reason)),
-                    ]
-                    .into_iter()
-                    .collect(),
+    let tx_a = db.begin_or_panic();
+    let tx_b = db.begin_or_panic();
+    for tx in [tx_a, tx_b] {
+        let staged = db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO invalidations (id, decision_id, reason_hash) VALUES ($id, $decision_id, $reason_hash)",
+                &[
+                    ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+                    ("decision_id".to_string(), Value::Uuid(parent)),
+                    ("reason_hash".to_string(), Value::Text(reason.clone())),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        assert_eq!(staged.rows_affected, 1);
+    }
+    let outcomes = [db.commit(tx_a), db.commit(tx_b)];
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(Error::UniqueViolation { table, column })
+                        if table == "invalidations" && column == "reason_hash"
                 )
-            }));
-        }
-        barrier.wait();
-        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_unique_collision_outcomes(&outcomes, 1, 1, "invalidations", "reason_hash");
-    });
+            })
+            .count(),
+        1,
+        "loser must report UniqueViolation on invalidations.reason_hash at commit, got {outcomes:?}"
+    );
     assert_eq!(row_count(db, "invalidations"), 1);
 }
 

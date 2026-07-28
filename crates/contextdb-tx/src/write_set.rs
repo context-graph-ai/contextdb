@@ -19,6 +19,14 @@ pub struct WriteSet {
     pub vector_moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
     pub commit_lsn: Option<Lsn>,
     pub relational_insert_source_lsns: HashMap<TableName, HashMap<RowId, Lsn>>,
+    pub relational_insert_source_kinds: HashMap<TableName, HashMap<RowId, u8>>,
+    /// Engine-owned durable metadata written in the same storage transaction
+    /// as this write set. Sync uses this for authenticated applied receipts.
+    pub config_writes: Vec<(String, Vec<u8>)>,
+    /// Config keys whose `u64` payload is a monotonic frontier. Persistence
+    /// compares and raises these inside the write transaction so concurrent
+    /// authenticated sync applies cannot publish an older receipt last.
+    pub config_max_u64_keys: Vec<String>,
     pub visibility_floor: Option<TxId>,
     pub propagation_in_progress: bool,
 }
@@ -36,6 +44,7 @@ impl WriteSet {
             && self.vector_inserts.is_empty()
             && self.vector_deletes.is_empty()
             && self.vector_moves.is_empty()
+            && self.config_writes.is_empty()
     }
 
     pub fn stamp_lsn(&mut self, lsn: Lsn) {
@@ -125,10 +134,33 @@ impl WriteSet {
         row_id: RowId,
         lsn: Lsn,
     ) {
+        let table = table.into();
         self.relational_insert_source_lsns
-            .entry(table.into())
+            .entry(table.clone())
             .or_default()
             .insert(row_id, lsn);
+        self.relational_insert_source_kinds
+            .entry(table)
+            .or_default()
+            .insert(row_id, 0);
+    }
+
+    pub fn set_relational_insert_source_lsn_kind(
+        &mut self,
+        table: impl Into<TableName>,
+        row_id: RowId,
+        lsn: Lsn,
+        kind: u8,
+    ) {
+        let table = table.into();
+        self.relational_insert_source_lsns
+            .entry(table.clone())
+            .or_default()
+            .insert(row_id, lsn);
+        self.relational_insert_source_kinds
+            .entry(table)
+            .or_default()
+            .insert(row_id, kind);
     }
 }
 

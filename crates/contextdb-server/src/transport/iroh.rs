@@ -862,6 +862,10 @@ impl ClientTransport for IrohClientTransport {
         Some(hex_node_id(&target.id))
     }
 
+    fn has_stable_edge_identity(&self) -> bool {
+        parse_dial_target(&self.spec).is_ok_and(|(_, parsed)| parsed.identity_path().is_some())
+    }
+
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
         Box::pin(async move {
             self.connected_state().await?;
@@ -1393,7 +1397,7 @@ async fn write_reply(
 
 #[cfg(test)]
 mod sticky_port_tests {
-    use super::read_sticky_ports;
+    use super::{EndpointSpec, read_sticky_ports};
 
     #[test]
     fn reads_legacy_single_port_and_the_port_pair() {
@@ -1409,5 +1413,20 @@ mod sticky_port_tests {
         std::fs::write(&junk, "not-a-port").expect("write junk");
         assert_eq!(read_sticky_ports(&junk), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parser_distinguishes_pinned_and_ephemeral_edge_identities() {
+        let pinned = EndpointSpec::parse("iroh:?identity=/tmp/edge.key")
+            .expect("pinned endpoint spec parses");
+        let ephemeral = EndpointSpec::parse("iroh:").expect("ephemeral endpoint spec parses");
+        assert!(
+            pinned.identity_path().is_some(),
+            "a key path pins the edge identity"
+        );
+        assert!(
+            ephemeral.identity_path().is_none(),
+            "a dial ticket alone selects the hub, not the edge identity"
+        );
     }
 }

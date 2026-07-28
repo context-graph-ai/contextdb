@@ -70,6 +70,8 @@ const GRAPH_REV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("gra
 const VECTORS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vector_entries");
 const SYNC_ROW_SOURCE_LSN_TABLE: TableDefinition<&[u8], u64> =
     TableDefinition::new("sync_row_source_lsn");
+const SYNC_ROW_SOURCE_KIND_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("sync_row_source_kind");
 const FORMAT_VERSION_KEY: &str = "format_version";
 pub(crate) const CURRENT_FORMAT_VERSION: &str = "1.0.0";
 const TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY: &str = "__trigger_audit_next_index";
@@ -391,6 +393,25 @@ impl From<LegacyTableMetaV1> for TableMeta {
 impl RedbPersistence {
     pub fn create(path: &Path) -> Result<Self> {
         let lock_file = Self::acquire_pid_lock(path)?;
+        Self::create_with_lock(path, lock_file)
+    }
+
+    /// Recreate a store while holding its existing coordination lock. The lock
+    /// file is never unlinked: its OS lock is the ownership boundary that
+    /// prevents another process from opening the path between removal and the
+    /// fresh format marker being written.
+    pub fn recreate(path: &Path) -> Result<Self> {
+        let lock_file = Self::acquire_pid_lock(path)?;
+        if path.exists()
+            && let Err(err) = std::fs::remove_file(path)
+        {
+            drop(lock_file);
+            return Err(Self::storage_error(err));
+        }
+        Self::create_with_lock(path, lock_file)
+    }
+
+    fn create_with_lock(path: &Path, lock_file: File) -> Result<Self> {
         // `create` opens the file in place when it already exists, so it can hit
         // the same corrupt-file redb panic as `open` — guard it identically so
         // no open-time backtrace leaks to stderr.
@@ -876,16 +897,25 @@ impl RedbPersistence {
                 let mut source_lsn_table = write_txn
                     .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
                     .map_err(Self::storage_error)?;
+                let mut source_kind_table = write_txn
+                    .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+                    .map_err(Self::storage_error)?;
                 for (table, row_id) in clear_source_lsns {
                     let key = Self::sync_row_source_lsn_key(&table, row_id);
                     source_lsn_table
                         .remove(key.as_slice())
                         .map_err(Self::storage_error)?;
+                    source_kind_table
+                        .remove(key.as_slice())
+                        .map_err(Self::storage_error)?;
                 }
-                for (table, row_id, source_lsn) in set_source_lsns {
+                for (table, row_id, source_lsn, kind) in set_source_lsns {
                     let key = Self::sync_row_source_lsn_key(&table, row_id);
                     source_lsn_table
                         .insert(key.as_slice(), source_lsn.0)
+                        .map_err(Self::storage_error)?;
+                    source_kind_table
+                        .insert(key.as_slice(), kind)
                         .map_err(Self::storage_error)?;
                 }
             }
@@ -1221,6 +1251,29 @@ impl RedbPersistence {
                 }
             }
 
+            if !ws.config_writes.is_empty() {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in &ws.config_writes {
+                    let encoded = if ws.config_max_u64_keys.iter().any(|max_key| max_key == key) {
+                        let incoming = Self::decode::<u64>(encoded)?;
+                        let current = config_table
+                            .get(key.as_str())
+                            .map_err(Self::storage_error)?
+                            .map(|value| Self::decode::<u64>(value.value()))
+                            .transpose()?
+                            .unwrap_or(0);
+                        Self::encode(&current.max(incoming))?
+                    } else {
+                        encoded.clone()
+                    };
+                    config_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -1543,7 +1596,7 @@ impl RedbPersistence {
                 Err(redb::TableError::TableTypeMismatch { .. }) => {}
                 Err(err) => return Err(Self::storage_error(err)),
             }
-            Self::remove_sync_source_lsns_for_table(&write_txn, name)?;
+            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -1582,7 +1635,7 @@ impl RedbPersistence {
                 Err(redb::TableError::TableTypeMismatch { .. }) => {}
                 Err(err) => return Err(Self::storage_error(err)),
             }
-            Self::remove_sync_source_lsns_for_table(&write_txn, name)?;
+            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
             if !config_values.is_empty() {
                 let mut config_table = write_txn
                     .open_table(CONFIG_TABLE)
@@ -1648,7 +1701,7 @@ impl RedbPersistence {
                 Err(redb::TableError::TableTypeMismatch { .. }) => {}
                 Err(err) => return Err(Self::storage_error(err)),
             }
-            Self::remove_sync_source_lsns_for_table(&write_txn, name)?;
+            Self::remove_sync_source_provenance_for_table(&write_txn, name)?;
 
             let _ = write_txn.delete_table(GRAPH_FWD_TABLE);
             let _ = write_txn.delete_table(GRAPH_REV_TABLE);
@@ -1740,7 +1793,7 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
             }
-            Self::retain_sync_source_lsns_for_table_rows(&write_txn, name, rows)?;
+            Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
         })
@@ -1816,7 +1869,7 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
             }
-            Self::retain_sync_source_lsns_for_table_rows(&write_txn, name, rows)?;
+            Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
             let _ = write_txn.delete_table(VECTORS_TABLE);
             {
                 let mut table = write_txn
@@ -2050,6 +2103,25 @@ impl RedbPersistence {
                 }
             }
             Ok(source_lsns)
+        })
+    }
+
+    pub fn load_sync_source_kinds(&self) -> Result<HashMap<(String, RowId), u8>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read_txn.open_table(SYNC_ROW_SOURCE_KIND_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let mut kinds = HashMap::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                if let Some((table, row_id)) = Self::decode_sync_row_source_lsn_key(key.value()) {
+                    kinds.insert((table, row_id), value.value());
+                }
+            }
+            Ok(kinds)
         })
     }
 
@@ -2338,7 +2410,7 @@ impl RedbPersistence {
                         .insert(key.as_slice(), encoded.as_slice())
                         .map_err(Self::storage_error)?;
                 }
-                Self::retain_sync_source_lsns_for_table_rows(&write_txn, name, rows)?;
+                Self::retain_sync_source_provenance_for_table_rows(&write_txn, name, rows)?;
             }
 
             match write_txn.delete_table(VECTORS_TABLE) {
@@ -2555,15 +2627,24 @@ impl RedbPersistence {
             drop(opened_rel_tables);
 
             if !orphaned_source_lsn_rows.is_empty() {
-                match write_txn.open_table(SYNC_ROW_SOURCE_LSN_TABLE) {
-                    Ok(mut table) => {
+                match (
+                    write_txn.open_table(SYNC_ROW_SOURCE_LSN_TABLE),
+                    write_txn.open_table(SYNC_ROW_SOURCE_KIND_TABLE),
+                ) {
+                    (Ok(mut lsn_table), Ok(mut kind_table)) => {
                         for (table_name, row_id) in orphaned_source_lsn_rows {
                             let key = Self::sync_row_source_lsn_key(table_name, *row_id);
-                            table.remove(key.as_slice()).map_err(Self::storage_error)?;
+                            lsn_table
+                                .remove(key.as_slice())
+                                .map_err(Self::storage_error)?;
+                            kind_table
+                                .remove(key.as_slice())
+                                .map_err(Self::storage_error)?;
                         }
                     }
-                    Err(redb::TableError::TableDoesNotExist(_)) => {}
-                    Err(err) => return Err(Self::storage_error(err)),
+                    (Err(redb::TableError::TableDoesNotExist(_)), _) => {}
+                    (_, Err(redb::TableError::TableDoesNotExist(_))) => {}
+                    (Err(err), _) | (_, Err(err)) => return Err(Self::storage_error(err)),
                 }
             }
 
@@ -2930,9 +3011,9 @@ impl RedbPersistence {
         })
     }
 
-    pub(crate) fn append_sync_source_lsns_batch(
+    pub(crate) fn append_sync_source_provenance_batch(
         &self,
-        entries: &[(String, RowId, Lsn)],
+        entries: &[(String, RowId, Lsn, u8)],
     ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -2940,18 +3021,22 @@ impl RedbPersistence {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
             {
-                let mut table = write_txn
+                let mut lsns = write_txn
                     .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
                     .map_err(Self::storage_error)?;
-                for (table_name, row_id, lsn) in entries {
-                    let key = Self::sync_row_source_lsn_key(table_name, *row_id);
-                    table
-                        .insert(key.as_slice(), lsn.0)
+                let mut kinds = write_txn
+                    .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, row_id, lsn, kind) in entries {
+                    let key = Self::sync_row_source_lsn_key(table, *row_id);
+                    lsns.insert(key.as_slice(), lsn.0)
+                        .map_err(Self::storage_error)?;
+                    kinds
+                        .insert(key.as_slice(), *kind)
                         .map_err(Self::storage_error)?;
                 }
             }
-            write_txn.commit().map_err(Self::storage_error)?;
-            Ok(())
+            write_txn.commit().map_err(Self::storage_error)
         })
     }
 
@@ -3325,24 +3410,34 @@ impl RedbPersistence {
         Some((table, row_id))
     }
 
-    fn remove_sync_source_lsns_for_table(
+    fn remove_sync_source_provenance_for_table(
         write_txn: &redb::WriteTransaction,
         table: &str,
     ) -> Result<()> {
         let mut source_lsn_table = write_txn
             .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
             .map_err(Self::storage_error)?;
-        let keys_to_remove =
+        let lsn_keys_to_remove =
             Self::sync_source_lsn_keys_for_table(&source_lsn_table, table, |_| true)?;
-        for key in keys_to_remove {
+        let mut source_kind_table = write_txn
+            .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+            .map_err(Self::storage_error)?;
+        let kind_keys_to_remove =
+            Self::sync_source_kind_keys_for_table(&source_kind_table, table, |_| true)?;
+        for key in lsn_keys_to_remove {
             source_lsn_table
+                .remove(key.as_slice())
+                .map_err(Self::storage_error)?;
+        }
+        for key in kind_keys_to_remove {
+            source_kind_table
                 .remove(key.as_slice())
                 .map_err(Self::storage_error)?;
         }
         Ok(())
     }
 
-    fn retain_sync_source_lsns_for_table_rows(
+    fn retain_sync_source_provenance_for_table_rows(
         write_txn: &redb::WriteTransaction,
         table: &str,
         rows: &[VersionedRow],
@@ -3355,12 +3450,24 @@ impl RedbPersistence {
         let mut source_lsn_table = write_txn
             .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
             .map_err(Self::storage_error)?;
-        let keys_to_remove =
+        let lsn_keys_to_remove =
             Self::sync_source_lsn_keys_for_table(&source_lsn_table, table, |row_id| {
                 !live_row_ids.contains(&row_id)
             })?;
-        for key in keys_to_remove {
+        let mut source_kind_table = write_txn
+            .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+            .map_err(Self::storage_error)?;
+        let kind_keys_to_remove =
+            Self::sync_source_kind_keys_for_table(&source_kind_table, table, |row_id| {
+                !live_row_ids.contains(&row_id)
+            })?;
+        for key in lsn_keys_to_remove {
             source_lsn_table
+                .remove(key.as_slice())
+                .map_err(Self::storage_error)?;
+        }
+        for key in kind_keys_to_remove {
+            source_kind_table
                 .remove(key.as_slice())
                 .map_err(Self::storage_error)?;
         }
@@ -3374,6 +3481,24 @@ impl RedbPersistence {
     ) -> Result<Vec<Vec<u8>>> {
         let mut keys = Vec::new();
         for entry in source_lsn_table.iter().map_err(Self::storage_error)? {
+            let (key, _) = entry.map_err(Self::storage_error)?;
+            if let Some((entry_table, row_id)) = Self::decode_sync_row_source_lsn_key(key.value())
+                && entry_table == table
+                && should_remove(row_id)
+            {
+                keys.push(key.value().to_vec());
+            }
+        }
+        Ok(keys)
+    }
+
+    fn sync_source_kind_keys_for_table(
+        source_kind_table: &impl ReadableTable<&'static [u8], u8>,
+        table: &str,
+        should_remove: impl Fn(RowId) -> bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        for entry in source_kind_table.iter().map_err(Self::storage_error)? {
             let (key, _) = entry.map_err(Self::storage_error)?;
             if let Some((entry_table, row_id)) = Self::decode_sync_row_source_lsn_key(key.value())
                 && entry_table == table

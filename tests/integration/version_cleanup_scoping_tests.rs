@@ -171,7 +171,7 @@ fn a_fresh_edge_pulling_after_cleanup_converges_to_current_truth() {
 }
 
 // ---------------------------------------------------------------------------
-// Re-aimed (own commit, see its subject for the reason): the engine does not
+// The engine does not
 // pin a snapshot at `begin()` -- a repeat `execute_in_tx` read on the SAME
 // open transaction already observes the live watermark with zero cleanup
 // involved, so the original open-transaction shape here could never pass
@@ -595,7 +595,7 @@ fn version_cleanup_cost_is_invariant_to_unrelated_vector_ballast() {
 }
 
 // ---------------------------------------------------------------------------
-// Sanctioned flip (own commit; see its subject): commit-index candidate-only
+// Commit-index candidate-only
 // removal now WORKS -- `compact_currency_versions_inner` shrinks the commit
 // index to exactly the LSNs the pruned change-log entries touched (via
 // `scoped_commit_index_removal`), landed in commit `a78b76d engine: move
@@ -662,7 +662,7 @@ fn version_cleanup_shrinks_the_commit_index_to_reachable_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// Sanctioned flip (own commit; see its subject): vector-copy release now
+// Vector-copy release now
 // WORKS. Pruning a row version that carries a vector releases ITS vector
 // copy too, not just the row -- `VectorStore::prune_superseded_versions`,
 // matched by `(row_id, created_tx, lsn)` identity, landed in
@@ -734,7 +734,7 @@ fn version_cleanup_releases_a_pruned_rows_vector_copy() {
 }
 
 // ---------------------------------------------------------------------------
-// Sanctioned flip (own commit; see its subject): eligible-tables-only
+// Eligible-tables-only
 // scoping of the in-memory clone now WORKS.
 // `compact_currency_versions_inner` reads (and clones) only the DECLARED
 // eligible tables' row histories (`tables.iter().filter_map(...)`), not

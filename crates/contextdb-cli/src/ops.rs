@@ -371,43 +371,16 @@ fn run_reset(args: &[String]) -> i32 {
         return EXIT_USAGE;
     }
 
-    if path.exists()
-        && let Err(err) = std::fs::remove_file(path)
-    {
-        eprintln!(
-            "Error: reset failed to remove the existing store at '{}': {err}",
-            path.display()
-        );
-        return EXIT_ERROR;
-    }
-    let lock_path = lock_path_for(path);
-    if lock_path.exists() {
-        let _ = std::fs::remove_file(&lock_path);
-    }
-
-    match Database::open(path) {
-        Ok(db) => match db.close() {
-            Ok(()) => {
-                println!(
-                    "reset '{}': a fresh, empty current-format store was created.",
-                    path.display()
-                );
-                EXIT_OK
-            }
-            Err(err) => {
-                eprintln!(
-                    "Error: reset recreated '{}' but it did not close cleanly: {err}",
-                    path.display()
-                );
-                EXIT_ERROR
-            }
-        },
-        Err(err) => {
-            eprintln!(
-                "Error: reset removed the existing store at '{}' but failed to recreate it: \
-                 {err}",
+    match Database::force_reset(path) {
+        Ok(()) => {
+            println!(
+                "reset '{}': a fresh, empty current-format store was created.",
                 path.display()
             );
+            EXIT_OK
+        }
+        Err(err) => {
+            eprintln!("Error: reset failed for '{}': {err}", path.display());
             EXIT_ERROR
         }
     }

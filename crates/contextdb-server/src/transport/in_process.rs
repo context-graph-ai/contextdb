@@ -52,6 +52,10 @@ impl ClientTransport for InProcessClient {
             .clone()
     }
 
+    fn has_stable_edge_identity(&self) -> bool {
+        self.node_id.is_some()
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,

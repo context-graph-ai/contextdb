@@ -211,7 +211,7 @@ fn an_encoded_delete_names_the_whole_key() {
     target
         .apply_changes(
             across_the_wire(source.changes_since(before_delete)),
-            &policies,
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .expect("apply the delete");
 

@@ -4,6 +4,7 @@ use contextdb_core::{
 };
 use contextdb_graph::GraphStore;
 use contextdb_relational::RelationalStore;
+use contextdb_relational::store::SyncSourceKind;
 use contextdb_tx::{WriteSet, WriteSetApplicator};
 use contextdb_vector::VectorStore;
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -58,7 +59,7 @@ pub(crate) fn record_change_log_entries(
 }
 
 pub(crate) type SyncSourceLsnClear = (TableName, RowId);
-pub(crate) type SyncSourceLsnSet = (TableName, RowId, Lsn);
+pub(crate) type SyncSourceLsnSet = (TableName, RowId, Lsn, u8);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChangeLogEntry {
@@ -423,7 +424,25 @@ impl CompositeStore {
             self.relational.clear_sync_source_lsns(clear_source_lsns);
         }
         if !set_source_lsns.is_empty() {
-            self.relational.set_sync_source_lsns(set_source_lsns);
+            self.relational.set_sync_source_lsns(
+                set_source_lsns
+                    .iter()
+                    .map(|(table, row_id, lsn, _)| (table.clone(), *row_id, *lsn)),
+            );
+            self.relational
+                .set_sync_source_kinds(set_source_lsns.into_iter().map(
+                    |(table, row_id, _, kind)| {
+                        (
+                            table,
+                            row_id,
+                            match kind {
+                                1 => SyncSourceKind::AcceptedLocal,
+                                2 => SyncSourceKind::AcceptedLocalPending,
+                                _ => SyncSourceKind::Pulled,
+                            },
+                        )
+                    },
+                ));
         }
         record_change_log_entries(
             &mut self.change_log_table_index.write(),
@@ -451,7 +470,13 @@ pub(crate) fn sync_source_lsn_updates(
             .and_then(|by_row| by_row.get(&row.row_id))
             .copied()
         {
-            set.push((table.clone(), row.row_id, source_lsn));
+            let kind = ws
+                .relational_insert_source_kinds
+                .get(table)
+                .and_then(|rows| rows.get(&row.row_id))
+                .copied()
+                .unwrap_or(0);
+            set.push((table.clone(), row.row_id, source_lsn, kind));
         } else {
             clear.push((table.clone(), row.row_id));
         }

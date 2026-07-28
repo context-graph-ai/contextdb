@@ -407,7 +407,7 @@ fn c5b_a_delete_removes_only_the_row_whose_whole_key_matches() {
     replica
         .apply_changes(
             rows_only(source.changes_since(before_delete)),
-            &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .expect("apply the delete");
 

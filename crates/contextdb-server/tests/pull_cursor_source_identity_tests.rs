@@ -248,6 +248,10 @@ impl ClientTransport for RedirectSecondPullPage {
         self.primary.peer_node_id()
     }
 
+    fn has_stable_edge_identity(&self) -> bool {
+        self.primary.has_stable_edge_identity()
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,
@@ -734,6 +738,10 @@ struct BlankSourceInPullResponse {
 impl ClientTransport for BlankSourceInPullResponse {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
     }
 
     fn request<'a>(

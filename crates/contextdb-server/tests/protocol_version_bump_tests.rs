@@ -65,6 +65,10 @@ impl ClientTransport for RewriteEnvelopeVersion {
         self.inner.peer_node_id()
     }
 
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,
@@ -334,7 +338,7 @@ async fn a_version_mismatched_peer_is_refused_on_the_status_exchange() {
     // Anonymous transport, deliberately: `client_as` would carry an
     // authenticated node id, and the hub's per-node last-contact clock
     // advances on ANY contact regardless of message validity (an existing,
-    // separate design choice) — that would make the hub's own commit
+    // separate design choice) — that would make the hub's durable position
     // position an unreliable proxy for "did the mismatched exchange move
     // anything sync-relevant." Anonymous keeps that side effect out of the
     // picture entirely, so the checks below are unambiguous.

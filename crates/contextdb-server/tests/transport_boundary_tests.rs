@@ -10,7 +10,10 @@ use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
 use contextdb_server::transport::{
     ClientTransport, TransportError, TransportFuture, TransportResult, TransportStatusFuture,
 };
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer, split_changeset_for_test};
+use contextdb_server::{
+    InProcessBroker, SyncClient, SyncServer, acceptance_stamped_push_batches_for_test,
+    split_changeset_for_test,
+};
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -374,7 +377,10 @@ async fn ip_01_push_pull_converges_over_fake() {
     edge_a_db
         .execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
         .expect("insert on edge A");
-    let expected_push_batches = split_changeset_for_test(edge_a_db.changes_since(Lsn(0)));
+    let expected_push_batches =
+        acceptance_stamped_push_batches_for_test(edge_a_db.changes_since(Lsn(0)));
+    let expected_batch_results =
+        expected_apply_results_for_batches(&expected_push_batches, &policies);
     let edge_a = SyncClient::with_transport(
         edge_a_db.clone(),
         broker.client(),
@@ -404,17 +410,29 @@ async fn ip_01_push_pull_converges_over_fake() {
     let push_exchanges = exchanges_on(&broker, &push_subject(tenant));
     assert_eq!(
         push_exchanges.len(),
-        1,
-        "push must send one complete PushRequest envelope through the fake"
+        expected_push_batches.len(),
+        "each atomic source-LSN group must cross the fake in its own complete PushRequest envelope"
     );
-    assert_push_exchange(
-        &push_exchanges[0],
-        expected_push_batches[0].clone().into(),
-        PushResponse {
-            result: Some(edge_a_push.clone().into()),
-            error: None,
-        },
-        "single-batch push",
+    let mut applied = 0usize;
+    for (idx, (exchange, expected_batch)) in push_exchanges
+        .iter()
+        .zip(&expected_push_batches)
+        .enumerate()
+    {
+        assert_push_exchange(
+            exchange,
+            expected_batch.clone().into(),
+            PushResponse {
+                result: Some(expected_batch_results[idx].clone()),
+                error: None,
+            },
+            &format!("acceptance-stamped push group {idx}"),
+        );
+        applied += expected_batch_results[idx].applied_rows;
+    }
+    assert_eq!(
+        applied, edge_a_push.applied_rows,
+        "the caller-visible result accumulates every acceptance-stamped response"
     );
 
     let edge_b_db = Arc::new(Database::open_memory());
@@ -489,6 +507,14 @@ struct DropPushAckAfterApply {
 }
 
 impl ClientTransport for DropPushAckAfterApply {
+    fn peer_node_id(&self) -> Option<String> {
+        self.inner.peer_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
         self.inner.ensure_connected()
     }
@@ -650,7 +676,8 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
         )
         .expect("insert second");
     let losing_lsn = second_db.current_lsn();
-    let expected_push_batches = split_changeset_for_test(second_db.changes_since(Lsn(0)));
+    let expected_push_batches =
+        acceptance_stamped_push_batches_for_test(second_db.changes_since(Lsn(0)));
     let second = SyncClient::with_transport(
         second_db.clone(),
         broker.client(),
@@ -680,17 +707,35 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
     let push_exchanges = exchanges_on(&broker, &push_subject(tenant));
     assert_eq!(
         push_exchanges.len(),
-        1,
-        "the losing write must still travel to the hub as push request bytes"
+        expected_push_batches.len(),
+        "every source-LSN group, including bootstrap schema, must travel as its own request"
     );
-    assert_push_exchange(
-        &push_exchanges[0],
-        expected_push_batches[0].clone().into(),
-        PushResponse {
-            result: Some(second_result.clone().into()),
-            error: None,
-        },
-        "conflicting push",
+    let mut response_skipped = 0usize;
+    for (idx, (exchange, expected_batch)) in push_exchanges
+        .iter()
+        .zip(&expected_push_batches)
+        .enumerate()
+    {
+        let request: PushRequest = payload(
+            &exchange.0,
+            MessageType::PushRequest,
+            &format!("conflicting group {idx} request"),
+        );
+        assert_eq!(
+            request.changeset,
+            WireChangeSet::from(expected_batch.clone())
+        );
+        let response: PushResponse = payload(
+            &exchange.1,
+            MessageType::PushResponse,
+            &format!("conflicting group {idx} response"),
+        );
+        let result = response.result.expect("group response result");
+        response_skipped += result.skipped_rows;
+    }
+    assert_eq!(
+        response_skipped, second_result.skipped_rows,
+        "caller result accumulates the individual group responses"
     );
     assert_eq!(
         second_result.applied_rows, 0,
@@ -775,7 +820,12 @@ async fn ip_03_large_changeset_batch_split_converges_over_fake() {
             )
             .expect("insert blob");
     }
-    let expected_batches = split_changeset_for_test(edge_db.changes_since(Lsn(0)));
+    let size_split_batches = split_changeset_for_test(edge_db.changes_since(Lsn(0)));
+    assert!(
+        size_split_batches.len() > 1,
+        "fixture must exercise the independent size/barrier splitter"
+    );
+    let expected_batches = acceptance_stamped_push_batches_for_test(edge_db.changes_since(Lsn(0)));
     assert!(
         expected_batches.len() > 1,
         "fixture must force several sync batches, got {}",

@@ -30,6 +30,39 @@ use contextdb_vector::{
     HnswGraphStats, HnswIndex, MemVectorExecutor, VectorSearchDebugTrace, VectorStore,
     cosine_similarity,
 };
+
+#[derive(Debug, Clone)]
+pub struct SyncApplyReceipt {
+    pub tenant_id: TenantId,
+    pub node_id: String,
+    pub incarnation: Incarnation,
+    pub source_lsn: Lsn,
+}
+
+/// Provenance for the CURRENT delete marker of a natural key. This is an
+/// open-session guard only: a live relational row has durable sidecars, while
+/// a deleted one deliberately does not retain an unbounded historical record.
+#[derive(Debug, Clone, Copy)]
+struct SyncTombstoneArrival {
+    arrival: Lsn,
+    delete_lsn: Lsn,
+    /// Local owner identity for exact vector tombstone classification. This is
+    /// intentionally open-session only with the rest of delete provenance.
+    row_id: Option<RowId>,
+    kind: contextdb_relational::store::SyncSourceKind,
+    /// A status regression proved this accepted-local delete's old hub order
+    /// no longer exists. Keep suppressing live replays until the delete is
+    /// reaccepted, but never suppress the delete outbound.
+    accepted_local_order_invalidated: bool,
+}
+
+type AcceptedSyncTombstone = (
+    String,
+    NaturalKey,
+    Option<Lsn>,
+    contextdb_relational::store::SyncSourceKind,
+    RowId,
+);
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Condvar, Mutex, RwLock};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -561,6 +594,13 @@ pub struct Database {
     change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
     change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
+    /// In-memory provenance for the CURRENT delete marker of a natural key.
+    /// A row delete has no live relational row on which to retain the ordinary
+    /// sync-source sidecar, but a pulled tombstone must not be offered back to
+    /// the hub as fresh local work. This deliberately lasts only for the open
+    /// database lifetime; rebuilding old tombstone provenance after restart is
+    /// a separate retention/recovery design.
+    sync_tombstone_arrivals: Arc<RwLock<HashMap<(String, String), SyncTombstoneArrival>>>,
     persistence: Option<Arc<RedbPersistence>>,
     open_registry_path: Mutex<Option<PathBuf>>,
     operation_gate: Arc<RwLock<()>>,
@@ -2372,6 +2412,7 @@ impl Database {
             change_log_table_index,
             change_log_lsn_refcounts,
             ddl_log,
+            sync_tombstone_arrivals: Arc::new(RwLock::new(HashMap::new())),
             persistence,
             open_registry_path: Mutex::new(open_registry_path),
             operation_gate: Arc::new(RwLock::new(())),
@@ -2453,6 +2494,20 @@ impl Database {
             Arc::new(CorePlugin),
             Arc::new(MemoryAccountant::no_limit()),
         )
+    }
+
+    /// Force-recreate a file-backed store while owning its normal open lock
+    /// for the complete destructive operation. A live owner is reported as
+    /// `DatabaseLocked` before either the database or its coordination lock is
+    /// changed; after the owner exits the same operation creates a fresh,
+    /// current-format root.
+    pub fn force_reset(path: impl AsRef<Path>) -> Result<()> {
+        let canonical_path = canonical_database_path(path.as_ref())?;
+        let registry_reservation = OpenRegistryReservation::acquire(canonical_path.clone())?;
+        let persistence = RedbPersistence::recreate(&canonical_path)?;
+        persistence.close();
+        drop(registry_reservation);
+        Ok(())
     }
 
     pub fn open_memory() -> Self {
@@ -2578,6 +2633,7 @@ impl Database {
             change_log_table_index: self.change_log_table_index.clone(),
             change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),
+            sync_tombstone_arrivals: self.sync_tombstone_arrivals.clone(),
             persistence: self.persistence.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),
@@ -2737,7 +2793,7 @@ impl Database {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let sync_source_lsns = persistence
+        let sync_source_lsns: HashMap<(String, RowId), Lsn> = persistence
             .load_sync_source_lsns()?
             .into_iter()
             .filter(|((table, row_id), _)| {
@@ -2746,7 +2802,38 @@ impl Database {
                     .is_some_and(|row_ids| row_ids.contains(row_id))
             })
             .collect();
+        let mut sync_source_kinds = persistence
+            .load_sync_source_kinds()?
+            .into_iter()
+            .filter_map(|((table, row_id), kind)| {
+                (loaded_row_ids
+                    .get(&table)
+                    .is_some_and(|rows| rows.contains(&row_id))
+                    // A kind is a companion to an LSN, never independent
+                    // provenance. Ignore roots left by an older cleanup bug
+                    // rather than reclassifying a locally-authored row.
+                    && sync_source_lsns.contains_key(&(table.clone(), row_id)))
+                .then(|| {
+                    let kind = match kind {
+                        1 => contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                        2 => contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
+                        _ => contextdb_relational::store::SyncSourceKind::Pulled,
+                    };
+                    ((table, row_id), kind)
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        // Roots written before the companion table existed contain only the
+        // source LSN. Those entries were historically pulled/echo provenance,
+        // so preserve that meaning rather than treating old remote data as
+        // newly authored local work.
+        for key in sync_source_lsns.keys() {
+            sync_source_kinds
+                .entry(key.clone())
+                .or_insert(contextdb_relational::store::SyncSourceKind::Pulled);
+        }
         relational.replace_sync_source_lsns(sync_source_lsns);
+        relational.replace_sync_source_kinds(sync_source_kinds);
 
         let graph = Arc::new(GraphStore::new());
         for edge in persistence.load_forward_edges()? {
@@ -4143,6 +4230,7 @@ impl Database {
             event_bus_ddl,
             trigger_ddl,
             None,
+            None,
         )
     }
 
@@ -4153,6 +4241,7 @@ impl Database {
         event_bus_ddl: &[DdlChange],
         trigger_ddl: &[DdlChange],
         sync_pull_trigger_audit_projection: Option<&BTreeMap<String, TriggerDeclaration>>,
+        sync_tombstones: Option<&[AcceptedSyncTombstone]>,
     ) -> Result<CommitValidationOutcome> {
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
         let pending_trigger_active_guards =
@@ -4316,6 +4405,21 @@ impl Database {
                         self.add_commit_stage_stats(&stats);
                         self.publish_staged_event_bus_ddl_commit(lsn);
                         self.publish_staged_trigger_ddl_commit(lsn);
+                        if let Some(sync_tombstones) = sync_tombstones {
+                            let mut tombstones = self.sync_tombstone_arrivals.write();
+                            for (table, natural_key, arrival, kind, row_id) in sync_tombstones {
+                                tombstones.insert(
+                                    Self::sync_tombstone_key(table, natural_key),
+                                    SyncTombstoneArrival {
+                                        arrival: arrival.unwrap_or(lsn),
+                                        delete_lsn: lsn,
+                                        row_id: Some(*row_id),
+                                        kind: *kind,
+                                        accepted_local_order_invalidated: false,
+                                    },
+                                );
+                            }
+                        }
                         // DDL metadata mutation also needs the commit mutex.
                         // Release delete-side accounting here so DROP/RENAME
                         // cannot remove vector state before cleanup observes it.
@@ -5264,8 +5368,516 @@ impl Database {
             return false;
         };
         self.relational_store
-            .sync_source_lsn(table, row_id)
-            .is_some()
+            .sync_source_kind(table, row_id)
+            .is_some_and(|kind| matches!(kind, contextdb_relational::store::SyncSourceKind::Pulled))
+    }
+
+    /// Whether this exact outgoing row change was supplied by sync. Live rows
+    /// use their relational provenance sidecar; deletes use the open-session
+    /// tombstone marker staged before an incoming delete becomes visible.
+    pub fn row_change_arrived_by_sync(&self, row: &RowChange) -> bool {
+        let _operation = self.assert_open_operation();
+        if !row.deleted {
+            return self.row_version_arrived_by_sync(&row.table, &row.natural_key);
+        }
+        self.sync_tombstone_arrivals
+            .read()
+            .get(&Self::sync_tombstone_key(&row.table, &row.natural_key))
+            .is_some_and(|marker| {
+                matches!(
+                    marker.kind,
+                    contextdb_relational::store::SyncSourceKind::Pulled
+                ) && (marker.delete_lsn == row.lsn
+                    || marker.delete_lsn == SYNC_SOURCE_LSN_OWN_COMMIT)
+            })
+    }
+
+    /// Whether this exact vector-owner mutation arrived by sync. Vector
+    /// RowIds are local-store identities, so outbound echo filtering must use
+    /// the owner plus its local commit LSN rather than a table/LSN group.
+    /// Delete provenance is intentionally session-local, matching the current
+    /// tombstone retention boundary.
+    pub fn vector_change_arrived_by_sync(&self, vector: &VectorChange) -> bool {
+        let _operation = self.assert_open_operation();
+        if !vector.vector.is_empty() {
+            return self
+                .row_visible_at_snapshot(
+                    &vector.index.table,
+                    vector.row_id,
+                    self.snapshot_for_read(),
+                )
+                .is_some_and(|row| {
+                    row.lsn == vector.lsn
+                        && matches!(
+                            self.relational_store
+                                .sync_source_kind(&vector.index.table, vector.row_id),
+                            Some(contextdb_relational::store::SyncSourceKind::Pulled)
+                        )
+                });
+        }
+        self.change_log.read().iter().any(|entry| {
+            let ChangeLogEntry::RowDelete {
+                table,
+                row_id,
+                natural_key,
+                lsn,
+            } = entry
+            else {
+                return false;
+            };
+            table == &vector.index.table
+                && *row_id == vector.row_id
+                && *lsn == vector.lsn
+                && self
+                    .sync_tombstone_arrivals
+                    .read()
+                    .get(&Self::sync_tombstone_key(table, natural_key))
+                    .is_some_and(|marker| {
+                        matches!(
+                            marker.kind,
+                            contextdb_relational::store::SyncSourceKind::Pulled
+                        ) && marker.delete_lsn == *lsn
+                            && marker.row_id == Some(*row_id)
+                    })
+        })
+    }
+
+    fn sync_tombstone_key(table: &str, natural_key: &NaturalKey) -> (String, String) {
+        (table.to_string(), format!("{:?}", natural_key.pairs()))
+    }
+
+    fn clear_sync_tombstone(&self, table: &str, natural_key: &NaturalKey) {
+        self.sync_tombstone_arrivals
+            .write()
+            .remove(&Self::sync_tombstone_key(table, natural_key));
+    }
+
+    fn row_id_for_delete_change(&self, row: &RowChange) -> Option<RowId> {
+        self.change_log.read().iter().rev().find_map(|entry| {
+            let ChangeLogEntry::RowDelete {
+                table,
+                row_id,
+                natural_key,
+                lsn,
+            } = entry
+            else {
+                return None;
+            };
+            (table == &row.table && natural_key == &row.natural_key && *lsn == row.lsn)
+                .then_some(*row_id)
+        })
+    }
+
+    /// A hub restored before an acknowledged local delete can replay its old
+    /// live row. While this database is still open, the accepted-local delete
+    /// records the hub order that made it obsolete; do not resurrect that row
+    /// from an older ordered arrival. This intentionally does not reconstruct
+    /// tombstones on restart (DL-CDB-31 owns that retention question).
+    fn incoming_row_is_stale_against_sync_tombstone(
+        &self,
+        row: &RowChange,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
+    ) -> bool {
+        // A cursor that just adopted a different source compares no prior
+        // source ordering. Its authoritative from-zero history must be able
+        // to restore a row even when this session still remembers a delete
+        // accepted by the old source.
+        if adoption != SyncAdoption::Continuing {
+            return false;
+        }
+        let Some(incoming_arrival) = Self::resolve_incoming_arrival(row, arrivals) else {
+            return false;
+        };
+        self.sync_tombstone_arrivals
+            .read()
+            .get(&Self::sync_tombstone_key(&row.table, &row.natural_key))
+            .is_some_and(|marker| match marker.kind {
+                // The hub may refuse a keep-first/server-wins delete and
+                // re-emit its retained row in THAT SAME commit. That equal
+                // arrival is authoritative repair, not a restored-hub replay.
+                contextdb_relational::store::SyncSourceKind::AcceptedLocal => {
+                    marker.accepted_local_order_invalidated || incoming_arrival < marker.arrival
+                }
+                contextdb_relational::store::SyncSourceKind::AcceptedLocalPending => true,
+                // A pulled tombstone already describes the hub's own
+                // authoritative delete; its equal-arrival echo remains stale.
+                contextdb_relational::store::SyncSourceKind::Pulled => {
+                    incoming_arrival <= marker.arrival
+                }
+            })
+    }
+
+    /// Persist the accepting hub's order after a push acknowledgement. The
+    /// acknowledgement's existing `ApplyResult::new_lsn` is the hub commit
+    /// position, so no wire field is needed. The commit lock makes the
+    /// current-row comparison and the provenance write one ordering boundary:
+    /// a later local write has a different row LSN and is never marked as if
+    /// the hub had accepted it.
+    pub fn record_hub_accepted_rows(&self, rows: &[RowChange], hub_lsn: Lsn) -> Result<()> {
+        let _operation = self.assert_open_operation();
+        self.with_commit_lock(|| {
+            let snapshot = self.snapshot();
+            let empty_skip_deleted = HashSet::new();
+            let mut source_entries = Vec::new();
+            let mut tombstones = Vec::new();
+            for row in rows {
+                if row.deleted {
+                    let row_id = self.row_id_for_delete_change(row);
+                    let current = self
+                        .visible_row_by_natural_key(
+                            &row.table,
+                            &row.natural_key,
+                            snapshot,
+                            &empty_skip_deleted,
+                        )?
+                        .is_none();
+                    if current {
+                        tombstones.push((
+                            Self::sync_tombstone_key(&row.table, &row.natural_key),
+                            SyncTombstoneArrival {
+                                arrival: hub_lsn,
+                                delete_lsn: row.lsn,
+                                row_id,
+                                kind: contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                                accepted_local_order_invalidated: false,
+                            },
+                        ));
+                    }
+                    continue;
+                }
+                let Some(local) = self.visible_row_by_natural_key(
+                    &row.table,
+                    &row.natural_key,
+                    snapshot,
+                    &empty_skip_deleted,
+                )?
+                else {
+                    continue;
+                };
+                if local.lsn == row.lsn {
+                    // Re-delivery after a hub restore has the same local
+                    // source LSN but a NEW hub ordering position. Refresh an
+                    // existing AcceptedLocal marker as well as creating one.
+                    source_entries.push((row.table.clone(), local.row_id, hub_lsn));
+                }
+            }
+            if source_entries.is_empty() && tombstones.is_empty() {
+                return Ok(());
+            }
+            if let Some(persistence) = &self.persistence {
+                persistence.append_sync_source_provenance_batch(
+                    &source_entries
+                        .iter()
+                        .map(|(table, row_id, lsn)| (table.clone(), *row_id, *lsn, 1))
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+            if !source_entries.is_empty() {
+                self.relational_store
+                    .set_sync_source_lsns(source_entries.clone());
+                self.relational_store
+                    .set_sync_source_kinds(source_entries.into_iter().map(|(table, row_id, _)| {
+                        (
+                            table,
+                            row_id,
+                            contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                        )
+                    }));
+            }
+            if !tombstones.is_empty() {
+                self.sync_tombstone_arrivals.write().extend(tombstones);
+            }
+            Ok(())
+        })
+    }
+
+    /// A status reply from this authenticated edge's hub is behind the local
+    /// push frontier, proving the hub was restored before some acknowledged
+    /// local work. Mark only the affected `AcceptedLocal` order anchors as
+    /// pending fresh ordering before the caller lowers its push watermark and
+    /// resends; `Pulled` anchors still describe data this node received and
+    /// must remain intact.
+    ///
+    /// The commit lock makes the current-version check and durable sidecar
+    /// state change one boundary. A concurrent local write cannot be
+    /// accidentally reclassified after this method chose its entries.
+    pub fn invalidate_accepted_local_ordering_after_hub_regression(
+        &self,
+        hub_applied_source_watermark: Lsn,
+    ) -> Result<()> {
+        let _operation = self.assert_open_operation();
+        self.with_commit_lock(|| {
+            let entries = self
+                .relational_store
+                .tables
+                .read()
+                .iter()
+                .flat_map(|(table, rows)| {
+                    rows.iter()
+                        .filter(|row| {
+                            row.deleted_tx.is_none()
+                                && row.lsn > hub_applied_source_watermark
+                                && matches!(
+                                    self.relational_store.sync_source_kind(table, row.row_id),
+                                    Some(
+                                        contextdb_relational::store::SyncSourceKind::AcceptedLocal
+                                    )
+                                )
+                        })
+                        .map(|row| {
+                            (
+                                table.clone(),
+                                row.row_id,
+                                self.relational_store
+                                    .sync_source_lsn(table, row.row_id)
+                                    .expect("AcceptedLocal always carries source LSN"),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            if !entries.is_empty() {
+                if let Some(persistence) = &self.persistence {
+                    persistence.append_sync_source_provenance_batch(
+                        &entries
+                            .iter()
+                            .map(|(table, row_id, lsn)| (table.clone(), *row_id, *lsn, 2))
+                            .collect::<Vec<_>>(),
+                    )?;
+                }
+                self.relational_store
+                    .set_sync_source_kinds(entries.into_iter().map(|(table, row_id, _)| {
+                        (
+                            table,
+                            row_id,
+                            contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
+                        )
+                    }));
+            }
+            for marker in self.sync_tombstone_arrivals.write().values_mut() {
+                if matches!(
+                    marker.kind,
+                    contextdb_relational::store::SyncSourceKind::AcceptedLocal
+                ) && marker.delete_lsn > hub_applied_source_watermark
+                {
+                    marker.accepted_local_order_invalidated = true;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// A status confirms source work landed but not the hub order it received.
+    /// Mark current, locally outbound work in the supplied source interval
+    /// Pending before a pull can consume its echo. `through_inclusive = None`
+    /// intentionally includes later local writes too: a restored-hub ordinary
+    /// pull must not overwrite any current local work past its frontier.
+    pub fn mark_outbound_rows_pending(
+        &self,
+        after_exclusive: Lsn,
+        through_inclusive: Option<Lsn>,
+    ) -> Result<()> {
+        let _operation = self.assert_open_operation();
+        self.with_commit_lock(|| {
+            let entries = self
+                .relational_store
+                .tables
+                .read()
+                .iter()
+                .flat_map(|(table, rows)| {
+                    rows.iter()
+                        .filter(|row| {
+                            row.deleted_tx.is_none()
+                                && row.lsn > after_exclusive
+                                && through_inclusive.is_none_or(|through| row.lsn <= through)
+                                && !matches!(
+                                    self.relational_store.sync_source_kind(table, row.row_id),
+                                    Some(contextdb_relational::store::SyncSourceKind::Pulled)
+                                )
+                        })
+                        .map(|row| (table.clone(), row.row_id, row.lsn))
+                })
+                .collect::<Vec<_>>();
+            let snapshot = self.snapshot();
+            let empty_deleted = HashSet::new();
+            let mut tombstones: HashMap<(String, String), (Lsn, RowId)> = HashMap::new();
+            for entry in self.change_log_since_unlocked(after_exclusive) {
+                let ChangeLogEntry::RowDelete {
+                    table,
+                    row_id,
+                    natural_key,
+                    lsn,
+                } = entry
+                else {
+                    continue;
+                };
+                if through_inclusive.is_some_and(|through| lsn > through) {
+                    continue;
+                }
+                let key = Self::sync_tombstone_key(&table, &natural_key);
+                if self
+                    .visible_row_by_natural_key(&table, &natural_key, snapshot, &empty_deleted)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let pulled = self
+                    .sync_tombstone_arrivals
+                    .read()
+                    .get(&key)
+                    .is_some_and(|marker| {
+                        matches!(
+                            marker.kind,
+                            contextdb_relational::store::SyncSourceKind::Pulled
+                        )
+                    });
+                if !pulled {
+                    tombstones
+                        .entry(key)
+                        .and_modify(|latest| {
+                            if lsn > latest.0 {
+                                *latest = (lsn, row_id);
+                            }
+                        })
+                        .or_insert((lsn, row_id));
+                }
+            }
+            if !entries.is_empty() {
+                if let Some(persistence) = &self.persistence {
+                    persistence.append_sync_source_provenance_batch(
+                        &entries
+                            .iter()
+                            .map(|(table, row_id, lsn)| (table.clone(), *row_id, *lsn, 2))
+                            .collect::<Vec<_>>(),
+                    )?;
+                }
+                self.relational_store.set_sync_source_lsns(entries.clone());
+                self.relational_store
+                    .set_sync_source_kinds(entries.into_iter().map(|(table, row_id, _)| {
+                        (
+                            table,
+                            row_id,
+                            contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
+                        )
+                    }));
+            }
+            if !tombstones.is_empty() {
+                let mut markers = self.sync_tombstone_arrivals.write();
+                for (key, (delete_lsn, row_id)) in tombstones {
+                    markers.insert(
+                        key,
+                        SyncTombstoneArrival {
+                            arrival: delete_lsn,
+                            delete_lsn,
+                            row_id: Some(row_id),
+                            kind: contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
+                            accepted_local_order_invalidated: false,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// After status confirmed a re-send landed, a byte-identical pull echo
+    /// has no row mutation to carry through the normal sync write set. Refresh
+    /// any still-pending current row explicitly, in one durable provenance
+    /// batch under the commit lock. Differing hub truth has already replaced
+    /// Pending during apply and is deliberately left alone.
+    pub fn refresh_confirmed_pending_rows(
+        &self,
+        rows: &[RowChange],
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+    ) -> Result<()> {
+        let _operation = self.assert_open_operation();
+        self.with_commit_lock(|| {
+            let snapshot = self.snapshot();
+            let empty_deleted = HashSet::new();
+            let mut entries = Vec::new();
+            let mut tombstone_refreshes = Vec::new();
+            for row in rows.iter().filter(|row| !row.deleted) {
+                let Some(arrival) = Self::resolve_incoming_arrival(row, arrivals) else {
+                    continue;
+                };
+                let Some(current) = self.visible_row_by_natural_key(
+                    &row.table,
+                    &row.natural_key,
+                    snapshot,
+                    &empty_deleted,
+                )?
+                else {
+                    continue;
+                };
+                if matches!(
+                    self.relational_store
+                        .sync_source_kind(&row.table, current.row_id),
+                    Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                ) && Self::sync_incoming_row_is_already_local(
+                    &row.values,
+                    &current,
+                    &row.table,
+                    self.table_meta(&row.table).as_ref(),
+                ) {
+                    entries.push((row.table.clone(), current.row_id, arrival));
+                }
+            }
+            for row in rows.iter().filter(|row| row.deleted) {
+                let Some(arrival) = Self::resolve_incoming_arrival(row, arrivals) else {
+                    continue;
+                };
+                let key = Self::sync_tombstone_key(&row.table, &row.natural_key);
+                if self
+                    .sync_tombstone_arrivals
+                    .read()
+                    .get(&key)
+                    .is_some_and(|marker| {
+                        matches!(
+                            marker.kind,
+                            contextdb_relational::store::SyncSourceKind::AcceptedLocal
+                                | contextdb_relational::store::SyncSourceKind::AcceptedLocalPending
+                        ) && (marker.accepted_local_order_invalidated
+                            || matches!(
+                                marker.kind,
+                                contextdb_relational::store::SyncSourceKind::AcceptedLocalPending
+                            ))
+                            && marker.delete_lsn == row.lsn
+                    })
+                {
+                    tombstone_refreshes.push((key, arrival));
+                }
+            }
+            if !entries.is_empty() {
+                if let Some(persistence) = &self.persistence {
+                    persistence.append_sync_source_provenance_batch(
+                        &entries
+                            .iter()
+                            .map(|(table, row_id, lsn)| (table.clone(), *row_id, *lsn, 1))
+                            .collect::<Vec<_>>(),
+                    )?;
+                }
+                self.relational_store.set_sync_source_lsns(entries.clone());
+                self.relational_store
+                    .set_sync_source_kinds(entries.into_iter().map(|(table, row_id, _)| {
+                        (
+                            table,
+                            row_id,
+                            contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                        )
+                    }));
+            }
+            if !tombstone_refreshes.is_empty() {
+                let mut tombstones = self.sync_tombstone_arrivals.write();
+                for (key, arrival) in tombstone_refreshes {
+                    if let Some(marker) = tombstones.get_mut(&key) {
+                        marker.arrival = arrival;
+                        marker.kind = contextdb_relational::store::SyncSourceKind::AcceptedLocal;
+                        marker.accepted_local_order_invalidated = false;
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Test-introspection: how many commit-index entries are retained, and the
@@ -5314,6 +5926,19 @@ impl Database {
     ) -> Result<()> {
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.set_relational_insert_source_lsn(table.to_string(), row_id, source_lsn);
+        })
+    }
+
+    fn set_sync_row_source_lsn_kind(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        source_lsn: Lsn,
+        kind: u8,
+    ) -> Result<()> {
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.set_relational_insert_source_lsn_kind(table.to_string(), row_id, source_lsn, kind);
         })
     }
 
@@ -9007,6 +9632,15 @@ impl Database {
         };
         self.ensure_trigger_table_ready(table, "delete_row")?;
         self.assert_row_id_write_allowed(Some(tx), table, row_id, self.snapshot_for_read())?;
+        if let Some(row) = self.row_visible_at_snapshot(table, row_id, self.snapshot_for_read())
+            && let Some(meta) = self.table_meta(table)
+            && let Some(natural_key) = natural_key_from_row_values(&meta, &row.values)
+        {
+            // A local delete replaces any older pulled tombstone for this key.
+            // Sync apply records its own marker again only after its delete
+            // commits, so a failed inbound delete never becomes suppressible.
+            self.clear_sync_tombstone(table, &natural_key);
+        }
         self.relational.delete(tx, table, row_id)
     }
 
@@ -12215,7 +12849,7 @@ impl Database {
             let meta = table_meta.get(name);
             let mut offset = 0usize;
             loop {
-                let (batch, source_lsns) = {
+                let (batch, source_provenance) = {
                     let tables = self.relational_store.tables.read();
                     let Some(stored) = tables.get(name) else {
                         break;
@@ -12225,7 +12859,7 @@ impl Database {
                     }
                     let end = stored.len().min(offset + EXPORT_BATCH_SIZE);
                     let mut batch = Vec::with_capacity(end - offset);
-                    let mut source_lsns = Vec::new();
+                    let mut source_provenance = Vec::new();
                     for row in &stored[offset..end] {
                         let Some(row) = export_row_at_snapshot(row, watermark) else {
                             continue;
@@ -12235,16 +12869,28 @@ impl Database {
                             if let Some(lsn) =
                                 self.relational_store.sync_source_lsn(name, row.row_id)
                             {
-                                source_lsns.push((name.to_string(), row.row_id, lsn));
+                                let kind = match self
+                                    .relational_store
+                                    .sync_source_kind(name, row.row_id)
+                                {
+                                    Some(
+                                        contextdb_relational::store::SyncSourceKind::AcceptedLocal,
+                                    ) => 1,
+                                    Some(
+                                        contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
+                                    ) => 2,
+                                    _ => 0,
+                                };
+                                source_provenance.push((name.to_string(), row.row_id, lsn, kind));
                             }
                         }
                         batch.push(row);
                     }
                     offset = end;
-                    (batch, source_lsns)
+                    (batch, source_provenance)
                 };
                 artifact.append_table_rows_batch(name, meta, &batch)?;
-                artifact.append_sync_source_lsns_batch(&source_lsns)?;
+                artifact.append_sync_source_provenance_batch(&source_provenance)?;
             }
         }
 
@@ -13170,6 +13816,39 @@ impl Database {
         if let Some(persistence) = &self.persistence {
             persistence
                 .flush_config_value(&tenant_id.config_key("sync_push_watermark"), &watermark.0)?;
+        }
+        Ok(())
+    }
+
+    /// A hub status probe proved that this edge's push reached the hub, but the
+    /// edge has not yet pulled the hub's exact cursor events that establish
+    /// their provenance. This marker survives restart so a later client cannot
+    /// resend the same stampless rows before that pull completes.
+    pub fn persisted_sync_pending_push_confirmation(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Option<Lsn>> {
+        let _operation = self.open_operation()?;
+        let Some(persistence) = &self.persistence else {
+            return Ok(None);
+        };
+        persistence
+            .load_config_value::<u64>(&tenant_id.config_key("sync_pending_push_confirmation"))
+            .map(|value| value.map(Lsn))
+    }
+
+    pub fn persist_sync_pending_push_confirmation(
+        &self,
+        tenant_id: &TenantId,
+        watermark: Option<Lsn>,
+    ) -> Result<()> {
+        let _operation = self.open_operation()?;
+        if let Some(persistence) = &self.persistence {
+            let key = tenant_id.config_key("sync_pending_push_confirmation");
+            match watermark {
+                Some(watermark) => persistence.flush_config_value(&key, &watermark.0)?,
+                None => persistence.remove_config_value(&key)?,
+            }
         }
         Ok(())
     }
@@ -14363,6 +15042,7 @@ impl Database {
         &self,
         changes: &ChangeSet,
         policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
     ) -> Result<()> {
         if changes.ddl.is_empty() {
@@ -14416,6 +15096,7 @@ impl Database {
                 &mut incoming_fk_values,
                 &mut deleted_committed_fk_row_ids,
                 policies,
+                arrivals,
                 adoption,
             )?;
 
@@ -14898,6 +15579,7 @@ impl Database {
         incoming_values: &mut HashMap<String, Vec<HashMap<String, Value>>>,
         deleted_committed_row_ids: &mut HashMap<String, HashSet<RowId>>,
         policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
     ) -> Result<()> {
         if rows.is_empty() {
@@ -14907,6 +15589,11 @@ impl Database {
         let mut current_deleted_committed_row_ids = Vec::<(String, RowId)>::new();
         let mut applying_rows = Vec::<&RowChange>::new();
         for row in rows.iter().filter(|row| row.deleted) {
+            let policy = Self::sync_conflict_policy_for_table(
+                policies,
+                projected_table_meta.get(&row.table),
+                &row.table,
+            );
             let empty_deleted = HashSet::new();
             let skip_deleted = deleted_committed_row_ids
                 .get(&row.table)
@@ -14919,6 +15606,15 @@ impl Database {
                     skip_deleted,
                 )?
             {
+                if !self.sync_row_applies_over_committed(
+                    row,
+                    &committed,
+                    policy,
+                    Self::resolve_incoming_arrival(row, arrivals),
+                    adoption,
+                ) {
+                    continue;
+                }
                 current_deleted_committed_row_ids.push((row.table.clone(), committed.row_id));
                 deleted_projected_rows.push((row.table.clone(), committed.values));
                 continue;
@@ -14934,6 +15630,40 @@ impl Database {
 
         let mut post_incoming_values = incoming_values.clone();
         for row in rows.iter().filter(|row| row.deleted) {
+            let empty_deleted = HashSet::new();
+            let skip_deleted = deleted_committed_row_ids
+                .get(&row.table)
+                .unwrap_or(&empty_deleted);
+            let deletes_committed = self.table_meta(&row.table).is_some()
+                && self
+                    .visible_row_by_natural_key(
+                        &row.table,
+                        &row.natural_key,
+                        snapshot,
+                        skip_deleted,
+                    )?
+                    .is_some();
+            if deletes_committed {
+                let policy = Self::sync_conflict_policy_for_table(
+                    policies,
+                    projected_table_meta.get(&row.table),
+                    &row.table,
+                );
+                if let Some(committed) = self.visible_row_by_natural_key(
+                    &row.table,
+                    &row.natural_key,
+                    snapshot,
+                    skip_deleted,
+                )? && !self.sync_row_applies_over_committed(
+                    row,
+                    &committed,
+                    policy,
+                    Self::resolve_incoming_arrival(row, arrivals),
+                    adoption,
+                ) {
+                    continue;
+                }
+            }
             if let Some(table_values) = post_incoming_values.get_mut(&row.table) {
                 table_values.retain(|values| !row.natural_key.matches_values(values));
             }
@@ -15446,7 +16176,6 @@ impl Database {
             {
                 continue;
             }
-
             let empty_deleted = HashSet::new();
             let skip_deleted = deleted_committed_row_ids
                 .get(&row.table)
@@ -15459,9 +16188,45 @@ impl Database {
                 snapshot,
                 skip_deleted,
             )?;
+            if !row.deleted
+                && existing.is_none()
+                && self.incoming_row_is_stale_against_sync_tombstone(row, arrivals, adoption)
+            {
+                continue;
+            }
+
+            // Keep preflight's projected world identical to the apply loop:
+            // a continuing pull cannot mutate a current Pending row while its
+            // source lacks fresh ordering. Counting it here would invent an
+            // FK/DDL effect that the real apply then skips.
+            if adoption == SyncAdoption::Continuing
+                && existing.as_ref().is_some_and(|local| {
+                    matches!(
+                        self.relational_store
+                            .sync_source_kind(&row.table, local.row_id),
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                    )
+                })
+            {
+                continue;
+            }
 
             if row.deleted {
-                if let Some(local) = existing {
+                let policy = Self::sync_conflict_policy_for_table(
+                    policies,
+                    self.table_meta(&row.table).as_ref(),
+                    &row.table,
+                );
+                let applies = existing.as_ref().is_some_and(|local| {
+                    self.sync_row_applies_over_committed(
+                        row,
+                        local,
+                        policy,
+                        Self::resolve_incoming_arrival(row, arrivals),
+                        adoption,
+                    )
+                });
+                if applies && let Some(local) = existing {
                     remove_cached_row(&mut projected_rows_cache, &row.table, local.row_id);
                     if !synthetic_row_ids.remove(&local.row_id) {
                         deleted_committed_row_ids
@@ -16037,10 +16802,16 @@ impl Database {
         let mut rows = Vec::new();
         let mut edges = Vec::new();
         let mut vectors = Vec::new();
+        let mut deleted_vector_owners = HashMap::<(String, RowId), Lsn>::new();
+        let mut inserted_vector_owners = HashMap::<(String, RowId), Lsn>::new();
 
         for entry in change_entries {
             match entry {
                 ChangeLogEntry::RowInsert { table, row_id, lsn } => {
+                    inserted_vector_owners
+                        .entry((table.clone(), row_id))
+                        .and_modify(|latest| *latest = (*latest).max(lsn))
+                        .or_insert(lsn);
                     let snapshot = self.snapshot_at(lsn);
                     if let Some(row) = self.row_for_change(&table, row_id, lsn)
                         && self.row_read_allowed_for_change(&table, &row, snapshot)
@@ -16063,6 +16834,7 @@ impl Database {
                     lsn,
                     row_id,
                 } => {
+                    deleted_vector_owners.insert((table.clone(), row_id), lsn);
                     let snapshot = self.snapshot_before_lsn(lsn);
                     if !self.access_is_admin() {
                         let Some(row) = self.row_visible_at_snapshot(&table, row_id, snapshot)
@@ -16213,6 +16985,22 @@ impl Database {
         vectors.retain(|v| {
             !v.vector.is_empty() || !vector_reinserts.contains(&(v.index.clone(), v.row_id, v.lsn))
         });
+        deleted_vector_owners.retain(|owner, delete_lsn| {
+            inserted_vector_owners
+                .get(owner)
+                .is_none_or(|insert_lsn| insert_lsn < delete_lsn)
+        });
+        // Do not send older vector inserts after their owner tombstone: a
+        // receiver would otherwise try to attach that history to an owner
+        // that the same changeset has already removed. Keep the paired empty
+        // VectorDelete so apply can remove the local ANN entry before it
+        // stages the relational delete.
+        vectors.retain(|vector| {
+            vector.vector.is_empty()
+                || deleted_vector_owners
+                    .get(&(vector.index.table.clone(), vector.row_id))
+                    .is_none_or(|delete_lsn| vector.lsn > *delete_lsn)
+        });
         self.restore_vector_owner_rows(&mut rows, &vectors);
 
         ChangeSet {
@@ -16244,11 +17032,25 @@ impl Database {
         let empty_skip_deleted = HashSet::new();
         let mut arrivals = HashMap::new();
         for row in &changes.rows {
-            if row.deleted || arrivals.contains_key(&row.lsn) {
+            if arrivals.contains_key(&row.lsn) {
                 continue;
             }
-            let arrival = self
-                .visible_row_by_natural_key(
+            let arrival = if row.deleted {
+                self.sync_tombstone_arrivals
+                    .read()
+                    .get(&Self::sync_tombstone_key(&row.table, &row.natural_key))
+                    .and_then(|marker| {
+                        (!matches!(
+                            marker.kind,
+                            contextdb_relational::store::SyncSourceKind::AcceptedLocalPending
+                        ) && !marker.accepted_local_order_invalidated
+                            && (marker.delete_lsn == row.lsn
+                                || marker.delete_lsn == SYNC_SOURCE_LSN_OWN_COMMIT))
+                            .then(|| Self::resolve_sync_source_lsn(Some(marker.arrival), row.lsn))
+                            .flatten()
+                    })
+            } else {
+                self.visible_row_by_natural_key(
                     &row.table,
                     &row.natural_key,
                     snapshot,
@@ -16257,9 +17059,18 @@ impl Database {
                 .ok()
                 .flatten()
                 .and_then(|versioned| {
-                    self.relational_store
-                        .sync_source_lsn(&row.table, versioned.row_id)
-                });
+                    (!matches!(
+                        self.relational_store
+                            .sync_source_kind(&row.table, versioned.row_id),
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                    ))
+                    .then(|| {
+                        self.relational_store
+                            .sync_source_lsn(&row.table, versioned.row_id)
+                    })
+                    .flatten()
+                })
+            };
             // The sentinel never crosses the wire: resolve it to this row's
             // own committed position before a peer ever sees it (the wire
             // format itself is unchanged -- see `SYNC_SOURCE_LSN_OWN_COMMIT`).
@@ -16595,7 +17406,13 @@ impl Database {
         changes: ChangeSet,
         policies: &ConflictPolicies,
     ) -> Result<ApplyResult> {
-        self.apply_changes_impl(changes, policies, &HashMap::new(), SyncAdoption::Continuing)
+        self.apply_changes_impl(
+            changes,
+            policies,
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            None,
+        )
     }
 
     /// Apply a synced changeset carrying explicit per-row arrival positions —
@@ -16617,7 +17434,32 @@ impl Database {
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
     ) -> Result<ApplyResult> {
-        self.apply_changes_impl(changes, policies, arrivals, adoption)
+        self.apply_changes_impl(changes, policies, arrivals, adoption, None)
+    }
+
+    pub fn apply_synced_changes_with_receipt(
+        &self,
+        changes: ChangeSet,
+        policies: &ConflictPolicies,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
+        receipt: SyncApplyReceipt,
+    ) -> Result<ApplyResult> {
+        let result =
+            self.apply_changes_impl(changes, policies, arrivals, adoption, Some(receipt.clone()))?;
+        if self.persistence.is_none() {
+            let key = Self::applied_push_watermark_node_incarnation_key(
+                &receipt.tenant_id,
+                &receipt.node_id,
+                receipt.incarnation,
+            );
+            self.in_memory_applied_push_watermarks
+                .lock()
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(receipt.source_lsn))
+                .or_insert(receipt.source_lsn);
+        }
+        Ok(result)
     }
 
     fn apply_changes_impl(
@@ -16626,6 +17468,7 @@ impl Database {
         policies: &ConflictPolicies,
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
+        receipt: Option<SyncApplyReceipt>,
     ) -> Result<ApplyResult> {
         let _operation = self.open_operation_after_public_tx_control_wait("apply_changes")?;
         // Per I14: the whole batch takes the index-maintenance lock once.
@@ -16672,7 +17515,7 @@ impl Database {
                 }
             }
         }
-        self.preflight_sync_ddl_mixed_apply(&changes, policies, adoption)?;
+        self.preflight_sync_ddl_mixed_apply(&changes, policies, arrivals, adoption)?;
         self.preflight_sync_apply_trigger_ready(&changes)?;
         let _sync_trigger_gate = self.enter_sync_apply_trigger_gate_bypass();
 
@@ -16685,8 +17528,13 @@ impl Database {
                 new_lsn: self.current_lsn(),
             };
             for group in lsn_groups {
+                if receipt.is_some() {
+                    return Err(Error::SyncError(
+                        "authenticated sync receipt requires one source-LSN group".to_string(),
+                    ));
+                }
                 let result =
-                    self.apply_changes_single_lsn_group(group, policies, arrivals, adoption)?;
+                    self.apply_changes_single_lsn_group(group, policies, arrivals, adoption, None)?;
                 total.applied_rows += result.applied_rows;
                 total.skipped_rows += result.skipped_rows;
                 total.conflicts.extend(result.conflicts);
@@ -16703,6 +17551,7 @@ impl Database {
             policies,
             arrivals,
             adoption,
+            receipt,
         )
     }
 
@@ -16779,14 +17628,92 @@ impl Database {
         })
     }
 
+    /// Put the receiver's retained row back on the normal forward sync log
+    /// when a non-overwriting policy refuses an incoming mutation. This is
+    /// deliberately part of the *same* sync transaction as the refusal: a
+    /// follow-up transaction could snapshot an old row, let a newer hub write
+    /// commit, then overwrite that newer value while trying to repair the
+    /// loser.
+    ///
+    /// The conditional guard makes that promise hold even when a local writer
+    /// commits between this branch's point lookup and this transaction's final
+    /// validation. In that race the staged replacement is discarded and the
+    /// newer writer's own ordinary change-log entry is what the edge pulls.
+    fn stage_authoritative_row_after_sync_refusal(
+        &self,
+        tx: TxId,
+        table: &str,
+        local: &VersionedRow,
+    ) -> Result<()> {
+        let snapshot = self.snapshot();
+        let vectors = self
+            .table_meta(table)
+            .into_iter()
+            .flat_map(|meta| meta.columns.into_iter())
+            .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+            .filter_map(|column| {
+                let index = VectorIndexRef::new(table, column.name);
+                self.vector_store_live_entry_for_row(&index, local.row_id, snapshot)
+                    .map(|entry| (index, entry.vector))
+            })
+            .collect::<Vec<_>>();
+        let before = self.write_set_counts(tx)?;
+
+        for (index, _) in &vectors {
+            self.delete_vector(tx, index.clone(), local.row_id)?;
+        }
+        self.relational.delete(tx, table, local.row_id)?;
+        self.insert_synced_row_at(
+            tx,
+            table,
+            local.row_id,
+            local.values.clone(),
+            snapshot,
+            local.created_at,
+        )?;
+        // This is a new hub-authored ordering event. Resolve the sentinel to
+        // the transaction's actual commit LSN, not a pre-commit clock sample.
+        self.set_sync_row_source_lsn_kind(tx, table, local.row_id, SYNC_SOURCE_LSN_OWN_COMMIT, 1)?;
+        for (index, vector) in vectors {
+            self.insert_vector(tx, index, local.row_id, vector)?;
+        }
+        let after = self.write_set_counts(tx)?;
+        self.record_conditional_update_guard(
+            tx,
+            table.to_string(),
+            local.row_id,
+            local
+                .values
+                .iter()
+                .map(|(column, value)| (column.clone(), value.clone()))
+                .collect(),
+            before,
+            after,
+            false,
+        )
+    }
+
     fn apply_changes_single_lsn_group(
         &self,
         changes: ChangeSet,
         policies: &ConflictPolicies,
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
+        receipt: Option<SyncApplyReceipt>,
     ) -> Result<ApplyResult> {
         let mut tx = self.begin()?;
+        if let Some(receipt) = receipt {
+            let key = Self::applied_push_watermark_node_incarnation_key(
+                &receipt.tenant_id,
+                &receipt.node_id,
+                receipt.incarnation,
+            );
+            let encoded = RedbPersistence::encode_config_value(&receipt.source_lsn.0)?;
+            self.tx_mgr.with_write_set(tx, |ws| {
+                ws.config_max_u64_keys.push(key.clone());
+                ws.config_writes.push((key, encoded));
+            })?;
+        }
         let commit_each_row = false;
         let batch_row_commits = false;
         let mut result = ApplyResult {
@@ -16795,10 +17722,9 @@ impl Database {
             conflicts: Vec::new(),
             new_lsn: self.current_lsn(),
         };
-        let vector_row_ids = changes.vectors.iter().map(|v| v.row_id).collect::<Vec<_>>();
         let mut vector_row_map: HashMap<RowId, RowId> = HashMap::new();
         let mut vector_row_idx = 0usize;
-        let mut failed_row_ids: HashSet<RowId> = HashSet::new();
+        let mut failed_vector_groups: HashSet<(RowId, String, Lsn, bool)> = HashSet::new();
         let mut table_meta_cache: HashMap<String, Option<TableMeta>> = HashMap::new();
         let mut applied_rows_cache: HashMap<String, Vec<VersionedRow>> = HashMap::new();
         let mut applied_deleted_committed_row_ids: HashMap<String, HashSet<RowId>> = HashMap::new();
@@ -16956,8 +17882,8 @@ impl Database {
                                     // back door, so it asks the identical question
                                     // again rather than trusting the preflight
                                     // alone (defense in depth: the SAME shape, the
-                                    // SAME function, matching R2's parse-time
-                                    // refusal precedent of asking at every door
+                                    // SAME function, matching the parse-time
+                                    // refusal rule of asking at every door
                                     // that can produce the combination).
                                     crate::executor::refuse_reclaimed_history_under_keep_first(
                                         &name, &meta,
@@ -17460,7 +18386,7 @@ impl Database {
                 right.deleted.cmp(&left.deleted)
             }
         });
-        let mut non_vector_delete_phase_open = false;
+        let mut accepted_sync_tombstones = Vec::<AcceptedSyncTombstone>::new();
         for row in rows {
             if row.values.is_empty() {
                 result.skipped_rows += 1;
@@ -17484,12 +18410,6 @@ impl Database {
                     .iter()
                     .any(|col| matches!(col.column_type, ColumnType::Vector(_)))
             });
-            if !row.deleted && non_vector_delete_phase_open {
-                self.commit_with_source(tx, CommitSource::SyncPull)?;
-                tx = self.begin()?;
-                non_vector_delete_phase_open = false;
-            }
-
             if !row.deleted
                 && let Some(meta) = cached_table_meta(self, &mut table_meta_cache, &row.table)
                 && !self.sync_incoming_values_allowed_for_access(
@@ -17504,11 +18424,13 @@ impl Database {
                     .columns
                     .iter()
                     .any(|col| matches!(col.column_type, ColumnType::Vector(_)));
-                if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                if row_has_vector
+                    && next_vector_row_group_matches(&changes.vectors, vector_row_idx, &row)
+                {
                     consume_failed_vector_row_group(
-                        &vector_row_ids,
+                        &changes.vectors,
                         &mut vector_row_idx,
-                        &mut failed_row_ids,
+                        &mut failed_vector_groups,
                     );
                 }
                 // Refused, and that is the whole story: no `Conflict` is
@@ -17545,15 +18467,148 @@ impl Database {
             };
             let is_delete = row.deleted;
 
+            if adoption == SyncAdoption::Continuing
+                && existing.as_ref().is_some_and(|local| {
+                    matches!(
+                        self.relational_store
+                            .sync_source_kind(&row.table, local.row_id),
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                    )
+                })
+            {
+                // This source was restored before it ordered the local row.
+                // Until resend receives a fresh hub acknowledgement, none of
+                // its pulls may overwrite (or delete) the pending local work.
+                continue;
+            }
+
+            if !is_delete
+                && existing.is_none()
+                && self.incoming_row_is_stale_against_sync_tombstone(&row, arrivals, adoption)
+            {
+                // An old hub copy can re-offer a row from before this edge's
+                // acknowledged local delete. The delete remains local work
+                // (AcceptedLocal is never outbound-suppressed), so a later
+                // push repairs that hub instead of reviving its stale row.
+                continue;
+            }
+
             if is_delete {
                 if let Some(local) = existing {
-                    if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
-                        consume_vector_row_group(
-                            &vector_row_ids,
-                            &mut vector_row_idx,
-                            local.row_id,
-                            &mut vector_row_map,
-                        );
+                    let incoming_arrival = Self::resolve_incoming_arrival(&row, arrivals);
+                    let applies = self.sync_row_applies_over_committed(
+                        &row,
+                        &local,
+                        policy,
+                        incoming_arrival,
+                        adoption,
+                    );
+                    if !applies {
+                        if matches!(
+                            policy,
+                            ConflictPolicy::InsertIfNotExists | ConflictPolicy::ServerWins
+                        ) && let Err(err) =
+                            self.stage_authoritative_row_after_sync_refusal(tx, &row.table, &local)
+                        {
+                            let _ = self.rollback(tx);
+                            return Err(err);
+                        }
+                        // A rejected delete must leave both the relational row
+                        // and any vector it owns intact. The vector change is
+                        // tied to this remote owner, so mark that owner failed
+                        // rather than mapping it to the local row for deletion.
+                        if row_has_vector
+                            && let Some(remote_row_id) = changes
+                                .vectors
+                                .get(vector_row_idx)
+                                .map(|vector| vector.row_id)
+                            && changes.vectors.iter().any(|vector| {
+                                vector.row_id == remote_row_id
+                                    && vector.vector.is_empty()
+                                    && vector.index.table == row.table
+                                    && vector.lsn == row.lsn
+                            })
+                        {
+                            consume_failed_vector_row_group(
+                                &changes.vectors,
+                                &mut vector_row_idx,
+                                &mut failed_vector_groups,
+                            );
+                        }
+                        match policy {
+                            ConflictPolicy::LatestWins => {}
+                            ConflictPolicy::InsertIfNotExists => result.skipped_rows += 1,
+                            ConflictPolicy::ServerWins => {
+                                result.skipped_rows += 1;
+                                result.conflicts.push(Conflict {
+                                    natural_key: row.natural_key.clone(),
+                                    resolution: policy,
+                                    reason: Some("server_wins".to_string()),
+                                });
+                            }
+                            ConflictPolicy::EdgeWins => unreachable!("edge wins always applies"),
+                        }
+                        if commit_each_row {
+                            self.commit_with_source(tx, CommitSource::SyncPull)?;
+                            tx = self.begin()?;
+                        }
+                        continue;
+                    }
+                    if row_has_vector {
+                        // The cursor identifies one remote owner group. Pair
+                        // and consume only that group; a same-LSN transaction
+                        // can delete several vector owners, and scanning every
+                        // empty vector at that LSN would steal the next
+                        // owner's mapping.
+                        let paired_deletes = changes
+                            .vectors
+                            .get(vector_row_idx)
+                            .map(|vector| vector.row_id)
+                            .map(|remote_row_id| {
+                                changes
+                                    .vectors
+                                    .iter()
+                                    .filter(|vector| {
+                                        vector.row_id == remote_row_id
+                                            && vector.vector.is_empty()
+                                            && vector.index.table == row.table
+                                            && vector.lsn == row.lsn
+                                    })
+                                    .map(|vector| vector.index.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        for index in &paired_deletes {
+                            // A retained replay may carry the earlier live
+                            // relational row and the later row/vector
+                            // tombstones while omitting the superseded vector
+                            // insert. The relational owner exists in this
+                            // transaction, but there is no ANN entry to
+                            // delete; persistent vector storage treats an
+                            // absent owner as NotFound, so do not stage a
+                            // fictitious delete.
+                            if self
+                                .vector_store_live_entry_for_row(
+                                    index,
+                                    local.row_id,
+                                    self.snapshot(),
+                                )
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            if let Err(err) = self.delete_vector(tx, index.clone(), local.row_id) {
+                                let _ = self.rollback(tx);
+                                return Err(err);
+                            }
+                        }
+                        if !paired_deletes.is_empty() {
+                            consume_failed_vector_row_group(
+                                &changes.vectors,
+                                &mut vector_row_idx,
+                                &mut failed_vector_groups,
+                            );
+                        }
                     }
                     if let Err(err) = self.delete_row(tx, &row.table, local.row_id) {
                         result.conflicts.push(Conflict {
@@ -17571,11 +18626,39 @@ impl Database {
                                 .insert(local.row_id);
                         }
                         result.applied_rows += 1;
-                        if !row_has_vector {
-                            non_vector_delete_phase_open = true;
-                        }
+                        accepted_sync_tombstones.push((
+                            row.table.clone(),
+                            row.natural_key.clone(),
+                            incoming_arrival,
+                            contextdb_relational::store::SyncSourceKind::Pulled,
+                            local.row_id,
+                        ));
                     }
                 } else {
+                    // A deleting edge can pull its own accepted tombstone
+                    // after the keyed row is already absent locally. Consume
+                    // only the vector group paired with THIS remote owner;
+                    // leaving it for the generic vector loop would try to
+                    // delete the hub's RowId on this edge, and consuming every
+                    // same-LSN tombstone would steal a later owner's group.
+                    if row_has_vector
+                        && let Some(remote_row_id) = changes
+                            .vectors
+                            .get(vector_row_idx)
+                            .map(|vector| vector.row_id)
+                        && changes.vectors.iter().any(|vector| {
+                            vector.row_id == remote_row_id
+                                && vector.vector.is_empty()
+                                && vector.index.table == row.table
+                                && vector.lsn == row.lsn
+                        })
+                    {
+                        consume_failed_vector_row_group(
+                            &changes.vectors,
+                            &mut vector_row_idx,
+                            &mut failed_vector_groups,
+                        );
+                    }
                     result.skipped_rows += 1;
                 }
                 if commit_each_row {
@@ -17608,6 +18691,13 @@ impl Database {
                     row_meta.as_ref(),
                 )
             {
+                let confirmed_pending_echo = adoption
+                    == SyncAdoption::ConfirmedPendingReconciliation
+                    && matches!(
+                        self.relational_store
+                            .sync_source_kind(&row.table, local.row_id),
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                    );
                 // The content is unchanged, but a row arriving WITH an
                 // established arrival is now KNOWN to be at that fleet
                 // position — even on its first appearance in this node's own
@@ -17620,15 +18710,18 @@ impl Database {
                 // nothing established to record.
                 if matches!(policy, ConflictPolicy::LatestWins)
                     && let Some(arrival) = Self::resolve_incoming_arrival(&row, arrivals)
+                    && !confirmed_pending_echo
                     && let Err(err) =
                         self.set_sync_row_source_lsn(tx, &row.table, local.row_id, arrival)
                 {
                     let _ = self.rollback(tx);
                     return Err(err);
                 }
-                if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                if row_has_vector
+                    && next_vector_row_group_matches(&changes.vectors, vector_row_idx, &row)
+                {
                     consume_vector_row_group(
-                        &vector_row_ids,
+                        &changes.vectors,
                         &mut vector_row_idx,
                         local.row_id,
                         &mut vector_row_map,
@@ -17718,11 +18811,17 @@ impl Database {
 
                         if let Some(err_msg) = constraint_error {
                             result.skipped_rows += 1;
-                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                            if row_has_vector
+                                && next_vector_row_group_matches(
+                                    &changes.vectors,
+                                    vector_row_idx,
+                                    &row,
+                                )
+                            {
                                 consume_failed_vector_row_group(
-                                    &vector_row_ids,
+                                    &changes.vectors,
                                     &mut vector_row_idx,
-                                    &mut failed_row_ids,
+                                    &mut failed_vector_groups,
                                 );
                             }
                             result.conflicts.push(Conflict {
@@ -17746,11 +18845,17 @@ impl Database {
                             &projected_sync_apply.deleted_committed_row_ids,
                         )? {
                             result.skipped_rows += 1;
-                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                            if row_has_vector
+                                && next_vector_row_group_matches(
+                                    &changes.vectors,
+                                    vector_row_idx,
+                                    &row,
+                                )
+                            {
                                 consume_failed_vector_row_group(
-                                    &vector_row_ids,
+                                    &changes.vectors,
                                     &mut vector_row_idx,
-                                    &mut failed_row_ids,
+                                    &mut failed_vector_groups,
                                 );
                             }
                             result.conflicts.push(Conflict {
@@ -17794,7 +18899,7 @@ impl Database {
                             // cross-sender defect this stamp must not
                             // reintroduce. A stampless row gets the SENTINEL,
                             // never a `current_lsn()` sample: this insert's
-                            // own commit has not happened yet, and a
+                            // transaction's commit has not happened yet, and a
                             // concurrent apply's commit landing first would
                             // make a sampled value stale before this one even
                             // commits (see `SYNC_SOURCE_LSN_OWN_COMMIT`).
@@ -17820,9 +18925,15 @@ impl Database {
                                 },
                             );
                             result.applied_rows += 1;
-                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                            if row_has_vector
+                                && next_vector_row_group_matches(
+                                    &changes.vectors,
+                                    vector_row_idx,
+                                    &row,
+                                )
+                            {
                                 consume_vector_row_group(
-                                    &vector_row_ids,
+                                    &changes.vectors,
                                     &mut vector_row_idx,
                                     new_row_id,
                                     &mut vector_row_map,
@@ -17835,11 +18946,17 @@ impl Database {
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
-                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                            if row_has_vector
+                                && next_vector_row_group_matches(
+                                    &changes.vectors,
+                                    vector_row_idx,
+                                    &row,
+                                )
+                            {
                                 consume_failed_vector_row_group(
-                                    &vector_row_ids,
+                                    &changes.vectors,
                                     &mut vector_row_idx,
-                                    &mut failed_row_ids,
+                                    &mut failed_vector_groups,
                                 );
                             }
                             result.conflicts.push(Conflict {
@@ -17851,24 +18968,39 @@ impl Database {
                     }
                 }
                 (Some(local), ConflictPolicy::InsertIfNotExists) => {
-                    if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
-                        consume_vector_row_group(
-                            &vector_row_ids,
+                    if row_has_vector
+                        && next_vector_row_group_matches(&changes.vectors, vector_row_idx, &row)
+                    {
+                        consume_failed_vector_row_group(
+                            &changes.vectors,
                             &mut vector_row_idx,
-                            local.row_id,
-                            &mut vector_row_map,
+                            &mut failed_vector_groups,
                         );
+                    }
+                    if let Err(err) =
+                        self.stage_authoritative_row_after_sync_refusal(tx, &row.table, &local)
+                    {
+                        let _ = self.rollback(tx);
+                        return Err(err);
                     }
                     result.skipped_rows += 1;
                 }
-                (Some(_), ConflictPolicy::ServerWins) => {
+                (Some(local), ConflictPolicy::ServerWins) => {
                     result.skipped_rows += 1;
-                    if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                    if row_has_vector
+                        && next_vector_row_group_matches(&changes.vectors, vector_row_idx, &row)
+                    {
                         consume_failed_vector_row_group(
-                            &vector_row_ids,
+                            &changes.vectors,
                             &mut vector_row_idx,
-                            &mut failed_row_ids,
+                            &mut failed_vector_groups,
                         );
+                    }
+                    if let Err(err) =
+                        self.stage_authoritative_row_after_sync_refusal(tx, &row.table, &local)
+                    {
+                        let _ = self.rollback(tx);
+                        return Err(err);
                     }
                     result.conflicts.push(Conflict {
                         natural_key: row.natural_key.clone(),
@@ -17886,13 +19018,22 @@ impl Database {
                         .relational_store
                         .sync_source_lsn(&row.table, local.row_id);
                     let incoming_arrival = Self::resolve_incoming_arrival(&row, arrivals);
-                    let incoming_wins = self.sync_latest_wins_incoming(
-                        &row,
-                        &local,
-                        committed_source,
-                        incoming_arrival,
-                        adoption,
-                    );
+                    let incoming_wins = if adoption == SyncAdoption::ConfirmedPendingReconciliation
+                        && matches!(
+                            self.relational_store
+                                .sync_source_kind(&row.table, local.row_id),
+                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending)
+                        ) {
+                        true
+                    } else {
+                        self.sync_latest_wins_incoming(
+                            &row,
+                            &local,
+                            committed_source,
+                            incoming_arrival,
+                            adoption,
+                        )
+                    };
 
                     if !incoming_wins {
                         // A stale echo: an ordering position at or below the
@@ -17902,11 +19043,13 @@ impl Database {
                         // receipt. The vector bookkeeping still needs to
                         // consume this row's slot to keep the vector-row index
                         // aligned with the rows that carry one.
-                        if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                        if row_has_vector
+                            && next_vector_row_group_matches(&changes.vectors, vector_row_idx, &row)
+                        {
                             consume_failed_vector_row_group(
-                                &vector_row_ids,
+                                &changes.vectors,
                                 &mut vector_row_idx,
-                                &mut failed_row_ids,
+                                &mut failed_vector_groups,
                             );
                         }
                         if commit_each_row {
@@ -17938,12 +19081,16 @@ impl Database {
                                 if !valid && incoming != current {
                                     result.skipped_rows += 1;
                                     if row_has_vector
-                                        && vector_row_ids.get(vector_row_idx).is_some()
+                                        && next_vector_row_group_matches(
+                                            &changes.vectors,
+                                            vector_row_idx,
+                                            &row,
+                                        )
                                     {
                                         consume_failed_vector_row_group(
-                                            &vector_row_ids,
+                                            &changes.vectors,
                                             &mut vector_row_idx,
-                                            &mut failed_row_ids,
+                                            &mut failed_vector_groups,
                                         );
                                     }
                                     result.conflicts.push(Conflict {
@@ -17992,10 +19139,14 @@ impl Database {
                                 // it must not count as applied work.
                                 if matches!(upsert_result, UpsertResult::NoOp) {
                                     if row_has_vector
-                                        && vector_row_ids.get(vector_row_idx).is_some()
+                                        && next_vector_row_group_matches(
+                                            &changes.vectors,
+                                            vector_row_idx,
+                                            &row,
+                                        )
                                     {
                                         consume_vector_row_group(
-                                            &vector_row_ids,
+                                            &changes.vectors,
                                             &mut vector_row_idx,
                                             local.row_id,
                                             &mut vector_row_map,
@@ -18045,7 +19196,13 @@ impl Database {
                                     row.lsn,
                                 );
                                 result.applied_rows += 1;
-                                if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                if row_has_vector
+                                    && next_vector_row_group_matches(
+                                        &changes.vectors,
+                                        vector_row_idx,
+                                        &row,
+                                    )
+                                {
                                     // The upsert preserves `local.row_id` (the
                                     // WHOLE-key-resolved target) across its
                                     // delete+reinsert, so attach the vector there
@@ -18053,7 +19210,7 @@ impl Database {
                                     // pick the wrong sibling when two rows share
                                     // that column.
                                     consume_vector_row_group(
-                                        &vector_row_ids,
+                                        &changes.vectors,
                                         &mut vector_row_idx,
                                         local.row_id,
                                         &mut vector_row_map,
@@ -18066,11 +19223,17 @@ impl Database {
                                     return Err(err);
                                 }
                                 result.skipped_rows += 1;
-                                if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                                if row_has_vector
+                                    && next_vector_row_group_matches(
+                                        &changes.vectors,
+                                        vector_row_idx,
+                                        &row,
+                                    )
+                                {
                                     consume_failed_vector_row_group(
-                                        &vector_row_ids,
+                                        &changes.vectors,
                                         &mut vector_row_idx,
-                                        &mut failed_row_ids,
+                                        &mut failed_vector_groups,
                                     );
                                 }
                                 result.conflicts.push(Conflict {
@@ -18148,13 +19311,19 @@ impl Database {
                                 row.lsn,
                             );
                             result.applied_rows += 1;
-                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                            if row_has_vector
+                                && next_vector_row_group_matches(
+                                    &changes.vectors,
+                                    vector_row_idx,
+                                    &row,
+                                )
+                            {
                                 // Attach to the WHOLE-key-resolved row the upsert
                                 // preserved, not a leading-column re-lookup that
                                 // would pick the wrong sibling (see the LatestWins
                                 // arm).
                                 consume_vector_row_group(
-                                    &vector_row_ids,
+                                    &changes.vectors,
                                     &mut vector_row_idx,
                                     local.row_id,
                                     &mut vector_row_map,
@@ -18167,11 +19336,17 @@ impl Database {
                                 return Err(err);
                             }
                             result.skipped_rows += 1;
-                            if row_has_vector && vector_row_ids.get(vector_row_idx).is_some() {
+                            if row_has_vector
+                                && next_vector_row_group_matches(
+                                    &changes.vectors,
+                                    vector_row_idx,
+                                    &row,
+                                )
+                            {
                                 consume_failed_vector_row_group(
-                                    &vector_row_ids,
+                                    &changes.vectors,
                                     &mut vector_row_idx,
-                                    &mut failed_row_ids,
+                                    &mut failed_vector_groups,
                                 );
                             }
                             if let Some(last) = result.conflicts.last_mut() {
@@ -18223,7 +19398,12 @@ impl Database {
         }
 
         for vector in changes.vectors {
-            if failed_row_ids.contains(&vector.row_id) {
+            if failed_vector_groups.contains(&(
+                vector.row_id,
+                vector.index.table.clone(),
+                vector.lsn,
+                vector.vector.is_empty(),
+            )) {
                 continue; // skip vectors for rows that failed to insert
             }
             let local_row_id = vector_row_map
@@ -18265,12 +19445,16 @@ impl Database {
             self.sync_apply_pre_commit_pause.maybe_pause();
         }
 
+        // The commit callback publishes accepted delete provenance while the
+        // transaction manager still holds its commit lock, after relational
+        // apply made the tombstone visible and before another commit can run.
         self.commit_with_source_and_sync_ddl_and_trigger_audit_projection(
             tx,
             CommitSource::SyncPull,
             &event_bus_ddl,
             &trigger_ddl,
             sync_pull_trigger_audit_projection.as_ref(),
+            Some(&accepted_sync_tombstones),
         )?;
         let committed_lsn = self.current_lsn();
         result.new_lsn = committed_lsn;
@@ -18779,32 +19963,58 @@ fn projected_sync_rows_by_table(
 }
 
 fn consume_vector_row_group(
-    remote_row_ids: &[RowId],
+    vectors: &[VectorChange],
     cursor: &mut usize,
     local_row_id: RowId,
     map: &mut HashMap<RowId, RowId>,
 ) {
-    let Some(remote_row_id) = remote_row_ids.get(*cursor).copied() else {
+    let Some(first) = vectors.get(*cursor) else {
         return;
     };
-    while remote_row_ids.get(*cursor).copied() == Some(remote_row_id) {
+    let remote_row_id = first.row_id;
+    let table = first.index.table.clone();
+    let lsn = first.lsn;
+    let deleted = first.vector.is_empty();
+    while vectors.get(*cursor).is_some_and(|vector| {
+        vector.row_id == remote_row_id
+            && vector.index.table == table
+            && vector.lsn == lsn
+            && vector.vector.is_empty() == deleted
+    }) {
         map.insert(remote_row_id, local_row_id);
         *cursor += 1;
     }
 }
 
 fn consume_failed_vector_row_group(
-    remote_row_ids: &[RowId],
+    vectors: &[VectorChange],
     cursor: &mut usize,
-    failed: &mut HashSet<RowId>,
+    failed: &mut HashSet<(RowId, String, Lsn, bool)>,
 ) {
-    let Some(remote_row_id) = remote_row_ids.get(*cursor).copied() else {
+    let Some(first) = vectors.get(*cursor) else {
         return;
     };
-    while remote_row_ids.get(*cursor).copied() == Some(remote_row_id) {
-        failed.insert(remote_row_id);
+    let remote_row_id = first.row_id;
+    let table = first.index.table.clone();
+    let lsn = first.lsn;
+    let deleted = first.vector.is_empty();
+    while vectors.get(*cursor).is_some_and(|vector| {
+        vector.row_id == remote_row_id
+            && vector.index.table == table
+            && vector.lsn == lsn
+            && vector.vector.is_empty() == deleted
+    }) {
+        failed.insert((remote_row_id, table.clone(), lsn, deleted));
         *cursor += 1;
     }
+}
+
+fn next_vector_row_group_matches(vectors: &[VectorChange], cursor: usize, row: &RowChange) -> bool {
+    vectors.get(cursor).is_some_and(|vector| {
+        vector.index.table == row.table
+            && vector.lsn == row.lsn
+            && vector.vector.is_empty() == row.deleted
+    })
 }
 
 struct VectorExplainShape {
@@ -20197,9 +21407,10 @@ fn retention_prune_candidates(
             continue;
         }
         for row in rows {
-            let arrived_by_sync = relational_store
-                .sync_source_lsn(table_name, row.row_id)
-                .is_some();
+            let arrived_by_sync = matches!(
+                relational_store.sync_source_kind(table_name, row.row_id),
+                Some(contextdb_relational::store::SyncSourceKind::Pulled)
+            );
             if row_is_prunable(row, meta, now, sync_watermark, arrived_by_sync) {
                 candidates.insert(RetentionRowKey::new(table_name, row.row_id, row.created_tx));
             }

@@ -324,7 +324,7 @@ impl<'de> serde::Deserialize<'de> for TableMeta {
                 // must (`sc01_bincode_legacy_column_def_payload_fails_
                 // loudly`). Genuine short-tail TOLERANCE is scoped to ONLY
                 // the two NEWEST fields (`conflict_policy`, `history_policy`)
-                // below, which is the specific gap this run's tests pin.
+                // below, which is the compatibility boundary these tests pin.
                 let dag_edge_types = seq.next_element::<Vec<String>>()?.unwrap_or_default();
                 let unique_constraints =
                     seq.next_element::<Vec<Vec<String>>>()?.unwrap_or_default();
@@ -690,7 +690,7 @@ impl<'de> serde::Deserialize<'de> for ColumnDef {
                 // its zero value on a genuinely older payload would let a
                 // corrupt or pre-`immutable` payload pose as a non-immutable
                 // column, defeating the flag's own protection. Not touched
-                // by this run: the short-tail tolerance work here is scoped
+                // by this compatibility rule: short-tail tolerance is scoped
                 // to `TableMeta.conflict_policy`/`history_policy` only.
                 let unique = seq.next_element::<bool>()?.unwrap_or_default();
                 let default = seq.next_element::<Option<String>>()?.unwrap_or_default();

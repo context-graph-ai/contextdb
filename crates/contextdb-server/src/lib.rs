@@ -34,7 +34,7 @@ pub use blob_resolver::{BlobStore, ResolveError};
 pub use identity::FabricIdentity;
 pub use sync_client::SyncClient;
 #[doc(hidden)]
-pub use sync_client::split_changeset_for_test;
+pub use sync_client::{acceptance_stamped_push_batches_for_test, split_changeset_for_test};
 pub use sync_plugin::SyncPlugin;
 pub use sync_server::SyncServer;
 /// Re-export the async runtime this crate is built on, so a consumer that drives the shipped async

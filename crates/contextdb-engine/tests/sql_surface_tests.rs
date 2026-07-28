@@ -5461,7 +5461,7 @@ fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
             ],
             ..sync::ChangeSet::default()
         },
-        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::ServerWins),
+        &sync::ConflictPolicies::uniform(sync::ConflictPolicy::EdgeWins),
     )
     .unwrap();
 

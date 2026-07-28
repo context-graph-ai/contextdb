@@ -2199,7 +2199,8 @@ fn t3_sync_trigger_ddl_fk_preflight_accepts_child_update_before_parent_delete() 
 }
 
 #[test]
-fn t3_sync_trigger_ddl_fk_preflight_rejects_skipped_child_update_before_parent_delete() {
+fn t3_sync_trigger_ddl_fk_preflight_rejects_server_wins_child_update_before_edge_wins_parent_delete()
+ {
     let db = Database::open_memory();
     db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
         .unwrap();
@@ -2267,7 +2268,10 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_skipped_child_update_before_parent_d
             ],
             ..Default::default()
         },
-        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+        &ConflictPolicies {
+            per_table: HashMap::from([("parent_rows".to_string(), ConflictPolicy::EdgeWins)]),
+            default: ConflictPolicy::ServerWins,
+        },
     );
 
     assert!(

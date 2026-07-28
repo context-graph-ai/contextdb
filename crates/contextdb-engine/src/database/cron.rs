@@ -758,6 +758,7 @@ impl Database {
             change_log_table_index: self.change_log_table_index.clone(),
             change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),
+            sync_tombstone_arrivals: self.sync_tombstone_arrivals.clone(),
             persistence: self.persistence.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),

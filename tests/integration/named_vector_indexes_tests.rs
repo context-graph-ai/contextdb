@@ -489,7 +489,7 @@ fn nv04_delete_drops_row_from_every_vector_index() {
         .apply_changes(
             cs,
             &contextdb_engine::sync_types::ConflictPolicies::uniform(
-                contextdb_engine::sync_types::ConflictPolicy::ServerWins,
+                contextdb_engine::sync_types::ConflictPolicy::EdgeWins,
             ),
         )
         .expect("receiver applies delete changeset");

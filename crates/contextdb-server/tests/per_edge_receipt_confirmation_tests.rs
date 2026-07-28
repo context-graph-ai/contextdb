@@ -22,7 +22,7 @@ use contextdb_engine::work_ledger::{advertise_capability, install_work_ledger_sc
 use contextdb_server::protocol::{
     MessageType, SyncStatusRequest, SyncStatusResponse, decode, encode,
 };
-use contextdb_server::subjects::{push_subject, status_subject};
+use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
 use contextdb_server::transport::{
     ClientTransport, TransportError, TransportFuture, TransportResult, TransportStatusFuture,
 };
@@ -334,6 +334,10 @@ impl DropPushRequestOnTheWire {
 impl ClientTransport for DropPushRequestOnTheWire {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
     }
 
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
@@ -695,6 +699,372 @@ async fn c3d_a_hub_restored_from_an_older_copy_is_noticed_while_another_edge_pus
     );
 
     gen2.stop().await;
+}
+
+/// A restored hub must re-order an edge's lost acknowledged value in its NEW
+/// history. If the edge keeps the discarded old hub arrival, a later edit on
+/// the restored hub loses numerically even though it committed later there.
+#[tokio::test]
+async fn restored_hub_reorders_lost_accepted_value_before_a_later_same_key_edit() {
+    let ddl = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let broker = InProcessBroker::new();
+    let live_path = temp.path().join("hub-live.db");
+    let edge_path = temp.path().join("edge-a.db");
+    let live_db = Arc::new(Database::open(&live_path).expect("open live hub"));
+    live_db.execute(ddl, &p()).expect("create latest hub table");
+    let first_hub = start_hub_on(&broker, live_db.clone());
+    let edge_a = Arc::new(Database::open(&edge_path).expect("open persistent edge A"));
+    edge_a.execute(ddl, &p()).expect("create latest A table");
+    let edge_b = Arc::new(Database::open_memory());
+    edge_b.execute(ddl, &p()).expect("create latest B table");
+    let client_a = edge_client(&edge_a, &broker, EDGE_A);
+    let client_b = edge_client(&edge_b, &broker, EDGE_B);
+
+    insert_notes(&edge_a, 1..2);
+    within(client_a.push()).await.expect("seed A value");
+    within(client_b.pull_default()).await.expect("seed B value");
+    let artifact = temp.path().join("hub-before-lost-value.cdb");
+    live_db
+        .export_snapshot(&artifact)
+        .expect("export pre-loss hub");
+
+    edge_a
+        .execute("UPDATE notes SET body = 'a-lost' WHERE id = 1", &p())
+        .expect("A writes value later lost by restore");
+    within(client_a.push())
+        .await
+        .expect("live hub accepts A lost value");
+    assert_eq!(
+        bodies(&live_db, "notes"),
+        std::collections::BTreeSet::from(["a-lost".to_string()]),
+        "fixture: live hub has A's later acknowledged value"
+    );
+
+    first_hub.stop().await;
+    let restored = Arc::new(Database::open(&artifact).expect("open restored hub"));
+    let second_hub = start_hub_on(&broker, restored.clone());
+    within(client_a.push())
+        .await
+        .expect("A detects restore and re-sends its lost value");
+    assert_eq!(
+        bodies(&restored, "notes"),
+        std::collections::BTreeSet::from(["a-lost".to_string()]),
+        "the restored hub holds A's re-ordered lost value before B edits it"
+    );
+
+    within(client_b.pull_default())
+        .await
+        .expect("B receives restored-hub A value");
+    edge_b
+        .execute("UPDATE notes SET body = 'b-later' WHERE id = 1", &p())
+        .expect("B writes later value on restored hub history");
+    within(client_b.push())
+        .await
+        .expect("restored hub accepts B later value");
+    within(client_a.pull_default())
+        .await
+        .expect("A pulls B later value");
+
+    let expected = std::collections::BTreeSet::from(["b-later".to_string()]);
+    for (name, db) in [
+        ("restored hub", &restored),
+        ("edge A", &edge_a),
+        ("edge B", &edge_b),
+    ] {
+        assert_eq!(
+            bodies(db, "notes"),
+            expected,
+            "{name} must retain the later restored-hub edit, not old discarded order"
+        );
+    }
+    second_hub.stop().await;
+}
+
+/// A restored-hub resend can land while its acknowledgement and first recovery
+/// pull both fail. The next push sees a status that covers the pending batch;
+/// it must use the explicit confirmed reconciliation mode so the identical echo
+/// refreshes Pending provenance, then later restored-hub truth can win.
+#[tokio::test]
+async fn landed_ack_lost_after_restore_recovers_pending_on_next_push_before_later_edit() {
+    let ddl = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let broker = InProcessBroker::new();
+    let live_path = temp.path().join("hub-live.db");
+    let edge_path = temp.path().join("edge-a.db");
+    let live_db = Arc::new(Database::open(&live_path).expect("open live hub"));
+    live_db.execute(ddl, &p()).expect("create latest hub table");
+    let first_hub = start_hub_on(&broker, live_db.clone());
+    let edge_a = Arc::new(Database::open(&edge_path).expect("open persistent edge A"));
+    edge_a.execute(ddl, &p()).expect("create latest A table");
+    let edge_b = Arc::new(Database::open_memory());
+    edge_b.execute(ddl, &p()).expect("create latest B table");
+    let client_a = edge_client(&edge_a, &broker, EDGE_A);
+    let client_b = edge_client(&edge_b, &broker, EDGE_B);
+
+    insert_notes(&edge_a, 1..2);
+    within(client_a.push()).await.expect("seed A value");
+    within(client_b.pull_default()).await.expect("seed B value");
+    let artifact = temp.path().join("hub-before-lost-value.cdb");
+    live_db
+        .export_snapshot(&artifact)
+        .expect("export pre-loss hub");
+
+    edge_a
+        .execute("UPDATE notes SET body = 'a-lost' WHERE id = 1", &p())
+        .expect("A writes value later lost by restore");
+    let lost_lsn = edge_a.current_lsn();
+    within(client_a.push())
+        .await
+        .expect("live hub accepts A lost value");
+
+    first_hub.stop().await;
+    let restored = Arc::new(Database::open(&artifact).expect("open restored hub"));
+    let second_hub = start_hub_on(&broker, restored.clone());
+    let landed_but_unreconciled =
+        landed_ack_lost_with_recovery_pull_dropped_client(&edge_a, &broker, EDGE_A);
+    let interrupted = within(landed_but_unreconciled.push()).await;
+    assert!(
+        interrupted.is_err(),
+        "the lost acknowledgement plus lost recovery pull leaves the batch pending: {interrupted:?}"
+    );
+    assert_eq!(
+        bodies(&restored, "notes"),
+        std::collections::BTreeSet::from(["a-lost".to_string()]),
+        "fixture: the restored hub received the resend before its acknowledgement was lost"
+    );
+    assert_eq!(
+        edge_a
+            .persisted_sync_pending_push_confirmation(&TenantId::from(TENANT))
+            .expect("read durable pending confirmation"),
+        Some(lost_lsn),
+        "the failed recovery leaves a durable no-send gate for the next push"
+    );
+
+    let recovered_a = edge_client(&edge_a, &broker, EDGE_A);
+    within(recovered_a.push())
+        .await
+        .expect("next push status-confirms and reconciles the landed resend");
+    assert_eq!(
+        edge_a
+            .persisted_sync_pending_push_confirmation(&TenantId::from(TENANT))
+            .expect("read cleared pending confirmation"),
+        None,
+        "only the completed confirmed pull may retire the durable no-send gate"
+    );
+    let (_, arrivals) = edge_a.changes_since_with_arrivals(Lsn(0));
+    assert!(
+        matches!(arrivals.get(&lost_lsn), Some(Some(_))),
+        "the confirmed identical echo must replace Pending's missing arrival: {arrivals:?}"
+    );
+
+    within(client_b.pull_default())
+        .await
+        .expect("B receives restored A value");
+    edge_b
+        .execute("UPDATE notes SET body = 'b-later' WHERE id = 1", &p())
+        .expect("B writes later restored-hub value");
+    within(client_b.push())
+        .await
+        .expect("restored hub accepts B later value");
+    within(recovered_a.pull_default())
+        .await
+        .expect("A pulls B later value after pending refresh");
+
+    let expected = std::collections::BTreeSet::from(["b-later".to_string()]);
+    for (name, db) in [
+        ("restored hub", &restored),
+        ("edge A", &edge_a),
+        ("edge B", &edge_b),
+    ] {
+        assert_eq!(
+            bodies(db, "notes"),
+            expected,
+            "{name} must accept the later edit after the lost-ack recovery refresh"
+        );
+    }
+    second_hub.stop().await;
+}
+
+/// A hub can be restored below a batch that landed but whose acknowledgement
+/// and recovery pull were lost. Status is then below the durable pending
+/// target: the reconciliation pull must remain ordinary and the next send must
+/// re-deliver the local value without treating the stale hub history as an ack.
+#[tokio::test]
+async fn restored_before_pending_preserves_pending_until_the_resend_is_redelivered() {
+    let ddl = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let broker = InProcessBroker::new();
+    let live_path = temp.path().join("hub-live.db");
+    let edge_path = temp.path().join("edge-a.db");
+    let live_db = Arc::new(Database::open(&live_path).expect("open live hub"));
+    live_db.execute(ddl, &p()).expect("create latest hub table");
+    let first_hub = start_hub_on(&broker, live_db.clone());
+    let edge_a = Arc::new(Database::open(&edge_path).expect("open persistent edge A"));
+    edge_a.execute(ddl, &p()).expect("create latest A table");
+    let edge_b = Arc::new(Database::open_memory());
+    edge_b.execute(ddl, &p()).expect("create latest B table");
+    let client_a = edge_client(&edge_a, &broker, EDGE_A);
+    let client_b = edge_client(&edge_b, &broker, EDGE_B);
+
+    insert_notes(&edge_a, 1..2);
+    within(client_a.push()).await.expect("seed A value");
+    let artifact = temp.path().join("hub-before-lost-value.cdb");
+    live_db
+        .export_snapshot(&artifact)
+        .expect("export pre-loss hub");
+    edge_a
+        .execute("UPDATE notes SET body = 'a-pending' WHERE id = 1", &p())
+        .expect("write value later lost by restore");
+    let pending_lsn = edge_a.current_lsn();
+    let landed_but_unreconciled =
+        landed_ack_lost_with_recovery_pull_dropped_client(&edge_a, &broker, EDGE_A);
+    assert!(
+        within(landed_but_unreconciled.push()).await.is_err(),
+        "fixture: the live hub accepted the update but the acknowledgement/recovery were lost"
+    );
+    assert_eq!(
+        edge_a
+            .persisted_sync_pending_push_confirmation(&TenantId::from(TENANT))
+            .expect("read durable pending target"),
+        Some(pending_lsn),
+        "fixture: the landed live update has a durable confirmation target"
+    );
+
+    first_hub.stop().await;
+    let restored = Arc::new(Database::open(&artifact).expect("open restored hub"));
+    let second_hub = start_hub_on(&broker, restored.clone());
+    let final_retry = edge_client(&edge_a, &broker, EDGE_A);
+    within(final_retry.push())
+        .await
+        .expect("below-target status pulls ordinarily then re-delivers the pending value");
+    assert_eq!(
+        bodies(&edge_a, "notes"),
+        std::collections::BTreeSet::from(["a-pending".to_string()]),
+        "the stale restored hub value cannot replace the local pending value"
+    );
+    assert_eq!(
+        bodies(&restored, "notes"),
+        std::collections::BTreeSet::from(["a-pending".to_string()]),
+        "the below-target branch re-delivers rather than falsely confirming the lost batch"
+    );
+    assert_eq!(
+        edge_a
+            .persisted_sync_pending_push_confirmation(&TenantId::from(TENANT))
+            .expect("read cleared pending target"),
+        None,
+        "the ordinary below-target pull clears only the confirmation target before re-delivery"
+    );
+    within(client_b.pull_default())
+        .await
+        .expect("B receives A re-delivered value");
+    edge_b
+        .execute("UPDATE notes SET body = 'b-later' WHERE id = 1", &p())
+        .expect("B writes later restored-hub value");
+    within(client_b.push())
+        .await
+        .expect("restored hub accepts B later value");
+    within(final_retry.pull_default())
+        .await
+        .expect("A receives later hub value");
+    let expected = std::collections::BTreeSet::from(["b-later".to_string()]);
+    for (name, db) in [("restored hub", &restored), ("edge A", &edge_a)] {
+        assert_eq!(
+            bodies(db, "notes"),
+            expected,
+            "{name} must accept the later restored-hub edit after re-delivery"
+        );
+    }
+    second_hub.stop().await;
+}
+
+/// Even when status recovery succeeds immediately, its identical pull echo
+/// must leave A's local value AcceptedLocal rather than Pulled. A later hub
+/// restore therefore re-uploads it, and B's subsequent restored-history edit
+/// still wins everywhere.
+#[tokio::test]
+async fn successful_lost_ack_recovery_survives_later_restore_and_later_edit() {
+    let ddl = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let broker = InProcessBroker::new();
+    let live_path = temp.path().join("hub-live.db");
+    let edge_path = temp.path().join("edge-a.db");
+    let live = Arc::new(Database::open(&live_path).expect("open live hub"));
+    live.execute(ddl, &p()).expect("create latest hub table");
+    let first_hub = start_hub_on(&broker, live.clone());
+    let edge_a = Arc::new(Database::open(&edge_path).expect("open persistent edge A"));
+    let edge_b = Arc::new(Database::open_memory());
+    edge_a.execute(ddl, &p()).expect("create latest A table");
+    edge_b.execute(ddl, &p()).expect("create latest B table");
+    let client_a = edge_client(&edge_a, &broker, EDGE_A);
+    let client_b = edge_client(&edge_b, &broker, EDGE_B);
+
+    insert_notes(&edge_a, 1..2);
+    within(client_a.push()).await.expect("seed A value");
+    within(client_b.pull_default()).await.expect("seed B value");
+    let artifact = temp.path().join("hub-before-ack-loss.cdb");
+    live.export_snapshot(&artifact)
+        .expect("export pre-loss hub");
+    edge_a
+        .execute("UPDATE notes SET body = 'a-recovered' WHERE id = 1", &p())
+        .expect("A writes lost-ack value");
+    let recovered_lsn = edge_a.current_lsn();
+    let lost_ack = landed_ack_lost_client(&edge_a, &broker, EDGE_A);
+    within(lost_ack.push())
+        .await
+        .expect("status recovery pulls the exact live hub order");
+    assert_eq!(
+        edge_a
+            .persisted_sync_pending_push_confirmation(&TenantId::from(TENANT))
+            .expect("read cleared recovery marker"),
+        None,
+        "a completed status recovery retires its durable pending marker"
+    );
+    let (outbound, arrivals) = edge_a.changes_since_with_arrivals(Lsn(0));
+    let recovered_row = outbound
+        .rows
+        .iter()
+        .find(|row| row.lsn == recovered_lsn)
+        .expect("recovered local row remains in history");
+    assert!(
+        matches!(arrivals.get(&recovered_lsn), Some(Some(_)))
+            && !edge_a.row_change_arrived_by_sync(recovered_row),
+        "the successful identical echo records exact AcceptedLocal order, never Pulled"
+    );
+
+    first_hub.stop().await;
+    let restored = Arc::new(Database::open(&artifact).expect("open restored hub"));
+    let second_hub = start_hub_on(&broker, restored.clone());
+    let restored_a = edge_client(&edge_a, &broker, EDGE_A);
+    within(restored_a.push())
+        .await
+        .expect("A re-uploads recovered value after hub restore");
+    assert_eq!(
+        bodies(&restored, "notes"),
+        std::collections::BTreeSet::from(["a-recovered".to_string()]),
+        "the restored hub receives the status-recovered local update again"
+    );
+    within(client_b.pull_default())
+        .await
+        .expect("B receives A re-upload");
+    edge_b
+        .execute("UPDATE notes SET body = 'b-later' WHERE id = 1", &p())
+        .expect("B writes later restored-history value");
+    within(client_b.push())
+        .await
+        .expect("hub accepts B later value");
+    within(restored_a.pull_default())
+        .await
+        .expect("A receives B later value");
+    let expected = std::collections::BTreeSet::from(["b-later".to_string()]);
+    for (name, db) in [
+        ("restored hub", &restored),
+        ("edge A", &edge_a),
+        ("edge B", &edge_b),
+    ] {
+        assert_eq!(bodies(db, "notes"), expected, "{name} keeps B's later edit");
+    }
+    second_hub.stop().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,11 +1436,18 @@ fn expect_fixb(ids: std::ops::Range<i64>) -> std::collections::BTreeSet<String> 
 struct ForwardPushThenDropAck {
     inner: Arc<dyn ClientTransport>,
     push_subject: String,
+    /// Test-only fault: the recovery pull after status confirmation fails once,
+    /// leaving the durable confirmation marker for the next ordinary push.
+    drop_first_pull: Option<Arc<AtomicBool>>,
 }
 
 impl ClientTransport for ForwardPushThenDropAck {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
     }
 
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
@@ -1087,6 +1464,18 @@ impl ClientTransport for ForwardPushThenDropAck {
         request_bytes: Vec<u8>,
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
+        if subject == pull_subject(TENANT)
+            && self
+                .drop_first_pull
+                .as_ref()
+                .is_some_and(|drop| drop.swap(false, Ordering::SeqCst))
+        {
+            return Box::pin(async {
+                Err(TransportError::Unreachable(
+                    "first status-confirmed recovery pull lost on the wire".to_string(),
+                ))
+            });
+        }
         self.inner.request(subject, request_bytes, timeout)
     }
 
@@ -1096,6 +1485,18 @@ impl ClientTransport for ForwardPushThenDropAck {
         request_bytes: Vec<u8>,
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
+        if subject == pull_subject(TENANT)
+            && self
+                .drop_first_pull
+                .as_ref()
+                .is_some_and(|drop| drop.swap(false, Ordering::SeqCst))
+        {
+            return Box::pin(async {
+                Err(TransportError::Unreachable(
+                    "first status-confirmed recovery pull lost on the wire".to_string(),
+                ))
+            });
+        }
         if subject == self.push_subject {
             let inner = self.inner.clone();
             let subject = subject.to_string();
@@ -1133,6 +1534,23 @@ fn landed_ack_lost_client(
         Arc::new(ForwardPushThenDropAck {
             inner: broker.client_as(node_id),
             push_subject: push_subject(TENANT),
+            drop_first_pull: None,
+        }),
+        TenantId::from(TENANT),
+    )
+}
+
+fn landed_ack_lost_with_recovery_pull_dropped_client(
+    db: &Arc<Database>,
+    broker: &InProcessBroker,
+    node_id: &str,
+) -> SyncClient {
+    SyncClient::with_transport(
+        db.clone(),
+        Arc::new(ForwardPushThenDropAck {
+            inner: broker.client_as(node_id),
+            push_subject: push_subject(TENANT),
+            drop_first_pull: Some(Arc::new(AtomicBool::new(true))),
         }),
         TenantId::from(TENANT),
     )
@@ -1408,6 +1826,10 @@ impl ClientTransport for ForwardPushThenAlterThenDropAck {
         self.inner.peer_node_id()
     }
 
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
         self.inner.ensure_connected()
     }
@@ -1565,6 +1987,10 @@ impl ClientTransport for ProbeFailsThenPushDropped {
         self.inner.peer_node_id()
     }
 
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
         self.inner.ensure_connected()
     }
@@ -1642,24 +2068,25 @@ fn probe_failing_dropped_push_client(
     )
 }
 
-/// A transport for the in-memory reincarnation scenario (G2). The FIRST push
-/// exchange is FORWARDED so the hub applies and acknowledges it — the warmup that
-/// re-establishes a non-zero LOCAL push position and thereby clears the pre-fix
-/// code's per-push boolean distrust (which fires only while the local position is zero).
-/// Every LATER push exchange is DROPPED on the way OUT so the hub never stores
-/// it. Status exchanges always forward. On an in-memory edge the persisted
-/// stale-incarnation marker is inert (persistence is None), so nothing re-arms
-/// the distrust after the warmup — the exact path the persisted marker never
-/// covered.
+/// A transport for the in-memory reincarnation scenario (G2). The test arms
+/// dropping only AFTER the complete warmup `push()` returns. Exact receipt
+/// stamping legitimately sends more than one PushRequest when DDL and row
+/// commits have distinct source LSNs, so counting requests would drop part of
+/// the warmup instead of the subsequent backlog. Status exchanges always
+/// forward.
 struct WarmupConfirmsThenPushDropped {
     inner: Arc<dyn ClientTransport>,
     push_subject: String,
-    warmed: AtomicBool,
+    drop_after_warmup: Arc<AtomicBool>,
 }
 
 impl ClientTransport for WarmupConfirmsThenPushDropped {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
     }
 
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
@@ -1685,9 +2112,9 @@ impl ClientTransport for WarmupConfirmsThenPushDropped {
         request_bytes: Vec<u8>,
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
-        if subject == self.push_subject && self.warmed.swap(true, Ordering::SeqCst) {
-            // The warmup push already landed; every later batch is lost on the way
-            // out so the hub never stores it.
+        if subject == self.push_subject && self.drop_after_warmup.load(Ordering::SeqCst) {
+            // Every backlog batch is lost on the way out, so the hub never
+            // stores it. The test arms this only after warmup completion.
             return Box::pin(async {
                 Err(TransportError::Unreachable(
                     "push request dropped on the wire before it reached the hub".to_string(),
@@ -1711,16 +2138,18 @@ fn warmup_then_dropped_push_client(
     db: &Arc<Database>,
     broker: &InProcessBroker,
     node_id: &str,
-) -> SyncClient {
-    SyncClient::with_transport(
+) -> (SyncClient, Arc<AtomicBool>) {
+    let drop_after_warmup = Arc::new(AtomicBool::new(false));
+    let client = SyncClient::with_transport(
         db.clone(),
         Arc::new(WarmupConfirmsThenPushDropped {
             inner: broker.client_as(node_id),
             push_subject: push_subject(TENANT),
-            warmed: AtomicBool::new(false),
+            drop_after_warmup: drop_after_warmup.clone(),
         }),
         TenantId::from(TENANT),
-    )
+    );
+    (client, drop_after_warmup)
 }
 
 /// G3 — the reincarnation false confirmation must be refused EVEN IF the pre-push
@@ -1873,7 +2302,7 @@ async fn g2_in_memory_reincarnation_is_not_false_confirmed_across_a_warmup() {
     // two pushes (a fresh client would reload zero and re-arm the boolean).
     let reborn = Arc::new(Database::open_memory());
     reborn.execute(FIXB_DDL, &p()).expect("reborn table");
-    let client = warmup_then_dropped_push_client(&reborn, &broker, EDGE_A);
+    let (client, drop_after_warmup) = warmup_then_dropped_push_client(&reborn, &broker, EDGE_A);
 
     // The warmup: one directly-confirmed push whose single row sits BELOW the
     // stale watermark. It raises the local position off zero (clearing the
@@ -1887,6 +2316,7 @@ async fn g2_in_memory_reincarnation_is_not_false_confirmed_across_a_warmup() {
         client.push_watermark()
     );
     let gate_after_warmup = reborn.sync_watermark();
+    drop_after_warmup.store(true, Ordering::SeqCst);
 
     // A DELIVERING backlog that splits at the 100-group boundary: its first
     // batch's max LSN sits BELOW the stale watermark, its tail ABOVE it, so the
@@ -2183,6 +2613,44 @@ async fn g4_hub_keys_the_per_edge_watermark_by_node_and_incarnation() {
     );
 
     hub.stop().await;
+}
+
+/// A memory-only hub can restart its SyncServer over the same `Database`.
+/// The server's own cache is new, so this proves the committed receipt was
+/// published into the database-owned memory frontier only after the apply.
+#[tokio::test]
+async fn memory_hub_server_restart_keeps_the_authenticated_edge_receipt() {
+    let first_broker = InProcessBroker::new();
+    let hub_db = Arc::new(Database::open_memory());
+    let first_hub = start_hub_on(&first_broker, hub_db.clone());
+    let edge = Arc::new(Database::open_memory());
+    edge.execute(FIXB_DDL, &p()).expect("edge table");
+    insert_fixb(&edge, 1..4);
+    within(edge_client(&edge, &first_broker, EDGE_A).push())
+        .await
+        .expect("initial push");
+    let incarnation = edge
+        .sync_incarnation(&TenantId::from(TENANT))
+        .expect("edge incarnation");
+    let recorded = hub_db
+        .persisted_sync_applied_push_watermark_for_node_incarnation(
+            &TenantId::from(TENANT),
+            EDGE_A,
+            incarnation,
+        )
+        .expect("read database-owned memory receipt")
+        .expect("initial push committed a receipt");
+    first_hub.stop().await;
+
+    let restarted_broker = InProcessBroker::new();
+    let restarted_hub = start_hub_on(&restarted_broker, hub_db);
+    let (_request, status) = status_for(&restarted_broker, TENANT, EDGE_A, incarnation).await;
+    assert_eq!(
+        status.applied_push_watermark,
+        Some(recorded),
+        "a new SyncServer cache must reload the same database-owned receipt"
+    );
+    restarted_hub.stop().await;
 }
 
 /// Reopen-retains-incarnation. A file-backed database reloads the SAME incarnation

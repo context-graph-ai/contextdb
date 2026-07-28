@@ -33,6 +33,9 @@ pub struct SyncClient {
     endpoint: String,
     tenant_id: TenantId,
     push_watermark: AtomicLsn,
+    /// A confirmed hub push whose exact ordering still needs a pull. This is
+    /// in memory for memory databases and persisted for file-backed ones.
+    pending_push_confirmation: AtomicLsn,
     pull_watermark: AtomicLsn,
     /// Pages served during a pull, then discarded unapplied because they
     /// reported an incarnation other than the one this client's cursor
@@ -69,6 +72,10 @@ impl std::fmt::Debug for SyncClient {
             .field(
                 "push_watermark",
                 &self.push_watermark.load(Ordering::Relaxed),
+            )
+            .field(
+                "pending_push_confirmation",
+                &self.pending_push_confirmation.load(Ordering::Relaxed),
             )
             .field(
                 "pull_watermark",
@@ -135,12 +142,20 @@ impl SyncClient {
                 None
             })
             .map(|(source, _lsn)| source);
+        let pending_push_confirmation = db
+            .persisted_sync_pending_push_confirmation(&tenant_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(%tenant_id, error = %err, "failed to load pending sync push confirmation");
+                None
+            })
+            .unwrap_or(Lsn(0));
         Self {
             db,
             transport,
             endpoint,
             tenant_id,
             push_watermark: AtomicLsn::new(push_watermark),
+            pending_push_confirmation: AtomicLsn::new(pending_push_confirmation),
             pull_watermark: AtomicLsn::new(pull_watermark),
             pages_discarded_for_source_mismatch: AtomicUsize::new(0),
             pull_source: std::sync::RwLock::new(pull_source),
@@ -436,7 +451,7 @@ impl SyncClient {
         // server whose applied-push watermark is behind ours was restored from
         // a stale artifact and silently lost acked commits; regress the local
         // push watermark so the changeset recomputation re-pushes them.
-        let local = self.push_watermark.load(Ordering::SeqCst);
+        let mut local = self.push_watermark.load(Ordering::SeqCst);
         let pre_push_server_watermark = self
             .fetch_sync_status(incarnation)
             .await
@@ -450,13 +465,99 @@ impl SyncClient {
                 server_applied_watermark = server_applied.0,
                 "server applied-push watermark behind local; regressing to re-push acked commits"
             );
+            // Clear stale hub-order anchors BEFORE persisting the regressed
+            // source frontier. A crash after the watermark write but before
+            // this durable invalidation would otherwise let a later hub edit
+            // lose to the restored hub's discarded order.
+            self.db
+                .invalidate_accepted_local_ordering_after_hub_regression(server_applied)
+                .map_err(|err| Error::SyncError(err.to_string()))?;
             self.push_watermark.store(server_applied, Ordering::SeqCst);
             self.db
                 .persist_sync_push_watermark(&self.tenant_id, server_applied)
                 .map_err(|err| Error::SyncError(err.to_string()))?;
+            local = server_applied;
         }
 
-        let since = self.push_watermark.load(Ordering::SeqCst);
+        // A status watermark only says that this edge's request reached the
+        // hub. It does not identify the row ordering that request received.
+        // Recover that ordering with an ordinary pull before constructing any
+        // next push changeset; otherwise a restart after a lost acknowledgement
+        // could resend the same stampless LatestWins row as a fresh overwrite.
+        // The marker is durable so this gate survives a new SyncClient/process.
+        let durable_pending_confirmation = self
+            .db
+            .persisted_sync_pending_push_confirmation(&self.tenant_id)
+            .map_err(|err| Error::SyncError(err.to_string()))?;
+        let in_memory_pending = self.pending_push_confirmation.load(Ordering::SeqCst);
+        let pending_confirmation = durable_pending_confirmation
+            .or_else(|| (in_memory_pending.0 != 0).then_some(in_memory_pending));
+        // A status frontier belongs to the edge identity the client presents,
+        // not the remote hub identity. Anonymous/broker transports expose an
+        // aggregate server value, so it must never be mistaken for this
+        // client's pending work.
+        let reconciliation_target = pending_confirmation.or_else(|| {
+            self.transport.has_stable_edge_identity().then_some(())?;
+            pre_push_server_watermark.filter(|server_applied| *server_applied > local)
+        });
+        if let Some(target) = reconciliation_target {
+            let Some(server_applied) = pre_push_server_watermark else {
+                return Err(Error::SyncPushUnconfirmed {
+                    detail: "a prior push awaits exact hub-order reconciliation, but hub status is unavailable; no rows were resent".to_string(),
+                });
+            };
+            let restored_before_pending = server_applied < target;
+            // A restored status below the durable pending target proves that
+            // this hub does not yet contain the re-send. Its ordinary history
+            // must not clear Pending; only a status-confirmed hub can use the
+            // explicit Pending-bypassing reconciliation mode.
+            if restored_before_pending {
+                self.db.mark_outbound_rows_pending(server_applied, None)?;
+            } else {
+                // The status covers this edge's pending batch. Protect only
+                // that confirmed interval while the exact-order pull runs;
+                // later, unconfirmed local work must remain ordinary local
+                // work rather than being stamped by this confirmation.
+                self.db
+                    .mark_outbound_rows_pending(local, Some(server_applied))?;
+            }
+            let reconciliation_pull = if restored_before_pending {
+                self.pull_default().await
+            } else {
+                self.pull_default_confirmed_pending().await
+            };
+            if let Err(pull_err) = reconciliation_pull {
+                return Err(Error::SyncPushUnconfirmed {
+                    detail: format!(
+                        "the prior push reconciliation pull failed ({pull_err}); no rows were resent"
+                    ),
+                });
+            }
+            if restored_before_pending {
+                tracing::info!(
+                    tenant_id = %self.tenant_id,
+                    pending = target.0,
+                    restored_frontier = server_applied.0,
+                    "hub restored below pending push confirmation; adopted its history before re-delivery"
+                );
+            }
+            // The pull supplied exact arrivals; status supplies this edge's
+            // outbound frontier. Persist that frontier before clearing pending:
+            // a crash can then only repeat the safe idempotent pull.
+            self.push_watermark.store(server_applied, Ordering::SeqCst);
+            self.db
+                .persist_sync_push_watermark(&self.tenant_id, server_applied)
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+            self.db
+                .persist_sync_pending_push_confirmation(&self.tenant_id, None)
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+            self.pending_push_confirmation
+                .store(Lsn(0), Ordering::SeqCst);
+            self.advance_engine_sync_watermark(server_applied);
+            local = server_applied;
+        }
+
+        let since = local;
         // Clone directions out of RwLock BEFORE any .await
         let directions = self.table_directions()?;
         refuse_keyless_tables_with_no_identity_fallback(&self.db, &directions)?;
@@ -495,7 +596,12 @@ impl SyncClient {
 
         let hub = self.hub_node_id();
         let mut last_successful_lsn = since;
-        for batch in split_changeset(changeset) {
+        // `ApplyResult::new_lsn` is one accepting commit position. Do not
+        // stamp an entire size batch with it: a size batch may contain many
+        // independently committed data-LSN groups and hub work can interleave
+        // between them. Keep each request to exactly one group so the existing
+        // v6 acknowledgement remains an exact provenance position.
+        for batch in acceptance_stamped_push_batches(changeset) {
             let batch_max_lsn = batch.max_lsn().unwrap_or_else(|| {
                 if batch.ddl.is_empty() {
                     since
@@ -527,20 +633,38 @@ impl SyncClient {
                     // unchanged: the watermark advances only on a CONFIRMED
                     // batch, and an unconfirmed outcome leaves it untouched so a
                     // later push re-sends the same batch idempotently.
-                    return self
-                        .finish_interrupted_push(
-                            err,
-                            batch_max_lsn,
-                            total,
-                            hub.as_deref(),
-                            batch_items,
-                            batch_payload_bytes,
-                            transmitted_ceiling,
-                            incarnation,
-                        )
-                        .await;
+                    self.finish_interrupted_push(
+                        err,
+                        batch_max_lsn,
+                        hub.as_deref(),
+                        batch_items,
+                        batch_payload_bytes,
+                        transmitted_ceiling,
+                        incarnation,
+                    )
+                    .await?;
+                    // The confirmed group is now durably retired, but this
+                    // push can contain later independently committed LSN
+                    // groups. Continue with them rather than returning a
+                    // misleading success after only the first lost-ack group.
+                    last_successful_lsn = batch_max_lsn;
+                    continue;
                 }
             };
+            // `new_lsn` is the accepting hub's committed position for this
+            // acknowledged batch. Record it on the author before advancing its
+            // push watermark: a later pull can now distinguish this accepted
+            // echo from a subsequent local mutation that is still unpushed.
+            // This reuses the existing reply field; protocol v6's bytes stay
+            // unchanged.
+            // This request is exactly one data-LSN group, so `new_lsn` is the
+            // exact hub ordering position for every mutation it addressed.
+            // A refused key is immediately superseded by the hub's targeted
+            // authoritative re-emission in this SAME hub commit/position;
+            // keeping the group stamp lets accepted siblings reject only an
+            // older stale echo before that ordinary pull arrives.
+            self.db
+                .record_hub_accepted_rows(&batch.rows, result.new_lsn)?;
             // Every refusal this hub can still report advances the watermark:
             // now that arbitration compares each row against a single
             // accepting-node ordering position instead of two machines'
@@ -601,9 +725,11 @@ impl SyncClient {
     /// committed on the hub, so ask the hub what it actually applied:
     ///
     /// * If the hub's applied-push watermark covers this batch's max LSN, the
-    ///   batch DID land: advance and persist the push watermark to it and report
-    ///   the push as the success it was. Any later batches this run never sent
-    ///   reconcile idempotently on the next push.
+    ///   batch DID land, but the status watermark is not an exact row-arrival
+    ///   position. Pull before retiring the batch: the accepted echo carries
+    ///   the hub's precise arrival marker, and any later hub write follows it
+    ///   in the same ordinary cursor order. Only that successful reconciliation
+    ///   lets this method advance and persist the push watermark.
     /// * Otherwise the hub is unreachable or its watermark does not (yet) confirm
     ///   the batch. The outcome is genuinely UNKNOWN, so surface the distinct
     ///   [`Error::SyncPushUnconfirmed`] (never a definitive failure) and leave the
@@ -613,13 +739,12 @@ impl SyncClient {
         &self,
         transport_err: Error,
         batch_max_lsn: Lsn,
-        applied_before_interruption: ApplyResult,
         hub: Option<&str>,
         batch_items: u64,
         batch_payload_bytes: u64,
         transmitted_ceiling: Lsn,
         incarnation: Incarnation,
-    ) -> Result<ApplyResult, Error> {
+    ) -> Result<(), Error> {
         // The hub answers this edge with the per-edge record it holds for THIS
         // life of the edge — keyed by (node_id, incarnation), stamped on the
         // status probe below. A lost acknowledgement is confirmed only when that
@@ -655,12 +780,48 @@ impl SyncClient {
             tracing::info!(
                 tenant_id = %self.tenant_id,
                 batch_max_lsn = batch_max_lsn.0,
-                "push acknowledgement was lost but the hub confirms the batch landed; reconciling to success"
+                "push acknowledgement was lost but the hub confirms the batch landed; pulling exact hub ordering before retiring it"
             );
+            // Mark the exact confirmed batch before recording its recovery
+            // target or pulling. Its identical echo has no row mutation, so
+            // without this durable Pending provenance a later restore could
+            // classify the local row as Pulled and suppress re-upload.
+            let previous_push_watermark = self.push_watermark.load(Ordering::SeqCst);
+            self.db
+                .mark_outbound_rows_pending(previous_push_watermark, Some(batch_max_lsn))?;
+            // Record this before the pull. A crash or transport failure after
+            // status confirmation must survive restart as a no-send gate until
+            // the exact hub events are pulled.
+            self.db
+                .persist_sync_pending_push_confirmation(&self.tenant_id, Some(batch_max_lsn))
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+            self.pending_push_confirmation
+                .store(batch_max_lsn, Ordering::SeqCst);
+            // Never replay a stampless batch here. In particular, replaying a
+            // previously accepted LatestWins write would look freshly authored
+            // to the hub and could overwrite a newer hub edit. The original
+            // accepted echo remains ahead of this pull cursor and carries its
+            // exact arrival; pulling it also orders any later hub edit after
+            // that echo. If the pull cannot complete, the push watermark stays
+            // put and a later call can safely reconcile again.
+            if let Err(pull_err) = self.pull_default_confirmed_pending().await {
+                return Err(Error::SyncPushUnconfirmed {
+                    detail: format!(
+                        "the hub confirmed the push landed but the required pull reconciliation \
+                         could not establish its exact ordering ({pull_err}); the push watermark \
+                         remains unchanged and a later push will reconcile"
+                    ),
+                });
+            }
             self.push_watermark.store(batch_max_lsn, Ordering::SeqCst);
             self.db
                 .persist_sync_push_watermark(&self.tenant_id, batch_max_lsn)
                 .map_err(|err| Error::SyncError(err.to_string()))?;
+            self.db
+                .persist_sync_pending_push_confirmation(&self.tenant_id, None)
+                .map_err(|err| Error::SyncError(err.to_string()))?;
+            self.pending_push_confirmation
+                .store(Lsn(0), Ordering::SeqCst);
             self.advance_engine_sync_watermark(batch_max_lsn);
             // The batch is confirmed DELIVERED, so it is counted — recorded
             // here, beside the watermark advance, because this is the one place
@@ -677,7 +838,7 @@ impl SyncClient {
                 batch_items,
                 batch_payload_bytes,
             );
-            return Ok(applied_before_interruption);
+            return Ok(());
         }
 
         Err(Error::SyncPushUnconfirmed {
@@ -691,6 +852,23 @@ impl SyncClient {
 
     /// Pull with explicit policies (frozen test contract, library consumers).
     pub async fn pull(&self, policies: &ConflictPolicies) -> Result<ApplyResult, Error> {
+        self.pull_with_initial_adoption(policies, SyncAdoption::Continuing)
+            .await
+    }
+
+    /// Status-confirmed recovery is the sole pull mode allowed to resolve a
+    /// restored-hub Pending marker. It is private to the lost-ack path.
+    async fn pull_default_confirmed_pending(&self) -> Result<ApplyResult, Error> {
+        let policies = self.conflict_policies()?;
+        self.pull_with_initial_adoption(&policies, SyncAdoption::ConfirmedPendingReconciliation)
+            .await
+    }
+
+    async fn pull_with_initial_adoption(
+        &self,
+        policies: &ConflictPolicies,
+        initial_adoption: SyncAdoption,
+    ) -> Result<ApplyResult, Error> {
         self.ensure_connected().await.map_err(Error::SyncError)?;
         // The work ledger's per-table policies are merged over whatever the
         // caller passes (they are the ledger's contract, not caller policy):
@@ -756,7 +934,7 @@ impl SyncClient {
         // cleared for the rest of THIS call: every page from that point on
         // is part of the same from-zero re-fetch of the newly adopted
         // source's full history (see `SyncAdoption`).
-        let mut adoption = SyncAdoption::Continuing;
+        let mut adoption = initial_adoption;
 
         loop {
             let request = PullRequest {
@@ -849,12 +1027,20 @@ impl SyncClient {
             let received_items = filtered.rows.len() as u64;
             let received_payload_bytes = row_payload_bytes(&filtered.rows);
             let stop_for_trigger_bootstrap = filtered.has_create_trigger_ddl() && has_more;
+            let pending_refresh_rows = if adoption == SyncAdoption::ConfirmedPendingReconciliation {
+                Some(filtered.rows.clone())
+            } else {
+                None
+            };
             let result = self.db.apply_synced_changes(
                 filtered,
                 &remap_pull_policies(policies),
                 &arrivals,
                 adoption,
             )?;
+            if let Some(rows) = pending_refresh_rows {
+                self.db.refresh_confirmed_pending_rows(&rows, &arrivals)?;
+            }
             self.receipts.record(
                 hub.as_deref(),
                 TransferPlane::Sync,
@@ -1196,17 +1382,33 @@ pub(crate) fn refuse_keyless_tables_with_no_identity_fallback(
 }
 
 /// An edge pushes what it WROTE, not what it was given: a row whose current
-/// local version arrived over sync is dropped from the outbound changeset.
+/// local version or delete marker arrived over sync is dropped from the outbound changeset.
 /// Pushing it back would hand the hub its own data — the echo that makes a
 /// pull-then-push cycle re-deliver rows forever — and it would also make the
 /// transfer receipt count rows that never needed to move. A row that was
-/// pulled and then EDITED here has lost the marker, so local work always
-/// propagates. Edges, vectors and DDL are untouched.
+/// pulled and then edited or deleted locally loses the marker, so local work
+/// always propagates. Vectors follow their owning row's exact `(table, local
+/// commit LSN)` group: a pulled vector must not echo, but a locally edited,
+/// deleted, AcceptedLocal, or Pending owner remains outbound work.
 pub(crate) fn drop_rows_that_arrived_by_sync(db: &Database, changes: ChangeSet) -> ChangeSet {
     let mut changes = changes;
-    changes
+    // A changeset can include the older local insert that preceded a pulled
+    // tombstone. Suppressing only the tombstone would re-offer that stale
+    // history as a live row, so suppress the complete natural-key history
+    // while the current delete marker is known to have arrived by sync.
+    let synced_delete_keys = changes
         .rows
-        .retain(|row| !db.row_version_arrived_by_sync(&row.table, &row.natural_key));
+        .iter()
+        .filter(|row| row.deleted && db.row_change_arrived_by_sync(row))
+        .map(|row| (row.table.clone(), format!("{:?}", row.natural_key.pairs())))
+        .collect::<std::collections::HashSet<_>>();
+    changes.rows.retain(|row| {
+        !synced_delete_keys.contains(&(row.table.clone(), format!("{:?}", row.natural_key.pairs())))
+            && !db.row_change_arrived_by_sync(row)
+    });
+    changes
+        .vectors
+        .retain(|vector| !db.vector_change_arrived_by_sync(vector));
     changes
 }
 
@@ -1253,6 +1455,16 @@ pub(crate) fn split_changeset(changeset: ChangeSet) -> Vec<ChangeSet> {
     split_changeset_by_size(bootstrap_batches.into_iter().next().unwrap_or_default())
 }
 
+/// The existing push acknowledgement carries one accepting commit position.
+/// Keep every acknowledgement-stamped request to one data-LSN group, while
+/// retaining the row/vector/edge entries that committed together.
+fn acceptance_stamped_push_batches(changeset: ChangeSet) -> Vec<ChangeSet> {
+    split_changeset(changeset)
+        .into_iter()
+        .flat_map(ChangeSet::split_by_data_lsn)
+        .collect()
+}
+
 fn split_changeset_by_size(changeset: ChangeSet) -> Vec<ChangeSet> {
     let wire = WireChangeSet::from(changeset.clone());
     let estimated = rmp_serde::to_vec(&wire).map(|v| v.len()).unwrap_or(0);
@@ -1275,6 +1487,15 @@ fn split_changeset_by_size(changeset: ChangeSet) -> Vec<ChangeSet> {
 #[doc(hidden)]
 pub fn split_changeset_for_test(changeset: ChangeSet) -> Vec<ChangeSet> {
     split_changeset(changeset)
+}
+
+/// The exact production request boundary for v6 push acknowledgements. The
+/// size/barrier splitter remains independently testable above; this second
+/// step keeps every request to one atomic source-LSN group so `new_lsn` is
+/// usable as provenance for every mutation in its reply.
+#[doc(hidden)]
+pub fn acceptance_stamped_push_batches_for_test(changeset: ChangeSet) -> Vec<ChangeSet> {
+    acceptance_stamped_push_batches(changeset)
 }
 
 fn data_lsn_group_count(changeset: &ChangeSet) -> usize {
@@ -2119,5 +2340,95 @@ mod tests {
             batches[0].has_create_trigger_ddl() && batches[0].data_entry_count() == 1,
             "same-LSN trigger DDL/data remains atomic and will fail closed at apply if callbacks are missing; batches={batches:?}"
         );
+    }
+
+    #[test]
+    fn acknowledgement_stamped_push_batches_keep_exact_data_lsn_groups() {
+        let id = Uuid::new_v4();
+        let changeset = ChangeSet {
+            rows: vec![
+                RowChange {
+                    table: "notes".to_string(),
+                    natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
+                    values: HashMap::from([("id".to_string(), Value::Uuid(id))]),
+                    deleted: false,
+                    lsn: Lsn(7),
+                    created_at: None,
+                },
+                RowChange {
+                    table: "notes".to_string(),
+                    natural_key: NaturalKey::single("id".to_string(), Value::Int64(2)),
+                    values: HashMap::from([("id".to_string(), Value::Int64(2))]),
+                    deleted: false,
+                    lsn: Lsn(8),
+                    created_at: None,
+                },
+            ],
+            edges: Vec::new(),
+            vectors: vec![VectorChange {
+                index: contextdb_core::VectorIndexRef::new("notes", "embedding"),
+                row_id: RowId(44),
+                vector: vec![1.0, 0.0],
+                lsn: Lsn(7),
+            }],
+            ddl: Vec::new(),
+            ddl_lsn: Vec::new(),
+        };
+
+        let batches = acceptance_stamped_push_batches(changeset);
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|batch| {
+            let lsns = batch
+                .rows
+                .iter()
+                .map(|row| row.lsn)
+                .chain(batch.vectors.iter().map(|vector| vector.lsn))
+                .collect::<std::collections::BTreeSet<_>>();
+            lsns.len() == 1
+        }));
+        assert_eq!(batches[0].rows.len(), 1);
+        assert_eq!(batches[0].vectors.len(), 1);
+        assert_eq!(batches[0].max_lsn(), Some(Lsn(7)));
+        assert_eq!(batches[1].max_lsn(), Some(Lsn(8)));
+    }
+
+    #[test]
+    fn acknowledgement_stamped_push_never_splits_one_oversized_atomic_lsn_group() {
+        let changeset = ChangeSet {
+            rows: vec![
+                RowChange {
+                    table: "notes".to_string(),
+                    natural_key: NaturalKey::single("id".to_string(), Value::Int64(1)),
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Int64(1)),
+                        ("body".to_string(), Value::Text("x".repeat(MAX_BATCH_BYTES))),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(44),
+                    created_at: None,
+                },
+                RowChange {
+                    table: "notes".to_string(),
+                    natural_key: NaturalKey::single("id".to_string(), Value::Int64(2)),
+                    values: HashMap::from([
+                        ("id".to_string(), Value::Int64(2)),
+                        ("body".to_string(), Value::Text("y".repeat(MAX_BATCH_BYTES))),
+                    ]),
+                    deleted: false,
+                    lsn: Lsn(44),
+                    created_at: None,
+                },
+            ],
+            ..ChangeSet::default()
+        };
+        assert!(batch_wire_size(&changeset) > MAX_BATCH_BYTES);
+        let batches = acceptance_stamped_push_batches(changeset);
+        assert_eq!(
+            batches.len(),
+            1,
+            "one atomic source LSN may exceed the size target but cannot be split into inexact acknowledgement groups"
+        );
+        assert_eq!(batches[0].rows.len(), 2);
+        assert_eq!(batches[0].max_lsn(), Some(Lsn(44)));
     }
 }

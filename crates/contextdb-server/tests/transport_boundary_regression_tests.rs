@@ -193,6 +193,23 @@ async fn push_retry_unsafe_transport_falls_back_to_one_single_attempt() {
         &Default::default(),
     )
     .unwrap();
+    let client = SyncClient::with_transport(
+        db.clone(),
+        transport.clone(),
+        contextdb_core::TenantId::from("push-retry-unsafe"),
+    );
+    client
+        .push()
+        .await
+        .expect("bootstrap DDL should use the single-attempt path");
+    // The transport contract is per encoded request. Retire the independent
+    // DDL source group first so the assertion below isolates one row request
+    // and can still distinguish a fallback from a retry.
+    transport.retry_safe_push_calls.store(0, Ordering::SeqCst);
+    transport
+        .single_attempt_push_calls
+        .store(0, Ordering::SeqCst);
+
     let id = Uuid::new_v4();
     let mut params = std::collections::HashMap::new();
     params.insert("id".to_string(), Value::Uuid(id));
@@ -200,11 +217,6 @@ async fn push_retry_unsafe_transport_falls_back_to_one_single_attempt() {
     db.execute("INSERT INTO t (id, v) VALUES ($id, $v)", &params)
         .unwrap();
 
-    let client = SyncClient::with_transport(
-        db,
-        transport.clone(),
-        contextdb_core::TenantId::from("push-retry-unsafe"),
-    );
     let result = client
         .push()
         .await

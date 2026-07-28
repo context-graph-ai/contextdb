@@ -116,7 +116,7 @@ fn concurrent_stampless_applies_never_serve_equal_arrivals_for_different_commits
         "apply B must have applied its row: {result_b:?}"
     );
 
-    // Let A proceed to its own commit now that B has fully landed.
+    // Let A proceed to commit now that B has fully landed.
     pause.release();
     let result_a = handle_a.join().expect("apply A thread must not panic");
     assert_eq!(

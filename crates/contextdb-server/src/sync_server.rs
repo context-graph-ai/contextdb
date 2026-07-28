@@ -111,38 +111,15 @@ impl PerEdgeAppliedPushWatermarks {
         Self::load_locked(&mut cache, db, tenant_id, node_id, incarnation)
     }
 
-    /// Raise this edge life's record to `candidate` if it is higher, persisting
-    /// the new value. Monotonic per `(edge, incarnation)`, exactly like the
-    /// per-tenant record.
-    fn advance(
-        &self,
-        db: &Database,
-        tenant_id: &TenantId,
-        node_id: &str,
-        incarnation: Incarnation,
-        candidate: Lsn,
-    ) {
+    /// The engine has already committed this authenticated receipt in the
+    /// same transaction as its data. Publishing this cache entry cannot make
+    /// status run ahead of durable state.
+    fn publish_committed(&self, node_id: &str, incarnation: Incarnation, candidate: Lsn) {
         let mut cache = self.cache.lock().unwrap_or_else(|err| err.into_inner());
-        let current = Self::load_locked(&mut cache, db, tenant_id, node_id, incarnation);
-        if candidate <= current {
-            return;
-        }
-        if let Err(err) = db.persist_sync_applied_push_watermark_for_node(
-            tenant_id,
-            node_id,
-            incarnation,
-            candidate,
-        ) {
-            tracing::warn!(
-                %tenant_id,
-                %node_id,
-                %incarnation,
-                error = %err,
-                "failed to persist per-edge applied-push watermark"
-            );
-            return;
-        }
-        cache.insert((node_id.to_string(), incarnation), candidate);
+        cache
+            .entry((node_id.to_string(), incarnation))
+            .and_modify(|current| *current = (*current).max(candidate))
+            .or_insert(candidate);
     }
 
     fn load_locked(
@@ -789,24 +766,35 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                     // detects "my own source changed," only a pulling client
                     // does (see `SyncClient::pull`). Every push apply is the
                     // ordinary, continuing case.
-                    let result = db.apply_synced_changes(
-                        changeset,
-                        &policies,
-                        &arrivals,
-                        SyncAdoption::Continuing,
-                    )?;
+                    let result = if let (Some(node_id), Some(max_lsn)) =
+                        (applying_node_id.as_deref(), push_max_lsn)
+                    {
+                        db.apply_synced_changes_with_receipt(
+                            changeset,
+                            &policies,
+                            &arrivals,
+                            SyncAdoption::Continuing,
+                            contextdb_engine::database::SyncApplyReceipt {
+                                tenant_id: tenant_id.clone(),
+                                node_id: node_id.to_string(),
+                                incarnation,
+                                source_lsn: max_lsn,
+                            },
+                        )?
+                    } else {
+                        db.apply_synced_changes(
+                            changeset,
+                            &policies,
+                            &arrivals,
+                            SyncAdoption::Continuing,
+                        )?
+                    };
                     if let Some(max_lsn) = push_max_lsn {
                         // What this hub now holds FROM THIS EDGE. Raised only
                         // after the apply committed, so the number the status
                         // exchange answers with never runs ahead of the data.
                         if let Some(node_id) = applying_node_id.as_deref() {
-                            per_edge_watermarks.advance(
-                                &db,
-                                &tenant_id,
-                                node_id,
-                                incarnation,
-                                max_lsn,
-                            );
+                            per_edge_watermarks.publish_committed(node_id, incarnation, max_lsn);
                         }
                         applied_push_watermark.fetch_max(max_lsn, Ordering::SeqCst);
                         let watermark = applied_push_watermark.load(Ordering::SeqCst);

@@ -409,10 +409,10 @@ fn arriving_sync_ddl_refuses_engine_owned_mutation_sibling_table_still_applies()
 }
 
 // ---------------------------------------------------------------------
-// Sync-apply preserve-or-refuse (Findings 1 & 2, cold review #4).
+// Sync-apply preserve-or-refuse for engine-owned table policy.
 // ---------------------------------------------------------------------
 
-/// FINDING 1 (cold review #4), the reviewer's own probe shape: an arriving
+/// An arriving
 /// `AlterTable` for `work_inputs` that carries the FULL post-alter shape with
 /// NO `RETAIN` clause at all -- exactly the wire shape `DROP RETAIN` produces
 /// on an unguarded/older peer, or a hand-crafted changeset. The interop
@@ -486,14 +486,14 @@ fn arriving_alter_silent_on_history_and_conflict_preserves_work_capabilities_pol
 /// `HISTORY` / `SYNC` clause at all -- the shape an unrelated column-only
 /// ALTER from a peer would carry) must PRESERVE the declared `SYNC OFF`, not
 /// clear it back to the undeclared default (`SyncDirection::Both`) -- the
-/// same clearing defect as Finding 1, on the direction axis instead of
+/// same clearing defect on the direction axis instead of
 /// RETAIN. (Silent on `HISTORY` too, deliberately: an incoming shape
 /// explicit on `HISTORY CURRENT ONLY` but silent on direction alone is not a
 /// shape this table's own reconcile order ever produces -- see
 /// `install_node_contacts_schema`, which sets direction BEFORE history -- and
 /// separately trips the pre-existing `refuse_reclaimed_history_under_
 /// keep_first` hazard check, which is unrelated to this test's contract and
-/// out of this round's scope.)
+/// outside this test's contract.)
 #[test]
 fn arriving_alter_silent_on_direction_preserves_work_node_contacts_sync_off() {
     let db = Database::open_memory();
@@ -538,7 +538,7 @@ fn arriving_alter_silent_on_direction_preserves_work_node_contacts_sync_off() {
     );
 }
 
-/// FINDING 2 (cold review #4), the reviewer's first probe shape: a
+/// A hand-crafted arriving
 /// hand-crafted arriving `CreateTable` for the ALREADY-EXISTING
 /// `work_capabilities`, explicitly declaring `SYNC CONFLICT KEEP FIRST` --
 /// the byte-identical mutation `arriving_sync_ddl_refuses_engine_owned_
@@ -582,15 +582,14 @@ fn arriving_create_table_adopt_keep_first_on_work_capabilities_refuses() {
     );
 }
 
-/// FINDING 2 (cold review #4), the reviewer's second probe shape (the
-/// aggravator): a hand-crafted arriving `CreateTable` for the
+/// A second hand-crafted arriving `CreateTable` probe covers the
 /// ALREADY-EXISTING `work_capabilities`, explicitly declaring `SYNC OFF`.
 /// `work_capabilities` has no reconcile heal on its `sync_direction` axis
 /// (only `install_node_contacts_schema` heals direction, for
 /// `work_node_contacts`), so before the fix this landed SILENTLY and
 /// PERMANENTLY stopped capability advertisements from syncing -- the same
 /// engine-owned mutation the local ALTER door refuses, reachable through the
-/// adopt back door on a different axis than Finding 2's first probe.
+/// adopt back door on a different policy axis.
 #[test]
 fn arriving_create_table_adopt_sync_off_on_work_capabilities_refuses() {
     let db = Database::open_memory();
@@ -743,7 +742,7 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
     assert_eq!(healed.conflict_policy, Some(ConflictPolicy::LatestWins));
 }
 
-/// The innocent case named in cold review #4's Finding 2: an older binary
+/// An older binary
 /// that does not know `ALTER TABLE ADD COLUMN` (or any column change) so it
 /// emits `DropTable` + `CreateTable` instead of an `AlterTable`, and its
 /// `CreateTable` restates the shape it has always known -- the OLD,
@@ -755,8 +754,7 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
 /// immediately ahead of it in the SAME batch removes the table from the
 /// preflight's projection before the `CreateTable` is judged -- so it is
 /// judged as a FRESH create, not an adopt (fresh creation of one of the four
-/// names stays the owning installer's domain, per this round's explicit
-/// scope, not this door's -- a separately tracked, pre-existing gap). The
+/// names stays the owning installer's domain, not this door's. The
 /// batch applies, and the recreated table lands undeclared -- exactly the
 /// legacy pre-declaration shape a fresh install of that older binary would
 /// have produced -- until the next `install_work_ledger_schema` call

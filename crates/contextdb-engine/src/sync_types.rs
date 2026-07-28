@@ -791,6 +791,10 @@ pub enum SyncAdoption {
     /// cursor's source just changed. Every row in it belongs to the newly
     /// adopted source, for the whole duration of this apply.
     ReadoptingSource,
+    /// A status probe proved this edge's previously re-sent work landed, but
+    /// its acknowledgement was lost. The pull is the one safe place to
+    /// resolve `AcceptedLocalPending` against that hub's current history.
+    ConfirmedPendingReconciliation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -347,6 +347,15 @@ fn filter_slot(bit: u64) -> (usize, u64) {
     ((bit / 64) as usize, 1_u64 << (bit % 64))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSourceKind {
+    Pulled,
+    AcceptedLocal,
+    /// A hub restore invalidated this local row's former hub order. The row
+    /// remains outbound work until it receives a fresh acknowledgement.
+    AcceptedLocalPending,
+}
+
 pub struct RelationalStore {
     pub tables: RwLock<HashMap<TableName, Vec<VersionedRow>>>,
     row_positions: RwLock<HashMap<(TableName, RowId), usize>>,
@@ -355,6 +364,7 @@ pub struct RelationalStore {
     /// Nested keying lets the hot apply path probe with a borrowed `&str`
     /// table name, avoiding a per-row `String` allocation.
     sync_source_lsns: RwLock<HashMap<TableName, HashMap<RowId, Lsn>>>,
+    sync_source_kinds: RwLock<HashMap<TableName, HashMap<RowId, SyncSourceKind>>>,
     pub table_meta: RwLock<HashMap<TableName, TableMeta>>,
     /// table → index_name → IndexStorage. Physical storage is table-keyed so
     /// DML can maintain only the affected table's indexes without consulting
@@ -383,6 +393,7 @@ impl RelationalStore {
             row_positions: RwLock::new(HashMap::new()),
             row_version_positions: RwLock::new(HashMap::new()),
             sync_source_lsns: RwLock::new(HashMap::new()),
+            sync_source_kinds: RwLock::new(HashMap::new()),
             table_meta: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
             index_write_lock_count: AtomicU64::new(0),
@@ -405,6 +416,14 @@ impl RelationalStore {
             .copied()
     }
 
+    pub fn sync_source_kind(&self, table: &str, row_id: RowId) -> Option<SyncSourceKind> {
+        self.sync_source_kinds
+            .read()
+            .get(table)
+            .and_then(|rows| rows.get(&row_id))
+            .copied()
+    }
+
     pub fn set_sync_source_lsns(&self, entries: impl IntoIterator<Item = (TableName, RowId, Lsn)>) {
         let mut source_lsns = self.sync_source_lsns.write();
         for (table, row_id, lsn) in entries {
@@ -412,13 +431,33 @@ impl RelationalStore {
         }
     }
 
+    pub fn set_sync_source_kinds(
+        &self,
+        entries: impl IntoIterator<Item = (TableName, RowId, SyncSourceKind)>,
+    ) {
+        let mut kinds = self.sync_source_kinds.write();
+        for (table, row_id, kind) in entries {
+            kinds.entry(table).or_default().insert(row_id, kind);
+        }
+    }
+
     pub fn clear_sync_source_lsns(&self, entries: impl IntoIterator<Item = (TableName, RowId)>) {
+        let entries = entries.into_iter().collect::<Vec<_>>();
         let mut source_lsns = self.sync_source_lsns.write();
+        for (table, row_id) in &entries {
+            if let Some(by_row) = source_lsns.get_mut(table) {
+                by_row.remove(row_id);
+                if by_row.is_empty() {
+                    source_lsns.remove(table);
+                }
+            }
+        }
+        let mut kinds = self.sync_source_kinds.write();
         for (table, row_id) in entries {
-            if let Some(by_row) = source_lsns.get_mut(&table) {
+            if let Some(by_row) = kinds.get_mut(&table) {
                 by_row.remove(&row_id);
                 if by_row.is_empty() {
-                    source_lsns.remove(&table);
+                    kinds.remove(&table);
                 }
             }
         }
@@ -430,6 +469,17 @@ impl RelationalStore {
             nested.entry(table).or_default().insert(row_id, lsn);
         }
         *self.sync_source_lsns.write() = nested;
+    }
+
+    pub fn replace_sync_source_kinds(&self, entries: HashMap<(TableName, RowId), SyncSourceKind>) {
+        let mut nested = HashMap::new();
+        for ((table, row_id), kind) in entries {
+            nested
+                .entry(table)
+                .or_insert_with(HashMap::new)
+                .insert(row_id, kind);
+        }
+        *self.sync_source_kinds.write() = nested;
     }
 
     /// Apply row inserts AND maintain every index (user-declared AND auto)
@@ -816,6 +866,15 @@ impl RelationalStore {
                 }
             }
         }
+        {
+            let mut kinds = self.sync_source_kinds.write();
+            if let Some(by_row) = kinds.get_mut(table) {
+                by_row.retain(|row_id, _| !row_ids.contains(row_id));
+                if by_row.is_empty() {
+                    kinds.remove(table);
+                }
+            }
+        }
         let mut positions = self.row_positions.write();
         let mut version_positions = self.row_version_positions.write();
         Self::rebuild_position_maps_for_table(table, rows, &mut positions, &mut version_positions);
@@ -841,6 +900,15 @@ impl RelationalStore {
                 by_row.retain(|row_id, _| remaining_live_row_ids.contains(row_id));
                 if by_row.is_empty() {
                     source_lsns.remove(table);
+                }
+            }
+        }
+        {
+            let mut kinds = self.sync_source_kinds.write();
+            if let Some(by_row) = kinds.get_mut(table) {
+                by_row.retain(|row_id, _| remaining_live_row_ids.contains(row_id));
+                if by_row.is_empty() {
+                    kinds.remove(table);
                 }
             }
         }
@@ -894,6 +962,7 @@ impl RelationalStore {
             .write()
             .retain(|(table, _), _| table != name);
         self.sync_source_lsns.write().remove(name);
+        self.sync_source_kinds.write().remove(name);
     }
 
     /// Register a new index storage for (table, name). The IndexDecl must

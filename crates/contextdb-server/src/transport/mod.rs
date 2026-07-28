@@ -127,6 +127,14 @@ pub trait ClientTransport: Send + Sync {
         None
     }
 
+    /// True only when this client presents one stable authenticated edge
+    /// identity to the server. Status's applied-push frontier is meaningful
+    /// for status-ahead recovery only under that condition; the remote peer's
+    /// identity alone says nothing about which edge the frontier belongs to.
+    fn has_stable_edge_identity(&self) -> bool {
+        false
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,

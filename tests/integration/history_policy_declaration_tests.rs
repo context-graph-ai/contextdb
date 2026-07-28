@@ -561,7 +561,7 @@ fn history_current_only_arriving_as_an_alter_starts_maintenance_without_reopen()
 // perfectly legal table riding in the same changeset. Forward-looking: the
 // refusal itself does not exist yet (see the file-level doc comment above),
 // so `apply_changes` currently succeeds outright here with no refusal at
-// all. Re-aimed (own commit, see its subject for the reason): the refusal
+// all. The refusal
 // is wired at the SAME preflight the two adjacent sync-DDL refusals
 // (`refuse_undeliverable_promise_sync_ddl`, `refuse_keyless_sync_safe_sync_
 // ddl`) already use -- one pass over the WHOLE arriving changeset, before

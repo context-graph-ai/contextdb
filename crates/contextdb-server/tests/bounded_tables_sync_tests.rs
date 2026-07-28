@@ -16,7 +16,7 @@ use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
 use contextdb_engine::work_ledger::{BlobHash, MovementPolicy, install_work_ledger_schema};
 use contextdb_server::blob_resolver::BlobStore;
-use contextdb_server::subjects::{push_subject, status_subject};
+use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::transport::{
     ClientTransport, TransportError, TransportFuture, TransportResult, TransportStatusFuture,
@@ -1346,11 +1346,17 @@ struct LoseAckAfterApply {
     push_subject: String,
     status_subject: String,
     confirmable: bool,
+    fail_reconciliation_pull: bool,
+    after_push_apply: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ClientTransport for LoseAckAfterApply {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
     }
 
     fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
@@ -1367,6 +1373,13 @@ impl ClientTransport for LoseAckAfterApply {
         request_bytes: Vec<u8>,
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
+        if self.fail_reconciliation_pull && subject == pull_subject(TENANT) {
+            return Box::pin(async {
+                Err(TransportError::Unreachable(
+                    "reconciliation pull unavailable".to_string(),
+                ))
+            });
+        }
         self.inner.request(subject, request_bytes, timeout)
     }
 
@@ -1379,11 +1392,15 @@ impl ClientTransport for LoseAckAfterApply {
         if subject == self.push_subject {
             let inner = self.inner.clone();
             let subject = subject.to_string();
+            let after_push_apply = self.after_push_apply.clone();
             return Box::pin(async move {
                 // The hub applies and commits ...
                 let _ = inner
                     .request_single_reply(&subject, request_bytes, timeout)
                     .await;
+                if let Some(after_push_apply) = after_push_apply {
+                    after_push_apply();
+                }
                 // ... and then the acknowledgement is lost coming back.
                 Err(TransportError::Unreachable(
                     "ack lost after the hub committed the batch".to_string(),
@@ -1423,6 +1440,52 @@ fn lost_ack_client(
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable,
+            fail_reconciliation_pull: false,
+            after_push_apply: None,
+        }),
+        TenantId::from(TENANT),
+    )
+}
+
+fn lost_ack_client_with_newer_hub_edit(
+    db: &Arc<Database>,
+    broker: &InProcessBroker,
+    node_id: &str,
+    hub_db: Arc<Database>,
+    fail_reconciliation_pull: bool,
+) -> SyncClient {
+    SyncClient::with_transport(
+        db.clone(),
+        Arc::new(LoseAckAfterApply {
+            inner: broker.client_as(node_id),
+            push_subject: push_subject(TENANT),
+            status_subject: status_subject(TENANT),
+            confirmable: true,
+            fail_reconciliation_pull,
+            after_push_apply: Some(Arc::new(move || {
+                hub_db
+                    .execute("UPDATE notes SET body = 'hub-newer' WHERE id = 1", &p())
+                    .expect("newer hub edit after the accepted request");
+            })),
+        }),
+        TenantId::from(TENANT),
+    )
+}
+
+fn lost_ack_client_with_failed_reconciliation_pull(
+    db: &Arc<Database>,
+    broker: &InProcessBroker,
+    node_id: &str,
+) -> SyncClient {
+    SyncClient::with_transport(
+        db.clone(),
+        Arc::new(LoseAckAfterApply {
+            inner: broker.client_as(node_id),
+            push_subject: push_subject(TENANT),
+            status_subject: status_subject(TENANT),
+            confirmable: true,
+            fail_reconciliation_pull: true,
+            after_push_apply: None,
         }),
         TenantId::from(TENANT),
     )
@@ -1504,6 +1567,164 @@ async fn c9_a_push_whose_ack_was_lost_but_landed_records_its_sent_receipt_once()
          must add nothing: {after_first:?} -> {after_retry:?}"
     );
 
+    hub.stop().await;
+}
+
+/// A status watermark proves only that the request landed; it does not carry
+/// the row's exact hub ordering. Replaying the edge's original stampless
+/// LatestWins row here would treat it as a new authoring event and overwrite
+/// the `hub-newer` edit. Recovery must instead pull the original accepted echo
+/// and the later hub edit in cursor order before it retires the push batch.
+#[tokio::test]
+async fn lost_ack_recovery_pulls_a_newer_hub_edit_without_replaying_the_stale_edge_write() {
+    let (_clock, _guard) = MockClock::install(T0);
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker);
+    let edge = open_edge(None);
+
+    // Establish schema/cursors before the one-row request under test, so its
+    // lost acknowledgement covers the authored row rather than bootstrap DDL.
+    within(edge_client(&edge, &broker, "edge-a").push())
+        .await
+        .expect("bootstrap push");
+    let mut row = p();
+    row.insert("id".to_string(), Value::Int64(1));
+    row.insert("body".to_string(), Value::Text("edge-old".to_string()));
+    edge.execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
+        .expect("edge write");
+
+    let client =
+        lost_ack_client_with_newer_hub_edit(&edge, &broker, "edge-a", hub.db.clone(), false);
+    within(client.push())
+        .await
+        .expect("confirmed push recovers by pulling hub order");
+
+    let hub_body = hub
+        .db
+        .execute("SELECT body FROM notes WHERE id = 1", &p())
+        .expect("hub read")
+        .rows[0][0]
+        .clone();
+    let edge_body = edge
+        .execute("SELECT body FROM notes WHERE id = 1", &p())
+        .expect("edge read")
+        .rows[0][0]
+        .clone();
+    assert_eq!(hub_body, Value::Text("hub-newer".to_string()));
+    assert_eq!(
+        edge_body,
+        Value::Text("hub-newer".to_string()),
+        "the recovery pull must apply the newer hub edit after the accepted echo; a raw replay \
+         would overwrite it with edge-old"
+    );
+
+    hub.stop().await;
+}
+
+/// The pending-confirmation marker is durable. After a lost acknowledgement
+/// whose required pull failed, a new client opened on the same edge database
+/// must pull before it sends anything. The newer hub edit therefore survives
+/// restart instead of being overwritten by the edge's old stampless history.
+#[tokio::test]
+async fn reopened_edge_reconciles_pending_lost_ack_before_it_can_resend_old_rows() {
+    let (_clock, _guard) = MockClock::install(T0);
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker);
+    let dir = tempfile::tempdir().expect("edge dir");
+    let path = dir.path().join("edge.redb");
+    let edge = open_edge(Some(&path));
+    within(edge_client(&edge, &broker, "edge-a").push())
+        .await
+        .expect("bootstrap push");
+    let mut row = p();
+    row.insert("id".to_string(), Value::Int64(1));
+    row.insert("body".to_string(), Value::Text("edge-old".to_string()));
+    edge.execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
+        .expect("edge write");
+
+    let interrupted =
+        lost_ack_client_with_newer_hub_edit(&edge, &broker, "edge-a", hub.db.clone(), true);
+    let outcome = within(interrupted.push()).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
+        ),
+        "the fixture requires a status-confirmed push whose exact pull failed: {outcome:?}"
+    );
+    drop(interrupted);
+    drop(edge);
+
+    let reopened = open_edge(Some(&path));
+    let recovered = edge_client(&reopened, &broker, "edge-a");
+    within(recovered.push())
+        .await
+        .expect("reopened edge pulls the pending hub order before any send");
+
+    let hub_body = hub
+        .db
+        .execute("SELECT body FROM notes WHERE id = 1", &p())
+        .expect("hub read")
+        .rows[0][0]
+        .clone();
+    let edge_body = reopened
+        .execute("SELECT body FROM notes WHERE id = 1", &p())
+        .expect("edge read")
+        .rows[0][0]
+        .clone();
+    assert_eq!(hub_body, Value::Text("hub-newer".to_string()));
+    assert_eq!(
+        edge_body,
+        Value::Text("hub-newer".to_string()),
+        "the reopened retry must not retransmit edge-old after the durable pending gate"
+    );
+
+    hub.stop().await;
+}
+
+/// A confirmed status response is insufficient to retire a lost-ack batch:
+/// the recovery pull supplies the precise hub ordering that status omits. If
+/// that pull is unavailable, leave the push frontier where it was so the row
+/// remains eligible for a later safe reconciliation.
+#[tokio::test]
+async fn confirmed_lost_ack_with_failed_reconciliation_pull_keeps_the_push_watermark() {
+    let (_clock, _guard) = MockClock::install(T0);
+    let broker = InProcessBroker::new();
+    let hub = start_hub(&broker);
+    let edge = open_edge(None);
+    within(edge_client(&edge, &broker, "edge-a").push())
+        .await
+        .expect("bootstrap push");
+
+    let mut row = p();
+    row.insert("id".to_string(), Value::Int64(1));
+    row.insert("body".to_string(), Value::Text("edge-pending".to_string()));
+    edge.execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
+        .expect("edge write");
+
+    let client = lost_ack_client_with_failed_reconciliation_pull(&edge, &broker, "edge-a");
+    let before = client.push_watermark();
+    let outcome = within(client.push()).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
+        ),
+        "a confirmed status without its required ordering pull remains unconfirmed: {outcome:?}"
+    );
+    assert_eq!(
+        client.push_watermark(),
+        before,
+        "status alone may not retire the batch or open the delivery frontier"
+    );
+    let retry = within(client.push()).await;
+    assert!(
+        matches!(
+            retry,
+            Err(contextdb_core::Error::SyncPushUnconfirmed { .. })
+        ),
+        "the in-memory pending gate must refuse a retry while status/pull cannot reconcile: {retry:?}"
+    );
     hub.stop().await;
 }
 

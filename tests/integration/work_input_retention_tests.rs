@@ -149,7 +149,7 @@ fn a_job_with_no_ledger_inputs_at_all_is_not_reported_as_expired() {
 // Expired-then-pull does not resurrect.
 // ---------------------------------------------------------------------------
 
-// Re-aimed (own commit, see its subject for the reason): this pins the
+// This pins the
 // ORDINARY incremental-pull flow, not a full resync from `Lsn(0)`. Those are
 // genuinely different operations here -- `changes_since(Lsn(0))` replays a
 // source's ENTIRE change log from the beginning (or a full state snapshot,
@@ -157,8 +157,7 @@ fn a_job_with_no_ledger_inputs_at_all_is_not_reported_as_expired() {
 // includes a row's insert entry as long as the HUB's own log still has it,
 // with no watermark able to prevent that (there is nothing to compare
 // against; zero means "from the start"). That full-resync ("cursor-reset")
-// shape is a REAL, separate hazard this run did not build a fix for --
-// logged as its own deferral-ledger entry (retention-pruned rows can
+// shape is a separate recovery hazard: retention-pruned rows can
 // resurrect on a full re-pull after a source rebind; the fix needs a
 // durable across-prune tombstone the design never specified).
 //

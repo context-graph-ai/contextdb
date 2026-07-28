@@ -4,6 +4,7 @@ use contextdb_core::table_meta::{ColumnType, TableMeta};
 use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
 use contextdb_engine::cli_render::render_table_meta;
+use contextdb_engine::composite_store::ChangeLogEntry;
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,
 };
@@ -2187,6 +2188,11 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
     let id = Uuid::new_v4();
     insert_decision(&db, id);
     let before = row_snapshot(&db, "decisions", id);
+    let row_id = db
+        .point_lookup("decisions", "id", &Value::Uuid(id), db.snapshot())
+        .unwrap()
+        .expect("decision must exist before sync refusal")
+        .row_id;
     let lsn_before = db.current_lsn();
 
     let incoming = RowChange {
@@ -2225,8 +2231,59 @@ fn ic09_sync_apply_rejection_under_insert_if_not_exists() {
         result.applied_rows, 0,
         "InsertIfNotExists skips existing row"
     );
+    assert_eq!(
+        result.skipped_rows, 1,
+        "InsertIfNotExists must report the refused incoming row"
+    );
     assert_eq!(row_text(&db, id, "decision_type"), "sql-migration");
-    assert_no_ghost_write(&db, "decisions", id, &before, lsn_before);
+    assert!(
+        db.ddl_log_since(lsn_before).is_empty(),
+        "refusal repair must not emit DDL"
+    );
+    assert_eq!(
+        row_snapshot(&db, "decisions", id),
+        before,
+        "refusal repair must preserve the authoritative row values"
+    );
+    let repair = db.change_log_since(lsn_before);
+    assert_eq!(
+        repair.len(),
+        2,
+        "refusal repair must emit one delete and one insert, got {repair:?}"
+    );
+    let delete = repair.iter().find_map(|entry| match entry {
+        ChangeLogEntry::RowDelete {
+            table,
+            row_id,
+            natural_key,
+            lsn,
+        } => Some((table, row_id, natural_key, lsn)),
+        _ => None,
+    });
+    let insert = repair.iter().find_map(|entry| match entry {
+        ChangeLogEntry::RowInsert { table, row_id, lsn } => Some((table, row_id, lsn)),
+        _ => None,
+    });
+    let (delete_table, delete_row_id, delete_key, delete_lsn) =
+        delete.expect("refusal repair must carry one row delete");
+    let (insert_table, insert_row_id, insert_lsn) =
+        insert.expect("refusal repair must carry one row insert");
+    assert_eq!(delete_table, "decisions");
+    assert_eq!(insert_table, "decisions");
+    assert_eq!(*delete_row_id, row_id);
+    assert_eq!(*insert_row_id, row_id);
+    assert_eq!(
+        delete_key,
+        &NaturalKey::single("id".to_string(), Value::Uuid(id))
+    );
+    assert_eq!(
+        delete_lsn, insert_lsn,
+        "delete and insert repair halves must share one commit"
+    );
+    assert!(
+        *delete_lsn > lsn_before,
+        "repair commit must advance beyond the refused row's starting point"
+    );
 }
 
 // ============================================================================

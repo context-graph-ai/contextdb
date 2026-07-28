@@ -1559,10 +1559,7 @@ fn ds16_deletion_tombstone_sync() {
     );
 
     server
-        .apply_changes(
-            cs_del,
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
-        )
+        .apply_changes(cs_del, &ConflictPolicies::uniform(ConflictPolicy::EdgeWins))
         .unwrap();
 
     let server_rows = server.scan("items", server.snapshot()).unwrap();
@@ -1638,7 +1635,7 @@ fn assert_delete_tombstone_syncs_for_scalar_id(create_sql: &str, id: Value) {
     server
         .apply_changes(
             delete_changes,
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .unwrap();
     assert!(
@@ -1723,7 +1720,7 @@ fn ds19_primary_key_wins_over_non_key_id_for_delete_tombstone_sync() {
     server
         .apply_changes(
             delete_changes,
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .unwrap();
     assert!(
@@ -1790,7 +1787,7 @@ fn ds20_delete_tombstone_uses_latest_primary_key_after_key_update() {
     server
         .apply_changes(
             edge.changes_since(lsn_after_initial),
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .unwrap();
     assert!(
@@ -1853,7 +1850,7 @@ fn ds20_delete_tombstone_uses_latest_primary_key_after_key_update() {
     server
         .apply_changes(
             delete_changes,
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .unwrap();
     assert!(
@@ -1904,7 +1901,7 @@ fn ds21_single_column_fk_null_child_does_not_block_parent_delete_sync() {
     server
         .apply_changes(
             edge.changes_since(lsn_after_initial),
-            &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
+            &ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
         )
         .unwrap();
 
