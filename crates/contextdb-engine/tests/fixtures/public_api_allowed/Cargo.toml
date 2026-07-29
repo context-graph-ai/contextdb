@@ -1,0 +1,14 @@
+[package]
+name = "public-api-allowed"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+durable-limits = []
+
+[dependencies]
+contextdb-core = { path = "../../../../contextdb-core" }
+contextdb-engine = { path = "../../.." }

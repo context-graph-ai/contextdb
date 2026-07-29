@@ -42,6 +42,10 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 contextdb-parser = { path = "../contextdb-parser", version = "1.0" }
 tempfile = "3"
+uuid.workspace = true
 # Depending on ourselves with `test-seams` on enables the feature when Cargo
 # builds this crate's test targets, and only then.
 contextdb-cli = { path = ".", features = ["test-seams"] }
+# Integration tests host a real ticketed-Iroh hub through the server's
+# feature-gated test seam; the normal CLI dependency above remains unchanged.
+contextdb-server = { path = "../contextdb-server", features = ["test-seams"] }

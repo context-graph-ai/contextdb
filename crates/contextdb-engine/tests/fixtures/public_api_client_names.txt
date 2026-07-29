@@ -1,0 +1,17 @@
+new
+ensure_connected
+reconnect
+is_connected
+shutdown
+db
+transfer_receipts
+has_pending_push_changes
+push
+pull_default
+push_watermark
+pull_watermark
+pages_discarded_for_source_mismatch
+tenant_id
+endpoint
+connected_hub_node_id
+change_destination

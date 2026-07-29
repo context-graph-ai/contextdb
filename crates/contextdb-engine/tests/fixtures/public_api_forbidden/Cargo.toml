@@ -1,0 +1,51 @@
+[package]
+name = "public-api-forbidden"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+accountant_accessor = []
+raw_accountant_mutation = []
+raw_accountant_allocate = []
+raw_accountant_allocate_for = []
+raw_accountant_release = []
+accountant_constructor = []
+plugin_accountant_constructor = []
+file_accountant_constructor = []
+file_disk_accountant_constructor = []
+sync_watermark_setter = []
+sync_incarnation_writer = []
+push_watermark_writer = []
+pending_confirmation_writer = []
+pull_watermark_writer = []
+pull_cursor_writer = []
+applied_push_writer = []
+callerless_applied_push_writer = []
+outbound_pending_writer = []
+confirmed_pending_writer = []
+record_hub_acceptance_writer = []
+invalidate_hub_regression_writer = []
+register_retention_peer_writer = []
+change_retention_peer_writer = []
+sync_relay_mode_writer = []
+database_policy_accessor = []
+client_pull_policy_map = []
+client_initial_sync_policy_map = []
+client_direction_setter = []
+client_policy_setter = []
+client_default_policy_setter = []
+client_arbitrary_transport = []
+server_arbitrary_transport = []
+server_policy_constructor = []
+raw_policy_apply = []
+raw_apply_changes = []
+raw_apply_changes_with_receipt = []
+role_relative_policy_types = []
+
+[dependencies]
+contextdb-core = { path = "../../../../contextdb-core" }
+contextdb-engine = { path = "../../.." }
+contextdb-server = { path = "../../../../contextdb-server" }
