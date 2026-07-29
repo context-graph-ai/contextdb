@@ -11,7 +11,9 @@ use crate::transport::{
 };
 use contextdb_core::{AtomicLsn, Incarnation, Lsn, TenantId};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, SyncAdoption, SyncDirection};
+use contextdb_engine::sync_types::{
+    ChangeSet, ConflictPolicies, ConflictPolicy, SyncAdoption, SyncDirection,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -296,6 +298,26 @@ impl SyncServer {
         policies: ConflictPolicies,
     ) -> Self {
         Self::build(db, transport, tenant_id, policies)
+    }
+
+    /// Test-only authenticated transport injection. This is deliberately not
+    /// available to normal downstream builds: production server construction
+    /// owns its transport and reads ordinary arbitration from declarations.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    pub fn with_authenticated_transport_for_test(
+        db: Arc<Database>,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        tenant_id: TenantId,
+    ) -> Self {
+        Self::build(
+            db,
+            transport,
+            tenant_id,
+            // Deliberately contrary to fixture declarations: a declaration
+            // resolver, not this harness default, must make the tests pass.
+            ConflictPolicies::uniform(ConflictPolicy::EdgeWins),
+        )
     }
 
     pub fn db(&self) -> &Database {
