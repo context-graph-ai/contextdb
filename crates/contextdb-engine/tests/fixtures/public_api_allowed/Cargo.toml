@@ -11,4 +11,4 @@ durable-limits = []
 
 [dependencies]
 contextdb-core = { path = "../../../../contextdb-core" }
-contextdb-engine = { path = "../../.." }
+contextdb-engine = { path = "../../..", features = ["iroh"] }

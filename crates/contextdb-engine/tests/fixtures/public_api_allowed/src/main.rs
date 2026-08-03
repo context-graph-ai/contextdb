@@ -1,3 +1,4 @@
+#[cfg(feature = "durable-limits")]
 use contextdb_core::Value;
 use contextdb_engine::Database;
 
