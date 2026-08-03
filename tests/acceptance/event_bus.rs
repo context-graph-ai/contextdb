@@ -44,16 +44,22 @@ fn wait_delivered(db: &Database, sink: &str, n: u64) {
     });
 }
 
-/// Wait until `sink`'s queue is fully drained, then return the settled metrics.
-/// Deterministic terminal for a NON-scoped sink whose declared events all
-/// deliver: once the queue is empty every enqueued event has been consumed, so
-/// `delivered` is final — a stray extra event (a routing/filter bug) either
-/// remains queued or shows up in `delivered`, and the caller's assertions catch
-/// it. Replaces the trailing settle-sleep.
-fn wait_drained(db: &Database, sink: &str) -> SinkMetrics {
-    wait_for_bus(&format!("{sink} queue drained"), || {
-        db.sink_metrics_for_test(sink).queued == 0
-    });
+/// Wait until `sink`'s queue is drained and the dispatcher has published every
+/// expected successful delivery, then return the settled metrics.
+///
+/// Durable acknowledgement removes queue entries before the dispatcher
+/// publishes its batch counters. Queue depth alone can therefore reach zero
+/// while `delivered` still describes the preceding batch. The combined state
+/// is the deterministic terminal; a caller's exact assertions still catch an
+/// unexpected extra delivery.
+fn wait_drained(db: &Database, sink: &str, expected_delivered: u64) -> SinkMetrics {
+    wait_for_bus(
+        &format!("{sink} queue drained with complete delivery counters"),
+        || {
+            let metrics = db.sink_metrics_for_test(sink);
+            metrics.queued == 0 && metrics.delivered >= expected_delivered
+        },
+    );
     db.sink_metrics_for_test(sink)
 }
 
@@ -673,7 +679,7 @@ fn t5_09_route_fires_on_update_event_type() {
     db.execute("UPDATE memos SET body = $body WHERE id = $id", &p)
         .unwrap();
 
-    let m = wait_drained(&db, "slack");
+    let m = wait_drained(&db, "slack", 1);
     assert_eq!(m.delivered, 1, "UPDATE must fire exactly once");
     let captured = log.lock().unwrap();
     assert_eq!(captured.len(), 1, "UPDATE must fire exactly once");
@@ -721,7 +727,7 @@ fn t5_10_route_fires_on_delete_event_type() {
     assert_eq!(log.lock().unwrap().len(), 0);
 
     db.execute("DELETE FROM memos WHERE id = $id", &p).unwrap();
-    let m = wait_drained(&db, "slack");
+    let m = wait_drained(&db, "slack", 1);
     assert_eq!(m.delivered, 1, "DELETE must fire exactly once");
     let captured = log.lock().unwrap();
     assert_eq!(captured.len(), 1, "DELETE must fire exactly once");
@@ -2107,7 +2113,7 @@ fn t5_29_scoped_with_constraints_register_sink_delivers_only_authorized_scope_la
     // Broader (unscoped) re-registration replays the two retained server rows,
     // which now all deliver — so the queue drains to empty. That drain is the
     // deterministic terminal.
-    wait_drained(&db, "slack");
+    wait_drained(&db, "slack", 4);
     let broad = broad_log.lock().unwrap();
     assert_eq!(
         broad.len(),
@@ -2305,7 +2311,7 @@ fn t5_30_scoped_handle_principal_register_sink_excludes_acl_denied_rows() {
 
     // Broader (unscoped) re-registration replays the two retained ACL-denied
     // rows, which now all deliver — the queue drains to empty.
-    wait_drained(&db, "alice_sink");
+    wait_drained(&db, "alice_sink", 4);
     let broad = broad_log.lock().unwrap();
     assert_eq!(
         broad.len(),
@@ -2704,7 +2710,7 @@ fn t5_34_resource_owner_sink_unaffected_by_sibling_scoped_handle_sink() {
 
     // The owner audit sink sees both contexts, so its queue drains to empty —
     // a deterministic terminal for "received both events".
-    let audit_metrics = wait_drained(&db, "audit");
+    let audit_metrics = wait_drained(&db, "audit", 2);
     let audit = audit_log.lock().unwrap();
     assert_eq!(
         audit.len(),
@@ -2857,7 +2863,7 @@ fn t5_36_scoped_handle_register_sink_transient_error_retries_and_succeeds() {
     // The transient first attempt retries and the second succeeds, acking the
     // entry — so the queue drains to empty. A drained queue proves the retry
     // ran to success (both callback attempts happened); no fixed wait needed.
-    let metrics = wait_drained(&db, "slack");
+    let metrics = wait_drained(&db, "slack", 1);
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         2,
@@ -3187,7 +3193,7 @@ fn t5_41_scoped_handle_register_sink_inprocess_drop_and_reopen_replay() {
                 Ok(())
             })
             .unwrap();
-        let m = wait_drained(&db, "slack");
+        let m = wait_drained(&db, "slack", 2);
         assert_eq!(
             m.delivered, 2,
             "both durably queued ctx_a events must replay after reopen"
@@ -3609,7 +3615,7 @@ fn t5_44_scoped_with_constraints_three_dimensions_combined_filter() {
 
     // Broader (unscoped) re-registration replays all six retained denied rows,
     // which now deliver — the queue drains to empty.
-    wait_drained(&db, "alice_sink");
+    wait_drained(&db, "alice_sink", 8);
     let broad = broad_log.lock().unwrap();
     assert_eq!(
         broad.len(),
