@@ -97,8 +97,8 @@ async fn pending_push_change_count_matches_the_authenticated_iroh_push_set_acros
         .pending_push_change_count()
         .expect("count local-only create and drop");
     assert_eq!(
-        first_count, 0,
-        "creating then dropping a SYNC OFF table leaves exactly no eligible outbound entries"
+        first_count, 2,
+        "the SYNC OFF declaration and drop are real pending schema work even though no rows travel"
     );
     assert_eq!(
         first_client
@@ -106,6 +106,24 @@ async fn pending_push_change_count_matches_the_authenticated_iroh_push_set_acros
             .expect("inspect local-only create and drop"),
         first_count > 0,
         "the boolean pending probe agrees with the public exact count"
+    );
+    let schema_push = within(first_client.push())
+        .await
+        .expect("deliver the complete authenticated local-only schema history");
+    assert_eq!(
+        schema_push.applied_rows, 0,
+        "schema delivery does not invent a data-row count"
+    );
+    assert!(
+        hub.db.table_meta(LOCAL_TABLE).is_none(),
+        "the hub applies the declaration and later drop in order"
+    );
+    assert_eq!(
+        first_client
+            .pending_push_change_count()
+            .expect("count after local-only schema confirmation"),
+        0,
+        "confirmed schema delivery clears the pending frontier instead of leaving a phantom"
     );
     first_client.shutdown().await;
     drop(first_client);
@@ -197,7 +215,9 @@ async fn pending_push_change_count_matches_the_authenticated_iroh_push_set_acros
         .transfer_receipts()
         .into_iter()
         .filter(|receipt| {
-            receipt.plane == TransferPlane::Sync && receipt.direction == TransferDirection::Received
+            receipt.plane == TransferPlane::Sync
+                && receipt.direction == TransferDirection::Received
+                && receipt.counters.items > 0
         })
         .collect::<Vec<_>>();
     assert_eq!(

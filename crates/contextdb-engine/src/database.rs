@@ -27295,10 +27295,6 @@ impl Database {
                     }
                 }
                 DdlChange::DropTable { name } => history.record_drop(name.clone(), *lsn),
-                DdlChange::CreateTrigger { name, table, .. } => {
-                    history.record_trigger_create(name.clone(), table.clone(), *lsn);
-                }
-                DdlChange::DropTrigger { name } => history.record_trigger_drop(name.clone(), *lsn),
                 _ => {}
             }
         }

@@ -1806,12 +1806,28 @@ async fn a9_14_selective_sync_direction_filtering() {
         "server must receive observations (Push direction)"
     );
 
-    // A wholly local schema commit stays on its author, together with its
-    // rows. The source filter never slices an authenticated commit: this
-    // CREATE was its own complete commit, so it is excluded as one unit.
+    // Direction controls row placement, not whether peers learn the declared
+    // policy. The hub receives the exact SYNC OFF definition so it can enforce
+    // it, while the scratch row remains only on its author.
+    assert_eq!(
+        server
+            .table_meta("scratch")
+            .expect("the hub receives the scratch policy declaration")
+            .sync_direction,
+        Some(contextdb_core::SyncDirection::None),
+        "the hub enforces the exact SYNC OFF declaration"
+    );
     assert!(
-        !server.table_names().contains(&"scratch".to_string()),
-        "the SYNC OFF scratch declaration and its data must never leave the edge"
+        server
+            .point_lookup(
+                "scratch",
+                "id",
+                &Value::Uuid(uuid_scratch),
+                server.snapshot(),
+            )
+            .unwrap()
+            .is_none(),
+        "the SYNC OFF scratch row must never leave the edge"
     );
 
     // Server did NOT get edge's local pattern guess

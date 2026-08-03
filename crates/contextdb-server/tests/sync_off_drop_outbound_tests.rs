@@ -1,4 +1,4 @@
-//! A dropped local-only table must never become outbound sync work.
+//! A dropped local-only table's schema history travels, but its rows never do.
 
 use contextdb_core::{Lsn, TenantId, Value};
 use contextdb_engine::Database;
@@ -82,7 +82,7 @@ impl Hub {
 }
 
 #[tokio::test]
-async fn dropping_a_sync_off_table_never_creates_outbound_work_after_full_edge_database_restart() {
+async fn dropped_sync_off_schema_stays_pending_across_restart_then_clears_after_delivery() {
     let root = tempfile::tempdir().expect("tempdir");
     let hub = start_hub(root.path()).await;
     let edge_path = root.path().join("edge.db");
@@ -103,10 +103,10 @@ async fn dropping_a_sync_off_table_never_creates_outbound_work_after_full_edge_d
 
     let first_client = SyncClient::new(edge.clone(), &edge_dial_spec, TenantId::from(TENANT));
     assert!(
-        !first_client
+        first_client
             .has_pending_push_changes()
             .expect("inspect local-only create and drop"),
-        "creating then dropping a SYNC OFF table leaves exactly no outbound work"
+        "the declaration and drop are authenticated schema work pending delivery"
     );
     first_client.shutdown().await;
     drop(first_client);
@@ -119,10 +119,10 @@ async fn dropping_a_sync_off_table_never_creates_outbound_work_after_full_edge_d
     );
     let client = SyncClient::new(reopened.clone(), &edge_dial_spec, TenantId::from(TENANT));
     assert!(
-        !client
+        client
             .has_pending_push_changes()
             .expect("inspect reopened edge"),
-        "the reopened edge keeps exactly no outbound work for the local-only create and drop"
+        "a full edge restart preserves unconfirmed schema work"
     );
 
     reopened
@@ -155,6 +155,12 @@ async fn dropping_a_sync_off_table_never_creates_outbound_work_after_full_edge_d
         pushed.conflicts.is_empty(),
         "the control row has no arbitration conflict: {pushed:?}"
     );
+    assert!(
+        !client
+            .has_pending_push_changes()
+            .expect("inspect confirmed schema and row delivery"),
+        "the acknowledged push clears both schema history and row work"
+    );
 
     let receipts = hub.server.transfer_receipts();
     let received = receipts
@@ -178,15 +184,17 @@ async fn dropping_a_sync_off_table_never_creates_outbound_work_after_full_edge_d
     );
     assert!(
         hub.db.table_meta(LOCAL_TABLE).is_none(),
-        "the local-only table was never created on the hub"
+        "the hub applied the local-only declaration and its later drop in order"
     );
-    assert!(
+    assert_eq!(
         hub.db
             .changes_since(Lsn(0))
             .ddl
             .iter()
-            .all(|change| !is_local_table_create_or_drop(change)),
-        "the hub received neither a create nor a drop for the local-only table"
+            .filter(|change| is_local_table_create_or_drop(change))
+            .count(),
+        2,
+        "the hub received the exact local-only CREATE and DROP schema history"
     );
     let hub_control = hub
         .db
