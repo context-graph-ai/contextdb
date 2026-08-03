@@ -178,6 +178,7 @@ struct Hub {
 struct ObservingTransport {
     inner: Arc<dyn ClientTransport>,
     pull_response_types: Mutex<Vec<MessageType>>,
+    push_request_types: Mutex<Vec<MessageType>>,
 }
 
 impl ObservingTransport {
@@ -185,6 +186,7 @@ impl ObservingTransport {
         Self {
             inner,
             pull_response_types: Mutex::new(Vec::new()),
+            push_request_types: Mutex::new(Vec::new()),
         }
     }
 
@@ -193,6 +195,26 @@ impl ObservingTransport {
             .lock()
             .expect("observe pull response types")
             .clone()
+    }
+
+    fn push_request_types(&self) -> Vec<MessageType> {
+        self.push_request_types
+            .lock()
+            .expect("observe push request types")
+            .clone()
+    }
+
+    fn observe_push_request(&self, subject: &str, request_bytes: &[u8]) -> TransportResult<()> {
+        if subject != contextdb_server::subjects::push_subject(TENANT) {
+            return Ok(());
+        }
+        let envelope = decode(request_bytes)
+            .map_err(|err| TransportError::Other(format!("decode observed push request: {err}")))?;
+        self.push_request_types
+            .lock()
+            .expect("record observed push request")
+            .push(envelope.message_type);
+        Ok(())
     }
 }
 
@@ -227,6 +249,9 @@ impl ClientTransport for ObservingTransport {
         request_bytes: Vec<u8>,
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
+        if let Err(error) = self.observe_push_request(subject, &request_bytes) {
+            return Box::pin(async move { Err(error) });
+        }
         Box::pin(async move {
             let reply = self.inner.request(subject, request_bytes, timeout).await?;
             if subject == contextdb_server::subjects::pull_subject(TENANT) {
@@ -247,6 +272,9 @@ impl ClientTransport for ObservingTransport {
         request_bytes: Vec<u8>,
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
+        if let Err(error) = self.observe_push_request(subject, &request_bytes) {
+            return Box::pin(async move { Err(error) });
+        }
         self.inner
             .request_single_reply(subject, request_bytes, timeout)
     }
@@ -261,6 +289,14 @@ impl ClientTransport for ObservingTransport {
 }
 
 async fn start_hub(root: &Path) -> Hub {
+    start_hub_inner(root, true).await
+}
+
+async fn restart_hub(root: &Path) -> Hub {
+    start_hub_inner(root, false).await
+}
+
+async fn start_hub_inner(root: &Path, declare_schema: bool) -> Hub {
     let identity_path = root.join("hub.db.fabric-identity.key");
     let node_id = FabricIdentity::load_or_generate(&identity_path)
         .expect("persist hub identity")
@@ -270,7 +306,9 @@ async fn start_hub(root: &Path) -> Hub {
         .expect("bind authenticated Iroh hub");
     let ticket = endpoint.ticket();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub database"));
-    declare_tables(&db);
+    if declare_schema {
+        declare_tables(&db);
+    }
     let server = Arc::new(SyncServer::new(
         db.clone(),
         &endpoint,
@@ -572,6 +610,128 @@ async fn refused_dependency_unit_retires_resend_and_converges_only_after_pull() 
     );
 
     client.shutdown().await;
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn recreated_generations_return_mixed_terminal_reasons_for_one_dependency_unit() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let hub = start_hub(root.path()).await;
+    let edge_path = root.path().join("retired-unit-edge.db");
+    let identity_path = root.path().join("retired-unit-edge.fabric-identity.key");
+    let edge_identity =
+        Arc::new(FabricIdentity::load_or_generate(&identity_path).expect("persist edge identity"));
+    let edge_node_id = edge_identity.node_id();
+    let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
+    let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
+    declare_tables(&edge);
+    let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT));
+    within(client.push())
+        .await
+        .expect("bootstrap declarations reach the hub");
+    let declaration_lsn = edge.current_lsn();
+
+    let parent_id = Uuid::parse_str(PARENT_ID).expect("fixed parent UUID");
+    let child_id = Uuid::parse_str(FIRST_CHILD_ID).expect("fixed child UUID");
+    insert_parent(&edge, parent_id, "old parent");
+    insert_child(&edge, child_id, parent_id, "old child");
+    within(client.push())
+        .await
+        .expect("hub receives the old connected unit before recreation");
+    let snapshot = root.path().join("old-connected-unit.cdb");
+    edge.export_snapshot(&snapshot)
+        .expect("capture authenticated old-generation provenance");
+    hub.db
+        .execute(
+            "PURGE FROM parents WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(parent_id))]),
+        )
+        .expect("permanently remove the old parent lineage");
+    hub.db
+        .execute("DROP TABLE children", &HashMap::new())
+        .expect("retire child generation");
+    hub.db
+        .execute("DROP TABLE parents", &HashMap::new())
+        .expect("retire parent generation");
+    declare_tables(&hub.db);
+    within(client.shutdown()).await;
+    drop(client);
+    drop(edge);
+
+    let restored = Arc::new(Database::open(&snapshot).expect("open old connected source"));
+    let restored_incarnation = restored
+        .sync_incarnation(&TenantId::from(TENANT))
+        .expect("restored source keeps its database incarnation");
+    restored
+        .persist_sync_push_watermark(&TenantId::from(TENANT), declaration_lsn)
+        .expect("make the post-schema parent and child pending again");
+    hub.db
+        .persist_sync_applied_push_watermark_for_node_incarnation(
+            &TenantId::from(TENANT),
+            &edge_node_id,
+            restored_incarnation,
+            declaration_lsn,
+        )
+        .expect("lower the original edge receipt to the schema declaration");
+    hub.stop().await;
+    let hub = restart_hub(root.path()).await;
+    let replay_dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
+    let observing_transport =
+        Arc::new(ObservingTransport::new(client_transport(&replay_dial_spec)));
+    let restored_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        restored.clone(),
+        observing_transport.clone(),
+        TenantId::from(TENANT),
+        edge_identity,
+    );
+    let source_ceiling = restored
+        .changes_since(restored_client.push_watermark())
+        .max_lsn()
+        .expect("the stale connected unit is outbound work");
+    let replay = within(restored_client.push())
+        .await
+        .expect("a mixed terminal dependency unit is a valid acknowledged result");
+    assert_eq!(
+        observing_transport.push_request_types(),
+        vec![MessageType::DependencyCompletePushRequest],
+        "the old parent and child must travel in one dependency-complete request"
+    );
+    assert_eq!(
+        replay.applied_rows, 0,
+        "neither old-generation member mutates the hub"
+    );
+    assert_eq!(
+        replay.skipped_rows, 2,
+        "the complete connected unit is refused"
+    );
+    assert!(
+        replay.conflicts.iter().any(|conflict| {
+            conflict.table.as_deref() == Some("parents")
+                && conflict.reason.as_deref() == Some("purged_lineage")
+        }),
+        "the old purged parent keeps its stronger terminal reason"
+    );
+    assert!(
+        replay.conflicts.iter().any(|conflict| {
+            conflict.table.as_deref() == Some("children")
+                && conflict.reason.as_deref() == Some("removed_generation")
+        }),
+        "the unpurged child reports the retired generation"
+    );
+    assert_eq!(
+        hub.db
+            .persisted_sync_applied_push_watermark_for_node(&TenantId::from(TENANT), &edge_node_id)
+            .expect("read hub receipt for terminal unit"),
+        Some(source_ceiling),
+        "the complete mixed terminal unit commits its source receipt"
+    );
+    assert!(
+        row(&hub.db, "parents", parent_id).is_none()
+            && row(&hub.db, "children", child_id).is_none(),
+        "the recreated tables do not receive either old-generation member"
+    );
+
+    within(restored_client.shutdown()).await;
     hub.stop().await;
 }
 

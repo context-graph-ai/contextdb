@@ -1081,6 +1081,7 @@ pub enum SyncAdoption {
 }
 
 pub(crate) const PURGED_LINEAGE_CONFLICT_REASON: &str = "purged_lineage";
+pub(crate) const REMOVED_GENERATION_CONFLICT_REASON: &str = "removed_generation";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conflict {

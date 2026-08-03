@@ -13,8 +13,8 @@ use crate::transport::{
     ServerTransport, TransportError,
 };
 use contextdb_core::{AtomicLsn, Incarnation, Lsn, TenantId};
-use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ChangeSet, NaturalKey, SyncAdoption, SyncDirection};
+use contextdb_engine::{Conflict, Database};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -176,6 +176,7 @@ struct PushApplyWork {
     request_key: PushRequestKey,
     changeset: ChangeSet,
     received_ddl: Option<crate::protocol::ReceivedDdlContext>,
+    terminal_conflicts: Option<Vec<Conflict>>,
     lineages: Vec<(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)>,
     arrivals: HashMap<Lsn, Option<Lsn>>,
     tenant_id: TenantId,
@@ -597,6 +598,18 @@ async fn handle_push(
         .map_err(|err| contextdb_core::Error::SyncError(err.to_string()))?;
         let changeset = ChangeSet::try_from(request.changeset)
             .map_err(|err| contextdb_core::Error::SyncError(err.to_string()))?;
+        if ddl_context.is_none() {
+            let conflicts = state.db.retired_generation_refusals(
+                &state.tenant_id,
+                &changeset,
+                &lineages,
+                &authenticated_peer,
+                incarnation,
+            )?;
+            if !changeset.rows.is_empty() && conflicts.len() == changeset.rows.len() {
+                return Ok::<_, contextdb_core::Error>((changeset, ddl_context, Some(conflicts)));
+            }
+        }
         let changeset = if let Some(received_ddl) = ddl_context.as_ref() {
             state.db.validate_incoming_push_lineages_with_received_ddl(
                 &state.tenant_id,
@@ -624,9 +637,9 @@ async fn handle_push(
                 .db
                 .reject_accepted_lineage_replays(&state.tenant_id, changeset, &lineages)?
         };
-        Ok::<_, contextdb_core::Error>((changeset, ddl_context, authenticated_peer))
+        Ok::<_, contextdb_core::Error>((changeset, ddl_context, None))
     })() {
-        Ok((changeset, received_ddl, _authenticated_peer)) => {
+        Ok((changeset, received_ddl, terminal_conflicts)) => {
             spawn_apply_and_reply(PushApplyWork {
                 db: state.db.clone(),
                 local_node_id: state.local_node_id.clone(),
@@ -637,6 +650,7 @@ async fn handle_push(
                 request_key,
                 changeset,
                 received_ddl,
+                terminal_conflicts,
                 lineages,
                 arrivals,
                 tenant_id: state.tenant_id.clone(),
@@ -1038,6 +1052,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
         request_key,
         changeset,
         received_ddl,
+        terminal_conflicts,
         lineages,
         arrivals,
         tenant_id,
@@ -1070,7 +1085,27 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                     if dependency_complete {
                         db.validate_dependency_complete_unit(&changeset)?;
                     }
-                    let result = if let (Some(node_id), Some(max_lsn)) =
+                    let result = if let Some(conflicts) = terminal_conflicts {
+                        let (Some(node_id), Some(max_lsn)) =
+                            (applying_node_id.as_deref(), push_max_lsn)
+                        else {
+                            return Err(contextdb_core::Error::SyncError(
+                                "authenticated terminal push refusal lacks an edge receipt identity"
+                                    .to_string(),
+                            ));
+                        };
+                        db.commit_terminal_sync_refusals_with_receipt(
+                            contextdb_engine::database::SyncApplyReceipt {
+                                tenant_id: tenant_id.clone(),
+                                node_id: node_id.to_string(),
+                                incarnation,
+                                source_lsn: max_lsn,
+                                dependency_complete,
+                            },
+                            row_count,
+                            conflicts,
+                        )?
+                    } else if let (Some(node_id), Some(max_lsn)) =
                         (applying_node_id.as_deref(), push_max_lsn)
                     {
                         db.apply_authenticated_received_changes_with_receipt_and_lineages(

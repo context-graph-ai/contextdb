@@ -769,6 +769,8 @@ impl Database {
             terminal_refusal_scans: self.terminal_refusal_scans.clone(),
             accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
             received_schema_stages: self.received_schema_stages.clone(),
+            pending_local_schema_stages: self.pending_local_schema_stages.clone(),
+            local_schema_stages: self.local_schema_stages.clone(),
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
             detached_sync_write_set: self.detached_sync_write_set.clone(),
             persistence: self.persistence.clone(),

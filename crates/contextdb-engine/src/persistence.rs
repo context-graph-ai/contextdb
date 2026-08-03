@@ -266,6 +266,22 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     pub(crate) structurally_dropped_tables: HashSet<String>,
 }
 
+/// The narrow durable payload for one locally authored SQL schema commit.
+/// Unlike a received-schema projection, it updates only the schema entries
+/// the local transaction changed and never reconstructs unrelated rows,
+/// graph state, vectors, or sidecars.
+pub(crate) struct LocalSchemaPersistenceProjection {
+    /// Metadata for exactly the tables affected by this local DDL vector.
+    pub(crate) affected_table_meta: HashMap<String, TableMeta>,
+    /// The ordered DDL vector, all durably recorded at the owning commit LSN.
+    pub(crate) ddl: Vec<DdlChange>,
+    /// Values already encoded by the schema preparation phase.
+    pub(crate) config_values: Vec<(String, Vec<u8>)>,
+    /// DDL-only WriteSets do not carry a row from which persistence can infer
+    /// this identity, so retain the transaction manager's visibility choice.
+    pub(crate) commit_index_tx: TxId,
+}
+
 /// Fully prepared, crate-private durable mutation for one authoritative
 /// purge.  It contains only persistence-owned/public value types: database
 /// lineage structs are encoded by the caller before Redb starts its write
@@ -1817,6 +1833,94 @@ impl RedbPersistence {
                         .map_err(Self::storage_error)?;
                 }
             }
+            if take_received_schema_pre_commit_fault_for_test() {
+                return Err(Error::Other(
+                    "injected received-schema Redb pre-commit failure".to_string(),
+                ));
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    /// Persist a locally authored schema stage without replacing the received
+    /// schema image. The caller has already prepared the exact affected table
+    /// metadata and encoded sidecars; this transaction deliberately leaves
+    /// all unrelated relation rows and durable state untouched.
+    pub(crate) fn flush_local_schema_stage(
+        &self,
+        ws: &WriteSet,
+        stage: &LocalSchemaPersistenceProjection,
+    ) -> Result<()> {
+        let lsn = ws.commit_lsn.ok_or_else(|| {
+            Error::Other("local schema stage is missing its commit LSN".to_string())
+        })?;
+        if stage.ddl.is_empty() {
+            return Err(Error::Other(
+                "local schema stage contains no DDL".to_string(),
+            ));
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, meta) in &stage.affected_table_meta {
+                    let key = Self::meta_key(table);
+                    let encoded = Self::encode(meta)?;
+                    meta_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            // `open_table` is both the Redb table creation path and a no-op
+            // for an existing relation. Do not delete, scan, or rewrite rows:
+            // another committed local table must remain byte-for-byte intact.
+            for table in stage.affected_table_meta.keys() {
+                let table_name = Self::rel_table_name(table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let _relation = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+            }
+
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in &stage.config_values {
+                    config_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (index, change) in stage.ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, stage.ddl.len());
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            {
+                let mut index = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                index
+                    .insert(lsn.0, stage.commit_index_tx.0)
+                    .map_err(Self::storage_error)?;
+            }
+
             if take_received_schema_pre_commit_fault_for_test() {
                 return Err(Error::Other(
                     "injected received-schema Redb pre-commit failure".to_string(),
@@ -3736,16 +3840,60 @@ impl RedbPersistence {
         self.dump_str_keyed_table_raw(CONFIG_TABLE)
     }
 
-    /// Exact byte fingerprint of every Redb table an authenticated schema or
-    /// data apply can mutate. This hashes persisted vector encodings and sync
-    /// arbitration sidecars directly rather than their lossy/in-memory
-    /// projections. Dynamic relational and sink-queue table names are part of
-    /// the digest, so creating or removing an empty table is still visible.
+    fn digest_canonical_relational_table(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table_name: &str,
+        hasher: &mut blake3::Hasher,
+    ) -> Result<u64> {
+        digest_field(hasher, table_name.as_bytes());
+        let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(table_name);
+        let table = read_txn
+            .open_table(definition)
+            .map_err(Self::storage_error)?;
+        let mut count = 0_u64;
+        for entry in table.iter().map_err(Self::storage_error)? {
+            let (key, value) = entry.map_err(Self::storage_error)?;
+            digest_field(hasher, key.value());
+            let row: PersistedVersionedRow = Self::decode(value.value())?;
+            rmp_serde::encode::write(
+                &mut *hasher,
+                &(
+                    row.row_id,
+                    row.created_tx,
+                    row.deleted_tx,
+                    row.lsn,
+                    row.created_at,
+                ),
+            )
+            .map_err(|err| Error::Other(format!("failed to fingerprint relational row: {err}")))?;
+            let mut columns = row.values.into_iter().collect::<Vec<_>>();
+            columns.sort_by(|left, right| left.0.cmp(&right.0));
+            rmp_serde::encode::write(&mut *hasher, &(columns.len() as u64)).map_err(|err| {
+                Error::Other(format!("failed to fingerprint relational columns: {err}"))
+            })?;
+            for (column, value) in columns {
+                digest_field(hasher, column.as_bytes());
+                rmp_serde::encode::write(&mut *hasher, &value).map_err(|err| {
+                    Error::Other(format!("failed to fingerprint relational value: {err}"))
+                })?;
+            }
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
+    /// Fingerprint every Redb table an authenticated schema or data apply can
+    /// mutate. Relational rows are decoded and hashed with column-sorted
+    /// values because snapshot export re-encodes their `HashMap`; every other
+    /// category remains an exact persisted key/value-byte hash. Dynamic
+    /// relational and sink-queue table names are part of the digest, so
+    /// creating or removing an empty table is still visible.
     pub(crate) fn raw_sync_apply_state_digest(&self) -> Result<RawSyncApplyStateDigest> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
             let mut hasher = blake3::Hasher::new();
-            digest_field(&mut hasher, b"contextdb.raw-sync-apply-state.v1");
+            digest_field(&mut hasher, b"contextdb.raw-sync-apply-state.v2");
 
             digest_redb_table(&read_txn, META_TABLE, "meta", &mut hasher)?;
             digest_redb_table(
@@ -3794,9 +3942,7 @@ impl RedbPersistence {
             let mut sink_queue_entries = 0_u64;
             for name in dynamic_names {
                 if name.starts_with("rel_") {
-                    let definition: TableDefinition<&[u8], &[u8]> =
-                        TableDefinition::new(name.as_str());
-                    digest_redb_table(&read_txn, definition, &name, &mut hasher)?;
+                    self.digest_canonical_relational_table(&read_txn, &name, &mut hasher)?;
                 } else {
                     let definition: TableDefinition<u64, &[u8]> =
                         TableDefinition::new(name.as_str());

@@ -27,6 +27,11 @@ pub struct WriteSet {
     /// compares and raises these inside the write transaction so concurrent
     /// authenticated sync applies cannot publish an older receipt last.
     pub config_max_u64_keys: Vec<String>,
+    /// A transaction-owned engine sidecar needs the normal commit boundary
+    /// even when it has no row/edge/vector writes.  The sidecar itself stays
+    /// in the engine; this bit only prevents the transaction manager's empty
+    /// write-set fast path from skipping LSN allocation and `store.apply`.
+    pub requires_commit_lsn: bool,
     pub visibility_floor: Option<TxId>,
     pub propagation_in_progress: bool,
 }
@@ -45,6 +50,7 @@ impl WriteSet {
             && self.vector_deletes.is_empty()
             && self.vector_moves.is_empty()
             && self.config_writes.is_empty()
+            && !self.requires_commit_lsn
     }
 
     pub fn stamp_lsn(&mut self, lsn: Lsn) {

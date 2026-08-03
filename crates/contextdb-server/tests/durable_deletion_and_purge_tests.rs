@@ -384,6 +384,98 @@ impl ClientTransport for PurgeInjectingPushTransport {
     }
 }
 
+/// Sends otherwise-authenticated data pushes with an invalid immutable root.
+/// The server must reply to each retry; leaving an admitted malformed request
+/// in the in-flight fanout would make the second request wait forever.
+struct MalformedLineagePushTransport {
+    inner: Arc<dyn ClientTransport>,
+}
+
+impl MalformedLineagePushTransport {
+    fn corrupt_lineage(&self, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
+        let envelope = decode(&bytes).map_err(|error| TransportError::Other(error.to_string()))?;
+        if !matches!(
+            envelope.message_type,
+            MessageType::PushRequest | MessageType::DependencyCompletePushRequest
+        ) {
+            return Ok(bytes);
+        }
+        let mut request: PushRequest = rmp_serde::from_slice(&envelope.payload)
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        let Some(lineage) = request
+            .changeset
+            .rows
+            .iter_mut()
+            .find_map(|row| row.lineage.as_mut())
+        else {
+            return Ok(bytes);
+        };
+        lineage.lineage_root = "forged-lineage-root".to_string();
+        encode(envelope.message_type, &request)
+            .map_err(|error| TransportError::Other(error.to_string()))
+    }
+}
+
+impl ClientTransport for MalformedLineagePushTransport {
+    fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.ensure_connected()
+    }
+
+    fn reconnect<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.reconnect()
+    }
+
+    fn is_connected<'a>(&'a self) -> TransportStatusFuture<'a> {
+        self.inner.is_connected()
+    }
+
+    fn peer_node_id(&self) -> Option<String> {
+        self.inner.peer_node_id()
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+
+    fn request<'a>(
+        &'a self,
+        subject: &'a str,
+        request_bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> TransportFuture<'a, Vec<u8>> {
+        match self.corrupt_lineage(request_bytes) {
+            Ok(request_bytes) => self.inner.request(subject, request_bytes, timeout),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    fn request_single_reply<'a>(
+        &'a self,
+        subject: &'a str,
+        request_bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> TransportFuture<'a, Vec<u8>> {
+        match self.corrupt_lineage(request_bytes) {
+            Ok(request_bytes) => self
+                .inner
+                .request_single_reply(subject, request_bytes, timeout),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    fn ensure_single_reply_retry_safe(&self, request_bytes: &[u8]) -> TransportResult<()> {
+        self.inner.ensure_single_reply_retry_safe(request_bytes)
+    }
+
+    fn shutdown<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.shutdown()
+    }
+}
+
 /// Records the hub pages an ordinary sync client applies while making the
 /// server enforce a single source frontier per pull reply. This keeps the
 /// production Iroh identities and apply path intact; only the wire request's
@@ -2458,10 +2550,9 @@ async fn authenticated_edge_push_borne_purge_is_refused_before_hub_mutation() {
         "the rejected push cannot install deletion or purge state"
     );
     let post_request_changes = hub.db.change_log_since(before_lsn);
-    assert!(
-        !post_request_changes.is_empty(),
-        "the authenticated request must record peer contact"
-    );
+    // A contact timestamp can match the already-recorded millisecond and be
+    // idempotent, so this exchange may leave no change-log entry. Any entry
+    // that does exist must remain hub-local peer bookkeeping.
     assert!(
         post_request_changes.iter().all(|entry| matches!(
             entry,
@@ -2785,7 +2876,7 @@ async fn recreated_table_refuses_removed_generation_and_syncs_new_rows() {
     let outbound_new_id = Uuid::new_v4();
     let (old_source, old_client, old_identity) =
         copy_test_edge(root.path(), "old-source", &hub.ticket, tenant);
-    FabricIdentity::load_or_generate(&old_identity)
+    let source_identity = FabricIdentity::load_or_generate(&old_identity)
         .expect("persist the old source's existing adjacent fabric identity");
     put(&old_source, old_id, "removed-generation-row");
     put(
@@ -2841,6 +2932,8 @@ async fn recreated_table_refuses_removed_generation_and_syncs_new_rows() {
         "stale-never-purged-old-generation-descendant",
     );
     let old_key = NaturalKey::single("id".to_string(), Value::Uuid(old_id));
+    let never_purged_old_key =
+        NaturalKey::single("id".to_string(), Value::Uuid(never_purged_old_id));
     let old_lineage = restored_old
         .authoritative_purge_current_live_row_sidecar_for_test("notes", &old_key)
         .expect("restored old-generation row keeps its authenticated lineage sidecar");
@@ -2849,15 +2942,50 @@ async fn recreated_table_refuses_removed_generation_and_syncs_new_rows() {
         &peer_dial_spec(&hub.ticket, &old_identity),
         TenantId::from(tenant),
     );
+    let replay_source_ceiling = restored_old
+        .changes_since(restored_client.push_watermark())
+        .max_lsn()
+        .expect("the stale old-generation descendants are outbound work");
     let replay = within(restored_client.push())
         .await
-        .expect_err("removed table generation receives a visible typed refusal");
-    let diagnostic = replay.to_string().to_ascii_lowercase();
+        .expect("removed table generation returns visible typed refusals");
+    assert_eq!(
+        replay.applied_rows, 0,
+        "old-generation rows never mutate the hub"
+    );
+    assert_eq!(replay.skipped_rows, 2, "each old-generation row is refused");
+    assert_eq!(
+        replay.conflicts.len(),
+        2,
+        "both old-generation rows stay visible"
+    );
     assert!(
-        diagnostic.contains("wire row lineage generation 1")
-            && diagnostic.contains("projected generation 2")
-            && diagnostic.contains("table notes"),
-        "both rows must fail at the removed-generation boundary before purge lineage adjudication: {replay}"
+        replay.conflicts.iter().any(|conflict| {
+            conflict.natural_key == old_key && conflict.reason.as_deref() == Some("purged_lineage")
+        }),
+        "the purged old-generation row keeps permanent-lineage precedence"
+    );
+    assert!(
+        replay.conflicts.iter().any(|conflict| {
+            conflict.natural_key == never_purged_old_key
+                && conflict.reason.as_deref() == Some("removed_generation")
+        }),
+        "the unpurged old-generation row reports its removed table generation"
+    );
+    let source_incarnation = restored_old
+        .sync_incarnation(&TenantId::from(tenant))
+        .expect("restored source keeps its authenticated database incarnation");
+    let source_node_id = source_identity.node_id();
+    assert_eq!(
+        hub.db
+            .persisted_sync_applied_push_watermark_for_node_incarnation(
+                &TenantId::from(tenant),
+                &source_node_id,
+                source_incarnation,
+            )
+            .expect("read durable terminal-refusal receipt"),
+        Some(replay_source_ceiling),
+        "a fully refused old-generation replay still commits the edge receipt for lost-ack recovery"
     );
     assert_absent(
         &hub.db,
@@ -2927,6 +3055,41 @@ async fn recreated_table_refuses_removed_generation_and_syncs_new_rows() {
         "the hub accepts a row authored under the replacement generation"
     );
     within(restored_client.shutdown()).await;
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn malformed_authenticated_push_replies_to_an_exact_retry() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let tenant = "malformed-push-retry";
+    let hub = start_hub(root.path(), tenant).await;
+    let edge_identity = root.path().join("malformed-edge.fabric-identity.key");
+    let edge = Arc::new(Database::open(root.path().join("malformed-edge.db")).expect("open edge"));
+    create_notes(&edge);
+    let identity = Arc::new(
+        FabricIdentity::load_or_generate(&edge_identity)
+            .expect("persist the malformed edge's authenticated identity"),
+    );
+    put(&edge, Uuid::new_v4(), "malformed immutable lineage");
+    let transport = Arc::new(MalformedLineagePushTransport {
+        inner: client_transport(&peer_dial_spec(&hub.ticket, &edge_identity)),
+    });
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge,
+        transport,
+        TenantId::from(tenant),
+        identity,
+    );
+
+    for attempt in 1..=2 {
+        let result = within(client.push()).await;
+        assert!(
+            matches!(result, Err(Error::SyncError(ref error)) if error.contains("lineage root")),
+            "retry {attempt} must receive the same preflight rejection, got {result:?}"
+        );
+    }
+
+    within(client.shutdown()).await;
     hub.stop().await;
 }
 

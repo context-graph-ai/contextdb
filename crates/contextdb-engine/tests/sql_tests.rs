@@ -1,5 +1,6 @@
-use contextdb_core::{Error, Value};
+use contextdb_core::{Error, Lsn, Value};
 use contextdb_engine::Database;
+use contextdb_engine::sync_types::DdlChange;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -353,6 +354,150 @@ fn begin_commit_rollback_session_sql() {
 
     let rows = db.scan("entities", db.snapshot()).unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+fn assert_transactional_schema_ddl_vector(db: &Database, phase: &str) -> Lsn {
+    let authored = db.changes_since(Lsn(0));
+    assert!(
+        matches!(
+            authored.ddl.as_slice(),
+            [
+                DdlChange::CreateTable { name, .. },
+                DdlChange::CreateTrigger { name: trigger, .. },
+                DdlChange::AlterTable { name: altered, .. },
+            ] if name == "authored_migration"
+                && trigger == "authored_migration_insert"
+                && altered == "authored_migration"
+        ),
+        "{phase}: the committed DDL vector must retain the authored CREATE TABLE, CREATE TRIGGER, ALTER TABLE order; got {:?}",
+        authored.ddl
+    );
+    assert_eq!(
+        authored.ddl_lsn.len(),
+        3,
+        "{phase}: the three authored DDL entries must retain three LSN positions"
+    );
+    let commit_lsn = authored.ddl_lsn[0];
+    assert!(
+        authored.ddl_lsn.iter().all(|lsn| *lsn == commit_lsn),
+        "{phase}: one SQL COMMIT must assign the same LSN to its complete authored DDL vector; got {:?}",
+        authored.ddl_lsn
+    );
+    assert_ne!(
+        commit_lsn,
+        Lsn(0),
+        "{phase}: the committed DDL vector must have a nonzero commit boundary"
+    );
+    assert_eq!(
+        db.current_lsn(),
+        commit_lsn,
+        "{phase}: the DDL vector must occupy this isolated database's commit boundary"
+    );
+    commit_lsn
+}
+
+#[test]
+fn file_backed_sql_transaction_keeps_heterogeneous_ddl_at_one_lsn_after_reopen() {
+    let root = tempfile::tempdir().expect("temporary database directory");
+    let path = root.path().join("transactional-ddl.db");
+    let empty = HashMap::new();
+
+    let commit_lsn = {
+        let db = Database::open(&path).expect("open file-backed database");
+        db.execute("BEGIN", &empty).expect("begin DDL transaction");
+        db.execute(
+            "CREATE TABLE authored_migration (id UUID PRIMARY KEY, body TEXT) \
+             SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            &empty,
+        )
+        .expect("create table in DDL transaction");
+        db.execute(
+            "CREATE TRIGGER authored_migration_insert ON authored_migration WHEN INSERT",
+            &empty,
+        )
+        .expect("create trigger in DDL transaction");
+        db.execute(
+            "ALTER TABLE authored_migration ADD COLUMN detail TEXT",
+            &empty,
+        )
+        .expect("alter table in DDL transaction");
+        db.execute("COMMIT", &empty)
+            .expect("commit DDL transaction");
+
+        let commit_lsn = assert_transactional_schema_ddl_vector(&db, "before reopen");
+        db.close().expect("close file-backed database");
+        commit_lsn
+    };
+
+    let reopened = Database::open(&path).expect("reopen file-backed database");
+    assert_eq!(
+        assert_transactional_schema_ddl_vector(&reopened, "after reopen"),
+        commit_lsn,
+        "reopen must retain the exact SQL commit boundary for the authored DDL vector"
+    );
+    reopened.close().expect("close reopened database");
+}
+
+fn assert_rolled_back_schema_ddl_absent(db: &Database, phase: &str) {
+    assert!(
+        db.table_meta("rolled_back_migration").is_none(),
+        "{phase}: a rolled-back table must not be visible"
+    );
+    assert!(
+        db.list_triggers().is_empty(),
+        "{phase}: a rolled-back trigger must not remain declared"
+    );
+    let changes = db.changes_since(Lsn(0));
+    assert!(
+        changes.ddl.is_empty(),
+        "{phase}: a rolled-back DDL transaction must not leave an authored DDL log"
+    );
+    assert!(
+        changes.ddl_lsn.is_empty(),
+        "{phase}: a rolled-back DDL transaction must not leave an authored DDL position"
+    );
+    assert_eq!(
+        db.current_lsn(),
+        Lsn(0),
+        "{phase}: a rolled-back DDL transaction must not consume a durable position"
+    );
+}
+
+#[test]
+fn file_backed_sql_transaction_rollback_removes_heterogeneous_ddl_after_reopen() {
+    let root = tempfile::tempdir().expect("temporary database directory");
+    let path = root.path().join("rolled-back-transactional-ddl.db");
+    let empty = HashMap::new();
+
+    {
+        let db = Database::open(&path).expect("open file-backed database");
+        db.execute("BEGIN", &empty).expect("begin DDL transaction");
+        db.execute(
+            "CREATE TABLE rolled_back_migration (id UUID PRIMARY KEY, body TEXT) \
+             SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+            &empty,
+        )
+        .expect("create table in DDL transaction");
+        db.execute(
+            "CREATE TRIGGER rolled_back_migration_insert ON rolled_back_migration WHEN INSERT",
+            &empty,
+        )
+        .expect("create trigger in DDL transaction");
+        db.execute(
+            "ALTER TABLE rolled_back_migration ADD COLUMN detail TEXT",
+            &empty,
+        )
+        .expect("alter table in DDL transaction");
+        db.execute("ROLLBACK", &empty)
+            .expect("roll back DDL transaction");
+
+        assert_rolled_back_schema_ddl_absent(&db, "before reopen");
+        db.close().expect("close file-backed database");
+    }
+
+    let reopened = Database::open(&path).expect("reopen file-backed database");
+    assert_rolled_back_schema_ddl_absent(&reopened, "after reopen");
+    reopened.close().expect("close reopened database");
 }
 
 #[test]

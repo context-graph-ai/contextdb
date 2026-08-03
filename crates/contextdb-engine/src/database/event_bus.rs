@@ -745,6 +745,12 @@ impl Database {
     }
 
     pub(super) fn stage_event_bus_ddl_in_tx(&self, tx: TxId, ddl: DdlChange) -> Result<()> {
+        if self.pending_local_schema_stages.lock().contains_key(&tx) {
+            return Err(Error::Other(
+                "event-bus DDL and transactional local table schema DDL cannot be combined yet; commit or roll back before changing the other schema surface"
+                    .to_string(),
+            ));
+        }
         self.tx_mgr.cloned_write_set(tx)?;
         self.require_admin_event_bus_ddl()?;
         let _ = self.event_bus_definitions_with_ddl(Some(tx), std::slice::from_ref(&ddl))?;

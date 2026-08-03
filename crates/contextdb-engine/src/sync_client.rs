@@ -12,7 +12,8 @@ use contextdb_core::{AtomicLsn, Error, Incarnation, Lsn, TableMeta, TenantId};
 use contextdb_engine::Database;
 use contextdb_engine::database::{AuthoritativePurgeDeliveryItem, TerminalRefusalPullContext};
 use contextdb_engine::sync_types::{
-    ApplyResult, ChangeSet, PURGED_LINEAGE_CONFLICT_REASON, SyncAdoption, SyncDirection,
+    ApplyResult, ChangeSet, PURGED_LINEAGE_CONFLICT_REASON, REMOVED_GENERATION_CONFLICT_REASON,
+    SyncAdoption, SyncDirection,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -1141,20 +1142,22 @@ impl SyncClient {
             // This request is exactly one data-LSN group, so `new_lsn` is the
             // exact hub ordering position for every mutation it addressed.
             // Every terminal diagnostic must cover exactly one transmitted
-            // row. Ordinary arbitration carries both winner fields; a purge
-            // boundary carries neither because the permanently removed root
-            // has no live winner to attribute.
+            // row. Ordinary arbitration carries both winner fields; permanent
+            // purge and retired-generation boundaries carry neither because
+            // no live winner can authorize an old lineage.
             let mut refused_indexes = BTreeSet::new();
             let mut ordinary_refused_rows = Vec::new();
             let mut purge_refused_rows = Vec::new();
             for conflict in &result.conflicts {
                 let purged_lineage =
                     conflict.reason.as_deref() == Some(PURGED_LINEAGE_CONFLICT_REASON);
+                let removed_generation =
+                    conflict.reason.as_deref() == Some(REMOVED_GENERATION_CONFLICT_REASON);
                 let winner_fields = (
                     conflict.winning_author_node_id.is_some(),
                     conflict.hub_acceptance_position.is_some(),
                 );
-                match (purged_lineage, winner_fields) {
+                match (purged_lineage || removed_generation, winner_fields) {
                     (true, (false, false)) | (false, (true, true)) => {}
                     (false, (false, false)) => {
                         if conflict.table.is_some() || conflict.mutation_kind.is_some() {
@@ -1205,14 +1208,6 @@ impl SyncClient {
             {
                 return Err(Error::SyncError(
                     "dependency-complete refusal covers only part of the unit".to_string(),
-                ));
-            }
-            if dependency_complete
-                && !purge_refused_rows.is_empty()
-                && purge_refused_rows.len() != batch.rows.len()
-            {
-                return Err(Error::SyncError(
-                    "dependency-complete purge refusal mixes terminal outcome classes".to_string(),
                 ));
             }
             let accepted_rows = batch

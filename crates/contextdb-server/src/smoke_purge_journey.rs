@@ -18,7 +18,7 @@ use contextdb_engine::transport::client_transport;
 use contextdb_engine::work_ledger::{
     BlobHash, InputRef, JobSpec, MovementPolicy, install_work_ledger_schema, submit_job,
 };
-use contextdb_engine::{BlobStore, Database, SyncClient, SyncServer};
+use contextdb_engine::{ApplyResult, BlobStore, Database, SyncClient, SyncServer};
 use contextdb_server::{FabricIdentity, PeerEndpoint, peer_bind_spec, peer_dial_spec};
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
@@ -293,6 +293,17 @@ fn require_blob_absent(report: &BlobInspection, place: &str) -> Result<u64, Stri
     Ok(report.last_purge_lsn)
 }
 
+fn require_clean_setup_sync(result: &ApplyResult, operation: &str) -> Result<(), String> {
+    if !result.conflicts.is_empty() || result.skipped_rows != 0 {
+        return Err(format!(
+            "{operation} did not cleanly apply setup rows before purge: {} conflicts, {} skipped",
+            result.conflicts.len(),
+            result.skipped_rows
+        ));
+    }
+    Ok(())
+}
+
 fn exact_purge_conflict(
     result: &impl serde::Serialize,
     table: &str,
@@ -359,6 +370,14 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
         "selected-secret-before-edit",
         vec![1.0, 0.0, 0.0],
     )?;
+    let initial_push = within(edge_a.client.push())
+        .await?
+        .map_err(|_| "cannot publish initial selected purge row at hub".to_string())?;
+    require_clean_setup_sync(&initial_push, "initial selected-row push")?;
+    let initial_pull = within(edge_b.client.pull_default())
+        .await?
+        .map_err(|_| "cannot publish initial selected purge row at second edge".to_string())?;
+    require_clean_setup_sync(&initial_pull, "initial selected-row pull")?;
     edit_note(&edge_a.db, selected, "selected-secret-after-edit")?;
     put_note(
         &edge_a.db,
@@ -400,12 +419,14 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
         }
     }
 
-    within(edge_a.client.push())
+    let final_push = within(edge_a.client.push())
         .await?
         .map_err(|_| "cannot seed purge copy classes at hub".to_string())?;
-    within(edge_b.client.pull_default())
+    require_clean_setup_sync(&final_push, "purge copy-class push")?;
+    let final_pull = within(edge_b.client.pull_default())
         .await?
         .map_err(|_| "cannot seed purge copy classes at second edge".to_string())?;
+    require_clean_setup_sync(&final_pull, "purge copy-class pull")?;
     let selected_rows = [
         note_row_id(&hub.db, selected)?,
         note_row_id(&edge_a.db, selected)?,
@@ -746,14 +767,18 @@ async fn run_recreated_generation(root: &Path) -> Result<(), String> {
         "removed-generation-control-row",
         vec![0.0, 1.0, 0.0],
     )?;
+    let seeded = within(source.client.push())
+        .await?
+        .map_err(|_| "cannot seed old table generation".to_string())?;
+    require_clean_setup_sync(&seeded, "old-generation seed push")?;
+    if note_body(&hub.db, purged)?.is_none() || note_body(&hub.db, old_control)?.is_none() {
+        return Err("old-generation seed did not reach the hub".to_string());
+    }
     let old_snapshot = case.join("old-generation.snapshot");
     source
         .db
         .export_snapshot(&old_snapshot)
-        .map_err(|_| "cannot export old table generation".to_string())?;
-    within(source.client.push())
-        .await?
-        .map_err(|_| "cannot seed old table generation".to_string())?;
+        .map_err(|_| "cannot export authenticated old table generation".to_string())?;
     hub.db
         .execute(
             "PURGE FROM notes WHERE id = $id",
@@ -784,6 +809,12 @@ async fn run_recreated_generation(root: &Path) -> Result<(), String> {
         Database::open(&old_snapshot)
             .map_err(|_| "cannot reopen old table generation".to_string())?,
     );
+    edit_note(&restored, purged, "old-generation-purged-lineage-replay")?;
+    edit_note(
+        &restored,
+        old_control,
+        "old-generation-removed-lineage-replay",
+    )?;
     let client = SyncClient::new(
         restored.clone(),
         &peer_dial_spec(&hub.ticket, &source.identity),
@@ -819,8 +850,10 @@ async fn run_recreated_generation(root: &Path) -> Result<(), String> {
     let generation_meaning = generation_conflict.to_string().to_ascii_lowercase();
     if purged_conflict["table"] != "notes"
         || purged_conflict["mutation_kind"] != "edit"
+        || purged_conflict["reason"] != "purged_lineage"
         || generation_conflict["table"] != "notes"
         || generation_conflict["mutation_kind"] != "edit"
+        || generation_conflict["reason"] != "removed_generation"
         || !generation_meaning.contains("generation")
         || !generation_meaning.contains("removed")
     {
@@ -1277,7 +1310,13 @@ async fn run_pre_purge_restore(root: &Path) -> Result<(), String> {
         "id",
         Value::Uuid(selected),
     )?;
-    require_purged_key(&retained, "pre-backup peer")?;
+    let expected_frontier = require_purged_key(&retained, "pre-backup peer")?;
+    let expected_lineage_fingerprint = retained
+        .lineage
+        .as_ref()
+        .ok_or_else(|| "pre-backup peer lost its permanent purge lineage".to_string())?
+        .lineage_fingerprint
+        .clone();
     edge.client.shutdown().await;
     drop(edge.client);
     edge.db
@@ -1304,9 +1343,42 @@ async fn run_pre_purge_restore(root: &Path) -> Result<(), String> {
     let edge = open_edge(&case, "edge", &restored.ticket, tenant, Some(NOTES_DDL))?;
     let refusal = within(edge.client.pull_default())
         .await?
-        .map_err(|_| "peer could not adjudicate restored pre-purge lineage".to_string())?;
-    let conflict =
-        exact_purge_conflict(&refusal, "notes", "id", Value::Uuid(selected), Some("edit"))?;
+        .expect_err("peer with a permanent purge must fence a restored pre-purge lineage");
+    let refusal = match refusal {
+        Error::PurgeCausalityFence {
+            table,
+            key,
+            lineage_root,
+            frontier,
+        } => {
+            let expected_key = NaturalKey::single("id".to_string(), Value::Uuid(selected));
+            let actual_fingerprint = blake3::hash(lineage_root.as_bytes()).to_hex().to_string();
+            if table != "notes"
+                || key != expected_key.pairs()
+                || lineage_root.is_empty()
+                || frontier.0 != expected_frontier
+                || actual_fingerprint != expected_lineage_fingerprint
+            {
+                return Err(format!(
+                    "restored pre-purge lineage fence did not match the peer's durable purge: \
+                     table={table}, key={key:?}, frontier={}, lineage_fingerprint={actual_fingerprint}",
+                    frontier.0
+                ));
+            }
+            json!({
+                "type":"purge_causality_fence",
+                "table":table,
+                "natural_key":expected_key,
+                "lineage_fingerprint":actual_fingerprint,
+                "frontier":frontier.0,
+            })
+        }
+        other => {
+            return Err(format!(
+                "restored pre-purge lineage returned the wrong refusal: {other}"
+            ));
+        }
+    };
     if note_body(&edge.db, selected)?.is_some()
         || note_body(&restored.db, selected)?.as_deref() != Some("operator-backup-still-holds-this")
     {
@@ -1343,7 +1415,7 @@ async fn run_pre_purge_restore(root: &Path) -> Result<(), String> {
         json!({
             "event":"purge_pre_backup_restore",
             "restored_hub_identity":original_hub_id,
-            "peer_refusal":conflict,
+            "peer_refusal":refusal,
             "peer_remained_absent":true,
             "operator_reissued_purge":true,
         })
@@ -1481,41 +1553,50 @@ async fn run_forged_push(root: &Path) -> Result<(), String> {
     }
     let hub_state_after = sync_state(&hub.db, &case.join("after-forged-push.snapshot"))?;
     let contact_changes = hub.db.change_log_since(hub_lsn_before);
-    if contact_changes.is_empty()
-        || !contact_changes.iter().all(|entry| {
-            matches!(
-                entry,
-                ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. }
-                    if table == "work_node_contacts"
-            )
-        })
-    {
+    if !contact_changes.iter().all(|entry| {
+        matches!(
+            entry,
+            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. }
+                if table == "work_node_contacts"
+        )
+    }) {
         return Err(
             "forged push changed durable state beyond its authenticated peer contact".to_string(),
         );
     }
-    let mut hub_state_before_unaffected = hub_state_before;
-    let mut hub_state_after_unaffected = hub_state_after;
-    for state in [
-        &mut hub_state_before_unaffected,
-        &mut hub_state_after_unaffected,
-    ] {
-        let Some(fields) = state.as_object_mut() else {
-            return Err("cannot normalize authenticated-apply fingerprint".to_string());
-        };
-        for field in [
-            "digest",
-            "current_lsn",
-            "retained_row_versions",
-            "index_postings",
-            "change_log_entries",
-            "commit_index_entries",
-        ] {
-            fields.remove(field);
+    // A terminal authority refusal can return before push admission records a
+    // contact. Even an admitted contact can be a same-millisecond idempotent
+    // update. With no durable contact entry, the entire inspection must match.
+    if contact_changes.is_empty() {
+        if hub_state_before != hub_state_after {
+            return Err("forged push mutated durable state without a peer-contact row".to_string());
         }
-    }
-    if hub_state_before_unaffected != hub_state_after_unaffected {
-        return Err("forged push mutated durable state outside the peer-contact row".to_string());
+    } else {
+        let mut hub_state_before_unaffected = hub_state_before;
+        let mut hub_state_after_unaffected = hub_state_after;
+        for state in [
+            &mut hub_state_before_unaffected,
+            &mut hub_state_after_unaffected,
+        ] {
+            let Some(fields) = state.as_object_mut() else {
+                return Err("cannot normalize authenticated-apply fingerprint".to_string());
+            };
+            for field in [
+                "digest",
+                "current_lsn",
+                "retained_row_versions",
+                "index_postings",
+                "change_log_entries",
+                "commit_index_entries",
+            ] {
+                fields.remove(field);
+            }
+        }
+        if hub_state_before_unaffected != hub_state_after_unaffected {
+            return Err(
+                "forged push mutated durable state outside the peer-contact row".to_string(),
+            );
+        }
     }
     let selected_key = export_key(
         &hub.db,

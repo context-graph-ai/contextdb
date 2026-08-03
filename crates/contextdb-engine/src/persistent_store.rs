@@ -1,7 +1,7 @@
 use crate::composite_store::CompositeStore;
-use crate::database::ReceivedSchemaStageRegistry;
 use crate::database::event_bus::{EventBusState, MAX_SINK_QUEUE_DEPTH};
 use crate::database::trigger::TriggerState;
+use crate::database::{LocalSchemaStageRegistry, ReceivedSchemaStageRegistry};
 use crate::persistence::{
     FlushDataOptions, FlushDataSnapshots, RedbPersistence, SchemaDdlPersistence,
 };
@@ -15,6 +15,7 @@ pub struct PersistentCompositeStore {
     event_bus: Option<Arc<EventBusState>>,
     trigger: Option<Arc<TriggerState>>,
     received_schema_stages: ReceivedSchemaStageRegistry,
+    local_schema_stages: LocalSchemaStageRegistry,
 }
 
 impl PersistentCompositeStore {
@@ -24,6 +25,7 @@ impl PersistentCompositeStore {
         event_bus: Option<Arc<EventBusState>>,
         trigger: Option<Arc<TriggerState>>,
         received_schema_stages: ReceivedSchemaStageRegistry,
+        local_schema_stages: LocalSchemaStageRegistry,
     ) -> Self {
         Self {
             inner,
@@ -31,6 +33,7 @@ impl PersistentCompositeStore {
             event_bus,
             trigger,
             received_schema_stages,
+            local_schema_stages,
         }
     }
 }
@@ -38,6 +41,16 @@ impl PersistentCompositeStore {
 impl WriteSetApplicator for PersistentCompositeStore {
     fn apply(&self, ws: &WriteSet) -> Result<()> {
         if let Some(lsn) = ws.commit_lsn {
+            let mut local_stages = self.local_schema_stages.lock();
+            if let Some(stage) = local_stages.get(&lsn) {
+                let result = self
+                    .persistence
+                    .flush_local_schema_stage(ws, &stage.durable_projection);
+                if result.is_err() {
+                    local_stages.remove(&lsn);
+                }
+                return result;
+            }
             let mut stages = self.received_schema_stages.lock();
             if let Some(stage) = stages.get(&lsn) {
                 let result = self.persistence.flush_data_with_logs_and_sink_events(

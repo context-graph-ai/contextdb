@@ -7,7 +7,8 @@ use crate::composite_store::{
 use crate::executor::{apply_on_conflict_updates, execute_plan, validate_plan_columns};
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::{
-    AuthoritativePurgePersistenceProjection, ReceivedSchemaPersistenceProjection, RedbPersistence,
+    AuthoritativePurgePersistenceProjection, LocalSchemaPersistenceProjection,
+    ReceivedSchemaPersistenceProjection, RedbPersistence,
 };
 use crate::persistent_store::PersistentCompositeStore;
 use crate::plugin::{
@@ -1957,6 +1958,215 @@ mod received_schema_stage_tests {
         assert!(reopened.received_ddl_arrivals.read().is_empty());
     }
 
+    fn assert_local_schema_transaction_absent(
+        db: &Database,
+        table: &str,
+        trigger: &str,
+        phase: &str,
+    ) {
+        assert!(
+            db.table_meta(table).is_none(),
+            "{phase}: failed local DDL must not publish table metadata"
+        );
+        assert!(
+            db.list_triggers()
+                .iter()
+                .all(|declaration| declaration.name != trigger),
+            "{phase}: failed local DDL must not publish a trigger"
+        );
+        let changes = db.changes_since(Lsn(0));
+        assert!(
+            changes.ddl.is_empty() && changes.ddl_lsn.is_empty(),
+            "{phase}: failed local DDL must not publish an authored schema vector"
+        );
+        assert_eq!(
+            db.current_lsn(),
+            Lsn(0),
+            "{phase}: failed local DDL must not consume a commit frontier"
+        );
+
+        let persistence = db
+            .persistence
+            .as_ref()
+            .expect("local schema failure proof uses a file-backed database");
+        assert!(
+            !persistence
+                .load_all_table_meta()
+                .unwrap()
+                .contains_key(table),
+            "{phase}: failed local DDL must not persist table metadata"
+        );
+        assert!(
+            persistence.load_ddl_log().unwrap().is_empty(),
+            "{phase}: failed local DDL must not persist a DDL log"
+        );
+        assert!(
+            persistence.load_commit_index().unwrap().is_empty(),
+            "{phase}: failed local DDL must not persist a commit-index frontier"
+        );
+        assert!(
+            persistence
+                .load_config_value::<u64>(&Database::durable_lineage_table_generation_key(table))
+                .unwrap()
+                .is_none(),
+            "{phase}: failed local DDL must not persist a table generation"
+        );
+        let durable_triggers = persistence
+            .load_config_value::<Vec<TriggerDeclaration>>("__trigger_declarations")
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            durable_triggers
+                .iter()
+                .all(|declaration| declaration.name != trigger),
+            "{phase}: failed local DDL must not persist a trigger declaration"
+        );
+    }
+
+    #[test]
+    fn local_schema_memory_refusal_leaves_no_live_or_durable_schema() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("local-schema-memory-refusal.redb");
+        let db = Database::open(&path).unwrap();
+        db.set_memory_limit(Some(1)).unwrap();
+        db.execute("BEGIN", &HashMap::new()).unwrap();
+
+        let error = db
+            .execute(
+                "CREATE TABLE local_memory_refusal (id UUID PRIMARY KEY)",
+                &HashMap::new(),
+            )
+            .expect_err("the schema-only stage must honor MEMORY_LIMIT");
+        assert!(
+            matches!(
+                error,
+                Error::MemoryBudgetExceeded {
+                    ref subsystem,
+                    ref operation,
+                    ..
+                } if subsystem == "ddl" && operation == "stage_transactional_schema"
+            ),
+            "schema staging must return the typed memory refusal: {error:?}"
+        );
+        assert!(db.pending_local_schema_stages.lock().is_empty());
+        assert!(db.local_schema_stages.lock().is_empty());
+        assert_local_schema_transaction_absent(
+            &db,
+            "local_memory_refusal",
+            "local_memory_refusal_insert",
+            "before rollback",
+        );
+        db.execute("ROLLBACK", &HashMap::new()).unwrap();
+        db.close().unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_local_schema_transaction_absent(
+            &reopened,
+            "local_memory_refusal",
+            "local_memory_refusal_insert",
+            "after reopen",
+        );
+    }
+
+    #[test]
+    fn local_schema_commit_peak_memory_refusal_drops_private_projection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("local-schema-commit-memory-refusal.redb");
+        let db = Database::open(&path).unwrap();
+        let params = HashMap::new();
+        db.execute("BEGIN", &params).unwrap();
+        db.execute(
+            "CREATE TABLE local_commit_memory_refusal (id UUID PRIMARY KEY, body TEXT)",
+            &params,
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TRIGGER local_commit_memory_refusal_insert ON local_commit_memory_refusal WHEN INSERT",
+            &params,
+        )
+        .unwrap();
+
+        let staged_bytes = db.accountant.usage().used;
+        assert!(staged_bytes > 0, "the private schema stage must be charged");
+        db.set_memory_limit(Some(staged_bytes.saturating_add(1)))
+            .unwrap();
+        let error = db
+            .execute("COMMIT", &params)
+            .expect_err("commit must reserve its affected-schema projection before cloning");
+        assert!(
+            matches!(
+                error,
+                Error::MemoryBudgetExceeded {
+                    ref subsystem,
+                    ref operation,
+                    ..
+                } if subsystem == "ddl" && operation == "commit_transactional_schema"
+            ),
+            "schema commit must return the typed peak-memory refusal: {error:?}"
+        );
+        assert!(db.pending_local_schema_stages.lock().is_empty());
+        assert!(db.local_schema_stages.lock().is_empty());
+        assert_local_schema_transaction_absent(
+            &db,
+            "local_commit_memory_refusal",
+            "local_commit_memory_refusal_insert",
+            "after commit memory refusal",
+        );
+        db.set_memory_limit(None).unwrap();
+        db.close().unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_local_schema_transaction_absent(
+            &reopened,
+            "local_commit_memory_refusal",
+            "local_commit_memory_refusal_insert",
+            "after reopen",
+        );
+    }
+
+    #[test]
+    fn local_schema_redb_failure_rolls_back_table_trigger_and_frontier() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("local-schema-redb-refusal.redb");
+        let db = Database::open(&path).unwrap();
+        let params = HashMap::new();
+        db.execute("BEGIN", &params).unwrap();
+        db.execute(
+            "CREATE TABLE local_redb_refusal (id UUID PRIMARY KEY, body TEXT)",
+            &params,
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TRIGGER local_redb_refusal_insert ON local_redb_refusal WHEN INSERT",
+            &params,
+        )
+        .unwrap();
+        crate::persistence::arm_received_schema_pre_commit_fault_for_test();
+        db.execute("COMMIT", &params)
+            .expect_err("the shared Redb pre-commit seam must abort local schema durability");
+
+        assert!(db.pending_local_schema_stages.lock().is_empty());
+        assert!(db.local_schema_stages.lock().is_empty());
+        assert_local_schema_transaction_absent(
+            &db,
+            "local_redb_refusal",
+            "local_redb_refusal_insert",
+            "before reopen",
+        );
+        db.close().unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_local_schema_transaction_absent(
+            &reopened,
+            "local_redb_refusal",
+            "local_redb_refusal_insert",
+            "after reopen",
+        );
+    }
+
     #[test]
     fn received_schema_prepare_failure_drops_registered_stage_without_publication() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2997,6 +3207,8 @@ mod query_trace_rows_examined_contract_tests;
 mod received_schema_atomic_retry_tests;
 #[cfg(test)]
 mod received_schema_atomic_side_effects_tests;
+#[cfg(test)]
+mod retired_generation_refusal_tests;
 
 #[derive(Debug, Clone)]
 #[cfg(feature = "test-seams")]
@@ -3318,6 +3530,31 @@ pub(crate) struct ReceivedSchemaStage {
 
 pub(crate) type ReceivedSchemaStageRegistry = Arc<Mutex<HashMap<Lsn, ReceivedSchemaStage>>>;
 
+/// A locally authored table-schema vector held privately until its owning
+/// transaction receives a commit LSN.  Unlike received-schema staging, this
+/// carries no sync receipts or lineage adjudication: it is solely the
+/// durable-before-memory hand-off for SQL BEGIN/COMMIT DDL.
+pub(crate) struct LocalSchemaStage {
+    relational: Vec<TableProjection>,
+    trigger: trigger::PreparedTriggerPublication,
+    table_generations: Vec<(String, u64)>,
+    ddl_generations: Vec<((Lsn, u32), (Option<String>, Option<u64>))>,
+    ddl_log: Vec<(Lsn, DdlChange)>,
+    memory_swap: PreparedMemorySwap,
+    _temporary_memory: TemporaryMemoryReservation,
+    pub(crate) durable_projection: LocalSchemaPersistenceProjection,
+}
+
+pub(crate) type LocalSchemaStageRegistry = Arc<Mutex<HashMap<Lsn, LocalSchemaStage>>>;
+
+struct PendingLocalSchemaStage {
+    working: Database,
+    base_tables: HashMap<String, TableMeta>,
+    base_triggers: BTreeMap<String, TriggerDeclaration>,
+    base_table_generations: HashMap<String, u64>,
+    temporary_memory: TemporaryMemoryReservation,
+}
+
 /// The caller-owned facts that govern a received unit's existing
 /// conflict/adoption adjudication.  Schema preparation must carry these
 /// unchanged; replacing them with a convenient default can accept a row that
@@ -3343,6 +3580,42 @@ struct PreparedMemorySwap {
     accountant: Arc<MemoryAccountant>,
     reserved_positive_delta: usize,
     release_after_swap: usize,
+}
+
+/// Real-accountant reservation for private staging allocations that disappear
+/// after commit or rollback. Unlike [`PreparedMemorySwap`], none of these
+/// bytes becomes retained database state.
+struct TemporaryMemoryReservation {
+    accountant: Arc<MemoryAccountant>,
+    bytes: usize,
+}
+
+impl TemporaryMemoryReservation {
+    fn reserve(
+        accountant: Arc<MemoryAccountant>,
+        bytes: usize,
+        operation: &'static str,
+    ) -> Result<Self> {
+        accountant.try_allocate_for(
+            bytes,
+            "ddl",
+            operation,
+            "Reduce the schema transaction size or raise MEMORY_LIMIT before retrying.",
+        )?;
+        Ok(Self { accountant, bytes })
+    }
+
+    fn absorb(&mut self, mut other: Self) {
+        debug_assert!(Arc::ptr_eq(&self.accountant, &other.accountant));
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        other.bytes = 0;
+    }
+}
+
+impl Drop for TemporaryMemoryReservation {
+    fn drop(&mut self) {
+        self.accountant.release(self.bytes);
+    }
 }
 
 impl PreparedMemorySwap {
@@ -4269,8 +4542,9 @@ impl SnapshotInspector {
     }
 
     /// Fingerprint every durable category that authenticated schema/data
-    /// apply can mutate. The returned digest comes from exact canonical Redb
-    /// key/value bytes, including vector encodings and private sidecars; large
+    /// apply can mutate. Relational rows use canonical decoded content so
+    /// snapshot re-encoding cannot change the result; vectors and private
+    /// sidecars retain exact persisted key/value-byte coverage. Large
     /// row/vector values never enter the report.
     pub fn inspect_sync_apply_state(&self) -> Result<SyncApplyStateInspection> {
         use contextdb_core::DirectedValue;
@@ -5072,6 +5346,12 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
+    /// Exact internal received-schema executors that must retain their
+    /// established mixed DDL+row transaction path. Unlike the trigger-ready
+    /// depth above, this authority is bound to one database handle and TxId;
+    /// synchronous plugin reentry cannot inherit it for caller work.
+    static SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK: std::cell::RefCell<Vec<(usize, TxId)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static SQL_WRITE_CONTROL_BYPASS_STACK: std::cell::RefCell<Vec<(usize, TxId)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static DB_OPERATION_STACK: std::cell::RefCell<Vec<usize>> =
@@ -5087,6 +5367,11 @@ thread_local! {
 }
 
 struct SyncApplyTriggerGateGuard;
+
+struct SyncApplyLocalSchemaBypassGuard {
+    db_id: usize,
+    tx: TxId,
+}
 
 struct SqlWriteControlBypassGuard {
     db_id: usize,
@@ -5173,6 +5458,19 @@ impl Drop for SyncApplyTriggerGateGuard {
     fn drop(&mut self) {
         SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| {
             depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+impl Drop for SyncApplyLocalSchemaBypassGuard {
+    fn drop(&mut self) {
+        SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(
+                popped,
+                Some((self.db_id, self.tx)),
+                "sync-apply local-schema bypass stack mismatch"
+            );
         });
     }
 }
@@ -5283,6 +5581,11 @@ pub struct Database {
     /// handles share this exact map because the transaction manager assigns
     /// the LSN and invokes callbacks through the shared database state.
     received_schema_stages: Arc<Mutex<HashMap<Lsn, ReceivedSchemaStage>>>,
+    /// The explicit SQL-transaction half is keyed by TxId until the commit
+    /// manager assigns its one LSN; PersistentCompositeStore consumes the
+    /// resulting LSN-keyed stage in that same Redb write transaction.
+    pending_local_schema_stages: Arc<Mutex<HashMap<TxId, PendingLocalSchemaStage>>>,
+    local_schema_stages: LocalSchemaStageRegistry,
     /// Private detached-adjudication probe.  It is armed only by received
     /// schema preparation and snapshots the exact WriteSet after normal sync
     /// commit preparation has stamped lineage/delete positions and receipt
@@ -7355,6 +7658,8 @@ impl Database {
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
         received_schema_stages: ReceivedSchemaStageRegistry,
+        pending_local_schema_stages: Arc<Mutex<HashMap<TxId, PendingLocalSchemaStage>>>,
+        local_schema_stages: LocalSchemaStageRegistry,
         persistence: Option<Arc<RedbPersistence>>,
         blob_repository: Arc<BlobRepository>,
         open_registry_path: Option<PathBuf>,
@@ -7381,6 +7686,8 @@ impl Database {
             terminal_refusal_scans: Arc::new(RwLock::new(HashMap::new())),
             accepted_sync_row_authors: Arc::new(RwLock::new(HashMap::new())),
             received_schema_stages,
+            pending_local_schema_stages,
+            local_schema_stages,
             capture_detached_sync_write_set: Arc::new(AtomicBool::new(false)),
             detached_sync_write_set: Arc::new(Mutex::new(None)),
             persistence,
@@ -7652,6 +7959,8 @@ impl Database {
             terminal_refusal_scans: self.terminal_refusal_scans.clone(),
             accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
             received_schema_stages: self.received_schema_stages.clone(),
+            pending_local_schema_stages: self.pending_local_schema_stages.clone(),
+            local_schema_stages: self.local_schema_stages.clone(),
             capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
             detached_sync_write_set: self.detached_sync_write_set.clone(),
             persistence: self.persistence.clone(),
@@ -7995,6 +8304,8 @@ impl Database {
         let change_log_lsn_refcounts = Arc::new(RwLock::new(initial_lsn_refcounts));
         let ddl_log = Arc::new(RwLock::new(loaded_ddl_log));
         let received_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let pending_local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let composite = CompositeStore::new_with_apply_phase_pause(
             relational.clone(),
@@ -8015,6 +8326,7 @@ impl Database {
             Some(event_bus.clone()),
             Some(trigger.clone()),
             received_schema_stages.clone(),
+            local_schema_stages.clone(),
         );
         let store: DynStore = Box::new(persistent);
         let tx_mgr = Arc::new(TransactionManager::new_with_counters_and_commit_index(
@@ -8037,6 +8349,8 @@ impl Database {
             change_log_lsn_refcounts,
             ddl_log,
             received_schema_stages,
+            pending_local_schema_stages,
+            local_schema_stages,
             Some(persistence),
             blob_repository,
             Some(registry_reservation.disarm()),
@@ -8080,6 +8394,8 @@ impl Database {
         let change_log_lsn_refcounts = Arc::new(RwLock::new(ChangeLogLsnRefcounts::new()));
         let ddl_log = Arc::new(RwLock::new(Vec::new()));
         let received_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let pending_local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
+        let local_schema_stages = Arc::new(Mutex::new(HashMap::new()));
         let apply_phase_pause = Arc::new(ApplyPhasePause::new());
         let trigger = Arc::new(TriggerState::new());
         let store: DynStore = Box::new(CompositeStore::new_with_apply_phase_pause(
@@ -8108,6 +8424,8 @@ impl Database {
             change_log_lsn_refcounts,
             ddl_log,
             received_schema_stages,
+            pending_local_schema_stages,
+            local_schema_stages,
             None,
             blob_repository,
             None,
@@ -8475,8 +8793,11 @@ impl Database {
     pub fn commit(&self, tx: TxId) -> Result<()> {
         // Direct API commits can run trigger callbacks that execute nested
         // reads; give them the same statement-level schema view as SQL
-        // `COMMIT` (which enters this gate through `execute`).
-        let _schema_publication = self.enter_schema_publication_gate(false);
+        // `COMMIT` (which enters this gate through `execute`). A transaction
+        // with privately staged local schema must retain the write side
+        // through Redb durability and the complete after-apply publication;
+        // ordinary DML-only commits remain readers.
+        let _schema_publication = self.enter_commit_schema_publication_gate(tx);
         let _operation =
             self.open_operation_after_public_tx_control_wait_for_tx("commit", Some(tx))?;
         let _user_commit = self.enter_user_commit_callback_scope();
@@ -8536,9 +8857,327 @@ impl Database {
     fn rollback_without_callback_tx_control(&self, tx: TxId) -> Result<()> {
         let ws = self.tx_mgr.rollback_write_set(tx)?;
         self.pending_event_bus_ddl.lock().remove(&tx);
+        self.pending_local_schema_stages.lock().remove(&tx);
         self.pending_commit_metadata.lock().remove(&tx);
         self.release_insert_allocations(&ws);
         Ok(())
+    }
+
+    fn local_schema_stage_unsupported(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::CreateTable(table) => {
+                table.columns.iter().any(|column| {
+                    matches!(column.data_type, DataType::Vector(_)) || column.rank_policy.is_some()
+                }) || !table.dag_edge_types.is_empty()
+            }
+            Statement::AlterTable(alter) => matches!(
+                &alter.action,
+                AlterAction::AddColumn(column)
+                    if matches!(column.data_type, DataType::Vector(_)) || column.rank_policy.is_some()
+            ),
+            _ => false,
+        }
+    }
+
+    fn is_staged_local_schema_statement(stmt: &Statement) -> bool {
+        matches!(stmt, Statement::CreateTable(_))
+            || matches!(stmt, Statement::AlterTable(alter) if matches!(alter.action, AlterAction::AddColumn(_)))
+    }
+
+    fn is_local_table_schema_statement(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::CreateTable(_)
+                | Statement::DropTable(_)
+                | Statement::AlterTable(_)
+                | Statement::CreateIndex(_)
+                | Statement::DropIndex(_)
+                | Statement::CreateTrigger { .. }
+                | Statement::DropTrigger { .. }
+        )
+    }
+
+    fn ensure_no_mixed_local_schema_dml(&self, tx: TxId) -> Result<()> {
+        if self.pending_local_schema_stages.lock().contains_key(&tx) {
+            return Err(Error::Other(
+                "mixed DML and transactional local schema DDL is not supported; commit or roll back before writing rows"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_no_pending_event_bus_ddl_for_local_schema(&self, tx: TxId) -> Result<()> {
+        if self
+            .pending_event_bus_ddl
+            .lock()
+            .get(&tx)
+            .is_some_and(|ddl| !ddl.is_empty())
+        {
+            return Err(Error::Other(
+                "event-bus DDL and transactional local table schema DDL cannot be combined yet; commit or roll back before changing the other schema surface"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn local_schema_pending_baseline_bytes(&self) -> usize {
+        let metadata = self
+            .relational_store
+            .table_meta
+            .read()
+            .values()
+            .fold(0usize, |bytes, meta| {
+                bytes.saturating_add(meta.estimated_bytes())
+            });
+        let triggers =
+            self.trigger
+                .declarations
+                .lock()
+                .values()
+                .fold(0usize, |bytes, declaration| {
+                    bytes
+                        .saturating_add(64)
+                        .saturating_add(declaration.name.len())
+                        .saturating_add(declaration.table.len())
+                        .saturating_add(declaration.on_events.len().saturating_mul(8))
+                });
+        // `base_tables` and the schema-only worker each own metadata; the
+        // worker also prebuilds physical index declarations. Trigger state is
+        // retained in both the baseline and worker projections.
+        metadata
+            .saturating_mul(3)
+            .saturating_add(triggers.saturating_mul(2))
+            .saturating_add(4096)
+    }
+
+    fn new_pending_local_schema_stage(&self) -> Result<PendingLocalSchemaStage> {
+        let temporary_memory = TemporaryMemoryReservation::reserve(
+            self.accountant.clone(),
+            self.local_schema_pending_baseline_bytes(),
+            "stage_transactional_schema",
+        )?;
+        let working = self.detached_local_schema_working_database()?;
+        *working.trigger.declarations.lock() = self.trigger.declarations.lock().clone();
+        let base_triggers = working.trigger.declarations.lock().clone();
+        Ok(PendingLocalSchemaStage {
+            base_triggers,
+            base_table_generations: HashMap::new(),
+            working,
+            base_tables: self.relational_store.table_meta.read().clone(),
+            temporary_memory,
+        })
+    }
+
+    fn staged_table_ddl_temporary_bytes(sql: &str) -> usize {
+        sql.len().saturating_mul(32).saturating_add(4096)
+    }
+
+    fn staged_trigger_ddl_temporary_bytes(ddl: &DdlChange) -> usize {
+        let payload = match ddl {
+            DdlChange::CreateTrigger {
+                name,
+                table,
+                on_events,
+            } => name
+                .len()
+                .saturating_add(table.len())
+                .saturating_add(on_events.iter().map(String::len).sum::<usize>()),
+            DdlChange::DropTrigger { name } => name.len(),
+            _ => 0,
+        };
+        payload.saturating_mul(32).saturating_add(4096)
+    }
+
+    fn capture_local_schema_base_generation(
+        &self,
+        pending: &mut PendingLocalSchemaStage,
+        ddl: &DdlChange,
+    ) -> Result<()> {
+        let table = Self::ddl_affected_table(ddl)
+            .map(str::to_string)
+            .or_else(|| match ddl {
+                DdlChange::DropTrigger { name } => pending
+                    .base_triggers
+                    .get(name)
+                    .map(|declaration| declaration.table.clone()),
+                _ => None,
+            });
+        let Some(table) = table else {
+            return Ok(());
+        };
+        let generation = self.authoritative_table_generation_counter(&table)?;
+        pending
+            .base_table_generations
+            .entry(table.clone())
+            .or_insert(generation);
+        pending
+            .working
+            .in_memory_table_generations
+            .lock()
+            .entry(table)
+            .or_insert(generation);
+        Ok(())
+    }
+
+    /// Run the requested local schema change against a private clone.  The
+    /// clone deliberately uses the ordinary executor, so sequential DDL gets
+    /// its established validation without publishing a half-transaction
+    /// schema to the live database.
+    fn stage_local_schema_statement(
+        &self,
+        tx: TxId,
+        stmt: &Statement,
+        sql: &str,
+    ) -> Result<QueryResult> {
+        self.ensure_no_pending_event_bus_ddl_for_local_schema(tx)?;
+        match stmt {
+            Statement::CreateTable(_) if self.has_context_or_principal_constraints() => {
+                return Err(Error::Other(
+                    "DDL requires an admin database handle".to_string(),
+                ));
+            }
+            Statement::AlterTable(_) if self.has_access_constraints_for_query() => {
+                return Err(Error::Other(
+                    "DDL requires an admin database handle".to_string(),
+                ));
+            }
+            Statement::CreateTable(_) => self.check_disk_budget("CREATE TABLE")?,
+            Statement::AlterTable(_) => self.check_disk_budget("ALTER TABLE")?,
+            _ => {}
+        }
+        if Self::local_schema_stage_unsupported(stmt) {
+            return Err(Error::Other(
+                "transactional local schema staging currently supports CREATE TABLE and ALTER TABLE ADD COLUMN only for non-vector, non-rank, non-DAG shapes; commit or roll back before using this schema feature"
+                    .to_string(),
+            ));
+        }
+        let existing = self.pending_local_schema_stages.lock().remove(&tx);
+        if existing.is_none() {
+            let write_set = self.tx_mgr.cloned_write_set(tx)?;
+            if !write_set.is_empty() {
+                return Err(Error::Other(
+                    "mixed DML and transactional local schema DDL is not supported; commit or roll back before changing schema"
+                        .to_string(),
+                ));
+            }
+        }
+        let had_pending = existing.is_some();
+        let mut pending = match existing {
+            Some(pending) => pending,
+            None => self.new_pending_local_schema_stage()?,
+        };
+        let change = pending
+            .working
+            .ddl_change_for_statement(stmt, None)
+            .expect("staged local table statement has a DDL change");
+        if let Err(error) = self.capture_local_schema_base_generation(&mut pending, &change) {
+            if had_pending {
+                self.pending_local_schema_stages.lock().insert(tx, pending);
+            }
+            return Err(error);
+        }
+        let statement_memory = match TemporaryMemoryReservation::reserve(
+            self.accountant.clone(),
+            Self::staged_table_ddl_temporary_bytes(sql),
+            "grow_transactional_schema_stage",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if had_pending {
+                    self.pending_local_schema_stages.lock().insert(tx, pending);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.plugin.on_ddl(&change) {
+            if had_pending {
+                self.pending_local_schema_stages.lock().insert(tx, pending);
+            }
+            return Err(error);
+        }
+        let result = pending.working.execute(sql, &HashMap::new());
+        match result {
+            Ok(result) => {
+                pending.temporary_memory.absorb(statement_memory);
+                self.tx_mgr.with_write_set(tx, |ws| {
+                    ws.requires_commit_lsn = true;
+                })?;
+                self.pending_local_schema_stages.lock().insert(tx, pending);
+                Ok(result)
+            }
+            Err(error) => {
+                // A failed second statement must not erase earlier valid DDL
+                // from the still-open transaction.
+                if had_pending {
+                    self.pending_local_schema_stages.lock().insert(tx, pending);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn stage_local_trigger_ddl(&self, tx: TxId, ddl: DdlChange) -> Result<()> {
+        self.ensure_no_pending_event_bus_ddl_for_local_schema(tx)?;
+        self.require_admin_trigger_ddl(match &ddl {
+            DdlChange::CreateTrigger { .. } => "CREATE TRIGGER",
+            DdlChange::DropTrigger { .. } => "DROP TRIGGER",
+            _ => "trigger DDL",
+        })?;
+        let existing = self.pending_local_schema_stages.lock().remove(&tx);
+        if existing.is_none() {
+            let write_set = self.tx_mgr.cloned_write_set(tx)?;
+            if !write_set.is_empty() {
+                return Err(Error::Other(
+                    "mixed DML and transactional local schema DDL is not supported; commit or roll back before changing schema"
+                        .to_string(),
+                ));
+            }
+        }
+        let had_pending = existing.is_some();
+        let mut pending = match existing {
+            Some(pending) => pending,
+            None => self.new_pending_local_schema_stage()?,
+        };
+        // Capture before private execution while the outer schema-write gate
+        // excludes COMMIT/ROLLBACK and structural ABA. A fallible generation
+        // read must not discard earlier valid DDL from the still-open tx.
+        if let Err(error) = self.capture_local_schema_base_generation(&mut pending, &ddl) {
+            if had_pending {
+                self.pending_local_schema_stages.lock().insert(tx, pending);
+            }
+            return Err(error);
+        }
+        let statement_memory = match TemporaryMemoryReservation::reserve(
+            self.accountant.clone(),
+            Self::staged_trigger_ddl_temporary_bytes(&ddl),
+            "grow_transactional_schema_stage",
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if had_pending {
+                    self.pending_local_schema_stages.lock().insert(tx, pending);
+                }
+                return Err(error);
+            }
+        };
+        let result = pending.working.apply_trigger_ddl_from_user(ddl);
+        match result {
+            Ok(()) => {
+                pending.temporary_memory.absorb(statement_memory);
+                self.tx_mgr
+                    .with_write_set(tx, |ws| ws.requires_commit_lsn = true)?;
+                self.pending_local_schema_stages.lock().insert(tx, pending);
+                Ok(())
+            }
+            Err(error) => {
+                if had_pending {
+                    self.pending_local_schema_stages.lock().insert(tx, pending);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn snapshot(&self) -> SnapshotId {
@@ -8560,6 +9199,19 @@ impl Database {
 
     fn sync_apply_trigger_gate_bypass_active() -> bool {
         SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| depth.get() > 0)
+    }
+
+    fn enter_sync_apply_local_schema_bypass(&self, tx: TxId) -> SyncApplyLocalSchemaBypassGuard {
+        let db_id = self as *const Self as usize;
+        SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK.with(|stack| {
+            stack.borrow_mut().push((db_id, tx));
+        });
+        SyncApplyLocalSchemaBypassGuard { db_id, tx }
+    }
+
+    fn sync_apply_local_schema_bypass_active(&self, tx: TxId) -> bool {
+        let db_id = self as *const Self as usize;
+        SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK.with(|stack| stack.borrow().contains(&(db_id, tx)))
     }
 
     fn enter_user_commit_callback_scope(&self) -> UserCommitCallbackGuard {
@@ -8648,8 +9300,16 @@ impl Database {
         // This is the outer parsed-statement boundary: planning, subqueries,
         // trigger/callback reads, execution and autocommit all stay on one
         // side of a local table-schema publication.
-        let _schema_publication =
-            self.enter_schema_publication_gate(Self::statement_changes_table_schema(stmt));
+        let session_schema_commit = if matches!(stmt, Statement::Commit) {
+            *self.session_tx.lock()
+        } else {
+            None
+        };
+        let _schema_publication = if let Some(tx) = session_schema_commit {
+            self.enter_commit_schema_publication_gate(tx)
+        } else {
+            self.enter_schema_publication_gate(Self::statement_changes_table_schema(stmt))
+        };
 
         match stmt {
             Statement::Begin => {
@@ -8749,7 +9409,11 @@ impl Database {
                 let ddl = self
                     .ddl_change_for_statement(stmt, self.active_session_tx())
                     .expect("trigger statement has DDL change");
-                self.apply_trigger_ddl_from_user(ddl)?;
+                if let Some(tx) = self.active_session_tx() {
+                    self.stage_local_trigger_ddl(tx, ddl)?;
+                } else {
+                    self.apply_trigger_ddl_from_user(ddl)?;
+                }
                 return Ok(QueryResult::empty());
             }
             _ => {}
@@ -9326,8 +9990,286 @@ impl Database {
 
     fn commit_with_source(&self, tx: TxId, source: CommitSource) -> Result<()> {
         let event_bus_ddl = self.take_pending_event_bus_ddl(tx);
+        if self.pending_local_schema_stages.lock().contains_key(&tx) && !event_bus_ddl.is_empty() {
+            self.pending_event_bus_ddl
+                .lock()
+                .entry(tx)
+                .or_default()
+                .extend(event_bus_ddl);
+            return Err(Error::Other(
+                "event-bus DDL and transactional local table schema DDL cannot be combined yet; commit or roll back before changing the other schema surface"
+                    .to_string(),
+            ));
+        }
         self.commit_with_source_and_event_bus_ddl(tx, source, &event_bus_ddl)
             .map(|_| ())
+    }
+
+    fn prepare_and_register_local_schema_stage(
+        &self,
+        tx: TxId,
+        visibility_tx: TxId,
+        lsn: Lsn,
+    ) -> Result<()> {
+        let Some(pending) = self.pending_local_schema_stages.lock().remove(&tx) else {
+            return Ok(());
+        };
+        // Statement routing fences SQL row DML and the public row helpers,
+        // but graph/vector and future mutation entrypoints share the generic
+        // WriteSet.  The commit boundary is the final authority: schema
+        // staging is DDL-only until a full mixed-image implementation exists.
+        let mut write_set = self.tx_mgr.cloned_write_set(tx)?;
+        write_set.requires_commit_lsn = false;
+        if !write_set.is_empty() {
+            return Err(Error::Other(
+                "mixed DML and transactional local schema DDL is not supported; commit or roll back before changing schema"
+                    .to_string(),
+            ));
+        }
+        if *self.relational_store.table_meta.read() != pending.base_tables {
+            return Err(Error::Other(
+                "concurrent schema change invalidated this transactional local DDL; retry the transaction"
+                    .to_string(),
+            ));
+        }
+        if *self.trigger.declarations.lock() != pending.base_triggers {
+            return Err(Error::Other(
+                "concurrent trigger change invalidated this transactional local DDL; retry the transaction"
+                    .to_string(),
+            ));
+        }
+        for (table, expected_generation) in &pending.base_table_generations {
+            if self.authoritative_table_generation_counter(table)? != *expected_generation {
+                return Err(Error::Other(
+                    "concurrent table generation change invalidated this transactional local DDL; retry the transaction"
+                        .to_string(),
+                ));
+            }
+        }
+        let working = pending.working;
+        let staged_ddl = working.ddl_log.read().clone();
+        if staged_ddl.is_empty() {
+            return Err(Error::Other(
+                "transactional local schema stage contains no DDL".to_string(),
+            ));
+        }
+        let staged_changes = staged_ddl
+            .iter()
+            .map(|(_, change)| change.clone())
+            .collect::<Vec<_>>();
+        let tables = working.relational_store.table_meta.read().clone();
+        let projected_tables = staged_changes
+            .iter()
+            .filter_map(|change| match change {
+                DdlChange::CreateTable { name, .. } | DdlChange::AlterTable { name, .. } => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        // Prepare only tables whose metadata changes. The supported shapes do
+        // not mutate stored row values, graph edges, or vector payloads, so a
+        // schema commit never builds a whole-database replacement. Reserve
+        // the affected projection's peak before cloning any live rows.
+        let trigger_projection_bytes =
+            working
+                .trigger
+                .declarations
+                .lock()
+                .values()
+                .fold(0usize, |bytes, declaration| {
+                    bytes
+                        .saturating_add(64)
+                        .saturating_add(declaration.name.len())
+                        .saturating_add(declaration.table.len())
+                        .saturating_add(declaration.on_events.len().saturating_mul(8))
+                });
+        let projection_peak_bytes = {
+            let live_rows = self.relational_store.tables.read();
+            projected_tables.iter().fold(
+                trigger_projection_bytes
+                    .saturating_mul(6)
+                    .saturating_add(4096),
+                |bytes, table| {
+                    let Some(meta) = tables.get(*table) else {
+                        return bytes;
+                    };
+                    let rows = live_rows.get(*table).map(Vec::as_slice).unwrap_or_default();
+                    let row_bytes = rows.iter().fold(0usize, |row_bytes, row| {
+                        row_bytes.saturating_add(estimate_row_bytes_for_meta(
+                            &row.values,
+                            meta,
+                            false,
+                        ))
+                    });
+                    bytes
+                        .saturating_add(meta.estimated_bytes().saturating_mul(4))
+                        .saturating_add(row_bytes.saturating_mul(4))
+                },
+            )
+        };
+        let temporary_memory = TemporaryMemoryReservation::reserve(
+            self.accountant.clone(),
+            projection_peak_bytes,
+            "commit_transactional_schema",
+        )?;
+        let relational = {
+            let live_rows = self.relational_store.tables.read();
+            projected_tables
+                .iter()
+                .map(|table| {
+                    let meta = tables.get(*table).cloned().ok_or_else(|| {
+                        Error::SyncError(format!(
+                            "transactional schema projection lost affected table {table}"
+                        ))
+                    })?;
+                    Ok(RelationalStore::table_projection(
+                        (*table).to_string(),
+                        meta,
+                        live_rows.get(*table).cloned().unwrap_or_default(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let declarations = working.trigger.declarations.lock().clone();
+        let trigger = self.prepare_received_trigger_publication_from_projection(declarations)?;
+        let live_meta = self.relational_store.table_meta.read();
+        let old_bytes = projected_tables.iter().fold(0usize, |bytes, table| {
+            bytes.saturating_add(
+                live_meta
+                    .get(*table)
+                    .map(TableMeta::estimated_bytes)
+                    .unwrap_or(0),
+            )
+        });
+        let new_bytes = projected_tables.iter().fold(0usize, |bytes, table| {
+            bytes.saturating_add(
+                tables
+                    .get(*table)
+                    .map(TableMeta::estimated_bytes)
+                    .unwrap_or(0),
+            )
+        });
+        drop(live_meta);
+        let memory_swap =
+            PreparedMemorySwap::prepare(self.accountant.clone(), old_bytes, new_bytes, 0)?;
+
+        let working_table_generations = working.in_memory_table_generations.lock().clone();
+        let affected_tables = staged_changes
+            .iter()
+            .filter_map(Self::ddl_affected_table)
+            .collect::<HashSet<_>>();
+        let table_generation_updates = affected_tables
+            .iter()
+            .map(|table| {
+                working_table_generations
+                    .get(*table)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::SyncError(format!(
+                            "transactional DDL has no projected generation for {table}"
+                        ))
+                    })
+                    .map(|generation| ((*table).to_string(), generation))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let mut config_values = affected_tables
+            .iter()
+            .filter_map(|table| {
+                table_generation_updates
+                    .get(*table)
+                    .map(|generation| (*table, *generation))
+            })
+            .map(|(table, generation)| {
+                Ok((
+                    Self::durable_lineage_table_generation_key(table),
+                    RedbPersistence::encode_config_value(&generation)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut ddl_generations = Vec::with_capacity(staged_changes.len());
+        for (ordinal, change) in staged_changes.iter().enumerate() {
+            let table = Self::ddl_affected_table(change).map(str::to_string);
+            let generation = table
+                .as_deref()
+                .map(|table| {
+                    table_generation_updates.get(table).copied().ok_or_else(|| {
+                        Error::SyncError(format!(
+                            "transactional DDL has no projected generation for {table}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            let sidecar = DurableDdlGenerationSidecar {
+                table: table.clone(),
+                table_generation: generation,
+            };
+            config_values.push((
+                Self::durable_ddl_generation_sidecar_key(lsn, ordinal as u32),
+                RedbPersistence::encode_config_value(&sidecar)?,
+            ));
+            ddl_generations.push(((lsn, ordinal as u32), (table, generation)));
+        }
+        config_values.extend(trigger.config_values.iter().cloned());
+        let ddl_log = staged_changes
+            .iter()
+            .cloned()
+            .map(|change| (lsn, change))
+            .collect::<Vec<_>>();
+        let durable_projection = LocalSchemaPersistenceProjection {
+            affected_table_meta: projected_tables
+                .iter()
+                .map(|table| {
+                    tables
+                        .get(*table)
+                        .cloned()
+                        .map(|meta| ((*table).to_string(), meta))
+                        .ok_or_else(|| {
+                            Error::SyncError(format!(
+                                "transactional schema persistence lost affected table {table}"
+                            ))
+                        })
+                })
+                .collect::<Result<HashMap<_, _>>>()?,
+            ddl: staged_changes,
+            config_values,
+            commit_index_tx: visibility_tx,
+        };
+        self.local_schema_stages.lock().insert(
+            lsn,
+            LocalSchemaStage {
+                relational,
+                trigger,
+                table_generations: table_generation_updates.into_iter().collect(),
+                ddl_generations,
+                ddl_log,
+                memory_swap,
+                _temporary_memory: temporary_memory,
+                durable_projection,
+            },
+        );
+        Ok(())
+    }
+
+    fn take_local_schema_stage(&self, lsn: Lsn) -> Option<LocalSchemaStage> {
+        self.local_schema_stages.lock().remove(&lsn)
+    }
+
+    fn publish_local_schema_stage(&self, mut stage: LocalSchemaStage) {
+        self.relational_store
+            .publish_table_projections(stage.relational);
+        self.publish_prepared_trigger_publication(stage.trigger);
+        self.in_memory_table_generations
+            .lock()
+            .extend(stage.table_generations);
+        self.in_memory_ddl_generations
+            .lock()
+            .extend(stage.ddl_generations);
+        self.ddl_log.write().extend(stage.ddl_log);
+        stage.memory_swap.commit_after_swap();
+        self.clear_statement_cache();
+        self.reconcile_maintenance_thread();
     }
 
     fn commit_with_source_and_event_bus_ddl(
@@ -9385,7 +10327,8 @@ impl Database {
         let (lsn, ws) = {
             match self.tx_mgr.commit_with_lsn_active_prepare_and_applied_mut(
                 tx,
-                |_, _| {
+                |lsn, visibility_tx| {
+                    self.prepare_and_register_local_schema_stage(tx, visibility_tx, lsn)?;
                     // This observes the canonical staged write set before
                     // conditional-update revalidation can discard a stale
                     // descendant as a no-op. A purged lineage is a typed
@@ -9547,6 +10490,9 @@ impl Database {
                 },
                 |lsn, ws| {
                     if !ws.is_empty() {
+                        if let Some(stage) = self.take_local_schema_stage(lsn) {
+                            self.publish_local_schema_stage(stage);
+                        }
                         if let Some(delta) = in_memory_lineage_delta.borrow_mut().take() {
                             self.publish_in_memory_lineage_delta(delta);
                         }
@@ -9618,6 +10564,7 @@ impl Database {
                         // Redb apply failure; PersistentCompositeStore also
                         // removes it on its own flush error.
                         let _ = self.take_received_schema_stage(lsn);
+                        let _ = self.take_local_schema_stage(lsn);
                         let _ = self.event_bus.take_staged_sink_events_for_persistence(lsn);
                         self.discard_staged_event_bus_ddl_commit(lsn);
                         self.discard_staged_trigger_ddl_commit(lsn);
@@ -9635,6 +10582,7 @@ impl Database {
                         return Err(audit_error);
                     }
                     self.pending_commit_metadata.lock().remove(&tx);
+                    self.pending_local_schema_stages.lock().remove(&tx);
                     return Err(failure.error);
                 }
             }
@@ -9806,14 +10754,39 @@ impl Database {
             return Err(error);
         }
 
+        let started = Instant::now();
+        // Authenticated sync applies already run against their own private
+        // received-schema image and intentionally combine one source DDL
+        // vector with its rows. Keep that established atomic path in the
+        // ordinary executor; this local authoring stage is only for caller
+        // transactions.
+        if let Some(tx) = tx
+            && Self::is_staged_local_schema_statement(stmt)
+            && !self.sync_apply_local_schema_bypass_active(tx)
+        {
+            let result = self.stage_local_schema_statement(tx, stmt, sql);
+            let outcome = query_outcome_from_result(&result);
+            self.plugin.post_query(sql, started.elapsed(), &outcome);
+            return result;
+        }
         if let Some(change) = self.ddl_change_for_statement(stmt, tx).as_ref()
             && let Err(error) = self.plugin.on_ddl(change)
         {
             self.rollback_preopened_autocommit_tx(preopened_autocommit_tx.take());
             return Err(error);
         }
-
-        let started = Instant::now();
+        if let Some(tx) = tx
+            && Self::is_local_table_schema_statement(stmt)
+            && !self.sync_apply_local_schema_bypass_active(tx)
+        {
+            let result = Err(Error::Other(
+                "transactional local schema staging currently supports only CREATE TABLE and ALTER TABLE ADD COLUMN; commit or roll back before using another table-schema operation"
+                    .to_string(),
+            ));
+            let outcome = query_outcome_from_result(&result);
+            self.plugin.post_query(sql, started.elapsed(), &outcome);
+            return result;
+        }
         if let Some(result) = self.execute_event_bus_statement(stmt, tx) {
             self.rollback_preopened_autocommit_tx(preopened_autocommit_tx.take());
             let outcome = query_outcome_from_result(&result);
@@ -9904,6 +10877,19 @@ impl Database {
         preopened_autocommit_tx: Option<TxId>,
         skip_static_dml_validation: bool,
     ) -> Result<QueryResult> {
+        if let Some(tx) = tx
+            && matches!(
+                plan,
+                PhysicalPlan::Insert(_) | PhysicalPlan::Delete(_) | PhysicalPlan::Update(_)
+            )
+            && self.pending_local_schema_stages.lock().contains_key(&tx)
+        {
+            self.rollback_preopened_autocommit_tx(preopened_autocommit_tx);
+            return Err(Error::Other(
+                "mixed DML and transactional local schema DDL is not supported; commit or roll back before writing rows"
+                    .to_string(),
+            ));
+        }
         if !skip_static_dml_validation && let Err(error) = validate_dml(plan, self, params) {
             self.rollback_preopened_autocommit_tx(preopened_autocommit_tx);
             return Err(error);
@@ -10276,6 +11262,7 @@ impl Database {
         table: &str,
         values: HashMap<ColName, Value>,
     ) -> Result<RowId> {
+        self.ensure_no_mixed_local_schema_dml(tx)?;
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         let _operation = if trigger_callback_bound {
             None
@@ -11382,6 +12369,33 @@ impl Database {
             .saturating_add(rows)
             .saturating_add(edges)
             .saturating_add(vector_bytes)
+    }
+
+    /// Clone only declarations needed to validate locally authored CREATE /
+    /// ALTER ADD / trigger DDL. Row, edge, and vector payloads remain solely
+    /// in the live database and are never duplicated by a long-lived BEGIN.
+    fn detached_local_schema_working_database(&self) -> Result<Database> {
+        let working = Database::open_memory();
+        let metadata = self.relational_store.table_meta.read().clone();
+        for (table, meta) in metadata {
+            working.relational_store.create_table(&table, meta.clone());
+            for index in &meta.indexes {
+                if index.kind == IndexKind::Auto {
+                    working.relational_store.create_exact_index_storage(
+                        &table,
+                        &index.name,
+                        index.columns.clone(),
+                    );
+                } else {
+                    working.relational_store.create_index_storage(
+                        &table,
+                        &index.name,
+                        index.columns.clone(),
+                    );
+                }
+            }
+        }
+        Ok(working)
     }
 
     /// Clone the mutable state that the sync adjudicator reads into a private
@@ -12785,6 +13799,23 @@ impl Database {
             })
     }
 
+    /// Return the authoritative generation counter even when no live table
+    /// currently owns it.  A dropped table deliberately retains this counter
+    /// so a later same-name CREATE cannot reuse its former identity.
+    fn authoritative_table_generation_counter(&self, table: &str) -> Result<u64> {
+        if let Some(persistence) = &self.persistence {
+            return persistence
+                .load_config_value::<u64>(&Self::durable_lineage_table_generation_key(table))
+                .map(|generation| generation.unwrap_or(0));
+        }
+        Ok(self
+            .in_memory_table_generations
+            .lock()
+            .get(table)
+            .copied()
+            .unwrap_or(0))
+    }
+
     /// Allocate the next generation before a local CREATE is persisted.  A
     /// missing record is valid only for this first CREATE; reopening a schema
     /// without its record is corruption and is never reconstructed from DDL
@@ -13665,6 +14696,157 @@ impl Database {
             },
             refused_rows,
             conflicts,
+        })
+    }
+
+    /// Return one terminal, row-addressable refusal for each incoming row
+    /// whose authenticated lineage belongs to a retired table generation.
+    /// A purged root keeps its stronger permanent-erasure reason; every other
+    /// row from that generation is refused as removed-generation work.  The
+    /// caller may send this receipt only when it covers the whole request, so
+    /// no unclassified member can mutate beside it.
+    pub(crate) fn retired_generation_refusals(
+        &self,
+        tenant_id: &TenantId,
+        changes: &ChangeSet,
+        lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
+        authenticated_peer: &str,
+        sender_incarnation: Incarnation,
+    ) -> Result<Vec<Conflict>> {
+        // Verify the immutable, portable creator evidence before consulting a
+        // retired generation.  A relay is allowed to carry a creator's signed
+        // lineage, but an unauthenticated or malformed row must never learn
+        // whether that old key was purged or merely belongs to a removed table.
+        for row in &changes.rows {
+            let matching = lineages
+                .iter()
+                .filter(|(table, natural_key, lsn, _)| {
+                    table == &row.table && natural_key == &row.natural_key && *lsn == row.lsn
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(Error::SyncError(format!(
+                    "protocol v6 requires exactly one lineage for {} {:?} at source LSN {}",
+                    row.table, row.natural_key, row.lsn.0
+                )));
+            }
+            let lineage = &matching[0].3;
+            let expected_root = format!(
+                "author:{}:{}:{}",
+                lineage.author_node_id,
+                lineage.author_database_incarnation.to_hex(),
+                lineage.author_local_mutation_position.0,
+            );
+            if lineage.lineage_root != expected_root {
+                return Err(Error::SyncError(
+                    "wire row lineage root does not match its immutable creator tuple".to_string(),
+                ));
+            }
+            Self::verify_lineage_attestation(tenant_id, &row.table, &row.natural_key, lineage)?;
+        }
+        self.validate_incoming_push_lineage_authorship(
+            changes,
+            lineages,
+            authenticated_peer,
+            sender_incarnation,
+        )?;
+
+        let policies = Self::declared_sync_policies(true);
+        let mut conflicts = Vec::new();
+        for row in &changes.rows {
+            let matching = lineages
+                .iter()
+                .filter(|(table, natural_key, lsn, _)| {
+                    table == &row.table && natural_key == &row.natural_key && *lsn == row.lsn
+                })
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(Error::SyncError(format!(
+                    "protocol v6 requires exactly one lineage for {} {:?} at source LSN {}",
+                    row.table, row.natural_key, row.lsn.0
+                )));
+            }
+            let lineage = &matching[0].3;
+            let current_generation = self.durable_lineage_table_generation(&row.table)?;
+            // Only an older, retired table generation has a terminal
+            // no-retry outcome. A future generation is not evidence of
+            // retirement; leave it for the ordinary authenticated projection
+            // check, which fails closed rather than acknowledging unknown data.
+            if lineage.table_generation >= current_generation {
+                continue;
+            }
+            let record = self.durable_lineage_record_at_generation(
+                &row.table,
+                &row.natural_key,
+                lineage.table_generation,
+            )?;
+            let creator_incarnation = lineage.author_database_incarnation.to_hex();
+            let purged_lineage = record.is_some_and(|record| {
+                record.delete_obligation == DurableDeleteObligation::Purged
+                    && record.lineage_root == lineage.lineage_root
+                    && record.author_node_id.as_deref() == Some(lineage.author_node_id.as_str())
+                    && record.author_database_incarnation.as_deref()
+                        == Some(creator_incarnation.as_str())
+                    && record.author_local_mutation_position
+                        == lineage.author_local_mutation_position.0
+            });
+            conflicts.push(Conflict {
+                natural_key: row.natural_key.clone(),
+                resolution: Self::sync_conflict_policy_for_table(
+                    &policies,
+                    self.table_meta(&row.table).as_ref(),
+                    &row.table,
+                ),
+                reason: Some(
+                    if purged_lineage {
+                        crate::sync_types::PURGED_LINEAGE_CONFLICT_REASON
+                    } else {
+                        crate::sync_types::REMOVED_GENERATION_CONFLICT_REASON
+                    }
+                    .to_string(),
+                ),
+                table: Some(row.table.clone()),
+                mutation_kind: Some(if row.deleted { "delete" } else { "edit" }.to_string()),
+                winning_author_node_id: None,
+                hub_acceptance_position: None,
+            });
+        }
+        Ok(conflicts)
+    }
+
+    /// Commit the authenticated edge receipt for a push whose every row was
+    /// terminally refused before the normal row-apply path.  The receipt is
+    /// the durable acknowledgement boundary: a dropped response can then be
+    /// reconciled by the edge without retransmitting the same retired rows.
+    pub(crate) fn commit_terminal_sync_refusals_with_receipt(
+        &self,
+        receipt: SyncApplyReceipt,
+        row_count: usize,
+        conflicts: Vec<Conflict>,
+    ) -> Result<ApplyResult> {
+        if row_count == 0 || conflicts.len() != row_count {
+            return Err(Error::SyncError(
+                "terminal sync refusal receipt must cover every transmitted row".to_string(),
+            ));
+        }
+        self.commit_sync_apply_receipt_only(&receipt)?;
+        if self.persistence.is_none() {
+            let key = Self::applied_push_watermark_node_incarnation_key(
+                &receipt.tenant_id,
+                &receipt.node_id,
+                receipt.incarnation,
+            );
+            self.in_memory_applied_push_watermarks
+                .lock()
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(receipt.source_lsn))
+                .or_insert(receipt.source_lsn);
+        }
+        Ok(ApplyResult {
+            applied_rows: 0,
+            skipped_rows: row_count,
+            conflicts,
+            new_lsn: self.current_lsn(),
         })
     }
 
@@ -18811,6 +19993,7 @@ impl Database {
     }
 
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
+        self.ensure_no_mixed_local_schema_dml(tx)?;
         let trigger_callback_bound = self.trigger_callback_tx_bound_matches(tx);
         let _operation = if trigger_callback_bound || self.sql_write_control_bypass_active(tx) {
             None
@@ -24259,6 +25442,8 @@ impl Database {
             }
             if self.resource_owner {
                 self.resource_closed.store(true, Ordering::SeqCst);
+                self.pending_local_schema_stages.lock().clear();
+                self.local_schema_stages.lock().clear();
             }
         }
         let tx = self.session_tx.lock().take();
@@ -24267,8 +25452,17 @@ impl Database {
                 self.release_insert_allocations(&ws);
             }
             self.pending_event_bus_ddl.lock().remove(&tx);
+            self.pending_local_schema_stages.lock().remove(&tx);
             self.pending_commit_metadata.lock().remove(&tx);
             let _ = self.tx_mgr.rollback(tx);
+        }
+        // A resource-owner close can also follow direct `begin()` /
+        // `execute_in_tx()` use, whose TxId is not stored in `session_tx`.
+        // No public operation can still be committing past the close barrier,
+        // so discard every private staged image owned by this shared database.
+        if self.resource_owner {
+            self.pending_local_schema_stages.lock().clear();
+            self.local_schema_stages.lock().clear();
         }
         self.stop_cron_tickler();
         let event_bus_shutdown = self.stop_event_bus_threads();
@@ -24347,6 +25541,23 @@ impl Database {
         }
     }
 
+    /// Select the read or write side for COMMIT without racing a concurrent
+    /// final schema-staging statement on the same transaction. Once the read
+    /// side is held, no schema statement can publish a new pending stage; if
+    /// one landed between the first observation and lock acquisition, drop
+    /// the read side and retry as a writer instead of upgrading in place.
+    fn enter_commit_schema_publication_gate(&self, tx: TxId) -> SchemaPublicationGuard<'_> {
+        loop {
+            let publishes_local_schema = self.pending_local_schema_stages.lock().contains_key(&tx);
+            let guard = self.enter_schema_publication_gate(publishes_local_schema);
+            if publishes_local_schema || !self.pending_local_schema_stages.lock().contains_key(&tx)
+            {
+                return guard;
+            }
+            drop(guard);
+        }
+    }
+
     /// Take the received-schema write side without parking behind a callback
     /// that may be waiting for this very `apply_changes` call to return.
     /// Timed lock acquisition is only a wake-up cadence: callback state, not
@@ -24415,6 +25626,8 @@ impl Database {
                 | Statement::AlterTable(_)
                 | Statement::CreateIndex(_)
                 | Statement::DropIndex(_)
+                | Statement::CreateTrigger { .. }
+                | Statement::DropTrigger { .. }
         )
     }
 
@@ -31532,6 +32745,7 @@ impl Database {
         stage_verified_lineages: bool,
     ) -> Result<ApplyResult> {
         let mut tx = self.begin()?;
+        let _local_schema_bypass = self.enter_sync_apply_local_schema_bypass(tx);
         let atomic_receipt = dependency_complete;
         if let Some(receipt) = receipt.as_ref() {
             self.stage_sync_apply_receipt(tx, receipt)?;
@@ -34980,6 +36194,10 @@ impl Drop for Database {
             if self.resource_owner {
                 self.resource_closed.store(true, Ordering::SeqCst);
             }
+        }
+        if self.resource_owner {
+            self.pending_local_schema_stages.lock().clear();
+            self.local_schema_stages.lock().clear();
         }
         self.stop_cron_tickler();
         let event_bus_shutdown = self.stop_event_bus_threads();

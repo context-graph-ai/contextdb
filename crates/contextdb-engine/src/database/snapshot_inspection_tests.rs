@@ -141,44 +141,48 @@ fn sync_apply_state_digest_is_deterministic_and_changes_with_durable_state() {
     let root = tempfile::tempdir().expect("tempdir");
     let database_path = root.path().join("source.redb");
     let before_path = root.path().join("before.snapshot");
-    let after_path = root.path().join("after.snapshot");
+    let first_after_path = root.path().join("after-first.snapshot");
+    let second_after_path = root.path().join("after-second.snapshot");
     let db = Database::open(&database_path).expect("open source");
     db.export_snapshot(&before_path)
         .expect("export empty state");
     db.execute(
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) HISTORY ALL",
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, title TEXT) HISTORY ALL",
         &HashMap::new(),
     )
     .expect("declare table");
     db.execute(
-        "INSERT INTO notes (id, body) VALUES ($id, $body)",
+        "INSERT INTO notes (id, body, title) VALUES ($id, $body, $title)",
         &params(&[
             ("id", Value::Int64(1)),
             ("body", Value::Text("durable".to_string())),
+            ("title", Value::Text("multi-column".to_string())),
         ]),
     )
     .expect("insert row");
-    db.export_snapshot(&after_path)
-        .expect("export populated state");
+    db.export_snapshot(&first_after_path)
+        .expect("first populated export");
+    db.export_snapshot(&second_after_path)
+        .expect("second populated export");
     db.close().expect("close source");
 
     let before = SnapshotInspector::open(&before_path)
         .expect("open before")
         .inspect_sync_apply_state()
         .expect("inspect before");
-    let first = SnapshotInspector::open(&after_path)
-        .expect("open first copy")
+    let first = SnapshotInspector::open(&first_after_path)
+        .expect("open first export")
         .inspect_sync_apply_state()
         .expect("inspect first copy");
-    let second = SnapshotInspector::open(&after_path)
-        .expect("open second copy")
+    let second = SnapshotInspector::open(&second_after_path)
+        .expect("open second export")
         .inspect_sync_apply_state()
         .expect("inspect second copy");
 
     assert_ne!(before.digest, first.digest);
     assert_eq!(
         first, second,
-        "separate copies must canonicalize identically"
+        "back-to-back exports of unchanged multi-column rows must canonicalize identically"
     );
     assert_eq!(first.tables, 1);
     assert_eq!(first.retained_row_versions, 1);
