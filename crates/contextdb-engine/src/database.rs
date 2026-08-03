@@ -11576,11 +11576,41 @@ impl Database {
             if !changed {
                 return Ok(UpsertResult::NoOp);
             }
-            self.validate_commit_time_upsert_state_transition(table, existing, &values)?;
+            // Sync carries a complete row, including its current state.  A
+            // scalar-only change must not be treated as an explicit
+            // `state = state` transition: local SQL keeps that stricter
+            // contract and validates an assigned state column separately.
+            let state_text_pair = meta
+                .as_ref()
+                .and_then(|table_meta| table_meta.state_machine.as_ref())
+                .map(|state_machine| {
+                    (
+                        existing
+                            .values
+                            .get(&state_machine.column)
+                            .and_then(Value::as_text),
+                        values.get(&state_machine.column).and_then(Value::as_text),
+                    )
+                });
+            let carried_state_unchanged_text = matches!(
+                state_text_pair,
+                Some((Some(old_state), Some(incoming_state))) if old_state == incoming_state
+            );
+            let state_changed_text = matches!(
+                state_text_pair,
+                Some((Some(old_state), Some(incoming_state))) if old_state != incoming_state
+            );
+            // An absent or malformed state is never a no-op: it must retain
+            // the normal validator/constraint path. Only two equal text
+            // values mean sync carried the existing state unchanged.
+            if !carried_state_unchanged_text {
+                self.validate_commit_time_upsert_state_transition(table, existing, &values)?;
+            }
             self.relational.delete(tx, table, existing.row_id)?;
             self.insert_synced_row_at(tx, table, existing.row_id, values, snapshot, created_at)?;
-            if let (Some(uuid), Some(state), Some(_meta)) =
-                (row_uuid, new_state.as_deref(), meta.as_ref())
+            if state_changed_text
+                && let (Some(uuid), Some(state), Some(_meta)) =
+                    (row_uuid, new_state.as_deref(), meta.as_ref())
             {
                 self.propagate_state_change_if_needed(tx, table, Some(uuid), Some(state))?;
             }

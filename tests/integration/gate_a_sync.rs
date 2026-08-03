@@ -4,7 +4,7 @@
 //! verify complete authenticated request/response round trips.
 
 use contextdb_core::{Direction, Value};
-use contextdb_core::{Lsn, RowId};
+use contextdb_core::{Lsn, RowId, TxId};
 use contextdb_engine::Database;
 use contextdb_engine::memory_accounting::MemoryAccountant;
 #[allow(unused_imports)]
@@ -1467,6 +1467,162 @@ fn a9_11_conflict_resolution_respects_state_machine() {
             .map(|r| r.contains("state_machine") || r.contains("state machine"))
             .unwrap_or(false),
         "conflict reason must mention state machine violation"
+    );
+}
+
+// =========================================================================
+// A9-11a: scalar_only_latest_wins_sync_preserves_unchanged_state
+// =========================================================================
+#[test]
+fn a9_11a_scalar_only_latest_wins_sync_preserves_unchanged_state() {
+    let edge = setup_sync_db_with_tables(&["decisions_sm"]);
+    let server = setup_sync_db_with_tables(&["decisions_sm"]);
+    let decision_id = Uuid::new_v4();
+
+    // Seed both replicas with the same active decision through sync, then
+    // remember the precise source watermark. The next change is deliberately
+    // scalar-only: its wire row still carries `status = active`.
+    let seed_tx = edge.begin_or_panic();
+    edge.insert_row(
+        seed_tx,
+        "decisions",
+        make_params(vec![
+            ("id", Value::Uuid(decision_id)),
+            (
+                "description",
+                Value::Text("before confidence refresh".into()),
+            ),
+            ("status", Value::Text("active".into())),
+        ]),
+    )
+    .unwrap();
+    edge.commit(seed_tx).unwrap();
+    server
+        .apply_changes(
+            edge.changes_since(Lsn(0)),
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+    let source_watermark = edge.current_lsn();
+
+    edge.execute(
+        "UPDATE decisions SET description = 'after confidence refresh' WHERE id = $id",
+        &[("id".to_string(), Value::Uuid(decision_id))]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+
+    let applied = server
+        .apply_changes(
+            edge.changes_since(source_watermark),
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .expect("scalar-only sync with an unchanged state must apply");
+    assert_eq!(applied.applied_rows, 1, "one scalar row update must apply");
+    assert!(
+        applied.conflicts.is_empty(),
+        "active carried unchanged is not a state-machine conflict: {applied:?}"
+    );
+
+    let row = server
+        .point_lookup(
+            "decisions",
+            "id",
+            &Value::Uuid(decision_id),
+            server.snapshot(),
+        )
+        .unwrap()
+        .expect("synced decision must remain present");
+    assert_eq!(
+        row.values.get("description").and_then(Value::as_text),
+        Some("after confidence refresh")
+    );
+    assert_eq!(
+        row.values.get("status").and_then(Value::as_text),
+        Some("active"),
+        "the scalar update must not change the decision state"
+    );
+}
+
+// =========================================================================
+// A9-11b: malformed_state_is_rejected_before_sync_replace
+// =========================================================================
+#[test]
+fn a9_11b_malformed_state_is_rejected_before_sync_replace() {
+    let server = Database::open_memory();
+    server
+        .execute(
+            "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT NOT NULL) STATE MACHINE (status: active -> [superseded])",
+            &HashMap::new(),
+        )
+        .unwrap();
+    let decision_id = Uuid::new_v4();
+    server
+        .execute(
+            "INSERT INTO decisions (id, description, status) VALUES ($id, 'before', 'active')",
+            &[("id".to_string(), Value::Uuid(decision_id))]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+
+    let malformed_state = ChangeSet {
+        rows: vec![RowChange {
+            table: "decisions".to_string(),
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(decision_id)),
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(decision_id)),
+                (
+                    "description".to_string(),
+                    Value::Text("must not replace".into()),
+                ),
+                // `TxId` is not a text state. Sync preflight must not let it
+                // slip through the carried-state exception.
+                ("status".to_string(), Value::TxId(TxId(1))),
+            ]),
+            deleted: false,
+            lsn: Lsn(server.current_lsn().0 + 1),
+            created_at: None,
+        }],
+        edges: vec![],
+        vectors: vec![],
+        ddl: vec![],
+        ddl_lsn: Vec::new(),
+    };
+    let rejected = server
+        .apply_changes(
+            malformed_state,
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .expect("malformed sync rows must be refused as a recorded conflict");
+    assert_eq!(rejected.applied_rows, 0);
+    assert_eq!(rejected.skipped_rows, 1);
+    assert!(
+        rejected.conflicts.iter().any(|conflict| {
+            conflict.reason.as_deref().is_some_and(|reason| {
+                reason.contains("column type mismatch: decisions.status expected TEXT, got TxId")
+            })
+        }),
+        "a sync row with a malformed state must be recorded as refused before it can replace the active row: {rejected:?}"
+    );
+
+    let row = server
+        .point_lookup(
+            "decisions",
+            "id",
+            &Value::Uuid(decision_id),
+            server.snapshot(),
+        )
+        .unwrap()
+        .expect("the rejected row must leave the original decision intact");
+    assert_eq!(
+        row.values.get("status").and_then(Value::as_text),
+        Some("active")
+    );
+    assert_eq!(
+        row.values.get("description").and_then(Value::as_text),
+        Some("before")
     );
 }
 
