@@ -2582,11 +2582,24 @@ fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
         .unwrap();
     }
 
-    // Both events are consumed: the first panics (recorded as a permanent
-    // failure and acked) and the second delivers, so the queue drains to empty.
-    // A drained queue proves both entries were processed — hence both callback
-    // invocations happened — without a settle sleep.
-    wait_drained(&db, "slack");
+    // The durable ack removes queue entries before the dispatcher publishes
+    // their delivery/failure counters. Wait on the whole observable batch
+    // outcome so parallel load cannot expose the ack-to-metrics gap as a
+    // false failure.
+    wait_for_bus("slack panic batch outcome", || {
+        let metrics = db.sink_metrics_for_test("slack");
+        metrics.queued == 0
+            && metrics.delivered == 1
+            && metrics.permanent_failures == 1
+            && metrics.examined >= 2
+            && invocations.load(Ordering::SeqCst) == 2
+    });
+    wait_for_bus("slack structured panic event", || {
+        T5_EVENT_BUS_PANIC_COUNT.load(Ordering::SeqCst) == 1
+            && T5_EVENT_BUS_LAST_PANIC_FIELDS
+                .get()
+                .is_some_and(|cell| cell.lock().unwrap().is_some())
+    });
     assert_eq!(
         invocations.load(Ordering::SeqCst),
         2,
