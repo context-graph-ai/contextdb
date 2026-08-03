@@ -596,16 +596,25 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
             "smoke driver import",
         );
     }
-    // The plugin hook, durable database opening, and DDL-vector inspection
-    // are the three fixed verifier operations the smoke command is allowed to
-    // orchestrate. Do not add general engine names here.
+    // The plugin hook, durable database opening, and the exact DDL-vector /
+    // refusal inspections below are the fixed operations the smoke command and
+    // its negative-shape proofs may orchestrate. Do not add general engine
+    // names here.
     for (authorized_use, expected_count) in [
         ("fn on_sync_pull(&self, changes: &mut ChangeSet)", 1),
         // The three fixed smoke subcommands all open the caller-selected
         // database argument. Do not suppress a future open at any other
         // callsite.
         ("Database::open(&args.db)", 3),
-        ("database.changes_since(", 1),
+        ("database.changes_since(", 3),
+        ("let canonical = Database::open_memory();", 1),
+        ("let database = Database::open_memory();", 3),
+        ("print_refused_ddl_state(&Database::open_memory())", 1),
+        ("canonical.changes_since(", 1),
+        ("changes: &ChangeSet", 2),
+        ("fn fixture_vector(lsn: Lsn) -> ChangeSet", 1),
+        ("ChangeSet {", 1),
+        ("ChangeSet::default()", 1),
     ] {
         audited = remove_exact_sanctioned_occurrences(
             audited,
