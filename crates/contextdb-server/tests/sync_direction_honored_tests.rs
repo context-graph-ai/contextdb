@@ -15,12 +15,11 @@
 //! Discipline: no sleeps, no elapsed-time assertions, no raw clock reads.
 //! Assertions read rows and metadata after a driven exchange.
 
-use contextdb_core::Lsn;
 use contextdb_core::types::ContextId;
-use contextdb_core::{TenantId, Value};
+use contextdb_core::{Lsn, SyncDirection, TenantId, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +27,14 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const TENANT: &str = "direction";
-const HUB_NODE: &str = "hub-node-a";
+const READINGS_PULL_ONLY_DDL: &str =
+    "CREATE TABLE readings (id INTEGER PRIMARY KEY, body TEXT) SYNC PULL ONLY";
+const LOCAL_ONLY_OFF_DDL: &str =
+    "CREATE TABLE local_only (id INTEGER PRIMARY KEY, body TEXT) SYNC OFF";
+const NOTES_TWO_WAY_DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY";
+const UPLOADS_PUSH_ONLY_DDL: &str =
+    "CREATE TABLE uploads (id INTEGER PRIMARY KEY, body TEXT) SYNC PUSH ONLY";
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -79,12 +85,17 @@ impl RunningHub {
 /// holding is exactly what the edge sent it.
 fn start_empty_hub(broker: &InProcessBroker) -> RunningHub {
     let db = Arc::new(Database::open_memory());
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -94,11 +105,14 @@ fn start_empty_hub(broker: &InProcessBroker) -> RunningHub {
     RunningHub { db, shutdown, task }
 }
 
-fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
-    SyncClient::with_transport(
+fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> SyncClient {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&node_id),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -132,10 +146,18 @@ async fn c1d_a_declared_sync_off_table_never_leaves_the_edge() {
         3,
         "the control table proves the push path carried rows"
     );
-    assert!(
-        hub.db.table_meta("local_only").is_none(),
-        "a SYNC OFF table's definition and rows never leave the edge — no runtime \
-         setter was called, the declaration alone decided"
+    assert_eq!(
+        hub.db
+            .table_meta("local_only")
+            .expect("the authenticated hub receives the SYNC OFF declaration")
+            .sync_direction,
+        Some(SyncDirection::None),
+        "the authenticated schema carries the writer's exact SYNC OFF declaration"
+    );
+    assert_eq!(
+        row_count(&hub.db, "local_only"),
+        0,
+        "a SYNC OFF table's declaration travels but its rows never leave the edge"
     );
 
     hub.stop().await;
@@ -170,9 +192,18 @@ async fn c1d_a_declared_pull_only_table_never_leaves_the_edge() {
         3,
         "the control table travelled"
     );
-    assert!(
-        hub.db.table_meta("readings").is_none(),
-        "a PULL ONLY table sends nothing outbound, by declaration alone"
+    assert_eq!(
+        hub.db
+            .table_meta("readings")
+            .expect("the authenticated hub receives the SYNC PULL ONLY declaration")
+            .sync_direction,
+        Some(SyncDirection::Pull),
+        "the authenticated schema carries the writer's exact SYNC PULL ONLY declaration"
+    );
+    assert_eq!(
+        row_count(&hub.db, "readings"),
+        0,
+        "a PULL ONLY table sends its declaration but no rows outbound"
     );
 
     hub.stop().await;
@@ -250,23 +281,26 @@ async fn c1f_a_retained_two_way_definition_is_accepted_by_the_receiving_hub() {
 // the very coupling this change removes and still pass a push-only suite.
 // ---------------------------------------------------------------------------
 
-/// A hub already holding rows, so a pull has something to deliver.
-fn start_hub_holding(broker: &InProcessBroker, tables: &[&str]) -> RunningHub {
+/// A hub already holding rows under the same declaration as its receiving edge,
+/// so a pull has something to deliver without a contradictory hub default.
+fn start_hub_holding(broker: &InProcessBroker, tables: &[(&str, &str)]) -> RunningHub {
     let db = Arc::new(Database::open_memory());
-    for table in tables {
-        db.execute(
-            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, body TEXT)"),
-            &p(),
-        )
-        .unwrap_or_else(|err| panic!("hub table {table} must create: {err}"));
+    for (table, ddl) in tables {
+        db.execute(ddl, &p())
+            .unwrap_or_else(|err| panic!("hub table {table} must create: {err}"));
         insert_rows(&db, table, 1..4);
     }
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -281,19 +315,19 @@ fn start_hub_holding(broker: &InProcessBroker, tables: &[&str]) -> RunningHub {
 #[tokio::test]
 async fn c1d_a_pull_only_table_receives_while_a_sync_off_table_does_not() {
     let broker = InProcessBroker::new();
-    let hub = start_hub_holding(&broker, &["readings", "local_only"]);
+    let hub = start_hub_holding(
+        &broker,
+        &[
+            ("readings", READINGS_PULL_ONLY_DDL),
+            ("local_only", LOCAL_ONLY_OFF_DDL),
+        ],
+    );
 
     let edge = Arc::new(Database::open_memory());
-    edge.execute(
-        "CREATE TABLE readings (id INTEGER PRIMARY KEY, body TEXT) SYNC PULL ONLY",
-        &p(),
-    )
-    .expect("SYNC PULL ONLY must be declarable");
-    edge.execute(
-        "CREATE TABLE local_only (id INTEGER PRIMARY KEY, body TEXT) SYNC OFF",
-        &p(),
-    )
-    .expect("SYNC OFF must be declarable");
+    edge.execute(READINGS_PULL_ONLY_DDL, &p())
+        .expect("SYNC PULL ONLY must be declarable");
+    edge.execute(LOCAL_ONLY_OFF_DDL, &p())
+        .expect("SYNC OFF must be declarable");
 
     let client = edge_client(&edge, &broker, "edge-a");
     within(client.pull_default()).await.expect("edge pull");
@@ -318,19 +352,19 @@ async fn c1d_a_pull_only_table_receives_while_a_sync_off_table_does_not() {
 #[tokio::test]
 async fn c1d_a_two_way_table_receives_while_a_push_only_table_does_not() {
     let broker = InProcessBroker::new();
-    let hub = start_hub_holding(&broker, &["notes", "uploads"]);
+    let hub = start_hub_holding(
+        &broker,
+        &[
+            ("notes", NOTES_TWO_WAY_DDL),
+            ("uploads", UPLOADS_PUSH_ONLY_DDL),
+        ],
+    );
 
     let edge = Arc::new(Database::open_memory());
-    edge.execute(
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY",
-        &p(),
-    )
-    .expect("SYNC TWO WAY must be declarable");
-    edge.execute(
-        "CREATE TABLE uploads (id INTEGER PRIMARY KEY, body TEXT) SYNC PUSH ONLY",
-        &p(),
-    )
-    .expect("SYNC PUSH ONLY must be declarable");
+    edge.execute(NOTES_TWO_WAY_DDL, &p())
+        .expect("SYNC TWO WAY must be declarable");
+    edge.execute(UPLOADS_PUSH_ONLY_DDL, &p())
+        .expect("SYNC PUSH ONLY must be declarable");
 
     let client = edge_client(&edge, &broker, "edge-a");
     within(client.pull_default()).await.expect("edge pull");
@@ -403,10 +437,13 @@ async fn c1g_a_declared_direction_does_not_bypass_tenant_scoping() {
         .expect("SYNC TWO WAY must be declarable");
     insert_rows(&stranger, "notes", 1..4);
 
-    let other_tenant = SyncClient::with_transport(
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let other_tenant = SyncClient::with_authenticated_transport_and_identity_for_test(
         stranger.clone(),
-        broker.client_as("edge-stranger"),
+        broker.client_as(&node_id),
         TenantId::from("other-tenant"),
+        identity,
     );
     // The push may fail outright (nobody is listening for that tenant) or return;
     // either way what matters is what the hub ends up holding.
@@ -560,12 +597,17 @@ async fn a_non_retained_push_only_table_is_suppressed_at_the_server_for_a_fresh_
             .is_none(),
         "fixture: the table declares no retention, so the pre-fix drop skips it",
     );
-    let server = Arc::new(SyncServer::with_transport(
-        hub_db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();

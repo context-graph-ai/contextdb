@@ -1459,7 +1459,7 @@ fn t5_18_event_bus_ddl_full_snapshot_recreates_working_route_on_peer() {
 }
 
 #[test]
-fn t5_19_event_bus_ddl_direction_filter_does_not_emit_orphan_routes() {
+fn t5_19_event_bus_direction_filter_preserves_authenticated_schema_vector() {
     let source = Database::open_memory();
     declare_inv_schema(&source);
     let changes = source.changes_since(Lsn(0));
@@ -1468,21 +1468,13 @@ fn t5_19_event_bus_ddl_direction_filter_does_not_emit_orphan_routes() {
         &HashMap::from([("invalidations".to_string(), SyncDirection::None)]),
         &[SyncDirection::Push, SyncDirection::Both],
     );
-    assert!(
-        filtered_out.ddl.iter().all(|ddl| !matches!(
-            ddl,
-            DdlChange::CreateEventType { .. }
-                | DdlChange::CreateRoute { .. }
-                | DdlChange::DropRoute { .. }
-        )),
-        "excluding the event table must not emit event types or routes without their source table"
+    assert_eq!(
+        filtered_out.ddl, changes.ddl,
+        "row direction filtering must preserve the complete authenticated schema vector"
     );
-    assert!(
-        filtered_out
-            .ddl
-            .iter()
-            .all(|ddl| !matches!(ddl, DdlChange::CreateSink { .. })),
-        "excluding the event table must not leak unrelated sink definitions"
+    assert_eq!(
+        filtered_out.ddl_lsn, changes.ddl_lsn,
+        "row direction filtering must preserve every schema item's paired acceptance position"
     );
     Database::open_memory()
         .apply_changes(
@@ -2916,9 +2908,11 @@ fn t5_37_scoped_handle_register_sink_drop_route_stops_enqueueing_siblings_unaffe
     )
     .unwrap();
 
-    // The ctx_a event delivers to the scoped slack sink and drains — a settled
-    // baseline before removing the route.
-    let pre = wait_drained(&db, "slack");
+    // The ctx_a event must finish its scoped callback before the baseline is
+    // sampled. Queue removal precedes metrics publication, so queue-empty
+    // alone is not a settled delivery observation.
+    wait_delivered(&db, "slack", 1);
+    let pre = db.sink_metrics_for_test("slack");
     let pre_drop_scoped_delivered = pre.delivered;
     assert!(
         pre_drop_scoped_delivered >= 1,
@@ -2941,10 +2935,14 @@ fn t5_37_scoped_handle_register_sink_drop_route_stops_enqueueing_siblings_unaffe
     )
     .unwrap();
 
-    // The sibling audit route is intact, so audit delivers the post-drop event
-    // too and its queue drains — a deterministic terminal. The dropped slack
-    // route enqueues nothing new, so the slack counts below stay pinned.
-    wait_drained(&db, "audit");
+    // The sibling audit route is intact, so audit completes both callbacks.
+    // The dropped slack route enqueues nothing new, so its counts stay pinned.
+    wait_delivered(&db, "audit", 2);
+    assert_eq!(
+        db.sink_metrics_for_test("audit").queued,
+        0,
+        "sibling audit queue must drain after both completed callbacks"
+    );
 
     let post_drop_scoped_delivered = db.sink_metrics_for_test("slack").delivered;
     assert_eq!(

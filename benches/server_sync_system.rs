@@ -2,9 +2,8 @@
 mod common;
 
 use common::process::{run_cli_script, spawn_server, stop_child};
-use common::sync::{start_nats, wait_for_server_ready};
+use common::sync::start_sync_fixture;
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::path::Path;
 use std::process::Child;
@@ -16,7 +15,7 @@ struct PushFixture {
     server_path: std::path::PathBuf,
     edge_path: std::path::PathBuf,
     tenant: String,
-    ws_url: String,
+    ticket: String,
     server: Child,
 }
 
@@ -24,7 +23,7 @@ struct PullFixture {
     _tmp: TempDir,
     fresh_path: std::path::PathBuf,
     tenant: String,
-    ws_url: String,
+    ticket: String,
     server: Child,
 }
 
@@ -32,7 +31,7 @@ struct FanInFixture {
     _tmp: TempDir,
     verify_path: std::path::PathBuf,
     tenant: String,
-    ws_url: String,
+    ticket: String,
     edge_paths: Vec<std::path::PathBuf>,
     scripts: Vec<String>,
     server: Child,
@@ -43,7 +42,7 @@ struct BacklogFixture {
     server_path: std::path::PathBuf,
     edge_path: std::path::PathBuf,
     tenant: String,
-    ws_url: String,
+    ticket: String,
     server: Child,
 }
 
@@ -53,7 +52,9 @@ fn count_rows_from_file(path: &Path, table: &str) -> usize {
 }
 
 fn build_insert_script(count: usize) -> String {
-    let mut script = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from(
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP FIRST\n",
+    );
     for i in 0..count {
         script.push_str(&format!(
             "INSERT INTO items (id, name) VALUES ('{}', 'item-{}')\n",
@@ -89,47 +90,34 @@ fn append_offline_rows(path: &Path, start: usize, count: usize) {
     db.close().expect("close edge db after offline append");
 }
 
-fn setup_push_fixture(
-    rt: &tokio::runtime::Runtime,
-    nats_url: &str,
-    ws_url: &str,
-    policies: &ConflictPolicies,
-) -> PushFixture {
+fn setup_push_fixture(bind_spec: &str, ticket: &str) -> PushFixture {
     let tmp = TempDir::new().unwrap();
     let edge_path = tmp.path().join("edge.db");
     let server_path = tmp.path().join("server.db");
     let tenant = format!("system-push-{}", Uuid::new_v4());
-    let server = spawn_server(&server_path, &tenant, nats_url);
-    rt.block_on(wait_for_server_ready(ws_url, &tenant, policies));
+    let server = spawn_server(&server_path, &tenant, bind_spec);
 
     PushFixture {
         _tmp: tmp,
         server_path,
         edge_path,
         tenant,
-        ws_url: ws_url.to_string(),
+        ticket: ticket.to_string(),
         server,
     }
 }
 
-fn setup_pull_fixture(
-    rt: &tokio::runtime::Runtime,
-    nats_url: &str,
-    ws_url: &str,
-    policies: &ConflictPolicies,
-    count: usize,
-) -> PullFixture {
+fn setup_pull_fixture(bind_spec: &str, ticket: &str, count: usize) -> PullFixture {
     let tmp = TempDir::new().unwrap();
     let source_path = tmp.path().join("source.db");
     let fresh_path = tmp.path().join("fresh.db");
     let server_path = tmp.path().join("server.db");
     let tenant = format!("system-pull-{}", Uuid::new_v4());
-    let server = spawn_server(&server_path, &tenant, nats_url);
-    rt.block_on(wait_for_server_ready(ws_url, &tenant, policies));
+    let server = spawn_server(&server_path, &tenant, bind_spec);
 
     let output = run_cli_script(
         &source_path,
-        &["--tenant-id", &tenant, "--nats-url", ws_url],
+        &["--tenant-id", &tenant, "--sync-endpoint", ticket],
         &build_insert_script(count),
     );
     assert!(output.status.success(), "setup push failed");
@@ -138,23 +126,17 @@ fn setup_pull_fixture(
         _tmp: tmp,
         fresh_path,
         tenant,
-        ws_url: ws_url.to_string(),
+        ticket: ticket.to_string(),
         server,
     }
 }
 
-fn setup_fan_in_fixture(
-    rt: &tokio::runtime::Runtime,
-    nats_url: &str,
-    ws_url: &str,
-    policies: &ConflictPolicies,
-) -> FanInFixture {
+fn setup_fan_in_fixture(bind_spec: &str, ticket: &str) -> FanInFixture {
     let tmp = TempDir::new().unwrap();
     let server_path = tmp.path().join("server.db");
     let verify_path = tmp.path().join("verify.db");
     let tenant = format!("system-fanin-{}", Uuid::new_v4());
-    let server = spawn_server(&server_path, &tenant, nats_url);
-    rt.block_on(wait_for_server_ready(ws_url, &tenant, policies));
+    let server = spawn_server(&server_path, &tenant, bind_spec);
 
     let scripts: Vec<String> = (0..4).map(|_| build_insert_script(50)).collect();
     let edge_paths: Vec<_> = (0..4)
@@ -165,29 +147,23 @@ fn setup_fan_in_fixture(
         _tmp: tmp,
         verify_path,
         tenant,
-        ws_url: ws_url.to_string(),
+        ticket: ticket.to_string(),
         edge_paths,
         scripts,
         server,
     }
 }
 
-fn setup_backlog_fixture(
-    rt: &tokio::runtime::Runtime,
-    nats_url: &str,
-    ws_url: &str,
-    policies: &ConflictPolicies,
-) -> BacklogFixture {
+fn setup_backlog_fixture(bind_spec: &str, ticket: &str) -> BacklogFixture {
     let tmp = TempDir::new().unwrap();
     let edge_path = tmp.path().join("edge.db");
     let server_path = tmp.path().join("server.db");
     let tenant = format!("system-backlog-{}", Uuid::new_v4());
 
-    let mut server = spawn_server(&server_path, &tenant, nats_url);
-    rt.block_on(wait_for_server_ready(ws_url, &tenant, policies));
+    let mut server = spawn_server(&server_path, &tenant, bind_spec);
     let initial = run_cli_script(
         &edge_path,
-        &["--tenant-id", &tenant, "--nats-url", ws_url],
+        &["--tenant-id", &tenant, "--sync-endpoint", ticket],
         &build_insert_script(100),
     );
     assert!(initial.status.success(), "initial push should succeed");
@@ -195,23 +171,21 @@ fn setup_backlog_fixture(
 
     append_offline_rows(&edge_path, 100, 100);
 
-    let server = spawn_server(&server_path, &tenant, nats_url);
-    rt.block_on(wait_for_server_ready(ws_url, &tenant, policies));
+    let server = spawn_server(&server_path, &tenant, bind_spec);
 
     BacklogFixture {
         _tmp: tmp,
         server_path,
         edge_path,
         tenant,
-        ws_url: ws_url.to_string(),
+        ticket: ticket.to_string(),
         server,
     }
 }
 
 fn server_sync_system(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let nats = rt.block_on(start_nats());
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
+    let sync = rt.block_on(start_sync_fixture());
     let mut group = c.benchmark_group("sync_system");
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(5));
@@ -219,15 +193,15 @@ fn server_sync_system(c: &mut Criterion) {
 
     group.bench_function("push_100_rows_single_edge", |b| {
         b.iter_batched(
-            || setup_push_fixture(&rt, &nats.nats_url, &nats.ws_url, &policies),
+            || setup_push_fixture(&sync.bind_spec, &sync.ticket),
             |mut fixture| {
                 let output = run_cli_script(
                     &fixture.edge_path,
                     &[
                         "--tenant-id",
                         &fixture.tenant,
-                        "--nats-url",
-                        &fixture.ws_url,
+                        "--sync-endpoint",
+                        &fixture.ticket,
                     ],
                     &build_insert_script(100),
                 );
@@ -241,12 +215,12 @@ fn server_sync_system(c: &mut Criterion) {
 
     group.bench_function("pull_100_rows_single_edge", |b| {
         b.iter_batched(
-            || setup_pull_fixture(&rt, &nats.nats_url, &nats.ws_url, &policies, 100),
+            || setup_pull_fixture(&sync.bind_spec, &sync.ticket, 100),
             |mut fixture| {
                 let output = run_cli_script(
                     &fixture.fresh_path,
-                    &["--tenant-id", &fixture.tenant, "--nats-url", &fixture.ws_url],
-                    "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n.sync pull\nSELECT count(*) FROM items\n.quit\n",
+                    &["--tenant-id", &fixture.tenant, "--sync-endpoint", &fixture.ticket],
+                    "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP FIRST\n.sync pull\nSELECT count(*) FROM items\n.quit\n",
                 );
                 assert!(output.status.success(), "pull failed");
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -259,7 +233,7 @@ fn server_sync_system(c: &mut Criterion) {
 
     group.bench_function("fan_in_4_edges_x_50_rows", |b| {
         b.iter_batched(
-            || setup_fan_in_fixture(&rt, &nats.nats_url, &nats.ws_url, &policies),
+            || setup_fan_in_fixture(&sync.bind_spec, &sync.ticket),
             |mut fixture| {
                 let handles: Vec<_> = fixture
                     .scripts
@@ -268,12 +242,12 @@ fn server_sync_system(c: &mut Criterion) {
                     .map(|(idx, script)| {
                         let edge_path = fixture.edge_paths[idx].clone();
                         let tenant = fixture.tenant.clone();
-                        let ws_url = fixture.ws_url.clone();
+                        let ticket = fixture.ticket.clone();
                         let script = script.clone();
                         std::thread::spawn(move || {
                             run_cli_script(
                                 &edge_path,
-                                &["--tenant-id", &tenant, "--nats-url", &ws_url],
+                                &["--tenant-id", &tenant, "--sync-endpoint", &ticket],
                                 &script,
                             )
                         })
@@ -287,8 +261,8 @@ fn server_sync_system(c: &mut Criterion) {
 
                 let verify = run_cli_script(
                     &fixture.verify_path,
-                    &["--tenant-id", &fixture.tenant, "--nats-url", &fixture.ws_url],
-                    "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n.sync pull\nSELECT count(*) FROM items\n.quit\n",
+                    &["--tenant-id", &fixture.tenant, "--sync-endpoint", &fixture.ticket],
+                    "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP FIRST\n.sync pull\nSELECT count(*) FROM items\n.quit\n",
                 );
                 assert!(verify.status.success(), "verification pull failed");
                 let stdout = String::from_utf8_lossy(&verify.stdout);
@@ -301,15 +275,15 @@ fn server_sync_system(c: &mut Criterion) {
 
     group.bench_function("backlog_push_after_server_restart_100_rows", |b| {
         b.iter_batched(
-            || setup_backlog_fixture(&rt, &nats.nats_url, &nats.ws_url, &policies),
+            || setup_backlog_fixture(&sync.bind_spec, &sync.ticket),
             |mut fixture| {
                 let output = run_cli_script(
                     &fixture.edge_path,
                     &[
                         "--tenant-id",
                         &fixture.tenant,
-                        "--nats-url",
-                        &fixture.ws_url,
+                        "--sync-endpoint",
+                        &fixture.ticket,
                     ],
                     ".sync push\n.quit\n",
                 );
@@ -322,7 +296,7 @@ fn server_sync_system(c: &mut Criterion) {
     });
 
     group.finish();
-    rt.block_on(async { drop(nats) });
+    drop(sync);
 }
 
 criterion_group!(benches, server_sync_system);

@@ -228,8 +228,7 @@ fn sync_action_without_configuration_exits_one() {
         ".sync push",
         ".sync pull",
         ".sync reconnect",
-        ".sync direction t Push",
-        ".sync policy t ServerWins",
+        ".sync destination replacement-hub",
     ] {
         let script = format!("{subcmd}\n");
         let (code, stdout, stderr) = run_cli(&[], &script);

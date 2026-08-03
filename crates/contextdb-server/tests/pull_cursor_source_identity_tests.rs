@@ -23,17 +23,19 @@
 
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-use contextdb_server::protocol::{MessageType, PullRequest, PullResponse, decode, encode};
+use contextdb_server::protocol::{
+    DependencyCompletePullResponse, MessageType, PullRequest, PullResponse, decode, encode,
+};
 use contextdb_server::subjects::pull_subject;
 use contextdb_server::transport::{ClientTransport, TransportFuture};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-const DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+const DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -109,7 +111,16 @@ async fn raw_pull_response(
             Err(err) => panic!("pull request failed: {err}"),
             Ok(response_bytes) => {
                 let envelope = decode(&response_bytes).expect("decode response envelope");
-                return rmp_serde::from_slice(&envelope.payload).expect("decode pull response");
+                return match envelope.message_type {
+                    MessageType::PullResponse => rmp_serde::from_slice(&envelope.payload)
+                        .expect("decode ordinary pull response"),
+                    MessageType::DependencyCompletePullResponse => {
+                        rmp_serde::from_slice::<DependencyCompletePullResponse>(&envelope.payload)
+                            .expect("decode dependency-complete pull response")
+                            .ordinary
+                    }
+                    other => panic!("raw pull must return a pull response, got {other:?}"),
+                };
             }
         }
     }
@@ -159,16 +170,20 @@ impl HubGen {
 
 fn start_hub_as(
     broker: &InProcessBroker,
-    identity: &str,
+    identity: Arc<FabricIdentity>,
     tenant: &str,
     hub_db: Arc<Database>,
 ) -> HubGen {
-    let server = Arc::new(SyncServer::with_transport(
-        hub_db,
-        broker.server_as(identity),
-        TenantId::from(tenant),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db,
+            broker.server_as(&node_id),
+            TenantId::from(tenant),
+            node_id,
+            identity,
+        ),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -176,6 +191,35 @@ fn start_hub_as(
         async move { server.run_until(stop).await }
     });
     HubGen { stop, task }
+}
+
+fn edge_client_as(
+    db: Arc<Database>,
+    broker: &InProcessBroker,
+    tenant: &str,
+    identity: Arc<FabricIdentity>,
+) -> SyncClient {
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
+        db,
+        broker.client_as(&node_id),
+        TenantId::from(tenant),
+        identity,
+    )
+}
+
+fn edge_client_on_transport(
+    db: Arc<Database>,
+    transport: Arc<dyn ClientTransport>,
+    tenant: &str,
+    identity: Arc<FabricIdentity>,
+) -> SyncClient {
+    SyncClient::with_authenticated_transport_and_identity_for_test(
+        db,
+        transport,
+        TenantId::from(tenant),
+        identity,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -186,19 +230,23 @@ fn start_hub_as(
 async fn a_replaced_serving_store_delivers_its_history_below_the_old_cursor() {
     let broker = InProcessBroker::new();
     let tenant = "source-swap";
-    let identity = "stable-transport-identity";
+    let identity = Arc::new(FabricIdentity::generate());
 
     let hub1_db = Arc::new(Database::open_memory());
     hub1_db.execute(DDL, &p()).expect("hub1 ddl");
     for id in 1..=30 {
         insert_row(&hub1_db, id, &format!("hub1-{id}"));
     }
-    let hub1 = start_hub_as(&broker, identity, tenant, hub1_db);
+    let hub1 = start_hub_as(&broker, identity.clone(), tenant, hub1_db);
 
     let edge_db = Arc::new(Database::open_memory());
     edge_db.execute(DDL, &p()).expect("edge ddl");
-    let edge_client =
-        SyncClient::with_transport(edge_db.clone(), broker.client(), TenantId::from(tenant));
+    let edge_client = edge_client_as(
+        edge_db.clone(),
+        &broker,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    );
     pull_when_hub_is_live(&edge_client)
         .await
         .expect("pull hub1");
@@ -279,7 +327,12 @@ async fn a_page_from_an_unexpected_store_is_discarded_not_applied() {
     for id in 1..=520 {
         insert_row(&hub1_db, id, &format!("hub1-{id}"));
     }
-    let hub1 = start_hub_as(&broker1, "hub1", tenant, hub1_db);
+    let hub1 = start_hub_as(
+        &broker1,
+        Arc::new(FabricIdentity::generate()),
+        tenant,
+        hub1_db,
+    );
 
     let hub2_db = Arc::new(Database::open_memory());
     hub2_db.execute(DDL, &p()).expect("hub2 ddl");
@@ -287,7 +340,12 @@ async fn a_page_from_an_unexpected_store_is_discarded_not_applied() {
         insert_row(&hub2_db, id, &format!("hub2-filler-{id}"));
     }
     insert_row(&hub2_db, 99_999, "only-on-hub2-page2-must-not-apply");
-    let hub2 = start_hub_as(&broker2, "hub2", tenant, hub2_db);
+    let hub2 = start_hub_as(
+        &broker2,
+        Arc::new(FabricIdentity::generate()),
+        tenant,
+        hub2_db,
+    );
 
     // Warm hub2 up on a THROWAWAY client, off a plain (non-redirecting)
     // transport, before wiring the redirect below — so the mid-pull swap's
@@ -295,22 +353,27 @@ async fn a_page_from_an_unexpected_store_is_discarded_not_applied() {
     // hub2's own registration.
     let warmup_db = Arc::new(Database::open_memory());
     warmup_db.execute(DDL, &p()).expect("warmup ddl");
-    let warmup_client =
-        SyncClient::with_transport(warmup_db, broker2.client(), TenantId::from(tenant));
+    let warmup_client = edge_client_as(
+        warmup_db,
+        &broker2,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    );
     pull_when_hub_is_live(&warmup_client)
         .await
         .expect("warm up hub2");
 
     let edge_db = Arc::new(Database::open_memory());
     edge_db.execute(DDL, &p()).expect("edge ddl");
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
     let transport = Arc::new(RedirectSecondPullPage {
-        primary: broker1.client(),
-        secondary: broker2.client(),
+        primary: broker1.client_as(&edge_node_id),
+        secondary: broker2.client_as(&edge_node_id),
         pull_subject: pull_subject(tenant),
         pull_calls: AtomicUsize::new(0),
     });
-    let edge_client =
-        SyncClient::with_transport(edge_db.clone(), transport, TenantId::from(tenant));
+    let edge_client = edge_client_on_transport(edge_db.clone(), transport, tenant, edge_identity);
 
     let pull_result = within(edge_client.pull_default()).await;
 
@@ -363,22 +426,22 @@ async fn a_page_from_an_unexpected_store_is_discarded_not_applied() {
 async fn a_cursor_and_its_store_survive_a_restart_together() {
     let broker = InProcessBroker::new();
     let tenant = "cursor-source-restart";
-    let identity = "restart-hub-identity";
+    let identity = Arc::new(FabricIdentity::generate());
 
     let hub1_db = Arc::new(Database::open_memory());
     hub1_db.execute(DDL, &p()).expect("hub1 ddl");
     for id in 1..=30 {
         insert_row(&hub1_db, id, &format!("hub1-{id}"));
     }
-    let hub1 = start_hub_as(&broker, identity, tenant, hub1_db);
+    let hub1 = start_hub_as(&broker, identity.clone(), tenant, hub1_db);
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let edge_path = dir.path().join("edge.db");
+    let edge_identity = Arc::new(FabricIdentity::generate());
     let old_cursor = {
         let edge_db = Arc::new(Database::open(&edge_path).expect("open edge"));
         edge_db.execute(DDL, &p()).expect("edge ddl");
-        let edge_client =
-            SyncClient::with_transport(edge_db.clone(), broker.client(), TenantId::from(tenant));
+        let edge_client = edge_client_as(edge_db.clone(), &broker, tenant, edge_identity.clone());
         pull_when_hub_is_live(&edge_client)
             .await
             .expect("pull hub1");
@@ -401,8 +464,7 @@ async fn a_cursor_and_its_store_survive_a_restart_together() {
     // persisted cursor must reload bound to the store it addresses, not as
     // a bare number.
     let edge_db2 = Arc::new(Database::open(&edge_path).expect("reopen edge"));
-    let edge_client2 =
-        SyncClient::with_transport(edge_db2.clone(), broker.client(), TenantId::from(tenant));
+    let edge_client2 = edge_client_as(edge_db2.clone(), &broker, tenant, edge_identity);
     assert_eq!(
         edge_client2.pull_watermark(),
         old_cursor,
@@ -432,7 +494,7 @@ async fn a_cursor_and_its_store_survive_a_restart_together() {
 async fn an_edge_repointed_at_a_rebuilt_hub_converges_including_numerically_lower_arrivals() {
     let broker = InProcessBroker::new();
     let tenant = "source-readoption";
-    let identity = "readoption-hub-identity";
+    let identity = Arc::new(FabricIdentity::generate());
 
     let hub1_db = Arc::new(Database::open_memory());
     hub1_db.execute(DDL, &p()).expect("hub1 ddl");
@@ -442,18 +504,18 @@ async fn an_edge_repointed_at_a_rebuilt_hub_converges_including_numerically_lowe
         insert_row(&hub1_db, 2_000 + id, "hub1-filler");
     }
     insert_row(&hub1_db, 42, "store1-value");
-    let hub1 = start_hub_as(&broker, identity, tenant, hub1_db);
+    let hub1 = start_hub_as(&broker, identity.clone(), tenant, hub1_db);
 
     let edge_db = Arc::new(Database::open_memory());
     edge_db.execute(DDL, &p()).expect("edge ddl");
-    let edge_client =
-        SyncClient::with_transport(edge_db.clone(), broker.client(), TenantId::from(tenant));
-    // A client's own default policy is ServerWins (EdgeWins after the pull
-    // remap), which always applies the incoming row unconditionally — that
-    // would pass this test even with no arrival comparison at all. Set
-    // LatestWins explicitly so this test actually exercises the arrival-based
-    // arbitration its own name and doc comment claim to cover.
-    edge_client.set_default_conflict_policy(ConflictPolicy::LatestWins);
+    let edge_client = edge_client_as(
+        edge_db.clone(),
+        &broker,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    );
+    // The durable KEEP LATEST declaration makes this exercise the
+    // arrival-based arbitration its name and contract claim to cover.
     pull_when_hub_is_live(&edge_client)
         .await
         .expect("pull store1");
@@ -519,23 +581,32 @@ async fn a_schema_carrying_page_takes_its_cursor_from_the_schema_position() {
     let tenant = "ddl-only-serve-cursor";
 
     let hub_db = Arc::new(Database::open_memory());
+    let hub = start_hub_as(
+        &broker,
+        Arc::new(FabricIdentity::generate()),
+        tenant,
+        hub_db.clone(),
+    );
+    // The raw inspection request below deliberately has no authenticated node
+    // identity, so the hub does not publish a last-contact row ahead of this
+    // DDL-only response.
+    let before_ddl = hub_db.current_lsn();
     hub_db
         .execute(
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST",
             &p(),
         )
         .expect("ddl");
-    let expected_cursor = hub_db.changes_since(contextdb_core::Lsn(0)).max_lsn();
+    let expected_cursor = hub_db.changes_since(before_ddl).max_lsn();
     assert!(
         expected_cursor.is_some(),
         "fixture: a DDL-only changeset must carry a max_lsn derived from the \
          DDL entry itself"
     );
 
-    let hub = start_hub_as(&broker, "ddl-cursor-hub", tenant, hub_db.clone());
     let transport = broker.client();
     let request = PullRequest {
-        since_lsn: contextdb_core::Lsn(0),
+        since_lsn: before_ddl,
         max_entries: None,
     };
     let response = raw_pull_response(&transport, &pull_subject(tenant), &request).await;
@@ -569,7 +640,7 @@ async fn a_schema_carrying_page_takes_its_cursor_from_the_schema_position() {
 async fn an_edge_repointed_at_a_rebuilt_hub_converges_to_a_value_that_reached_it_by_sync() {
     let broker = InProcessBroker::new();
     let tenant = "source-readoption-via-sync";
-    let identity = "readoption-sync-hub-identity";
+    let identity = Arc::new(FabricIdentity::generate());
 
     let hub1_db = Arc::new(Database::open_memory());
     hub1_db.execute(DDL, &p()).expect("hub1 ddl");
@@ -579,17 +650,18 @@ async fn an_edge_repointed_at_a_rebuilt_hub_converges_to_a_value_that_reached_it
         insert_row(&hub1_db, 2_000 + id, "hub1-filler");
     }
     insert_row(&hub1_db, 42, "hub1-value");
-    let hub1 = start_hub_as(&broker, identity, tenant, hub1_db);
+    let hub1 = start_hub_as(&broker, identity.clone(), tenant, hub1_db);
 
     let edge_y_db = Arc::new(Database::open_memory());
     edge_y_db.execute(DDL, &p()).expect("edge y ddl");
-    let edge_y =
-        SyncClient::with_transport(edge_y_db.clone(), broker.client(), TenantId::from(tenant));
-    // A client's own default policy is ServerWins (EdgeWins after the pull
-    // remap), which always applies the incoming row unconditionally — that
-    // would pass or fail this test for the wrong reason. Set LatestWins
-    // explicitly so this exercises real arrival-based arbitration.
-    edge_y.set_default_conflict_policy(ConflictPolicy::LatestWins);
+    let edge_y = edge_client_as(
+        edge_y_db.clone(),
+        &broker,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    );
+    // The durable KEEP LATEST declaration makes this exercise real
+    // arrival-based arbitration.
     pull_when_hub_is_live(&edge_y).await.expect("pull hub1");
     assert_eq!(
         only_body(&edge_y_db, 42).as_deref(),
@@ -612,8 +684,12 @@ async fn an_edge_repointed_at_a_rebuilt_hub_converges_to_a_value_that_reached_it
     let edge_x_db = Arc::new(Database::open_memory());
     edge_x_db.execute(DDL, &p()).expect("edge x ddl");
     insert_row(&edge_x_db, 42, "edgeX-newer-value");
-    let edge_x =
-        SyncClient::with_transport(edge_x_db.clone(), broker.client(), TenantId::from(tenant));
+    let edge_x = edge_client_as(
+        edge_x_db.clone(),
+        &broker,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    );
     push_when_hub_is_live(&edge_x)
         .await
         .expect("edge x push to hub2");
@@ -655,7 +731,7 @@ async fn an_edge_repointed_at_a_rebuilt_hub_converges_to_a_value_that_reached_it
 async fn a_locally_authored_never_pushed_value_survives_source_readoption() {
     let broker = InProcessBroker::new();
     let tenant = "readoption-preserves-local-edit";
-    let identity = "readoption-local-edit-hub-identity";
+    let identity = Arc::new(FabricIdentity::generate());
 
     let hub1_db = Arc::new(Database::open_memory());
     hub1_db.execute(DDL, &p()).expect("hub1 ddl");
@@ -663,17 +739,18 @@ async fn a_locally_authored_never_pushed_value_survives_source_readoption() {
         insert_row(&hub1_db, 2_000 + id, "hub1-filler");
     }
     insert_row(&hub1_db, 42, "hub1-value");
-    let hub1 = start_hub_as(&broker, identity, tenant, hub1_db);
+    let hub1 = start_hub_as(&broker, identity.clone(), tenant, hub1_db);
 
     let edge_y_db = Arc::new(Database::open_memory());
     edge_y_db.execute(DDL, &p()).expect("edge y ddl");
-    let edge_y =
-        SyncClient::with_transport(edge_y_db.clone(), broker.client(), TenantId::from(tenant));
-    // A client's own default policy is ServerWins (EdgeWins after the pull
-    // remap), which always applies the incoming row unconditionally — that
-    // would pass or fail this test for the wrong reason. Set LatestWins
-    // explicitly so this exercises real arrival-based arbitration.
-    edge_y.set_default_conflict_policy(ConflictPolicy::LatestWins);
+    let edge_y = edge_client_as(
+        edge_y_db.clone(),
+        &broker,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    );
+    // The durable KEEP LATEST declaration makes this exercise real
+    // arrival-based arbitration.
     pull_when_hub_is_live(&edge_y).await.expect("pull hub1");
     assert_eq!(
         only_body(&edge_y_db, 42).as_deref(),
@@ -692,8 +769,12 @@ async fn a_locally_authored_never_pushed_value_survives_source_readoption() {
     let edge_x_db = Arc::new(Database::open_memory());
     edge_x_db.execute(DDL, &p()).expect("edge x ddl");
     insert_row(&edge_x_db, 42, "hub2-inherited-value");
-    let edge_x =
-        SyncClient::with_transport(edge_x_db.clone(), broker.client(), TenantId::from(tenant));
+    let edge_x = edge_client_as(
+        edge_x_db.clone(),
+        &broker,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    );
     push_when_hub_is_live(&edge_x)
         .await
         .expect("edge x push to hub2");
@@ -774,7 +855,7 @@ impl ClientTransport for BlankSourceInPullResponse {
 async fn a_bound_cursor_pull_refuses_when_response_carries_no_source_identity() {
     let broker = InProcessBroker::new();
     let tenant = "bound-cursor-missing-source";
-    let identity = "stable-identity";
+    let identity = Arc::new(FabricIdentity::generate());
 
     let hub_db = Arc::new(Database::open_memory());
     hub_db.execute(DDL, &p()).expect("hub ddl");
@@ -785,11 +866,11 @@ async fn a_bound_cursor_pull_refuses_when_response_carries_no_source_identity() 
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let edge_path = dir.path().join("edge.db");
+    let edge_identity = Arc::new(FabricIdentity::generate());
     let initial_cursor = {
         let edge_db = Arc::new(Database::open(&edge_path).expect("open edge"));
         edge_db.execute(DDL, &p()).expect("edge ddl");
-        let edge_client =
-            SyncClient::with_transport(edge_db.clone(), broker.client(), TenantId::from(tenant));
+        let edge_client = edge_client_as(edge_db.clone(), &broker, tenant, edge_identity.clone());
 
         // First pull establishes a source-bound cursor
         pull_when_hub_is_live(&edge_client)
@@ -806,13 +887,14 @@ async fn a_bound_cursor_pull_refuses_when_response_carries_no_source_identity() 
     // Reopen the database to reload the persisted cursor, then use a transport
     // that blanks the source in responses. The new client will load the cursor
     // from the database, making it bound to the original hub's source.
+    let edge_node_id = edge_identity.node_id();
     let blanking_transport = Arc::new(BlankSourceInPullResponse {
-        inner: broker.client(),
+        inner: broker.client_as(&edge_node_id),
         pull_subject: pull_subject(tenant),
     });
     let edge_db2 = Arc::new(Database::open(&edge_path).expect("reopen edge"));
     let edge_client_blanked =
-        SyncClient::with_transport(edge_db2.clone(), blanking_transport, TenantId::from(tenant));
+        edge_client_on_transport(edge_db2.clone(), blanking_transport, tenant, edge_identity);
 
     // Verify the new client loaded the same cursor
     assert_eq!(

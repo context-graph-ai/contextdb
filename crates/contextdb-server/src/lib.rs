@@ -15,23 +15,35 @@
 //! server are built with a database handle, an endpoint, and a `TenantId`.
 
 #[cfg(feature = "iroh")]
-pub mod blob_resolver;
+pub mod blob_resolver {
+    pub use contextdb_engine::blob_store::{
+        BlobFetchPolicy, BlobStore, ClaimRefreshHook, ResolveError,
+    };
+}
 pub mod chunking;
-pub mod error;
+pub use contextdb_engine::error;
 pub mod exit_codes;
-pub mod identity;
-pub mod protocol;
-pub mod subjects;
-pub mod sync_client;
+pub use contextdb_engine::identity;
+pub use contextdb_engine::protocol;
+pub use contextdb_engine::subjects;
+pub mod sync_client {
+    pub use contextdb_engine::sync_client::*;
+}
 pub mod sync_plugin;
-pub mod sync_server;
-pub mod transfer_receipts;
-pub mod transport;
+pub mod sync_server {
+    pub use contextdb_engine::sync_server::*;
+}
+pub mod transfer_receipts {
+    pub use contextdb_engine::transfer_receipts::*;
+}
+pub mod transport {
+    pub use contextdb_engine::transport::*;
+}
 pub mod work_ledger;
 
 #[cfg(feature = "iroh")]
 pub use blob_resolver::{BlobStore, ResolveError};
-pub use identity::FabricIdentity;
+pub use contextdb_engine::FabricIdentity;
 pub use sync_client::SyncClient;
 #[doc(hidden)]
 pub use sync_client::{acceptance_stamped_push_batches_for_test, split_changeset_for_test};
@@ -41,13 +53,7 @@ pub use sync_server::SyncServer;
 /// worker/claim/push surface can spin a runtime without taking its own direct `tokio` dependency.
 pub use tokio;
 pub use transfer_receipts::{TransferCounters, TransferDirection, TransferPlane, TransferReceipt};
-// Crate-root wiring only: lets blob_resolver.rs reach the fetch-backend
-// adapter without spelling a `transport::`-prefixed path (its containment
-// contract permits exactly one, the sanctioned `IrohServer` import) or the
-// backend's own name. The alias itself is established inside
-// transport/mod.rs, a file physically under the adapter boundary.
-#[cfg(feature = "iroh")]
-pub(crate) use transport::adapter;
+#[cfg(any(test, feature = "test-seams"))]
 pub use transport::in_process::InProcessBroker;
 // Transport-neutral peer endpoint surface for embedding consumers (e.g.
 // a downstream fabric runtime): a consumer names `PeerEndpoint` / `PeerEndpointSpec`

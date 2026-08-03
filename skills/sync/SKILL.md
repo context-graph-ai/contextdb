@@ -187,39 +187,34 @@ sync error is `1`, an unconfirmed push is `3`, success is `0`.
 
 Two independent axes, both per table.
 
-**Direction** (case-insensitive) — what flows where:
+**Direction** — declare what flows where in table DDL:
 
 | | |
 |---|---|
-| `Both` | bidirectional (default) |
-| `Push` | local writes replicate up; remote changes ignored |
-| `Pull` | remote changes applied locally; local writes not pushed |
-| `None` | table excluded from sync entirely |
+| `SYNC TWO WAY` | bidirectional (default) |
+| `SYNC PUSH ONLY` | local writes replicate up; remote changes ignored |
+| `SYNC PULL ONLY` | remote changes applied locally; local writes not pushed |
+| `SYNC OFF` | table excluded from sync entirely |
 
-**Conflict policy** (case-sensitive) — who wins a genuine divergence:
+**Conflict policy** — declare who wins a genuine divergence:
 
 | | |
 |---|---|
-| `LatestWins` | most recent write by **logical timestamp** (default) |
-| `ServerWins` | hub version takes precedence |
-| `EdgeWins` | edge version takes precedence |
-| `InsertIfNotExists` | insert if absent, skip otherwise — the right choice for append-only/immutable tables |
+| `SYNC CONFLICT KEEP FIRST` | the hub's first accepted value remains (default) |
+| `SYNC CONFLICT KEEP LATEST` | the later accepted value replaces it |
 
 ```bash
 contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
-CREATE TABLE audit_log (id UUID PRIMARY KEY, entry TEXT) IMMUTABLE;
-.sync direction audit_log None
-.sync policy items InsertIfNotExists
-.sync policy default LatestWins
+CREATE TABLE audit_log (id UUID PRIMARY KEY, entry TEXT) IMMUTABLE SYNC OFF;
+CREATE TABLE items (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST;
 SQL
 ```
 
-Note `LatestWins` orders by log sequence, not wall clock. Pick policy by table *class*: immutable /
-append-only tables want `InsertIfNotExists`; status rows that are a state machine want a
-deterministic total order (`ServerWins`).
+`KEEP LATEST` orders by the hub's accepted sequence, not wall clock. Immutable or append-only
+tables usually declare `KEEP FIRST`; current-truth rows may declare `KEEP LATEST`.
 
 **A table that also declares `HISTORY CURRENT ONLY` needs `SYNC CONFLICT KEEP LATEST`
-(`LatestWins`) if it delivers anywhere** (`Push` or the default `Both`). `HISTORY CURRENT ONLY`
+if it delivers anywhere. `HISTORY CURRENT ONLY`
 reclaims superseded versions, so the only value left to send is the newest one — a puller under
 `KEEP FIRST` (the DDL default) would file that newest value as the FIRST value it has ever seen for
 the key. Declare `SYNC CONFLICT KEEP LATEST` for a current-truth table, or `SYNC OFF` if it never
@@ -260,9 +255,7 @@ contextdb ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=$TICKET&lookup=md
 others (`mdns` — needs `--features mdns` — `n0`, `dns:<origin>`, or a relay URL). By default
 nothing is published anywhere and dialing uses exactly the addresses the ticket carries.
 
-A typo in an endpoint spec errors loudly and names the accepted parameters rather than falling
-through to the deprecated NATS broker path (which survives only behind the `nats` cargo feature and
-is not on the default path).
+A typo in an endpoint spec errors loudly and names the accepted parameters.
 
 ## Depth
 

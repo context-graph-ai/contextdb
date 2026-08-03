@@ -43,8 +43,23 @@ pub(super) enum TriggerContention {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TriggerPersistenceCommit {
-    pub(crate) config_values: Vec<(&'static str, Vec<u8>)>,
+    pub(crate) config_values: Vec<(String, Vec<u8>)>,
     pub(crate) ddl: Vec<DdlChange>,
+    pub(crate) generation_sidecars: Vec<super::DurableDdlGenerationSidecar>,
+    pub(crate) start_ordinal: u32,
+}
+
+/// Trigger declarations and encoded config prepared before the received
+/// schema transaction becomes durable.  Only this module may inspect the
+/// declaration map; callers can persist `config_values` and later hand the
+/// opaque value back for infallible publication.
+#[derive(Clone)]
+pub(crate) struct PreparedTriggerPublication {
+    declarations: BTreeMap<String, TriggerDeclaration>,
+    callbacks: HashMap<String, TriggerCallback>,
+    active_trigger_names: Vec<String>,
+    ready: bool,
+    pub(crate) config_values: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +188,7 @@ impl TriggerState {
         self.callback_active_txs.lock().contains_key(&tx)
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub(super) fn owner_thread_count(&self) -> usize {
         self.callback_owner_threads.lock().len()
     }
@@ -221,6 +237,23 @@ impl TriggerState {
             })
             .collect::<Vec<_>>();
         self.staged_persistence_audits.lock().insert(lsn, indexed);
+    }
+
+    /// Reserve audit indexes without mutating the live counter.  Received
+    /// schema work can still be abandoned after preparation, so its ids only
+    /// become visible during the post-durability publication.
+    pub(crate) fn prepare_received_persistence_audits(
+        &self,
+        entries: &[TriggerAuditEntry],
+    ) -> (Vec<(u64, TriggerAuditEntry)>, u64) {
+        let first = self.next_audit_index.load(Ordering::SeqCst);
+        let indexed = entries
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(offset, entry)| (first.saturating_add(offset as u64), entry))
+            .collect::<Vec<_>>();
+        (indexed, first.saturating_add(entries.len() as u64))
     }
 
     pub(crate) fn take_staged_persistence_audits(&self, lsn: Lsn) -> Vec<(u64, TriggerAuditEntry)> {
@@ -392,6 +425,71 @@ impl Database {
             });
         }
         Ok(())
+    }
+
+    /// Validate and encode a received trigger projection using the projected
+    /// table state supplied by the source-order schema planner.  This performs
+    /// every fallible parse/definition check before durable publication.
+    #[allow(dead_code)] // consumed when Phase B joins the staged Redb transaction
+    pub(super) fn prepare_received_trigger_publication(
+        &self,
+        ddl: &[DdlChange],
+        projected_tables: &HashMap<String, TableMeta>,
+    ) -> Result<PreparedTriggerPublication> {
+        let mut declarations = self.trigger.declarations.lock().clone();
+        for change in ddl {
+            self.apply_sync_trigger_ddl_to_projection(&mut declarations, change, projected_tables)?;
+        }
+        self.prepare_received_trigger_publication_from_projection(declarations)
+    }
+
+    pub(super) fn prepare_received_trigger_publication_from_projection(
+        &self,
+        declarations: BTreeMap<String, TriggerDeclaration>,
+    ) -> Result<PreparedTriggerPublication> {
+        let config_values = Self::encoded_trigger_config_values(&declarations)?
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+        let current_names = self
+            .trigger
+            .declarations
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let projected_names = declarations.keys().cloned().collect::<HashSet<_>>();
+        let mut callbacks = self.trigger.callbacks.read().clone();
+        callbacks.retain(|name, _| projected_names.contains(name));
+        let mut active_trigger_names = self.trigger.active_trigger_names.lock().clone();
+        active_trigger_names.retain(|name| projected_names.contains(name));
+        let adds_trigger = projected_names
+            .iter()
+            .any(|name| !current_names.contains(name));
+        let ready = projected_names.is_empty()
+            || (self.trigger.ready.load(Ordering::SeqCst) && !adds_trigger);
+        Ok(PreparedTriggerPublication {
+            declarations,
+            callbacks,
+            active_trigger_names,
+            ready,
+            config_values,
+        })
+    }
+
+    /// Publish a trigger declaration map that was completely validated and
+    /// encoded before Redb committed.  The post-durability path is deliberately
+    /// infallible.
+    pub(super) fn publish_prepared_trigger_publication(
+        &self,
+        publication: PreparedTriggerPublication,
+    ) {
+        *self.trigger.declarations.lock() = publication.declarations;
+        *self.trigger.callbacks.write() = publication.callbacks;
+        *self.trigger.active_trigger_names.lock() = publication.active_trigger_names;
+        self.trigger
+            .ready
+            .store(publication.ready, Ordering::SeqCst);
     }
 
     pub(super) fn apply_trigger_ddl_from_user(&self, ddl: DdlChange) -> Result<()> {
@@ -629,11 +727,24 @@ impl Database {
                 return Ok(None);
             }
             if let Some(persistence) = &self.persistence {
+                let mut config_values: Vec<(&str, Vec<u8>)> =
+                    Self::encoded_trigger_config_values(&projected)?
+                        .into_iter()
+                        .map(|(key, value)| (key as &str, value))
+                        .collect();
+                let provenance_values = self.ddl_generation_sidecar_values(lsn, &ddl, 0)?;
+                config_values.extend(
+                    provenance_values
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.clone())),
+                );
                 persistence.flush_encoded_config_values_and_append_ddl_log(
-                    Self::encoded_trigger_config_values(&projected)?,
+                    config_values,
                     lsn,
                     &ddl,
                 )?;
+            } else {
+                self.record_ddl_generation_sidecars(lsn, &ddl)?;
             }
             if current != projected {
                 self.apply_trigger_declarations_to_memory(projected);
@@ -1376,7 +1487,12 @@ impl Database {
         self.trigger.discard_staged_persistence_audits(lsn);
     }
 
-    pub(super) fn stage_trigger_ddl_for_commit(&self, lsn: Lsn, ddl: &[DdlChange]) -> Result<()> {
+    pub(super) fn stage_trigger_ddl_for_commit(
+        &self,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        start_ordinal: u32,
+    ) -> Result<()> {
         if ddl.is_empty() {
             return Ok(());
         }
@@ -1386,9 +1502,25 @@ impl Database {
         if current == projected && !transient_lifecycle {
             return Ok(());
         }
+        let mut config_values: Vec<(String, Vec<u8>)> =
+            Self::encoded_trigger_config_values(&projected)?
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect();
+        // The caller reserves the event-bus prefix because persistence
+        // concatenates event-bus DDL before trigger DDL at this commit LSN.
+        let generation_sidecars = self.ddl_generation_sidecars(ddl)?;
+        let provenance_values = self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal)?;
+        config_values.extend(
+            provenance_values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         let persistence = TriggerPersistenceCommit {
-            config_values: Self::encoded_trigger_config_values(&projected)?,
+            config_values,
             ddl: ddl.to_vec(),
+            generation_sidecars,
+            start_ordinal,
         };
         self.trigger
             .stage_trigger_ddl_commit(lsn, projected, persistence);
@@ -1409,6 +1541,11 @@ impl Database {
     pub(super) fn publish_staged_trigger_ddl_commit(&self, lsn: Lsn) {
         let staged = self.trigger.staged_ddl_for_persistence.lock().remove(&lsn);
         if let Some(staged) = staged {
+            self.publish_in_memory_ddl_generation_sidecars(
+                lsn,
+                staged.persistence.start_ordinal,
+                &staged.persistence.generation_sidecars,
+            );
             self.apply_trigger_declarations_to_memory(staged.declarations);
             self.ddl_log.write().extend(
                 staged
@@ -1465,6 +1602,12 @@ impl Database {
         if let Some(event_bus_values) = self.event_bus_config_values_without_table(table)? {
             config_values.extend(event_bus_values);
         }
+        let provenance_values = self.ddl_generation_sidecar_values(lsn, &ddl, 0)?;
+        config_values.extend(
+            provenance_values
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.clone())),
+        );
         let graph_edges = self.graph_edges_after_table_drop(table);
         let vectors = self.vector_entries_after_table_drop(table);
         if let Some(persistence) = &self.persistence {
@@ -1476,6 +1619,8 @@ impl Database {
                 &graph_edges,
                 &vectors,
             )?;
+        } else {
+            self.record_ddl_generation_sidecars(lsn, &ddl)?;
         }
         self.drop_table_aux_state(table);
         self.remove_rank_formulas_for_table(table);
@@ -1495,6 +1640,19 @@ impl Database {
         for entry in entries {
             self.append_trigger_audit_to_memory(entry);
         }
+    }
+
+    pub(super) fn publish_received_trigger_audits(
+        &self,
+        entries: Vec<(u64, TriggerAuditEntry)>,
+        next_audit_index: u64,
+    ) {
+        for (_, entry) in entries {
+            self.append_trigger_audit_to_memory(entry);
+        }
+        self.trigger
+            .next_audit_index
+            .fetch_max(next_audit_index, Ordering::SeqCst);
     }
 
     pub(super) fn append_rolled_back_trigger_audits(
@@ -1531,20 +1689,19 @@ impl Database {
     }
 
     fn append_trigger_audit_to_memory(&self, entry: TriggerAuditEntry) {
+        let volatile_entry = self.persistence.is_none().then(|| entry.clone());
         {
             let mut ring = self.trigger.audit_ring.lock();
             if ring.len() == TRIGGER_AUDIT_RING_CAPACITY {
                 ring.pop_front();
             }
-            ring.push_back(entry.clone());
+            ring.push_back(entry);
         }
-        {
-            if self.persistence.is_none() {
-                self.trigger
-                    .volatile_audit_history
-                    .lock()
-                    .push((Wallclock::now(), entry));
-            }
+        if let Some(entry) = volatile_entry {
+            self.trigger
+                .volatile_audit_history
+                .lock()
+                .push((Wallclock::now(), entry));
         }
     }
 

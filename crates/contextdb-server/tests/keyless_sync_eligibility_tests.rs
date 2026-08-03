@@ -17,16 +17,13 @@
 
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 const TENANT: &str = "keyless-eligibility";
-const HUB_NODE: &str = "hub-b6b";
-
 /// A table with neither a declared PRIMARY KEY nor a column literally named
 /// `id` — `natural_key_columns_for_meta` resolves to `None` for it. Default
 /// sync direction (no `SYNC` clause) is `Both`, i.e. it WOULD sync.
@@ -106,12 +103,17 @@ fn start_hub(broker: &InProcessBroker, ddl: &[&str]) -> RunningHub {
     for stmt in ddl {
         db.execute(stmt, &p()).expect("hub table");
     }
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -129,11 +131,14 @@ fn open_edge(ddl: &[&str]) -> Arc<Database> {
     db
 }
 
-fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
-    SyncClient::with_transport(
+fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> SyncClient {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&node_id),
         TenantId::from(TENANT),
+        identity,
     )
 }
 

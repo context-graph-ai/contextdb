@@ -243,11 +243,15 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                 write_set: Some(Box::new(ws)),
             });
         }
+        // Publish engine-owned sidecars and derived state before the MVCC
+        // watermark makes the applied rows visible to a fresh snapshot. A
+        // reader that can see a row must also be able to see the creation and
+        // delete evidence published for the same commit.
+        after_apply(lsn, &ws);
         self.commit_index.lock().insert(lsn, visibility_tx);
         self.committed_watermark
             .fetch_max(visibility_tx, Ordering::SeqCst);
         self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
-        after_apply(lsn, &ws);
         Ok((lsn, ws))
     }
 
@@ -259,7 +263,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         after_apply: impl FnOnce(Lsn, &WriteSet),
     ) -> std::result::Result<(Lsn, WriteSet), CommitFailure>
     where
-        F: FnOnce(Lsn) -> Result<()>,
+        F: FnOnce(Lsn, TxId) -> Result<()>,
         G: FnOnce(&mut WriteSet) -> Result<()>,
     {
         let _lock = self.commit_mutex.lock();
@@ -289,7 +293,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
             ws.stamp_lsn(lsn);
         }
 
-        if let Err(error) = active_prepare(lsn) {
+        if let Err(error) = active_prepare(lsn, visibility_tx) {
             self.next_lsn.store(lsn, Ordering::SeqCst);
             let write_set = self.active_txs.lock().remove(&tx).map(Box::new);
             return Err(CommitFailure { error, write_set });
@@ -321,11 +325,14 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
                 write_set: Some(Box::new(ws)),
             });
         }
+        // Keep applied storage private until its after-apply publication is
+        // complete. This is the atomic visibility boundary for engine-owned
+        // sidecars that are not part of the generic store.
+        after_apply(lsn, &ws);
         self.commit_index.lock().insert(lsn, visibility_tx);
         self.committed_watermark
             .fetch_max(visibility_tx, Ordering::SeqCst);
         self.committed_lsn.fetch_max(lsn, Ordering::SeqCst);
-        after_apply(lsn, &ws);
         Ok((lsn, ws))
     }
 

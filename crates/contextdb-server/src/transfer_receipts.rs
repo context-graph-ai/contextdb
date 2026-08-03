@@ -20,52 +20,12 @@
 //!   `SyncClient` / `SyncServer` / `BlobStore` that owns them. The engine
 //!   persists none of this, so a fresh handle starts from zero.
 
+pub use contextdb_engine::transfer_receipts::{
+    TransferCounters, TransferDirection, TransferPlane, TransferReceipt,
+};
+
 use std::collections::HashMap;
 use std::sync::Mutex;
-
-/// Which data plane a transfer crossed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransferPlane {
-    /// The sync plane: changesets between an edge and its hub.
-    Sync,
-    /// The blob plane: content-addressed media between two nodes.
-    Blob,
-}
-
-/// Which way the bytes went, from the perspective of the node holding the
-/// receipt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransferDirection {
-    Sent,
-    Received,
-}
-
-/// What MOVED — not what was kept. `items` counts rows (sync) or blobs (blob
-/// plane) that crossed the wire: the ones this end put on it for `Sent`, and the
-/// ones it took off it for `Received`. A received row that the conflict policy
-/// then skipped still moved, so it is still counted; these are transfer
-/// counters, and an application asking "what did this node ship" is asking about
-/// the wire, not about the outcome of applying it.
-///
-/// `payload_bytes` counts the payload those same items carried, with transport
-/// and encryption overhead excluded (see the module docs). Both figures are
-/// always drawn from the same row set, so they can be divided into each other.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TransferCounters {
-    pub items: u64,
-    pub payload_bytes: u64,
-}
-
-/// One peer, one plane, one direction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransferReceipt {
-    /// The peer's transport-authenticated node id. Non-optional on purpose:
-    /// receipts exist only for peers the transport actually authenticated.
-    pub peer_node_id: String,
-    pub plane: TransferPlane,
-    pub direction: TransferDirection,
-    pub counters: TransferCounters,
-}
 
 type ReceiptKey = (String, TransferPlane, TransferDirection);
 

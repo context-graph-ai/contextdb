@@ -1,6 +1,5 @@
 use clap::Parser;
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::ConflictPolicies;
 use contextdb_server::SyncServer;
 use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_USAGE};
 use contextdb_server::protocol::PROTOCOL_VERSION;
@@ -54,10 +53,6 @@ struct Args {
     /// a relay. When omitted, an identity next to the database file is used.
     #[arg(long, env = "CONTEXTDB_SYNC_ENDPOINT")]
     sync_endpoint: Option<String>,
-    /// DEPRECATED: broker URL for the retained NATS adapter (requires the
-    /// `nats` cargo feature). Use --sync-endpoint instead.
-    #[arg(long, env = "CONTEXTDB_NATS_URL")]
-    nats_url: Option<String>,
     #[arg(long, env = "CONTEXTDB_TENANT_ID")]
     tenant_id: String,
     /// Write the endpoint's enrollment ticket to this file once bound, so
@@ -123,40 +118,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "contextdb-server starting"
     );
 
-    let endpoint_spec = match (&args.sync_endpoint, &args.nats_url) {
-        (Some(spec), _) => spec.clone(),
-        (None, Some(broker_url)) => {
-            tracing::warn!(
-                "--nats-url is deprecated; the NATS adapter is retained off-default only. \
-                 Use --sync-endpoint."
-            );
-            broker_url.clone()
-        }
-        (None, None) => default_endpoint_spec(&args.db_path),
-    };
+    let endpoint_spec = args
+        .sync_endpoint
+        .clone()
+        .unwrap_or_else(|| default_endpoint_spec(&args.db_path));
 
-    // Whether this endpoint is one this build can bind and serve. Decided
-    // BEFORE the database is opened, because the flag combinations it rules out
-    // are usage errors, and exit 2 promises that nothing was attempted — which
-    // has to include not creating a database file on a fresh path for a command
-    // that was never going to run.
-    let binds_sync_endpoint = EndpointSpec::parse(&endpoint_spec).is_some();
-    if !binds_sync_endpoint {
-        if args.show_ticket || args.ticket_file.is_some() {
-            return Err(UsageError(
-                "tickets exist only for sync endpoints, not broker URLs".to_string(),
-            )
-            .into());
-        }
-        #[cfg(not(feature = "nats"))]
-        {
-            return Err(UsageError(format!(
-                "{endpoint_spec} is a broker URL, but this build carries no deprecated NATS \
-                 adapter; pass a sync-endpoint ticket/spec, or rebuild with the `nats` cargo \
-                 feature"
-            ))
-            .into());
-        }
+    // Validate the bind specification before opening the database. Exit 2
+    // promises that an invalid invocation creates no database file.
+    if EndpointSpec::parse(&endpoint_spec).is_none() {
+        return Err(UsageError(format!(
+            "invalid --sync-endpoint bind specification: {endpoint_spec}"
+        ))
+        .into());
     }
 
     let db = if args.db_path == ":memory:" {
@@ -164,85 +137,56 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Arc::new(Database::open(std::path::Path::new(&args.db_path))?)
     };
-    // The hub honors each table's DECLARED conflict policy (carried on its
-    // meta); this uniform default only decides a table that declared none, and
-    // it is the engine's non-overwriting default, agreeing with Database::open.
-    let policies = ConflictPolicies::uniform(contextdb_core::DEFAULT_CONFLICT_POLICY);
-
-    // For a dial-by-key endpoint, bind eagerly so the enrollment ticket is
+    // Bind eagerly so the enrollment ticket is
     // available up front (logged, and written to --ticket-file when asked).
-    let server = if binds_sync_endpoint {
-        let endpoint = IrohServer::bind(&endpoint_spec).await?;
-        let ticket = endpoint.ticket();
-        tracing::info!(
-            ticket = %ticket,
-            node_id = %endpoint.node_id(),
-            "sync endpoint bound; enroll edges with this ticket"
+    let endpoint = IrohServer::bind(&endpoint_spec).await?;
+    let ticket = endpoint.ticket();
+    tracing::info!(
+        ticket = %ticket,
+        node_id = %endpoint.node_id(),
+        "sync endpoint bound; enroll edges with this ticket"
+    );
+    if let Some(path) = &args.ticket_file {
+        std::fs::write(path, &ticket)?;
+    }
+    let dial_command = format!(
+        "contextdb <client-db-path> --sync-endpoint {ticket} --tenant-id {}",
+        args.tenant_id
+    );
+    if args.json {
+        // Machine channel: one stable JSON object carrying the ticket and
+        // the exact dial command so an agent can enroll a machine without
+        // scraping human text.
+        let obj = serde_json::json!({
+            "enrollment_ticket": ticket.to_string(),
+            "tenant_id": args.tenant_id,
+            "dial_command": dial_command,
+            "endpoint": endpoint.node_id().to_string(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&obj).expect("serialize enrollment object")
         );
-        if let Some(path) = &args.ticket_file {
-            std::fs::write(path, &ticket)?;
-        }
-        let dial_command = format!(
-            "contextdb <client-db-path> --sync-endpoint {ticket} --tenant-id {}",
-            args.tenant_id
-        );
-        if args.json {
-            // Machine channel: one stable JSON object carrying the ticket and
-            // the exact dial command so an agent can enroll a machine without
-            // scraping human text.
-            let obj = serde_json::json!({
-                "enrollment_ticket": ticket.to_string(),
-                "tenant_id": args.tenant_id,
-                "dial_command": dial_command,
-                "endpoint": endpoint.node_id().to_string(),
-            });
-            println!(
-                "{}",
-                serde_json::to_string(&obj).expect("serialize enrollment object")
-            );
-        } else if args.show_ticket {
-            // Bare ticket on stdout: script-friendly capture (non-JSON).
-            println!("{ticket}");
-        } else {
-            // The enrollment ticket is product surface, not logging: print it
-            // unconditionally so the documented "copy the ticket" flow works at
-            // any log level.
-            println!("enrollment ticket: {ticket}");
-            println!("To connect a client, run:");
-            println!("  {dial_command}");
-        }
-        if args.show_ticket {
-            endpoint.close().await;
-            return Ok(());
-        }
-        SyncServer::with_transport(
-            db,
-            endpoint.transport(),
-            contextdb_core::TenantId::from(args.tenant_id.as_str()),
-            policies,
-        )
+    } else if args.show_ticket {
+        // Bare ticket on stdout: script-friendly capture (non-JSON).
+        println!("{ticket}");
     } else {
-        // The ticket-flag and build-support checks already ran, above the
-        // database open.
-        if args.json {
-            eprintln!(
-                "Note: --json emits nothing for a broker URL — it carries no enrollment ticket; use a sync endpoint."
-            );
-        }
-        #[cfg(not(feature = "nats"))]
-        {
-            unreachable!(
-                "a broker URL is refused before the database is opened when this build carries no NATS adapter"
-            )
-        }
-        #[cfg(feature = "nats")]
-        SyncServer::new(
-            db,
-            &endpoint_spec,
-            contextdb_core::TenantId::from(args.tenant_id.as_str()),
-            policies,
-        )
-    };
+        // The enrollment ticket is product surface, not logging: print it
+        // unconditionally so the documented "copy the ticket" flow works at
+        // any log level.
+        println!("enrollment ticket: {ticket}");
+        println!("To connect a client, run:");
+        println!("  {dial_command}");
+    }
+    if args.show_ticket {
+        endpoint.close().await;
+        return Ok(());
+    }
+    let server = SyncServer::new(
+        db,
+        &endpoint,
+        contextdb_core::TenantId::from(args.tenant_id.as_str()),
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = shutdown.clone();

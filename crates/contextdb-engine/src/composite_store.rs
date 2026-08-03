@@ -1,3 +1,4 @@
+use crate::memory_accounting::MemoryAccountant;
 use crate::sync_types::{DdlChange, NaturalKey, natural_key_from_row_values};
 use contextdb_core::{
     EdgeType, Lsn, NodeId, Result, RowId, TableMeta, TableName, Value, VectorIndexRef, VersionedRow,
@@ -111,6 +112,118 @@ impl ChangeLogEntry {
     }
 }
 
+/// Build the exact log payload for a received-schema stage while its detached
+/// projection is still available.  Redb and post-commit memory publication
+/// both consume this owned vector; neither may rediscover it from live state.
+pub(crate) fn build_received_schema_change_log_entries(
+    ws: &WriteSet,
+    table_meta: &HashMap<String, TableMeta>,
+    deleted_rows: &HashMap<String, HashMap<RowId, VersionedRow>>,
+    structurally_dropped_tables: &HashSet<String>,
+) -> Vec<ChangeLogEntry> {
+    let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+    let mut entries = Vec::new();
+    for (table, row) in &ws.relational_inserts {
+        entries.push(ChangeLogEntry::RowInsert {
+            table: table.clone(),
+            row_id: row.row_id,
+            lsn,
+        });
+    }
+    for (table, row_id, _) in &ws.relational_deletes {
+        // A received DROP TABLE removes this row as part of the old table
+        // generation's structure, not as a user-requested row deletion. Do
+        // not manufacture outbound row history that the new generation
+        // cannot authenticate.
+        if structurally_dropped_tables.contains(table) {
+            continue;
+        }
+        let natural_key = deleted_rows
+            .get(table)
+            .and_then(|rows| rows.get(row_id))
+            .and_then(|row| {
+                table_meta
+                    .get(table)
+                    .and_then(|meta| natural_key_from_row_values(meta, &row.values))
+            })
+            .unwrap_or_else(|| NaturalKey::single("id".to_string(), Value::Int64(row_id.0 as i64)));
+        entries.push(ChangeLogEntry::RowDelete {
+            table: table.clone(),
+            row_id: *row_id,
+            natural_key,
+            lsn,
+        });
+    }
+    for entry in &ws.adj_inserts {
+        entries.push(ChangeLogEntry::EdgeInsert {
+            source: entry.source,
+            target: entry.target,
+            edge_type: entry.edge_type.clone(),
+            lsn,
+        });
+    }
+    for (source, edge_type, target, _) in &ws.adj_deletes {
+        entries.push(ChangeLogEntry::EdgeDelete {
+            source: *source,
+            target: *target,
+            edge_type: edge_type.clone(),
+            lsn,
+        });
+    }
+    for (index, row_id, _) in &ws.vector_deletes {
+        // Keep vector cleanup paired with its dropped table's row cleanup:
+        // neither is an outbound user deletion.
+        if structurally_dropped_tables.contains(&index.table) {
+            continue;
+        }
+        entries.push(ChangeLogEntry::VectorDelete {
+            index: index.clone(),
+            row_id: *row_id,
+            lsn,
+        });
+    }
+    for entry in &ws.vector_inserts {
+        entries.push(ChangeLogEntry::VectorInsert {
+            index: entry.index.clone(),
+            row_id: entry.row_id,
+            lsn,
+        });
+    }
+    entries
+}
+
+/// Infallibly append an already-prepared log payload and its two derived
+/// indexes. Received-schema publication calls this after Redb succeeds,
+/// without replaying any data WriteSet into the stores a second time.
+pub(crate) fn publish_prepared_change_log_entries(
+    change_log: &RwLock<Vec<ChangeLogEntry>>,
+    table_index: &RwLock<ChangeLogTableIndex>,
+    lsn_refcounts: &RwLock<ChangeLogLsnRefcounts>,
+    structurally_dropped_tables: &HashSet<String>,
+    entries: Vec<ChangeLogEntry>,
+) {
+    let mut table_index = table_index.write();
+    let mut lsn_refcounts = lsn_refcounts.write();
+    let mut change_log = change_log.write();
+    if !structurally_dropped_tables.is_empty() {
+        change_log.retain(|entry| match entry {
+            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } => {
+                !structurally_dropped_tables.contains(table)
+            }
+            ChangeLogEntry::VectorInsert { index, .. }
+            | ChangeLogEntry::VectorDelete { index, .. } => {
+                !structurally_dropped_tables.contains(&index.table)
+            }
+            ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => true,
+        });
+        table_index.clear();
+        lsn_refcounts.clear();
+        record_change_log_entries(&mut table_index, &mut lsn_refcounts, &change_log);
+    }
+    record_change_log_entries(&mut table_index, &mut lsn_refcounts, &entries);
+    change_log.extend(entries);
+}
+
 pub struct CompositeStore {
     pub relational: Arc<RelationalStore>,
     pub graph: Arc<GraphStore>,
@@ -119,7 +232,7 @@ pub struct CompositeStore {
     pub change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
     pub change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
     pub ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
-    accountant: Arc<contextdb_core::MemoryAccountant>,
+    accountant: Arc<MemoryAccountant>,
     apply_phase_pause: Arc<ApplyPhasePause>,
 }
 
@@ -145,6 +258,7 @@ impl ApplyPhasePause {
         }
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn arm(&self) -> u64 {
         let mut state = self.state.lock();
         state.generation = state.generation.saturating_add(1);
@@ -204,7 +318,7 @@ impl CompositeStore {
         change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
-        accountant: Arc<contextdb_core::MemoryAccountant>,
+        accountant: Arc<MemoryAccountant>,
     ) -> Self {
         Self::new_with_apply_phase_pause(
             relational,
@@ -228,7 +342,7 @@ impl CompositeStore {
         change_log_table_index: Arc<RwLock<ChangeLogTableIndex>>,
         change_log_lsn_refcounts: Arc<RwLock<ChangeLogLsnRefcounts>>,
         ddl_log: Arc<RwLock<Vec<(Lsn, DdlChange)>>>,
-        accountant: Arc<contextdb_core::MemoryAccountant>,
+        accountant: Arc<MemoryAccountant>,
         apply_phase_pause: Arc<ApplyPhasePause>,
     ) -> Self {
         Self {
@@ -417,7 +531,7 @@ impl CompositeStore {
             &ws.vector_inserts,
             &ws.vector_moves,
             ws.commit_lsn.unwrap_or(Lsn(0)),
-            Some(&self.accountant),
+            Some(&*self.accountant),
         );
         let (clear_source_lsns, set_source_lsns) = sync_source_lsn_updates(ws);
         if !clear_source_lsns.is_empty() {
@@ -491,5 +605,103 @@ impl WriteSetApplicator for CompositeStore {
 
     fn new_row_id(&self) -> RowId {
         self.relational.new_row_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contextdb_core::TxId;
+
+    #[test]
+    fn received_schema_drop_omits_structural_row_and_vector_deletes() {
+        let write_set = WriteSet {
+            commit_lsn: Some(Lsn(9)),
+            relational_deletes: vec![
+                ("dropped".to_string(), RowId(1), TxId(1)),
+                ("kept".to_string(), RowId(2), TxId(1)),
+            ],
+            vector_deletes: vec![
+                (
+                    VectorIndexRef::new("dropped", "embedding"),
+                    RowId(1),
+                    TxId(1),
+                ),
+                (VectorIndexRef::new("kept", "embedding"), RowId(2), TxId(1)),
+            ],
+            ..WriteSet::default()
+        };
+        let structurally_dropped_tables = HashSet::from(["dropped".to_string()]);
+
+        let entries = build_received_schema_change_log_entries(
+            &write_set,
+            &HashMap::new(),
+            &HashMap::new(),
+            &structurally_dropped_tables,
+        );
+
+        assert!(!entries.iter().any(
+            |entry| matches!(entry, ChangeLogEntry::RowDelete { table, .. } if table == "dropped")
+        ));
+        assert!(!entries.iter().any(
+            |entry| matches!(entry, ChangeLogEntry::VectorDelete { index, .. } if index.table == "dropped")
+        ));
+        assert!(entries.iter().any(
+            |entry| matches!(entry, ChangeLogEntry::RowDelete { table, .. } if table == "kept")
+        ));
+        assert!(entries.iter().any(
+            |entry| matches!(entry, ChangeLogEntry::VectorDelete { index, .. } if index.table == "kept")
+        ));
+
+        let historic = vec![
+            ChangeLogEntry::RowInsert {
+                table: "dropped".to_string(),
+                row_id: RowId(1),
+                lsn: Lsn(4),
+            },
+            ChangeLogEntry::VectorInsert {
+                index: VectorIndexRef::new("dropped", "embedding"),
+                row_id: RowId(1),
+                lsn: Lsn(4),
+            },
+            ChangeLogEntry::RowInsert {
+                table: "kept".to_string(),
+                row_id: RowId(2),
+                lsn: Lsn(5),
+            },
+        ];
+        let change_log = RwLock::new(historic.clone());
+        let table_index = RwLock::new(ChangeLogTableIndex::new());
+        let lsn_refcounts = RwLock::new(ChangeLogLsnRefcounts::new());
+        record_change_log_entries(
+            &mut table_index.write(),
+            &mut lsn_refcounts.write(),
+            &historic,
+        );
+
+        publish_prepared_change_log_entries(
+            &change_log,
+            &table_index,
+            &lsn_refcounts,
+            &structurally_dropped_tables,
+            entries,
+        );
+
+        assert!(!change_log.read().iter().any(|entry| match entry {
+            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } =>
+                table == "dropped",
+            ChangeLogEntry::VectorInsert { index, .. }
+            | ChangeLogEntry::VectorDelete { index, .. } => index.table == "dropped",
+            _ => false,
+        }));
+        assert_eq!(
+            table_index.read().get("dropped"),
+            None,
+            "retired generation coordinates leave the auxiliary index too"
+        );
+        assert!(
+            table_index.read().contains_key("kept"),
+            "unaffected table history and newly published deletes remain indexed"
+        );
     }
 }

@@ -10,16 +10,16 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "f25-edge.db");
     let server_path = temp_db_file(&tmp, "f25-server.db");
-    let nats = start_nats().await;
-    let nats_url = &nats.nats_url;
-    let ws_url = &nats.ws_url;
-    let mut server = spawn_server(&server_path, "f25", nats_url);
+    let sync = start_sync_fixture().await;
+    let bind_spec = &sync.bind_spec;
+    let ticket = &sync.ticket;
+    let mut server = spawn_server(&server_path, "f25", bind_spec);
 
     // Accumulate 1,000 rows offline (proves the pattern; 10K is a benchmark concern)
-    let mut script = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n");
     for i in 0..1_000 {
         script.push_str(&format!(
-            "INSERT INTO items (id, name) VALUES ('{}', 'item-{}')\n",
+            "INSERT INTO items (id, name) VALUES ('{}', 'item-{}');\n",
             uuid::Uuid::new_v4(),
             i
         ));
@@ -28,7 +28,7 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f25", "--nats-url", ws_url],
+        &["--tenant-id", "f25", "--sync-endpoint", ticket],
         &script,
     );
     assert!(
@@ -41,10 +41,10 @@ async fn f25_edge_offline_accumulates_ten_thousand_rows_reconnects_and_pushes() 
     let fresh_path = temp_db_file(&tmp, "f25-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f25", "--nats-url", ws_url],
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n\
+        &["--tenant-id", "f25", "--sync-endpoint", ticket],
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n\
          .sync pull\n\
-         SELECT count(*) FROM items\n\
+         SELECT count(*) FROM items;\n\
          .quit\n",
     );
     stop_child(&mut server);
@@ -63,16 +63,16 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "f26-edge.db");
     let server_path = temp_db_file(&tmp, "f26-server.db");
-    let nats = start_nats().await;
-    let nats_url = &nats.nats_url;
-    let ws_url = &nats.ws_url;
-    let mut server = spawn_server(&server_path, "f26", nats_url);
+    let sync = start_sync_fixture().await;
+    let bind_spec = &sync.bind_spec;
+    let ticket = &sync.ticket;
+    let mut server = spawn_server(&server_path, "f26", bind_spec);
 
     // Push 10,000 rows from the source edge
-    let mut script = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n");
     for i in 0..1_000 {
         script.push_str(&format!(
-            "INSERT INTO items (id, name) VALUES ('{}', 'item-{}')\n",
+            "INSERT INTO items (id, name) VALUES ('{}', 'item-{}');\n",
             uuid::Uuid::new_v4(),
             i
         ));
@@ -81,7 +81,7 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
 
     let push_output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f26", "--nats-url", ws_url],
+        &["--tenant-id", "f26", "--sync-endpoint", ticket],
         &script,
     );
     assert!(
@@ -93,10 +93,10 @@ async fn f26_large_pull_ten_thousand_rows_from_server_to_fresh_edge() {
     let fresh_path = temp_db_file(&tmp, "f26-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f26", "--nats-url", ws_url],
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n\
+        &["--tenant-id", "f26", "--sync-endpoint", ticket],
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n\
          .sync pull\n\
-         SELECT count(*) FROM items\n\
+         SELECT count(*) FROM items;\n\
          .quit\n",
     );
     stop_child(&mut server);
@@ -116,16 +116,16 @@ async fn f27_incremental_pull_after_initial_sync() {
     let source_path = temp_db_file(&tmp, "f27-source.db");
     let server_path = temp_db_file(&tmp, "f27-server.db");
     let puller_path = temp_db_file(&tmp, "f27-puller.db");
-    let nats = start_nats().await;
-    let nats_url = &nats.nats_url;
-    let ws_url = &nats.ws_url;
-    let mut server = spawn_server(&server_path, "f27", nats_url);
+    let sync = start_sync_fixture().await;
+    let bind_spec = &sync.bind_spec;
+    let ticket = &sync.ticket;
+    let mut server = spawn_server(&server_path, "f27", bind_spec);
 
     // Push initial 100 rows
-    let mut script1 = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script1 = String::from("CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n");
     for i in 0..100 {
         script1.push_str(&format!(
-            "INSERT INTO items (id, name) VALUES ('{}', 'batch1-{}')\n",
+            "INSERT INTO items (id, name) VALUES ('{}', 'batch1-{}');\n",
             uuid::Uuid::new_v4(),
             i
         ));
@@ -133,7 +133,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     script1.push_str(".sync push\n.quit\n");
     let push1 = run_cli_script(
         &source_path,
-        &["--tenant-id", "f27", "--nats-url", ws_url],
+        &["--tenant-id", "f27", "--sync-endpoint", ticket],
         &script1,
     );
     assert!(push1.status.success());
@@ -141,10 +141,10 @@ async fn f27_incremental_pull_after_initial_sync() {
     // Initial pull — puller gets 100 rows
     let pull1 = run_cli_script(
         &puller_path,
-        &["--tenant-id", "f27", "--nats-url", ws_url],
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)\n\
+        &["--tenant-id", "f27", "--sync-endpoint", ticket],
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT);\n\
          .sync pull\n\
-         SELECT count(*) FROM items\n\
+         SELECT count(*) FROM items;\n\
          .quit\n",
     );
     let stdout1 = output_string(&pull1.stdout);
@@ -158,7 +158,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     let mut script2 = String::new();
     for i in 0..50 {
         script2.push_str(&format!(
-            "INSERT INTO items (id, name) VALUES ('{}', 'batch2-{}')\n",
+            "INSERT INTO items (id, name) VALUES ('{}', 'batch2-{}');\n",
             uuid::Uuid::new_v4(),
             i
         ));
@@ -166,7 +166,7 @@ async fn f27_incremental_pull_after_initial_sync() {
     script2.push_str(".sync push\n.quit\n");
     let push2 = run_cli_script(
         &source_path,
-        &["--tenant-id", "f27", "--nats-url", ws_url],
+        &["--tenant-id", "f27", "--sync-endpoint", ticket],
         &script2,
     );
     assert!(push2.status.success());
@@ -174,9 +174,9 @@ async fn f27_incremental_pull_after_initial_sync() {
     // Incremental pull — puller gets the 50 new rows (total 150)
     let pull2 = run_cli_script(
         &puller_path,
-        &["--tenant-id", "f27", "--nats-url", ws_url],
+        &["--tenant-id", "f27", "--sync-endpoint", ticket],
         ".sync pull\n\
-         SELECT count(*) FROM items\n\
+         SELECT count(*) FROM items;\n\
          .quit\n",
     );
     stop_child(&mut server);

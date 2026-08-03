@@ -1,69 +1,16 @@
 use contextdb_core::Value;
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-struct NatsFixture {
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
-    ws_url: String,
-}
-
-async fn start_nats() -> NatsFixture {
-    let conf = format!(
-        "{}/../contextdb-server/tests/nats.conf",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_exposed_port(9222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-    let request = image
-        .with_mount(Mount::bind_mount(&conf, "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
-    let container: ContainerAsync<GenericImage> = request.start().await.expect("start NATS");
-    let nats_port = container
-        .get_host_port_ipv4(4222.tcp())
-        .await
-        .expect("NATS port");
-    let ws_port = container
-        .get_host_port_ipv4(9222.tcp())
-        .await
-        .expect("NATS websocket port");
-    NatsFixture {
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
-        ws_url: format!("ws://127.0.0.1:{ws_port}"),
-    }
-}
-
-async fn wait_for_server_ready(edge_url: &str, tenant: &str, policies: &ConflictPolicies) {
-    let probe_db = Arc::new(Database::open_memory());
-    let probe_client = SyncClient::new(probe_db, edge_url, contextdb_core::TenantId::from(tenant));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match probe_client.pull(policies).await {
-            Ok(_) => return,
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => panic!("server did not become ready for tenant {tenant}: {err}"),
-        }
-    }
-}
-
 fn create_observation_tables(db: &Database) {
     db.execute(
-        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(384)) IMMUTABLE",
+        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(384)) IMMUTABLE SYNC CONFLICT KEEP FIRST",
         &HashMap::new(),
     )
     .unwrap();
@@ -71,7 +18,7 @@ fn create_observation_tables(db: &Database) {
 
 fn create_items_table(db: &Database) {
     db.execute(
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP FIRST",
         &HashMap::new(),
     )
     .unwrap();
@@ -97,11 +44,8 @@ struct MultiEdgeFixture {
     server_task: JoinHandle<()>,
 }
 
-fn setup_chunked_mixed_push(
-    rt: &tokio::runtime::Runtime,
-    nats_url: &str,
-    edge_url: &str,
-) -> PushFixture {
+fn setup_chunked_mixed_push(rt: &tokio::runtime::Runtime) -> PushFixture {
+    let fabric = Arc::new(InProcessBroker::new());
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     create_observation_tables(&edge_db);
@@ -138,32 +82,40 @@ fn setup_chunked_mixed_push(
     }
     edge_db.commit(tx).unwrap();
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let tenant = format!("sync-pr-push-{}", Uuid::new_v4());
-    let server = Arc::new(SyncServer::new(
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
         server_db.clone(),
-        nats_url,
+        fabric.server_as("sync-pr-push-hub"),
         contextdb_core::TenantId::from(&tenant),
-        policies.clone(),
     ));
     let server_handle = rt.spawn({
         let server = server.clone();
         async move { server.run().await }
     });
-    rt.block_on(wait_for_server_ready(edge_url, &tenant, &policies));
+    rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+                &tenant,
+            )),
+        )
+        .await
+        .expect("sync-pr push server route")
+    });
 
     PushFixture {
-        client: SyncClient::new(edge_db, edge_url, contextdb_core::TenantId::from(&tenant)),
+        client: SyncClient::with_authenticated_transport_for_test(
+            edge_db,
+            fabric.client_as("sync-pr-push-edge"),
+            contextdb_core::TenantId::from(&tenant),
+        ),
         server_db,
         server_task: server_handle,
     }
 }
 
-fn setup_chunked_large_pull(
-    rt: &tokio::runtime::Runtime,
-    nats_url: &str,
-    edge_url: &str,
-) -> PullFixture {
+fn setup_chunked_large_pull(rt: &tokio::runtime::Runtime) -> PullFixture {
+    let fabric = Arc::new(InProcessBroker::new());
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     create_observation_tables(&server_db);
@@ -182,24 +134,31 @@ fn setup_chunked_large_pull(
     }
     server_db.commit(tx).unwrap();
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let tenant = format!("sync-pr-pull-{}", Uuid::new_v4());
-    let server = Arc::new(SyncServer::new(
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
         server_db,
-        nats_url,
+        fabric.server_as("sync-pr-pull-hub"),
         contextdb_core::TenantId::from(&tenant),
-        policies.clone(),
     ));
     let server_handle = rt.spawn({
         let server = server.clone();
         async move { server.run().await }
     });
-    rt.block_on(wait_for_server_ready(edge_url, &tenant, &policies));
+    rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+                &tenant,
+            )),
+        )
+        .await
+        .expect("sync-pr pull server route")
+    });
 
     PullFixture {
-        client: SyncClient::new(
+        client: SyncClient::with_authenticated_transport_for_test(
             edge_db.clone(),
-            edge_url,
+            fabric.client_as("sync-pr-pull-edge"),
             contextdb_core::TenantId::from(&tenant),
         ),
         edge_db,
@@ -207,11 +166,8 @@ fn setup_chunked_large_pull(
     }
 }
 
-fn setup_multi_edge_converge(
-    rt: &tokio::runtime::Runtime,
-    nats_url: &str,
-    edge_url: &str,
-) -> MultiEdgeFixture {
+fn setup_multi_edge_converge(rt: &tokio::runtime::Runtime) -> MultiEdgeFixture {
+    let fabric = Arc::new(InProcessBroker::new());
     let edge_a_db = Arc::new(Database::open_memory());
     let edge_b_db = Arc::new(Database::open_memory());
     let verifier_db = Arc::new(Database::open_memory());
@@ -250,26 +206,41 @@ fn setup_multi_edge_converge(
     }
     edge_b_db.commit(tx_b).unwrap();
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let tenant = format!("sync-pr-multiedge-{}", Uuid::new_v4());
-    let server = Arc::new(SyncServer::new(
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
         server_db,
-        nats_url,
+        fabric.server_as("sync-pr-multiedge-hub"),
         contextdb_core::TenantId::from(&tenant),
-        policies.clone(),
     ));
     let server_handle = rt.spawn({
         let server = server.clone();
         async move { server.run().await }
     });
-    rt.block_on(wait_for_server_ready(edge_url, &tenant, &policies));
+    rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+                &tenant,
+            )),
+        )
+        .await
+        .expect("sync-pr multiedge server route")
+    });
 
     MultiEdgeFixture {
-        edge_a: SyncClient::new(edge_a_db, edge_url, contextdb_core::TenantId::from(&tenant)),
-        edge_b: SyncClient::new(edge_b_db, edge_url, contextdb_core::TenantId::from(&tenant)),
-        verifier: SyncClient::new(
+        edge_a: SyncClient::with_authenticated_transport_for_test(
+            edge_a_db,
+            fabric.client_as("sync-pr-edge-a"),
+            contextdb_core::TenantId::from(&tenant),
+        ),
+        edge_b: SyncClient::with_authenticated_transport_for_test(
+            edge_b_db,
+            fabric.client_as("sync-pr-edge-b"),
+            contextdb_core::TenantId::from(&tenant),
+        ),
+        verifier: SyncClient::with_authenticated_transport_for_test(
             verifier_db.clone(),
-            edge_url,
+            fabric.client_as("sync-pr-verifier"),
             contextdb_core::TenantId::from(&tenant),
         ),
         verifier_db,
@@ -279,8 +250,6 @@ fn setup_multi_edge_converge(
 
 fn sync_pr(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let nats = rt.block_on(start_nats());
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
 
     let mut group = c.benchmark_group("sync_pr");
     group.sample_size(10);
@@ -289,7 +258,7 @@ fn sync_pr(c: &mut Criterion) {
 
     group.bench_function("chunked_mixed_push_400_rows", |b| {
         b.iter_batched(
-            || setup_chunked_mixed_push(&rt, &nats.nats_url, &nats.ws_url),
+            || setup_chunked_mixed_push(&rt),
             |fixture| {
                 rt.block_on(async {
                     let result = fixture.client.push().await.unwrap();
@@ -311,10 +280,10 @@ fn sync_pr(c: &mut Criterion) {
 
     group.bench_function("chunked_large_pull_600_rows", |b| {
         b.iter_batched(
-            || setup_chunked_large_pull(&rt, &nats.nats_url, &nats.ws_url),
+            || setup_chunked_large_pull(&rt),
             |fixture| {
                 rt.block_on(async {
-                    let result = fixture.client.pull(&policies).await.unwrap();
+                    let result = fixture.client.pull_default().await.unwrap();
                     assert_eq!(result.applied_rows, 600);
                     assert_eq!(
                         fixture
@@ -333,13 +302,13 @@ fn sync_pr(c: &mut Criterion) {
 
     group.bench_function("multi_edge_push_pull_converge_2x100", |b| {
         b.iter_batched(
-            || setup_multi_edge_converge(&rt, &nats.nats_url, &nats.ws_url),
+            || setup_multi_edge_converge(&rt),
             |fixture| {
                 rt.block_on(async {
                     let (a, b) = tokio::join!(fixture.edge_a.push(), fixture.edge_b.push());
                     a.unwrap();
                     b.unwrap();
-                    let pulled = fixture.verifier.pull(&policies).await.unwrap();
+                    let pulled = fixture.verifier.pull_default().await.unwrap();
                     assert_eq!(pulled.applied_rows, 200);
                     assert_eq!(
                         fixture
@@ -357,7 +326,6 @@ fn sync_pr(c: &mut Criterion) {
     });
 
     group.finish();
-    rt.block_on(async { drop(nats) });
 }
 
 criterion_group!(benches, sync_pr);

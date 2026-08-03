@@ -319,23 +319,53 @@ instead of parsing memory operation tags.
 ## Sync
 
 The wire protocol is currently `PROTOCOL_VERSION = 6`. The ALPN identifier
-deliberately stays `contextdb.sync.v4` — it names the transport framing, which is
-unchanged; payload version skew is caught by the envelope check below, not the ALPN.
+is `contextdb.sync.v6` — it names the transport framing, including the reply-receipt
+byte that lets graceful shutdown prove the dialing peer received a terminal reply
+and the per-publication nonce that prevents identical large replies from sharing
+durable bytes or completion state.
+Payload version skew is caught by the envelope check below, not the ALPN.
+Once shutdown closes admission, the hub finishes sync work it already accepted,
+including the chunk and authenticated completion exchange for an oversized reply.
+New requests are refused. A peer that stops acknowledging replies cannot hold the
+hub forever: each reply receipt and the complete graceful-drain phase have a
+30-second failure ceiling, after which the endpoint closes the stalled work. These
+deadlines are liveness bounds, not scheduling delays; normal progress advances on
+protocol state and returns as soon as the accepted work is complete.
+Before route admission, the default server policy permits at most 128 incoming
+connection/handshake tasks and 64 MiB of aggregate declared sync-frame payload.
+Request-frame reads must make application-byte progress every 30 seconds; QUIC
+keepalives do not reset that application deadline. Operators declare different
+server-local limits with `pre-admission-connections=`, `pre-admission-bytes=`, and
+`request-read-idle-ms=` in the bind endpoint spec. Exhaustion refuses new work
+immediately instead of allocating memory or creating a waiting task.
+The edge's push request uses the general 60-second sync-operation ceiling, so it
+does not reset a valid larger atomic push while the hub is still committing; on
+shutdown the hub's 30-second drain ceiling therefore decides first and returns a
+confirmed reply or a loud failure.
+The hub reserves at most 1,024 unfinished oversized replies in its shutdown
+registry and refuses the next reply before staging it. Each authenticated,
+validated chunk refreshes a 30-second inactivity lease. A transfer that resumes
+while the hub is still serving is re-registered after its durable manifest and
+chunk validate; a transfer that was silent for the full lease before shutdown is
+stalled work and is not allowed to reopen admission during drain.
 The server reports the supported protocol version in `contextdb-server --version`
 and in its INFO logs; mismatched envelopes are rejected instead of being
 partially applied.
 
-Version 6 added exactly two fields, nothing else on the wire moved:
+The completed, not-yet-released version 6 includes
 `WireRowChange.arrival` (the row's ordering position on the node that
 accepted it) and `PullResponse.source` (the serving store's per-tenant
-incarnation) — see "Arrival Ordering" and "Pull Cursors Are Bound To Their
-Serving Store" below. A version-mismatched peer is refused loudly on push,
+incarnation), a distinct PURGE instruction lane, a schema-provenance positional
+slot that remains present even when empty, and the structured
+`PurgeRequiresAuthoritativeHub` push refusal. See "Arrival Ordering" and "Pull
+Cursors Are Bound To Their Serving Store" below. Peers using the same v5
+transport framing but different payload versions are refused loudly on push,
 pull, and the dedicated status exchange: no rows move, no watermark advances
-on either side, and the error names the remedy (upgrade both ends) rather
-than just the two version numbers. A mixed fleet simply stops syncing until
-every participant is on the same release — nothing is lost in the meantime,
-because a refused exchange never advances a watermark it would otherwise
-have earned.
+on either side, and the error names the remedy (upgrade both ends) rather than
+just the two version numbers. An older `contextdb.sync.v4` peer cannot negotiate
+the receipt-bearing v5 framing at all; that connection refusal likewise names
+transport-version alignment and upgrading both ends as the remedy. Nothing is
+lost because either refusal happens before a watermark can advance.
 
 Future work bumps the protocol version whenever it changes sync bytes or sync semantics. SQL, storage, CLI, or maintenance work that leaves sync unchanged does not bump the protocol.
 
@@ -412,12 +442,10 @@ the table can be synced (it has an identity) or it explicitly opts out
 
 ### Conflict Resolution
 
-Per-table configurable policies:
+Each table declares its conflict behavior in DDL:
 
-- `LatestWins` — most recent write by logical timestamp (default)
-- `ServerWins` — server version takes precedence
-- `EdgeWins` — edge version takes precedence
-- `InsertIfNotExists` — insert if absent, skip otherwise
+- `SYNC CONFLICT KEEP FIRST` — the hub's first accepted value remains.
+- `SYNC CONFLICT KEEP LATEST` — the later accepted value replaces it.
 
 Whichever policy applies, a conflict means two machines genuinely diverged. A row that arrives
 carrying exactly what the receiving node already holds is a re-delivery — the everyday case being
@@ -438,7 +466,7 @@ row is refused outright, whatever it contains.
 
 #### Arrival Ordering
 
-`LatestWins` arbitrates on **one clock: the accepting node's own ordering of arrivals** — never
+`KEEP LATEST` arbitrates on **one clock: the accepting node's own ordering of arrivals** — never
 two machines' independent LSN counters. Each row's wire form carries `arrival`: the ordering
 position some node already gave it, or absent when the sender itself authored the row fresh and
 never yet synced it anywhere. The rule:
@@ -476,9 +504,21 @@ numerically AHEAD but holds real history below the old cursor.
 
 ### Transport
 
-Dial-by-key: each machine is reached by its own cryptographic identity (an ed25519 public key), carried by the Iroh library (iroh 1.0, wire-stable). A framed stream carries each payload whole — there is no 1MB message ceiling and no broker-side chunking; payload size is bounded by batching above the transport, and vector byte sizes are accounted for in batch estimation. LAN peers connect directly; cross-network peers are introduced by a self-hosted or opt-in relay.
+Dial-by-key: each machine is reached by its own cryptographic identity (an ed25519 public key), carried by the Iroh library (iroh 1.0, wire-stable). A framed stream carries each payload whole; payload size is bounded by batching above the transport, and vector byte sizes are accounted for in batch estimation. LAN peers connect directly; cross-network peers are introduced by a self-hosted or opt-in relay.
 
-The original NATS broker transport is retained behind the `nats` cargo feature as a deprecated compatibility adapter; it is not on the default path.
+Iroh is the single sync transport. Every exchange authenticates its peer by cryptographic fabric identity.
+
+`SyncClient::new` gives any file-backed `Database` a durable identity without
+exposing the database's persistence path: with a bare enrollment ticket it
+loads or creates `<canonical-db-path>.fabric-identity.key`. Reopening that
+database and recreating the database file while retaining this adjacent key
+both keep the same node identity; a recreated database still has its new store
+incarnation. An endpoint that explicitly supplies `identity=<key-file>` always
+takes precedence over the adjacent key. An in-memory edge must supply that
+explicit persisted identity itself: a bare ticket is refused before it dials or
+signs a sync request. The lower-level raw transport may still use an ephemeral
+identity only for protocol-level anonymous-refusal coverage where no database
+participates.
 
 ### DDL Sync
 
@@ -550,6 +590,24 @@ one layer up.
 
 `contextdb_server::BlobStore` (re-exported from the server crate root) moves
 opaque, content-addressed bytes between nodes:
+
+The bytes, chunk manifests, partial-transfer checkpoints, and protection tags
+live inside ContextDB's own redb file. They are not a second filesystem store.
+That ownership is what makes authoritative `PURGE` honest: one transaction
+removes the selected ledger lineage and every now-unreferenced engine-held blob
+copy, or the whole statement fails with no partial erasure. After success no
+ContextDB query, history read, serve, export, resume path, or engine-created
+backup can reach those bytes. This is logical engine erasure, not a claim that
+redb can overwrite filesystem journals, SSD wear-leveling ghosts, or external
+OS snapshots; encryption-at-rest with key erasure is the route to that stronger
+forensic guarantee.
+
+This boundary covers media deliberately ingested for distributed work, such as
+a detection clip sent from a submitting node to a GPU worker. An application's
+independent recording archive is outside ContextDB: for example, deleting
+continuous camera footage written by Vigil's own media pipeline remains a
+Vigil retention/erasure responsibility and must be coordinated separately for
+a product-level "erase this person" operation.
 
 - **Ingest** on the holder node: `ingest_bytes(&[u8]) -> BlobHash` or
   `ingest_file(&Path) -> BlobHash`. The returned `BlobHash` is the hash of the
@@ -730,7 +788,16 @@ The planner is rule-based (no cost optimizer). Key planning decisions:
 
 ## Memory And Disk Budgets
 
-`MemoryAccountant` tracks memory usage against a configurable budget. Set via `--memory-limit` in the CLI or `MemoryAccountant::with_budget(bytes)` in the API. All vector and row allocations are accounted. Budget exceeded → operations return `MemoryBudgetExceeded`.
+The database tracks all row, graph, and vector allocations against one memory
+budget. Embedding callers use the durable
+`Database::set_memory_limit(Some(bytes))`; its setting survives reopen and
+remains runtime-configurable. A process that needs a non-raisable startup
+ceiling uses `contextdb_engine::database::open_with_startup_limits` (or
+`open_memory_with_startup_limit`). The CLI's `--memory-limit` and
+`CONTEXTDB_MEMORY_LIMIT` use that same startup path. Budget exceeded →
+operations return `MemoryBudgetExceeded`. The raw mutable accountant is an
+engine implementation detail and is not attachable or reachable through the
+normal public API.
 
 File-backed databases also support a persisted disk budget:
 

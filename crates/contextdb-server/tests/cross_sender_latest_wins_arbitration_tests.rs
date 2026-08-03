@@ -20,7 +20,8 @@
 //! row that already carries an ordering position at or below what is stored
 //! is a stale echo: it must not regress the current value, and it must not
 //! be reported as a conflict — nothing was refused, there was nothing new.
-//! A conflict that CAN legitimately still refuse (e.g. `ServerWins`) keeps
+//! A conflict that CAN legitimately still refuse (for example, declared
+//! `KEEP FIRST`) keeps
 //! advancing the push watermark exactly once, so a refusal no later push
 //! could ever win is never silently retried forever either.
 //!
@@ -33,13 +34,16 @@ use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, NaturalKey, RowChange,
 };
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+const DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
+const KEEP_FIRST_DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST";
 const T0: i64 = 1_700_000_000_000;
 
 fn p() -> HashMap<String, Value> {
@@ -66,18 +70,27 @@ impl RunningHub {
     }
 }
 
-fn start_hub_with_policy(
+fn start_hub(broker: &InProcessBroker, tenant: &str, hub_db: Arc<Database>) -> RunningHub {
+    let identity = Arc::new(FabricIdentity::generate());
+    start_hub_with_identity(broker, tenant, hub_db, identity)
+}
+
+fn start_hub_with_identity(
     broker: &InProcessBroker,
     tenant: &str,
     hub_db: Arc<Database>,
-    policies: ConflictPolicies,
+    identity: Arc<FabricIdentity>,
 ) -> RunningHub {
-    let server = Arc::new(SyncServer::with_transport(
-        hub_db,
-        broker.server(),
-        TenantId::from(tenant),
-        policies,
-    ));
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db,
+            broker.server_as(&node_id),
+            TenantId::from(tenant),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -87,27 +100,40 @@ fn start_hub_with_policy(
     RunningHub { shutdown, task }
 }
 
-fn start_hub(broker: &InProcessBroker, tenant: &str, hub_db: Arc<Database>) -> RunningHub {
-    start_hub_with_policy(
-        broker,
-        tenant,
-        hub_db,
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    )
+fn edge_with_ddl(broker: &InProcessBroker, tenant: &str, ddl: &str) -> (Arc<Database>, SyncClient) {
+    let db = Arc::new(Database::open_memory());
+    db.execute(ddl, &p()).expect("edge ddl");
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        broker.client_as(&node_id),
+        TenantId::from(tenant),
+        identity,
+    );
+    (db, client)
 }
 
 fn edge(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient) {
-    let db = Arc::new(Database::open_memory());
-    db.execute(DDL, &p()).expect("edge ddl");
-    let client = SyncClient::with_transport(db.clone(), broker.client(), TenantId::from(tenant));
-    (db, client)
+    edge_with_ddl(broker, tenant, DDL)
+}
+
+fn keep_first_edge(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient) {
+    edge_with_ddl(broker, tenant, KEEP_FIRST_DDL)
 }
 
 fn edge_with_ledger(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient) {
     let db = Arc::new(Database::open_memory());
     contextdb_engine::work_ledger::install_work_ledger_schema(&db)
         .expect("install ledger schema on edge");
-    let client = SyncClient::with_transport(db.clone(), broker.client(), TenantId::from(tenant));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        broker.client_as(&node_id),
+        TenantId::from(tenant),
+        identity,
+    );
     (db, client)
 }
 
@@ -393,12 +419,13 @@ async fn arrival_positions_stay_ordered_across_a_restart_of_the_accepting_node()
     let tenant = "xsender-restart";
     let dir = tempfile::TempDir::new().expect("tempdir");
     let hub_path = dir.path().join("hub.db");
+    let hub_identity = Arc::new(FabricIdentity::generate());
 
     let hub_db1 = Arc::new(Database::open(&hub_path).expect("open hub"));
     hub_db1.execute(DDL, &p()).expect("hub ddl");
     // Moved, not cloned: the file lock must be released when this generation
     // stops, so the reopen below can succeed.
-    let hub1 = start_hub(&broker, tenant, hub_db1);
+    let hub1 = start_hub_with_identity(&broker, tenant, hub_db1, hub_identity.clone());
 
     // B is chatty: its clock runs far ahead, then it writes and pushes the
     // shared key BEFORE the restart, and pulls once to establish a
@@ -418,7 +445,7 @@ async fn arrival_positions_stay_ordered_across_a_restart_of_the_accepting_node()
     // provenance behind the shared key), a fresh handle and server
     // generation over it.
     let hub_db2 = Arc::new(Database::open(&hub_path).expect("reopen hub"));
-    let hub2 = start_hub(&broker, tenant, hub_db2.clone());
+    let hub2 = start_hub_with_identity(&broker, tenant, hub_db2.clone(), hub_identity);
 
     // A is quiet and has never contacted the hub, so its clock stays low.
     // It writes the SAME key AFTER the restart.
@@ -489,30 +516,29 @@ async fn a_refused_row_is_not_silently_stepped_over() {
     );
     hub.stop().await;
 
-    // Part B: a policy that CAN legitimately refuse (ServerWins) still
+    // Part B: declared KEEP FIRST can legitimately refuse and still
     // advances the push watermark exactly once, with the refusal reported —
     // and the refused row is never re-offered on a later push.
-    let tenant_b = "s2-server-wins-refusal-advances-once";
+    let tenant_b = "s2-keep-first-refusal-advances-once";
     let hub_db2 = Arc::new(Database::open_memory());
-    hub_db2.execute(DDL, &p()).expect("hub ddl 2");
+    hub_db2.execute(KEEP_FIRST_DDL, &p()).expect("hub ddl 2");
     write_key(&hub_db2, 1, "hub-keeps-this");
-    let hub2 = start_hub_with_policy(
-        &broker,
-        tenant_b,
-        hub_db2.clone(),
-        ConflictPolicies::uniform(ConflictPolicy::ServerWins),
-    );
-    let (edge_db, edge_client) = edge(&broker, tenant_b);
+    let hub2 = start_hub(&broker, tenant_b, hub_db2.clone());
+    let (edge_db, edge_client) = keep_first_edge(&broker, tenant_b);
     write_key(&edge_db, 1, "edge-tries-to-overwrite");
     let refused = within(edge_client.push())
         .await
         .expect("edge push (refused)");
     assert_eq!(
         refused.skipped_rows, 1,
-        "the ServerWins refusal must be reported: {refused:?}"
+        "the declared KEEP FIRST refusal must be reported: {refused:?}"
     );
     assert_eq!(refused.conflicts.len(), 1, "got {:?}", refused.conflicts);
-    assert_eq!(refused.conflicts[0].resolution, ConflictPolicy::ServerWins);
+    assert_eq!(
+        refused.conflicts[0].resolution,
+        ConflictPolicy::InsertIfNotExists,
+        "the engine reports declared KEEP FIRST through its private refusal value"
+    );
 
     let watermark_after_refusal = edge_client.push_watermark();
     assert!(

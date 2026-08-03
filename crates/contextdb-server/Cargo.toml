@@ -13,20 +13,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-# Iroh is the sole default transport. NATS is retained as a deprecated,
-# off-default adapter — a dormant revert option, never deleted. Its suites
-# run under `--features nats` (server crate) / `--features nats-tests`
-# (engine-hosted workspace suites) with a Docker daemon.
 default = ["iroh"]
-nats = ["dep:async-nats"]
-# Alias so the shared bench/test fixtures can gate on one feature name that
-# both this crate and contextdb-engine declare.
-nats-tests = ["nats"]
 iroh = [
+    "contextdb-engine/iroh",
     "dep:iroh",
     "dep:iroh-tickets",
-    "dep:iroh-blobs",
-    "dep:bytes",
     "dep:blake3",
     "dep:rustls-pki-types",
     "dep:url",
@@ -35,7 +26,7 @@ iroh = [
 # LAN-local mDNS lookup (lookup=mdns). A separate opt-in feature: the mdns
 # crate depends on iroh with DEFAULT features, whose unification would drag
 # the UPnP/MPL chain back into every downstream graph.
-mdns = ["dep:iroh-mdns-address-lookup"]
+mdns = ["iroh", "contextdb-engine/mdns"]
 # UPnP port-mapping (improves direct-connection odds through home routers) is
 # deliberately NOT declared as a feature here: even unused optional features
 # enter downstream lockfiles/metadata, and its chain carries an MPL-licensed
@@ -48,40 +39,40 @@ mdns = ["dep:iroh-mdns-address-lookup"]
 # below turns it on for this crate's OWN test targets, which is what lets the
 # seam tests run in the default `cargo test -p contextdb-server` gate without
 # the accessor existing for anyone else.
-test-seams = []
+test-seams = ["contextdb-engine/test-seams"]
+production-smoke-driver = ["iroh", "contextdb-engine/production-smoke-driver"]
 
 [[bin]]
 name = "contextdb-server"
 path = "src/main.rs"
 required-features = ["iroh"]
 
+[[bin]]
+name = "contextdb-smoke-driver"
+path = "src/smoke_driver.rs"
+required-features = ["production-smoke-driver"]
+
 [dependencies]
 serde_json.workspace = true
-contextdb-engine = { path = "../contextdb-engine", version = "1.0" }
+contextdb-engine = { path = "../contextdb-engine", version = "1.0", features = ["sync-orchestration"] }
 contextdb-core = { path = "../contextdb-core", version = "1.0" }
 contextdb-tx = { path = "../contextdb-tx", version = "1.0" }
 uuid.workspace = true
 tokio.workspace = true
-async-nats = { workspace = true, optional = true }
 rmp-serde.workspace = true
 serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 thiserror.workspace = true
-futures-util = "0.3"
 serde_bytes = "0.11"
+libc = "0.2"
 # Trimmed features: tls-ring is the TLS provider; portmapper (UPnP — pulls an
 # MPL-licensed HTTP client), local metrics counters, and the Apple datapath
 # are dropped for a leaner dependency tree. Direct connections, holepunching,
 # and relays are unaffected.
 iroh = { version = "1.0.2", optional = true, default-features = false, features = ["tls-ring"] }
-iroh-blobs = { version = "0.103.0", optional = true }
-bytes = { version = "1", optional = true }
 blake3 = { version = "1", optional = true }
-# LAN-local address lookup (lookup=mdns): announce/resolve on the local
-# network only — no third party involved.
-iroh-mdns-address-lookup = { version = "0.4", optional = true }
 url = { version = "2", optional = true }
 iroh-tickets = { version = "1.0.0", optional = true }
 # relay-ca=<cert-file> support: parse an operator-supplied relay CA cert
@@ -97,6 +88,7 @@ ed25519-dalek = "2"
 getrandom = "0.3"
 
 [dev-dependencies]
+tempfile = "3"
 blake3 = "1"
 tokio-test = "0.4"
 # The relay-dialing integration test runs a localhost relay via iroh's
@@ -104,9 +96,7 @@ tokio-test = "0.4"
 iroh = { version = "1.0.2", features = ["test-utils"] }
 iroh-relay = { version = "1.0.2", features = ["server", "test-utils"] }
 iroh-tickets = "1.0.0"
-testcontainers = "0.27"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
-tempfile = "3"
 uuid = { workspace = true }
 tokio.workspace = true
 roaring.workspace = true
@@ -142,12 +132,37 @@ required-features = ["iroh"]
 [[test]]
 name = "stale_restore_tests"
 path = "tests/stale_restore_tests.rs"
-required-features = ["nats"]
+required-features = ["iroh"]
 
 [[test]]
 name = "sync_integration"
 path = "tests/sync_integration.rs"
-required-features = ["nats"]
+required-features = ["iroh"]
+
+[[test]]
+name = "sync_off_drop_outbound_tests"
+path = "tests/sync_off_drop_outbound_tests.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "pending_push_change_count_tests"
+path = "tests/pending_push_change_count_tests.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "dependency_complete_sync_tests"
+path = "tests/dependency_complete_sync_tests.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "dependency_unit_refusal_tests"
+path = "tests/dependency_unit_refusal_tests.rs"
+required-features = ["iroh"]
+
+[[test]]
+name = "oversized_dependency_unit_tests"
+path = "tests/oversized_dependency_unit_tests.rs"
+required-features = ["iroh"]
 
 [[bench]]
 name = "server_throughput"
@@ -158,13 +173,13 @@ path = "../../benches/server_throughput.rs"
 name = "server_sync_system"
 harness = false
 path = "../../benches/server_sync_system.rs"
-required-features = ["nats-tests"]
+required-features = ["iroh"]
 
 [[bench]]
 name = "sync_pr"
 harness = false
 path = "../../benches/sync_pr.rs"
-required-features = ["nats"]
+required-features = ["iroh"]
 
 [[bench]]
 name = "blob_transfer"

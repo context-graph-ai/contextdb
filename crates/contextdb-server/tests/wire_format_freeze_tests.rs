@@ -1,47 +1,140 @@
-//! Frozen wire-bytes regression guard for `PROTOCOL_VERSION` 6.
+//! Frozen wire-bytes regression guard for the completed `PROTOCOL_VERSION` 6.
 //!
 //! Pure encode/decode against fixed, fully deterministic fixtures — no
-//! broker, no server, no async runtime. It used to live inside
-//! `stale_restore_tests.rs`, whose `[[test]]` entry carries
-//! `required-features = ["nats"]` for its OTHER (genuinely NATS-dependent)
-//! tests; `cargo test --workspace` skips a `required-features`-gated binary
-//! entirely, so this guard never ran in the default suite even though it
-//! needs no broker at all. This file has no such gate and is auto-discovered
-//! like any other `tests/*.rs` file, so it runs on every default
-//! `cargo test`.
+//! server and no async runtime. It lives in its own auto-discovered test
+//! target so the default workspace suite always runs it.
 
 use contextdb_core::{Incarnation, Lsn, Value};
 use contextdb_server::protocol::{
     MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireApplyResult,
-    WireChangeSet, WireNaturalKey, WireRowChange, decode, encode,
+    WireChangeSet, WireConflict, WireDdlChange, WireDdlProvenance, WireNaturalKey, WirePushError,
+    WireRowChange, canonical_ddl_provenance_digest, decode, encode, validate_wire_ddl_provenance,
 };
 use std::collections::HashMap;
 
-// ======== sr7 — REGRESSION GUARD: the wire bytes are frozen at PROTOCOL_VERSION 6 ========
+// ======== sr7 — REGRESSION GUARD: the wire bytes are frozen at protocol v6 ========
 //
-// These hex constants are the actual encoder output for a fixed, fully
-// deterministic fixture (single-entry maps only). They are a snapshot guard: any
-// field add/remove/reorder, MessageType name change, or PROTOCOL_VERSION bump
-// changes these bytes, so an UNINTENDED wire change fails here loudly. The
-// arrival-ordering + cursor-source-binding change deliberately reshaped this
-// surface — `WireRowChange` gained a trailing `arrival` field, `PullResponse`
-// gained a trailing `source` field, and every envelope's version byte went 5→6
-// (a clean break; a peer speaking the old version is rejected at the envelope
-// version check, not by struct shape) — so the constants were regenerated to
-// the true new v6 encoding and re-frozen here.
+// The greenfield v6 surface includes a distinct trailing PURGE lane, keeps its
+// schema-provenance slot present even when empty so later positional slots stay
+// stable, and lets `PushResponse` carry a structured authority error. No v6 peer
+// shipped before this completed shape. The six constants below freeze it.
 
 fn wire_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-const PUSH_REQUEST_WIRE: &str = "9306ab5075736852657175657374dc002acc92cc95cc90cc90cc91cc97cca174cc93cca26964cc81cca5496e74363407cc90cc81cca26964cc81cca5496e74363407ccc207ccc0ccc0cc90cc90cc920000";
-const PUSH_RESPONSE_WIRE: &str = "9306ac50757368526573706f6e736597cc92cc940100cc9007ccc0";
-const PULL_REQUEST_WIRE: &str = "9306ab50756c6c5265717565737495cc922acccd01ccf4";
-const PULL_RESPONSE_WIRE: &str =
-    "9306ac50756c6c526573706f6e73659acc94cc95cc90cc90cc90cc90cc90ccc22accc0";
+#[test]
+fn nonempty_schema_provenance_round_trips_and_validates() {
+    let ddl = WireDdlChange::CreateTable {
+        name: "empty_recreated".to_string(),
+        columns: vec![("id".to_string(), "INTEGER".to_string())],
+        constraints: vec!["PRIMARY KEY (id)".to_string()],
+        foreign_keys: Vec::new(),
+        composite_foreign_keys: Vec::new(),
+        composite_unique: Vec::new(),
+    };
+    let provenance = WireDdlProvenance {
+        source_ddl_lsn: Lsn(9),
+        ordinal: 0,
+        table: Some("empty_recreated".to_string()),
+        table_generation: Some(2),
+        digest: canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("empty_recreated"), Some(2))
+            .unwrap(),
+    };
+    let wire = WireChangeSet {
+        ddl: vec![ddl],
+        ddl_lsn: vec![Lsn(9)],
+        rows: Vec::new(),
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl_provenance: vec![provenance],
+        purges: Vec::new(),
+    };
+    validate_wire_ddl_provenance(&wire).unwrap();
+    let bytes = rmp_serde::to_vec(&wire).unwrap();
+    let decoded: WireChangeSet = rmp_serde::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, wire);
+    validate_wire_ddl_provenance(&decoded).unwrap();
+}
 
 #[test]
-fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
+fn schema_provenance_rejects_missing_source_lsn_before_ordinal_lookup() {
+    let ddl = WireDdlChange::DropTable {
+        name: "memories".to_string(),
+    };
+    let wire = WireChangeSet {
+        ddl: vec![ddl.clone()],
+        ddl_lsn: Vec::new(),
+        rows: Vec::new(),
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl_provenance: vec![WireDdlProvenance {
+            source_ddl_lsn: Lsn(9),
+            ordinal: 0,
+            table: Some("memories".to_string()),
+            table_generation: Some(2),
+            digest: canonical_ddl_provenance_digest(&ddl, Lsn(9), 0, Some("memories"), Some(2))
+                .unwrap(),
+        }],
+        purges: Vec::new(),
+    };
+
+    let error = validate_wire_ddl_provenance(&wire)
+        .expect_err("schema provenance without its source LSN must be rejected");
+    assert!(
+        error.to_string().contains("ddl_lsn length"),
+        "cardinality error must be reported before ordinal lookup: {error}"
+    );
+}
+
+#[test]
+fn filtered_schema_entry_keeps_its_original_nonzero_ordinal() {
+    let ddl = WireDdlChange::CreateTable {
+        name: "pulled_memories".to_string(),
+        columns: vec![("id".to_string(), "INTEGER".to_string())],
+        constraints: vec!["PRIMARY KEY (id)".to_string()],
+        foreign_keys: Vec::new(),
+        composite_foreign_keys: Vec::new(),
+        composite_unique: Vec::new(),
+    };
+    let wire = WireChangeSet {
+        ddl: vec![ddl.clone()],
+        ddl_lsn: vec![Lsn(17)],
+        rows: Vec::new(),
+        edges: Vec::new(),
+        vectors: Vec::new(),
+        ddl_provenance: vec![WireDdlProvenance {
+            source_ddl_lsn: Lsn(17),
+            ordinal: 1,
+            table: Some("pulled_memories".to_string()),
+            table_generation: Some(1),
+            digest: canonical_ddl_provenance_digest(
+                &ddl,
+                Lsn(17),
+                1,
+                Some("pulled_memories"),
+                Some(1),
+            )
+            .unwrap(),
+        }],
+        purges: Vec::new(),
+    };
+
+    validate_wire_ddl_provenance(&wire)
+        .expect("direction filtering must not renumber the surviving schema identity");
+}
+
+const PUSH_REQUEST_WIRE: &str = "9306ab5075736852657175657374dc002ccc92cc96cc90cc90cc91cc98cca174cc93cca26964cc81cca5496e74363407cc90cc81cca26964cc81cca5496e74363407ccc207ccc0ccc0ccc0cc90cc90cc90cc920000";
+const PUSH_RESPONSE_WIRE: &str = "9306ac50757368526571706f6e7365dc0079cc92cc940101cc91cc97cc93cca26964cc81cca5496e74363407cc90ccaa6b6565705f6669727374ccaa6b6565705f6669727374cca56e6f746573cca465646974ccd940616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261622907ccc0";
+const AUTHORITY_ERROR_PUSH_RESPONSE_WIRE: &str = "9306ac50757368526573706f6e7365dc0065cc93ccc0ccc0cc81ccbd50757267655265717569726573417574686f7269746174697665487562cc91ccd94063646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364";
+const GAPPED_CONFLICT_WIRE: &str =
+    "9793a2696481a5496e7436340790aa6b6565705f6669727374a57075726765a56e6f746573a57075726765c029";
+const PULL_REQUEST_WIRE: &str = "9306ab50756c6c5265717565737495cc922acccd01ccf4";
+const PULL_RESPONSE_WIRE: &str =
+    "9306ac50756c6c526573706f6e73659bcc94cc96cc90cc90cc90cc90cc90cc90ccc22accc0";
+
+#[test]
+fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
     // PushRequest: one row, single-entry values map (deterministic encoding).
     let row = WireRowChange {
         table: "t".to_string(),
@@ -55,14 +148,17 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
         lsn: Lsn(7),
         created_at: None,
         arrival: None,
+        lineage: None,
     };
     let push_request = PushRequest {
         changeset: WireChangeSet {
             ddl: Vec::new(),
             ddl_lsn: Vec::new(),
+            ddl_provenance: Vec::new(),
             rows: vec![row],
             edges: Vec::new(),
             vectors: Vec::new(),
+            purges: Vec::new(),
         },
         incarnation: Incarnation::default(),
     };
@@ -70,8 +166,7 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
     assert_eq!(
         wire_hex(&push_request_bytes),
         PUSH_REQUEST_WIRE,
-        "PushRequest wire bytes changed — old servers cannot decode a reshaped \
-         push request; existing subjects must stay byte-identical"
+        "protocol v6 PushRequest wire bytes changed without an explicit version review"
     );
     let envelope = decode(&push_request_bytes).unwrap();
     let decoded: PushRequest = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -84,19 +179,30 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
     let push_response = PushResponse {
         result: Some(WireApplyResult {
             applied_rows: 1,
-            skipped_rows: 0,
-            conflicts: Vec::new(),
+            skipped_rows: 1,
+            conflicts: vec![WireConflict {
+                natural_key: WireNaturalKey {
+                    column: "id".to_string(),
+                    value: Value::Int64(7),
+                    rest: Vec::new(),
+                },
+                resolution: "keep_first".to_string(),
+                reason: Some("keep_first".to_string()),
+                table: Some("notes".to_string()),
+                mutation_kind: Some("edit".to_string()),
+                winning_author_node_id: Some("ab".repeat(32)),
+                hub_acceptance_position: Some(Lsn(41)),
+            }],
             new_lsn: Lsn(7),
         }),
         error: None,
+        application_error: None,
     };
     let push_response_bytes = encode(MessageType::PushResponse, &push_response).unwrap();
     assert_eq!(
         wire_hex(&push_response_bytes),
         PUSH_RESPONSE_WIRE,
-        "PushResponse wire bytes changed — old clients cannot decode a reshaped \
-         push reply (trailing fields fail with LengthMismatch); regression data \
-         belongs on the status subject, not here"
+        "protocol v6 PushResponse wire bytes changed without an explicit version review"
     );
     let envelope = decode(&push_response_bytes).unwrap();
     let decoded: PushResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -104,6 +210,44 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
         decoded, push_response,
         "pinned PushResponse bytes must round-trip"
     );
+
+    let authority_error = PushResponse {
+        result: None,
+        error: None,
+        application_error: Some(WirePushError::PurgeRequiresAuthoritativeHub {
+            hub_node_id: "cd".repeat(32),
+        }),
+    };
+    let authority_error_bytes = encode(MessageType::PushResponse, &authority_error).unwrap();
+    assert_eq!(
+        wire_hex(&authority_error_bytes),
+        AUTHORITY_ERROR_PUSH_RESPONSE_WIRE,
+        "protocol v6 structured purge-authority refusal bytes changed without an explicit version review"
+    );
+    let envelope = decode(&authority_error_bytes).unwrap();
+    let decoded: PushResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
+    assert_eq!(decoded, authority_error);
+
+    // Positional optional fields keep their slots. In particular, a hub
+    // position without a winning author must decode as a position, never
+    // shift left into the author field.
+    let gapped_conflict = WireConflict {
+        natural_key: WireNaturalKey {
+            column: "id".to_string(),
+            value: Value::Int64(7),
+            rest: Vec::new(),
+        },
+        resolution: "keep_first".to_string(),
+        reason: Some("purge".to_string()),
+        table: Some("notes".to_string()),
+        mutation_kind: Some("purge".to_string()),
+        winning_author_node_id: None,
+        hub_acceptance_position: Some(Lsn(41)),
+    };
+    let gapped_bytes = rmp_serde::to_vec(&gapped_conflict).unwrap();
+    assert_eq!(wire_hex(&gapped_bytes), GAPPED_CONFLICT_WIRE);
+    let decoded: WireConflict = rmp_serde::from_slice(&gapped_bytes).unwrap();
+    assert_eq!(decoded, gapped_conflict);
 
     // PullRequest.
     let pull_request = PullRequest {
@@ -114,8 +258,7 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
     assert_eq!(
         wire_hex(&pull_request_bytes),
         PULL_REQUEST_WIRE,
-        "PullRequest wire bytes changed — old servers cannot decode a reshaped \
-         pull request"
+        "protocol v6 PullRequest wire bytes changed without an explicit version review"
     );
     let envelope = decode(&pull_request_bytes).unwrap();
     let decoded: PullRequest = rmp_serde::from_slice(&envelope.payload).unwrap();
@@ -135,8 +278,7 @@ fn sr7_guard_push_and_pull_wire_bytes_are_frozen() {
     assert_eq!(
         wire_hex(&pull_response_bytes),
         PULL_RESPONSE_WIRE,
-        "PullResponse wire bytes changed — old clients cannot decode a reshaped \
-         pull reply; regression data belongs on the status subject, not here"
+        "protocol v6 PullResponse wire bytes changed without an explicit version review"
     );
     let envelope = decode(&pull_response_bytes).unwrap();
     let decoded: PullResponse = rmp_serde::from_slice(&envelope.payload).unwrap();

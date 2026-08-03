@@ -17,7 +17,7 @@ fn timestamp_audit_no_new_txid_shaped_columns() {
     let whitelist: BTreeSet<(String, u32)> = [
         (
             "crates/contextdb-engine/tests/sql_surface_tests.rs".to_string(),
-            888u32,
+            889u32,
         ),
         ("tests/acceptance/query_surface.rs".to_string(), 690u32),
         (

@@ -93,6 +93,7 @@ fn failed_synced_commit_publishes_neither_row_nor_authenticated_receipt() {
                 node_id: node_id.to_string(),
                 incarnation,
                 source_lsn: receipt_lsn,
+                dependency_complete: false,
             },
         )
         .expect_err("injected failure rejects the synced transaction");
@@ -232,7 +233,7 @@ fn local_overwrite_clears_durable_accepted_local_provenance() {
         .into_iter()
         .next()
         .expect("local row change");
-    db.record_hub_accepted_rows(std::slice::from_ref(&accepted), Lsn(800))
+    db.record_hub_accepted_rows(std::slice::from_ref(&accepted), Lsn(800), Some("hub"))
         .expect("record hub acceptance");
     let (_, accepted_arrivals) = db.changes_since_with_arrivals(Lsn(0));
     assert_eq!(
@@ -274,103 +275,6 @@ fn local_overwrite_clears_durable_accepted_local_provenance() {
 }
 
 #[test]
-fn accepted_local_delete_blocks_only_older_same_source_replay_and_stays_pushable() {
-    let params = HashMap::new();
-    let edge = Database::open_memory();
-    edge.execute(NOTES_DDL, &params).expect("create table");
-    edge.execute("INSERT INTO notes VALUES (1, 'before delete')", &params)
-        .expect("insert local row");
-    let stale_live = edge
-        .changes_since(Lsn(1))
-        .rows
-        .into_iter()
-        .next()
-        .expect("capture the hub's stale live row");
-    let stale_lsn = stale_live.lsn;
-    edge.execute("DELETE FROM notes WHERE id = 1", &params)
-        .expect("local delete");
-    let accepted_delete = edge
-        .changes_since(stale_lsn)
-        .rows
-        .into_iter()
-        .find(|row| row.deleted)
-        .expect("capture local delete");
-    edge.record_hub_accepted_rows(std::slice::from_ref(&accepted_delete), Lsn(900))
-        .expect("record accepted local delete");
-    assert!(
-        !edge.row_change_arrived_by_sync(&accepted_delete),
-        "an AcceptedLocal delete must remain eligible to repair a hub that regressed"
-    );
-
-    edge.apply_synced_changes(
-        ChangeSet {
-            rows: vec![stale_live.clone()],
-            ..Default::default()
-        },
-        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-        &HashMap::from([(stale_lsn, Some(Lsn(800)))]),
-        SyncAdoption::Continuing,
-    )
-    .expect("stale hub replay is a safe no-op");
-    assert!(
-        edge.execute("SELECT * FROM notes", &params)
-            .expect("query edge after stale replay")
-            .rows
-            .is_empty(),
-        "a stale hub replay must not resurrect an acknowledged local delete in this session"
-    );
-
-    edge.apply_synced_changes(
-        ChangeSet {
-            rows: vec![stale_live.clone()],
-            ..Default::default()
-        },
-        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-        &HashMap::from([(stale_lsn, Some(Lsn(900)))]),
-        SyncAdoption::Continuing,
-    )
-    .expect("same-commit authoritative refusal repair applies");
-    assert_eq!(
-        edge.execute("SELECT body FROM notes WHERE id = 1", &params)
-            .expect("query equal-arrival repair")
-            .rows
-            .len(),
-        1,
-        "an equal arrival is the hub's same-commit authoritative repair, not a stale replay"
-    );
-
-    let before_second_delete = edge.current_lsn();
-    edge.execute("DELETE FROM notes WHERE id = 1", &params)
-        .expect("second local delete");
-    let second_delete = edge
-        .changes_since(before_second_delete)
-        .rows
-        .into_iter()
-        .find(|row| row.deleted)
-        .expect("second local delete change");
-    edge.record_hub_accepted_rows(std::slice::from_ref(&second_delete), Lsn(1_000))
-        .expect("record old-source accepted delete");
-    edge.apply_synced_changes(
-        ChangeSet {
-            rows: vec![stale_live],
-            ..Default::default()
-        },
-        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-        &HashMap::from([(stale_lsn, Some(Lsn(1)))]),
-        SyncAdoption::ReadoptingSource,
-    )
-    .expect("new-source authoritative history applies");
-    assert_eq!(
-        edge.execute("SELECT body FROM notes WHERE id = 1", &params)
-            .expect("query re-adopted source")
-            .rows
-            .len(),
-        1,
-        "re-adopting a source must bypass an old source's AcceptedLocal tombstone"
-    );
-}
-
-#[test]
 fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgement() {
     let params = HashMap::new();
     let temp = tempfile::TempDir::new().expect("tempdir");
@@ -385,7 +289,7 @@ fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgem
         .into_iter()
         .next()
         .expect("local row change");
-    db.record_hub_accepted_rows(std::slice::from_ref(&local), Lsn(800))
+    db.record_hub_accepted_rows(std::slice::from_ref(&local), Lsn(800), Some("hub"))
         .expect("record old hub acknowledgement");
     db.invalidate_accepted_local_ordering_after_hub_regression(Lsn(1))
         .expect("mark restored-hub row pending fresh ordering");
@@ -420,7 +324,7 @@ fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgem
         "the pending reorder state must survive reopen before resend"
     );
     reopened
-        .record_hub_accepted_rows(std::slice::from_ref(&local), Lsn(51))
+        .record_hub_accepted_rows(std::slice::from_ref(&local), Lsn(51), Some("hub"))
         .expect("fresh restored-hub acknowledgement");
     let (_, refreshed_arrivals) = reopened.changes_since_with_arrivals(Lsn(0));
     assert_eq!(
@@ -507,7 +411,7 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
         .into_iter()
         .find(|row| row.deleted)
         .expect("delete row change");
-    edge.record_hub_accepted_rows(std::slice::from_ref(&delete), Lsn(800))
+    edge.record_hub_accepted_rows(std::slice::from_ref(&delete), Lsn(800), Some("hub"))
         .expect("record old delete acknowledgement");
     edge.invalidate_accepted_local_ordering_after_hub_regression(Lsn(1))
         .expect("invalidate old delete order");

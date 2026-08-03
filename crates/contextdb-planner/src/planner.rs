@@ -53,6 +53,10 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             values: i.values.clone(),
             on_conflict: i.on_conflict.clone().map(Into::into),
         })),
+        Statement::Purge(p) => Ok(PhysicalPlan::Purge(PurgePlan {
+            table: p.table.clone(),
+            where_clause: p.where_clause.clone(),
+        })),
         Statement::Delete(d) => Ok(PhysicalPlan::Delete(DeletePlan {
             table: d.table.clone(),
             where_clause: d.where_clause.clone(),

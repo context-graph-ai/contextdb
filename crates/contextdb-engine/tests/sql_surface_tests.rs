@@ -1,5 +1,6 @@
 #[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
-use contextdb_core::{ContextId, Error, Lsn, MemoryAccountant, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
+use contextdb_core::{ContextId, Error, Lsn, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
+use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::{Database, sync_types as sync};
 use std::collections::{BTreeSet, HashMap};
 #[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
@@ -7015,9 +7016,12 @@ fn disk_06_sync_pull_rejected_when_over_disk_budget() {
             ]),
         )
         .unwrap();
-    let limit_kib = (std::fs::metadata(&server_path).unwrap().len() / 1024).max(1);
     server
-        .execute(&format!("SET DISK_LIMIT '{limit_kib}K'"), &empty())
+        // A fixed cap below the primed database survives redb's close-time
+        // page reclamation.  Deriving the cap from a pre-close file length
+        // made this rejection depend on allocator layout rather than the
+        // sync-pull contract under test.
+        .execute("SET DISK_LIMIT '1K'", &empty())
         .unwrap();
     server.close().unwrap();
 
@@ -8303,35 +8307,23 @@ fn alter_table_drop_vector_column_waits_for_inflight_build_then_removes_index() 
         done_drop_tx.send(result).unwrap();
     });
     assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    build_pause.release();
+    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    // Table-changing SQL now waits at the statement-wide schema-publication
+    // gate until the paused search releases its read lease.  Only then can it
+    // enter the vector DDL drain below; do not issue a SQL read while this
+    // writer pause owns that gate.
     assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
-    let old_shape_during_pause = db
-        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
-        .is_ok();
-    let vision_shape_during_pause = db
-        .execute("SELECT vector_vision FROM evidence LIMIT 1", &empty())
-        .is_ok();
     let ref_present_during_pause = vector_store
         .index_infos()
         .iter()
         .any(|info| info.index == text_ref);
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
     ddl_pause.release();
-    let drop_done_before_build_release = done_drop_rx.try_recv();
-    let old_shape_after_ddl_release = db
-        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
-        .is_ok();
-    build_pause.release();
-    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
-    assert!(old_shape_during_pause);
-    assert!(vision_shape_during_pause);
     assert!(ref_present_during_pause);
-    assert!(matches!(
-        drop_done_before_build_release,
-        Err(TryRecvError::Empty)
-    ));
-    assert!(old_shape_after_ddl_release);
     assert!(
         db.execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
             .is_err()
@@ -8385,13 +8377,15 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
             .recv_timeout(PER_INDEX_SQL_TIMEOUT)
             .is_ok()
     );
+    assert!(matches!(
+        done_rename_rx.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    build_pause.release();
+    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    // The paused search holds the statement-wide schema read lease, so the
+    // rename cannot enter this DDL pause until that search completes.
     assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
-    let old_shape_during_pause = db
-        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
-        .is_ok();
-    let new_shape_during_pause = db
-        .execute("SELECT vector_text_v2 FROM evidence LIMIT 1", &empty())
-        .is_ok();
     let old_ref_present_during_pause = vector_store
         .index_infos()
         .iter()
@@ -8401,26 +8395,9 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
         Err(TryRecvError::Empty)
     ));
     ddl_pause.release();
-    let rename_done_before_build_release = done_rename_rx.try_recv();
-    let old_shape_after_ddl_release = db
-        .execute("SELECT vector_text FROM evidence LIMIT 1", &empty())
-        .is_ok();
-    let new_shape_after_ddl_release = db
-        .execute("SELECT vector_text_v2 FROM evidence LIMIT 1", &empty())
-        .is_ok();
-    build_pause.release();
-    let build_result = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
     let rename_result = done_rename_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
-    assert!(old_shape_during_pause);
-    assert!(!new_shape_during_pause);
     assert!(old_ref_present_during_pause);
-    assert!(matches!(
-        rename_done_before_build_release,
-        Err(TryRecvError::Empty)
-    ));
-    assert!(old_shape_after_ddl_release);
-    assert!(!new_shape_after_ddl_release);
     assert!(
         db.execute(
             "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
@@ -9326,26 +9303,17 @@ fn drop_table_waits_for_inflight_vector_builds_then_removes_all_indexes() {
         done_drop_tx.send(result).unwrap();
     });
     assert!(started_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT).is_ok());
-    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
-    let table_shape_during_pause = db
-        .execute("SELECT id FROM evidence LIMIT 1", &empty())
-        .is_ok();
     assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
-    ddl_pause.release();
-    let drop_done_before_build_release = done_drop_rx.try_recv();
-    let table_shape_after_ddl_release = db
-        .execute("SELECT id FROM evidence LIMIT 1", &empty())
-        .is_ok();
     build_pause.release();
     let _ = done_build_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
+    // DROP TABLE likewise cannot pass the statement-wide schema writer gate
+    // while the vector search is paused.  The table-level DDL pause is only
+    // reachable after that read lease is released.
+    assert!(ddl_pause.wait_until_reached(PER_INDEX_SQL_TIMEOUT));
+    assert!(matches!(done_drop_rx.try_recv(), Err(TryRecvError::Empty)));
+    ddl_pause.release();
     let drop_result = done_drop_rx.recv_timeout(PER_INDEX_SQL_TIMEOUT);
 
-    assert!(table_shape_during_pause);
-    assert!(matches!(
-        drop_done_before_build_release,
-        Err(TryRecvError::Empty)
-    ));
-    assert!(table_shape_after_ddl_release);
     drop_result.unwrap().unwrap();
     assert!(
         db.execute("SELECT id FROM evidence LIMIT 1", &empty())

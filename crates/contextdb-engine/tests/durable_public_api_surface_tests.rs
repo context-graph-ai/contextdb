@@ -1,5 +1,6 @@
 //! External callers may inspect durable state but cannot forge it.
 
+use contextdb_engine::Database;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{ImplItem, ImplItemFn, Item, Meta, Type, Visibility};
+use syn::{ImplItem, ImplItemFn, Item, ItemImpl, Meta, Type, Visibility};
 
 fn engine_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -215,6 +216,9 @@ fn external_callers_cannot_mutate_sync_progress_or_raw_accounting() {
             "apply_synced_changes_with_receipt",
         ),
         ("role_relative_policy_types", "conflictpolicy"),
+        ("legacy_source_mutation", "execute"),
+        ("raw_blob_repository_type", "blob_repository"),
+        ("raw_blob_repository_accessor", "blob_repository"),
     ]);
 
     let allowed = cargo_fixture(&fixture("public_api_allowed"), "check", None, &[]);
@@ -243,8 +247,7 @@ fn external_callers_cannot_inject_an_accountant_durability_bypass() {
 
 #[test]
 fn callerless_applied_push_writer_is_absent() {
-    let database = std::fs::read_to_string(engine_root().join("src/database.rs"))
-        .expect("read production Database surface");
+    let database = method_names(&database_public_methods(&engine_root()));
     assert!(
         !database.contains("persist_sync_applied_push_watermark_for_node"),
         "the callerless per-node applied-push writer must be removed from production Database"
@@ -253,6 +256,89 @@ fn callerless_applied_push_writer_is_absent() {
         "callerless_applied_push_writer",
         "persist_sync_applied_push_watermark_for_node",
     )]);
+}
+
+#[test]
+fn legacy_migration_source_is_read_only_and_current_roots_are_refused_unchanged() {
+    let legacy_methods = method_names(&public_impl_methods(
+        &engine_root().join("src/database.rs"),
+        "LegacyMigrationSource",
+    ));
+    assert_eq!(
+        legacy_methods,
+        BTreeSet::from(["close".to_string(), "keyless_table_rows".to_string()]),
+        "the validated legacy source may expose only its fixed read-only snapshot and close operations"
+    );
+
+    let dir = tempfile::tempdir().expect("current-format tempdir");
+    let path = dir.path().join("current.db");
+    let db = Database::open(&path).expect("create current-format database");
+    db.execute(
+        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT)",
+        &Default::default(),
+    )
+    .expect("seed current-format schema");
+    db.close().expect("close current-format database");
+    let before = std::fs::read(&path).expect("read current-format bytes before refusal");
+
+    let err = match Database::open_legacy_for_migration(&path) {
+        Ok(_) => panic!("a current-format root must not become a privileged migration source"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("already current-format"),
+        "the typed migration boundary must explain the current-format refusal: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read current-format bytes after refusal"),
+        before,
+        "validating a rejected current-format source must be read-only"
+    );
+}
+
+#[test]
+fn visibility_changing_macro_definitions_match_the_audited_contract() {
+    const TEST_SEAM_PUBLIC: &str = r#"#[cfg(feature = "test-seams")]
+macro_rules! sync_test_seam {
+    ($(#[$attr:meta])* fn $($item:tt)*) => {
+        $(#[$attr])*
+        pub fn $($item)*
+    };
+}"#;
+    const TEST_SEAM_CRATE_PRIVATE: &str = r#"#[cfg(not(feature = "test-seams"))]
+macro_rules! sync_test_seam {
+    ($(#[$attr:meta])* fn $($item:tt)*) => {
+        $(#[$attr])*
+        pub(crate) fn $($item)*
+    };
+}"#;
+    const IROH_GATE: &str = r#"macro_rules! peer_endpoint_available {
+    ($item:item) => {
+        #[cfg(feature = "iroh")]
+        $item
+    };
+}"#;
+
+    let database = std::fs::read_to_string(engine_root().join("src/database.rs"))
+        .expect("read Database macro definitions");
+    assert_eq!(
+        database.matches("macro_rules! sync_test_seam").count(),
+        2,
+        "the test-seam visibility macro definition set changed"
+    );
+    assert_eq!(database.matches(TEST_SEAM_PUBLIC).count(), 1);
+    assert_eq!(database.matches(TEST_SEAM_CRATE_PRIVATE).count(), 1);
+
+    let transport = std::fs::read_to_string(engine_root().join("src/transport/mod.rs"))
+        .expect("read transport macro definitions");
+    assert_eq!(
+        transport
+            .matches("macro_rules! peer_endpoint_available")
+            .count(),
+        1,
+        "the Iroh item gate definition set changed"
+    );
+    assert_eq!(transport.matches(IROH_GATE).count(), 1);
 }
 
 fn public_impl_methods(path: &Path, target: &str) -> Vec<ImplItemFn> {
@@ -273,13 +359,60 @@ fn public_impl_methods(path: &Path, target: &str) -> Vec<ImplItemFn> {
         })
         .flat_map(|item| item.items)
         .filter_map(|item| match item {
-            ImplItem::Fn(method)
-                if matches!(method.vis, Visibility::Public(_))
-                    && !method.attrs.iter().any(cfg_is_test_only) =>
-            {
-                Some(method)
+            ImplItem::Fn(method) => Some(method),
+            ImplItem::Macro(item) => {
+                let path = item
+                    .mac
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                match path.as_str() {
+                    // This macro only adds `#[cfg(feature = "iroh")]`; the
+                    // wrapped method's visibility is therefore authoritative.
+                    "crate::transport::peer_endpoint_available" => Some(
+                        syn::parse2::<ImplItemFn>(item.mac.tokens).expect(
+                            "peer_endpoint_available must wrap exactly one auditable method",
+                        ),
+                    ),
+                    // In ordinary builds this macro deliberately changes the
+                    // wrapped private `fn` to `pub(crate) fn`; neither form is
+                    // a downstream public door. Parsing still proves the macro
+                    // contains only audited methods rather than hiding arbitrary
+                    // impl items. Some invocations deliberately carry private
+                    // helper methods after the first visibility-injected method.
+                    "sync_test_seam" => {
+                        let tokens = item.mac.tokens;
+                        let wrapper = format!("impl __PublicSurfaceAudit {{ {tokens} }}");
+                        let methods = syn::parse_str::<ItemImpl>(&wrapper)
+                            .unwrap_or_else(|err| {
+                                panic!("sync_test_seam must contain auditable impl items; {err}")
+                            })
+                            .items;
+                        assert!(!methods.is_empty(), "sync_test_seam must not be empty");
+                        for method in methods {
+                            let ImplItem::Fn(method) = method else {
+                                panic!(
+                                    "sync_test_seam may contain methods only; another impl item could hide a public {target} door"
+                                )
+                            };
+                            assert!(
+                                !matches!(method.vis, Visibility::Public(_)),
+                                "sync_test_seam input must not declare its own public {target} method"
+                            );
+                        }
+                        None
+                    }
+                    _ => panic!("unaudited impl-item macro `{path}` can hide a public {target} method"),
+                }
             }
             _ => None,
+        })
+        .filter(|method| {
+            matches!(method.vis, Visibility::Public(_))
+                && !method.attrs.iter().any(cfg_is_test_only)
         })
         .collect()
 }
@@ -299,7 +432,7 @@ fn cfg_condition_is_test_only(condition: &Meta) -> bool {
         Meta::Path(path) => path.is_ident("test"),
         Meta::NameValue(value) => {
             value.path.is_ident("feature")
-                && matches!(&value.value, syn::Expr::Lit(literal) if matches!(&literal.lit, syn::Lit::Str(name) if name.value() == "test-seams"))
+                && matches!(&value.value, syn::Expr::Lit(literal) if matches!(&literal.lit, syn::Lit::Str(name) if matches!(name.value().as_str(), "test-seams" | "production-smoke-driver")))
         }
         Meta::List(list) if list.path.is_ident("any") || list.path.is_ident("all") => {
             let branches = list

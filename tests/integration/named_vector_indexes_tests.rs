@@ -2148,7 +2148,8 @@ fn nv16c_alter_table_add_column_registers_new_vector_index() {
 
 #[test]
 fn nv_memory_budget_exceeded_carries_index_tag_in_operation_string() {
-    use contextdb_core::{Error, MemoryAccountant};
+    use contextdb_core::Error;
+    use contextdb_engine::memory_accounting::MemoryAccountant;
     use std::sync::Arc;
 
     // Tiny memory budget forces the failure to fire on a vector insert. The ensuing error must surface

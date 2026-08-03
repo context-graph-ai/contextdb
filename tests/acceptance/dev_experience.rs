@@ -34,7 +34,8 @@ fn f37_readme_quick_start_actually_works() {
     }
 }
 
-/// I ran --help on both the CLI and server binaries, and each one listed all the flags I need (tenant-id, nats-url, db-path).
+/// I ran --help on both the CLI and server binaries, and each one listed all
+/// the flags I need (tenant-id, sync-endpoint, db-path).
 #[test]
 fn f38_help_on_both_binaries_explains_all_options_clearly() {
     ensure_release_binaries();
@@ -51,10 +52,10 @@ fn f38_help_on_both_binaries_explains_all_options_clearly() {
     assert!(cli.status.success());
     assert!(server.status.success());
     assert!(cli_stdout.contains("--tenant-id"));
-    assert!(cli_stdout.contains("--nats-url"));
+    assert!(cli_stdout.contains("--sync-endpoint"));
     assert!(server_stdout.contains("--db-path"));
     assert!(server_stdout.contains("--tenant-id"));
-    assert!(server_stdout.contains("--nats-url"));
+    assert!(server_stdout.contains("--sync-endpoint"));
 }
 
 /// I typed a misspelled SQL keyword, and the error said "parse error" or "syntax" — not a panic backtrace.

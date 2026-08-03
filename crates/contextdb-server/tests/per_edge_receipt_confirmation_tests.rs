@@ -17,7 +17,6 @@
 
 use contextdb_core::{Incarnation, Lsn, TenantId, Value, Wallclock};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_engine::work_ledger::{advertise_capability, install_work_ledger_schema};
 use contextdb_server::protocol::{
     MessageType, SyncStatusRequest, SyncStatusResponse, decode, encode,
@@ -26,9 +25,11 @@ use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
 use contextdb_server::transport::{
     ClientTransport, TransportError, TransportFuture, TransportResult, TransportStatusFuture,
 };
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -37,24 +38,69 @@ const TENANT: &str = "per-edge-receipts";
 /// The hub's authenticated node id. An edge dials its hub by key, so it always
 /// knows who answered; the in-process broker presents this exactly as the p2p
 /// transport path presents the dialed endpoint's node id.
-const HUB_NODE: &str = "hub-node-a";
+const HUB_NODE: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 /// The two edges. These are the identities the transport authenticates on the
 /// connection — the hub reads them off the request, the request bytes never
 /// carry them.
-const EDGE_A: &str = "edge-node-a";
-const EDGE_B: &str = "edge-node-b";
+const EDGE_A: &str = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+const EDGE_B: &str = "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf";
 /// Two tenants served by ONE hub database (the multi-tenant hub shape). The
 /// per-(tenant, edge) test drives the SAME authenticated edge into both.
 const TENANT_1: &str = "per-edge-tenant-one";
 const TENANT_2: &str = "per-edge-tenant-two";
 
-const NOTES_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+const NOTES_DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST";
 /// Retention plus the delivery promise, with NO direction word: this spelling
 /// parses identically regardless of the direction-clause grammar, so the
 /// expired-rows-survive scenario pins the deletion gate rather than the grammar
 /// in flight beside it.
-const RETAINED_DDL: &str =
-    "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) RETAIN 1 HOURS SYNC SAFE";
+const RETAINED_DDL: &str = "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) RETAIN 1 HOURS SYNC SAFE SYNC CONFLICT KEEP FIRST";
+
+const HUB_SEED: [u8; 32] = [
+    0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+    0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
+];
+const EDGE_A_SEED: [u8; 32] = [
+    0x4c, 0xcd, 0x08, 0x9b, 0x28, 0xff, 0x96, 0xda, 0x9d, 0xb6, 0xc3, 0x46, 0xec, 0x11, 0x4e, 0x0f,
+    0x5b, 0x8a, 0x31, 0x9f, 0x35, 0xab, 0xa6, 0x24, 0xda, 0x8c, 0xf6, 0xed, 0x4f, 0xb8, 0xa6, 0xfb,
+];
+const EDGE_B_SEED: [u8; 32] = [
+    0x83, 0x3f, 0xe6, 0x24, 0x09, 0x23, 0x7b, 0x9d, 0x62, 0xec, 0x77, 0x58, 0x75, 0x20, 0x91, 0x1e,
+    0x9a, 0x75, 0x9c, 0xec, 0x1d, 0x19, 0x75, 0x5b, 0x7d, 0xa9, 0x01, 0xb9, 0x6d, 0xca, 0x3d, 0x42,
+];
+
+fn identity_from_seed(node_id: &str, seed: [u8; 32]) -> Arc<FabricIdentity> {
+    let mut key = tempfile::NamedTempFile::new().expect("temporary fabric identity");
+    key.write_all(&seed).expect("write test fabric identity");
+    key.flush().expect("flush test fabric identity");
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(key.path()).expect("load test fabric identity"));
+    assert_eq!(
+        identity.node_id(),
+        node_id,
+        "test identity must match its node id"
+    );
+    identity
+}
+
+fn identity_for_node(node_id: &str) -> Arc<FabricIdentity> {
+    static HUB: OnceLock<Arc<FabricIdentity>> = OnceLock::new();
+    static EDGE_A_IDENTITY: OnceLock<Arc<FabricIdentity>> = OnceLock::new();
+    static EDGE_B_IDENTITY: OnceLock<Arc<FabricIdentity>> = OnceLock::new();
+    match node_id {
+        HUB_NODE => HUB
+            .get_or_init(|| identity_from_seed(HUB_NODE, HUB_SEED))
+            .clone(),
+        EDGE_A => EDGE_A_IDENTITY
+            .get_or_init(|| identity_from_seed(EDGE_A, EDGE_A_SEED))
+            .clone(),
+        EDGE_B => EDGE_B_IDENTITY
+            .get_or_init(|| identity_from_seed(EDGE_B, EDGE_B_SEED))
+            .clone(),
+        other => panic!("unknown test fabric node identity: {other}"),
+    }
+}
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -162,12 +208,16 @@ impl RunningHub {
 }
 
 fn start_hub_on_tenant(broker: &InProcessBroker, db: Arc<Database>, tenant: &str) -> RunningHub {
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(tenant),
-        ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
-    ));
+    let identity = identity_for_node(HUB_NODE);
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(HUB_NODE),
+            TenantId::from(tenant),
+            HUB_NODE.to_string(),
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -199,10 +249,12 @@ fn edge_client_on_tenant(
     node_id: &str,
     tenant: &str,
 ) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = identity_for_node(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         broker.client_as(node_id),
         TenantId::from(tenant),
+        identity,
     )
 }
 
@@ -336,6 +388,10 @@ impl ClientTransport for DropPushRequestOnTheWire {
         self.inner.peer_node_id()
     }
 
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+
     fn has_stable_edge_identity(&self) -> bool {
         self.inner.has_stable_edge_identity()
     }
@@ -383,13 +439,15 @@ impl ClientTransport for DropPushRequestOnTheWire {
 }
 
 fn dropped_push_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = identity_for_node(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(DropPushRequestOnTheWire {
             inner: broker.client_as(node_id),
             push_subject: push_subject(TENANT),
         }),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -1446,6 +1504,10 @@ impl ClientTransport for ForwardPushThenDropAck {
         self.inner.peer_node_id()
     }
 
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+
     fn has_stable_edge_identity(&self) -> bool {
         self.inner.has_stable_edge_identity()
     }
@@ -1529,7 +1591,8 @@ fn landed_ack_lost_client(
     broker: &InProcessBroker,
     node_id: &str,
 ) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = identity_for_node(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(ForwardPushThenDropAck {
             inner: broker.client_as(node_id),
@@ -1537,6 +1600,7 @@ fn landed_ack_lost_client(
             drop_first_pull: None,
         }),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -1545,7 +1609,8 @@ fn landed_ack_lost_with_recovery_pull_dropped_client(
     broker: &InProcessBroker,
     node_id: &str,
 ) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = identity_for_node(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(ForwardPushThenDropAck {
             inner: broker.client_as(node_id),
@@ -1553,6 +1618,7 @@ fn landed_ack_lost_with_recovery_pull_dropped_client(
             drop_first_pull: Some(Arc::new(AtomicBool::new(true))),
         }),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -1826,6 +1892,10 @@ impl ClientTransport for ForwardPushThenAlterThenDropAck {
         self.inner.peer_node_id()
     }
 
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+
     fn has_stable_edge_identity(&self) -> bool {
         self.inner.has_stable_edge_identity()
     }
@@ -1912,7 +1982,8 @@ async fn fixa_concurrent_direction_change_does_not_reject_a_landed_push() {
     let frontier = edge.current_lsn();
     assert!(frontier > Lsn(0), "the edge has delivering rows to push");
 
-    let client = SyncClient::with_transport(
+    let identity = identity_for_node(EDGE_A);
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge.clone(),
         Arc::new(ForwardPushThenAlterThenDropAck {
             inner: broker.client_as(EDGE_A),
@@ -1922,6 +1993,7 @@ async fn fixa_concurrent_direction_change_does_not_reject_a_landed_push() {
             altered: AtomicBool::new(false),
         }),
         TenantId::from(TENANT),
+        identity,
     );
     let outcome = within(client.push()).await;
 
@@ -1985,6 +2057,10 @@ struct ProbeFailsThenPushDropped {
 impl ClientTransport for ProbeFailsThenPushDropped {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
     }
 
     fn has_stable_edge_identity(&self) -> bool {
@@ -2056,7 +2132,8 @@ fn probe_failing_dropped_push_client(
     broker: &InProcessBroker,
     node_id: &str,
 ) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = identity_for_node(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(ProbeFailsThenPushDropped {
             inner: broker.client_as(node_id),
@@ -2065,6 +2142,7 @@ fn probe_failing_dropped_push_client(
             status_calls: AtomicU64::new(0),
         }),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -2083,6 +2161,10 @@ struct WarmupConfirmsThenPushDropped {
 impl ClientTransport for WarmupConfirmsThenPushDropped {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
     }
 
     fn has_stable_edge_identity(&self) -> bool {
@@ -2140,7 +2222,8 @@ fn warmup_then_dropped_push_client(
     node_id: &str,
 ) -> (SyncClient, Arc<AtomicBool>) {
     let drop_after_warmup = Arc::new(AtomicBool::new(false));
-    let client = SyncClient::with_transport(
+    let identity = identity_for_node(node_id);
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(WarmupConfirmsThenPushDropped {
             inner: broker.client_as(node_id),
@@ -2148,6 +2231,7 @@ fn warmup_then_dropped_push_client(
             drop_after_warmup: drop_after_warmup.clone(),
         }),
         TenantId::from(TENANT),
+        identity,
     );
     (client, drop_after_warmup)
 }
@@ -2692,12 +2776,10 @@ fn reopen_retains_the_edge_incarnation_while_a_fresh_database_mints_a_new_one() 
 }
 
 // ---------------------------------------------------------------------------
-// Restart-survival regression guard: a row committed via the work-ledger
-// surface, dropped WITHOUT ever pushing, still pushes after a fresh reopen.
-// This is a GREEN pinning test: it verifies already-correct shipped
-// behavior (`SyncClient::with_transport` loads its push watermark from the
-// durable engine state, not an in-process-only counter), not a defect this
-// change fixes. It belongs beside
+// A row committed via the work-ledger surface, dropped without ever pushing,
+// still pushes after a fresh reopen. A restarted authenticated client loads
+// its push watermark from durable engine state, not an in-process-only
+// counter. This belongs beside
 // `reopen_retains_the_edge_incarnation_while_a_fresh_database_mints_a_new_one`
 // above, which pins the sibling incarnation-reload half of the same restart
 // story.
@@ -2733,7 +2815,7 @@ async fn a_row_committed_before_an_unclean_restart_still_pushes_after_reopen() {
 
     // Reopen fresh, exactly as a new process would after the restart.
     let db = Arc::new(Database::open(path.clone()).expect("reopen edge db"));
-    let client = edge_client(&db, &broker, "edge-restart");
+    let client = edge_client(&db, &broker, EDGE_A);
 
     assert!(
         client

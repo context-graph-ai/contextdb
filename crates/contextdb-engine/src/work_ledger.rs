@@ -21,7 +21,7 @@
 //!   data. This module names no work class and imports no product type.
 //! - **No transport.** Cross-machine arbitration rides the ordinary sync
 //!   changeset path; this module never names a pipe. The per-table conflict
-//!   policies in [`work_ledger_conflict_policy_entries`] are the whole
+//!   internal per-table policy entries are the whole
 //!   distributed contract: single-writer-per-key tables ride
 //!   insert-if-not-exists; hub-refereed tables (claims, results,
 //!   cancellations) ride server-wins so the hub's first-arrived row stands,
@@ -67,7 +67,7 @@ const CREATE_WORK_JOBS: &str = "CREATE TABLE work_jobs (\
      max_attempts INTEGER NOT NULL, \
      submitter_node_id TEXT NOT NULL, \
      provenance JSON, \
-     submitted_at TIMESTAMP NOT NULL)";
+     submitted_at TIMESTAMP NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
 const CREATE_WORK_CLAIMS: &str = "CREATE TABLE work_claims (\
      claim_key TEXT PRIMARY KEY, \
@@ -75,7 +75,7 @@ const CREATE_WORK_CLAIMS: &str = "CREATE TABLE work_claims (\
      attempt INTEGER NOT NULL, \
      node_id TEXT NOT NULL, \
      lease_deadline TIMESTAMP NOT NULL, \
-     claimed_at TIMESTAMP NOT NULL)";
+     claimed_at TIMESTAMP NOT NULL) SYNC TWO WAY";
 
 const CREATE_WORK_RESULTS: &str = "CREATE TABLE work_results (\
      job_id TEXT PRIMARY KEY, \
@@ -83,7 +83,7 @@ const CREATE_WORK_RESULTS: &str = "CREATE TABLE work_results (\
      executor_node_id TEXT NOT NULL, \
      output TEXT NOT NULL, \
      receipt JSON NOT NULL, \
-     completed_at TIMESTAMP NOT NULL)";
+     completed_at TIMESTAMP NOT NULL) SYNC TWO WAY";
 
 const CREATE_WORK_FAILURES: &str = "CREATE TABLE work_failures (\
      failure_key TEXT PRIMARY KEY, \
@@ -91,13 +91,13 @@ const CREATE_WORK_FAILURES: &str = "CREATE TABLE work_failures (\
      attempt INTEGER NOT NULL, \
      node_id TEXT NOT NULL, \
      error TEXT NOT NULL, \
-     failed_at TIMESTAMP NOT NULL)";
+     failed_at TIMESTAMP NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
 const CREATE_WORK_CANCELLATIONS: &str = "CREATE TABLE work_cancellations (\
      job_id TEXT PRIMARY KEY, \
      requested_by TEXT NOT NULL, \
      reason TEXT, \
-     cancelled_at TIMESTAMP NOT NULL)";
+     cancelled_at TIMESTAMP NOT NULL) SYNC TWO WAY";
 
 // `work_inputs` is keep-first and it syncs, so it is not itself eligible for
 // `HISTORY CURRENT ONLY` (its rows are immutable copies with no superseded
@@ -112,7 +112,7 @@ const CREATE_WORK_INPUTS: &str = "CREATE TABLE work_inputs (\
      input_key TEXT PRIMARY KEY, \
      job_id TEXT NOT NULL, \
      seq INTEGER NOT NULL, \
-     payload TEXT NOT NULL) RETAIN 7 DAYS";
+     payload TEXT NOT NULL) RETAIN 7 DAYS SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
 // A current-truth registry, re-advertised on a cadence (only the newest
 // advertisement per node has consumer value), so it declares its own
@@ -127,7 +127,7 @@ const CREATE_WORK_CAPABILITIES: &str = "CREATE TABLE work_capabilities (\
      capability_id TEXT NOT NULL, \
      tags JSON NOT NULL, \
      detail JSON, \
-     advertised_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST";
+     advertised_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 
 /// Materialized input chunks: (sequence number, payload bytes).
 pub type ExecutionInputs = Vec<(i64, Vec<u8>)>;
@@ -665,6 +665,32 @@ fn input_refs_from_json(value: &serde_json::Value) -> Result<Vec<InputRef>> {
         .collect()
 }
 
+/// Decode one canonical `work_jobs.input_refs` value and return every
+/// content-addressed blob identity in its canonical lowercase form.  This is
+/// pure so destructive kernels can validate and prebuild their complete
+/// outcome before crossing a persistence boundary.
+pub(crate) fn canonical_blob_hashes_from_input_refs(value: &Value) -> Result<Vec<String>> {
+    let Value::Json(value) = value else {
+        return Err(Error::Other(
+            "work ledger: input_refs must be JSON".to_string(),
+        ));
+    };
+    input_refs_from_json(value)?
+        .into_iter()
+        .filter(|input_ref| input_ref.kind == REF_KIND_BLOB_REF)
+        .map(|input_ref| {
+            let hash = input_ref
+                .detail
+                .get("hash")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    Error::Other("work ledger: blob_ref input needs a string hash".to_string())
+                })?;
+            BlobHash::from_hex(hash).map(|hash| hash.to_hex())
+        })
+        .collect()
+}
+
 fn input_refs_to_json(refs: &[InputRef]) -> serde_json::Value {
     serde_json::Value::Array(
         refs.iter()
@@ -704,7 +730,7 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
     if existing.iter().any(|name| name == "work_capabilities")
         && let Some(meta) = db.table_meta("work_capabilities")
     {
-        if meta.conflict_policy != Some(ConflictPolicy::LatestWins) {
+        if meta.conflict_policy != Some(contextdb_core::ConflictPolicy::KEEP_LATEST) {
             db.execute(
                 "ALTER TABLE work_capabilities SET SYNC CONFLICT KEEP LATEST",
                 &HashMap::new(),
@@ -740,7 +766,7 @@ pub fn install_work_ledger_schema(db: &Database) -> Result<()> {
 
 /// The per-table conflict contract (see the module doc for why each table
 /// carries the policy it does).
-pub fn work_ledger_conflict_policy_entries() -> [(&'static str, ConflictPolicy); 7] {
+fn work_ledger_conflict_policy_entries_inner() -> [(&'static str, ConflictPolicy); 7] {
     [
         ("work_jobs", ConflictPolicy::InsertIfNotExists),
         ("work_claims", ConflictPolicy::ServerWins),
@@ -758,12 +784,27 @@ pub fn work_ledger_conflict_policy_entries() -> [(&'static str, ConflictPolicy);
     ]
 }
 
+#[cfg(feature = "test-seams")]
+pub fn work_ledger_conflict_policy_entries() -> [(&'static str, ConflictPolicy); 7] {
+    work_ledger_conflict_policy_entries_inner()
+}
+
 /// Merge the ledger's per-table policies over `policies`. Sync chokepoints
 /// call this so no caller can arbitrate a work table incorrectly.
-pub fn apply_work_ledger_policy_overrides(policies: &mut ConflictPolicies) {
-    for (table, policy) in work_ledger_conflict_policy_entries() {
+fn apply_work_ledger_policy_overrides_inner(policies: &mut ConflictPolicies) {
+    for (table, policy) in work_ledger_conflict_policy_entries_inner() {
         policies.per_table.insert(table.to_string(), policy);
     }
+}
+
+#[cfg(feature = "test-seams")]
+pub fn apply_work_ledger_policy_overrides(policies: &mut ConflictPolicies) {
+    apply_work_ledger_policy_overrides_inner(policies);
+}
+
+#[cfg(not(feature = "test-seams"))]
+pub(crate) fn apply_work_ledger_policy_overrides(policies: &mut ConflictPolicies) {
+    apply_work_ledger_policy_overrides_inner(policies);
 }
 
 /// Write the job row inside the caller's open transaction, so submission
@@ -1559,7 +1600,7 @@ pub fn advertised_tags(db: &Database, node_id: &str) -> Result<Vec<String>> {
 /// - [`contextdb_core::Error::InputRequiresBlobResolver`] if any of the
 ///   job's inputs is a `blob_ref` — its bytes never ride the ledger, so the
 ///   caller must fetch it through the blob resolver
-///   (`contextdb-server`'s `blob_resolver::BlobStore::resolve_blob_ref`)
+///   ([`crate::blob_store::BlobStore::resolve_blob_ref`])
 ///   instead of this function.
 pub fn materialize_inputs(
     db: &Database,

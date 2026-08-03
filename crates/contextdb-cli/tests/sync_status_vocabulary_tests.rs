@@ -18,7 +18,7 @@ fn sample_view(connected: bool) -> SyncEndpointStatusView {
 }
 
 #[test]
-fn sync_status_output_speaks_endpoint_language_not_nats() {
+fn sync_status_output_speaks_endpoint_language() {
     let rendered = render_sync_endpoint_status(&sample_view(true));
     let lower = rendered.to_ascii_lowercase();
 
@@ -45,12 +45,8 @@ fn sync_status_output_speaks_endpoint_language_not_nats() {
         );
     }
     assert!(
-        !lower.contains("nats"),
-        "the default-path status must not name any concrete transport, got: {rendered}"
-    );
-    assert!(
         !lower.contains("url="),
-        "the broker-URL vocabulary is replaced by endpoint vocabulary, got: {rendered}"
+        "URL vocabulary is replaced by endpoint vocabulary, got: {rendered}"
     );
 }
 
@@ -61,10 +57,6 @@ fn sync_status_reports_unreachable_in_neutral_vocabulary() {
     assert!(
         lower.contains("transport: unreachable"),
         "a down endpoint must render as 'transport: unreachable', got: {rendered}"
-    );
-    assert!(
-        !lower.contains("nats"),
-        "no transport brand names: {rendered}"
     );
 }
 
@@ -80,10 +72,4 @@ fn reconnect_outcome_speaks_endpoint_language() {
         failed.contains("unreachable") && failed.contains("endpoint"),
         "reconnect failure must speak endpoint language, got: {failed}"
     );
-    for outcome in [&ok, &failed] {
-        assert!(
-            !outcome.contains("nats"),
-            "no transport brand names: {outcome}"
-        );
-    }
 }

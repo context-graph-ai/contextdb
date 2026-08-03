@@ -3,14 +3,15 @@ use crate::database::{
     UpsertIntentDetails, rank_index_name,
 };
 use crate::rank_formula::RankFormula;
-use crate::sync_types::ConflictPolicy;
+use crate::sync_types::{DdlChange, natural_key_from_row_values};
 use contextdb_core::*;
 use contextdb_parser::ast::{
     AlterAction, BinOp, ColumnRef, Cte, DataType, Expr, Literal, SelectStatement,
     SetDiskLimitValue, SetMemoryLimitValue, SortDirection, Statement, UnaryOp,
 };
 use contextdb_planner::{
-    DeletePlan, GraphStepPlan, InsertPlan, OnConflictPlan, PhysicalPlan, UpdatePlan, plan,
+    DeletePlan, GraphStepPlan, InsertPlan, OnConflictPlan, PhysicalPlan, PurgePlan, UpdatePlan,
+    plan,
 };
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
@@ -21,7 +22,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+// This never reaches a caller: the public entrypoint catches it and reruns
+// the complete local DDL validation/projection after another schema writer
+// released the allocation lock.
+const RETRY_LOCAL_SCHEMA_PROJECTION: &str = "__contextdb_internal_retry_local_schema_projection__";
+
+/// Local structural DDL validates cross-table rules (notably foreign keys)
+/// before taking the allocation lock. The complete map, rather than only the
+/// target table, is therefore the concurrency baseline.
+fn schema_snapshot_matches(db: &Database, expected: &HashMap<TableName, TableMeta>) -> bool {
+    *db.relational_store().table_meta.read() == *expected
+}
+
 pub(crate) fn execute_plan(
+    db: &Database,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+) -> Result<QueryResult> {
+    loop {
+        match execute_plan_once(db, plan, params, tx) {
+            Err(Error::Other(message)) if message == RETRY_LOCAL_SCHEMA_PROJECTION => continue,
+            result => return result,
+        }
+    }
+}
+
+fn execute_plan_once(
     db: &Database,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
@@ -31,6 +58,11 @@ pub(crate) fn execute_plan(
         PhysicalPlan::CreateTable(p) => {
             require_admin_for_create_table(db)?;
             db.check_disk_budget("CREATE TABLE")?;
+            // Foreign-key and duplicate-table validation below reads the
+            // complete schema, not only this table. Keep that baseline until
+            // the DDL allocation lock so another structural write cannot make
+            // a previously valid CREATE overwrite or contradict it.
+            let validated_schema = db.relational_store().table_meta.read().clone();
             if p.name.eq_ignore_ascii_case("acl_grants")
                 && p.columns.iter().any(|column| column.acl_ref.is_some())
             {
@@ -190,12 +222,6 @@ pub(crate) fn execute_plan(
             meta.indexes = auto_indexes_for_table_meta(&meta);
             auto_indexes = meta.indexes.clone();
             let metadata_bytes = meta.estimated_bytes();
-            db.accountant().try_allocate_for(
-                metadata_bytes,
-                "ddl",
-                "create_table",
-                "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
-            )?;
             let has_vector_columns = meta
                 .columns
                 .iter()
@@ -210,6 +236,27 @@ pub(crate) fn execute_plan(
                     .map(|column| VectorIndexRef::new(&p.name, column.name.clone()));
                 let _vector_schema = db.vector_schema_write_many(vector_schema_refs);
                 db.allocate_ddl_lsn(|lsn| {
+                    if !schema_snapshot_matches(db, &validated_schema) {
+                        return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                    }
+                    // A generation belongs to the CREATE that actually won
+                    // the schema lock, never to a stale validation attempt.
+                    let table_generation = db.next_table_generation_for_create(&p.name)?;
+                    db.accountant().try_allocate_for(
+                        metadata_bytes,
+                        "ddl",
+                        "create_table",
+                        "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
+                    )?;
+                    if let Err(error) = db.persist_created_table_generation_and_ddl(
+                        &p.name,
+                        &meta,
+                        table_generation,
+                        lsn,
+                    ) {
+                        db.accountant().release(metadata_bytes);
+                        return Err(error);
+                    }
                     db.relational_store().create_table(&p.name, meta);
                     for idx in &auto_indexes {
                         db.relational_store().create_exact_index_storage(
@@ -226,10 +273,6 @@ pub(crate) fn execute_plan(
                     for (column, resolved) in resolved_policies {
                         db.register_rank_formula(&p.name, &column, resolved.formula);
                     }
-                    if let Some(table_meta) = db.table_meta(&p.name) {
-                        db.persist_table_meta(&p.name, &table_meta)?;
-                        db.log_create_table_ddl(&p.name, &table_meta, lsn)?;
-                    }
                     Ok(())
                 })?;
                 db.clear_statement_cache();
@@ -237,6 +280,25 @@ pub(crate) fn execute_plan(
                 return Ok(QueryResult::empty_with_affected(0));
             } else {
                 db.allocate_ddl_lsn(|lsn| {
+                    if !schema_snapshot_matches(db, &validated_schema) {
+                        return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                    }
+                    let table_generation = db.next_table_generation_for_create(&p.name)?;
+                    db.accountant().try_allocate_for(
+                        metadata_bytes,
+                        "ddl",
+                        "create_table",
+                        "Reduce schema size or raise MEMORY_LIMIT before creating more tables.",
+                    )?;
+                    if let Err(error) = db.persist_created_table_generation_and_ddl(
+                        &p.name,
+                        &meta,
+                        table_generation,
+                        lsn,
+                    ) {
+                        db.accountant().release(metadata_bytes);
+                        return Err(error);
+                    }
                     db.relational_store().create_table(&p.name, meta);
                     for idx in &auto_indexes {
                         db.relational_store().create_exact_index_storage(
@@ -244,10 +306,6 @@ pub(crate) fn execute_plan(
                             &idx.name,
                             idx.columns.clone(),
                         );
-                    }
-                    if let Some(table_meta) = db.table_meta(&p.name) {
-                        db.persist_table_meta(&p.name, &table_meta)?;
-                        db.log_create_table_ddl(&p.name, &table_meta, lsn)?;
                     }
                     Ok(())
                 })?;
@@ -258,6 +316,7 @@ pub(crate) fn execute_plan(
         }
         PhysicalPlan::DropTable(name) => {
             require_admin_for_ddl(db)?;
+            let validated_schema = db.relational_store().table_meta.read().clone();
             if let Some(block) = rank_policy_drop_table_blocker(db, name) {
                 return Err(block);
             }
@@ -265,7 +324,12 @@ pub(crate) fn execute_plan(
             let bytes_to_release = estimate_drop_table_bytes(db, name);
             db.drain_vector_table_maintenance_for_ddl(name);
             let _vector_schema = db.vector_schema_write_table(name);
-            db.allocate_ddl_lsn(|lsn| db.log_drop_table_ddl_and_remove_triggers(name, lsn))?;
+            db.allocate_ddl_lsn(|lsn| {
+                if !schema_snapshot_matches(db, &validated_schema) {
+                    return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                }
+                db.log_drop_table_ddl_and_remove_triggers(name, lsn)
+            })?;
             db.accountant().release(bytes_to_release);
             db.clear_statement_cache();
             Ok(QueryResult::empty_with_affected(0))
@@ -274,6 +338,11 @@ pub(crate) fn execute_plan(
             require_admin_for_ddl(db)?;
             db.check_disk_budget("ALTER TABLE")?;
             let store = db.relational_store();
+            // ADD/DROP/RENAME validation may depend on foreign keys in other
+            // tables. Compare the complete map while holding the DDL lock,
+            // then transparently re-run validation if any schema writer won.
+            let validated_schema = store.table_meta.read().clone();
+            let metadata_only_projection: Option<(TableMeta, TableMeta)>;
             match &p.action {
                 AlterAction::AddColumn(col) => {
                     if col.primary_key {
@@ -350,59 +419,67 @@ pub(crate) fn execute_plan(
                             },
                         )?;
                     }
-                    if matches!(col.data_type, DataType::Vector(_)) {
-                        let index = VectorIndexRef::new(&p.table, col.name.clone());
-                        let _vector_schema = db.vector_schema_write(&index);
-                        db.allocate_ddl_lsn(|lsn| {
-                            store
-                                .alter_table_add_column(&p.table, core_col)
-                                .map_err(Error::Other)?;
-                            if let Some(table_meta) = db.table_meta(&p.table)
-                                && let Some(column) = table_meta
-                                    .columns
-                                    .iter()
-                                    .find(|column| column.name == col.name)
-                            {
-                                db.register_vector_index_for_column(&p.table, column);
-                            }
-                            if col.expires {
-                                let mut meta = store.table_meta.write();
-                                let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
-                                    Error::Other(format!("table '{}' not found", p.table))
-                                })?;
-                                table_meta.expires_column = Some(col.name.clone());
-                            }
-                            if let Some(resolved) = resolved_policy {
-                                db.register_rank_formula(&p.table, &col.name, resolved.formula);
-                            }
-                            refresh_auto_indexes_for_table(db, &p.table)?;
-                            if let Some(table_meta) = db.table_meta(&p.table) {
-                                db.persist_table_meta(&p.table, &table_meta)?;
-                                db.log_alter_table_ddl(&p.table, &table_meta, lsn)?;
-                            }
-                            Ok(())
-                        })?;
-                        db.clear_statement_cache();
-                        return Ok(QueryResult::empty_with_affected(0));
-                    }
+                    let added_vector = matches!(col.data_type, DataType::Vector(_));
+                    let _vector_schema = added_vector.then(|| {
+                        db.vector_schema_write(&VectorIndexRef::new(&p.table, col.name.clone()))
+                    });
                     db.allocate_ddl_lsn(|lsn| {
-                        store
-                            .alter_table_add_column(&p.table, core_col)
-                            .map_err(Error::Other)?;
+                        let old_meta = db.table_meta(&p.table).ok_or_else(|| {
+                            Error::Other(format!("table '{}' not found", p.table))
+                        })?;
+                        if !schema_snapshot_matches(db, &validated_schema) {
+                            return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                        }
+                        if old_meta
+                            .columns
+                            .iter()
+                            .any(|column| column.name == col.name)
+                        {
+                            return Err(Error::Other(format!(
+                                "column '{}' already exists in table '{}'",
+                                col.name, p.table
+                            )));
+                        }
+                        let mut projected_meta = old_meta.clone();
+                        projected_meta.columns.push(core_col.clone());
                         if col.expires {
-                            let mut meta = store.table_meta.write();
-                            let table_meta = meta.get_mut(&p.table).ok_or_else(|| {
-                                Error::Other(format!("table '{}' not found", p.table))
-                            })?;
-                            table_meta.expires_column = Some(col.name.clone());
+                            projected_meta.expires_column = Some(col.name.clone());
                         }
-                        if let Some(resolved) = resolved_policy {
-                            db.register_rank_formula(&p.table, &col.name, resolved.formula);
+                        let projected_meta =
+                            db.project_table_meta_with_auto_indexes(projected_meta);
+                        let projected_rows = store
+                            .tables
+                            .read()
+                            .get(&p.table)
+                            .cloned()
+                            .unwrap_or_default();
+                        let projected_vectors = db.vector_entries_for_ddl_projection();
+                        let ddl = vec![db.alter_table_ddl_for_meta(
+                            &p.table,
+                            &projected_meta,
+                            Vec::new(),
+                        )];
+                        db.persist_local_table_projection_and_ddl(
+                            &p.table,
+                            &projected_meta,
+                            &projected_rows,
+                            &projected_vectors,
+                            lsn,
+                            &ddl,
+                        )?;
+                        db.publish_local_table_projection_and_ddl(
+                            &p.table,
+                            &old_meta,
+                            projected_meta.clone(),
+                            projected_rows.clone(),
+                            lsn,
+                            &ddl,
+                        )?;
+                        if added_vector {
+                            db.register_vector_index_for_column(&p.table, &core_col);
                         }
-                        refresh_auto_indexes_for_table(db, &p.table)?;
-                        if let Some(table_meta) = db.table_meta(&p.table) {
-                            db.persist_table_meta(&p.table, &table_meta)?;
-                            db.log_alter_table_ddl(&p.table, &table_meta, lsn)?;
+                        if let Some(resolved) = &resolved_policy {
+                            db.register_rank_formula(&p.table, &col.name, resolved.formula.clone());
                         }
                         Ok(())
                     })?;
@@ -494,87 +571,89 @@ pub(crate) fn execute_plan(
                             index: dependent_user_indexes[0].clone(),
                         });
                     }
-                    if dropped_vector_column {
+                    let _vector_schema = dropped_vector_column.then(|| {
                         let index = VectorIndexRef::new(&p.table, name.clone());
                         db.drain_vector_index_maintenance_for_ddl(&index);
-                        let _vector_schema = db.vector_schema_write(&index);
-                        db.allocate_ddl_lsn(|lsn| {
-                            store
-                                .alter_table_drop_column(&p.table, name)
-                                .map_err(Error::Other)?;
-                            db.remove_rank_formula(&p.table, name);
-                            if *cascade {
-                                {
-                                    let mut metas = store.table_meta.write();
-                                    if let Some(m) = metas.get_mut(&p.table) {
-                                        m.indexes
-                                            .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
-                                    }
-                                }
-                                for idx in &dependent_indexes {
-                                    store.drop_index_storage(&p.table, idx);
-                                    if dependent_user_indexes.iter().any(|name| name == idx) {
-                                        db.log_drop_index_ddl(&p.table, idx, lsn)?;
-                                    }
-                                }
-                            }
-                            let mut meta = store.table_meta.write();
-                            if let Some(table_meta) = meta.get_mut(&p.table)
-                                && table_meta.expires_column.as_deref() == Some(name.as_str())
-                            {
-                                table_meta.expires_column = None;
-                            }
-                            drop(meta);
-                            db.deregister_vector_index(&p.table, name);
-                            refresh_auto_indexes_for_table(db, &p.table)?;
-                            if let Some(table_meta) = db.table_meta(&p.table) {
-                                db.persist_table_meta_rows_vectors_and_log_alter_table_ddl(
-                                    &p.table,
-                                    &table_meta,
-                                    lsn,
-                                )?;
-                            }
-                            Ok(())
+                        db.vector_schema_write(&index)
+                    });
+                    db.allocate_ddl_lsn(|lsn| {
+                        let old_meta = db.table_meta(&p.table).ok_or_else(|| {
+                            Error::Other(format!("table '{}' not found", p.table))
                         })?;
-                    } else {
-                        store
-                            .alter_table_drop_column(&p.table, name)
-                            .map_err(Error::Other)?;
-                        db.remove_rank_formula(&p.table, name);
+                        if !schema_snapshot_matches(db, &validated_schema) {
+                            return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                        }
+                        if !old_meta.columns.iter().any(|column| column.name == *name) {
+                            return Err(Error::Other(format!(
+                                "column '{}' does not exist in table '{}'",
+                                name, p.table
+                            )));
+                        }
+                        let mut projected_meta = old_meta.clone();
+                        projected_meta.columns.retain(|column| column.name != *name);
                         if *cascade {
-                            // Remove IndexDecls referencing `name`, release storage.
-                            {
-                                let mut metas = store.table_meta.write();
-                                if let Some(m) = metas.get_mut(&p.table) {
-                                    m.indexes
-                                        .retain(|i| !i.columns.iter().any(|(c, _)| c == name));
-                                }
-                            }
-                            for idx in &dependent_indexes {
-                                store.drop_index_storage(&p.table, idx);
-                                if dependent_user_indexes.iter().any(|name| name == idx) {
-                                    db.allocate_ddl_lsn(|lsn| {
-                                        db.log_drop_index_ddl(&p.table, idx, lsn)
-                                    })?;
-                                }
-                            }
+                            projected_meta.indexes.retain(|index| {
+                                !index.columns.iter().any(|(column, _)| column == name)
+                            });
                         }
-                        let mut meta = store.table_meta.write();
-                        if let Some(table_meta) = meta.get_mut(&p.table)
-                            && table_meta.expires_column.as_deref() == Some(name.as_str())
-                        {
-                            table_meta.expires_column = None;
+                        if projected_meta.expires_column.as_deref() == Some(name.as_str()) {
+                            projected_meta.expires_column = None;
                         }
-                        drop(meta);
-                        refresh_auto_indexes_for_table(db, &p.table)?;
-                        if let Some(table_meta) = db.table_meta(&p.table) {
-                            db.persist_table_meta(&p.table, &table_meta)?;
-                            db.persist_table_rows(&p.table)?;
-                            db.allocate_ddl_lsn(|lsn| {
-                                db.log_alter_table_ddl(&p.table, &table_meta, lsn)
-                            })?;
+                        let projected_meta =
+                            db.project_table_meta_with_auto_indexes(projected_meta);
+                        let projected_rows = store
+                            .tables
+                            .read()
+                            .get(&p.table)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|mut row| {
+                                row.values.remove(name);
+                                row
+                            })
+                            .collect::<Vec<_>>();
+                        let mut projected_vectors = db.vector_entries_for_ddl_projection();
+                        if dropped_vector_column {
+                            projected_vectors.retain(|entry| {
+                                entry.index.table != p.table || entry.index.column != *name
+                            });
                         }
-                    }
+                        let mut ddl = dependent_user_indexes
+                            .iter()
+                            .filter(|index_name| *cascade && dependent_indexes.contains(index_name))
+                            .map(|index_name| DdlChange::DropIndex {
+                                table: p.table.clone(),
+                                name: index_name.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        ddl.push(db.alter_table_ddl_for_meta(
+                            &p.table,
+                            &projected_meta,
+                            Vec::new(),
+                        ));
+                        db.persist_local_table_projection_and_ddl(
+                            &p.table,
+                            &projected_meta,
+                            &projected_rows,
+                            &projected_vectors,
+                            lsn,
+                            &ddl,
+                        )?;
+                        db.publish_local_table_projection_and_ddl(
+                            &p.table,
+                            &old_meta,
+                            projected_meta.clone(),
+                            projected_rows.clone(),
+                            lsn,
+                            &ddl,
+                        )?;
+                        db.remove_rank_formula(&p.table, name);
+                        if dropped_vector_column {
+                            db.deregister_vector_index(&p.table, name);
+                        }
+                        Ok(())
+                    })?;
                     db.clear_statement_cache();
                     return Ok(QueryResult {
                         columns: vec![],
@@ -643,51 +722,106 @@ pub(crate) fn execute_plan(
                             to, p.table
                         )));
                     }
-                    if renamed_vector_column {
+                    let _vector_schema = if renamed_vector_column {
                         let old_index = VectorIndexRef::new(&p.table, from.clone());
                         let new_index = VectorIndexRef::new(&p.table, to.clone());
+                        db.validate_vector_index_rename_for_ddl(&p.table, from, to)?;
                         db.drain_vector_index_maintenance_for_ddl(&old_index);
-                        let _vector_schema =
-                            db.vector_schema_write_many([old_index.clone(), new_index]);
-                        db.allocate_ddl_lsn(|lsn| {
-                            store
-                                .alter_table_rename_column(&p.table, from, to)
-                                .map_err(Error::Other)?;
-                            let mut meta = store.table_meta.write();
-                            if let Some(table_meta) = meta.get_mut(&p.table)
-                                && table_meta.expires_column.as_deref() == Some(from.as_str())
-                            {
-                                table_meta.expires_column = Some(to.clone());
-                            }
-                            drop(meta);
-                            db.rename_vector_index(&p.table, from, to)?;
-                            refresh_auto_indexes_for_table(db, &p.table)?;
-                            if let Some(table_meta) = db.table_meta(&p.table) {
-                                db.persist_table_meta_rows_vectors_and_log_alter_table_ddl_with_vector_rename(
-                                    &p.table,
-                                    &table_meta,
-                                    from,
-                                    to,
-                                    lsn,
-                                )?;
-                            }
-                            Ok(())
-                        })?;
-                        db.clear_statement_cache();
-                        return Ok(QueryResult::empty_with_affected(0));
+                        Some(db.vector_schema_write_many([old_index, new_index]))
                     } else {
-                        store
-                            .alter_table_rename_column(&p.table, from, to)
-                            .map_err(Error::Other)?;
-                    }
-                    let mut meta = store.table_meta.write();
-                    if let Some(table_meta) = meta.get_mut(&p.table)
-                        && table_meta.expires_column.as_deref() == Some(from.as_str())
-                    {
-                        table_meta.expires_column = Some(to.clone());
-                    }
-                    drop(meta);
-                    refresh_auto_indexes_for_table(db, &p.table)?;
+                        None
+                    };
+                    db.allocate_ddl_lsn(|lsn| {
+                        let old_meta = db.table_meta(&p.table).ok_or_else(|| {
+                            Error::Other(format!("table '{}' not found", p.table))
+                        })?;
+                        if !schema_snapshot_matches(db, &validated_schema) {
+                            return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                        }
+                        if old_meta.columns.iter().any(|column| column.name == *to) {
+                            return Err(Error::Other(format!(
+                                "column '{}' already exists in table '{}'",
+                                to, p.table
+                            )));
+                        }
+                        let mut projected_meta = old_meta.clone();
+                        let column = projected_meta
+                            .columns
+                            .iter_mut()
+                            .find(|column| column.name == *from)
+                            .ok_or_else(|| {
+                                Error::Other(format!(
+                                    "column '{}' does not exist in table '{}'",
+                                    from, p.table
+                                ))
+                            })?;
+                        column.name = to.clone();
+                        for index in &mut projected_meta.indexes {
+                            for (column, _) in &mut index.columns {
+                                if *column == *from {
+                                    *column = to.clone();
+                                }
+                            }
+                        }
+                        if projected_meta.expires_column.as_deref() == Some(from.as_str()) {
+                            projected_meta.expires_column = Some(to.clone());
+                        }
+                        let projected_meta =
+                            db.project_table_meta_with_auto_indexes(projected_meta);
+                        let projected_rows = store
+                            .tables
+                            .read()
+                            .get(&p.table)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|mut row| {
+                                if let Some(value) = row.values.remove(from) {
+                                    row.values.insert(to.clone(), value);
+                                }
+                                row
+                            })
+                            .collect::<Vec<_>>();
+                        let mut projected_vectors = db.vector_entries_for_ddl_projection();
+                        if renamed_vector_column {
+                            for entry in &mut projected_vectors {
+                                if entry.index.table == p.table && entry.index.column == *from {
+                                    entry.index.column = to.clone();
+                                }
+                            }
+                        }
+                        let ddl = vec![db.alter_table_ddl_for_meta(
+                            &p.table,
+                            &projected_meta,
+                            if renamed_vector_column {
+                                vec![crate::database::sync_vector_rename_constraint(from, to)]
+                            } else {
+                                Vec::new()
+                            },
+                        )];
+                        db.persist_local_table_projection_and_ddl(
+                            &p.table,
+                            &projected_meta,
+                            &projected_rows,
+                            &projected_vectors,
+                            lsn,
+                            &ddl,
+                        )?;
+                        db.publish_local_table_projection_and_ddl(
+                            &p.table,
+                            &old_meta,
+                            projected_meta.clone(),
+                            projected_rows.clone(),
+                            lsn,
+                            &ddl,
+                        )?;
+                        if renamed_vector_column {
+                            db.rename_vector_index(&p.table, from, to)?;
+                        }
+                        Ok(())
+                    })?;
+                    db.clear_statement_cache();
+                    return Ok(QueryResult::empty_with_affected(0));
                 }
                 AlterAction::SetRetain {
                     duration_seconds,
@@ -715,10 +849,10 @@ pub(crate) fn execute_plan(
                         )?;
                         refuse_sync_safe_without_key_for(&p.table, &existing)?;
                     }
-                    let mut meta = store.table_meta.write();
-                    let table_meta = meta
-                        .get_mut(&p.table)
+                    let old_meta = db
+                        .table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    let mut table_meta = old_meta.clone();
                     if table_meta.immutable {
                         return Err(Error::Other(
                             "IMMUTABLE and RETAIN are mutually exclusive".to_string(),
@@ -727,6 +861,7 @@ pub(crate) fn execute_plan(
                     table_meta.default_ttl_seconds = Some(*duration_seconds);
                     table_meta.sync_safe = *sync_safe;
                     table_meta.retain_declared_unit = Some(*declared_unit);
+                    metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::DropRetain => {
                     // Refused before the write lock, matching SET RETAIN's
@@ -738,13 +873,14 @@ pub(crate) fn execute_plan(
                             sync_safe: false,
                         },
                     )?;
-                    let mut meta = store.table_meta.write();
-                    let table_meta = meta
-                        .get_mut(&p.table)
+                    let old_meta = db
+                        .table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    let mut table_meta = old_meta.clone();
                     table_meta.default_ttl_seconds = None;
                     table_meta.sync_safe = false;
                     table_meta.retain_declared_unit = None;
+                    metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::SetHistory(policy) => {
                     // Refused before the write lock, matching SET RETAIN's
@@ -764,11 +900,12 @@ pub(crate) fn execute_plan(
                         EngineOwnedMutation::History(*policy),
                     )?;
                     refuse_reclaimed_history_under_keep_first(&p.table, &projected)?;
-                    let mut meta = store.table_meta.write();
-                    let table_meta = meta
-                        .get_mut(&p.table)
+                    let old_meta = db
+                        .table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    let mut table_meta = old_meta.clone();
                     table_meta.history_policy = Some(*policy);
+                    metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::SetSyncConflict(policy) => {
                     // The mirror guard: narrowing an already-declared HISTORY
@@ -788,11 +925,12 @@ pub(crate) fn execute_plan(
                         EngineOwnedMutation::SyncConflict(*policy),
                     )?;
                     refuse_reclaimed_history_under_keep_first(&p.table, &projected)?;
-                    let mut meta = store.table_meta.write();
-                    let table_meta = meta
-                        .get_mut(&p.table)
+                    let old_meta = db
+                        .table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    let mut table_meta = old_meta.clone();
                     table_meta.conflict_policy = Some(*policy);
+                    metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::SetSyncDirection(direction) => {
                     // Refused before the write lock, for the same reason: a
@@ -821,32 +959,54 @@ pub(crate) fn execute_plan(
                         ..existing
                     };
                     refuse_reclaimed_history_under_keep_first(&p.table, &projected)?;
-                    let mut meta = store.table_meta.write();
-                    let table_meta = meta
-                        .get_mut(&p.table)
+                    let old_meta = db
+                        .table_meta(&p.table)
                         .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    let mut table_meta = old_meta.clone();
                     table_meta.sync_direction = Some(*direction);
+                    metadata_only_projection = Some((old_meta, table_meta));
                 }
             }
-            if let Some(table_meta) = db.table_meta(&p.table) {
-                db.persist_table_meta(&p.table, &table_meta)?;
-                if !matches!(
-                    p.action,
-                    AlterAction::AddColumn(_)
-                        | AlterAction::SetRetain { .. }
-                        | AlterAction::DropRetain
-                        | AlterAction::SetHistory(_)
-                        | AlterAction::SetSyncConflict(_)
-                ) {
-                    db.persist_table_rows(&p.table)?;
-                }
-                db.allocate_ddl_lsn(|lsn| db.log_alter_table_ddl(&p.table, &table_meta, lsn))?;
+            if let Some((old_meta, projected_meta)) = metadata_only_projection {
+                db.allocate_ddl_lsn(|lsn| {
+                    db.table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    if !schema_snapshot_matches(db, &validated_schema) {
+                        return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
+                    }
+                    let projected_rows = store
+                        .tables
+                        .read()
+                        .get(&p.table)
+                        .cloned()
+                        .unwrap_or_default();
+                    let projected_vectors = db.vector_entries_for_ddl_projection();
+                    let ddl =
+                        vec![db.alter_table_ddl_for_meta(&p.table, &projected_meta, Vec::new())];
+                    db.persist_local_table_projection_and_ddl(
+                        &p.table,
+                        &projected_meta,
+                        &projected_rows,
+                        &projected_vectors,
+                        lsn,
+                        &ddl,
+                    )?;
+                    db.publish_local_table_projection_and_ddl(
+                        &p.table,
+                        &old_meta,
+                        projected_meta.clone(),
+                        projected_rows.clone(),
+                        lsn,
+                        &ddl,
+                    )
+                })?;
             }
             db.clear_statement_cache();
             db.reconcile_maintenance_thread();
             Ok(QueryResult::empty_with_affected(0))
         }
         PhysicalPlan::Insert(p) => exec_insert(db, p, params, tx),
+        PhysicalPlan::Purge(p) => exec_purge(db, p, params, tx),
         PhysicalPlan::Delete(p) => exec_delete(db, p, params, tx),
         PhysicalPlan::Update(p) => exec_update(db, p, params, tx),
         PhysicalPlan::Scan { table, filter, .. } => {
@@ -925,6 +1085,7 @@ pub(crate) fn execute_plan(
                         indexes_considered: considered,
                         sort_elided: false,
                         query_vector_source: None,
+                        rows_examined: 0,
                     };
                     return Ok(result);
                 } else {
@@ -946,6 +1107,7 @@ pub(crate) fn execute_plan(
                         indexes_considered: considered,
                         sort_elided: false,
                         query_vector_source: None,
+                        rows_examined: 0,
                     };
                     return Ok(result);
                 }
@@ -1862,8 +2024,7 @@ pub(crate) fn execute_plan(
                 SetMemoryLimitValue::Bytes(bytes) => Some(*bytes),
                 SetMemoryLimitValue::None => None,
             };
-            db.accountant().set_budget(limit)?;
-            db.persist_memory_limit(limit)?;
+            db.set_memory_limit(limit)?;
             Ok(QueryResult::empty())
         }
         PhysicalPlan::ShowMemoryLimit => {
@@ -1901,7 +2062,6 @@ pub(crate) fn execute_plan(
                 SetDiskLimitValue::None => None,
             };
             db.set_disk_limit(limit)?;
-            db.persist_disk_limit(limit)?;
             Ok(QueryResult::empty())
         }
         PhysicalPlan::ShowDiskLimit => {
@@ -1942,9 +2102,7 @@ pub(crate) fn execute_plan(
             // resolves against. Read it from there so SHOW reports what the sync
             // path actually uses; the runtime layer only carries the deployment
             // default.
-            let policies = db.conflict_policies();
-            let default_str = conflict_policy_to_string(policies.default);
-            let mut rows = vec![vec![Value::Text(default_str)]];
+            let mut rows = vec![vec![Value::Text("keep_first".to_string())]];
             let mut tables = db.table_names();
             tables.sort();
             for table in tables {
@@ -1952,7 +2110,7 @@ pub(crate) fn execute_plan(
                     rows.push(vec![Value::Text(format!(
                         "{}={}",
                         table,
-                        conflict_policy_to_string(policy)
+                        declared_conflict_policy_to_string(policy)
                     ))]);
                 }
             }
@@ -2468,6 +2626,52 @@ fn exec_insert(
     Ok(QueryResult::empty_with_affected(rows_affected))
 }
 
+fn exec_purge(
+    db: &Database,
+    p: &PurgePlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+) -> Result<QueryResult> {
+    // The authority refusal must precede every read, including subquery
+    // evaluation, so an edge never learns predicate-selected hub rows.
+    if let Some(hub_node_id) = db.retention_sync_peer() {
+        return Err(Error::PurgeRequiresAuthoritativeHub { hub_node_id });
+    }
+    if tx.is_some() {
+        return Err(Error::PurgeRequiresStandaloneExecution);
+    }
+
+    let snapshot = db.snapshot_for_read();
+    let rows = db.scan(&p.table, snapshot)?;
+    let resolved_where = p
+        .where_clause
+        .as_ref()
+        .map(|expr| resolve_in_subqueries(db, expr, params, None))
+        .transpose()?;
+    let matched = filter_rows_by_predicate(rows, resolved_where.as_ref(), params)?;
+    for row in &matched {
+        db.assert_row_write_allowed(&p.table, row.row_id, &row.values, snapshot)?;
+    }
+    if matched.is_empty() {
+        return Ok(QueryResult::empty_with_affected(0));
+    }
+
+    let meta = db
+        .table_meta(&p.table)
+        .ok_or_else(|| Error::TableNotFound(p.table.clone()))?;
+    let pinned = matched
+        .iter()
+        .map(|row| {
+            natural_key_from_row_values(&meta, &row.values)
+                .map(|key| (key, row.row_id))
+                .ok_or_else(|| Error::NotSyncEligible(p.table.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut result = db.commit_authoritative_purge_batch(&p.table, &pinned)?;
+    result.rows_affected = matched.len() as u64;
+    Ok(result)
+}
+
 fn exec_delete(
     db: &Database,
     p: &DeletePlan,
@@ -2504,6 +2708,10 @@ fn exec_delete(
                 db.delete_vector(txid, index, row.row_id)?;
             }
         }
+        // The row and its durable owed-to-hub delete record commit together.
+        // A later close/open may have no delete history left to reconstruct,
+        // so staging this after the row is gone would lose the obligation.
+        db.stage_local_delete_obligation(txid, &p.table, row)?;
         db.delete_row(txid, &p.table, row.row_id)?;
     }
     if !matched.is_empty()
@@ -3192,6 +3400,11 @@ pub(crate) fn validate_plan_columns(db: &Database, plan: &PhysicalPlan) -> Resul
             alias,
             filter: Some(predicate),
         } => validate_predicate_columns(db, table, alias.as_deref(), predicate)?,
+        PhysicalPlan::Purge(p) => {
+            if let Some(predicate) = &p.where_clause {
+                validate_predicate_columns(db, &p.table, None, predicate)?;
+            }
+        }
         PhysicalPlan::Delete(p) => {
             if let Some(predicate) = &p.where_clause {
                 validate_predicate_columns(db, &p.table, None, predicate)?;
@@ -3596,6 +3809,7 @@ fn exec_create_index(
     db: &Database,
     plan: &contextdb_planner::CreateIndexPlan,
 ) -> Result<QueryResult> {
+    let validated_schema = db.relational_store().table_meta.read().clone();
     // Reserved-prefix guard: user-declared indexes must not collide with the
     // auto-index namespace used for PRIMARY KEY / UNIQUE backing indexes.
     if let Some(prefix) = reserved_index_prefix(&plan.name) {
@@ -3649,28 +3863,51 @@ fn exec_create_index(
 
     // All validations passed. Reserve the DDL LSN before publishing the
     // IndexDecl/storage so concurrent DML cannot appear before the index DDL
-    // in changes_since().
+    // in changes_since().  Redb receives the projected metadata, unchanged
+    // rows/vectors, generation sidecar, and DDL before memory sees the index.
     db.allocate_ddl_lsn(|lsn| {
-        {
-            let store = db.relational_store();
-            let mut metas = store.table_meta.write();
-            let m = metas
-                .get_mut(&plan.table)
-                .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
-            m.indexes.push(contextdb_core::IndexDecl {
-                name: plan.name.clone(),
-                columns: plan.columns.clone(),
-                kind: contextdb_core::IndexKind::UserDeclared,
-            });
+        let old_meta = db
+            .table_meta(&plan.table)
+            .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
+        if !schema_snapshot_matches(db, &validated_schema) {
+            return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
         }
-        db.relational_store()
-            .create_index_storage(&plan.table, &plan.name, plan.columns.clone());
-        db.relational_store().rebuild_index(&plan.table, &plan.name);
-
-        if let Some(table_meta) = db.table_meta(&plan.table) {
-            db.persist_table_meta(&plan.table, &table_meta)?;
-        }
-        db.log_create_index_ddl(&plan.table, &plan.name, &plan.columns, lsn)
+        let mut projected_meta = old_meta.clone();
+        projected_meta.indexes.push(contextdb_core::IndexDecl {
+            name: plan.name.clone(),
+            columns: plan.columns.clone(),
+            kind: contextdb_core::IndexKind::UserDeclared,
+        });
+        let projected_meta = db.project_table_meta_with_auto_indexes(projected_meta);
+        let projected_rows = db
+            .relational_store()
+            .tables
+            .read()
+            .get(&plan.table)
+            .cloned()
+            .unwrap_or_default();
+        let projected_vectors = db.vector_entries_for_ddl_projection();
+        let ddl = vec![DdlChange::CreateIndex {
+            table: plan.table.clone(),
+            name: plan.name.clone(),
+            columns: plan.columns.clone(),
+        }];
+        db.persist_local_table_projection_and_ddl(
+            &plan.table,
+            &projected_meta,
+            &projected_rows,
+            &projected_vectors,
+            lsn,
+            &ddl,
+        )?;
+        db.publish_local_table_projection_and_ddl(
+            &plan.table,
+            &old_meta,
+            projected_meta,
+            projected_rows,
+            lsn,
+            &ddl,
+        )
     })?;
 
     db.clear_statement_cache();
@@ -3678,6 +3915,7 @@ fn exec_create_index(
 }
 
 fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Result<QueryResult> {
+    let validated_schema = db.relational_store().table_meta.read().clone();
     let meta = db
         .table_meta(&plan.table)
         .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
@@ -3701,19 +3939,47 @@ fn exec_drop_index(db: &Database, plan: &contextdb_planner::DropIndexPlan) -> Re
     if let Some(block) = rank_policy_drop_index_blocker(db, &plan.table, &plan.name) {
         return Err(block);
     }
-    {
-        let store = db.relational_store();
-        let mut metas = store.table_meta.write();
-        if let Some(m) = metas.get_mut(&plan.table) {
-            m.indexes.retain(|i| i.name != plan.name);
+    db.allocate_ddl_lsn(|lsn| {
+        let old_meta = db
+            .table_meta(&plan.table)
+            .ok_or_else(|| Error::TableNotFound(plan.table.clone()))?;
+        if !schema_snapshot_matches(db, &validated_schema) {
+            return Err(Error::Other(RETRY_LOCAL_SCHEMA_PROJECTION.to_string()));
         }
-    }
-    db.relational_store()
-        .drop_index_storage(&plan.table, &plan.name);
-    if let Some(table_meta) = db.table_meta(&plan.table) {
-        db.persist_table_meta(&plan.table, &table_meta)?;
-    }
-    db.allocate_ddl_lsn(|lsn| db.log_drop_index_ddl(&plan.table, &plan.name, lsn))?;
+        let mut projected_meta = old_meta.clone();
+        projected_meta
+            .indexes
+            .retain(|index| index.name != plan.name);
+        let projected_meta = db.project_table_meta_with_auto_indexes(projected_meta);
+        let projected_rows = db
+            .relational_store()
+            .tables
+            .read()
+            .get(&plan.table)
+            .cloned()
+            .unwrap_or_default();
+        let projected_vectors = db.vector_entries_for_ddl_projection();
+        let ddl = vec![DdlChange::DropIndex {
+            table: plan.table.clone(),
+            name: plan.name.clone(),
+        }];
+        db.persist_local_table_projection_and_ddl(
+            &plan.table,
+            &projected_meta,
+            &projected_rows,
+            &projected_vectors,
+            lsn,
+            &ddl,
+        )?;
+        db.publish_local_table_projection_and_ddl(
+            &plan.table,
+            &old_meta,
+            projected_meta,
+            projected_rows,
+            lsn,
+            &ddl,
+        )
+    })?;
     db.clear_statement_cache();
     Ok(QueryResult::empty_with_affected(0))
 }
@@ -3722,14 +3988,6 @@ pub(crate) fn reserved_index_prefix(name: &str) -> Option<&'static str> {
     ["__pk_", "__unique_", "__fk_", "__graph_edge_"]
         .into_iter()
         .find(|prefix| name.starts_with(prefix))
-}
-
-fn refresh_auto_indexes_for_table(db: &Database, table: &str) -> Result<()> {
-    let Some(meta) = db.table_meta(table) else {
-        return Err(Error::TableNotFound(table.to_string()));
-    };
-    db.replace_table_meta_and_refresh_auto_indexes(table, &meta.clone(), meta)?;
-    Ok(())
 }
 
 fn estimate_table_row_bytes(
@@ -4631,6 +4889,23 @@ fn execute_index_scan(
         return Ok((Vec::new(), 0));
     }
 
+    // A plan can outlive a concurrent DROP INDEX. Do not turn that race into
+    // an empty result: there is no physical posting list to trust, so use the
+    // normal visibility-aware table scan and let the caller's predicate path
+    // apply its residual filter.
+    let indexes = db.relational_store().indexes.read();
+    if indexes
+        .get(table)
+        .and_then(|table_indexes| table_indexes.get(&pick.name))
+        .is_none()
+    {
+        drop(indexes);
+        let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+        let rows_examined = rows.len() as u64;
+        return Ok((rows, rows_examined));
+    }
+    drop(indexes);
+
     // Coerce pick.shape's literal values to the pushed column's declared type.
     // A SELECT WHERE uuid_col = 'uuid-string' arrives here with Text(..) even
     // though the indexed column stores Uuid(..). B-tree walks use variant-exact
@@ -4653,7 +4928,12 @@ fn execute_index_scan(
         .and_then(|table_indexes| table_indexes.get(&pick.name))
     {
         Some(s) => s,
-        None => return Ok((Vec::new(), 0)),
+        None => {
+            drop(indexes);
+            let rows = scan_rows_for_select(db, table, snapshot, tx)?;
+            let rows_examined = rows.len() as u64;
+            return Ok((rows, rows_examined));
+        }
     };
 
     let first_dir = pick
@@ -4895,7 +5175,6 @@ fn execute_index_scan(
 
     // Now fetch base rows by row_id while preserving index-order. The index
     // already enumerates postings in index sort order; rows[] preserve it.
-    drop(indexes);
     let row_ids: Vec<RowId> = postings.iter().map(|p| p.row_id).collect();
     let mut out: Vec<VersionedRow> = Vec::with_capacity(row_ids.len());
     if !row_ids.is_empty() {
@@ -4905,6 +5184,11 @@ fn execute_index_scan(
             }
         }
     }
+    // Keep the physical-index read lock through the base-row fetch. A local
+    // DDL publisher takes the matching write lock while swapping its prepared
+    // rows, metadata and postings, so an old plan cannot join old postings to
+    // a new row shape.
+    drop(indexes);
     // Layer tx-scoped inserts / deletes on top, matching the semantics of
     // scan_with_tx.
     if let Some(tx_id) = tx {
@@ -5082,6 +5366,7 @@ fn run_index_scan_with_order(
         indexes_considered: Default::default(),
         sort_elided: true,
         query_vector_source: None,
+        rows_examined: 0,
     };
     Ok(Some(result))
 }
@@ -8374,7 +8659,7 @@ pub(crate) fn refuse_reclaimed_history_under_keep_first(
         return Ok(());
     }
     let conflict = meta.conflict_policy.unwrap_or(DEFAULT_CONFLICT_POLICY);
-    if conflict != ConflictPolicy::InsertIfNotExists {
+    if conflict != contextdb_core::ConflictPolicy::KEEP_FIRST {
         return Ok(());
     }
     Err(Error::SchemaInvalid {
@@ -8419,12 +8704,13 @@ pub(crate) const ENGINE_OWNED_LEDGER_TABLES: [&str; 4] = [
 /// up from here and so not importable as a constant; keep these two literal
 /// shapes in agreement by hand if either DDL string ever changes). None of
 /// the four declares `SYNC SAFE`, so `sync_safe` is `false` for all of them;
-/// `direction` is `None` (undeclared, so [`DEFAULT_SYNC_DIRECTION`] governs)
-/// for every table except `work_node_contacts`, which declares `SYNC OFF`.
+/// `work_inputs`, `work_capabilities`, and `peer_directory` explicitly
+/// declare `SYNC TWO WAY`; `work_node_contacts` explicitly declares `SYNC
+/// OFF`.
 pub(crate) struct EngineOwnedLedgerPolicy {
     pub(crate) retain: Option<(u64, RetainUnit)>,
     pub(crate) history: Option<HistoryPolicy>,
-    pub(crate) conflict: Option<ConflictPolicy>,
+    pub(crate) conflict: Option<contextdb_core::ConflictPolicy>,
     pub(crate) direction: Option<SyncDirection>,
     pub(crate) sync_safe: bool,
 }
@@ -8438,15 +8724,15 @@ pub(crate) fn engine_owned_ledger_policy(table: &str) -> Option<EngineOwnedLedge
         "work_inputs" => Some(EngineOwnedLedgerPolicy {
             retain: Some((7 * 24 * 60 * 60, RetainUnit::Days)),
             history: None,
-            conflict: None,
-            direction: None,
+            conflict: Some(contextdb_core::ConflictPolicy::KEEP_FIRST),
+            direction: Some(SyncDirection::Both),
             sync_safe: false,
         }),
         "work_capabilities" | "peer_directory" => Some(EngineOwnedLedgerPolicy {
             retain: None,
             history: Some(HistoryPolicy::CurrentOnly),
-            conflict: Some(ConflictPolicy::LatestWins),
-            direction: None,
+            conflict: Some(contextdb_core::ConflictPolicy::KEEP_LATEST),
+            direction: Some(SyncDirection::Both),
             sync_safe: false,
         }),
         "work_node_contacts" => Some(EngineOwnedLedgerPolicy {
@@ -8712,7 +8998,7 @@ pub(crate) struct EngineOwnedMergedPolicy {
     pub(crate) default_ttl_seconds: Option<u64>,
     pub(crate) retain_declared_unit: Option<RetainUnit>,
     pub(crate) history_policy: Option<HistoryPolicy>,
-    pub(crate) conflict_policy: Option<ConflictPolicy>,
+    pub(crate) conflict_policy: Option<contextdb_core::ConflictPolicy>,
     pub(crate) sync_direction: Option<SyncDirection>,
     pub(crate) sync_safe: bool,
 }
@@ -8753,7 +9039,7 @@ pub(crate) enum EngineOwnedMutation {
         sync_safe: bool,
     },
     History(HistoryPolicy),
-    SyncConflict(ConflictPolicy),
+    SyncConflict(contextdb_core::ConflictPolicy),
     SyncDirection(SyncDirection),
 }
 
@@ -9900,12 +10186,11 @@ fn map_vector_quantization(
     }
 }
 
-fn conflict_policy_to_string(p: ConflictPolicy) -> String {
-    match p {
-        ConflictPolicy::LatestWins => "latest_wins".to_string(),
-        ConflictPolicy::ServerWins => "server_wins".to_string(),
-        ConflictPolicy::EdgeWins => "edge_wins".to_string(),
-        ConflictPolicy::InsertIfNotExists => "insert_if_not_exists".to_string(),
+fn declared_conflict_policy_to_string(p: contextdb_core::ConflictPolicy) -> String {
+    if p == contextdb_core::ConflictPolicy::KEEP_LATEST {
+        "keep_latest".to_string()
+    } else {
+        "keep_first".to_string()
     }
 }
 

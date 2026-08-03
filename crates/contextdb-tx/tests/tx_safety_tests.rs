@@ -360,3 +360,53 @@ fn tx_08_prepare_apply_and_return_see_canonical_final_rows() {
         Some(&Value::Text("new".to_string()))
     );
 }
+
+#[test]
+fn tx_09_after_apply_publication_precedes_commit_visibility() {
+    let store = FailingStore {
+        next_row_id: AtomicU64::new(1),
+        fail_apply: AtomicBool::new(false),
+        ..Default::default()
+    };
+    let txm = TransactionManager::new(store);
+    let tx = txm.begin();
+    txm.advance_for_sync(tx, "items", TxId(100))
+        .expect("sync floor should stage before commit");
+    stage_empty_row(&txm, tx, 1);
+    let before_snapshot = txm.snapshot();
+    let before_lsn = txm.current_lsn();
+
+    let (lsn, _) = txm
+        .commit_with_lsn_active_prepare_and_applied_mut(
+            tx,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            |lsn, _| {
+                assert_eq!(
+                    txm.store().applied.lock().len(),
+                    1,
+                    "after-apply publication runs only after storage accepted the write set"
+                );
+                assert_eq!(
+                    txm.snapshot(),
+                    before_snapshot,
+                    "a fresh snapshot must not see applied rows before their sidecars publish"
+                );
+                assert_eq!(
+                    txm.current_lsn(),
+                    before_lsn,
+                    "the public LSN must remain behind the unpublished applied commit"
+                );
+                assert!(
+                    !txm.commit_index_contains(lsn),
+                    "the commit index must not expose an applied commit before after-apply publication"
+                );
+            },
+        )
+        .expect("commit should succeed");
+
+    assert_eq!(lsn, Lsn(1));
+    assert_eq!(txm.snapshot().0, 100);
+    assert_eq!(txm.current_lsn(), lsn);
+    assert!(txm.commit_index_contains(lsn));
+}

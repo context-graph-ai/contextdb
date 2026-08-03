@@ -25,7 +25,7 @@
 //!
 //! Discipline: no sleeps, no elapsed-time assertions, no raw clock reads.
 
-use contextdb_core::{HistoryPolicy, Lsn, Value};
+use contextdb_core::{ConflictPolicy as DeclaredConflictPolicy, HistoryPolicy, Lsn, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use std::collections::HashMap;
@@ -264,7 +264,7 @@ fn alter_set_sync_conflict_refuses_narrowing_to_keep_first_under_history_current
     );
     assert_eq!(
         db.table_meta("device_status").unwrap().conflict_policy,
-        Some(ConflictPolicy::LatestWins),
+        Some(DeclaredConflictPolicy::KEEP_LATEST),
         "a refused ALTER must apply no part of itself: {err}"
     );
 }

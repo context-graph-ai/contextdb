@@ -294,7 +294,7 @@ contextdb edge-1.db --sync-endpoint <ticket> --tenant-id demo
 contextdb edge-2.db --sync-endpoint <ticket> --tenant-id demo
 ```
 
-The ticket is pinned to each edge's identity key on first connect, so later reconnects are authenticated the same way. Two machines on one LAN sync with nothing running in the middle — no NATS, no cloud relay, no third party.
+The ticket is pinned to each edge's identity key on first connect, so later reconnects are authenticated the same way. Two machines on one LAN sync with nothing running in the middle — no cloud relay or other third party.
 
 ### Converge in both directions
 
@@ -331,7 +331,7 @@ SELECT * FROM decisions WHERE id = '850e8400-e29b-41d4-a716-446655440030';
 -- returns the row captured on edge 2
 ```
 
-Both edges now hold the same two rows, converged through the hub. `.sync status` reports what's pending in each direction before you push or pull. The full sync command surface — the `.sync` meta-commands, per-table direction and conflict policy, and auto-sync — is in the [CLI Reference](cli.md); the wire protocol is covered in the Architecture doc's Sync section.
+Both edges now hold the same two rows, converged through the hub. `.sync status` reports what's pending in each direction before you push or pull. Table direction and conflict behavior are durable `CREATE TABLE`/`ALTER TABLE` declarations (`SYNC ...` and `SYNC CONFLICT ...`), not session commands. The sync meta-commands and auto-sync are in the [CLI Reference](cli.md); the wire protocol is covered in the Architecture doc's Sync section.
 
 ### Restart durability
 

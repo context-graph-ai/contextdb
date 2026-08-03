@@ -18,11 +18,12 @@ use contextdb_engine::work_ledger::{
     self as ledger, ExecutionInputs, InputRef, JobSnapshot, JobSpec, MovementPolicy,
 };
 use contextdb_server::exit_codes::EXIT_ERROR;
+use contextdb_server::transport::PeerEndpointSpec;
 use contextdb_server::work_ledger::{
     ClaimOutcome, ExecutionOutput, ExecutionVerdict, PollOutcome, WorkExecutor, WorkerConfig,
     claim_job, poll_and_execute_once,
 };
-use contextdb_server::{FabricIdentity, SyncClient};
+use contextdb_server::{FabricIdentity, SyncClient, peer_dial_spec};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -180,10 +181,18 @@ async fn main() {
     // Attach this node's persistent identity to the endpoint spec unless the
     // operator already did. Pure string handling: the demo names no
     // transport — the endpoint spec is operator-supplied config data.
-    let endpoint = if args.endpoint.contains('?') && !args.endpoint.contains("identity=") {
-        format!("{}&identity={}", args.endpoint, identity_path)
-    } else {
-        args.endpoint.clone()
+    let endpoint = match PeerEndpointSpec::parse(&args.endpoint) {
+        Some(spec) if spec.dial_ticket().is_some() && spec.identity_path().is_none() => {
+            if args.endpoint.contains('?') {
+                format!("{}&identity={identity_path}", args.endpoint)
+            } else {
+                peer_dial_spec(
+                    spec.dial_ticket().expect("checked above"),
+                    std::path::Path::new(&identity_path),
+                )
+            }
+        }
+        _ => args.endpoint.clone(),
     };
     let client = SyncClient::new(
         db.clone(),

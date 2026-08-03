@@ -11,6 +11,122 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
+/// The durable direction declarations that governed each table generation.
+///
+/// A table name can be dropped and reused. Resolving only its current value
+/// would make a former `SYNC OFF` generation eligible once the live metadata
+/// disappears, so each outbound entry is resolved at its own LSN instead.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SyncDirectionHistory {
+    events: HashMap<String, Vec<SyncDirectionHistoryEvent>>,
+    trigger_tables: HashMap<String, Vec<TriggerTableHistoryEvent>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SyncDirectionHistoryEvent {
+    Set { lsn: Lsn, direction: SyncDirection },
+    Drop { lsn: Lsn },
+}
+
+#[derive(Debug, Clone)]
+enum TriggerTableHistoryEvent {
+    Set { lsn: Lsn, table: String },
+    Drop { lsn: Lsn },
+}
+
+impl SyncDirectionHistory {
+    pub(crate) fn record_create(&mut self, table: String, lsn: Lsn, direction: SyncDirection) {
+        self.events
+            .entry(table)
+            .or_default()
+            .push(SyncDirectionHistoryEvent::Set { lsn, direction });
+    }
+
+    pub(crate) fn record_alter(&mut self, table: String, lsn: Lsn, direction: SyncDirection) {
+        self.events
+            .entry(table)
+            .or_default()
+            .push(SyncDirectionHistoryEvent::Set { lsn, direction });
+    }
+
+    pub(crate) fn record_drop(&mut self, table: String, lsn: Lsn) {
+        self.events
+            .entry(table)
+            .or_default()
+            .push(SyncDirectionHistoryEvent::Drop { lsn });
+    }
+
+    pub(crate) fn record_trigger_create(&mut self, trigger: String, table: String, lsn: Lsn) {
+        self.trigger_tables
+            .entry(trigger)
+            .or_default()
+            .push(TriggerTableHistoryEvent::Set { lsn, table });
+    }
+
+    pub(crate) fn record_trigger_drop(&mut self, trigger: String, lsn: Lsn) {
+        self.trigger_tables
+            .entry(trigger)
+            .or_default()
+            .push(TriggerTableHistoryEvent::Drop { lsn });
+    }
+
+    pub(crate) fn has_declarations(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    pub(crate) fn includes(&self, table: &str, lsn: Lsn, include: &[SyncDirection]) -> bool {
+        include.contains(&self.direction_at(table, lsn))
+    }
+
+    fn includes_trigger_drop(&self, trigger: &str, lsn: Lsn, include: &[SyncDirection]) -> bool {
+        match self.trigger_table_at(trigger, lsn) {
+            Some(table) => self.includes(table, lsn, include),
+            None => true,
+        }
+    }
+
+    fn direction_at(&self, table: &str, lsn: Lsn) -> SyncDirection {
+        let Some(events) = self.events.get(table) else {
+            return SyncDirection::Both;
+        };
+        let mut direction = SyncDirection::Both;
+        for event in events {
+            match *event {
+                SyncDirectionHistoryEvent::Set {
+                    lsn: event_lsn,
+                    direction: declared,
+                } if event_lsn <= lsn => direction = declared,
+                // The drop itself belongs to the generation it removes. A
+                // later LSN starts with the default until another CREATE.
+                SyncDirectionHistoryEvent::Drop { lsn: event_lsn } if event_lsn < lsn => {
+                    direction = SyncDirection::Both;
+                }
+                _ => {}
+            }
+        }
+        direction
+    }
+
+    fn trigger_table_at(&self, trigger: &str, lsn: Lsn) -> Option<&str> {
+        let mut table = None;
+        for event in self.trigger_tables.get(trigger).into_iter().flatten() {
+            match event {
+                TriggerTableHistoryEvent::Set {
+                    lsn: event_lsn,
+                    table: declared_table,
+                } if *event_lsn <= lsn => table = Some(declared_table.as_str()),
+                // As with a table DROP, the drop statement itself belongs to
+                // the trigger generation it removes.
+                TriggerTableHistoryEvent::Drop { lsn: event_lsn } if *event_lsn < lsn => {
+                    table = None;
+                }
+                _ => {}
+            }
+        }
+        table
+    }
+}
+
 /// A set of changes extracted from a database since a given LSN.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeSet {
@@ -130,68 +246,67 @@ impl ChangeSet {
         directions: &HashMap<String, SyncDirection>,
         include: &[SyncDirection],
     ) -> ChangeSet {
-        let include_dir = |table: &str| {
-            let dir = directions
-                .get(table)
-                .copied()
-                .unwrap_or(SyncDirection::Both);
-            include.contains(&dir)
-        };
-        let include_event_table =
-            |table: &str| directions.is_empty() || (!table.is_empty() && include_dir(table));
-        let included_route_sinks = self
-            .ddl
-            .iter()
-            .filter_map(|d| match d {
-                DdlChange::CreateRoute { table, sink, .. } if include_event_table(table) => {
-                    Some(sink.clone())
-                }
-                _ => None,
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let include_ddl = |d: &DdlChange| match d {
-            DdlChange::CreateTable { name, .. } => include_dir(name),
-            DdlChange::DropTable { name } => include_dir(name),
-            DdlChange::AlterTable { name, .. } => include_dir(name),
-            DdlChange::CreateIndex { table, .. } => include_dir(table),
-            DdlChange::DropIndex { table, .. } => include_dir(table),
-            DdlChange::CreateTrigger { table, .. } => include_dir(table),
-            DdlChange::DropTrigger { .. } => true,
-            DdlChange::CreateEventType { table, .. } => include_event_table(table),
-            DdlChange::CreateSink { name, .. } => {
-                directions.is_empty() || included_route_sinks.contains(name)
-            }
-            DdlChange::CreateRoute { table, .. } => include_event_table(table),
-            DdlChange::DropRoute { table, .. } => include_event_table(table),
-        };
-        let carry_ddl_lsn = self.ddl_lsn.len() == self.ddl.len();
-        let mut ddl = Vec::new();
-        let mut ddl_lsn = Vec::new();
-        for (index, change) in self.ddl.iter().enumerate() {
-            if include_ddl(change) {
-                ddl.push(change.clone());
-                if carry_ddl_lsn {
-                    ddl_lsn.push(self.ddl_lsn[index]);
-                }
-            }
-        }
+        self.filter_by_direction_at(
+            |table, _| {
+                let dir = directions
+                    .get(table)
+                    .copied()
+                    .unwrap_or(SyncDirection::Both);
+                include.contains(&dir)
+            },
+            directions.is_empty(),
+            false,
+            |_, _| true,
+        )
+    }
 
+    /// Filters internal outbound work against the declaration that governed
+    /// the entry's own table generation. This is intentionally crate-private:
+    /// the wire and public `ChangeSet` API remain unchanged.
+    pub(crate) fn filter_by_direction_history(
+        &self,
+        history: &SyncDirectionHistory,
+        include: &[SyncDirection],
+    ) -> ChangeSet {
+        self.filter_by_direction_at(
+            |table, lsn| history.includes(table, lsn, include),
+            !history.has_declarations(),
+            true,
+            |trigger, lsn| history.includes_trigger_drop(trigger, lsn, include),
+        )
+    }
+
+    fn filter_by_direction_at<F, G>(
+        &self,
+        include_dir: F,
+        _no_declarations: bool,
+        _require_ddl_lsn: bool,
+        _include_drop_trigger: G,
+    ) -> ChangeSet
+    where
+        F: Fn(&str, Lsn) -> bool,
+        G: Fn(&str, Lsn) -> bool,
+    {
         ChangeSet {
             rows: self
                 .rows
                 .iter()
-                .filter(|r| include_dir(&r.table))
+                .filter(|r| include_dir(&r.table, r.lsn))
                 .cloned()
                 .collect(),
             edges: self.edges.clone(),
             vectors: self
                 .vectors
                 .iter()
-                .filter(|v| include_dir(&v.index.table))
+                .filter(|v| include_dir(&v.index.table, v.lsn))
                 .cloned()
                 .collect(),
-            ddl,
-            ddl_lsn,
+            // Sync direction governs row flow. Authenticated schema is one
+            // attested source vector and must never be filtered, regrouped,
+            // or have its paired LSNs rebuilt by a receiver-side direction
+            // decision.
+            ddl: self.ddl.clone(),
+            ddl_lsn: self.ddl_lsn.clone(),
         }
     }
 }
@@ -729,20 +844,53 @@ impl NaturalKey {
     }
 }
 
-// The conflict-policy vocabulary lives in `contextdb-core`, next to the
-// `TableMeta` that persists it, so the DDL clause, the stored declaration and
-// this apply-side resolver can never drift into two different enums — the same
-// placement `SyncDirection` uses.
-pub use contextdb_core::ConflictPolicy;
+// Ordinary tables persist only the public KEEP FIRST / KEEP LATEST
+// declaration in `TableMeta`. This engine-private type also carries the two
+// role-relative mechanics used by ContextDB-owned system tables.
+macro_rules! define_conflict_policy {
+    ($visibility:vis) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        $visibility enum ConflictPolicy {
+            InsertIfNotExists,
+            ServerWins,
+            EdgeWins,
+            LatestWins,
+        }
+    };
+}
 
+#[cfg(feature = "test-seams")]
+define_conflict_policy!(pub);
+#[cfg(not(feature = "test-seams"))]
+define_conflict_policy!(pub(crate));
+
+#[cfg(feature = "test-seams")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictPolicies {
     pub per_table: HashMap<String, ConflictPolicy>,
     pub default: ConflictPolicy,
 }
 
+#[cfg(not(feature = "test-seams"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ConflictPolicies {
+    pub per_table: HashMap<String, ConflictPolicy>,
+    pub default: ConflictPolicy,
+}
+
+#[cfg(feature = "test-seams")]
 impl ConflictPolicies {
     pub fn uniform(policy: ConflictPolicy) -> Self {
+        Self {
+            per_table: HashMap::new(),
+            default: policy,
+        }
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+impl ConflictPolicies {
+    pub(crate) fn uniform(policy: ConflictPolicy) -> Self {
         Self {
             per_table: HashMap::new(),
             default: policy,
@@ -797,11 +945,27 @@ pub enum SyncAdoption {
     ConfirmedPendingReconciliation,
 }
 
+pub(crate) const PURGED_LINEAGE_CONFLICT_REASON: &str = "purged_lineage";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conflict {
     pub natural_key: NaturalKey,
+    #[cfg(feature = "test-seams")]
     pub resolution: ConflictPolicy,
+    #[cfg(not(feature = "test-seams"))]
+    pub(crate) resolution: ConflictPolicy,
     pub reason: Option<String>,
+    /// Present for a terminal authenticated dependency-unit refusal. Ordinary
+    /// conflict accounting keeps these unset so its established wire shape is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winning_author_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_acceptance_position: Option<Lsn>,
 }
 
 // The direction vocabulary lives in `contextdb-core`, next to the `TableMeta`

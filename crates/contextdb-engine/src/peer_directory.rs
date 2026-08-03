@@ -14,7 +14,7 @@ use std::collections::HashMap;
 const CREATE_PEER_DIRECTORY: &str = "CREATE TABLE peer_directory (\
      node_id TEXT PRIMARY KEY, \
      ticket TEXT NOT NULL, \
-     enrolled_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC CONFLICT KEEP LATEST";
+     enrolled_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 
 /// Create the `peer_directory` table if absent. A root created before this
 /// table declared its own HISTORY / SYNC CONFLICT clauses is reconciled via
@@ -30,7 +30,7 @@ pub fn install_peer_directory_schema(db: &Database) -> Result<()> {
     let Some(meta) = db.table_meta("peer_directory") else {
         return Ok(());
     };
-    if meta.conflict_policy != Some(ConflictPolicy::LatestWins) {
+    if meta.conflict_policy != Some(contextdb_core::ConflictPolicy::KEEP_LATEST) {
         db.execute(
             "ALTER TABLE peer_directory SET SYNC CONFLICT KEEP LATEST",
             &HashMap::new(),
@@ -48,14 +48,14 @@ pub fn install_peer_directory_schema(db: &Database) -> Result<()> {
 /// The `peer_directory` table's conflict contract: node-id-keyed,
 /// latest-wins — a node re-enrolling with a rotated ticket overwrites its own
 /// row fabric-wide, mirroring the row-level upsert this module does locally.
-pub fn peer_directory_conflict_policy_entries() -> [(&'static str, ConflictPolicy); 1] {
+pub(crate) fn peer_directory_conflict_policy_entries() -> [(&'static str, ConflictPolicy); 1] {
     [("peer_directory", ConflictPolicy::LatestWins)]
 }
 
 /// Merge `peer_directory`'s policy over `policies`. Sync chokepoints call
 /// this alongside [`crate::work_ledger::apply_work_ledger_policy_overrides`]
 /// so the table syncs across the fabric like `work_capabilities`.
-pub fn apply_peer_directory_policy_overrides(policies: &mut ConflictPolicies) {
+pub(crate) fn apply_peer_directory_policy_overrides(policies: &mut ConflictPolicies) {
     for (table, policy) in peer_directory_conflict_policy_entries() {
         policies.per_table.insert(table.to_string(), policy);
     }

@@ -68,9 +68,8 @@ fn json_stderr_pure_for_startup_usage_error() {
     assert_every_line_is_json(&stderr, "startup usage error");
 }
 
-// (a) — a session that produces BOTH notices (the `--nats-url` deprecation
-// warning and the resulting unreachable-endpoint warning) and a real error,
-// all in the same stderr stream.
+// (a) — a session that produces an unreachable-endpoint notice and a real
+// error, both in the same stderr stream.
 #[test]
 fn json_stderr_pure_across_notices_and_an_error() {
     let (code, _stdout, stderr) = run(
@@ -78,8 +77,8 @@ fn json_stderr_pure_across_notices_and_an_error() {
             "--json",
             "--tenant-id",
             "acme",
-            "--nats-url",
-            "nats://localhost:1",
+            "--sync-endpoint",
+            "iroh:invalid-test-ticket",
             ":memory:",
         ],
         "SELET bad;\n.quit\n",

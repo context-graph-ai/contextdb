@@ -9,8 +9,11 @@ use contextdb_server::protocol::{
 use contextdb_server::subjects::push_subject;
 use contextdb_server::transfer_receipts::{TransferDirection, TransferPlane};
 use contextdb_server::transport::iroh::IrohServer;
-use contextdb_server::transport::{ClientTransport, TransportError};
-use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::transport::{
+    ClientTransport, TransportError, TransportFuture, TransportResult, TransportStatusFuture,
+    client_transport,
+};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer, peer_dial_spec};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +26,13 @@ async fn within<F: std::future::Future>(future: F) -> F::Output {
         .await
         .expect("bounded real-Iroh operation")
 }
+
+// Every journey in this binary creates a real Iroh endpoint.  A restarted
+// hub must reclaim its sticky UDP ports, which is incompatible with a sibling
+// journey concurrently choosing port zero.  One async permit makes that OS
+// resource ownership explicit without weakening any journey or adding time
+// based coordination.
+static REAL_IROH_JOURNEY_PERMIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn bind_spec(path: &Path) -> String {
     format!("iroh:?identity={}", path.display())
@@ -83,17 +93,16 @@ struct Hub {
 async fn hub(root: &Path, tenant: &str) -> Hub {
     let db_path = root.join("hub.db");
     let identity_path = root.join("hub.db.fabric-identity.key");
-    let (ticket, node_id, transport) = {
-        let endpoint = IrohServer::bind(&bind_spec(&identity_path))
-            .await
-            .expect("bind hub");
-        (endpoint.ticket(), endpoint.node_id(), endpoint.transport())
-    };
+    let endpoint = IrohServer::bind(&bind_spec(&identity_path))
+        .await
+        .expect("bind hub");
+    let ticket = endpoint.ticket();
+    let node_id = endpoint.node_id();
     let db = Arc::new(Database::open(db_path).expect("open hub database"));
     table_if_absent(&db);
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+    let server = Arc::new(SyncServer::new(
         db.clone(),
-        transport,
+        &endpoint,
         TenantId::from(tenant),
     ));
     let stop = Arc::new(AtomicBool::new(false));
@@ -150,6 +159,245 @@ fn received_sync_receipts(hub: &Hub) -> Vec<contextdb_server::TransferReceipt> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum LineageFault {
+    Missing,
+    Forged,
+}
+
+impl LineageFault {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Forged => "forged",
+        }
+    }
+}
+
+/// Preserves the actual Iroh peer identities and connection while corrupting
+/// one row lineage at the serialized sync boundary.
+struct TamperPushLineageTransport {
+    inner: Arc<dyn ClientTransport>,
+    subject: String,
+    fault: LineageFault,
+    mutated: Arc<AtomicBool>,
+}
+
+impl TamperPushLineageTransport {
+    fn rewrite(&self, subject: &str, bytes: Vec<u8>) -> TransportResult<Vec<u8>> {
+        if subject != self.subject {
+            return Ok(bytes);
+        }
+        let envelope = decode(&bytes).map_err(|err| TransportError::Other(err.to_string()))?;
+        if envelope.message_type != MessageType::PushRequest {
+            return Ok(bytes);
+        }
+        let mut request: PushRequest = rmp_serde::from_slice(&envelope.payload)
+            .map_err(|err| TransportError::Other(err.to_string()))?;
+        let Some(row) = request.changeset.rows.first_mut() else {
+            return Ok(bytes);
+        };
+        match self.fault {
+            LineageFault::Missing => row.lineage = None,
+            LineageFault::Forged => {
+                let lineage = row
+                    .lineage
+                    .as_mut()
+                    .expect("authenticated source stamps each pushed row with lineage");
+                let first = lineage
+                    .attestation
+                    .first_mut()
+                    .expect("authenticated source signs each pushed row lineage");
+                *first ^= 0x80;
+            }
+        }
+        self.mutated.store(true, Ordering::SeqCst);
+        encode(MessageType::PushRequest, &request)
+            .map_err(|err| TransportError::Other(err.to_string()))
+    }
+}
+
+impl ClientTransport for TamperPushLineageTransport {
+    fn peer_node_id(&self) -> Option<String> {
+        self.inner.peer_node_id()
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        self.inner.has_stable_edge_identity()
+    }
+
+    fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.ensure_connected()
+    }
+
+    fn reconnect<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.reconnect()
+    }
+
+    fn is_connected<'a>(&'a self) -> TransportStatusFuture<'a> {
+        self.inner.is_connected()
+    }
+
+    fn request<'a>(
+        &'a self,
+        subject: &'a str,
+        request_bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> TransportFuture<'a, Vec<u8>> {
+        let request_bytes = match self.rewrite(subject, request_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        self.inner.request(subject, request_bytes, timeout)
+    }
+
+    fn request_single_reply<'a>(
+        &'a self,
+        subject: &'a str,
+        request_bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> TransportFuture<'a, Vec<u8>> {
+        let request_bytes = match self.rewrite(subject, request_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        self.inner
+            .request_single_reply(subject, request_bytes, timeout)
+    }
+
+    fn ensure_single_reply_retry_safe(&self, request_bytes: &[u8]) -> TransportResult<()> {
+        self.inner.ensure_single_reply_retry_safe(request_bytes)
+    }
+
+    fn shutdown<'a>(&'a self) -> TransportFuture<'a, ()> {
+        self.inner.shutdown()
+    }
+}
+
+async fn assert_authenticated_iroh_lineage_fault_is_refused(fault: LineageFault) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let tenant = format!("lineage-{}", fault.name());
+    let hub = hub(root.path(), &tenant).await;
+    let edge_path = root.path().join("edge.db");
+    let identity_path = root.path().join("edge.db.fabric-identity.key");
+    let identity =
+        Arc::new(FabricIdentity::load_or_generate(&identity_path).expect("persist edge identity"));
+    let edge_node_id = identity.node_id();
+    let dial_spec = peer_dial_spec(&hub.ticket, &identity_path);
+    let edge = Arc::new(Database::open(&edge_path).expect("open edge database"));
+    table(&edge);
+    let bootstrap = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(tenant.as_str()));
+    within(bootstrap.push())
+        .await
+        .expect("bootstrap declarations reach the authenticated hub");
+    bootstrap.shutdown().await;
+
+    let id = Uuid::new_v4();
+    insert(&edge, id, "must not survive lineage tampering");
+    let incarnation = edge
+        .sync_incarnation(&TenantId::from(tenant.as_str()))
+        .expect("read durable edge incarnation");
+    let hub_receipts_before = received_sync_receipts(&hub);
+    let hub_watermark_before = hub
+        .db
+        .persisted_sync_applied_push_watermark_for_node_incarnation(
+            &TenantId::from(tenant.as_str()),
+            &edge_node_id,
+            incarnation,
+        )
+        .expect("read hub edge watermark before tampering");
+    let mutated = Arc::new(AtomicBool::new(false));
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge.clone(),
+        Arc::new(TamperPushLineageTransport {
+            inner: client_transport(&dial_spec),
+            subject: push_subject(&tenant),
+            fault,
+            mutated: mutated.clone(),
+        }),
+        TenantId::from(tenant.as_str()),
+        identity,
+    );
+    let source_push_before = client.push_watermark();
+    let source_progress_before = edge
+        .persisted_sync_watermarks(&TenantId::from(tenant.as_str()))
+        .expect("read edge progress before malformed push");
+    let source_receipts_before = client.transfer_receipts();
+    let source_pending_before = client
+        .pending_push_change_count()
+        .expect("count pending malformed source row");
+
+    let refusal = within(client.push())
+        .await
+        .expect_err("the hub refuses a malformed authenticated row lineage");
+    assert!(
+        refusal.to_string().contains("lineage"),
+        "the refusal identifies the malformed immutable provenance: {refusal}"
+    );
+    assert!(
+        mutated.load(Ordering::SeqCst),
+        "the real Iroh transport carried a row-bearing push altered by this test"
+    );
+    assert_eq!(
+        body(&hub.db, id),
+        None,
+        "the hub cannot expose a row whose v6 lineage failed validation"
+    );
+    assert_eq!(
+        received_sync_receipts(&hub),
+        hub_receipts_before,
+        "lineage refusal records no received-sync receipt"
+    );
+    assert_eq!(
+        hub.db
+            .persisted_sync_applied_push_watermark_for_node_incarnation(
+                &TenantId::from(tenant.as_str()),
+                &edge_node_id,
+                incarnation,
+            )
+            .expect("read hub edge watermark after tampering"),
+        hub_watermark_before,
+        "lineage refusal cannot advance the authenticated edge receipt"
+    );
+    assert_eq!(
+        client.push_watermark(),
+        source_push_before,
+        "lineage refusal cannot retire the source push watermark"
+    );
+    assert_eq!(
+        edge.persisted_sync_watermarks(&TenantId::from(tenant.as_str()))
+            .expect("read edge progress after malformed push"),
+        source_progress_before,
+        "lineage refusal cannot persist source sync progress"
+    );
+    assert_eq!(
+        client.transfer_receipts(),
+        source_receipts_before,
+        "lineage refusal cannot record a completed sent receipt"
+    );
+    assert_eq!(
+        client
+            .pending_push_change_count()
+            .expect("count pending malformed source row after refusal"),
+        source_pending_before,
+        "the malformed source row remains pending for operator repair"
+    );
+
+    client.shutdown().await;
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn authenticated_iroh_refuses_missing_or_forged_v6_lineage_before_effects() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    assert_authenticated_iroh_lineage_fault_is_refused(LineageFault::Missing).await;
+    assert_authenticated_iroh_lineage_fault_is_refused(LineageFault::Forged).await;
+}
+
 fn exact_conflict(rendered: &serde_json::Value, id: Uuid, author: &str) -> serde_json::Value {
     let conflicts = rendered["conflicts"]
         .as_array()
@@ -177,6 +425,7 @@ fn exact_conflict(rendered: &serde_json::Value, id: Uuid, author: &str) -> serde
 
 #[tokio::test]
 async fn declared_policy_survives_restart_and_governs_an_authenticated_exchange() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = "declared-policy";
     let hub = hub(root.path(), tenant).await;
@@ -190,8 +439,10 @@ async fn declared_policy_survives_restart_and_governs_an_authenticated_exchange(
     within(client_a.push())
         .await
         .expect("first controlled push");
-    drop(client_a);
-    drop(client_b);
+    // Rebinding the restarted hub's remembered port requires both dialing
+    // endpoints to finish their asynchronous transport shutdown first.
+    client_a.shutdown().await;
+    client_b.shutdown().await;
     let hub = restart_hub(hub, root.path(), tenant).await;
     let client_a = SyncClient::new(edge_a.clone(), &hub.ticket, TenantId::from(tenant));
     let client_b = SyncClient::new(edge_b.clone(), &hub.ticket, TenantId::from(tenant));
@@ -214,6 +465,7 @@ async fn declared_policy_survives_restart_and_governs_an_authenticated_exchange(
 
 #[tokio::test]
 async fn keep_first_refusal_names_authenticated_winner_and_hub_position() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = "winner-diagnostic";
     let hub = hub(root.path(), tenant).await;
@@ -241,6 +493,11 @@ async fn keep_first_refusal_names_authenticated_winner_and_hub_position() {
     let first_rendered = serde_json::to_value(&first).expect("serialize first refusal");
     let first_conflict = exact_conflict(&first_rendered, id, &winner_id);
     let first_position = first_conflict["hub_acceptance_position"].clone();
+    // The restarted hub must reclaim its remembered UDP ports.  Close both
+    // dialing endpoints before stopping the hub, rather than relying on
+    // drop timing while sibling real-Iroh journeys are active.
+    winner.shutdown().await;
+    loser.shutdown().await;
     let hub = restart_hub(hub, root.path(), tenant).await;
     let winner = SyncClient::new(winner_db.clone(), &hub.ticket, TenantId::from(tenant));
     let loser = SyncClient::new(loser_db.clone(), &hub.ticket, TenantId::from(tenant));
@@ -272,6 +529,7 @@ async fn keep_first_refusal_names_authenticated_winner_and_hub_position() {
 
 #[tokio::test]
 async fn file_backed_identity_survives_restart_and_database_recreation() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = "identity-life";
     let hub = hub(root.path(), tenant).await;
@@ -351,6 +609,7 @@ async fn request_after_server_registers(
 
 #[tokio::test]
 async fn production_sync_refuses_identityless_transport() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let root = tempfile::tempdir().expect("tempdir");
     let tenant = "identityless";
     let hub = hub(root.path(), tenant).await;

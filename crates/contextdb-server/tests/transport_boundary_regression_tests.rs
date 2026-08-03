@@ -1,12 +1,11 @@
-use contextdb_core::{Lsn, Value};
+use contextdb_core::{Error, Lsn, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_server::protocol::{MessageType, PushRequest, PushResponse, decode, encode};
 use contextdb_server::transport::{
     ClientTransport, HandlerRegistration, IncomingRequest, Responder, ServerTransport,
     TransportError, TransportFuture,
 };
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, SyncClient, SyncServer};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,9 +13,14 @@ use uuid::Uuid;
 
 struct AlwaysIncompleteTransport {
     push_calls: AtomicUsize,
+    status_calls: AtomicUsize,
 }
 
 impl ClientTransport for AlwaysIncompleteTransport {
+    fn peer_node_id(&self) -> Option<String> {
+        Some("incomplete-reply-hub".to_string())
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,
@@ -24,7 +28,10 @@ impl ClientTransport for AlwaysIncompleteTransport {
         _timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
         if subject.ends_with(".push") {
+            self.status_calls.store(0, Ordering::SeqCst);
             self.push_calls.fetch_add(1, Ordering::SeqCst);
+        } else if subject.ends_with(".status") {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
         }
         Box::pin(async {
             Err(TransportError::IncompleteReply(
@@ -38,6 +45,7 @@ impl ClientTransport for AlwaysIncompleteTransport {
 async fn push_does_not_retry_incomplete_reply() {
     let transport = Arc::new(AlwaysIncompleteTransport {
         push_calls: AtomicUsize::new(0),
+        status_calls: AtomicUsize::new(0),
     });
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -45,17 +53,11 @@ async fn push_does_not_retry_incomplete_reply() {
         &Default::default(),
     )
     .unwrap();
-    let id = Uuid::new_v4();
-    let mut params = std::collections::HashMap::new();
-    params.insert("id".to_string(), Value::Uuid(id));
-    params.insert("v".to_string(), Value::Text("data".into()));
-    db.execute("INSERT INTO t (id, v) VALUES ($id, $v)", &params)
-        .unwrap();
-
-    let client = SyncClient::with_transport(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         db,
         transport.clone(),
         contextdb_core::TenantId::from("push-incomplete-reply"),
+        Arc::new(FabricIdentity::generate()),
     );
     let result = client.push().await;
 
@@ -68,13 +70,24 @@ async fn push_does_not_retry_incomplete_reply() {
         1,
         "push must not retry after a reply stream has already started"
     );
+    assert_eq!(
+        transport.status_calls.load(Ordering::SeqCst),
+        1,
+        "an incomplete post-send reply remains ambiguous and runs lost-ack status reconciliation"
+    );
 }
 
 struct TerminalPushErrorTransport {
     push_calls: AtomicUsize,
+    status_calls: AtomicUsize,
+    pull_calls: AtomicUsize,
 }
 
 impl ClientTransport for TerminalPushErrorTransport {
+    fn peer_node_id(&self) -> Option<String> {
+        Some("terminal-error-hub".to_string())
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,
@@ -83,7 +96,12 @@ impl ClientTransport for TerminalPushErrorTransport {
     ) -> TransportFuture<'a, Vec<u8>> {
         let is_push = subject.ends_with(".push");
         if is_push {
+            self.status_calls.store(0, Ordering::SeqCst);
             self.push_calls.fetch_add(1, Ordering::SeqCst);
+        } else if subject.ends_with(".status") {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+        } else if subject.ends_with(".pull") {
+            self.pull_calls.fetch_add(1, Ordering::SeqCst);
         }
         Box::pin(async move {
             if !is_push {
@@ -94,6 +112,7 @@ impl ClientTransport for TerminalPushErrorTransport {
                 &PushResponse {
                     result: None,
                     error: Some("server rejected push".to_string()),
+                    application_error: None,
                 },
             )
             .map_err(|err| TransportError::Other(err.to_string()))
@@ -102,9 +121,11 @@ impl ClientTransport for TerminalPushErrorTransport {
 }
 
 #[tokio::test]
-async fn push_does_not_retry_valid_server_error_reply() {
+async fn valid_server_error_surfaces_directly_without_lost_ack_reconciliation() {
     let transport = Arc::new(TerminalPushErrorTransport {
         push_calls: AtomicUsize::new(0),
+        status_calls: AtomicUsize::new(0),
+        pull_calls: AtomicUsize::new(0),
     });
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -112,25 +133,32 @@ async fn push_does_not_retry_valid_server_error_reply() {
         &Default::default(),
     )
     .unwrap();
-    let id = Uuid::new_v4();
-    let mut params = std::collections::HashMap::new();
-    params.insert("id".to_string(), Value::Uuid(id));
-    params.insert("v".to_string(), Value::Text("data".into()));
-    db.execute("INSERT INTO t (id, v) VALUES ($id, $v)", &params)
-        .unwrap();
-
-    let client = SyncClient::with_transport(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         db,
         transport.clone(),
         contextdb_core::TenantId::from("push-terminal-error"),
+        Arc::new(FabricIdentity::generate()),
     );
     let result = client.push().await;
 
-    assert!(result.is_err(), "push must surface server rejection");
+    assert!(
+        matches!(&result, Err(Error::SyncError(detail)) if detail == "server rejected push"),
+        "push must surface the decoded server rejection unchanged, got {result:?}"
+    );
     assert_eq!(
         transport.push_calls.load(Ordering::SeqCst),
         1,
         "push must not retry a valid server error reply"
+    );
+    assert_eq!(
+        transport.status_calls.load(Ordering::SeqCst),
+        0,
+        "a decoded terminal server response must not enter lost-ack status reconciliation"
+    );
+    assert_eq!(
+        transport.pull_calls.load(Ordering::SeqCst),
+        0,
+        "a decoded terminal server response must not enter lost-ack pull reconciliation"
     );
 }
 
@@ -141,9 +169,23 @@ struct NoResponderTransport {
 struct RetryUnsafePushTransport {
     retry_safe_push_calls: AtomicUsize,
     single_attempt_push_calls: AtomicUsize,
+    edge_node_id: String,
+    hub_node_id: String,
 }
 
 impl ClientTransport for RetryUnsafePushTransport {
+    fn peer_node_id(&self) -> Option<String> {
+        Some(self.hub_node_id.clone())
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        Some(self.edge_node_id.clone())
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        true
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,
@@ -169,6 +211,7 @@ impl ClientTransport for RetryUnsafePushTransport {
                         new_lsn: Lsn(2),
                     }),
                     error: None,
+                    application_error: None,
                 },
             )
             .map_err(|err| TransportError::Other(err.to_string()))
@@ -183,9 +226,13 @@ impl ClientTransport for RetryUnsafePushTransport {
 
 #[tokio::test]
 async fn push_retry_unsafe_transport_falls_back_to_one_single_attempt() {
+    let identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = identity.node_id();
     let transport = Arc::new(RetryUnsafePushTransport {
         retry_safe_push_calls: AtomicUsize::new(0),
         single_attempt_push_calls: AtomicUsize::new(0),
+        edge_node_id,
+        hub_node_id: "retry-unsafe-hub".to_string(),
     });
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -193,10 +240,11 @@ async fn push_retry_unsafe_transport_falls_back_to_one_single_attempt() {
         &Default::default(),
     )
     .unwrap();
-    let client = SyncClient::with_transport(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         transport.clone(),
         contextdb_core::TenantId::from("push-retry-unsafe"),
+        identity,
     );
     client
         .push()
@@ -236,6 +284,10 @@ async fn push_retry_unsafe_transport_falls_back_to_one_single_attempt() {
 }
 
 impl ClientTransport for NoResponderTransport {
+    fn peer_node_id(&self) -> Option<String> {
+        Some("no-responder-hub".to_string())
+    }
+
     fn request<'a>(
         &'a self,
         subject: &'a str,
@@ -255,14 +307,13 @@ async fn pull_does_not_retry_no_responder() {
         pull_calls: AtomicUsize::new(0),
     });
     let db = Arc::new(Database::open_memory());
-    let client = SyncClient::with_transport(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         db,
         transport.clone(),
         contextdb_core::TenantId::from("pull-no-responder"),
+        Arc::new(FabricIdentity::generate()),
     );
-    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
-
-    let result = client.pull(&policies).await;
+    let result = client.pull_default().await;
 
     assert!(
         result.is_err(),
@@ -278,8 +329,8 @@ async fn pull_does_not_retry_no_responder() {
 #[tokio::test]
 async fn in_process_request_timeout_bounds_handler_and_reply_wait() {
     let broker = contextdb_server::InProcessBroker::new();
-    let client = broker.client();
-    let server = broker.server();
+    let client = broker.client_as("timeout-edge");
+    let server = broker.server_as("timeout-hub");
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = shutdown.clone();
     let server_task = tokio::spawn(async move {
@@ -367,7 +418,7 @@ impl ServerTransport for SinglePushServerTransport {
             (registration.handler)(IncomingRequest {
                 bytes: request_bytes,
                 responder,
-                node_id: None,
+                node_id: Some("apply-drain-edge".to_string()),
             })
             .await
         })
@@ -376,23 +427,8 @@ impl ServerTransport for SinglePushServerTransport {
 
 #[tokio::test]
 async fn server_run_until_returns_after_accepted_push_apply_finishes() {
-    let edge_db = Arc::new(Database::open_memory());
-    edge_db
-        .execute(
-            "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)",
-            &Default::default(),
-        )
-        .unwrap();
-    let id = Uuid::new_v4();
-    let mut params = std::collections::HashMap::new();
-    params.insert("id".to_string(), Value::Uuid(id));
-    params.insert("v".to_string(), Value::Text("data".into()));
-    edge_db
-        .execute("INSERT INTO t (id, v) VALUES ($id, $v)", &params)
-        .unwrap();
-
     let request = PushRequest {
-        changeset: edge_db.changes_since(Lsn(0)).into(),
+        changeset: Default::default(),
         incarnation: contextdb_core::Incarnation::default(),
     };
     let request_bytes = encode(MessageType::PushRequest, &request).unwrap();
@@ -402,11 +438,14 @@ async fn server_run_until_returns_after_accepted_push_apply_finishes() {
         response_bytes: response_bytes.clone(),
     });
     let server_db = Arc::new(Database::open_memory());
-    let server = SyncServer::with_transport(
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = SyncServer::with_authenticated_transport_and_identity_for_test(
         server_db.clone(),
         transport,
         contextdb_core::TenantId::from("apply-drain"),
-        ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
+        node_id,
+        identity,
     );
 
     // The exact lost-wakeup requires a scheduler interleaving inside wait_idle,
@@ -429,6 +468,7 @@ async fn server_run_until_returns_after_accepted_push_apply_finishes() {
     assert!(matches!(envelope.message_type, MessageType::PushResponse));
     let response: PushResponse = rmp_serde::from_slice(&envelope.payload).unwrap();
     assert_eq!(response.error, None);
-    assert_eq!(response.result.expect("push result").applied_rows, 1);
-    assert_eq!(server_db.scan("t", server_db.snapshot()).unwrap().len(), 1);
+    let result = response.result.expect("push result");
+    assert_eq!(result.applied_rows, 0);
+    assert_eq!(result.skipped_rows, 0);
 }

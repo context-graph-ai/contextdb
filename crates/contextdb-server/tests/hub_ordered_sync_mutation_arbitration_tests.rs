@@ -5,7 +5,7 @@
 
 use contextdb_core::{TenantId, Value, VectorIndexRef};
 use contextdb_engine::Database;
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,12 +55,17 @@ fn start_hub(broker: &InProcessBroker) -> Hub {
 fn start_hub_ddl(broker: &InProcessBroker, ddl: &str) -> Hub {
     let db = Arc::new(Database::open_memory());
     db.execute(ddl, &p()).expect("hub declared table");
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as("mutation-arbitration-hub"),
-        TenantId::from(TENANT),
-        db.conflict_policies(),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -69,13 +74,17 @@ fn start_hub_ddl(broker: &InProcessBroker, ddl: &str) -> Hub {
     });
     Hub { db, stop, task }
 }
-fn start_hub_db(broker: &InProcessBroker, identity: &str, db: Arc<Database>) -> Hub {
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(identity),
-        TenantId::from(TENANT),
-        db.conflict_policies(),
-    ));
+fn start_hub_db(broker: &InProcessBroker, identity: Arc<FabricIdentity>, db: Arc<Database>) -> Hub {
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -88,11 +97,17 @@ fn start_hub_db(broker: &InProcessBroker, identity: &str, db: Arc<Database>) -> 
 fn edge(broker: &InProcessBroker, node: &str) -> (Arc<Database>, SyncClient) {
     edge_ddl(broker, node, LATEST)
 }
-fn edge_ddl(broker: &InProcessBroker, node: &str, ddl: &str) -> (Arc<Database>, SyncClient) {
+fn edge_ddl(broker: &InProcessBroker, _role: &str, ddl: &str) -> (Arc<Database>, SyncClient) {
     let db = Arc::new(Database::open_memory());
     db.execute(ddl, &p()).expect("edge declared table");
-    let client =
-        SyncClient::with_transport(db.clone(), broker.client_as(node), TenantId::from(TENANT));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        broker.client_as(&node_id),
+        TenantId::from(TENANT),
+        identity,
+    );
     (db, client)
 }
 
@@ -398,10 +413,10 @@ async fn stale_pulled_delete_is_not_reoffered_to_erase_a_later_hub_edit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_rebind_then_ordinary_later_write_converges_everywhere() {
     let broker = InProcessBroker::new();
-    let identity = "source-rebind-hub";
+    let identity = Arc::new(FabricIdentity::generate());
     let hub1db = Arc::new(Database::open_memory());
     hub1db.execute(LATEST, &p()).unwrap();
-    let hub1 = start_hub_db(&broker, identity, hub1db);
+    let hub1 = start_hub_db(&broker, identity.clone(), hub1db);
     let (a, ac) = edge(&broker, "rebind-a");
     let (b, bc) = edge(&broker, "rebind-b");
     write(&a, "generation-one");

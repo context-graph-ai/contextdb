@@ -2,6 +2,8 @@ use super::common::*;
 use contextdb_core::Value;
 use tempfile::TempDir;
 
+const OOM_SYNC_SOURCE_ROWS: usize = 128;
+
 fn seed_edge_big_table(edge_path: &std::path::Path, rows: usize) {
     let db = contextdb_engine::Database::open(edge_path).expect("open edge db");
     db.execute(
@@ -9,6 +11,8 @@ fn seed_edge_big_table(edge_path: &std::path::Path, rows: usize) {
         &std::collections::HashMap::new(),
     )
     .expect("create big table");
+    db.execute("BEGIN", &std::collections::HashMap::new())
+        .expect("begin source rows transaction");
     for _ in 0..rows {
         db.execute(
             "INSERT INTO big (id, payload) VALUES ($id, $payload)",
@@ -19,6 +23,8 @@ fn seed_edge_big_table(edge_path: &std::path::Path, rows: usize) {
         )
         .expect("seed edge row");
     }
+    db.execute("COMMIT", &std::collections::HashMap::new())
+        .expect("commit source rows transaction");
     db.close().expect("close edge db");
 }
 
@@ -28,30 +34,30 @@ async fn f12_server_crash_mid_push_does_not_corrupt_server_data() {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "f12-edge.db");
     let server_path = temp_db_file(&tmp, "f12-server.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f12", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f12", &sync.bind_spec);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f12", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync push\n.quit\n",
+        &["--tenant-id", "f12", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
     let count = count_rows_from_file(&server_path, "sensors");
     assert!(count == 0 || count == 1000);
 }
 
-/// NATS went down and came back, and my edge CLI reconnected on its own without me restarting it.
+/// I explicitly reconnected the edge CLI to its sync endpoint without restarting it.
 #[tokio::test]
-async fn f13_nats_restart_does_not_require_edge_restart() {
+async fn f13_sync_reconnect_does_not_require_edge_restart() {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "f13-edge.db");
     let server_path = temp_db_file(&tmp, "f13-server.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f13", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f13", &sync.bind_spec);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f13", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync reconnect\n.sync push\n.quit\n",
+        &["--tenant-id", "f13", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync reconnect\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
     assert!(output.status.success());
@@ -64,19 +70,19 @@ async fn f14_server_restart_does_not_require_edge_restart() {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "f14-edge.db");
     let server_path = temp_db_file(&tmp, "f14-server.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f14", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f14", &sync.bind_spec);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f14", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n.sync push\n.quit\n",
+        &["--tenant-id", "f14", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
-    server = spawn_server(&server_path, "f14", &nats.nats_url);
+    server = spawn_server(&server_path, "f14", &sync.bind_spec);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f14", "--nats-url", &nats.ws_url],
-        "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'x')\n.sync push\n.quit\n",
+        &["--tenant-id", "f14", "--sync-endpoint", &sync.ticket],
+        "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'x');\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
     assert!(output.status.success());
@@ -142,8 +148,8 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "f16-edge.db");
     let server_path = temp_db_file(&tmp, "f16-server.db");
-    let nats = start_nats().await;
-    seed_edge_big_table(&edge_path, 500);
+    let sync = start_sync_fixture().await;
+    seed_edge_big_table(&edge_path, OOM_SYNC_SOURCE_ROWS);
 
     // Pre-configure server DB with a tiny memory limit
     {
@@ -153,11 +159,11 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
         db.close().expect("close");
     }
 
-    let mut server = spawn_server(&server_path, "f16", &nats.nats_url);
+    let mut server = spawn_server(&server_path, "f16", &sync.bind_spec);
 
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
-        &["--tenant-id", "f16", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f16", "--sync-endpoint", &sync.ticket],
         ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );
@@ -182,8 +188,8 @@ async fn f16_server_out_of_memory_does_not_silently_drop_pushed_data() {
             "successful push must not report an error; stdout={stdout}, stderr={stderr}"
         );
         assert_eq!(
-            count, 500,
-            "successful push must persist all 500 rows, got {}",
+            count, OOM_SYNC_SOURCE_ROWS,
+            "successful push must persist all {OOM_SYNC_SOURCE_ROWS} rows, got {}",
             count
         );
     } else {
@@ -205,8 +211,8 @@ async fn f16c_server_restart_preserves_constrained_memory_push_behavior() {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "f16c-edge.db");
     let server_path = temp_db_file(&tmp, "f16c-server.db");
-    let nats = start_nats().await;
-    seed_edge_big_table(&edge_path, 500);
+    let sync = start_sync_fixture().await;
+    seed_edge_big_table(&edge_path, OOM_SYNC_SOURCE_ROWS);
 
     {
         let db = contextdb_engine::Database::open(&server_path).expect("open server db");
@@ -215,13 +221,13 @@ async fn f16c_server_restart_preserves_constrained_memory_push_behavior() {
         db.close().expect("close");
     }
 
-    let mut first_server = spawn_server(&server_path, "f16c", &nats.nats_url);
+    let mut first_server = spawn_server(&server_path, "f16c", &sync.bind_spec);
     stop_child(&mut first_server);
-    let mut restarted_server = spawn_server(&server_path, "f16c", &nats.nats_url);
+    let mut restarted_server = spawn_server(&server_path, "f16c", &sync.bind_spec);
 
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
-        &["--tenant-id", "f16c", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f16c", "--sync-endpoint", &sync.ticket],
         ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );

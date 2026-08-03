@@ -1,9 +1,9 @@
-//! Protocol v6: the arrival position on a row change and the serving
-//! store's identity on a pull response ride ONE version bump; no other wire
-//! shape moves. `decode` already refuses any envelope whose version is not
-//! exactly `PROTOCOL_VERSION` (`protocol.rs`), so the refusal mechanism
-//! itself is not new — what is new is the bump itself, the two carried
-//! fields, and an actionable message.
+//! The unshipped protocol v6 includes a distinct PURGE instruction lane and a
+//! structured authority refusal together with its arrival/source fields.
+//! `decode` already refuses any envelope whose
+//! version is not exactly `PROTOCOL_VERSION` (`protocol.rs`), so the refusal
+//! mechanism itself is not new; this test freezes the completed v6 wire shape
+//! and its actionable authority result.
 //!
 //! Contract: `PROTOCOL_VERSION` is 6. A version-mismatched peer is refused
 //! loudly on push, pull, AND the dedicated status exchange; no rows are ever
@@ -14,22 +14,24 @@
 
 use contextdb_core::{Incarnation, Lsn, TenantId, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_engine::composite_store::ChangeLogEntry;
 use contextdb_server::protocol::{
     Envelope, MessageType, PROTOCOL_VERSION, PullResponse, SyncStatusRequest, WireChangeSet,
     WireNaturalKey, WireRowChange, encode,
 };
 use contextdb_server::subjects::status_subject;
 use contextdb_server::transport::{ClientTransport, TransportFuture};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::work_ledger::WORK_NODE_CONTACTS_TABLE;
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+const DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
 /// A version guaranteed to differ from whatever `PROTOCOL_VERSION` is on
-/// this tree today or after the v6 bump — never a peer this tree could
+/// this tree today or after a future bump — never a peer this tree could
 /// legitimately be.
 const BOGUS_VERSION: u8 = 250;
 
@@ -65,6 +67,10 @@ impl ClientTransport for RewriteEnvelopeVersion {
         self.inner.peer_node_id()
     }
 
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
+    }
+
     fn has_stable_edge_identity(&self) -> bool {
         self.inner.has_stable_edge_identity()
     }
@@ -93,12 +99,17 @@ impl RunningHub {
 }
 
 fn start_hub(broker: &InProcessBroker, tenant: &str, hub_db: Arc<Database>) -> RunningHub {
-    let server = Arc::new(SyncServer::with_transport(
-        hub_db,
-        broker.server(),
-        TenantId::from(tenant),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db,
+            broker.server_as(&node_id),
+            TenantId::from(tenant),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -115,24 +126,32 @@ fn row_count(db: &Database, table: &str) -> usize {
         .len()
 }
 
-/// The v6 bump itself: `PROTOCOL_VERSION` must be 6, carrying the arrival
-/// position and the serving store's identity in one change. Fails until the
-/// bump lands (the tree is at v5 today); everything else in this file
-/// compiles and is meaningful either side of the bump.
+fn assert_only_optional_peer_contact_changes_since(db: &Database, before_lsn: Lsn, exchange: &str) {
+    let changes = db.change_log_since(before_lsn);
+    assert!(
+        changes.iter().all(|entry| matches!(
+            entry,
+            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. }
+                if table == WORK_NODE_CONTACTS_TABLE
+        )),
+        "the refused {exchange} may record only work_node_contacts peer-contact changes: {changes:?}"
+    );
+}
+
+/// The completed greenfield v6 contract carries the distinct PURGE lane and
+/// structured authority refusal before any v6 peer ships.
 #[test]
-fn protocol_version_is_v6() {
+fn protocol_version_is_amended_v6() {
     assert_eq!(
         PROTOCOL_VERSION, 6,
-        "protocol v5->v6 must carry the arrival position on the row change \
-         and the serving store's identity on the pull response in ONE bump"
+        "the unshipped protocol v6 must include the distinct PURGE instruction lane and \
+         structured authoritative-hub refusal"
     );
 }
 
 /// The two v6 fields exist and round-trip: `WireRowChange.arrival` and
-/// `PullResponse.source`. Neither is populated by any real sender or server
-/// yet (both default to absent, the legacy behavior every existing caller
-/// gets — see the stub notes on the field definitions), but the shape is
-/// live on the wire type today, ahead of the version bump itself.
+/// `PullResponse.source`. They remain part of the completed v6 wire contract, and their
+/// absent defaults retain the legacy meaning.
 #[test]
 fn the_v6_wire_fields_exist_and_round_trip() {
     let row = WireRowChange {
@@ -147,6 +166,7 @@ fn the_v6_wire_fields_exist_and_round_trip() {
         lsn: Lsn(5),
         created_at: None,
         arrival: Some(Lsn(3)),
+        lineage: None,
     };
     let row_bytes = rmp_serde::to_vec(&row).expect("WireRowChange encode");
     let row_back: WireRowChange = rmp_serde::from_slice(&row_bytes).expect("WireRowChange decode");
@@ -183,6 +203,48 @@ fn the_v6_wire_fields_exist_and_round_trip() {
     );
 }
 
+#[test]
+fn protocol_v6_purge_instruction_and_typed_authority_error_round_trip() {
+    let changeset = WireChangeSet {
+        purges: vec![contextdb_server::protocol::WirePurgeChange {
+            table: "notes".to_string(),
+            table_generation: 3,
+            natural_key: WireNaturalKey {
+                column: "id".to_string(),
+                value: Value::Int64(7),
+                rest: Vec::new(),
+            },
+            purged_lineage_roots: vec!["lineage-root-7".to_string()],
+            purge_frontier: Lsn(12),
+        }],
+        ..WireChangeSet::default()
+    };
+    let changeset_bytes = rmp_serde::to_vec(&changeset).expect("WireChangeSet encode");
+    let changeset_back: WireChangeSet =
+        rmp_serde::from_slice(&changeset_bytes).expect("WireChangeSet decode");
+    assert_eq!(
+        changeset_back, changeset,
+        "nonempty PURGE lane must round-trip"
+    );
+
+    let response = contextdb_server::protocol::PushResponse {
+        result: None,
+        error: None,
+        application_error: Some(
+            contextdb_server::protocol::WirePushError::PurgeRequiresAuthoritativeHub {
+                hub_node_id: "authoritative-hub".to_string(),
+            },
+        ),
+    };
+    let response_bytes = rmp_serde::to_vec(&response).expect("PushResponse encode");
+    let response_back: contextdb_server::protocol::PushResponse =
+        rmp_serde::from_slice(&response_bytes).expect("PushResponse decode");
+    assert_eq!(
+        response_back, response,
+        "structured PURGE authority refusal must round-trip"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advancing_no_watermark() {
     let broker = InProcessBroker::new();
@@ -203,17 +265,22 @@ async fn a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advanci
         .execute("INSERT INTO notes (id, body) VALUES ($id, $body)", &row)
         .expect("edge write");
 
-    let node_id = "edge-mismatch-push";
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let node_id = edge_identity.node_id();
     let transport = Arc::new(RewriteEnvelopeVersion {
-        inner: broker.client_as(node_id),
+        inner: broker.client_as(&node_id),
         version: BOGUS_VERSION,
     });
-    let edge_client =
-        SyncClient::with_transport(edge_db.clone(), transport, TenantId::from(tenant));
+    let edge_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_db.clone(),
+        transport,
+        TenantId::from(tenant),
+        edge_identity,
+    );
 
     let tenant_id = TenantId::from(tenant);
     let hub_watermark_before = hub_db
-        .persisted_sync_applied_push_watermark_for_node(&tenant_id, node_id)
+        .persisted_sync_applied_push_watermark_for_node(&tenant_id, &node_id)
         .expect("read hub per-edge watermark before push");
     assert_eq!(
         hub_watermark_before, None,
@@ -246,7 +313,7 @@ async fn a_version_mismatched_peer_is_refused_on_push_moving_no_rows_and_advanci
         "the push watermark must not advance on a refused version mismatch"
     );
     let hub_watermark_after = hub_db
-        .persisted_sync_applied_push_watermark_for_node(&tenant_id, node_id)
+        .persisted_sync_applied_push_watermark_for_node(&tenant_id, &node_id)
         .expect("read hub per-edge watermark after push");
     assert_eq!(
         hub_watermark_after, hub_watermark_before,
@@ -276,12 +343,18 @@ async fn a_version_mismatched_peer_is_refused_on_pull_moving_no_rows_and_advanci
 
     let edge_db = Arc::new(Database::open_memory());
     edge_db.execute(DDL, &p()).expect("edge ddl");
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
     let transport = Arc::new(RewriteEnvelopeVersion {
-        inner: broker.client(),
+        inner: broker.client_as(&edge_node_id),
         version: BOGUS_VERSION,
     });
-    let edge_client =
-        SyncClient::with_transport(edge_db.clone(), transport, TenantId::from(tenant));
+    let edge_client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_db.clone(),
+        transport,
+        TenantId::from(tenant),
+        edge_identity,
+    );
 
     let tenant_id = TenantId::from(tenant);
     let hub_lsn_before = hub_db.current_lsn();
@@ -308,11 +381,10 @@ async fn a_version_mismatched_peer_is_refused_on_pull_moving_no_rows_and_advanci
         contextdb_core::Lsn(0),
         "the pull watermark must not advance on a refused version mismatch"
     );
-    assert_eq!(
-        hub_db.current_lsn(),
+    assert_only_optional_peer_contact_changes_since(
+        &hub_db,
         hub_lsn_before,
-        "the hub state used to serve cursors must be untouched by a refused \
-         version-mismatched pull"
+        "version-mismatched pull",
     );
     let edge_persisted_after = edge_db
         .persisted_sync_watermarks(&tenant_id)
@@ -335,15 +407,12 @@ async fn a_version_mismatched_peer_is_refused_on_the_status_exchange() {
     hub_db.execute(DDL, &p()).expect("hub ddl");
     let hub = start_hub(&broker, tenant, hub_db.clone());
 
-    // Anonymous transport, deliberately: `client_as` would carry an
-    // authenticated node id, and the hub's per-node last-contact clock
-    // advances on ANY contact regardless of message validity (an existing,
-    // separate design choice) — that would make the hub's durable position
-    // position an unreliable proxy for "did the mismatched exchange move
-    // anything sync-relevant." Anonymous keeps that side effect out of the
-    // picture entirely, so the checks below are unambiguous.
+    // This transport authenticates its peer identity. Best-effort contact
+    // bookkeeping may run even when the envelope version is refused, so the
+    // check below permits only `work_node_contacts` entries while still proving
+    // that no sync progress advances.
     let transport = Arc::new(RewriteEnvelopeVersion {
-        inner: broker.client(),
+        inner: broker.client_as("protocol-version-status-edge"),
         version: BOGUS_VERSION,
     });
     let request = SyncStatusRequest {
@@ -377,11 +446,10 @@ async fn a_version_mismatched_peer_is_refused_on_the_status_exchange() {
         "a refused version-mismatched status exchange must not move the \
          hub's applied-push watermark"
     );
-    assert_eq!(
-        hub_db.current_lsn(),
+    assert_only_optional_peer_contact_changes_since(
+        &hub_db,
         hub_lsn_before,
-        "a refused version-mismatched status exchange must not move the \
-         hub's own commit position either"
+        "version-mismatched status exchange",
     );
 
     hub.stop().await;

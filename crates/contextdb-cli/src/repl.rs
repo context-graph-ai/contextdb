@@ -2,7 +2,6 @@ use crate::formatter::{DEFAULT_ROW_CAP, format_query_result_capped, format_query
 use crate::json_output::{self, ErrorClass};
 use contextdb_core::{Error, TableMeta};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_INTERRUPTED_PUSH_UNCONFIRMED, EXIT_OK};
 use contextdb_server::{SyncClient, SyncPlugin};
 use rustyline::DefaultEditor;
@@ -56,6 +55,20 @@ impl OutputOptions {
             json_output::print_notice(class, message);
         } else {
             eprintln!("{message}");
+        }
+    }
+
+    /// Report a notice whose typed detail must remain machine-addressable.
+    pub fn report_notice_document(
+        &self,
+        class: ErrorClass,
+        message: &str,
+        detail: &serde_json::Value,
+    ) {
+        if self.json {
+            json_output::print_notice_document(class, message, detail);
+        } else {
+            eprintln!("{message}: {detail}");
         }
     }
 }
@@ -857,9 +870,6 @@ fn help_lines(topic: &str) -> Vec<&'static str> {
         ".sync pull                Pull remote changes from server",
         ".sync reconnect           Reconnect to the sync endpoint",
         ".sync destination         Move retained-data delivery to the connected hub",
-        ".sync direction <t> <d>   Set table sync direction (Push|Pull|Both|None)",
-        ".sync policy <t> <p>      Set table conflict policy (InsertIfNotExists|ServerWins|EdgeWins|LatestWins)",
-        ".sync policy default <p>  Set default conflict policy",
         ".sync auto [on|off]       Toggle auto-sync after DML",
     ]
 }
@@ -1014,6 +1024,16 @@ fn run_sync_command(
     let parts: Vec<&str> = args.split_whitespace().collect();
     let sub = parts.first().copied().unwrap_or("status");
 
+    if !matches!(
+        sub,
+        "status" | "auto" | "push" | "pull" | "reconnect" | "destination"
+    ) {
+        return SyncCommandOutcome::failed(
+            ErrorClass::Usage,
+            format!("Unknown .sync command: {sub}"),
+        );
+    }
+
     let (Some(client), Some(rt)) = (sync_client, rt) else {
         // Without a sync endpoint a QUERY still answers the question it was
         // asked ("is sync set up?" — no), so it succeeds. An ACTION did not
@@ -1069,9 +1089,10 @@ fn run_sync_command(
                     result.conflicts.len()
                 );
                 for conflict in &result.conflicts {
-                    if let Some(reason) = &conflict.reason {
-                        msg.push_str(&format!("\n  conflict: {}", reason));
-                    }
+                    msg.push_str(&format!(
+                        "\n  conflict: {}",
+                        contextdb_engine::cli_render::render_sync_conflict(conflict)
+                    ));
                 }
                 SyncCommandOutcome::succeeded(
                     msg,
@@ -1116,9 +1137,10 @@ fn run_sync_command(
                     result.conflicts.len()
                 );
                 for conflict in &result.conflicts {
-                    if let Some(reason) = &conflict.reason {
-                        msg.push_str(&format!("\n  conflict: {}", reason));
-                    }
+                    msg.push_str(&format!(
+                        "\n  conflict: {}",
+                        contextdb_engine::cli_render::render_sync_conflict(conflict)
+                    ));
                 }
                 SyncCommandOutcome::succeeded(
                     msg,
@@ -1184,86 +1206,6 @@ fn run_sync_command(
                 ),
             }
         }
-        "direction" => {
-            if parts.len() != 3 {
-                return SyncCommandOutcome::failed(
-                    ErrorClass::Usage,
-                    "Usage: .sync direction <table> <Push|Pull|Both|None>".to_string(),
-                );
-            }
-            let table = parts[1];
-            let dir = match parts[2] {
-                "Push" | "push" => SyncDirection::Push,
-                "Pull" | "pull" => SyncDirection::Pull,
-                "Both" | "both" => SyncDirection::Both,
-                "None" | "none" => SyncDirection::None,
-                other => {
-                    return SyncCommandOutcome::failed(
-                        ErrorClass::Usage,
-                        format!("Unknown direction: {other}. Use: Push, Pull, Both, None"),
-                    );
-                }
-            };
-            if let Err(err) = client.set_table_direction(table, dir) {
-                // A delivery-promising table refuses a direction that would
-                // stop delivering it; surface the engine's reason verbatim.
-                return SyncCommandOutcome::failed(ErrorClass::of(&err), err.to_string());
-            }
-            SyncCommandOutcome::succeeded(
-                format!("{table} -> {dir:?}"),
-                serde_json::json!({
-                    "sync_direction": {
-                        "table": table,
-                        "direction": json_output::sync_direction_wire_word(dir),
-                    }
-                }),
-            )
-        }
-        "policy" => {
-            if parts.len() != 3 {
-                return SyncCommandOutcome::failed(
-                    ErrorClass::Usage,
-                    "Usage: .sync policy <table> <InsertIfNotExists|ServerWins|EdgeWins|LatestWins>\n       .sync policy default <policy>".to_string(),
-                );
-            }
-            let policy = match parts[2] {
-                "InsertIfNotExists" => ConflictPolicy::InsertIfNotExists,
-                "ServerWins" => ConflictPolicy::ServerWins,
-                "EdgeWins" => ConflictPolicy::EdgeWins,
-                "LatestWins" => ConflictPolicy::LatestWins,
-                other => {
-                    return SyncCommandOutcome::failed(
-                        ErrorClass::Usage,
-                        format!(
-                            "Unknown policy: {other}. Use: InsertIfNotExists, ServerWins, EdgeWins, LatestWins"
-                        ),
-                    );
-                }
-            };
-            if parts[1] == "default" {
-                client.set_default_conflict_policy(policy);
-                SyncCommandOutcome::succeeded(
-                    format!("Default conflict policy -> {policy:?}"),
-                    serde_json::json!({
-                        "sync_policy": {
-                            "scope": "default",
-                            "policy": json_output::conflict_policy_wire_word(policy),
-                        }
-                    }),
-                )
-            } else {
-                client.set_conflict_policy(parts[1], policy);
-                SyncCommandOutcome::succeeded(
-                    format!("{} -> {policy:?}", parts[1]),
-                    serde_json::json!({
-                        "sync_policy": {
-                            "table": parts[1],
-                            "policy": json_output::conflict_policy_wire_word(policy),
-                        }
-                    }),
-                )
-            }
-        }
         "auto" => {
             let Some(plugin) = sync_plugin else {
                 return SyncCommandOutcome::succeeded(
@@ -1311,7 +1253,7 @@ fn run_sync_command(
 }
 
 /// A push or pull result as a document: what moved, what was skipped, and each
-/// conflict's reason — the same three facts the human line reports.
+/// complete typed conflict receipt — the same document the human line reports.
 fn apply_result_json(
     result: &contextdb_engine::sync_types::ApplyResult,
     outcome: &str,
@@ -1322,8 +1264,7 @@ fn apply_result_json(
         "conflicts": result
             .conflicts
             .iter()
-            .filter_map(|conflict| conflict.reason.as_ref())
-            .map(|reason| serde_json::json!({ "reason": reason }))
+            .map(contextdb_engine::cli_render::sync_conflict_document)
             .collect::<Vec<_>>(),
         "outcome": outcome,
     })
@@ -1345,7 +1286,6 @@ fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: boo
     let output = input.output;
     match db.execute(sql, &HashMap::new()) {
         Ok(result) => {
-            let rows_examined = db.__rows_examined();
             if result.columns.is_empty() {
                 if output.json {
                     // A non-query statement: a small JSON status object so the
@@ -1378,13 +1318,13 @@ fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: boo
                     // The trace is diagnostics about a result, not the result:
                     // on stdout it would corrupt the JSON Lines stream a
                     // consumer is parsing.
-                    json_output::print_trace(&result.trace, rows_examined);
+                    json_output::print_trace(&result.trace, result.trace.rows_examined);
                 } else {
                     println!(
                         "{}",
                         contextdb_engine::cli_render::render_query_trace(
                             &result.trace,
-                            rows_examined
+                            result.trace.rows_examined
                         )
                     );
                 }
@@ -1406,7 +1346,6 @@ fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
     use contextdb_parser::{Statement, parse};
 
     /// A scripted, human-output context — what the meta-command tests below
@@ -1492,8 +1431,6 @@ mod tests {
             ("pull", false),
             ("reconnect", false),
             ("destination", false),
-            ("direction t Push", false),
-            ("policy t ServerWins", false),
         ] {
             let result = handle_sync_command(None, None, subcmd, None);
             assert!(
@@ -1510,88 +1447,6 @@ mod tests {
         }
     }
 
-    // B3: .sync direction parses all four direction values
-    #[test]
-    fn b3_sync_direction_parsing() {
-        let db = Arc::new(Database::open_memory());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = rt.block_on(async {
-            SyncClient::new(
-                db,
-                "nats://localhost:19999",
-                contextdb_core::TenantId::from("b3-test"),
-            )
-        });
-
-        // Suppress unused import warning — SyncDirection is used to verify the API exists
-        let _directions = [
-            SyncDirection::Push,
-            SyncDirection::Pull,
-            SyncDirection::Both,
-            SyncDirection::None,
-        ];
-
-        for (table, dir) in [
-            ("observations", "Push"),
-            ("patterns", "pull"),
-            ("decisions", "Both"),
-            ("scratch", "None"),
-        ] {
-            let args = format!("direction {} {}", table, dir);
-            let result = handle_sync_command(Some(&client), Some(&rt), &args, None).message;
-            assert!(
-                result.contains(table),
-                "direction command for '{}' should contain table name, got: {}",
-                table,
-                result
-            );
-        }
-    }
-
-    // B4: .sync policy parses all four policies + default
-    #[test]
-    fn b4_sync_policy_parsing() {
-        let db = Arc::new(Database::open_memory());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = rt.block_on(async {
-            SyncClient::new(
-                db,
-                "nats://localhost:19999",
-                contextdb_core::TenantId::from("b4-test"),
-            )
-        });
-
-        // Suppress unused import warning — ConflictPolicy is used to verify the API exists
-        let _policies = [
-            ConflictPolicy::InsertIfNotExists,
-            ConflictPolicy::ServerWins,
-            ConflictPolicy::EdgeWins,
-            ConflictPolicy::LatestWins,
-        ];
-
-        let result = handle_sync_command(
-            Some(&client),
-            Some(&rt),
-            "policy obs InsertIfNotExists",
-            None,
-        )
-        .message;
-        assert!(
-            result.contains("InsertIfNotExists"),
-            "policy command should contain 'InsertIfNotExists', got: {}",
-            result
-        );
-
-        let result =
-            handle_sync_command(Some(&client), Some(&rt), "policy default ServerWins", None)
-                .message;
-        assert!(
-            result.contains("Default") || result.contains("default"),
-            "default policy command should reference 'default', got: {}",
-            result
-        );
-    }
-
     // B5: .sync invalid arguments handled gracefully
     #[test]
     fn b5_sync_invalid_args() {
@@ -1600,7 +1455,7 @@ mod tests {
         let client = rt.block_on(async {
             SyncClient::new(
                 db,
-                "nats://localhost:19999",
+                "iroh:invalid-test-ticket",
                 contextdb_core::TenantId::from("b5-test"),
             )
         });
@@ -1731,8 +1586,22 @@ mod tests {
 
         // Connects, but every request after connect is unreachable — so the push
         // batch cannot be sent AND the reconcile status probe cannot confirm it.
-        struct UnreachableAfterConnect;
+        struct UnreachableAfterConnect {
+            local_node_id: String,
+        }
         impl ClientTransport for UnreachableAfterConnect {
+            fn peer_node_id(&self) -> Option<String> {
+                Some("unreachable-test-hub".to_string())
+            }
+
+            fn local_node_id(&self) -> Option<String> {
+                Some(self.local_node_id.clone())
+            }
+
+            fn has_stable_edge_identity(&self) -> bool {
+                true
+            }
+
             fn ensure_connected<'a>(&'a self) -> TransportFuture<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
@@ -1781,10 +1650,14 @@ mod tests {
         .unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = SyncClient::with_transport(
+        let edge_identity = Arc::new(contextdb_server::FabricIdentity::generate());
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
             db,
-            Arc::new(UnreachableAfterConnect),
+            Arc::new(UnreachableAfterConnect {
+                local_node_id: edge_identity.node_id(),
+            }),
             contextdb_core::TenantId::from("usr19-exit"),
+            edge_identity,
         );
 
         // The library surfaces the distinct indeterminate error — never a bare

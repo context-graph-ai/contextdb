@@ -53,7 +53,7 @@ fn sample_meta(history_policy: Option<HistoryPolicy>) -> TableMeta {
         sync_direction: Some(SyncDirection::Both),
         retain_declared_unit: None,
         primary_key_columns: Vec::new(),
-        conflict_policy: Some(ConflictPolicy::LatestWins),
+        conflict_policy: Some(ConflictPolicy::KEEP_LATEST),
         history_policy,
     }
 }
@@ -101,7 +101,7 @@ fn legacy_bytes_without_history_policy() -> Vec<u8> {
         sync_direction: Some(SyncDirection::Both),
         retain_declared_unit: None,
         primary_key_columns: Vec::new(),
-        conflict_policy: Some(ConflictPolicy::LatestWins),
+        conflict_policy: Some(ConflictPolicy::KEEP_LATEST),
     };
     bincode::serde::encode_to_vec(&legacy, bincode::config::standard())
         .expect("legacy shape must encode")
@@ -126,7 +126,7 @@ fn declared_history_policy_round_trips_through_the_real_on_disk_encoding() {
             "a declared HISTORY policy must survive the on-disk round trip"
         );
         // The neighboring fields must not be disturbed by the new tail field.
-        assert_eq!(decoded.conflict_policy, Some(ConflictPolicy::LatestWins));
+        assert_eq!(decoded.conflict_policy, Some(ConflictPolicy::KEEP_LATEST));
         assert_eq!(decoded.sync_direction, Some(SyncDirection::Both));
     }
 }
@@ -153,7 +153,7 @@ fn a_pre_history_policy_on_disk_table_meta_still_loads_with_no_declared_policy()
          and not default to a policy nobody wrote"
     );
     // The rest of the legacy payload must still decode intact.
-    assert_eq!(decoded.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(decoded.conflict_policy, Some(ConflictPolicy::KEEP_LATEST));
     assert_eq!(decoded.columns.len(), 1);
 }
 

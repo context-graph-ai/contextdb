@@ -1,12 +1,13 @@
 use contextdb_core::{
-    Error, Lsn, MemoryAccountant, RowId, SnapshotId, TxId, Value, VectorEntry, VectorExecutor,
+    Error, Lsn, MemoryUsage, RowId, SnapshotId, TxId, Value, VectorEntry, VectorExecutor,
     VectorIndexRef, VectorQuantization,
 };
 use contextdb_tx::{TransactionManager, WriteSet, WriteSetApplicator};
-use contextdb_vector::{MemVectorExecutor, VectorStore, cosine_similarity};
+use contextdb_vector::{MemVectorExecutor, MemoryBudget, VectorStore, cosine_similarity};
 use roaring::RoaringTreemap;
 use std::collections::HashSet;
 use std::sync::Barrier;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 #[cfg(feature = "test-seams")]
 use std::sync::mpsc::TryRecvError;
@@ -21,6 +22,84 @@ const MIN_EXACT_COSINE: f32 = 0.99999;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "test-seams")]
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct MemoryAccountant {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl MemoryAccountant {
+    fn no_limit() -> Self {
+        Self {
+            limit: 0,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_budget(limit: usize) -> Self {
+        Self {
+            limit,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    fn usage(&self) -> MemoryUsage {
+        let used = self.used.load(Ordering::SeqCst);
+        let limit = (self.limit != 0).then_some(self.limit);
+        MemoryUsage {
+            limit,
+            used,
+            available: limit.map(|limit| limit.saturating_sub(used)),
+            startup_ceiling: limit,
+        }
+    }
+}
+
+impl MemoryBudget for MemoryAccountant {
+    fn try_allocate_for(
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
+    ) -> contextdb_core::Result<()> {
+        loop {
+            let used = self.used.load(Ordering::SeqCst);
+            let available = self.limit.saturating_sub(used);
+            if self.limit != 0 && bytes > available {
+                return Err(Error::MemoryBudgetExceeded {
+                    subsystem: subsystem.to_string(),
+                    operation: operation.to_string(),
+                    requested_bytes: bytes,
+                    available_bytes: available,
+                    budget_limit_bytes: self.limit,
+                    hint: hint.to_string(),
+                });
+            }
+            if self
+                .used
+                .compare_exchange(
+                    used,
+                    used.saturating_add(bytes),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
 
 struct TestStore {
     vector: Arc<VectorStore>,

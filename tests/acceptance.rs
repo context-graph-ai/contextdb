@@ -58,9 +58,6 @@ mod conditional_update_serializable;
 mod contributing;
 #[path = "acceptance/cross_platform.rs"]
 mod cross_platform;
-// Broker-bound sync suite: runs under --features nats-tests (see the
-// tracked follow-up: port these suites to the default transport).
-#[cfg(feature = "nats-tests")]
 #[path = "acceptance/data_integrity.rs"]
 mod data_integrity;
 #[path = "acceptance/db_lock_visibility.rs"]
@@ -89,21 +86,12 @@ mod foreign_key_delete_race;
 mod graph_adjacency_routing;
 #[path = "acceptance/handle_scope_constraint.rs"]
 mod handle_scope_constraint;
-// Broker-bound sync suite: runs under --features nats-tests (see the
-// tracked follow-up: port these suites to the default transport).
-#[cfg(feature = "nats-tests")]
 #[path = "acceptance/infra_failures.rs"]
 mod infra_failures;
-// Broker-bound sync suite: runs under --features nats-tests (see the
-// tracked follow-up: port these suites to the default transport).
-#[cfg(feature = "nats-tests")]
 #[path = "acceptance/long_running.rs"]
 mod long_running;
 #[path = "acceptance/memory_accounting.rs"]
 mod memory_accounting;
-// Broker-bound sync suite: runs under --features nats-tests (see the
-// tracked follow-up: port these suites to the default transport).
-#[cfg(feature = "nats-tests")]
 #[path = "acceptance/multi_edge.rs"]
 mod multi_edge;
 #[path = "acceptance/multi_table_atomic_visibility.rs"]
@@ -118,9 +106,6 @@ mod principal_scoped_handle;
 mod query_surface;
 #[path = "acceptance/schema_evolution.rs"]
 mod schema_evolution;
-// Broker-bound sync suite: runs under --features nats-tests (see the
-// tracked follow-up: port these suites to the default transport).
-#[cfg(feature = "nats-tests")]
 #[path = "acceptance/schema_lifecycle.rs"]
 mod schema_lifecycle;
 #[path = "acceptance/single_pk_concurrent_update.rs"]
@@ -133,9 +118,6 @@ mod state_machine_concurrent_legal_transition;
 mod state_machine_self_edge_check;
 #[path = "acceptance/storage_scale_hardening.rs"]
 mod storage_scale_hardening;
-// Broker-bound sync suite: runs under --features nats-tests (see the
-// tracked follow-up: port these suites to the default transport).
-#[cfg(feature = "nats-tests")]
 #[path = "acceptance/sync.rs"]
 mod sync;
 #[path = "acceptance/test_alloc_counter.rs"]

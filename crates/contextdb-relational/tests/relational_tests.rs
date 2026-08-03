@@ -13,8 +13,13 @@ struct TestStore {
 
 impl WriteSetApplicator for TestStore {
     fn apply(&self, ws: &WriteSet) -> contextdb_core::Result<()> {
-        self.relational.apply_inserts(ws.relational_inserts.clone());
-        self.relational.apply_deletes(ws.relational_deletes.clone());
+        if ws.relational_deletes.is_empty() || ws.relational_inserts.is_empty() {
+            self.relational.apply_deletes_ref(&ws.relational_deletes);
+            self.relational.apply_inserts_ref(&ws.relational_inserts);
+        } else {
+            self.relational
+                .apply_replacements_ref(&ws.relational_deletes, &ws.relational_inserts);
+        }
         Ok(())
     }
 
@@ -153,6 +158,12 @@ fn upsert_insert_update_noop() {
         .unwrap();
     tx_mgr.commit(tx1).unwrap();
     assert_eq!(r1, UpsertResult::Inserted);
+    let created_snapshot = tx_mgr.snapshot();
+    let created_row_id = exec
+        .point_lookup("entities", "id", &Value::Uuid(id), created_snapshot)
+        .unwrap()
+        .expect("upserted row exists")
+        .row_id;
 
     let tx2 = tx_mgr.begin();
     let r2 = exec
@@ -169,6 +180,27 @@ fn upsert_insert_update_noop() {
         .unwrap();
     tx_mgr.commit(tx2).unwrap();
     assert_eq!(r2, UpsertResult::Updated);
+    let created_version = exec
+        .point_lookup("entities", "id", &Value::Uuid(id), created_snapshot)
+        .unwrap()
+        .expect("the pre-update snapshot still resolves the created version");
+    assert_eq!(created_version.row_id, created_row_id);
+    assert_eq!(
+        created_version.values.get("name"),
+        Some(&Value::Text("a".into()))
+    );
+    let updated_version = exec
+        .point_lookup("entities", "id", &Value::Uuid(id), tx_mgr.snapshot())
+        .unwrap()
+        .expect("updated row exists");
+    assert_eq!(
+        updated_version.row_id, created_row_id,
+        "an upsert update preserves the row's internal identity"
+    );
+    assert_eq!(
+        updated_version.values.get("name"),
+        Some(&Value::Text("b".into()))
+    );
 
     let tx3 = tx_mgr.begin();
     let r3 = exec

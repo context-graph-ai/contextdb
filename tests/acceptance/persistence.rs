@@ -1,6 +1,7 @@
 use super::common::*;
-use contextdb_core::{Error, MemoryAccountant, Value, VectorIndexRef};
+use contextdb_core::{Error, Value, VectorIndexRef};
 use contextdb_engine::Database;
+use contextdb_engine::memory_accounting::MemoryAccountant;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -380,8 +381,8 @@ SELECT id, name FROM entities WHERE category = 'sensor' ORDER BY embedding <=> $
         &[
             "--tenant-id",
             "unused",
-            "--nats-url",
-            "nats://127.0.0.1:65530",
+            "--sync-endpoint",
+            "iroh:invalid-test-ticket",
         ],
         query,
     );
@@ -390,8 +391,8 @@ SELECT id, name FROM entities WHERE category = 'sensor' ORDER BY embedding <=> $
         &[
             "--tenant-id",
             "unused",
-            "--nats-url",
-            "nats://127.0.0.1:65530",
+            "--sync-endpoint",
+            "iroh:invalid-test-ticket",
         ],
         query,
     );
@@ -682,6 +683,8 @@ fn persist_vector_rows_for_footprint(
         &empty_params(),
     )
     .expect("create footprint table");
+    db.execute("BEGIN", &empty_params())
+        .expect("begin footprint write transaction");
     for (id, vector) in rows {
         db.execute(
             &format!("INSERT INTO {table} (id, vec) VALUES ($id, $v)"),
@@ -692,7 +695,22 @@ fn persist_vector_rows_for_footprint(
         )
         .expect("insert footprint row");
     }
-    drop(db);
+    db.execute("COMMIT", &empty_params())
+        .expect("commit footprint write transaction");
+    db.compact_now()
+        .expect("compact footprint database before measuring");
+    db.close().expect("close footprint db");
+
+    let reopened = Database::open(path).expect("reopen footprint db");
+    assert_eq!(
+        reopened
+            .scan(table, reopened.snapshot())
+            .expect("scan reopened footprint table")
+            .len(),
+        rows.len(),
+        "reopened footprint table must contain every committed row"
+    );
+    reopened.close().expect("close reopened footprint db");
 }
 
 fn file_len(path: &Path) -> u64 {
@@ -1348,7 +1366,12 @@ fn f113c_sq4_cross_batch_recall_stability() {
         crossbatch_row[bytes_idx]
     );
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let footprint_batch: Vec<(Uuid, Vec<f32>)> = (0..5000)
+    // Use fewer, wider vectors so vector encoding dominates the unavoidable
+    // per-row/MVCC metadata in both files. The total generated float volume is
+    // comparable to the dim-128 recall corpus, but this whole-file comparison
+    // now measures SQ4 storage instead of row-count overhead.
+    let footprint_dim = 1024;
+    let footprint_batch: Vec<(Uuid, Vec<f32>)> = (0..1000)
         .map(|i| {
             let range = if i < 256 {
                 (-1.0_f32, 1.0_f32)
@@ -1357,14 +1380,26 @@ fn f113c_sq4_cross_batch_recall_stability() {
             };
             (
                 Uuid::new_v4(),
-                rand_in(i as u64 + 20_000, range.0, range.1, dim),
+                rand_in(i as u64 + 20_000, range.0, range.1, footprint_dim),
             )
         })
         .collect();
     let sq4_path = tmp.path().join("sq4.db");
     let f32_path = tmp.path().join("f32.db");
-    persist_vector_rows_for_footprint(&sq4_path, "crossbatch4", dim, Some("SQ4"), &footprint_batch);
-    persist_vector_rows_for_footprint(&f32_path, "crossbatch4", dim, None, &footprint_batch);
+    persist_vector_rows_for_footprint(
+        &sq4_path,
+        "crossbatch4",
+        footprint_dim,
+        Some("SQ4"),
+        &footprint_batch,
+    );
+    persist_vector_rows_for_footprint(
+        &f32_path,
+        "crossbatch4",
+        footprint_dim,
+        None,
+        &footprint_batch,
+    );
     let sq4_file_bytes = file_len(&sq4_path);
     let f32_file_bytes = file_len(&f32_path);
     assert!(

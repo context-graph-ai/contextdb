@@ -585,18 +585,16 @@ pub async fn poll_and_execute_once(
             }
         };
 
-        let db_for_check = client.db_arc();
         let job_id_for_check = job.job_id.clone();
         let node_for_check = config.node_id.clone();
+        let (abandon_check_tx, mut abandon_check_rx) =
+            tokio::sync::mpsc::unbounded_channel::<std::sync::mpsc::SyncSender<bool>>();
         let check = move || {
-            ledger::should_abandon(
-                &db_for_check,
-                &job_id_for_check,
-                attempt,
-                &node_for_check,
-                now_ms,
-            )
-            .unwrap_or(true)
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+            if abandon_check_tx.send(reply_tx).is_err() {
+                return true;
+            }
+            reply_rx.recv().unwrap_or(true)
         };
 
         // The between-chunks abandonment check must see REMOTE state — a
@@ -628,6 +626,8 @@ pub async fn poll_and_execute_once(
         });
         tokio::pin!(executor_task);
         let mut warned_in_execution_pull_failure = false;
+        let execution_pull = tokio::time::sleep(Duration::from_millis(EXECUTION_PULL_INTERVAL_MS));
+        tokio::pin!(execution_pull);
         let verdict = loop {
             tokio::select! {
                 biased;
@@ -636,7 +636,7 @@ pub async fn poll_and_execute_once(
                         ExecutionVerdict::Failed(format!("worker executor task panicked: {err}"))
                     });
                 }
-                _ = tokio::time::sleep(Duration::from_millis(EXECUTION_PULL_INTERVAL_MS)) => {
+                _ = &mut execution_pull => {
                     if let Err(err) = client.pull_default().await
                         && !warned_in_execution_pull_failure
                     {
@@ -649,6 +649,21 @@ pub async fn poll_and_execute_once(
                              warning for the rest of this attempt"
                         );
                     }
+                    execution_pull.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(EXECUTION_PULL_INTERVAL_MS),
+                    );
+                }
+                Some(reply_tx) = abandon_check_rx.recv() => {
+                    let should_abandon = ledger::should_abandon(
+                        client.db(),
+                        &job_id_for_check,
+                        attempt,
+                        &node_for_check,
+                        now_ms,
+                    )
+                    .unwrap_or(true);
+                    let _ = reply_tx.send(should_abandon);
                 }
             }
         };

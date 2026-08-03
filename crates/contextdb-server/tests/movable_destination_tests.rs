@@ -21,8 +21,7 @@
 
 use contextdb_core::{Lsn, TenantId, Value, Wallclock};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,16 +29,10 @@ use std::time::Duration;
 
 const T0: u64 = 1_700_000_000_000;
 const TENANT: &str = "movable";
-/// Two hubs with DISTINCT transport-authenticated identities. The client dials
-/// by key, so the edge always knows which one it is talking to; the in-process
-/// broker presents the identity exactly as the p2p transport presents the
-/// dialed endpoint's node id.
-const HUB_ONE: &str = "hub-node-one";
-const HUB_TWO: &str = "hub-node-two";
 /// Retained + delivery-promising, declared with NO direction word so this file
 /// does not depend on the new direction clause landing.
 const RETAINED_DDL: &str = "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-     RETAIN 1 HOURS SYNC SAFE";
+     RETAIN 1 HOURS SYNC SAFE SYNC CONFLICT KEEP LATEST";
 
 // ---------------------------------------------------------------------------
 // THE OPERATION UNDER TEST
@@ -100,6 +93,7 @@ impl MockClock {
 
 struct RunningHub {
     db: Arc<Database>,
+    node_id: String,
     shutdown: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -111,22 +105,32 @@ impl RunningHub {
     }
 }
 
-fn start_hub_as(broker: &InProcessBroker, node_id: &str) -> RunningHub {
+fn start_hub(broker: &InProcessBroker) -> RunningHub {
     let db = Arc::new(Database::open_memory());
     db.execute(RETAINED_DDL, &p()).expect("hub retained table");
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(node_id),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id.clone(),
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
         let shutdown = shutdown.clone();
         async move { server.run_until(shutdown).await }
     });
-    RunningHub { db, shutdown, task }
+    RunningHub {
+        db,
+        node_id,
+        shutdown,
+        task,
+    }
 }
 
 fn open_edge(path: Option<&std::path::Path>) -> Arc<Database> {
@@ -140,11 +144,17 @@ fn open_edge(path: Option<&std::path::Path>) -> Arc<Database> {
     db
 }
 
-fn edge_client(db: &Arc<Database>, broker: &InProcessBroker) -> SyncClient {
-    SyncClient::with_transport(
+fn edge_client(
+    db: &Arc<Database>,
+    broker: &InProcessBroker,
+    identity: Arc<FabricIdentity>,
+) -> SyncClient {
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as("edge-a"),
+        broker.client_as(&node_id),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -198,19 +208,22 @@ async fn c4a_the_destination_moves_both_ways_and_each_binding_survives_a_restart
     let path = dir.path().join("edge.db");
 
     let broker_one = InProcessBroker::new();
-    let hub_one = start_hub_as(&broker_one, HUB_ONE);
+    let hub_one = start_hub(&broker_one);
     let broker_two = InProcessBroker::new();
-    let hub_two = start_hub_as(&broker_two, HUB_TWO);
+    let hub_two = start_hub(&broker_two);
+    let hub_one_id = hub_one.node_id.clone();
+    let hub_two_id = hub_two.node_id.clone();
+    let edge_identity = Arc::new(FabricIdentity::generate());
 
     // Bind to hub one by delivering to it, exactly as an edge does in the field.
     {
         let edge = open_edge(Some(&path));
         insert_windows(&edge, 1..4);
-        let client = edge_client(&edge, &broker_one);
+        let client = edge_client(&edge, &broker_one, edge_identity.clone());
         within(client.push()).await.expect("first delivery");
         assert_eq!(
             edge.retention_sync_peer().as_deref(),
-            Some(HUB_ONE),
+            Some(hub_one_id.as_str()),
             "the first delivery binds the edge to hub one"
         );
     }
@@ -219,7 +232,7 @@ async fn c4a_the_destination_moves_both_ways_and_each_binding_survives_a_restart
         let edge = open_edge(Some(&path));
         assert_eq!(
             edge.retention_sync_peer().as_deref(),
-            Some(HUB_ONE),
+            Some(hub_one_id.as_str()),
             "the binding survives a restart"
         );
     }
@@ -228,9 +241,9 @@ async fn c4a_the_destination_moves_both_ways_and_each_binding_survives_a_restart
     // "any number of times, both directions"; each is followed by a restart, so
     // a change that lived only in memory fails here.
     for (round, (destination, broker)) in [
-        (HUB_TWO, &broker_two),
-        (HUB_ONE, &broker_one),
-        (HUB_TWO, &broker_two),
+        (hub_two_id.as_str(), &broker_two),
+        (hub_one_id.as_str(), &broker_one),
+        (hub_two_id.as_str(), &broker_two),
     ]
     .into_iter()
     .enumerate()
@@ -243,7 +256,7 @@ async fn c4a_the_destination_moves_both_ways_and_each_binding_survives_a_restart
                 Some(destination),
                 "round {round}: the shipped operation rebinds the edge to {destination}"
             );
-            let client = edge_client(&edge, broker);
+            let client = edge_client(&edge, broker, edge_identity.clone());
             insert_windows(&edge, (100 + round as i64 * 10)..(103 + round as i64 * 10));
             within(client.push())
                 .await
@@ -276,13 +289,15 @@ async fn c4a_the_destination_moves_both_ways_and_each_binding_survives_a_restart
 async fn c4b_repointing_clears_what_the_previous_destination_confirmed() {
     let (clock, _guard) = MockClock::install(T0);
     let broker_one = InProcessBroker::new();
-    let hub_one = start_hub_as(&broker_one, HUB_ONE);
+    let hub_one = start_hub(&broker_one);
     let broker_two = InProcessBroker::new();
-    let hub_two = start_hub_as(&broker_two, HUB_TWO);
+    let hub_two = start_hub(&broker_two);
+    let hub_two_id = hub_two.node_id.clone();
+    let edge_identity = Arc::new(FabricIdentity::generate());
 
     let edge = open_edge(None);
     insert_windows(&edge, 1..6);
-    let first_client = edge_client(&edge, &broker_one);
+    let first_client = edge_client(&edge, &broker_one, edge_identity.clone());
     within(first_client.push()).await.expect("first delivery");
     assert_eq!(
         bodies(&hub_one.db),
@@ -294,7 +309,7 @@ async fn c4b_repointing_clears_what_the_previous_destination_confirmed() {
         "hub one's confirmation opened the deletion gate"
     );
 
-    change_destination(&edge, HUB_TWO);
+    change_destination(&edge, &hub_two_id);
 
     // Retention runs BEFORE the new destination has confirmed anything.
     clock.advance(48 * 60 * 60 * 1000);
@@ -322,7 +337,7 @@ async fn c4b_repointing_clears_what_the_previous_destination_confirmed() {
     );
 
     // Only the NEW destination's confirmation reopens the gate.
-    let second_client = edge_client(&edge, &broker_two);
+    let second_client = edge_client(&edge, &broker_two, edge_identity);
     within(second_client.push())
         .await
         .expect("delivery to the new destination");
@@ -355,19 +370,21 @@ async fn c4b_repointing_clears_what_the_previous_destination_confirmed() {
 async fn c4c_a_new_empty_destination_receives_everything_including_pre_confirmation_rows() {
     let (_clock, _guard) = MockClock::install(T0);
     let broker_one = InProcessBroker::new();
-    let hub_one = start_hub_as(&broker_one, HUB_ONE);
+    let hub_one = start_hub(&broker_one);
     let broker_two = InProcessBroker::new();
-    let hub_two = start_hub_as(&broker_two, HUB_TWO);
+    let hub_two = start_hub(&broker_two);
+    let hub_two_id = hub_two.node_id.clone();
+    let edge_identity = Arc::new(FabricIdentity::generate());
 
     let edge = open_edge(None);
     insert_windows(&edge, 1..6);
-    let first_client = edge_client(&edge, &broker_one);
+    let first_client = edge_client(&edge, &broker_one, edge_identity.clone());
     within(first_client.push()).await.expect("first delivery");
     // Written after that confirmation, so the two age classes are both present.
     insert_windows(&edge, 6..9);
 
-    change_destination(&edge, HUB_TWO);
-    let second_client = edge_client(&edge, &broker_two);
+    change_destination(&edge, &hub_two_id);
+    let second_client = edge_client(&edge, &broker_two, edge_identity);
     within(second_client.push())
         .await
         .expect("delivery to the new empty destination");
@@ -398,23 +415,26 @@ async fn c4c_a_new_empty_destination_receives_everything_including_pre_confirmat
 async fn c4d_pointing_back_converges_with_no_binding_left_behind_and_repeats() {
     let (_clock, _guard) = MockClock::install(T0);
     let broker_one = InProcessBroker::new();
-    let hub_one = start_hub_as(&broker_one, HUB_ONE);
+    let hub_one = start_hub(&broker_one);
     let broker_two = InProcessBroker::new();
-    let hub_two = start_hub_as(&broker_two, HUB_TWO);
+    let hub_two = start_hub(&broker_two);
+    let hub_one_id = hub_one.node_id.clone();
+    let hub_two_id = hub_two.node_id.clone();
+    let edge_identity = Arc::new(FabricIdentity::generate());
 
     let edge = open_edge(None);
     insert_windows(&edge, 1..4);
-    within(edge_client(&edge, &broker_one).push())
+    within(edge_client(&edge, &broker_one, edge_identity.clone()).push())
         .await
         .expect("first delivery to hub one");
 
     let mut next_id = 10;
     for round in 0..2 {
         // Away to hub two.
-        change_destination(&edge, HUB_TWO);
+        change_destination(&edge, &hub_two_id);
         insert_windows(&edge, next_id..next_id + 3);
         next_id += 3;
-        within(edge_client(&edge, &broker_two).push())
+        within(edge_client(&edge, &broker_two, edge_identity.clone()).push())
             .await
             .unwrap_or_else(|err| panic!("round {round}: delivery to hub two: {err}"));
         let held = bodies(&edge);
@@ -425,10 +445,10 @@ async fn c4d_pointing_back_converges_with_no_binding_left_behind_and_repeats() {
         );
 
         // Back to hub one, which still holds its own older copy.
-        change_destination(&edge, HUB_ONE);
+        change_destination(&edge, &hub_one_id);
         insert_windows(&edge, next_id..next_id + 3);
         next_id += 3;
-        within(edge_client(&edge, &broker_one).push())
+        within(edge_client(&edge, &broker_one, edge_identity.clone()).push())
             .await
             .unwrap_or_else(|err| panic!("round {round}: delivery back to hub one: {err}"));
         let held_now = bodies(&edge);
@@ -444,7 +464,7 @@ async fn c4d_pointing_back_converges_with_no_binding_left_behind_and_repeats() {
         );
         assert_eq!(
             edge.retention_sync_peer().as_deref(),
-            Some(HUB_ONE),
+            Some(hub_one_id.as_str()),
             "round {round}: no binding from the other destination is left behind"
         );
     }
@@ -472,19 +492,21 @@ async fn c4d_pointing_back_converges_with_no_binding_left_behind_and_repeats() {
 async fn one_destination_at_a_time_the_previous_server_receives_nothing_new() {
     let (_clock, _guard) = MockClock::install(T0);
     let broker_one = InProcessBroker::new();
-    let hub_one = start_hub_as(&broker_one, HUB_ONE);
+    let hub_one = start_hub(&broker_one);
     let broker_two = InProcessBroker::new();
-    let hub_two = start_hub_as(&broker_two, HUB_TWO);
+    let hub_two = start_hub(&broker_two);
+    let hub_two_id = hub_two.node_id.clone();
+    let edge_identity = Arc::new(FabricIdentity::generate());
 
     let edge = open_edge(None);
     insert_windows(&edge, 1..4);
-    let first_client = edge_client(&edge, &broker_one);
+    let first_client = edge_client(&edge, &broker_one, edge_identity.clone());
     within(first_client.push()).await.expect("first delivery");
     let hub_one_at_change = bodies(&hub_one.db);
 
-    change_destination(&edge, HUB_TWO);
+    change_destination(&edge, &hub_two_id);
     insert_windows(&edge, 200..203);
-    let second_client = edge_client(&edge, &broker_two);
+    let second_client = edge_client(&edge, &broker_two, edge_identity);
     within(second_client.push())
         .await
         .expect("delivery to the new destination");
@@ -506,7 +528,7 @@ async fn one_destination_at_a_time_the_previous_server_receives_nothing_new() {
     );
     assert_eq!(
         edge.retention_sync_peer().as_deref(),
-        Some(HUB_TWO),
+        Some(hub_two_id.as_str()),
         "and the binding still names only the current destination"
     );
 
@@ -530,12 +552,14 @@ async fn one_destination_at_a_time_the_previous_server_receives_nothing_new() {
 async fn c4_a_failed_destination_change_leaves_the_edge_on_the_safe_side() {
     let (clock, _guard) = MockClock::install(T0);
     let broker_one = InProcessBroker::new();
-    let hub_one = start_hub_as(&broker_one, HUB_ONE);
+    let hub_one = start_hub(&broker_one);
+    let hub_one_id = hub_one.node_id.clone();
     let _broker_two = InProcessBroker::new();
+    let edge_identity = Arc::new(FabricIdentity::generate());
 
     let edge = open_edge(None);
     insert_windows(&edge, 1..6);
-    let client = edge_client(&edge, &broker_one);
+    let client = edge_client(&edge, &broker_one, edge_identity);
     within(client.push())
         .await
         .expect("first delivery to hub one");
@@ -556,7 +580,8 @@ async fn c4_a_failed_destination_change_leaves_the_edge_on_the_safe_side() {
     // Arm the one-shot injection so the destination change fails after it clears
     // the confirmation record, then attempt to move to hub two through the client.
     edge.__arm_retention_peer_persist_fault_for_test();
-    let outcome = client.change_destination(HUB_TWO);
+    let new_destination = FabricIdentity::generate().node_id();
+    let outcome = client.change_destination(&new_destination);
     assert!(
         outcome.is_err(),
         "the injected failure must surface as an error, got {outcome:?}",
@@ -571,7 +596,7 @@ async fn c4_a_failed_destination_change_leaves_the_edge_on_the_safe_side() {
     // Safe side #2: the binding did not move to the new, empty hub.
     assert_eq!(
         edge.retention_sync_peer().as_deref(),
-        Some(HUB_ONE),
+        Some(hub_one_id.as_str()),
         "a failed change must not rebind the edge to a hub that holds nothing",
     );
     // Safe side #3: the client's cached frontier was reset in lockstep, so the

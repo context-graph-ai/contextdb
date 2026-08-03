@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use contextdb_core::{MemoryAccountant, Value, VectorIndexRef};
+use contextdb_core::{Value, VectorIndexRef};
+use contextdb_engine::memory_accounting::MemoryAccountant;
 
 fn bench_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)

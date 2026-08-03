@@ -15,7 +15,7 @@ use contextdb_server::work_ledger::{
     ClaimOutcome, ExecutionOutput, ExecutionVerdict, PollOutcome, WorkExecutor, WorkerConfig,
     claim_job, poll_and_execute_once, run_worker_loop,
 };
-use contextdb_server::{InProcessBroker, SyncClient};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -36,15 +36,18 @@ async fn within<F: std::future::Future>(fut: F) -> F::Output {
 /// authenticated peer id. Exercises the hub's per-node last-contact recording,
 /// which is keyed on that transport identity (not on the changeset contents),
 /// so a status-only exchange still attributes contact to the right node.
-fn edge_as(broker: &InProcessBroker, tenant: &str, node_id: &str) -> (Arc<Database>, SyncClient) {
+fn edge_as(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient, String) {
     let db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&db).expect("install ledger schema on edge");
-    let client = SyncClient::with_transport(
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&node_id),
         contextdb_core::TenantId::from(tenant),
+        identity,
     );
-    (db, client)
+    (db, client, node_id)
 }
 
 fn demo_spec(job_id: &str, submitter: &str) -> JobSpec {
@@ -1157,19 +1160,19 @@ async fn hub_records_last_contact_per_node_and_it_advances() {
     let tenant = "wl-s15";
     let (hub_db, shutdown, task) = start_hub(&broker, tenant);
 
-    // The edge presents "node-w" as its transport-authenticated identity, so
-    // the hub attributes every exchange it serves — including the status-only
-    // second push below — to node-w.
-    let (w_db, w_client) = edge_as(&broker, tenant, "node-w");
+    // The edge presents its signer-derived transport identity, so the hub
+    // attributes every exchange it serves — including the status-only second
+    // push below — to the authenticated key rather than the ledger label.
+    let (w_db, w_client, transport_node_id) = edge_as(&broker, tenant);
 
     advertise_capability(&w_db, "node-w", "wl.demo", &tags(&["class:wl.demo"]), T0)
         .expect("advertise");
     within(w_client.push()).await.expect("first exchange");
 
-    let first = hub_last_contact_ms(&hub_db, "node-w");
+    let first = hub_last_contact_ms(&hub_db, &transport_node_id);
     assert!(
         first.is_some(),
-        "the hub must record a last-contact for node-w after it serves an exchange; got {first:?}"
+        "the hub must record a last-contact for authenticated node {transport_node_id} after it serves an exchange; got {first:?}"
     );
 
     // A later exchange must advance the recorded last-contact. The hub stamps
@@ -1180,7 +1183,7 @@ async fn hub_records_last_contact_per_node_and_it_advances() {
     within(async {
         loop {
             within(w_client.push()).await.expect("later exchange");
-            second = hub_last_contact_ms(&hub_db, "node-w");
+            second = hub_last_contact_ms(&hub_db, &transport_node_id);
             if matches!((first, second), (Some(a), Some(b)) if b > a) {
                 break;
             }
@@ -1191,6 +1194,66 @@ async fn hub_records_last_contact_per_node_and_it_advances() {
     assert!(
         matches!((first, second), (Some(a), Some(b)) if b > a),
         "a later exchange must advance the recorded last-contact; first={first:?} second={second:?}"
+    );
+
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = task.await;
+}
+
+/// Hub-local contact updates are intentionally hidden from an edge. They may
+/// be traversed while serving a pull, but cannot advance the edge's durable
+/// cursor past a later deliverable row.
+#[tokio::test]
+async fn hub_local_contacts_do_not_advance_the_pull_cursor_past_later_work() {
+    let broker = InProcessBroker::new();
+    let tenant = "wl-hidden-pull-tail";
+    let (hub_db, shutdown, task) = start_hub(&broker, tenant);
+    let (edge_db, edge_client, _) = edge_as(&broker, tenant);
+
+    hub_db
+        .execute(
+            "CREATE TABLE pull_cursor_notes (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY",
+            &HashMap::new(),
+        )
+        .expect("create deliverable hub table");
+    hub_db
+        .execute(
+            "INSERT INTO pull_cursor_notes (id, body) VALUES (1, 'first')",
+            &HashMap::new(),
+        )
+        .expect("write first deliverable hub row");
+
+    within(edge_client.pull_default())
+        .await
+        .expect("pull first deliverable row");
+    assert_eq!(count_rows(&edge_db, "pull_cursor_notes"), 1);
+    let delivered_cursor = edge_client.pull_watermark();
+
+    // Status plus the pull handler each record this edge's hub-local contact.
+    // The response contains only `work_node_contacts`, which declares SYNC
+    // OFF, so this call must retain the cursor from the real row above.
+    within(edge_client.pull_default())
+        .await
+        .expect("traverse hidden hub-local contact updates");
+    assert_eq!(
+        edge_client.pull_watermark(),
+        delivered_cursor,
+        "hidden hub-local contact updates must not become external pull progress"
+    );
+
+    hub_db
+        .execute(
+            "INSERT INTO pull_cursor_notes (id, body) VALUES (2, 'later')",
+            &HashMap::new(),
+        )
+        .expect("write later deliverable hub row");
+    within(edge_client.pull_default())
+        .await
+        .expect("pull later deliverable row after hidden tail");
+    assert_eq!(count_rows(&edge_db, "pull_cursor_notes"), 2);
+    assert!(
+        edge_client.pull_watermark() > delivered_cursor,
+        "a later deliverable row must still advance the external pull cursor"
     );
 
     shutdown.store(true, Ordering::SeqCst);
@@ -1233,7 +1296,8 @@ async fn redelivered_own_claim_reads_as_won_not_lost() {
     let tenant = "wl-s12";
     let (hub_db, shutdown, task) = start_hub(&broker, tenant);
 
-    let (a_db, a_client) = edge(&broker, tenant);
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let (a_db, a_client) = edge_with_identity(&broker, tenant, edge_identity.clone());
     submit_job(&a_db, &demo_spec("job-s12", "node-a"), &[b"payload"]).expect("submit");
     let first = within(claim_job(&a_client, "job-s12", 1, "node-a", T0 + LEASE, T0))
         .await
@@ -1246,7 +1310,7 @@ async fn redelivered_own_claim_reads_as_won_not_lost() {
     // The hub already holds that key, so the push reply carries the refusal
     // — and the verify-by-pull must recognize the node as the standing
     // holder and conclude Won, never Lost.
-    let (b_db, b_client) = edge(&broker, tenant);
+    let (b_db, b_client) = edge_with_identity(&broker, tenant, edge_identity);
     submit_job(&b_db, &demo_spec("job-s12", "node-a"), &[b"payload"]).expect("re-created job");
     let redelivered = within(claim_job(
         &b_client,
@@ -1432,7 +1496,7 @@ async fn canonical_worker_never_pushes_its_advertisement() {
     let broker = InProcessBroker::new();
     let (hub_db, shutdown, task) = start_hub(&broker, "t-canon");
 
-    let (_edge_db, client) = edge_as(&broker, "t-canon", "canon-node");
+    let (_edge_db, client, _) = edge_as(&broker, "t-canon");
     let config = WorkerConfig {
         node_id: "canon-node".to_string(),
         advertised_tags: vec!["class:test".to_string()],

@@ -10,12 +10,12 @@ async fn f32_no_silent_data_loss_on_push() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "f32-server.db");
     let edge_path = temp_db_file(&tmp, "f32-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f32", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f32", &sync.bind_spec);
     let _ = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f32", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL)\nINSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'temp-1', 42.0)\n.sync push\n.quit\n",
+        &["--tenant-id", "f32", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT, reading REAL);\nINSERT INTO sensors (id, name, reading) VALUES ('00000000-0000-0000-0000-000000000001', 'temp-1', 42.0);\n.sync push\n.quit\n",
     );
     stop_child(&mut server);
     let db = Database::open(&server_path).expect("server db");
@@ -38,12 +38,12 @@ async fn f33_vector_data_round_trips_correctly_through_sync() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "f33-server.db");
     let edge_path = temp_db_file(&tmp, "f33-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f33", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f33", &sync.bind_spec);
 
     // Insert 10 vectors on edge, each with VECTOR(3)
     let mut script =
-        String::from("CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(3))\n");
+        String::from("CREATE TABLE embeddings (id UUID PRIMARY KEY, embedding VECTOR(3));\n");
     let vectors: Vec<[f32; 3]> = vec![
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
@@ -61,7 +61,7 @@ async fn f33_vector_data_round_trips_correctly_through_sync() {
         .collect();
     for (i, v) in vectors.iter().enumerate() {
         script.push_str(&format!(
-            "INSERT INTO embeddings (id, embedding) VALUES ('{}', [{}, {}, {}])\n",
+            "INSERT INTO embeddings (id, embedding) VALUES ('{}', [{}, {}, {}]);\n",
             ids[i], v[0], v[1], v[2]
         ));
     }
@@ -69,10 +69,15 @@ async fn f33_vector_data_round_trips_correctly_through_sync() {
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f33", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f33", "--sync-endpoint", &sync.ticket],
         &script,
     );
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "vector sync script failed: stdout={}, stderr={}",
+        output_string(&output.stdout),
+        output_string(&output.stderr)
+    );
 
     // Pull onto a fresh edge — do NOT create the table locally; the pull must
     // create it from the server's DDL. This guards against bugs where pull
@@ -80,9 +85,9 @@ async fn f33_vector_data_round_trips_correctly_through_sync() {
     let fresh_path = edge_path.with_file_name("f33-fresh.db");
     let pull_output = run_cli_script(
         &fresh_path,
-        &["--tenant-id", "f33", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f33", "--sync-endpoint", &sync.ticket],
         ".sync pull\n\
-         SELECT id FROM embeddings ORDER BY embedding <=> [1.0, 0.0, 0.0] LIMIT 1\n\
+         SELECT id FROM embeddings ORDER BY embedding <=> [1.0, 0.0, 0.0] LIMIT 1;\n\
          .quit\n",
     );
     stop_child(&mut server);
@@ -101,14 +106,16 @@ async fn f34_row_deletion_syncs_correctly() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "f34-server.db");
     let edge_path = temp_db_file(&tmp, "f34-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f34", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f34", &sync.bind_spec);
 
     // Insert 10 rows with deterministic UUIDs
-    let mut script = String::from("CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n");
+    let mut script = String::from(
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP LATEST;\n",
+    );
     for i in 1..=10 {
         script.push_str(&format!(
-            "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-{:012}', 'sensor-{}')\n",
+            "INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-{:012}', 'sensor-{}');\n",
             i, i
         ));
     }
@@ -117,7 +124,7 @@ async fn f34_row_deletion_syncs_correctly() {
     // Delete 3 rows
     for i in 1..=3 {
         script.push_str(&format!(
-            "DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-{:012}'\n",
+            "DELETE FROM sensors WHERE id = '00000000-0000-0000-0000-{:012}';\n",
             i
         ));
     }
@@ -125,16 +132,23 @@ async fn f34_row_deletion_syncs_correctly() {
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f34", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f34", "--sync-endpoint", &sync.ticket],
         &script,
     );
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "delete sync script failed: stdout={}, stderr={}",
+        output_string(&output.stdout),
+        output_string(&output.stderr)
+    );
     stop_child(&mut server);
 
     assert_eq!(
         count_rows_from_file(&server_path, "sensors"),
         7,
-        "server should have 7 rows after 3 deletions were pushed"
+        "server should have 7 rows after 3 deletions were pushed; stdout={}, stderr={}",
+        output_string(&output.stdout),
+        output_string(&output.stderr)
     );
 }
 
@@ -144,8 +158,8 @@ async fn f35_graph_edges_sync_correctly() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "f35-server.db");
     let edge_path = temp_db_file(&tmp, "f35-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f35", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f35", &sync.bind_spec);
 
     // Create a DAG: 5 nodes, 4 edges (A->B, A->C, B->D, C->E)
     let a = "00000000-0000-0000-0000-000000000001";
@@ -155,26 +169,31 @@ async fn f35_graph_edges_sync_correctly() {
     let e = "00000000-0000-0000-0000-000000000005";
 
     let script = format!(
-        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT)\n\
-         INSERT INTO entities (id, name) VALUES ('{a}', 'A')\n\
-         INSERT INTO entities (id, name) VALUES ('{b}', 'B')\n\
-         INSERT INTO entities (id, name) VALUES ('{c}', 'C')\n\
-         INSERT INTO entities (id, name) VALUES ('{d}', 'D')\n\
-         INSERT INTO entities (id, name) VALUES ('{e}', 'E')\n\
-         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{a}', '{b}', 'DEPENDS_ON')\n\
-         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{a}', '{c}', 'DEPENDS_ON')\n\
-         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{b}', '{d}', 'DEPENDS_ON')\n\
-         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{c}', '{e}', 'DEPENDS_ON')\n\
+        "CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT);\n\
+         INSERT INTO entities (id, name) VALUES ('{a}', 'A');\n\
+         INSERT INTO entities (id, name) VALUES ('{b}', 'B');\n\
+         INSERT INTO entities (id, name) VALUES ('{c}', 'C');\n\
+         INSERT INTO entities (id, name) VALUES ('{d}', 'D');\n\
+         INSERT INTO entities (id, name) VALUES ('{e}', 'E');\n\
+         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{a}', '{b}', 'DEPENDS_ON');\n\
+         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{a}', '{c}', 'DEPENDS_ON');\n\
+         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{b}', '{d}', 'DEPENDS_ON');\n\
+         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{c}', '{e}', 'DEPENDS_ON');\n\
          .sync push\n\
          .quit\n"
     );
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f35", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f35", "--sync-endpoint", &sync.ticket],
         &script,
     );
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "graph sync script failed: stdout={}, stderr={}",
+        output_string(&output.stdout),
+        output_string(&output.stderr)
+    );
     stop_child(&mut server);
 
     // Verify BFS on the server finds all reachable nodes from A
@@ -210,8 +229,8 @@ async fn f35b_state_propagation_effects_sync_correctly() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "f35b-server.db");
     let edge_path = temp_db_file(&tmp, "f35b-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f35b", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f35b", &sync.bind_spec);
 
     // Create parent and child tables with state machine + propagation
     let parent_id = "00000000-0000-0000-0000-000000000001";
@@ -219,22 +238,27 @@ async fn f35b_state_propagation_effects_sync_correctly() {
     let child2_id = "00000000-0000-0000-0000-000000000003";
 
     let script = format!(
-        "CREATE TABLE parents (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> archived))\n\
-         CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) ON STATE archived PROPAGATE SET archived, status TEXT STATE_MACHINE(status: active -> archived))\n\
-         INSERT INTO parents (id, status) VALUES ('{parent_id}', 'active')\n\
-         INSERT INTO children (id, parent_id, status) VALUES ('{child1_id}', '{parent_id}', 'active')\n\
-         INSERT INTO children (id, parent_id, status) VALUES ('{child2_id}', '{parent_id}', 'active')\n\
-         UPDATE parents SET status = 'archived' WHERE id = '{parent_id}'\n\
+        "CREATE TABLE parents (id UUID PRIMARY KEY, status TEXT STATE_MACHINE(status: active -> archived)) SYNC CONFLICT KEEP LATEST;\n\
+         CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID REFERENCES parents(id) ON STATE archived PROPAGATE SET archived, status TEXT STATE_MACHINE(status: active -> archived)) SYNC CONFLICT KEEP LATEST;\n\
+         INSERT INTO parents (id, status) VALUES ('{parent_id}', 'active');\n\
+         INSERT INTO children (id, parent_id, status) VALUES ('{child1_id}', '{parent_id}', 'active');\n\
+         INSERT INTO children (id, parent_id, status) VALUES ('{child2_id}', '{parent_id}', 'active');\n\
+         UPDATE parents SET status = 'archived' WHERE id = '{parent_id}';\n\
          .sync push\n\
          .quit\n"
     );
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f35b", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f35b", "--sync-endpoint", &sync.ticket],
         &script,
     );
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "state-propagation sync script failed: stdout={}, stderr={}",
+        output_string(&output.stdout),
+        output_string(&output.stderr)
+    );
     stop_child(&mut server);
 
     // Verify propagated states on the server
@@ -352,27 +376,27 @@ async fn f109_sync_preserves_graph_vector_relational_atomicity_end_to_end() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "f109-server.db");
     let edge_path = temp_db_file(&tmp, "f109-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f109", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f109", &sync.bind_spec);
 
     let id1 = "00000000-0000-0000-0000-000000000001";
     let id2 = "00000000-0000-0000-0000-000000000002";
     let id3 = "00000000-0000-0000-0000-000000000003";
 
     let script = format!(
-        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT, embedding VECTOR(3))\n\
-         INSERT INTO items (id, name, embedding) VALUES ('{id1}', 'alpha', [1.0, 0.0, 0.0])\n\
-         INSERT INTO items (id, name, embedding) VALUES ('{id2}', 'beta', [0.0, 1.0, 0.0])\n\
-         INSERT INTO items (id, name, embedding) VALUES ('{id3}', 'gamma', [0.0, 0.0, 1.0])\n\
-         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{id1}', '{id2}', 'RELATES_TO')\n\
-         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{id2}', '{id3}', 'RELATES_TO')\n\
+        "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT, embedding VECTOR(3));\n\
+         INSERT INTO items (id, name, embedding) VALUES ('{id1}', 'alpha', [1.0, 0.0, 0.0]);\n\
+         INSERT INTO items (id, name, embedding) VALUES ('{id2}', 'beta', [0.0, 1.0, 0.0]);\n\
+         INSERT INTO items (id, name, embedding) VALUES ('{id3}', 'gamma', [0.0, 0.0, 1.0]);\n\
+         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{id1}', '{id2}', 'RELATES_TO');\n\
+         INSERT INTO __edges (source_id, target_id, edge_type) VALUES ('{id2}', '{id3}', 'RELATES_TO');\n\
          .sync push\n\
          .quit\n"
     );
 
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "f109", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f109", "--sync-endpoint", &sync.ticket],
         &script,
     );
     assert!(output.status.success());
@@ -438,13 +462,13 @@ async fn sf01_ddl_column_attributes_preserved_through_sync() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "sf01-server.db");
     let edge_path = temp_db_file(&tmp, "sf01-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "sf01", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "sf01", &sync.bind_spec);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "sf01", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL, code TEXT UNIQUE)\n\
-         INSERT INTO sensors (id, name, code) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 'S001')\n\
+        &["--tenant-id", "sf01", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL, code TEXT UNIQUE);\n\
+         INSERT INTO sensors (id, name, code) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 'S001');\n\
          .sync push\n\
          .quit\n",
     );
@@ -506,13 +530,13 @@ async fn sf02_ddl_attributes_persist_across_server_restart() {
     let tmp = TempDir::new().expect("tempdir");
     let server_path = temp_db_file(&tmp, "sf02-server.db");
     let edge_path = temp_db_file(&tmp, "sf02-edge.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "sf02", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "sf02", &sync.bind_spec);
     let output = run_cli_script(
         &edge_path,
-        &["--tenant-id", "sf02", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL, code TEXT UNIQUE)\n\
-         INSERT INTO sensors (id, name, code) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 'S001')\n\
+        &["--tenant-id", "sf02", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL, code TEXT UNIQUE);\n\
+         INSERT INTO sensors (id, name, code) VALUES ('00000000-0000-0000-0000-000000000001', 'a', 'S001');\n\
          .sync push\n\
          .quit\n",
     );
@@ -563,15 +587,15 @@ async fn sf03_not_null_constraint_enforced_on_server_during_push() {
     let server_path = temp_db_file(&tmp, "sf03-server.db");
     let edge1_path = temp_db_file(&tmp, "sf03-edge1.db");
     let edge2_path = temp_db_file(&tmp, "sf03-edge2.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "sf03", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "sf03", &sync.bind_spec);
 
     // Edge1: create table WITH NOT NULL, push valid row to establish schema on server
     let setup = run_cli_script(
         &edge1_path,
-        &["--tenant-id", "sf03", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL)\n\
-         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid')\n\
+        &["--tenant-id", "sf03", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT NOT NULL);\n\
+         INSERT INTO sensors (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'valid');\n\
          .sync push\n\
          .quit\n",
     );
@@ -581,20 +605,27 @@ async fn sf03_not_null_constraint_enforced_on_server_during_push() {
     // Server has NOT NULL from edge1's DDL, so it must reject this row
     let violation = run_cli_script(
         &edge2_path,
-        &["--tenant-id", "sf03", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT)\n\
-         INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002')\n\
+        &["--tenant-id", "sf03", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, name TEXT);\n\
+         INSERT INTO sensors (id) VALUES ('00000000-0000-0000-0000-000000000002');\n\
          .sync push\n\
          .quit\n",
     );
     stop_child(&mut server);
 
     // The push output must report a conflict/constraint violation
-    let stdout = output_string(&violation.stdout).to_lowercase();
+    let diagnostic = format!(
+        "{}{}",
+        output_string(&violation.stdout),
+        output_string(&violation.stderr)
+    )
+    .to_lowercase();
     assert!(
-        stdout.contains("constraint") || stdout.contains("not null") || stdout.contains("conflict"),
+        diagnostic.contains("constraint")
+            || diagnostic.contains("not null")
+            || diagnostic.contains("conflict"),
         "push of NULL into NOT NULL column must be rejected by server, got: {}",
-        stdout
+        diagnostic
     );
 
     // Server must still have only 1 row (the valid one), not 2
@@ -613,15 +644,15 @@ async fn sf04_unique_constraint_enforced_on_server_during_push() {
     let server_path = temp_db_file(&tmp, "sf04-server.db");
     let edge1_path = temp_db_file(&tmp, "sf04-edge1.db");
     let edge2_path = temp_db_file(&tmp, "sf04-edge2.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "sf04", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "sf04", &sync.bind_spec);
 
     // Edge1: push table with UNIQUE constraint and one row
     let setup = run_cli_script(
         &edge1_path,
-        &["--tenant-id", "sf04", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, code TEXT UNIQUE)\n\
-         INSERT INTO sensors (id, code) VALUES ('00000000-0000-0000-0000-000000000001', 'ABC')\n\
+        &["--tenant-id", "sf04", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, code TEXT UNIQUE);\n\
+         INSERT INTO sensors (id, code) VALUES ('00000000-0000-0000-0000-000000000001', 'ABC');\n\
          .sync push\n\
          .quit\n",
     );
@@ -631,20 +662,27 @@ async fn sf04_unique_constraint_enforced_on_server_during_push() {
     // Server must reject this as a UNIQUE violation
     let violation = run_cli_script(
         &edge2_path,
-        &["--tenant-id", "sf04", "--nats-url", &nats.ws_url],
-        "CREATE TABLE sensors (id UUID PRIMARY KEY, code TEXT UNIQUE)\n\
-         INSERT INTO sensors (id, code) VALUES ('00000000-0000-0000-0000-000000000002', 'ABC')\n\
+        &["--tenant-id", "sf04", "--sync-endpoint", &sync.ticket],
+        "CREATE TABLE sensors (id UUID PRIMARY KEY, code TEXT UNIQUE);\n\
+         INSERT INTO sensors (id, code) VALUES ('00000000-0000-0000-0000-000000000002', 'ABC');\n\
          .sync push\n\
          .quit\n",
     );
     stop_child(&mut server);
 
     // The push output must report a conflict/constraint violation
-    let stdout = output_string(&violation.stdout).to_lowercase();
+    let diagnostic = format!(
+        "{}{}",
+        output_string(&violation.stdout),
+        output_string(&violation.stderr)
+    )
+    .to_lowercase();
     assert!(
-        stdout.contains("constraint") || stdout.contains("unique") || stdout.contains("conflict"),
+        diagnostic.contains("constraint")
+            || diagnostic.contains("unique")
+            || diagnostic.contains("conflict"),
         "push of duplicate UNIQUE value must be rejected by server, got: {}",
-        stdout
+        diagnostic
     );
 
     // Server must still have only 1 row (the first one), not 2

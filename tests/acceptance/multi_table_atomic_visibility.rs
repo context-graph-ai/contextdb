@@ -1,5 +1,6 @@
-use contextdb_core::{Direction, MemoryAccountant, RowId, SnapshotId, Value, VectorIndexRef};
+use contextdb_core::{Direction, RowId, SnapshotId, Value, VectorIndexRef};
 use contextdb_engine::Database;
+use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
     VectorChange,

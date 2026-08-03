@@ -402,7 +402,7 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 }
 
                 self.delete(tx, table, existing_row.row_id)?;
-                self.insert_with_tx(tx, table, values, snapshot)?;
+                self.insert_with_row_id(tx, table, existing_row.row_id, values, snapshot)?;
                 Ok(UpsertResult::Updated)
             }
         }

@@ -1,4 +1,4 @@
-use crate::types::{ContextId, Principal, RowId, ScopeLabel, TxId, VectorIndexRef};
+use crate::types::{ContextId, Principal, RowId, ScopeLabel, TxId, Value, VectorIndexRef};
 use std::collections::BTreeSet;
 
 /// Distinguishes which callback context produced a callback-active error.
@@ -226,6 +226,29 @@ pub enum Error {
     PlanError(String),
     #[error("sync error: {0}")]
     SyncError(String),
+    #[error("PURGE must originate at authoritative hub {hub_node_id}; run PURGE there")]
+    PurgeRequiresAuthoritativeHub { hub_node_id: String },
+    #[error("PURGE must run as a standalone authoritative statement")]
+    PurgeRequiresStandaloneExecution,
+    #[error(
+        "purge causality fence rejects {table} key {key:?}: lineage root {lineage_root} was permanently purged at frontier {frontier}"
+    )]
+    PurgeCausalityFence {
+        table: String,
+        key: Vec<(String, Value)>,
+        lineage_root: String,
+        frontier: crate::types::Lsn,
+    },
+    #[error(
+        "export snapshot fence rejects {table} key {key:?}: lineage root {lineage_root} was permanently purged at frontier {frontier} after snapshot {snapshot_lsn}"
+    )]
+    PurgeExportSnapshotFence {
+        table: String,
+        key: Vec<(String, Value)>,
+        lineage_root: String,
+        frontier: crate::types::Lsn,
+        snapshot_lsn: crate::types::Lsn,
+    },
     #[error("table {0} is not sync-eligible (no natural key)")]
     NotSyncEligible(String),
     #[error(

@@ -119,20 +119,15 @@ pub(crate) fn propagation_direction_wire_word(direction: &Direction) -> &'static
     }
 }
 
-/// The wire word for a table's conflict policy, on the same terms.
-///
-/// The two DDL-declarable policies take their clause words
-/// (`ConflictPolicy::declared_clause`). `ServerWins` and `EdgeWins` have no
-/// clause — the engine bakes them into its own distributed-contract tables
-/// rather than letting a schema declare them — but a `.schema` on one of those
-/// tables still carries the field, so they take the word their role is named
-/// by.
-pub(crate) fn conflict_policy_wire_word(policy: ConflictPolicy) -> &'static str {
-    match policy {
-        ConflictPolicy::InsertIfNotExists => "keep_first",
-        ConflictPolicy::LatestWins => "keep_latest",
-        ConflictPolicy::ServerWins => "server_wins",
-        ConflictPolicy::EdgeWins => "edge_wins",
+/// The machine word for a DDL-declared conflict policy. Engine-private
+/// mechanics have no declared clause and therefore no public representation.
+pub(crate) fn conflict_policy_wire_word(policy: ConflictPolicy) -> Option<&'static str> {
+    if policy == ConflictPolicy::KEEP_FIRST {
+        Some("keep_first")
+    } else if policy == ConflictPolicy::KEEP_LATEST {
+        Some("keep_latest")
+    } else {
+        None
     }
 }
 
@@ -234,6 +229,15 @@ pub(crate) fn print_notice(class: ErrorClass, message: &str) {
     eprintln!(
         "{}",
         json!({ "notice": { "class": class.as_str(), "message": message } })
+    );
+}
+
+/// Write one NOTICE with structured detail that remains directly queryable by
+/// a JSON consumer instead of being embedded as escaped JSON in `message`.
+pub(crate) fn print_notice_document(class: ErrorClass, message: &str, detail: &Value) {
+    eprintln!(
+        "{}",
+        json!({ "notice": { "class": class.as_str(), "message": message, "detail": detail } })
     );
 }
 
@@ -358,11 +362,8 @@ pub(crate) fn table_meta_document(table: &str, meta: &TableMeta) -> Value {
             json!(sync_direction_wire_word(direction)),
         );
     }
-    if let Some(policy) = meta.conflict_policy {
-        document.insert(
-            "conflict_policy".to_string(),
-            json!(conflict_policy_wire_word(policy)),
-        );
+    if let Some(policy) = meta.conflict_policy.and_then(conflict_policy_wire_word) {
+        document.insert("conflict_policy".to_string(), json!(policy));
     }
     if let Some(policy) = meta.history_policy {
         // An object, not a bare string, for the same reason "retain" is: the
@@ -670,30 +671,6 @@ mod tests {
         assert_eq!(sync_direction_wire_word(SyncDirection::Both), "two_way");
     }
 
-    /// The same for conflict policies, including the two the engine keeps for
-    /// its own distributed-contract tables — no schema can declare those, so
-    /// nothing a test can `CREATE` will carry one, but a `.schema` on such a
-    /// table still reports the field.
-    #[test]
-    fn conflict_policy_wire_word_covers_every_variant() {
-        assert_eq!(
-            conflict_policy_wire_word(ConflictPolicy::InsertIfNotExists),
-            "keep_first"
-        );
-        assert_eq!(
-            conflict_policy_wire_word(ConflictPolicy::LatestWins),
-            "keep_latest"
-        );
-        assert_eq!(
-            conflict_policy_wire_word(ConflictPolicy::ServerWins),
-            "server_wins"
-        );
-        assert_eq!(
-            conflict_policy_wire_word(ConflictPolicy::EdgeWins),
-            "edge_wins"
-        );
-    }
-
     /// No wire word may coincide with its variant's `Debug` spelling. The
     /// point of declaring these words is that renaming a Rust type cannot
     /// reach a consumer, and an accidental match would hide a regression back
@@ -709,18 +686,6 @@ mod tests {
             assert_ne!(
                 sync_direction_wire_word(direction),
                 format!("{direction:?}"),
-                "the wire word must not be the Rust identifier"
-            );
-        }
-        for policy in [
-            ConflictPolicy::InsertIfNotExists,
-            ConflictPolicy::LatestWins,
-            ConflictPolicy::ServerWins,
-            ConflictPolicy::EdgeWins,
-        ] {
-            assert_ne!(
-                conflict_policy_wire_word(policy),
-                format!("{policy:?}"),
                 "the wire word must not be the Rust identifier"
             );
         }

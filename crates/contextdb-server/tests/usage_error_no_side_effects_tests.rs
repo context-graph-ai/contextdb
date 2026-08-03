@@ -1,17 +1,9 @@
 //! Exit `2` means the invocation itself was wrong and nothing ran — no work
 //! attempted. `contextdb-server` must never open (and, for a fresh path,
 //! create) the database file before it validates that
-//! `--show-ticket`/`--ticket-file` were paired with a sync endpoint rather
-//! than a broker URL — a caller that branches on exit `2` to mean "safe to
-//! retry, nothing changed on disk" must never find a brand-new database file
-//! waiting for it.
-//!
-//! The mutually-exclusive-branch shape of `main.rs` means this scenario
-//! (a broker URL plus a ticket-only flag) never reaches the code path that
-//! binds a listening port — that branch requires `EndpointSpec::parse` to
-//! recognize the endpoint as a sync-endpoint spec, which a broker URL never
-//! is — so there is nothing observable to assert about port binding here
-//! beyond the database file itself.
+//! `--sync-endpoint` before doing any work — a caller that branches on exit
+//! `2` to mean "safe to retry, nothing changed on disk" must never find a
+//! brand-new database file waiting for it.
 
 use std::process::Command;
 
@@ -27,10 +19,9 @@ fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-// A broker URL (`--nats-url`) combined with `--show-ticket` is a usage
-// error (tickets exist only for sync-endpoint binds): the invocation is
-// wrong, so the database must never be opened (and, since the path is
-// fresh, created on disk) before that check runs.
+// An invalid sync-endpoint bind combined with `--show-ticket` is a usage
+// error, so the database must never be opened (and, since the path is fresh,
+// created on disk) before that check runs.
 #[test]
 fn usage_error_before_ticket_flag_check_does_not_create_the_database() {
     let dir = unique_temp_dir("fresh");
@@ -42,8 +33,8 @@ fn usage_error_before_ticket_flag_check_does_not_create_the_database() {
         .arg(&db_path)
         .arg("--tenant-id")
         .arg("acme")
-        .arg("--nats-url")
-        .arg("nats://localhost:4222")
+        .arg("--sync-endpoint")
+        .arg("not-a-valid-sync-endpoint")
         .arg("--show-ticket")
         .output()
         .expect("spawn contextdb-server");
@@ -58,7 +49,7 @@ fn usage_error_before_ticket_flag_check_does_not_create_the_database() {
     assert!(
         !db_path.exists(),
         "exit 2 must mean no work was attempted — the database file must never \
-         be created before the ticket-flags/broker-URL check runs. Directory \
+         be created before sync-endpoint validation runs. Directory \
          contents: {:?}",
         std::fs::read_dir(&dir)
             .map(|entries| entries

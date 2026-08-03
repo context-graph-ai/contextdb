@@ -9,9 +9,10 @@ use crate::common_tracing::{
     install_global_subscriber as t30_install_global_subscriber, t30_reset_warn_counters, t37_reset,
 };
 use contextdb_core::{
-    CallbackKind, Error, MemoryAccountant, Result, Value, VectorIndexRef,
+    CallbackKind, Error, Result, Value, VectorIndexRef,
     types::{EdgeType, NodeId},
 };
+use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::plugin::DatabasePlugin;
 use contextdb_engine::{CronAuditKind, Database, QueryResult};
 use serial_test::serial;

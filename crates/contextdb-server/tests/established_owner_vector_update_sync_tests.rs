@@ -3,7 +3,7 @@
 use contextdb_core::{RowId, TenantId, Value, VectorIndexRef};
 use contextdb_engine::Database;
 use contextdb_server::transport::iroh::IrohServer;
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,19 +28,28 @@ struct Hub {
 }
 
 async fn hub(root: &Path, tenant: &str) -> Hub {
+    let identity_path = root.join("hub.identity");
     let (ticket, transport) = {
-        let endpoint = IrohServer::bind(&spec(&root.join("hub.identity")))
+        let endpoint = IrohServer::bind(&spec(&identity_path))
             .await
             .expect("bind hub");
         (endpoint.ticket(), endpoint.transport())
     };
+    let identity = Arc::new(
+        FabricIdentity::load_or_generate(&identity_path).expect("load hub fabric identity"),
+    );
+    let node_id = identity.node_id();
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub"));
     db.execute("CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT, embedding VECTOR(3)) SYNC CONFLICT KEEP LATEST", &HashMap::new()).expect("hub schema");
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        db.clone(),
-        transport,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            transport,
+            TenantId::from(tenant),
+            node_id,
+            identity,
+        ),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let stop = stop.clone();

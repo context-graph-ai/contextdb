@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'scripts/**'
       - 'tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -40,7 +41,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo build --release
-      - run: cargo check --workspace --tests --features contextdb-engine/nats-tests,contextdb-server/nats
+
+  installed-smoke:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install release binaries into an isolated root
+        run: |
+          install_root="$RUNNER_TEMP/contextdb-installed"
+          cargo install --locked --path crates/contextdb-cli --root "$install_root"
+          cargo install --locked --path crates/contextdb-server --root "$install_root" \
+            --features production-smoke-driver --bins
+      - name: Run installed release durability smoke
+        run: |
+          install_root="$RUNNER_TEMP/contextdb-installed"
+          CONTEXTDB_CLI="$install_root/bin/contextdb" \
+          CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" \
+          CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
+            scripts/installed-release-durable-sync-smoke.sh
 
   cross-compile:
     needs: lint

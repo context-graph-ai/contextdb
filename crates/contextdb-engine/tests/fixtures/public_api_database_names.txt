@@ -30,6 +30,7 @@ force_reset
 get_edge_properties
 guard_row_conditions_in_tx
 has_live_vector
+import_legacy_database
 insert_edge
 insert_row
 insert_vector

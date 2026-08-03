@@ -93,16 +93,15 @@ impl SyncDirection {
 /// words, the stored declaration and the sync-apply resolver must never drift
 /// into two different enums.
 ///
-/// The two policies an application DECLARES on a table are `KEEP FIRST`
-/// ([`Self::InsertIfNotExists`] — the first value written for a key stays; a
-/// re-send does not overwrite it) and `KEEP LATEST` ([`Self::LatestWins`] — the
-/// newest write for a key wins). [`Self::ServerWins`] and [`Self::EdgeWins`] are
-/// role-relative resolutions used only by the engine's baked distributed-contract
-/// tables (the work ledger and peer directory); they are NOT part of the DDL
-/// surface, because "server" and "edge" are not table properties an application
-/// declares — see [`Self::declared_clause`].
+/// Applications can name only `KEEP FIRST` and `KEEP LATEST`. The private
+/// storage enum retains the historical four-slot binary layout so an existing
+/// database still decodes, but role-relative arbitration is not constructible
+/// through this public type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictPolicy(StoredConflictPolicy);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ConflictPolicy {
+enum StoredConflictPolicy {
     InsertIfNotExists,
     ServerWins,
     EdgeWins,
@@ -110,15 +109,60 @@ pub enum ConflictPolicy {
 }
 
 impl ConflictPolicy {
+    pub const KEEP_FIRST: Self = Self(StoredConflictPolicy::InsertIfNotExists);
+    pub const KEEP_LATEST: Self = Self(StoredConflictPolicy::LatestWins);
+
     /// The DDL clause that DECLARES this policy — the same words an operator
     /// writes, so `.schema` gives the declaration back verbatim. Only the two
     /// application-facing policies render; the role-relative distributed-contract
     /// policies are not declarable and render nothing.
     pub fn declared_clause(self) -> Option<&'static str> {
-        match self {
-            ConflictPolicy::InsertIfNotExists => Some("SYNC CONFLICT KEEP FIRST"),
-            ConflictPolicy::LatestWins => Some("SYNC CONFLICT KEEP LATEST"),
-            ConflictPolicy::ServerWins | ConflictPolicy::EdgeWins => None,
+        match self.0 {
+            StoredConflictPolicy::InsertIfNotExists => Some("SYNC CONFLICT KEEP FIRST"),
+            StoredConflictPolicy::LatestWins => Some("SYNC CONFLICT KEEP LATEST"),
+            StoredConflictPolicy::ServerWins | StoredConflictPolicy::EdgeWins => None,
+        }
+    }
+}
+
+impl Serialize for ConflictPolicy {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            let word = match self.0 {
+                StoredConflictPolicy::InsertIfNotExists => "keep_first",
+                StoredConflictPolicy::LatestWins => "keep_latest",
+                StoredConflictPolicy::ServerWins | StoredConflictPolicy::EdgeWins => {
+                    return Err(serde::ser::Error::custom(
+                        "role-relative conflict mechanics are not public policy",
+                    ));
+                }
+            };
+            serializer.serialize_str(word)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConflictPolicy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let word = String::deserialize(deserializer)?;
+            match word.as_str() {
+                "keep_first" => Ok(Self::KEEP_FIRST),
+                "keep_latest" => Ok(Self::KEEP_LATEST),
+                _ => Err(serde::de::Error::custom(
+                    "conflict policy must be keep_first or keep_latest",
+                )),
+            }
+        } else {
+            StoredConflictPolicy::deserialize(deserializer).map(Self)
         }
     }
 }
@@ -127,7 +171,7 @@ impl ConflictPolicy {
 /// keep-first, the non-overwriting default. A re-send of an existing key does
 /// not silently overwrite it; `SYNC CONFLICT KEEP LATEST` is the explicit
 /// opt-in for last-writer-wins current-state semantics.
-pub const DEFAULT_CONFLICT_POLICY: ConflictPolicy = ConflictPolicy::InsertIfNotExists;
+pub const DEFAULT_CONFLICT_POLICY: ConflictPolicy = ConflictPolicy::KEEP_FIRST;
 
 /// How much of each live row's version history a table keeps. `HISTORY ALL`
 /// ([`Self::All`]) keeps every superseded version; `HISTORY CURRENT ONLY`
@@ -164,7 +208,7 @@ pub const DEFAULT_HISTORY_POLICY: HistoryPolicy = HistoryPolicy::All;
 /// engine default and the recovery contract.
 pub const DEFAULT_SYNC_DIRECTION: SyncDirection = SyncDirection::Both;
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct TableMeta {
     pub columns: Vec<ColumnDef>,
     pub immutable: bool,
@@ -570,7 +614,7 @@ impl IndexDecl {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PropagationRule {
     ForeignKey {
         fk_column: String,
@@ -594,7 +638,7 @@ pub enum PropagationRule {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateMachineConstraint {
     pub column: String,
     pub transitions: HashMap<String, Vec<String>>,

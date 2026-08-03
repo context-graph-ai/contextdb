@@ -23,15 +23,13 @@ use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, RowChange, SyncAdoption,
 };
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const TENANT: &str = "conflict";
-const HUB_NODE: &str = "hub-node-a";
-
 fn p() -> HashMap<String, Value> {
     HashMap::new()
 }
@@ -113,12 +111,17 @@ fn start_hub_with_ddls(broker: &InProcessBroker, ddls: &[&str]) -> RunningHub {
     for ddl in ddls {
         db.execute(ddl, &p()).expect("hub table");
     }
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(TENANT),
-        db.conflict_policies(),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -140,11 +143,14 @@ fn open_edge_with_ddls(ddls: &[&str]) -> Arc<Database> {
     db
 }
 
-fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
-    SyncClient::with_transport(
+fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> SyncClient {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&node_id),
         TenantId::from(TENANT),
+        identity,
     )
 }
 

@@ -39,13 +39,13 @@ fn main() {
         Value::Int64(limit),
         Value::Int64(used),
         Value::Int64(available),
-        Value::Int64(startup),
+        Value::Text(startup),
     ] = row.as_slice()
     else {
-        panic!("SHOW MEMORY_LIMIT must return numeric durable limits: {row:?}");
+        panic!("SHOW MEMORY_LIMIT must return the durable limit and no startup ceiling: {row:?}");
     };
     assert_eq!(*limit, memory as i64);
-    assert_eq!(*startup, memory as i64);
+    assert_eq!(startup, "none");
     assert_eq!(*available, (memory as i64 - *used).max(0));
     assert_eq!(reopened.disk_limit(), Some(disk));
 }

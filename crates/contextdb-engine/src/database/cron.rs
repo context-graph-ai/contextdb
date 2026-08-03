@@ -266,12 +266,14 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
         let _operation = self.open_operation()?;
         self.wait_for_imminent_cron_due_for_test(Duration::from_millis(75));
         self.dispatch_due_cron_schedules(true)
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn pause_cron_tickler_for_test(&self) -> CronPauseGuard {
         let _operation = self.assert_open_operation();
         self.cron.pause_count.fetch_add(1, Ordering::SeqCst);
@@ -286,16 +288,19 @@ impl Database {
     /// ("no tickler started" / "no further fires possible") assert on this
     /// state instead of sleeping through a wall-clock window.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn cron_tickler_running_for_test(&self) -> bool {
         self.cron.runtime.lock().handle.is_some()
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __trigger_progress_worker_handle_for_test(&self) -> Database {
         let _operation = self.assert_open_operation();
         self.worker_handle_for_background()
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn cron_audit_log_for_test(&self) -> Vec<CronAuditEntry> {
         let _operation = self.assert_open_operation();
         self.cron.audit.lock().iter().cloned().collect()
@@ -385,6 +390,7 @@ impl Database {
             .min()
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     fn wait_for_imminent_cron_due_for_test(&self, max_wait: Duration) {
         let deadline = Instant::now() + max_wait;
         loop {
@@ -759,11 +765,20 @@ impl Database {
             change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),
             sync_tombstone_arrivals: self.sync_tombstone_arrivals.clone(),
+            terminal_refusal_markers: self.terminal_refusal_markers.clone(),
+            terminal_refusal_scans: self.terminal_refusal_scans.clone(),
+            accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
+            received_schema_stages: self.received_schema_stages.clone(),
+            capture_detached_sync_write_set: self.capture_detached_sync_write_set.clone(),
+            detached_sync_write_set: self.detached_sync_write_set.clone(),
             persistence: self.persistence.clone(),
+            blob_repository: self.blob_repository.clone(),
             open_registry_path: Mutex::new(None),
             operation_gate: self.operation_gate.clone(),
+            schema_publication_gate: self.schema_publication_gate.clone(),
             apply_phase_pause: self.apply_phase_pause.clone(),
             sync_apply_pre_commit_pause: self.sync_apply_pre_commit_pause.clone(),
+            export_after_capture_pause: self.export_after_capture_pause.clone(),
             relational: MemRelationalExecutor::new(
                 self.relational_store.clone(),
                 self.tx_mgr.clone(),
@@ -785,15 +800,24 @@ impl Database {
             subscriptions: self.subscriptions.clone(),
             pruning_runtime: Mutex::new(PruningRuntime::new()),
             pruning_guard: self.pruning_guard.clone(),
-            retention_sync_peer: Mutex::new(self.retention_sync_peer.lock().clone()),
+            retention_sync_peer: self.retention_sync_peer.clone(),
+            in_memory_destination_reuploads: self.in_memory_destination_reuploads.clone(),
+            lineage_state_lock: self.lineage_state_lock.clone(),
+            received_schema_manifest_lock: self.received_schema_manifest_lock.clone(),
+            in_memory_received_schema_manifests: self.in_memory_received_schema_manifests.clone(),
+            in_memory_table_generations: self.in_memory_table_generations.clone(),
+            in_memory_ddl_generations: self.in_memory_ddl_generations.clone(),
+            received_ddl_arrivals: self.received_ddl_arrivals.clone(),
             cron: self.cron.clone(),
             event_bus: self.event_bus.clone(),
             trigger: self.trigger.clone(),
             sync_relay_mode: self.sync_relay_mode.clone(),
+            in_memory_sync_progress: self.in_memory_sync_progress.clone(),
             in_memory_applied_push_watermarks: self.in_memory_applied_push_watermarks.clone(),
             sync_incarnations: self.sync_incarnations.clone(),
             pending_event_bus_ddl: Mutex::new(HashMap::new()),
             pending_commit_metadata: Mutex::new(HashMap::new()),
+            limit_update_lock: self.limit_update_lock.clone(),
             disk_limit: AtomicU64::new(self.disk_limit.load(Ordering::SeqCst)),
             disk_limit_startup_ceiling: AtomicU64::new(
                 self.disk_limit_startup_ceiling.load(Ordering::SeqCst),

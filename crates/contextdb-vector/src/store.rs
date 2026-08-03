@@ -1,7 +1,7 @@
+use crate::memory_budget::MemoryBudget;
 use crate::{HnswIndex, quantized::StoredVectorEntry};
 use contextdb_core::{
-    Error, Lsn, MemoryAccountant, Result, RowId, TxId, VectorEntry, VectorIndexRef,
-    VectorQuantization,
+    Error, Lsn, Result, RowId, TxId, VectorEntry, VectorIndexRef, VectorQuantization,
 };
 use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
@@ -86,7 +86,7 @@ pub struct IndexState {
     vectors: RwLock<Vec<StoredVectorEntry>>,
     hnsw: OnceLock<RwLock<Option<HnswIndex>>>,
     hnsw_bytes: AtomicUsize,
-    hnsw_accountant: RwLock<Option<Arc<MemoryAccountant>>>,
+    hnsw_accountant: RwLock<Option<Arc<dyn MemoryBudget>>>,
 }
 
 impl IndexState {
@@ -197,7 +197,7 @@ impl IndexState {
         released
     }
 
-    pub fn clear_hnsw(&self, accountant: &MemoryAccountant) {
+    pub fn clear_hnsw(&self, accountant: &dyn MemoryBudget) {
         self.clear_hnsw_with_optional_accountant(Some(accountant));
     }
 
@@ -205,7 +205,7 @@ impl IndexState {
         self.clear_hnsw_with_optional_accountant(None);
     }
 
-    fn clear_hnsw_with_optional_accountant(&self, accountant: Option<&MemoryAccountant>) {
+    fn clear_hnsw_with_optional_accountant(&self, accountant: Option<&dyn MemoryBudget>) {
         let bytes = self.remove_hnsw_graph();
         let recorded_accountant = self.hnsw_accountant.write().take();
         if bytes == 0 {
@@ -295,7 +295,7 @@ impl IndexState {
     pub(crate) fn set_hnsw_bytes_with_accountant(
         &self,
         bytes: usize,
-        accountant: Arc<MemoryAccountant>,
+        accountant: Arc<dyn MemoryBudget>,
     ) {
         self.hnsw_bytes.store(bytes, Ordering::SeqCst);
         *self.hnsw_accountant.write() = Some(accountant);
@@ -344,6 +344,30 @@ pub struct VectorStore {
     pause_registry: crate::test_seam::PauseRegistry,
 }
 
+/// A fully constructed vector registry.  Received-schema staging creates this
+/// before durability so publishing it cannot reconfigure an index, quantize a
+/// vector, or allocate registry entries after Redb commits.
+pub struct PreparedVectorPublication {
+    registry: HashMap<VectorIndexRef, Arc<IndexState>>,
+}
+
+impl PreparedVectorPublication {
+    fn into_registry(mut self) -> HashMap<VectorIndexRef, Arc<IndexState>> {
+        std::mem::take(&mut self.registry)
+    }
+}
+
+/// A prepared purge publication can own HNSW graphs before the durable commit.
+/// If that commit never happens, release those precharged graphs with the
+/// publication rather than leaking their final allocation.
+impl Drop for PreparedVectorPublication {
+    fn drop(&mut self) {
+        for state in self.registry.values() {
+            state.drop_hnsw_without_accounting();
+        }
+    }
+}
+
 impl Default for VectorStore {
     fn default() -> Self {
         Self::new(Arc::new(OnceLock::new()))
@@ -358,6 +382,101 @@ impl VectorStore {
             bulk_gate: RwLock::new(()),
             #[cfg(feature = "test-seams")]
             pause_registry: crate::test_seam::PauseRegistry::default(),
+        }
+    }
+
+    pub fn prepare_received_schema_publication(
+        schemas: Vec<(VectorIndexRef, usize, VectorQuantization)>,
+        entries: Vec<VectorEntry>,
+    ) -> PreparedVectorPublication {
+        let mut registry = HashMap::<VectorIndexRef, Arc<IndexState>>::new();
+        for (index, dimension, quantization) in schemas {
+            registry.insert(index, Arc::new(IndexState::new(dimension, quantization)));
+        }
+        for entry in entries {
+            let index = entry.index.clone();
+            let state = registry.entry(index).or_insert_with(|| {
+                Arc::new(IndexState::new(entry.vector.len(), VectorQuantization::F32))
+            });
+            state.push_entry(state.stored_entry(entry));
+        }
+        PreparedVectorPublication { registry }
+    }
+
+    /// Build the exact replacement registry for authoritative purge.  Unlike
+    /// normal lazy search construction, this preserves a graph only for an
+    /// index that already had one, and builds it before durability even when
+    /// the survivor count has crossed below the ordinary lazy threshold.
+    pub fn prepare_authoritative_purge_publication(
+        schemas: Vec<(VectorIndexRef, usize, VectorQuantization)>,
+        entries: Vec<VectorEntry>,
+        materialized_indexes: Vec<VectorIndexRef>,
+        accountant: Arc<dyn MemoryBudget>,
+    ) -> Result<PreparedVectorPublication> {
+        let publication = Self::prepare_received_schema_publication(schemas, entries);
+        for index in materialized_indexes {
+            let Some(state) = publication.registry.get(&index) else {
+                continue;
+            };
+            Self::build_prepared_hnsw(&index, state, accountant.clone())?;
+        }
+        Ok(publication)
+    }
+
+    fn build_prepared_hnsw(
+        index: &VectorIndexRef,
+        state: &Arc<IndexState>,
+        accountant: Arc<dyn MemoryBudget>,
+    ) -> Result<()> {
+        let entry_count = state.vector_count();
+        let final_bytes =
+            crate::mem::estimate_hnsw_bytes(entry_count, state.dimension(), state.quantization());
+        let reservation_bytes = crate::mem::estimate_hnsw_build_reservation(
+            entry_count,
+            state.dimension(),
+            state.quantization(),
+        );
+        accountant.try_allocate_for(
+            reservation_bytes,
+            "vector_index",
+            &format!("prepare_authoritative_purge_hnsw@{}.{}", index.table, index.column),
+            "Reduce vector volume or raise MEMORY_LIMIT before authoritative purge can rebuild its materialized HNSW index.",
+        )?;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.with_entries(|entries| {
+                HnswIndex::new(entries, state.dimension(), state.quantization())
+            })
+        }));
+        let hnsw = match built {
+            Ok(hnsw) => hnsw,
+            Err(_) => {
+                accountant.release(reservation_bytes);
+                return Err(Error::Other(format!(
+                    "authoritative purge HNSW build panicked for {}.{}",
+                    index.table, index.column
+                )));
+            }
+        };
+        accountant.release(reservation_bytes.saturating_sub(final_bytes));
+        state.set_hnsw(Some(hnsw), final_bytes);
+        state.set_hnsw_bytes_with_accountant(final_bytes, accountant);
+        Ok(())
+    }
+
+    /// Replace an already prepared registry after durable received-schema
+    /// publication.  Any outgoing HNSW graph is retired here, after the
+    /// replacement is visible; its accountant release is paired with the
+    /// engine's private staged-memory settlement.
+    pub fn publish_prepared_received_schema(
+        &self,
+        publication: PreparedVectorPublication,
+        accountant: &dyn MemoryBudget,
+    ) {
+        let _bulk = self.bulk_gate.write();
+        let old_registry =
+            std::mem::replace(&mut *self.registry.write(), publication.into_registry());
+        for state in old_registry.values() {
+            state.clear_hnsw(accountant);
         }
     }
 
@@ -483,7 +602,7 @@ impl VectorStore {
         });
     }
 
-    pub fn deregister_index(&self, index: &VectorIndexRef, accountant: &MemoryAccountant) {
+    pub fn deregister_index(&self, index: &VectorIndexRef, accountant: &dyn MemoryBudget) {
         self.with_index_maintenance(index, || {
             if let Some(state) = self.registry.write().remove(index) {
                 state.clear_hnsw(accountant);
@@ -491,7 +610,7 @@ impl VectorStore {
         });
     }
 
-    pub fn deregister_table(&self, table: &str, accountant: &MemoryAccountant) {
+    pub fn deregister_table(&self, table: &str, accountant: &dyn MemoryBudget) {
         loop {
             let keys = {
                 let registry = self.registry.read();
@@ -588,7 +707,7 @@ impl VectorStore {
     pub fn apply_inserts_with_accountant(
         &self,
         inserts: Vec<VectorEntry>,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         let mut by_index = HashMap::<VectorIndexRef, Vec<VectorEntry>>::new();
         for entry in inserts {
@@ -606,7 +725,7 @@ impl VectorStore {
     fn apply_inserts_unlocked(
         &self,
         inserts: Vec<VectorEntry>,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         for entry in inserts {
             #[cfg(feature = "test-seams")]
@@ -632,7 +751,7 @@ impl VectorStore {
     pub fn apply_deletes_with_accountant(
         &self,
         deletes: Vec<(VectorIndexRef, RowId, TxId)>,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         let mut by_index = HashMap::<VectorIndexRef, Vec<(VectorIndexRef, RowId, TxId)>>::new();
         for delete in deletes {
@@ -650,7 +769,7 @@ impl VectorStore {
     fn apply_deletes_unlocked(
         &self,
         deletes: Vec<(VectorIndexRef, RowId, TxId)>,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         for (index, row_id, deleted_tx) in deletes {
             #[cfg(feature = "test-seams")]
@@ -675,7 +794,7 @@ impl VectorStore {
         &self,
         moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
         lsn: contextdb_core::Lsn,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         let mut by_index =
             HashMap::<VectorIndexRef, Vec<(VectorIndexRef, RowId, RowId, TxId)>>::new();
@@ -698,7 +817,7 @@ impl VectorStore {
         &self,
         moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
         lsn: contextdb_core::Lsn,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         for (index, old_row_id, new_row_id, tx) in moves {
             #[cfg(feature = "test-seams")]
@@ -726,7 +845,7 @@ impl VectorStore {
         inserts: Vec<VectorEntry>,
         moves: Vec<(VectorIndexRef, RowId, RowId, TxId)>,
         lsn: contextdb_core::Lsn,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         let mut by_index = HashMap::<VectorIndexRef, PendingVectorChanges>::new();
         for delete in deletes {
@@ -767,7 +886,7 @@ impl VectorStore {
         inserts: &[VectorEntry],
         moves: &[(VectorIndexRef, RowId, RowId, TxId)],
         lsn: contextdb_core::Lsn,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         let mut by_index = HashMap::<&VectorIndexRef, PendingVectorChangesRef<'_>>::new();
         for delete in deletes {
@@ -804,7 +923,7 @@ impl VectorStore {
     fn apply_deletes_unlocked_ref(
         &self,
         deletes: &[&(VectorIndexRef, RowId, TxId)],
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         for (index, row_id, deleted_tx) in deletes.iter().copied() {
             #[cfg(feature = "test-seams")]
@@ -820,7 +939,7 @@ impl VectorStore {
     fn apply_inserts_unlocked_ref(
         &self,
         inserts: &[&VectorEntry],
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         for entry in inserts {
             #[cfg(feature = "test-seams")]
@@ -843,7 +962,7 @@ impl VectorStore {
         &self,
         moves: &[&(VectorIndexRef, RowId, RowId, TxId)],
         lsn: contextdb_core::Lsn,
-        accountant: Option<&MemoryAccountant>,
+        accountant: Option<&dyn MemoryBudget>,
     ) {
         for (index, old_row_id, new_row_id, tx) in moves.iter().copied() {
             #[cfg(feature = "test-seams")]
@@ -914,7 +1033,7 @@ impl VectorStore {
     pub fn prune_row_ids(
         &self,
         row_ids: &std::collections::HashSet<RowId>,
-        accountant: &MemoryAccountant,
+        accountant: &dyn MemoryBudget,
     ) -> usize {
         self.with_bulk_maintenance(|| {
             #[cfg(feature = "test-seams")]
@@ -1011,7 +1130,20 @@ impl VectorStore {
         })
     }
 
-    pub fn clear_hnsw(&self, accountant: &MemoryAccountant) {
+    /// The purge planner uses this to preserve the materialization contract
+    /// without causing previously lazy indexes to allocate a graph.
+    pub fn materialized_hnsw_indexes(&self) -> Vec<VectorIndexRef> {
+        self.with_bulk_read(|| {
+            self.registry
+                .read()
+                .iter()
+                .filter(|(_, state)| state.hnsw_len().is_some())
+                .map(|(index, _)| index.clone())
+                .collect()
+        })
+    }
+
+    pub fn clear_hnsw(&self, accountant: &dyn MemoryBudget) {
         self.with_bulk_maintenance(|| {
             #[cfg(feature = "test-seams")]
             self.pause_registry.maybe_pause(
@@ -1024,7 +1156,7 @@ impl VectorStore {
         });
     }
 
-    pub fn clear_hnsw_for(&self, index: &VectorIndexRef, accountant: &MemoryAccountant) {
+    pub fn clear_hnsw_for(&self, index: &VectorIndexRef, accountant: &dyn MemoryBudget) {
         self.with_index_maintenance(index, || {
             if let Some(state) = self.try_state(index) {
                 state.clear_hnsw(accountant);

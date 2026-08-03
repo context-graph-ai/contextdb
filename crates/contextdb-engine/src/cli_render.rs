@@ -2,6 +2,7 @@
 
 use crate::Database;
 use crate::database::QueryTrace;
+use crate::sync_types::Conflict;
 use contextdb_core::Value;
 use contextdb_core::table_meta::{ColumnType, TableMeta};
 use std::fmt::Write;
@@ -62,6 +63,9 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
             meta.primary_key_columns.join(", ")
         )
         .unwrap();
+    }
+    for unique_constraint in &meta.unique_constraints {
+        write!(&mut buf, ",\n  UNIQUE ({})", unique_constraint.join(", ")).unwrap();
     }
     buf.push_str("\n)");
     if meta.immutable {
@@ -200,4 +204,90 @@ pub fn value_to_string(v: &Value) -> String {
 /// Render the `.sync status` output buffer. Includes the live committed-TxId.
 pub fn render_sync_status(db: &Database) -> String {
     format!("Committed TxId: {}\n", db.committed_watermark().0)
+}
+
+/// Stable public document for one synchronous conflict receipt. Optional
+/// facts are absent rather than fabricated, which matters for authority
+/// refusals that deliberately have no winning value.
+pub fn sync_conflict_document(conflict: &Conflict) -> serde_json::Value {
+    let mut fields = serde_json::Map::from_iter([(
+        "natural_key".to_string(),
+        serde_json::to_value(&conflict.natural_key).expect("natural keys are serializable"),
+    )]);
+    for (name, value) in [
+        ("table", conflict.table.clone()),
+        ("mutation_kind", conflict.mutation_kind.clone()),
+        ("reason", conflict.reason.clone()),
+        (
+            "winning_author_node_id",
+            conflict.winning_author_node_id.clone(),
+        ),
+    ] {
+        if let Some(value) = value {
+            fields.insert(name.to_string(), serde_json::Value::String(value));
+        }
+    }
+    if let Some(position) = conflict.hub_acceptance_position {
+        fields.insert(
+            "hub_acceptance_position".to_string(),
+            serde_json::Value::Number(position.0.into()),
+        );
+    }
+    serde_json::Value::Object(fields)
+}
+
+/// Human rendering uses the same complete document as JSON and bundled
+/// auto-sync, so no path can silently reduce a receipt to its reason string.
+pub fn render_sync_conflict(conflict: &Conflict) -> String {
+    sync_conflict_document(conflict).to_string()
+}
+
+#[cfg(test)]
+mod sync_conflict_tests {
+    use super::*;
+    use crate::sync_types::ConflictPolicy;
+    use crate::sync_types::NaturalKey;
+    use contextdb_core::{Lsn, Value};
+
+    #[test]
+    fn conflict_document_keeps_every_provenance_field() {
+        let conflict = Conflict {
+            natural_key: NaturalKey::single("id".to_string(), Value::Int64(7)),
+            resolution: ConflictPolicy::InsertIfNotExists,
+            reason: Some("keep_first".to_string()),
+            table: Some("camera_events".to_string()),
+            mutation_kind: Some("delete".to_string()),
+            winning_author_node_id: Some("ab".repeat(32)),
+            hub_acceptance_position: Some(Lsn(41)),
+        };
+
+        assert_eq!(
+            sync_conflict_document(&conflict),
+            serde_json::json!({
+                "natural_key": { "column": "id", "value": { "Int64": 7 }, "rest": [] },
+                "table": "camera_events",
+                "mutation_kind": "delete",
+                "reason": "keep_first",
+                "winning_author_node_id": "ab".repeat(32),
+                "hub_acceptance_position": 41,
+            })
+        );
+    }
+
+    #[test]
+    fn winnerless_document_does_not_invent_winner_fields() {
+        let conflict = Conflict {
+            natural_key: NaturalKey::single("id".to_string(), Value::Int64(7)),
+            resolution: ConflictPolicy::InsertIfNotExists,
+            reason: Some("purge_requires_authoritative_hub".to_string()),
+            table: Some("camera_events".to_string()),
+            mutation_kind: Some("purge".to_string()),
+            winning_author_node_id: None,
+            hub_acceptance_position: None,
+        };
+
+        let document = sync_conflict_document(&conflict);
+        assert!(document.get("winning_author_node_id").is_none());
+        assert!(document.get("hub_acceptance_position").is_none());
+    }
 }

@@ -44,6 +44,9 @@ raw_policy_apply = []
 raw_apply_changes = []
 raw_apply_changes_with_receipt = []
 role_relative_policy_types = []
+legacy_source_mutation = []
+raw_blob_repository_type = []
+raw_blob_repository_accessor = []
 
 [dependencies]
 contextdb-core = { path = "../../../../contextdb-core" }

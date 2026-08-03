@@ -1009,29 +1009,32 @@ fn t15_11_rejected_tx_produces_no_subscription_event() {
     let receiver = db.subscribe();
     let name = "alice".to_string();
 
-    let barrier = Arc::new(Barrier::new(3));
-    thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let barrier = Arc::clone(&barrier);
-            let name = name.clone();
-            handles.push(scope.spawn(move || {
-                barrier.wait();
-                db.execute(
-                    "INSERT INTO entities (id, name) VALUES ($id, $name)",
-                    &[
-                        ("id".to_string(), Value::Uuid(Uuid::new_v4())),
-                        ("name".to_string(), Value::Text(name)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )
-            }));
-        }
-        barrier.wait();
-        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_unique_collision_outcomes(&outcomes, 1, 1, "entities", "name");
-    });
+    let tx_a = db.begin_or_panic();
+    let tx_b = db.begin_or_panic();
+    for tx in [tx_a, tx_b] {
+        let staged = db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO entities (id, name) VALUES ($id, $name)",
+                &[
+                    ("id".to_string(), Value::Uuid(Uuid::new_v4())),
+                    ("name".to_string(), Value::Text(name.clone())),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        assert_eq!(staged.rows_affected, 1);
+    }
+    db.commit(tx_a).expect("first staged insert commits");
+    assert!(
+        matches!(
+            db.commit(tx_b),
+            Err(Error::UniqueViolation { table, column })
+                if table == "entities" && column == "name"
+        ),
+        "second staged insert must fail at commit-time unique revalidation"
+    );
 
     // Drain the subscriber. Commit events are published synchronously inside the
     // commit path, so after both writers have joined every event is already in

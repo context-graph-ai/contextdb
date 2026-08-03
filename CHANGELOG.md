@@ -4,10 +4,41 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
-- **Breaking.** Wire protocol version 5 → 6 in one bump: `WireRowChange` gains
-  `arrival` (the row's ordering position on the node that accepted it) and
-  `PullResponse` gains `source` (the serving store's per-tenant incarnation).
-  No other wire shape moves. A peer speaking a different protocol version is
+- **Breaking.** Sync policy and direction are now declared only in table DDL.
+  Callers must use `SYNC CONFLICT KEEP FIRST | KEEP LATEST` and
+  `SYNC OFF | PUSH ONLY | PULL ONLY | TWO WAY`, then call
+  `SyncClient::pull_default`/the ordinary initial-sync path. The public
+  in-memory policy maps, policy/direction setters, caller-supplied apply maps,
+  and arbitrary-transport constructors were removed; authenticated endpoint
+  construction remains the production path and transport injection is a
+  test-seam-only capability.
+- **Breaking.** Mutable `MemoryAccountant` attachment and raw accounting access
+  were removed from the public Database API. Use the durable
+  `Database::set_memory_limit` for live configuration. For a non-raisable
+  process-start ceiling, use
+  `contextdb_engine::database::open_with_startup_limits` or
+  `open_memory_with_startup_limit`; the CLI uses those numeric bootstrap
+  functions for `--memory-limit`/`--disk-limit`.
+- **Behavior change.** Distributed-work blob bytes now live in ContextDB's own
+  redb file instead of a separate upstream filesystem store. Authoritative
+  `PURGE` can therefore erase selected ledger lineage and unreferenced
+  engine-held blob copies in one commit. Success means no ContextDB
+  query/history/serve/export/resume/backup path can reach the bytes; it does
+  not promise forensic overwrite of filesystem journals, SSD remaps, or OS
+  snapshots.
+- **Added.** `contextdb snapshot export` publishes a transactionally consistent,
+  purge-fenced artifact, and `contextdb inspect key|blob|sync-apply-state` reads bounded durable
+  history, lineage, purge-frontier, media-generation, partial-transfer, and
+  addressability facts from a private disposable copy. Inspection never opens
+  or changes the supplied artifact and exposes no raw media bytes, tag names,
+  identity material, storage paths, database handle, or repository capability.
+- **Breaking.** Wire protocol version 5 → 6 completes the authenticated
+  ordering, schema, conflict-evidence, and purge shape in one bump:
+  `WireRowChange` gains `arrival`; `PullResponse` gains the serving-store
+  `source`; `WireChangeSet` gains authenticated `ddl_provenance` plus the
+  separate purge lane; `WireConflict` gains table, mutation kind, winning
+  author identity, and hub acceptance position; and `PushResponse` gains the
+  structured authority-refusal error. A peer speaking a different protocol version is
   refused loudly on push, pull, and the status exchange — no rows move and no
   watermark advances on either side — with a message naming the remedy
   (upgrade both ends). A mixed fleet simply stops syncing until every
@@ -91,20 +122,24 @@ Earlier versions: see git tags.
 - Boolean literals (`TRUE`/`FALSE`) are valid predicates everywhere a predicate is legal, including `JOIN ... ON TRUE`.
 - **Fixed.** The parser could abort the process on multi-byte UTF-8 near a keyword lookahead; it now parses or rejects, never panics.
 - The CLI accepts standard multi-line, semicolon-terminated SQL in both interactive and piped modes (statements end at `;` outside quotes and comments, or at end of piped input), so multi-line schema files and documentation examples run as pasted.
-- The manual `workflow_dispatch` trigger was added to CI, along with a compile-only check of the deprecated feature-gated broker suites, so the full gate can be run on demand against any branch.
+- The manual `workflow_dispatch` trigger was added to CI so the full gate can be run on demand against any branch.
 - Test-harness: acceptance and integration suites resolve the spawned CLI/server binary through one shared resolver that picks the most recently built profile (override with `CONTEXTDB_TEST_BIN_PROFILE`), so a stale binary can no longer produce false results.
 - CLI exit codes are now one documented four-value table honored by every binary (`docs/cli.md`, "Exit Codes"): `0` success, `1` error, `2` usage, `3` an interrupted push whose outcome the hub never confirmed.
 - **Behavior change.** Every error now goes to stderr and fails the run. Runtime errors (constraint violations, immutable-column writes, and the rest of the former "non-fatal" class) previously printed to stdout and left the exit code at `0`; a script branching on `$?` could not see them.
 - **Behavior change.** `.sync push`, `pull`, `reconnect`, `destination`, `direction` and `policy` now fail when the CLI was started without `--tenant-id`, instead of printing "Sync not configured" to stdout and exiting `0`. `.sync status` and `.sync auto` still answer and exit `0`.
-- **Behavior change.** An invalid flag value (`--memory-limit 12Q`), an incomplete flag combination (`--tenant-id` with no endpoint), and a ticket requested from a broker URL now exit `2` instead of `1`.
+- **Behavior change.** An invalid flag value (`--memory-limit 12Q`) and an incomplete flag combination (`--tenant-id` with no endpoint) now exit `2` instead of `1`.
 - **Behavior change.** The media-transfer demo's `scan-hub` now exits non-zero when it finds the marker it scans for (it printed `hub_marker_found=true` and exited `0`), and its local outcome-deviation code moved from `3` to `1`.
 - An interactive REPL session exits `0` even after errors, as `psql` and `sqlite3` do; an unconfirmed push still reports `3`.
 - `--json` now covers every meta-command: `.tables`, `.schema` (a structured table description including RETAIN/PROPAGATE/state-machine/sync policy, plus the exact DDL), `.explain`, `.trace`, and the whole `.sync` family. stdout under `--json` is JSON Lines.
 - Errors under `--json` are written to stderr as `{"error":{"class":...,"message":...}}`, where `class` is `sql`, `sync`, `io` or `usage`.
 - **Fixed.** `.trace on` wrote its per-statement trace line to stdout under `--json`, corrupting the JSON stream. Traces and `.help` now go to stderr under `--json`.
 - **Fixed.** `.explain` under `--json` executed the statement it was asked to explain, so `.explain DELETE FROM t` deleted the rows. A statement that would write is now planned without being run, as it already was in human mode; the document reports which of the two happened as `runtime_trace`.
-- **Behavior change.** `.schema`, `.sync direction` and `.sync policy` under `--json` now report a table's sync direction and conflict policy as declared words — `sync_off`/`push_only`/`pull_only`/`two_way` and `keep_first`/`keep_latest`/`server_wins`/`edge_wins` — instead of the Rust enum-variant spellings (`Push`, `LatestWins`) they leaked before. A consumer that matched on the old strings must move to the new ones, which are the DDL's own words and no longer change if a type is renamed.
-- The CLI binary's own failures — argument validation, opening the database, and every step of the shutdown sequence — now use the same `{"error":{...}}` envelope under `--json` as errors raised inside the REPL. Warnings that are not failures (a deprecated flag, an unreachable endpoint, a final push whose outcome is unconfirmed) arrive as `{"notice":{...}}`.
+- **Behavior change.** `.schema` and sync status under `--json` now report a
+  table's direction and conflict policy only as declared words —
+  `sync_off`/`push_only`/`pull_only`/`two_way` and
+  `keep_first`/`keep_latest` — instead of leaking Rust enum identifiers. A
+  consumer that matched on the old strings must move to the DDL vocabulary.
+- The CLI binary's own failures — argument validation, opening the database, and every step of the shutdown sequence — now use the same `{"error":{...}}` envelope under `--json` as errors raised inside the REPL. Warnings that are not failures (an unreachable endpoint or a final push whose outcome is unconfirmed) arrive as `{"notice":{...}}`.
 
 ## v1.1.0
 

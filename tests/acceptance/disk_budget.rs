@@ -1,9 +1,7 @@
 use super::common::*;
-#[cfg(feature = "nats-tests")]
 use contextdb_core::Value;
 use tempfile::TempDir;
 
-#[cfg(feature = "nats-tests")]
 fn seed_edge_big_table(edge_path: &std::path::Path, rows: usize) {
     let db = contextdb_engine::Database::open(edge_path).expect("open edge db");
     db.execute(
@@ -148,13 +146,12 @@ fn a_db5_file_backed_disk_limit_survives_restart() {
     );
 }
 
-#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
     let tmp = TempDir::new().expect("tempdir");
     let edge_path = temp_db_file(&tmp, "a_db6-edge.db");
     let server_path = temp_db_file(&tmp, "a_db6-server.db");
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     seed_edge_big_table(&edge_path, 64);
 
     let configured_limit_bytes = {
@@ -172,21 +169,17 @@ async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
             ]),
         )
         .expect("prime server row");
-        let limit_kib = (std::fs::metadata(&server_path).expect("metadata").len() / 1024).max(1);
-        let configured_limit_bytes = limit_kib * 1024;
-        db.execute(
-            &format!("SET DISK_LIMIT '{limit_kib}K'"),
-            &std::collections::HashMap::new(),
-        )
-        .expect("set server disk limit");
+        let configured_limit_bytes = 1024;
+        db.execute("SET DISK_LIMIT '1K'", &std::collections::HashMap::new())
+            .expect("set server disk limit");
         db.close().expect("close server db");
         configured_limit_bytes
     };
 
-    let mut server = spawn_server(&server_path, "a_db6", &nats.nats_url);
+    let mut server = spawn_server(&server_path, "a_db6", &sync.bind_spec);
     let output = run_cli_script_allow_startup_failure_with_timeout(
         &edge_path,
-        &["--tenant-id", "a_db6", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "a_db6", "--sync-endpoint", &sync.ticket],
         ".sync push\n.quit\n",
         std::time::Duration::from_secs(30),
     );
@@ -195,7 +188,11 @@ async fn a_db6_server_disk_limit_rejects_sync_push_clearly() {
     let stdout = output_string(&output.stdout).to_lowercase();
     let stderr = output_string(&output.stderr).to_lowercase();
     assert!(
-        stdout.contains("disk") || stdout.contains("budget") || stderr.contains("disk"),
+        !output.status.success(),
+        "disk-budget rejection must make the push exit nonzero; stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("disk budget exceeded") || stderr.contains("disk budget exceeded"),
         "failed sync push must report disk budget rejection; stdout={stdout}, stderr={stderr}"
     );
     assert_eq!(

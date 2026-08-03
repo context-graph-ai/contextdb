@@ -16,19 +16,26 @@ cargo test --workspace
 
 ## Before Submitting a PR
 
-All five checks must pass:
+All five checks must pass. The fifth installs the release binaries into an
+isolated root and drives the production ticketed-Iroh durability smoke; its
+feature-gated verifier is not part of the ordinary product CLI.
+The smoke uses Bash 3.2-compatible syntax and requires GNU `timeout`; macOS
+contributors can install it as `gtimeout` with `brew install coreutils`.
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release
-cargo check --workspace --tests --features contextdb-engine/nats-tests,contextdb-server/nats
+install_root="$(mktemp -d)"
+cargo install --locked --path crates/contextdb-cli --root "$install_root"
+cargo install --locked --path crates/contextdb-server --root "$install_root" \
+  --features production-smoke-driver --bins
+CONTEXTDB_CLI="$install_root/bin/contextdb" \
+CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" \
+CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
+  scripts/installed-release-durable-sync-smoke.sh
 ```
-
-The fifth step is compile-only — no Docker, no broker, seconds. The deprecated broker
-suites are feature-gated, so `cargo test --workspace` never builds them and an API change
-can break them with every other step still green.
 
 ## Crate Layout
 

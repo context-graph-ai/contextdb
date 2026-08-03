@@ -1,6 +1,7 @@
 use super::helpers::make_params;
-use contextdb_core::{Error, MemoryAccountant, Value};
+use contextdb_core::{Error, Value};
 use contextdb_engine::Database;
+use contextdb_engine::memory_accounting::MemoryAccountant;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;

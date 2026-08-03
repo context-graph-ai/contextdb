@@ -1,3 +1,6 @@
+use crate::blob_repository::{
+    BlobAuthoritativePurgeProjection, apply_authoritative_purge_in_write,
+};
 use crate::composite_store::{ChangeLogEntry, sync_source_lsn_updates};
 use crate::database::TriggerAuditEntry;
 use crate::database::event_bus::{EventBusPersistenceCommit, PreparedSinkEvent, SinkQueueEntry};
@@ -8,8 +11,12 @@ use contextdb_core::{
     Result, RowId, StateMachineConstraint, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
     VectorQuantization, VersionedRow, Wallclock,
 };
+use contextdb_relational::store::SyncSourceKind;
 use contextdb_tx::WriteSet;
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
+use redb::{
+    Key as RedbKey, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle, Value as RedbValue,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -27,6 +34,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// leave the no-op hook permanently installed.
 static HOOK_SWAP: Mutex<()> = Mutex::new(());
 
+/// Bound Redb's process-resident page cache independently of database size.
+/// Large blob payloads remain disk-backed instead of accumulating in Redb's
+/// one-GiB default cache.
+const REDB_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+fn redb_builder() -> redb::Builder {
+    let mut builder = redb::Builder::new();
+    builder.set_cache_size(REDB_CACHE_BYTES);
+    builder
+}
+
 thread_local! {
     /// Test-only injection seam: when armed, the NEXT [`RedbPersistence::
     /// compact`]'s post-compact handle recycle (close the redb handle, then
@@ -36,11 +54,29 @@ thread_local! {
     /// `arm_handle_recycle_reopen_fault_for_test`; default off, so
     /// production reads a thread-local that is never set.
     static HANDLE_RECYCLE_REOPEN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// One-shot failure immediately before the received-schema Redb commit.
+    /// It proves no private stage publishes memory when durability aborts.
+    static RECEIVED_SCHEMA_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot failure at the received-schema side-effect checkpoint. The
+    /// checkpoint is after the complete core image has been assembled in the
+    /// live Redb write transaction and immediately before sink-queue and
+    /// trigger-audit persistence; a failed checkpoint must leave all of that
+    /// one transaction uncommitted.
+    static RECEIVED_SCHEMA_SIDE_EFFECT_PERSISTENCE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// One-shot failure after an authoritative purge has staged every point
+    /// removal and lifecycle write, immediately before its sole Redb commit.
+    /// The write transaction must roll back every copy class together.
+    static AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Arm the one-shot test injection seam: the NEXT `compact()` call on THIS
 /// thread fails to reopen after closing the handle. Production-dead —
 /// nothing but a test calls it.
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn arm_handle_recycle_reopen_fault_for_test() {
     HANDLE_RECYCLE_REOPEN_FAULT.with(|f| f.set(true));
 }
@@ -49,6 +85,37 @@ pub(crate) fn arm_handle_recycle_reopen_fault_for_test() {
 /// never set outside a test, so the production path takes the `false` arm.
 fn take_handle_recycle_reopen_fault_for_test() -> bool {
     HANDLE_RECYCLE_REOPEN_FAULT.with(|f| f.replace(false))
+}
+
+#[cfg(test)]
+pub(crate) fn arm_received_schema_pre_commit_fault_for_test() {
+    RECEIVED_SCHEMA_PRE_COMMIT_FAULT.with(|fault| fault.set(true));
+}
+
+fn take_received_schema_pre_commit_fault_for_test() -> bool {
+    RECEIVED_SCHEMA_PRE_COMMIT_FAULT.with(|fault| fault.replace(false))
+}
+
+/// Arm the one-shot received-schema side-effect checkpoint fault for this
+/// test thread. This seam is absent from production builds.
+#[cfg(test)]
+pub(crate) fn arm_received_schema_side_effect_persistence_fault_for_test() {
+    RECEIVED_SCHEMA_SIDE_EFFECT_PERSISTENCE_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn take_received_schema_side_effect_persistence_fault_for_test() -> bool {
+    RECEIVED_SCHEMA_SIDE_EFFECT_PERSISTENCE_FAULT.with(|fault| fault.replace(false))
+}
+
+#[cfg(test)]
+pub(crate) fn arm_authoritative_purge_point_remove_persistence_failure_for_test() {
+    AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn take_authoritative_purge_point_remove_persistence_failure_for_test() -> bool {
+    AUTHORITATIVE_PURGE_PRE_COMMIT_FAULT.with(|fault| fault.replace(false))
 }
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -77,6 +144,14 @@ pub(crate) const CURRENT_FORMAT_VERSION: &str = "1.0.0";
 const TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY: &str = "__trigger_audit_next_index";
 const TRIGGER_AUDIT_RING_CONFIG_KEY: &str = "__trigger_audit_ring";
 
+fn sync_source_kind_to_u8(kind: SyncSourceKind) -> u8 {
+    match kind {
+        SyncSourceKind::Pulled => 0,
+        SyncSourceKind::AcceptedLocal => 1,
+        SyncSourceKind::AcceptedLocalPending => 2,
+    }
+}
+
 pub struct RedbPersistence {
     path: std::path::PathBuf,
     lock_file: Mutex<Option<File>>,
@@ -89,6 +164,52 @@ pub struct RedbPersistence {
     /// past it. Never set back to `false` — one legacy table is enough to
     /// mark the whole root.
     used_legacy_table_meta_layout: AtomicBool,
+}
+
+pub(crate) struct RawSyncApplyStateDigest {
+    pub(crate) digest: String,
+    pub(crate) trigger_audit_entries: u64,
+    pub(crate) sink_audit_entries: u64,
+    pub(crate) sink_queue_entries: u64,
+}
+
+fn digest_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn digest_redb_table<K: RedbKey + 'static, V: RedbValue + 'static>(
+    read_txn: &redb::ReadTransaction,
+    definition: TableDefinition<K, V>,
+    label: &str,
+    hasher: &mut blake3::Hasher,
+) -> Result<u64> {
+    digest_field(hasher, label.as_bytes());
+    let table = match read_txn.open_table(definition) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(err) => {
+            return Err(Error::Other(format!(
+                "snapshot digest table open failed: {err}"
+            )));
+        }
+    };
+    let mut count = 0_u64;
+    for entry in table
+        .iter()
+        .map_err(|err| Error::Other(format!("snapshot digest table iteration failed: {err}")))?
+    {
+        let (key, value) = entry
+            .map_err(|err| Error::Other(format!("snapshot digest entry read failed: {err}")))?;
+        let key_value = key.value();
+        let value_value = value.value();
+        let key_bytes = K::as_bytes(&key_value);
+        let value_bytes = V::as_bytes(&value_value);
+        digest_field(hasher, key_bytes.as_ref());
+        digest_field(hasher, value_bytes.as_ref());
+        count = count.saturating_add(1);
+    }
+    Ok(count)
 }
 
 /// Point-removed key counts from one scoped prune pass — real integer
@@ -121,6 +242,46 @@ pub(crate) struct FlushDataOptions<'a> {
     pub(crate) schema_ddl: SchemaDdlPersistence<'a>,
     pub(crate) max_sink_queue_depth: usize,
     pub(crate) snapshots: FlushDataSnapshots,
+    /// A complete prepared received-schema image. When present, it replaces
+    /// the ordinary incremental Redb writes in this same transaction; memory
+    /// publication remains the transaction manager's after-apply work.
+    pub(crate) received_schema: Option<&'a ReceivedSchemaPersistenceProjection>,
+}
+
+/// The durable half of a private received-schema stage. It is fully owned and
+/// encoded before Redb begins its write transaction, so persistence cannot
+/// regroup source DDL or consult live schema state while committing it.
+pub(crate) struct ReceivedSchemaPersistenceProjection {
+    pub(crate) table_meta: HashMap<String, TableMeta>,
+    pub(crate) rows: HashMap<String, Vec<VersionedRow>>,
+    pub(crate) sync_sources: Vec<(String, RowId, Lsn, SyncSourceKind)>,
+    pub(crate) edges: Vec<AdjEntry>,
+    pub(crate) vectors: Vec<VectorEntry>,
+    pub(crate) ddl_log: Vec<(Lsn, DdlChange)>,
+    pub(crate) config_values: Vec<(String, Vec<u8>)>,
+    pub(crate) config_max_u64_keys: Vec<String>,
+    /// A received DROP TABLE retires this generation's data history. Its
+    /// row/vector entries must leave the durable log in the same transaction
+    /// that installs the replacement schema image.
+    pub(crate) structurally_dropped_tables: HashSet<String>,
+}
+
+/// Fully prepared, crate-private durable mutation for one authoritative
+/// purge.  It contains only persistence-owned/public value types: database
+/// lineage structs are encoded by the caller before Redb starts its write
+/// transaction.  The point identities keep the storage layer from reading or
+/// rediscovering mutable database state while it commits.
+pub(crate) struct AuthoritativePurgePersistenceProjection {
+    pub(crate) row_versions: Vec<(String, RowId, TxId, Lsn)>,
+    pub(crate) source_provenance: Vec<(String, RowId, Lsn, u8)>,
+    pub(crate) vectors: Vec<VectorEntry>,
+    pub(crate) graph_entries: Vec<AdjEntry>,
+    pub(crate) sink_entries: Vec<(String, u64, Vec<u8>)>,
+    pub(crate) change_log_entries: Vec<ChangeLogEntry>,
+    pub(crate) config_keys_removed: Vec<String>,
+    pub(crate) lifecycle_records: Vec<(String, Vec<u8>)>,
+    pub(crate) purge_delivery_items: Vec<(String, Vec<u8>)>,
+    pub(crate) blob_purge: BlobAuthoritativePurgeProjection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,7 +576,7 @@ impl RedbPersistence {
         // `create` opens the file in place when it already exists, so it can hit
         // the same corrupt-file redb panic as `open` — guard it identically so
         // no open-time backtrace leaks to stderr.
-        let created = Self::open_hook_suppressed(|| redb::Database::create(path));
+        let created = Self::open_hook_suppressed(|| redb_builder().create(path));
         let create_result = match created {
             Ok(inner) => inner.map_err(|err| Self::storage_open_error(path, &lock_file, err)),
             Err(_) => Err(Error::StoreCorrupted {
@@ -524,7 +685,7 @@ impl RedbPersistence {
         // page_manager assertion (a panic, not a clean `Err`) on the
         // READ-ONLY path too, and this call must never let that raw panic
         // (or its backtrace) escape to `repair`/`migrate`'s caller.
-        let opened = Self::open_hook_suppressed(|| redb::ReadOnlyDatabase::open(path));
+        let opened = Self::open_hook_suppressed(|| redb_builder().open_read_only(path));
         let ro = match opened {
             Ok(Ok(db)) => db,
             Ok(Err(err)) => return Err(Self::storage_error(err)),
@@ -656,7 +817,7 @@ impl RedbPersistence {
     }
 
     fn open_db_checked(path: &Path, lock_file: &File) -> Result<redb::Database> {
-        let opened = Self::open_hook_suppressed(|| redb::Database::open(path));
+        let opened = Self::open_hook_suppressed(|| redb_builder().open(path));
         match opened {
             Ok(Ok(db)) => Ok(db),
             Ok(Err(err)) if err.to_string().contains("already open") => {
@@ -770,6 +931,7 @@ impl RedbPersistence {
                 },
                 max_sink_queue_depth: usize::MAX,
                 snapshots: FlushDataSnapshots::default(),
+                received_schema: None,
             },
         )
     }
@@ -789,6 +951,16 @@ impl RedbPersistence {
         let trigger_audits = options.trigger_audits;
         let schema_ddl = options.schema_ddl;
         let max_sink_queue_depth = options.max_sink_queue_depth;
+        if let Some(received_schema) = options.received_schema {
+            return self.flush_received_schema_stage(
+                ws,
+                change_log,
+                received_schema,
+                sink_events,
+                trigger_audits,
+                max_sink_queue_depth,
+            );
+        }
         let has_vector_changes = !ws.vector_deletes.is_empty()
             || !ws.vector_inserts.is_empty()
             || !ws.vector_moves.is_empty();
@@ -1213,14 +1385,14 @@ impl RedbPersistence {
                     if let Some(event_bus_ddl) = schema_ddl.event_bus {
                         for (key, encoded) in &event_bus_ddl.config_values {
                             config_table
-                                .insert(*key, encoded.as_slice())
+                                .insert(key.as_str(), encoded.as_slice())
                                 .map_err(Self::storage_error)?;
                         }
                     }
                     if let Some(trigger_ddl) = schema_ddl.trigger {
                         for (key, encoded) in &trigger_ddl.config_values {
                             config_table
-                                .insert(*key, encoded.as_slice())
+                                .insert(key.as_str(), encoded.as_slice())
                                 .map_err(Self::storage_error)?;
                         }
                     }
@@ -1278,6 +1450,396 @@ impl RedbPersistence {
             Ok(())
         })
     }
+
+    /// Commit a complete received-schema projection in the transaction that
+    /// also records its finalized WriteSet identity.  The normal incremental
+    /// writer cannot be used here: a DROP or same-name recreation needs the
+    /// durable image to become the prepared full replacement atomically.
+    fn flush_received_schema_stage(
+        &self,
+        ws: &WriteSet,
+        change_log: &[ChangeLogEntry],
+        stage: &ReceivedSchemaPersistenceProjection,
+        sink_events: &[PreparedSinkEvent],
+        trigger_audits: &[(u64, TriggerAuditEntry)],
+        max_sink_queue_depth: usize,
+    ) -> Result<()> {
+        let prior_tables = self.load_all_table_meta()?;
+        let vector_quantization = Self::vector_quantization_map(&stage.table_meta);
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                for table in prior_tables.keys() {
+                    let key = Self::meta_key(table);
+                    meta_table
+                        .remove(key.as_str())
+                        .map_err(Self::storage_error)?;
+                }
+                for (table, meta) in &stage.table_meta {
+                    let key = Self::meta_key(table);
+                    let encoded = Self::encode(meta)?;
+                    meta_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            let mut relational_tables = prior_tables
+                .keys()
+                .chain(stage.table_meta.keys())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            relational_tables.sort();
+            relational_tables.dedup();
+            for table in relational_tables {
+                let table_name = Self::rel_table_name(&table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                match write_txn.delete_table(table_def) {
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                    Err(error) => return Err(Self::storage_error(error)),
+                }
+                let legacy_table_def: TableDefinition<u64, &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                match write_txn.delete_table(legacy_table_def) {
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(redb::TableError::TableTypeMismatch { .. }) => {}
+                    Err(error) => return Err(Self::storage_error(error)),
+                }
+            }
+            for (table, rows) in &stage.rows {
+                let table_name = Self::rel_table_name(table);
+                let table_def: TableDefinition<&[u8], &[u8]> =
+                    TableDefinition::new(table_name.as_str());
+                let mut redb_table = write_txn
+                    .open_table(table_def)
+                    .map_err(Self::storage_error)?;
+                for row in rows {
+                    let encoded = Self::encode_versioned_row(row, stage.table_meta.get(table))?;
+                    let key = Self::rel_row_key(row);
+                    redb_table
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            let _ = write_txn.delete_table(SYNC_ROW_SOURCE_LSN_TABLE);
+            let _ = write_txn.delete_table(SYNC_ROW_SOURCE_KIND_TABLE);
+            {
+                let mut lsn_table = write_txn
+                    .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut kind_table = write_txn
+                    .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, row_id, lsn, kind) in &stage.sync_sources {
+                    let key = Self::sync_row_source_lsn_key(table, *row_id);
+                    lsn_table
+                        .insert(key.as_slice(), lsn.0)
+                        .map_err(Self::storage_error)?;
+                    kind_table
+                        .insert(key.as_slice(), sync_source_kind_to_u8(*kind))
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            let _ = write_txn.delete_table(GRAPH_FWD_TABLE);
+            let _ = write_txn.delete_table(GRAPH_REV_TABLE);
+            {
+                let mut fwd = write_txn
+                    .open_table(GRAPH_FWD_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut rev = write_txn
+                    .open_table(GRAPH_REV_TABLE)
+                    .map_err(Self::storage_error)?;
+                for edge in &stage.edges {
+                    let encoded = Self::encode(edge)?;
+                    let fwd_key = Self::graph_fwd_key(edge);
+                    let rev_key = Self::graph_rev_key(edge);
+                    fwd.insert(fwd_key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                    rev.insert(rev_key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            let _ = write_txn.delete_table(VECTORS_TABLE);
+            {
+                let mut vectors = write_txn
+                    .open_table(VECTORS_TABLE)
+                    .map_err(Self::storage_error)?;
+                for entry in &stage.vectors {
+                    let quantization = vector_quantization
+                        .get(&entry.index)
+                        .copied()
+                        .unwrap_or_default();
+                    let encoded = Self::encode_vector_entry(entry, quantization)?;
+                    let key = Self::vector_key(entry);
+                    vectors
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+
+            let _ = write_txn.delete_table(DDL_LOG_TABLE);
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut grouped = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
+                for (lsn, ddl) in &stage.ddl_log {
+                    grouped.entry(*lsn).or_default().push(ddl);
+                }
+                for (lsn, ddl) in grouped {
+                    for (index, change) in ddl.iter().enumerate() {
+                        let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                        let encoded = Self::encode(*change)?;
+                        ddl_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+
+            if let (Some(lsn), Some(tx)) = (ws.commit_lsn, Self::write_set_visibility_tx(ws)) {
+                let mut index = write_txn
+                    .open_table(COMMIT_INDEX_TABLE)
+                    .map_err(Self::storage_error)?;
+                index.insert(lsn.0, tx.0).map_err(Self::storage_error)?;
+            }
+            if !stage.structurally_dropped_tables.is_empty() {
+                // Decode first and point-remove second: Redb does not permit
+                // mutating the table while its iterator holds value borrows.
+                // Both phases remain inside this received-schema write
+                // transaction, so a later failure cannot leave a new schema
+                // image paired with old-generation change history.
+                let retired_keys = {
+                    let log = write_txn
+                        .open_table(CHANGE_LOG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut retired_keys = Vec::new();
+                    for item in log.iter().map_err(Self::storage_error)? {
+                        let (key, value) = item.map_err(Self::storage_error)?;
+                        let entry = Self::decode::<ChangeLogEntry>(value.value())?;
+                        if Self::change_log_entry_references_any_table(
+                            &entry,
+                            &stage.structurally_dropped_tables,
+                        ) {
+                            retired_keys.push(key.value().to_string());
+                        }
+                    }
+                    retired_keys
+                };
+                if !retired_keys.is_empty() {
+                    let mut log = write_txn
+                        .open_table(CHANGE_LOG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for key in retired_keys {
+                        log.remove(key.as_str()).map_err(Self::storage_error)?;
+                    }
+                }
+            }
+            if !change_log.is_empty() {
+                let mut log = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut key = String::with_capacity(Self::change_log_entry_key_len());
+                let mut encoded = Vec::new();
+                for (index, entry) in change_log.iter().enumerate() {
+                    Self::write_change_log_entry_key(lsn, index, &mut key);
+                    Self::encode_into(entry, &mut encoded)?;
+                    log.insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            {
+                let mut config = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, value) in &stage.config_values {
+                    let value = if stage
+                        .config_max_u64_keys
+                        .iter()
+                        .any(|max_key| max_key == key)
+                    {
+                        let incoming = Self::decode::<u64>(value)?;
+                        let current = config
+                            .get(key.as_str())
+                            .map_err(Self::storage_error)?
+                            .map(|value| Self::decode::<u64>(value.value()))
+                            .transpose()?
+                            .unwrap_or(0);
+                        Self::encode(&current.max(incoming))?
+                    } else {
+                        value.clone()
+                    };
+                    config
+                        .insert(key.as_str(), value.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            // The complete received-schema core image now exists only inside
+            // this live Redb transaction. Sink queues and trigger audits for
+            // received rows belong immediately below this checkpoint and must
+            // commit with that image, never in a later transaction.
+            #[cfg(test)]
+            if take_received_schema_side_effect_persistence_fault_for_test() {
+                return Err(Error::Other(
+                    "injected received-schema side-effect persistence failure".to_string(),
+                ));
+            }
+            if !sink_events.is_empty() {
+                let lsn = ws.commit_lsn.unwrap_or(Lsn(0));
+                let mut overflow_audits = Vec::new();
+                let mut by_sink: BTreeMap<&str, Vec<(usize, &SinkQueueEntry)>> = BTreeMap::new();
+                for (index, (sink, entry)) in sink_events.iter().enumerate() {
+                    by_sink
+                        .entry(sink.as_str())
+                        .or_default()
+                        .push((index, entry));
+                }
+                for (sink, entries) in by_sink {
+                    let table_name = Self::sink_queue_table_name(sink);
+                    let table_def: TableDefinition<u64, &[u8]> =
+                        TableDefinition::new(table_name.as_str());
+                    let mut table = write_txn
+                        .open_table(table_def)
+                        .map_err(Self::storage_error)?;
+                    let mut existing = table.len().map_err(Self::storage_error)? as usize;
+                    for (index, entry) in entries {
+                        let overflow_id = if existing >= max_sink_queue_depth {
+                            table
+                                .first()
+                                .map_err(Self::storage_error)?
+                                .map(|(key, _)| key.value())
+                        } else {
+                            None
+                        };
+                        if let Some(id) = overflow_id {
+                            table.remove(id).map_err(Self::storage_error)?;
+                            existing = existing.saturating_sub(1);
+                            overflow_audits.push((index, sink.to_string()));
+                        }
+                        let encoded = Self::encode(entry)?;
+                        table
+                            .insert(entry.id, encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        existing = existing.saturating_add(1);
+                    }
+                }
+                if !overflow_audits.is_empty() {
+                    let mut audit_table = write_txn
+                        .open_table(SINK_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    for (index, sink) in overflow_audits {
+                        let key = Self::sink_audit_key(lsn, index, &sink);
+                        let audit = SinkAuditEntry {
+                            lsn,
+                            kind: SinkAuditKind::QueueOverflow {
+                                sink,
+                                dropped_count: 1,
+                            },
+                        };
+                        let encoded = Self::encode(&audit)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+            if !trigger_audits.is_empty() {
+                {
+                    let mut audit_table = write_txn
+                        .open_table(TRIGGER_AUDIT_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut stamps = write_txn
+                        .open_table(TRIGGER_AUDIT_STAMPS_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let stamped_at = Wallclock::now().0;
+                    for (index, entry) in trigger_audits {
+                        let key = Self::trigger_audit_key(*index, &entry.trigger_name);
+                        let encoded = Self::encode(entry)?;
+                        audit_table
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(Self::storage_error)?;
+                        stamps
+                            .insert(key.as_str(), stamped_at)
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+                {
+                    let mut config_table = write_txn
+                        .open_table(CONFIG_TABLE)
+                        .map_err(Self::storage_error)?;
+                    let mut ring: Vec<TriggerAuditEntry> = config_table
+                        .get(TRIGGER_AUDIT_RING_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode(value.value()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    ring.extend(trigger_audits.iter().map(|(_, entry)| entry.clone()));
+                    let overflow = ring
+                        .len()
+                        .saturating_sub(crate::database::trigger::TRIGGER_AUDIT_RING_CAPACITY);
+                    if overflow > 0 {
+                        ring.drain(0..overflow);
+                    }
+                    let current_next_index = config_table
+                        .get(TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY)
+                        .map_err(Self::storage_error)?
+                        .map(|value| Self::decode::<u64>(value.value()))
+                        .transpose()?
+                        .unwrap_or(0);
+                    let next_index = trigger_audits
+                        .iter()
+                        .map(|(index, _)| index.saturating_add(1))
+                        .max()
+                        .unwrap_or(0)
+                        .max(current_next_index);
+                    let encoded_ring = Self::encode(&ring)?;
+                    config_table
+                        .insert(TRIGGER_AUDIT_RING_CONFIG_KEY, encoded_ring.as_slice())
+                        .map_err(Self::storage_error)?;
+                    let encoded_next_index = Self::encode(&next_index)?;
+                    config_table
+                        .insert(
+                            TRIGGER_AUDIT_NEXT_INDEX_CONFIG_KEY,
+                            encoded_next_index.as_slice(),
+                        )
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            if take_received_schema_pre_commit_fault_for_test() {
+                return Err(Error::Other(
+                    "injected received-schema Redb pre-commit failure".to_string(),
+                ));
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    fn change_log_entry_references_any_table(
+        entry: &ChangeLogEntry,
+        tables: &HashSet<String>,
+    ) -> bool {
+        match entry {
+            ChangeLogEntry::RowInsert { table, .. } | ChangeLogEntry::RowDelete { table, .. } => {
+                tables.contains(table)
+            }
+            ChangeLogEntry::VectorInsert { index, .. }
+            | ChangeLogEntry::VectorDelete { index, .. } => tables.contains(&index.table),
+            ChangeLogEntry::EdgeInsert { .. } | ChangeLogEntry::EdgeDelete { .. } => false,
+        }
+    }
     pub fn flush_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().map_err(Self::storage_error)?;
@@ -1288,6 +1850,55 @@ impl RedbPersistence {
                 let key = Self::meta_key(name);
                 let encoded = Self::encode(meta)?;
                 meta_table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
+    }
+
+    /// Durable CREATE TABLE foundation: the table declaration, its one
+    /// authoritative schema generation, immutable DDL provenance, and the
+    /// matching DDL log entry must become visible together. This prevents
+    /// CREATE from retaining the former meta-then-log crash window.
+    pub fn flush_table_meta_with_config_values_and_append_ddl_log(
+        &self,
+        name: &str,
+        meta: &TableMeta,
+        config_values: Vec<(&str, Vec<u8>)>,
+        lsn: Lsn,
+        ddl: &DdlChange,
+    ) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut meta_table = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::meta_key(name);
+                let encoded = Self::encode(meta)?;
+                meta_table
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(Self::storage_error)?;
+            }
+            {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            {
+                let mut ddl_table = write_txn
+                    .open_table(DDL_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let key = Self::ddl_log_key(lsn);
+                let encoded = Self::encode(ddl)?;
+                ddl_table
                     .insert(key.as_str(), encoded.as_slice())
                     .map_err(Self::storage_error)?;
             }
@@ -1332,6 +1943,19 @@ impl RedbPersistence {
 
     pub(crate) fn encode_config_value<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
         Self::encode(value)
+    }
+
+    pub(crate) fn decode_config_value<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+        Self::decode(bytes)
+    }
+
+    /// Strict config decode for callers whose durable bytes are themselves an
+    /// authority boundary. Unlike the compatibility decoder above, a valid
+    /// prefix followed by stray bytes is corrupt rather than silently accepted.
+    pub(crate) fn decode_config_value_exact<T: serde::de::DeserializeOwned>(
+        bytes: &[u8],
+    ) -> Result<T> {
+        Self::decode_exact(bytes)
     }
 
     pub fn flush_encoded_config_values_and_append_ddl_log(
@@ -1826,6 +2450,10 @@ impl RedbPersistence {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one schema rewrite transaction must replace metadata, rows, vectors, config, and its DDL log together"
+    )]
     pub fn rewrite_table_meta_rows_vectors_and_append_ddl_log(
         &self,
         name: &str,
@@ -1833,7 +2461,8 @@ impl RedbPersistence {
         rows: &[VersionedRow],
         vectors: &[VectorEntry],
         lsn: Lsn,
-        ddl: &DdlChange,
+        ddl: &[DdlChange],
+        config_values: Vec<(&str, Vec<u8>)>,
     ) -> Result<()> {
         let mut table_meta = self.load_all_table_meta()?;
         table_meta.insert(name.to_string(), meta.clone());
@@ -1888,14 +2517,26 @@ impl RedbPersistence {
                 }
             }
             {
+                let mut config_table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, encoded) in config_values {
+                    config_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            {
                 let mut ddl_table = write_txn
                     .open_table(DDL_LOG_TABLE)
                     .map_err(Self::storage_error)?;
-                let key = Self::ddl_log_key(lsn);
-                let encoded = Self::encode(ddl)?;
-                ddl_table
-                    .insert(key.as_str(), encoded.as_slice())
-                    .map_err(Self::storage_error)?;
+                for (index, change) in ddl.iter().enumerate() {
+                    let key = Self::ddl_log_key_for_index(lsn, index, ddl.len());
+                    let encoded = Self::encode(change)?;
+                    ddl_table
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
             }
             write_txn.commit().map_err(Self::storage_error)?;
             Ok(())
@@ -1980,6 +2621,33 @@ impl RedbPersistence {
                     break;
                 }
                 out.push((key.to_string(), Self::decode(value.value())?));
+            }
+            Ok(out)
+        })
+    }
+
+    /// Every raw config value whose key starts with `prefix`, in key order.
+    /// Callers that treat the stored bytes as an authority boundary can apply
+    /// their own exact decoder without broadening generic config compatibility.
+    pub(crate) fn load_config_values_raw_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let config_table = match read_txn.open_table(CONFIG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let mut out = Vec::new();
+            for entry in config_table.range(prefix..).map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                let key = key.value();
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                out.push((key.to_string(), value.value().to_vec()));
             }
             Ok(out)
         })
@@ -2658,6 +3326,216 @@ impl RedbPersistence {
         })
     }
 
+    /// Apply the durable half of one authoritative purge in exactly one Redb
+    /// write transaction.  This is deliberately not composed from scoped
+    /// pruning helpers: the permanent lifecycle record must become durable
+    /// atomically with every selected copy's disappearance.
+    pub(crate) fn commit_authoritative_purge(
+        &self,
+        projection: &AuthoritativePurgePersistenceProjection,
+    ) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+
+            // A selected change-log occurrence is identified by its full
+            // value inside its LSN group.  Read and re-densify only touched
+            // groups so earlier scoped maintenance cannot leave an orphaned
+            // or mis-indexed survivor.
+            let mut selected_by_lsn = BTreeMap::<Lsn, Vec<ChangeLogEntry>>::new();
+            for entry in &projection.change_log_entries {
+                selected_by_lsn
+                    .entry(entry.lsn())
+                    .or_default()
+                    .push(entry.clone());
+            }
+            if !selected_by_lsn.is_empty() {
+                let mut table = write_txn
+                    .open_table(CHANGE_LOG_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut key_buf = String::with_capacity(Self::change_log_entry_key_len());
+                for (lsn, mut witnesses) in selected_by_lsn {
+                    let prefix = format!("{:020}:", lsn.0);
+                    let existing = {
+                        let mut entries = Vec::new();
+                        for entry in table
+                            .range(prefix.as_str()..)
+                            .map_err(Self::storage_error)?
+                        {
+                            let (key, value) = entry.map_err(Self::storage_error)?;
+                            if !key.value().starts_with(prefix.as_str()) {
+                                break;
+                            }
+                            entries.push((key.value().to_string(), value.value().to_vec()));
+                        }
+                        entries
+                    };
+                    let mut survivors = Vec::with_capacity(existing.len());
+                    for (key, bytes) in existing {
+                        let decoded: ChangeLogEntry = Self::decode(&bytes)?;
+                        if let Some(position) = witnesses.iter().position(|wanted| *wanted == decoded)
+                        {
+                            witnesses.remove(position);
+                        } else {
+                            survivors.push(bytes);
+                        }
+                        table.remove(key.as_str()).map_err(Self::storage_error)?;
+                    }
+                    if !witnesses.is_empty() {
+                        return Err(Error::SyncError(
+                            "authoritative purge change-log witness is missing from its LSN group"
+                                .to_string(),
+                        ));
+                    }
+                    for (index, bytes) in survivors.into_iter().enumerate() {
+                        Self::write_change_log_entry_key(lsn, index, &mut key_buf);
+                        table
+                            .insert(key_buf.as_str(), bytes.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                }
+            }
+
+            let mut relational_tables: HashMap<String, redb::Table<'_, &[u8], &[u8]>> =
+                HashMap::new();
+            for (table, row_id, created_tx, lsn) in &projection.row_versions {
+                if !relational_tables.contains_key(table) {
+                    let name = Self::rel_table_name(table);
+                    let definition: TableDefinition<&[u8], &[u8]> =
+                        TableDefinition::new(name.as_str());
+                    relational_tables.insert(
+                        table.clone(),
+                        write_txn.open_table(definition).map_err(Self::storage_error)?,
+                    );
+                }
+                let key = Self::rel_row_key_from_parts(*row_id, *created_tx, *lsn);
+                let removed = relational_tables
+                    .get_mut(table)
+                    .expect("opened relational table")
+                    .remove(key.as_slice())
+                    .map_err(Self::storage_error)?;
+                if removed.is_none() {
+                    return Err(Error::SyncError(
+                        "authoritative purge selected relational version disappeared before durable commit"
+                            .to_string(),
+                    ));
+                }
+            }
+            drop(relational_tables);
+
+            if !projection.source_provenance.is_empty() {
+                let mut lsns = write_txn
+                    .open_table(SYNC_ROW_SOURCE_LSN_TABLE)
+                    .map_err(Self::storage_error)?;
+                let mut kinds = write_txn
+                    .open_table(SYNC_ROW_SOURCE_KIND_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, row_id, expected_lsn, expected_kind) in &projection.source_provenance {
+                    let key = Self::sync_row_source_lsn_key(table, *row_id);
+                    let lsn = lsns
+                        .get(key.as_slice())
+                        .map_err(Self::storage_error)?
+                        .map(|value| value.value());
+                    let kind = kinds
+                        .get(key.as_slice())
+                        .map_err(Self::storage_error)?
+                        .map(|value| value.value());
+                    if lsn != Some(expected_lsn.0) || kind != Some(*expected_kind) {
+                        return Err(Error::SyncError(
+                            "authoritative purge source-provenance witness changed before durable commit"
+                                .to_string(),
+                        ));
+                    }
+                    lsns.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    kinds.remove(key.as_slice()).map_err(Self::storage_error)?;
+                }
+            }
+
+            if !projection.vectors.is_empty() {
+                let mut vectors = write_txn.open_table(VECTORS_TABLE).map_err(Self::storage_error)?;
+                for entry in &projection.vectors {
+                    let key = Self::vector_key(entry);
+                    let removed = vectors.remove(key.as_slice()).map_err(Self::storage_error)?;
+                    if removed.is_none() {
+                        return Err(Error::SyncError(
+                            "authoritative purge selected vector occurrence disappeared before durable commit"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if !projection.graph_entries.is_empty() {
+                let mut forward = write_txn.open_table(GRAPH_FWD_TABLE).map_err(Self::storage_error)?;
+                let mut reverse = write_txn.open_table(GRAPH_REV_TABLE).map_err(Self::storage_error)?;
+                for entry in &projection.graph_entries {
+                    let forward_key = Self::graph_fwd_key(entry);
+                    let reverse_key = Self::graph_rev_key(entry);
+                    let removed_forward = forward
+                        .remove(forward_key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    let removed_reverse = reverse
+                        .remove(reverse_key.as_slice())
+                        .map_err(Self::storage_error)?;
+                    if removed_forward.is_none() || removed_reverse.is_none() {
+                        return Err(Error::SyncError(
+                            "authoritative purge selected graph occurrence disappeared before durable commit"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            for (sink, queue_id, expected_bytes) in &projection.sink_entries {
+                let name = Self::sink_queue_table_name(sink);
+                let definition: TableDefinition<u64, &[u8]> = TableDefinition::new(name.as_str());
+                let mut queue = write_txn.open_table(definition).map_err(Self::storage_error)?;
+                let bytes = queue
+                    .get(*queue_id)
+                    .map_err(Self::storage_error)?
+                    .map(|value| value.value().to_vec());
+                if bytes.as_deref() != Some(expected_bytes.as_slice()) {
+                    return Err(Error::SyncError(
+                        "authoritative purge selected sink occurrence disappeared before durable commit"
+                            .to_string(),
+                    ));
+                }
+                queue.remove(*queue_id).map_err(Self::storage_error)?;
+            }
+
+            {
+                let mut config = write_txn.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
+                for key in &projection.config_keys_removed {
+                    config.remove(key.as_str()).map_err(Self::storage_error)?;
+                }
+                for (key, bytes) in &projection.lifecycle_records {
+                    config
+                        .insert(key.as_str(), bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                }
+                for (key, bytes) in &projection.purge_delivery_items {
+                    let previous = config
+                        .insert(key.as_str(), bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                    if previous.is_some() {
+                        return Err(Error::SyncError(format!(
+                            "authoritative purge delivery journal collision at {key}"
+                        )));
+                    }
+                }
+            }
+
+            apply_authoritative_purge_in_write(&write_txn, &projection.blob_purge)?;
+
+            #[cfg(test)]
+            if take_authoritative_purge_point_remove_persistence_failure_for_test() {
+                return Err(Error::Other(
+                    "authoritative purge point-remove persistence failure injected".to_string(),
+                ));
+            }
+            write_txn.commit().map_err(Self::storage_error)
+        })
+    }
+
     /// Remove exactly the named vectors and edges, in ONE redb write
     /// transaction. Used by the retention pass when pruned rows carried
     /// vectors or graph nodes, and by version cleanup ONLY for the vector
@@ -2807,7 +3685,7 @@ impl RedbPersistence {
                 reason: "injected reopen failure (test seam)".to_string(),
             });
         }
-        let reopened = Self::open_hook_suppressed(|| redb::Database::open(&self.path));
+        let reopened = Self::open_hook_suppressed(|| redb_builder().open(&self.path));
         match reopened {
             Ok(Ok(fresh)) => {
                 *db_guard = Some(fresh);
@@ -2858,8 +3736,107 @@ impl RedbPersistence {
         self.dump_str_keyed_table_raw(CONFIG_TABLE)
     }
 
+    /// Exact byte fingerprint of every Redb table an authenticated schema or
+    /// data apply can mutate. This hashes persisted vector encodings and sync
+    /// arbitration sidecars directly rather than their lossy/in-memory
+    /// projections. Dynamic relational and sink-queue table names are part of
+    /// the digest, so creating or removing an empty table is still visible.
+    pub(crate) fn raw_sync_apply_state_digest(&self) -> Result<RawSyncApplyStateDigest> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let mut hasher = blake3::Hasher::new();
+            digest_field(&mut hasher, b"contextdb.raw-sync-apply-state.v1");
+
+            digest_redb_table(&read_txn, META_TABLE, "meta", &mut hasher)?;
+            digest_redb_table(
+                &read_txn,
+                FORMAT_METADATA_TABLE,
+                "format-metadata",
+                &mut hasher,
+            )?;
+            digest_redb_table(&read_txn, CONFIG_TABLE, "config", &mut hasher)?;
+            digest_redb_table(&read_txn, CHANGE_LOG_TABLE, "change-log", &mut hasher)?;
+            digest_redb_table(&read_txn, DDL_LOG_TABLE, "ddl-log", &mut hasher)?;
+            digest_redb_table(&read_txn, COMMIT_INDEX_TABLE, "commit-index", &mut hasher)?;
+            let sink_audit_entries =
+                digest_redb_table(&read_txn, SINK_AUDIT_TABLE, "sink-audit", &mut hasher)?;
+            let trigger_audit_entries =
+                digest_redb_table(&read_txn, TRIGGER_AUDIT_TABLE, "trigger-audit", &mut hasher)?;
+            digest_redb_table(
+                &read_txn,
+                TRIGGER_AUDIT_STAMPS_TABLE,
+                "trigger-audit-stamps",
+                &mut hasher,
+            )?;
+            digest_redb_table(&read_txn, GRAPH_FWD_TABLE, "graph-forward", &mut hasher)?;
+            digest_redb_table(&read_txn, GRAPH_REV_TABLE, "graph-reverse", &mut hasher)?;
+            digest_redb_table(&read_txn, VECTORS_TABLE, "vectors", &mut hasher)?;
+            digest_redb_table(
+                &read_txn,
+                SYNC_ROW_SOURCE_LSN_TABLE,
+                "sync-row-source-lsn",
+                &mut hasher,
+            )?;
+            digest_redb_table(
+                &read_txn,
+                SYNC_ROW_SOURCE_KIND_TABLE,
+                "sync-row-source-kind",
+                &mut hasher,
+            )?;
+
+            let mut dynamic_names = read_txn
+                .list_tables()
+                .map_err(Self::storage_error)?
+                .map(|handle| handle.name().to_string())
+                .filter(|name| name.starts_with("rel_") || name.starts_with("__sink_queue_"))
+                .collect::<Vec<_>>();
+            dynamic_names.sort();
+            let mut sink_queue_entries = 0_u64;
+            for name in dynamic_names {
+                if name.starts_with("rel_") {
+                    let definition: TableDefinition<&[u8], &[u8]> =
+                        TableDefinition::new(name.as_str());
+                    digest_redb_table(&read_txn, definition, &name, &mut hasher)?;
+                } else {
+                    let definition: TableDefinition<u64, &[u8]> =
+                        TableDefinition::new(name.as_str());
+                    sink_queue_entries = sink_queue_entries.saturating_add(digest_redb_table(
+                        &read_txn,
+                        definition,
+                        &name,
+                        &mut hasher,
+                    )?);
+                }
+            }
+
+            Ok(RawSyncApplyStateDigest {
+                digest: hasher.finalize().to_hex().to_string(),
+                trigger_audit_entries,
+                sink_audit_entries,
+                sink_queue_entries,
+            })
+        })
+    }
+
     pub(crate) fn dump_trigger_audit_raw(&self) -> Result<Vec<(String, Vec<u8>)>> {
         self.dump_str_keyed_table_raw(TRIGGER_AUDIT_TABLE)
+    }
+
+    pub(crate) fn dump_trigger_audit_stamps_raw(&self) -> Result<Vec<(String, u64)>> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read_txn.open_table(TRIGGER_AUDIT_STAMPS_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(Self::storage_error(err)),
+            };
+            let mut entries = Vec::new();
+            for entry in table.iter().map_err(Self::storage_error)? {
+                let (key, value) = entry.map_err(Self::storage_error)?;
+                entries.push((key.value().to_string(), value.value()));
+            }
+            Ok(entries)
+        })
     }
 
     pub(crate) fn dump_sink_audit_raw(&self) -> Result<Vec<(String, Vec<u8>)>> {
@@ -2888,6 +3865,27 @@ impl RedbPersistence {
 
     pub(crate) fn append_trigger_audit_raw(&self, entries: &[(String, Vec<u8>)]) -> Result<()> {
         self.append_str_keyed_table_raw(TRIGGER_AUDIT_TABLE, entries)
+    }
+
+    pub(crate) fn append_trigger_audit_stamps_raw(&self, entries: &[(String, u64)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.with_db(|db| {
+            let write_txn = db.begin_write().map_err(Self::storage_error)?;
+            {
+                let mut table = write_txn
+                    .open_table(TRIGGER_AUDIT_STAMPS_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (key, value) in entries {
+                    table
+                        .insert(key.as_str(), *value)
+                        .map_err(Self::storage_error)?;
+                }
+            }
+            write_txn.commit().map_err(Self::storage_error)?;
+            Ok(())
+        })
     }
 
     pub(crate) fn append_sink_audit_raw(&self, entries: &[(String, Vec<u8>)]) -> Result<()> {
@@ -3593,6 +4591,18 @@ impl RedbPersistence {
         Ok(value)
     }
 
+    fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+        let (value, consumed) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|err| Error::Other(format!("bincode decode error: {err}")))?;
+        if consumed != bytes.len() {
+            return Err(Error::Other(
+                "bincode exact decode left trailing bytes".to_string(),
+            ));
+        }
+        Ok(value)
+    }
+
     /// Decode one `TableMeta` blob, trying the CURRENT layout first and
     /// falling back to the exact `v1.0.0` layout on the SPECIFIC decode
     /// failure that layout produces. Returns whether the legacy fallback
@@ -3623,7 +4633,7 @@ impl RedbPersistence {
         }
     }
 
-    fn storage_error(err: impl std::fmt::Display) -> Error {
+    pub(crate) fn storage_error(err: impl std::fmt::Display) -> Error {
         let msg = err.to_string();
         if msg.contains("lock") || msg.contains("already open") {
             Error::Other(format!(
@@ -3656,7 +4666,7 @@ impl RedbPersistence {
         }
     }
 
-    fn with_db<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_db<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
         let lock_guard = self.lock_file.lock().expect("pid lock mutex poisoned");
         if lock_guard.is_none() {
             return Err(Error::Other("database persistence is closed".to_string()));

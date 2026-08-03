@@ -16,7 +16,7 @@ use contextdb_server::work_ledger::{
     poll_and_execute_once,
 };
 use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,12 +33,6 @@ async fn within<F: std::future::Future>(fut: F) -> F::Output {
 
 fn identity_file(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("fabric-identity.key")
-}
-
-fn node_id_of(key: &Path) -> String {
-    FabricIdentity::load_or_generate(key)
-        .expect("identity")
-        .node_id()
 }
 
 fn marked(marker: &str, size: usize) -> Vec<u8> {
@@ -102,17 +96,22 @@ async fn blob_ref_job_resolves_and_executes_via_worker_loop() {
     // its blob door.
     let holder_dir = tempfile::tempdir().expect("holder dir");
     let holder_key = identity_file(&holder_dir);
-    let holder_node = node_id_of(&holder_key);
+    let holder_identity =
+        Arc::new(FabricIdentity::load_or_generate(&holder_key).expect("load holder identity"));
+    let holder_node = holder_identity.node_id();
     let content = marked("DISTRIBUTED-COMPUTE-BLOB", 128 * 1024);
     let hash = BlobHash::of(&content);
 
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder ledger schema");
-    let holder_client = Arc::new(SyncClient::with_transport(
-        holder_db.clone(),
-        broker.client(),
-        contextdb_core::TenantId::from(tenant),
-    ));
+    let holder_client = Arc::new(
+        SyncClient::with_authenticated_transport_and_identity_for_test(
+            holder_db.clone(),
+            broker.client_as(&holder_node),
+            contextdb_core::TenantId::from(tenant),
+            holder_identity,
+        ),
+    );
     let holder_blob_store = BlobStore::new(
         holder_db.clone(),
         MovementPolicy {
@@ -155,14 +154,17 @@ async fn blob_ref_job_resolves_and_executes_via_worker_loop() {
     // its WorkerConfig — the new (today-inert) scaffold field.
     let worker_dir = tempfile::tempdir().expect("worker dir");
     let worker_key = identity_file(&worker_dir);
-    let worker_node = node_id_of(&worker_key);
+    let worker_identity =
+        Arc::new(FabricIdentity::load_or_generate(&worker_key).expect("load worker identity"));
+    let worker_node = worker_identity.node_id();
 
     let worker_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&worker_db).expect("worker ledger schema");
-    let worker_client = SyncClient::with_transport(
+    let worker_client = SyncClient::with_authenticated_transport_and_identity_for_test(
         worker_db.clone(),
-        broker.client(),
+        broker.client_as(&worker_node),
         contextdb_core::TenantId::from(tenant),
+        worker_identity,
     );
     let worker_blob_store = Arc::new(BlobStore::new(
         worker_db.clone(),

@@ -1,3 +1,4 @@
+use crate::memory_budget::{MemoryBudget, unlimited_memory_budget};
 use crate::{HnswIndex, store::VectorStore};
 use contextdb_core::*;
 use contextdb_tx::{TransactionManager, WriteSetApplicator};
@@ -79,7 +80,7 @@ impl VectorSearchDebugTrace {
 pub struct MemVectorExecutor<S: WriteSetApplicator> {
     store: Arc<VectorStore>,
     tx_mgr: Arc<TransactionManager<S>>,
-    accountant: Arc<MemoryAccountant>,
+    accountant: Arc<dyn MemoryBudget>,
 }
 
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
@@ -88,14 +89,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         tx_mgr: Arc<TransactionManager<S>>,
         hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
     ) -> Self {
-        Self::new_with_accountant(store, tx_mgr, hnsw, Arc::new(MemoryAccountant::no_limit()))
+        Self::new_with_accountant(store, tx_mgr, hnsw, unlimited_memory_budget())
     }
 
     pub fn new_with_accountant(
         store: Arc<VectorStore>,
         tx_mgr: Arc<TransactionManager<S>>,
         _hnsw: Arc<OnceLock<RwLock<Option<HnswIndex>>>>,
-        accountant: Arc<MemoryAccountant>,
+        accountant: Arc<dyn MemoryBudget>,
     ) -> Self {
         Self {
             store,
@@ -641,7 +642,7 @@ impl<S: WriteSetApplicator> VectorExecutor for MemVectorExecutor<S> {
     }
 }
 
-fn estimate_hnsw_bytes(
+pub(crate) fn estimate_hnsw_bytes(
     entry_count: usize,
     dimension: usize,
     quantization: VectorQuantization,
@@ -661,7 +662,7 @@ fn estimate_hnsw_bytes(
     )
 }
 
-fn estimate_hnsw_build_reservation(
+pub(crate) fn estimate_hnsw_build_reservation(
     entry_count: usize,
     dimension: usize,
     quantization: VectorQuantization,

@@ -38,7 +38,7 @@ fn show_reflects_a_create_declared_conflict_policy() {
 
     let rows = policy_rows(&db);
     assert!(
-        rows.iter().any(|row| row == "notes=latest_wins"),
+        rows.iter().any(|row| row == "notes=keep_latest"),
         "SHOW SYNC_CONFLICT_POLICY must reflect the CREATE-declared policy the \
          sync path resolves against; got {rows:?}"
     );
@@ -55,7 +55,7 @@ fn show_reflects_a_create_declared_conflict_policy() {
         "an undeclared table must not appear as a per-table policy row; got {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row == "notes=latest_wins"),
+        rows.iter().any(|row| row == "notes=keep_latest"),
         "the declared table still appears; got {rows:?}"
     );
 }

@@ -20,7 +20,6 @@ contextdb <PATH> [OPTIONS]
 |------|---------|---------|-------------|
 | `--sync-endpoint <TICKET>` | `CONTEXTDB_SYNC_ENDPOINT` | *(none)* | Server's enrollment ticket to sync with (dial-by-key). |
 | `--tenant-id <ID>` | `CONTEXTDB_TENANT_ID` | *(none)* | Tenant ID. Omit for local-only mode. |
-| `--nats-url <URL>` | `CONTEXTDB_NATS_URL` | *(none)* | **Deprecated.** NATS broker URL. Requires a build with the `nats` feature. |
 | `--memory-limit <SIZE>` | `CONTEXTDB_MEMORY_LIMIT` | *(unlimited)* | Memory ceiling. Suffixes: `K`, `M`, `G`. |
 | `--disk-limit <SIZE>` | `CONTEXTDB_DISK_LIMIT` | *(unlimited)* | Disk ceiling for file-backed databases. Suffixes: `K`, `M`, `G`. Ignored for `:memory:`. |
 | `--json` | | off | Emit machine output for scripts and agents: stdout becomes JSON Lines — a JSON array of row objects (uncapped) per query, `{"rows_affected": N}` per non-query, and one document per meta-command. Errors, notices, traces and help are documents too, on stderr, so stdout stays pure machine data. |
@@ -56,7 +55,7 @@ $ echo ".schema decisions" | contextdb ./my.db --json | jq '{pk: .primary_key, r
 
 `.schema` returns the table's declared contract as data — `columns` (each with type, nullability, key/unique/immutable flags, `references` and its `ON STATE ... PROPAGATE SET ...` clause, vector quantization, rank policy), `primary_key`, `indexes`, `state_machine`, `retain`, `history`, `sync_direction`, `conflict_policy`, `dag_edge_types` and `propagate` (all three rule kinds, including the foreign-key rules the DDL renders on their column) — plus `ddl`, the exact text the human `.schema` prints, so a snapshot/replay flow keeps working. A policy the table never declared is absent rather than filled in with a default nobody wrote. `history` is `{"policy":"ALL"}` or `{"policy":"CURRENT_ONLY"}` when declared — an object, like `retain`, so a future windowed form can add keys without a shape break.
 
-`sync_direction` and `conflict_policy` speak a fixed vocabulary, the DDL's own clause words in lowercase — `sync_off`, `push_only`, `pull_only`, `two_way` for the direction, and `keep_first`, `keep_latest` for the two declarable policies. Two more policies exist on the engine's built-in distributed-contract tables and have no DDL clause to declare them: `server_wins` and `edge_wins`. The same words appear in `.sync direction` and `.sync policy` documents, so one concept reads the same everywhere.
+`sync_direction` and `conflict_policy` use only declared SQL vocabulary in lowercase: `sync_off`, `push_only`, `pull_only`, `two_way`, `keep_first`, and `keep_latest`.
 
 ```bash
 $ echo ".sync status" | contextdb ./my.db --tenant-id acme --sync-endpoint <ticket> --json
@@ -71,7 +70,7 @@ $ echo ".sync status" | contextdb ./my.db --tenant-id acme --sync-endpoint <tick
 | `.trace on\|off` | `{"trace":"on"}` / `{"trace":"off"}` |
 | `.sync status` | `{"sync":{...}}` |
 | `.sync push` / `.sync pull` | `{"sync_push":{"applied_rows":N,"skipped_rows":N,"conflicts":[...],"outcome":"applied"}}` (`"unconfirmed"` for an interrupted push) |
-| `.sync reconnect` / `destination` / `direction` / `policy` / `auto` | `{"sync_reconnect":...}`, `{"sync_destination":...}`, `{"sync_direction":...}`, `{"sync_policy":...}`, `{"sync_auto":...}` |
+| `.sync reconnect` / `destination` / `auto` | `{"sync_reconnect":...}`, `{"sync_destination":...}`, `{"sync_auto":...}` |
 | `.help` | `{"help":["line", ...]}`, on stderr (see below) |
 
 Under `--json`, everything that is not a result goes to stderr, so stdout stays parseable. Every line there is a JSON document too, and there are four kinds — the first two are what a consumer branches on, the last two are output a command was asked for.
@@ -120,7 +119,14 @@ contextdb ./edge.db --tenant-id dev --sync-endpoint <ticket>
 contextdb ./edge.db --tenant-id production --sync-endpoint <ticket>
 ```
 
-For a file-backed edge, a bare pasted ticket is automatically rewritten to the identity-pinned form using `<db-path>.fabric-identity.key`, so `.sync status` shows the rewritten `iroh:?to=…&identity=…` spec rather than the pasted ticket — this is expected. If the endpoint is down or unreachable, sync prints one clear line, `Warning: sync endpoint unreachable: …`, rather than failing hard.
+For a file-backed edge, a bare pasted ticket uses the durable adjacent identity
+at `<canonical-db-path>.fabric-identity.key`; the Rust `SyncClient::new` API
+uses the same derivation. An explicit `identity=<key-file>` always wins over
+that default. A memory-backed edge has no adjacent key, so it must name an
+explicit persisted identity in its endpoint; a bare ticket is refused before
+any sync request is signed or dialed. If the endpoint is down or unreachable,
+sync prints one clear line, `Warning: sync endpoint unreachable: …`, rather
+than failing hard.
 
 This is the same configuration you'd set in Rust code when constructing a `SyncClient` — the CLI just exposes it as flags.
 
@@ -136,14 +142,19 @@ RUST_LOG=debug contextdb :memory:
 
 ---
 
-## Store Maintenance (`migrate` / `reset` / `repair`)
+## Store Maintenance (`migrate` / `reset` / `repair` / `snapshot` / `inspect`)
 
-Three subcommands, dispatched by literal first argument BEFORE the normal `contextdb <PATH> [OPTIONS]` parsing runs — so they never collide with a database path (a real path is never literally `migrate`, `reset`, or `repair`):
+These subcommands are dispatched by literal first argument before the normal
+`contextdb <PATH> [OPTIONS]` parsing runs:
 
 ```
 contextdb migrate <PATH>
 contextdb reset <PATH> --force
 contextdb repair <PATH>
+contextdb snapshot export <PATH> <NEW_ARTIFACT> [--json]
+contextdb inspect key <SNAPSHOT_ARTIFACT> --table <TABLE> --key-json <NATURAL_KEY_JSON> [--column <COLUMN>]... [--json]
+contextdb inspect blob <SNAPSHOT_ARTIFACT> --hash <64_HEX_CHARS> [--json]
+contextdb inspect sync-apply-state <SNAPSHOT_ARTIFACT> [--json]
 ```
 
 ### `migrate` — bring a legacy-format root forward in place
@@ -207,6 +218,68 @@ contextdb repair ./maybe-corrupt.db
 ```
 
 `repair` never recommends `reset` where `migrate` is the right command, and vice versa — a legacy-format root is not corrupt (it just predates this release's on-disk layout), so its report points at `migrate` instead.
+
+### `snapshot export` — publish a purge-fenced backup
+
+`contextdb snapshot export ./hub.db ./hub.snapshot --json` uses the engine's
+transactionally consistent export path. The artifact path must not already
+exist. If an authoritative purge wins the race after capture, publication is
+refused instead of producing a backup that silently resurrects the purged
+lineage.
+
+### `inspect` — read durable key and media state from an exported snapshot
+
+`inspect` never opens the supplied artifact. It copies the completed snapshot
+into a private temporary directory, opens only that disposable copy, and emits
+a bounded report with no raw media bytes, tag names, identity material, or
+storage paths.
+
+For a row identity, pass the same `NaturalKey` JSON shape used by sync
+diagnostics. The report counts every physical retained version and emits the
+newest 128, explicitly saying when older versions were truncated. Add up to
+16 `--column` arguments for the values needed in the diagnosis. Scalar values
+and text up to 32 KiB are exact within a 1 MiB report budget; larger text,
+JSON, and vectors carry an explicit omission reason and size/unit facts rather
+than making inspection memory grow with the row. The lineage section contains
+the table generation, an opaque same-lineage fingerprint,
+pending/accepted/purged deletion state, hub acceptance position, and permanent
+purge frontier:
+
+```bash
+contextdb inspect key ./hub.snapshot \
+  --table notes \
+  --key-json '{"column":"id","value":{"Int64":7},"rest":[]}' \
+  --column body \
+  --json
+```
+
+For engine-held distributed-work media, pass its 64-character content hash.
+The report contains generation and purge fences, manifest and partial-transfer
+progress, and the two addressability roles, but never the payload:
+
+```bash
+contextdb inspect blob ./hub.snapshot --hash <64_HEX_CHARS> --json
+```
+
+For a before/after atomic-sync audit, `sync-apply-state` emits one opaque,
+deterministic digest plus counts for table metadata, every retained row
+version, physical index postings, edges, vectors, DDL and change logs, the
+commit index, sync-arbitration sidecars, sink queues, trigger/sink audits, and
+persisted configuration (including received-schema markers and sync receipts).
+The digest reads exact persisted vector bytes rather than a quantized
+in-memory reconstruction. It never emits a key or value from those categories:
+
+```bash
+contextdb inspect sync-apply-state ./hub.snapshot --json
+```
+
+Equal reports from before and after a refused authenticated DDL rewrite prove
+that the receiver changed none of those durable categories. The digest is a
+same-release comparison aid, not a stable cross-version data format.
+
+The input must be an artifact completed by `contextdb snapshot export`, not a
+live database file. Inspecting a copy avoids interfering with the live owner
+and keeps Redb housekeeping writes away from the supplied artifact.
 
 ---
 
@@ -282,9 +355,9 @@ planned and the measured fields are absent rather than empty.
 For machine-readable access, every `QueryResult` returned by
 `Database::execute` carries `QueryResult.trace`, a `QueryTrace` with the
 physical strategy, chosen index, pushed predicates, and indexes the planner
-considered and rejected. The per-query examined-row count is available
-separately through the database execution counter, which `.trace on` reads
-immediately after the statement and formats for terminal inspection.
+considered and rejected. `QueryResult.trace.rows_examined` owns that
+statement's examined-row count, and `.trace on` renders the result-owned value
+for terminal inspection.
 
 ### `.schema` and Enforced Policy
 
@@ -309,7 +382,7 @@ All sync commands require `--tenant-id` at startup. Without it:
 Sync not configured. Start with --tenant-id to enable.
 ```
 
-That message is a *query's* answer, not a failure: `.sync status` and `.sync auto` print it to stdout and exit `0`. The action subcommands — `push`, `pull`, `reconnect`, `destination`, `direction`, `policy` — print it to stderr and exit `1` instead, because the action did not happen and a scripted `push && shutdown` must never read "not configured" as "pushed".
+That message is a *query's* answer, not a failure: `.sync status` and `.sync auto` print it to stdout and exit `0`. The action subcommands — `push`, `pull`, `reconnect`, and `destination` — print it to stderr and exit `1` instead, because the action did not happen and a scripted `push && shutdown` must never read "not configured" as "pushed".
 
 | Command | Description |
 |---------|-------------|
@@ -317,24 +390,19 @@ That message is a *query's* answer, not a failure: `.sync status` and `.sync aut
 | `.sync push` | Push local changes to server. Reports applied, skipped, conflicts. |
 | `.sync pull` | Pull remote changes from server. Reports applied, skipped, conflicts. |
 | `.sync reconnect` | Drop and re-establish the connection to the sync endpoint. |
-| `.sync direction <table> <dir>` | Set sync direction for a table. |
-| `.sync policy <table> <policy>` | Set conflict policy for a table. |
-| `.sync policy default <policy>` | Set the default conflict policy for all tables. |
 | `.sync auto [on\|off]` | Toggle auto-sync after writes. No argument shows current state. |
 
-**Sync directions** (case-insensitive): `Push`, `Pull`, `Both`, `None`
+Declare sync direction in `CREATE TABLE` or `ALTER TABLE` SQL:
 
-- `Push` — local writes replicate to server, remote changes ignored
-- `Pull` — remote changes applied locally, local writes not pushed
-- `Both` — bidirectional (default)
-- `None` — table excluded from sync
+- `SYNC PUSH ONLY` — local writes replicate to server, remote changes ignored
+- `SYNC PULL ONLY` — remote changes applied locally, local writes not pushed
+- `SYNC TWO WAY` — bidirectional (default)
+- `SYNC OFF` — table excluded from sync
 
-**Conflict policies** (case-sensitive): `InsertIfNotExists`, `ServerWins`, `EdgeWins`, `LatestWins`
+Declare conflict behavior in the same DDL:
 
-- `LatestWins` — most recent write by logical timestamp wins (default)
-- `ServerWins` — server version always takes precedence
-- `EdgeWins` — client version always takes precedence
-- `InsertIfNotExists` — insert only if the row doesn't exist; skip otherwise
+- `SYNC CONFLICT KEEP FIRST` — the hub's first accepted value remains (default)
+- `SYNC CONFLICT KEEP LATEST` — the later accepted value replaces it
 
 **LSN** (Log Sequence Number) is the position in the change log. The push and pull watermarks shown by `.sync status` tell you how far each direction has progressed — useful for diagnosing sync lag.
 
@@ -395,7 +463,7 @@ contextdb-server --tenant-id <TENANT_ID> [OPTIONS]
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--db-path <PATH>` | `CONTEXTDB_DB_PATH` | `:memory:` | Database file path. `:memory:` for ephemeral. |
-| `--sync-endpoint <SPEC>` | `CONTEXTDB_SYNC_ENDPOINT` | *(auto)* | Sync endpoint spec, form `iroh:?identity=<key-file>[&port=<u16>][&relay=<none\|n0\|url>][&relay-ca=<cert-file>][&publish=<n0\|url>][&lookup=<n0\|mdns\|dns:origin\|url>]`. When omitted, an identity file is created next to the database file (`<db-path>.fabric-identity.key`). |
+| `--sync-endpoint <SPEC>` | `CONTEXTDB_SYNC_ENDPOINT` | *(auto)* | Sync endpoint spec, form `iroh:?identity=<key-file>[&port=<u16>][&relay=<none\|n0\|url>][&relay-ca=<cert-file>][&publish=<n0\|url>][&lookup=<n0\|mdns\|dns:origin\|url>][&response-staging-bytes=<positive-u64>][&pre-admission-connections=<positive-usize>][&pre-admission-bytes=<positive-u32>][&request-read-idle-ms=<positive-u64>]`. When omitted, an identity file is created next to the database file (`<db-path>.fabric-identity.key`). |
 | `--ticket-file <PATH>` | | *(none)* | Write the enrollment ticket to this file once bound (overwrites), so scripts and operators can pick it up without parsing logs. The ticket is sensitive bearer material — keep the file out of version control and restrict its permissions. |
 | `--show-ticket` | | off | Print the bare enrollment ticket to stdout and exit, without serving. |
 | `--json` | | off | Emit one JSON object to stdout with `enrollment_ticket` and `dial_command` (plus `endpoint` and `tenant_id`), for scripts and agents enrolling a machine. |
@@ -430,16 +498,25 @@ file, so binding to a different port has no effect on it.
 
 Machines on one LAN reach each other over direct connections with zero external infrastructure and no internet. To cross networks, set `relay=<url>` to a self-hosted `iroh-relay` (a small stateless forwarder that only carries end-to-end-encrypted bytes), or `relay=n0` to opt into the free public relays. The default configuration contacts no third-party service. When the relay presents a private or self-signed certificate, add `relay-ca=<cert-file>` pointing at its PEM bundle or single DER certificate to trust it.
 
-A typo in the endpoint spec errors loudly rather than falling through to the deprecated broker path. An unknown parameter reports which names are accepted:
+A typo in the endpoint spec errors loudly. An unknown parameter reports which names are accepted:
 
 ```
-unknown parameter `X` in sync endpoint spec (accepted: identity, port, relay, relay-ca, publish, lookup, to)
+unknown parameter at position N in sync endpoint spec (accepted: identity, port, relay, relay-ca, publish, lookup, response-staging-bytes, pre-admission-connections, pre-admission-bytes, request-read-idle-ms, to)
 ```
 
 Full spec grammar:
 
-- **Bind (server):** `iroh:?identity=<key-file>[&port=<u16>][&relay=<none|n0|url>][&relay-ca=<cert-file>][&publish=...][&lookup=...]`
+- **Bind (server):** `iroh:?identity=<key-file>[&port=<u16>][&relay=<none|n0|url>][&relay-ca=<cert-file>][&publish=...][&lookup=...][&response-staging-bytes=<positive-u64>][&pre-admission-connections=<positive-usize>][&pre-admission-bytes=<positive-u32>][&request-read-idle-ms=<positive-u64>]`
 - **Dial (edge):** a bare ticket, `iroh:<ticket>`, or `iroh:?to=<ticket>&identity=<key-file>` — plus the same `lookup=`/`publish=` knobs
+
+The four resource controls are server-local and are rejected in a `to=` dial
+spec. `response-staging-bytes` bounds durable unfinished-response storage.
+`pre-admission-connections` bounds incoming connection and handshake tasks;
+`pre-admission-bytes` bounds aggregate request payload reserved before route
+admission; and `request-read-idle-ms` closes a request that makes no
+application-byte progress before that deadline. Their defaults are unlimited
+durable response staging, 128 connections, 64 MiB of pre-admission payload,
+and 30 seconds without byte progress.
 
 ### Address Lookup (optional)
 
@@ -455,7 +532,7 @@ contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?iden
 contextdb ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=<ticket>&lookup=mdns"
 ```
 
-Default conflict policy is `LatestWins`. The default log level is `ERROR`; server logs go to stdout. Set `RUST_LOG=info` to see operational logs (the ticket prints regardless). Build-time options: UPnP port mapping (better direct-connection odds through home routers) via `cargo build --release -p contextdb-server --features iroh/portmapper` — not in default builds because its dependency chain carries an MPL-licensed HTTP client; LAN mDNS lookup via `--features mdns`. Transport metrics counters are on by default (local only):
+The undeclared conflict default is `KEEP FIRST`. The default log level is `ERROR`; server logs go to stdout. Set `RUST_LOG=info` to see operational logs (the ticket prints regardless). Build-time options: UPnP port mapping (better direct-connection odds through home routers) via `cargo build --release -p contextdb-server --features iroh/portmapper` — not in default builds because its dependency chain carries an MPL-licensed HTTP client; LAN mDNS lookup via `--features mdns`. Transport metrics counters are on by default (local only):
 
 ```bash
 RUST_LOG=info contextdb-server --tenant-id dev
@@ -463,7 +540,7 @@ RUST_LOG=info contextdb-server --tenant-id dev
 
 ### Server Exit Codes
 
-`contextdb-server` honors the same table as the CLI ([Exit Codes](#exit-codes)): `0` on clean shutdown, `2` when the invocation itself is wrong (an unknown flag, or asking for an enrollment ticket from a broker URL that has none), and `1` for anything that failed while running. Exit code `3` is the CLI's alone — the server never pushes.
+`contextdb-server` honors the same table as the CLI ([Exit Codes](#exit-codes)): `0` on clean shutdown, `2` when the invocation itself is wrong, and `1` for anything that failed while running. Exit code `3` is the CLI's alone — the server never pushes.
 
 ### Restart Semantics and Port Stickiness
 
@@ -481,12 +558,6 @@ The server (and any edge that syncs) writes these next to the database file:
 | `<db-stem>.lock` | No | A PID lockfile. It can persist as a harmless orphan after exit. |
 
 Add `*.fabric-identity.key` (and its `.port` sibling) to your `.gitignore`.
-
-### Deprecated: NATS transport
-
-The original NATS broker adapter is retained behind the `nats` cargo feature. `--nats-url` (env `CONTEXTDB_NATS_URL`) selects it and requires a build with that feature. New deployments should use the dial-by-key sync endpoint above.
-
----
 
 ## Non-Interactive Mode
 

@@ -9,15 +9,17 @@
 //! [`BlobStore::resolve_blob_ref`] for the entitlement precondition and
 //! error conditions.
 
-use crate::adapter::{self, BlobStoreHandle, FetchFailure, FetchVerdict};
+use crate::Database;
 use crate::transfer_receipts::{TransferDirection, TransferLedger, TransferPlane, TransferReceipt};
+use crate::transport::adapter::{self, BlobStoreHandle, FetchFailure, FetchVerdict};
 use crate::transport::iroh::IrohServer;
-use contextdb_core::{Error, Result, Wallclock};
-use contextdb_engine::Database;
-use contextdb_engine::work_ledger::{
+use crate::work_ledger::{
     BlobHash, MovementPolicy, any_node_holds_claim_for_blob, blob_ref_retention_eligible,
     node_claim_permits_movement, node_holds_claim_for_blob,
 };
+use contextdb_core::{Error, Result, Wallclock};
+#[cfg(any(test, feature = "test-seams"))]
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +42,7 @@ const RECLAIM_INTERVAL: Duration = Duration::from_secs(300);
 /// Operator-declared bound on one [`BlobStore::resolve_blob_ref`] fetch
 /// attempt, covering the whole dial-and-transfer path — not just the
 /// per-progress-item idle bound already applied inside the transfer loop.
-/// Declared like [`contextdb_engine::work_ledger::MovementPolicy`] (a plain
+/// Declared like [`crate::work_ledger::MovementPolicy`] (a plain
 /// struct an installation supplies) rather than a bare `Duration` constant
 /// buried in the resolver, so an installation can widen or narrow the bound
 /// without a code change. `resolve_blob_ref` enforces it by spawning the
@@ -136,6 +138,103 @@ pub struct BlobStore {
     /// ordinary consumer of this crate can reach it — production is never
     /// armable.
     wedge_next_fetch_for_test: AtomicBool,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub struct PausedProviderGenerationForTest {
+    repository: Arc<crate::blob_repository::BlobRepository>,
+    hash: [u8; 32],
+    generation: u64,
+    session: Mutex<Option<crate::blob_repository::BlobReadSession>>,
+    payload_bytes_emitted: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl PausedProviderGenerationForTest {
+    pub fn wait_until_shared_hash_guarded(&self, _timeout: Duration) -> bool {
+        self.session
+            .lock()
+            .expect("provider read session")
+            .is_some()
+    }
+
+    pub fn abort_retaining_stale_generation_for_test(&self) {
+        self.session.lock().expect("provider read session").take();
+    }
+
+    pub fn payload_bytes_emitted_for_test(&self) -> u64 {
+        self.payload_bytes_emitted.load(Ordering::SeqCst)
+    }
+
+    pub fn resume_from_stale_generation_for_test(&self) -> Result<()> {
+        let session = self.repository.open_read(self.hash)?.ok_or_else(|| {
+            Error::Other("blob provider generation was retired by authoritative purge".to_string())
+        })?;
+        if session.generation() != self.generation {
+            return Err(Error::Other("blob provider generation changed".to_string()));
+        }
+        let bytes = session.read_payload_at(0, 1)?;
+        self.payload_bytes_emitted
+            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub struct PausedWriterGenerationForTest {
+    repository: Arc<crate::blob_repository::BlobRepository>,
+    hash: [u8; 32],
+    generation: u64,
+    guard: Mutex<Option<crate::blob_repository::BlobSharedGenerationGuard>>,
+    object_id: [u8; 16],
+    total_size: u64,
+    payload_chunk_count: u64,
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+impl PausedWriterGenerationForTest {
+    pub fn wait_until_shared_hash_guarded(&self, _timeout: Duration) -> bool {
+        self.guard
+            .lock()
+            .expect("writer generation guard")
+            .is_some()
+    }
+
+    pub fn abort_retaining_stale_generation_for_test(&self) {
+        self.guard.lock().expect("writer generation guard").take();
+    }
+
+    pub fn complete_from_stale_generation_for_test(&self) -> Result<()> {
+        let guard = self.repository.begin_write_generation(self.hash)?;
+        if guard.generation() != self.generation {
+            return Err(Error::Other(format!(
+                "blob writer generation {} was retired by authoritative purge; current generation is {}",
+                self.generation,
+                guard.generation()
+            )));
+        }
+        let partial = crate::blob_repository::BlobPartialState::from_exact_indices(
+            0..self.payload_chunk_count,
+            std::iter::empty(),
+            Vec::new(),
+        )?;
+        self.repository.bind_staging(
+            &guard,
+            crate::blob_repository::BlobStagingBind {
+                hash: self.hash,
+                object_id: self.object_id,
+                format: 0,
+                total_size: self.total_size,
+                outboard_size: 0,
+                validated_size: self.total_size,
+                state: crate::blob_repository::BlobManifestState::Partial,
+                partial_state: Some(&partial),
+                tags: &[],
+                replace_active: true,
+            },
+        )?;
+        Ok(())
+    }
 }
 
 /// Why a resolve failed. Seven outcomes the caller must tell apart: five
@@ -262,18 +361,10 @@ impl BlobStore {
         *self.claim_refresh.lock().expect("claim refresh lock") = hook;
     }
 
-    /// The blob store lives next to the fabric identity.
-    fn store_root(&self) -> PathBuf {
-        self.identity_path
-            .parent()
-            .map(|dir| dir.join("blob-store"))
-            .unwrap_or_else(|| PathBuf::from("blob-store"))
-    }
-
     fn store(&self) -> Result<Arc<BlobStoreHandle>> {
         self.store
             .get_or_init(|| {
-                BlobStoreHandle::open(&self.store_root())
+                BlobStoreHandle::open(self.db.blob_repository())
                     .map(Arc::new)
                     .map_err(|e| e.to_string())
             })
@@ -382,8 +473,8 @@ impl BlobStore {
         // v1 holder discovery: the serving node registers its OWN ticket;
         // the row syncs through the hub like any coordination row.
         if let Ok(identity) = crate::FabricIdentity::load_or_generate(&self.identity_path) {
-            let _ = contextdb_engine::peer_directory::install_peer_directory_schema(&self.db);
-            let _ = contextdb_engine::peer_directory::register_peer_ticket(
+            let _ = crate::peer_directory::install_peer_directory_schema(&self.db);
+            let _ = crate::peer_directory::register_peer_ticket(
                 &self.db,
                 &identity.node_id(),
                 &endpoint.ticket(),
@@ -401,6 +492,7 @@ impl BlobStore {
     /// the adapter-purity guard). Returns the same endpoint handle
     /// `serve_on` takes; callers only need its existing public methods
     /// (`ticket()`, `close()`, ...).
+    #[cfg(any(test, feature = "test-seams"))]
     pub async fn bind_and_serve_for_test(&self, identity_path: &Path) -> Result<IrohServer> {
         let spec = format!("iroh:?identity={}", identity_path.display());
         let endpoint = IrohServer::bind(&spec)
@@ -463,9 +555,6 @@ impl BlobStore {
         holder_ticket: &str,
         sink: &mut (dyn Write + Send),
     ) -> std::result::Result<u64, ResolveError> {
-        let store = self
-            .store()
-            .map_err(|_| ResolveError::LocalStoreUnavailable)?;
         // Client-side pre-check on the consumer's OWN local ledger mirror: a
         // pure optimization to skip a wasted dial when this node has never
         // even mirrored a live claim for this hash. It does NOT check
@@ -477,6 +566,9 @@ impl BlobStore {
             Ok(true) => {}
             Ok(false) | Err(_) => return Err(ResolveError::Unentitled),
         }
+        let store = self
+            .store()
+            .map_err(|_| ResolveError::LocalStoreUnavailable)?;
         // Content-addressed correctness: entitlement is checked
         // UNCONDITIONALLY above and is never waived by local presence. Once
         // entitled, if this service's OWN store already holds the
@@ -489,10 +581,13 @@ impl BlobStore {
             .await
             .is_some()
         {
-            return adapter::export_into_sink(&store, &hash.as_bytes(), sink, 0)
+            let outcome = adapter::export_into_sink(&store, &hash.as_bytes(), sink, 0)
                 .await
-                .map(|outcome| outcome.bytes_written)
-                .map_err(|failure| map_failure(failure, hash));
+                .map_err(|failure| map_failure(failure, hash))?;
+            adapter::release_complete_cache_ownership(&store, &hash.as_bytes())
+                .await
+                .map_err(|failure| map_failure(failure, hash))?;
+            return Ok(outcome.bytes_written);
         }
         // The declared whole-fetch-attempt bound (see `BlobFetchPolicy`):
         // the network dial, the holder's tag bookkeeping, and the verified
@@ -538,7 +633,13 @@ impl BlobStore {
                     // verified before the abort; export that verified
                     // partial prefix into the caller's sink so a retry can
                     // resume from it, then still report the abort.
-                    let _ = adapter::export_into_sink(&store, &hash.as_bytes(), sink, 0).await;
+                    let _ = adapter::export_verified_prefix_into_sink(
+                        &store,
+                        &hash.as_bytes(),
+                        sink,
+                        0,
+                    )
+                    .await;
                 }
                 return Err(map_failure(failure, hash));
             }
@@ -557,7 +658,9 @@ impl BlobStore {
         let outcome = adapter::export_into_sink(&store, &hash.as_bytes(), sink, 0)
             .await
             .map_err(|failure| map_failure(failure, hash))?;
-        adapter::release_fetch_protection(&store, &hash.as_bytes()).await;
+        adapter::release_fetch_protection(&store, &hash.as_bytes())
+            .await
+            .map_err(|failure| map_failure(failure, hash))?;
         // One blob, its own bytes, against the holder the ticket actually
         // dialed. Framing and encryption overhead are not counted.
         self.receipts.record(
@@ -575,6 +678,7 @@ impl BlobStore {
     /// make the holder SERVE `bytes` under `claimed` even though they do not
     /// content-address to it — the consumer's verification is what must
     /// catch the lie.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn serve_wrong_bytes_for_test(&self, claimed: &BlobHash, bytes: &[u8]) -> Result<()> {
         self.store()?.arm_tamper(&claimed.as_bytes(), bytes)
     }
@@ -589,6 +693,7 @@ impl BlobStore {
     /// Test seam: the exact PAYLOAD bytes (not wire/framing bytes) this
     /// holder has served across every successfully completed transfer.
     /// Zero when the local store never opened.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn payload_bytes_emitted_for_test(&self) -> u64 {
         self.store().map(|s| s.payload_bytes_emitted()).unwrap_or(0)
     }
@@ -596,6 +701,7 @@ impl BlobStore {
     /// Test seam: count of blob-door requests whose `GetRequest` this holder
     /// read and authorized, INCLUDING refused ones — a reset still counts.
     /// Zero when the local store never opened.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn fetch_requests_received_for_test(&self) -> u64 {
         self.store()
             .map(|s| s.fetch_requests_received())
@@ -607,6 +713,7 @@ impl BlobStore {
     /// that `resolve_blob_ref` runs first — proving the HOLDER itself refuses
     /// a caller that bypassed all client-side logic, not just the client
     /// convenience check.
+    #[cfg(any(test, feature = "test-seams"))]
     pub async fn attempt_authorization_bypass_for_test(
         &self,
         hash: &BlobHash,
@@ -634,25 +741,137 @@ impl BlobStore {
     /// Test seam: shorten the local content-store open fail-fast bound so a
     /// contention test need not pay the full production wait. Production is
     /// unaffected; the bounded-and-typed store-open guarantee is unchanged.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn set_store_open_timeout_ms_for_test(&self, ms: u64) {
         adapter::set_store_open_timeout_ms_for_test(ms);
     }
 
     /// Harness seam: how many blobs this node currently serves — lets a test
     /// observe the reclaim driver's effect without performing the reclaim.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn servable_count_for_test(&self) -> usize {
         self.store().map(|s| s.servable_count()).unwrap_or(0)
+    }
+
+    /// Read-only exact-hash snapshot over the production blob-store adapter.
+    /// This exists only in ContextDB's own test builds and deliberately cannot
+    /// mutate the store, inspect payload bytes, or stand in for a purge.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn exact_hash_state_for_test(&self) -> BTreeSet<[u8; 32]> {
+        self.store()
+            .map(|store| store.servable_hashes_for_test())
+            .unwrap_or_default()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn pause_authorized_provider_stream_after_shared_hash_guard_for_test(
+        &self,
+        hash: &BlobHash,
+    ) -> Result<PausedProviderGenerationForTest> {
+        let repository = self.db.blob_repository();
+        let session = repository
+            .open_read(hash.as_bytes())?
+            .ok_or_else(|| Error::Other("blob provider has no canonical object".to_string()))?;
+        Ok(PausedProviderGenerationForTest {
+            repository,
+            hash: hash.as_bytes(),
+            generation: session.generation(),
+            session: Mutex::new(Some(session)),
+            payload_bytes_emitted: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn pause_partial_blob_writer_after_shared_hash_guard_for_test(
+        &self,
+        hash: &BlobHash,
+        bytes: &[u8],
+    ) -> Result<PausedWriterGenerationForTest> {
+        let repository = self.db.blob_repository();
+        let guard = repository.begin_write_generation(hash.as_bytes())?;
+        let mut staging = repository.begin_import_staging_for_generation(
+            &guard,
+            Some(bytes.len() as u64),
+            Vec::new(),
+        )?;
+        for (index, block) in
+            crate::blob_repository::BlobRepository::logical_blocks(bytes).enumerate()
+        {
+            staging = repository.append_staging_payload(staging.object_id, index as u64, block)?;
+        }
+        Ok(PausedWriterGenerationForTest {
+            repository,
+            hash: hash.as_bytes(),
+            generation: guard.generation(),
+            guard: Mutex::new(Some(guard)),
+            object_id: staging.object_id,
+            total_size: bytes.len() as u64,
+            payload_chunk_count: staging.payload_chunk_count,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn authoritative_engine_blob_roles_for_test(&self, hash: &BlobHash) -> BTreeSet<String> {
+        self.store()
+            .map(|store| store.authoritative_roles_for_test(&hash.as_bytes()))
+            .unwrap_or_default()
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn bytes_hydrated_while_opening_for_test(&self) -> u64 {
+        self.store()
+            .map(|store| store.bytes_hydrated_while_opening_for_test())
+            .expect("open ContextDB blob store for hydration measurement")
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn verified_partial_bytes_for_test(&self, hash: &BlobHash) -> u64 {
+        self.store()
+            .map(|store| store.verified_partial_bytes_for_test(&hash.as_bytes()))
+            .unwrap_or(0)
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn bounded_raw_blob_bytes_for_test(
+        &self,
+        hash: &BlobHash,
+        max_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        self.store()
+            .ok()
+            .and_then(|store| store.bounded_raw_blob_bytes_for_test(&hash.as_bytes(), max_bytes))
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn durable_next_missing_range_for_test(
+        &self,
+        hash: &BlobHash,
+    ) -> Option<std::ops::Range<u64>> {
+        self.store()
+            .ok()
+            .and_then(|store| store.durable_next_missing_range_for_test(&hash.as_bytes()))
     }
 
     /// Harness seam: how many consumer-side fetch-protection tags remain — a
     /// fully-delivered resolve must leave ZERO, proving no permanent per-fetch
     /// disk leak.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn fetch_tag_count_for_test(&self) -> usize {
         self.store().map(|s| s.fetch_tag_count()).unwrap_or(0)
     }
 
-    /// Harness seam: the holder drops the payload stream after serving `n`
-    /// bytes.
+    /// Harness seam: the holder drops the next authorized, servable GET once
+    /// after attempting `n` payload bytes. Later GETs run normally, allowing
+    /// retry from whatever prefix the consumer durably verified.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn drop_after_bytes_for_test(&self, n: u64) {
         if let Ok(store) = self.store() {
             store.arm_drop_after(n);
@@ -663,6 +882,7 @@ impl BlobStore {
     /// resolve-time "now" this instance's holder-side liveness check reads.
     /// Per-instance interior-mutable cell; unset falls back to the fabric
     /// `Wallclock::now()`.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn set_test_clock(&self, now_ms: i64) {
         *self.test_clock.lock().expect("clock lock") = Some(now_ms);
     }
@@ -709,6 +929,7 @@ impl BlobStore {
     /// fetches + appends the still-missing verified tail into `sink`. The
     /// already-verified local prefix is never re-fetched. Returns the
     /// payload bytes that actually moved over the wire on this leg.
+    #[cfg(any(test, feature = "test-seams"))]
     pub async fn resume_bytes_moved_for_test(
         &self,
         hash: &BlobHash,

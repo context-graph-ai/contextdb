@@ -3,8 +3,7 @@ mod common;
 
 use common::process::{spawn_server_with_barrier, wait_for_child_output};
 use common::sync::{
-    push_change_through_server, push_many_changes_through_server, start_nats,
-    wait_for_sync_server_ready,
+    push_change_through_server, push_many_changes_through_server, start_sync_fixture,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -47,17 +46,25 @@ fn empty_params() -> HashMap<String, Value> {
     HashMap::new()
 }
 
-async fn build_fixture(nats_url: &str) -> DrainFixture {
+async fn build_fixture(bind_spec: &str, ticket: &str) -> DrainFixture {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("drain.db");
     let barrier_path = tmp.path().join("push-started.barrier");
     let release_path = tmp.path().join("push-release.barrier");
     let stderr_path = tmp.path().join("server.stderr");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&release_path)
+            .status()
+            .expect("mkfifo must execute")
+            .success(),
+        "create deterministic push-release channel"
+    );
 
     {
         let db = Database::open(&db_path).expect("seed open");
         db.execute(
-            "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4))",
+            "CREATE TABLE evidence (id UUID PRIMARY KEY, vector_text VECTOR(4)) SYNC CONFLICT KEEP FIRST",
             &empty_params(),
         )
         .expect("create");
@@ -67,20 +74,15 @@ async fn build_fixture(nats_url: &str) -> DrainFixture {
     let child = spawn_server_with_barrier(
         &db_path,
         TENANT,
-        nats_url,
+        bind_spec,
         &barrier_path,
         &release_path,
         100,
         &stderr_path,
     );
-    assert!(
-        wait_for_sync_server_ready(nats_url, TENANT, Duration::from_secs(15)).await,
-        "sync server must respond before SIGTERM drain bench iteration"
-    );
-
     let in_flight_id = Uuid::new_v4();
     let in_flight_vec = vec![0.5_f32, 0.5, 0.5, 0.5];
-    push_change_through_server(nats_url, TENANT, "evidence", in_flight_id, in_flight_vec).await;
+    push_change_through_server(ticket, TENANT, "evidence", in_flight_id, in_flight_vec).await;
 
     let batch_ids: Vec<Uuid> = (0..BENCH_BATCH_ROWS).map(|_| Uuid::new_v4()).collect();
 
@@ -127,21 +129,21 @@ fn assert_durable(fixture: &DrainFixture) {
 
 /// Run one full SIGTERM-drain iteration and return the kill-to-exit elapsed.
 /// Re-asserts durability after the timed window.
-async fn run_drain_iteration(rt_nats_url: &str) -> Duration {
+async fn run_drain_iteration(bind_spec: &str, ticket: &str) -> Duration {
     use std::process::Command;
 
-    let mut fixture = build_fixture(rt_nats_url).await;
+    let mut fixture = build_fixture(bind_spec, ticket).await;
     let _stderr_dump = ServerStderrDump {
         path: &fixture.stderr_path,
     };
 
     let batch_for_task = fixture.batch_ids.clone();
-    let nats_url = rt_nats_url.to_string();
+    let ticket = ticket.to_string();
     let task_barrier_path = fixture.barrier_path.clone();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let pending_push = tokio::spawn(async move {
         push_many_changes_through_server(
-            &nats_url,
+            &ticket,
             TENANT,
             "evidence",
             batch_for_task,
@@ -193,12 +195,13 @@ async fn run_drain_iteration(rt_nats_url: &str) -> Duration {
 
 fn bench_sigterm_drain_in_flight_persistence(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let nats = rt.block_on(start_nats());
-    let nats_url = nats.nats_url.clone();
+    let sync = rt.block_on(start_sync_fixture());
+    let bind_spec = sync.bind_spec.clone();
+    let ticket = sync.ticket.clone();
 
     // Pre-timing correctness gate: run one full drain at 4096-row scale before any timed sample.
     rt.block_on(async {
-        let _ = run_drain_iteration(&nats_url).await;
+        let _ = run_drain_iteration(&bind_spec, &ticket).await;
     });
 
     let mut group = c.benchmark_group("sigterm_drain");
@@ -209,7 +212,7 @@ fn bench_sigterm_drain_in_flight_persistence(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let elapsed = rt.block_on(run_drain_iteration(&nats_url));
+                let elapsed = rt.block_on(run_drain_iteration(&bind_spec, &ticket));
                 total += elapsed;
             }
             total
@@ -217,7 +220,7 @@ fn bench_sigterm_drain_in_flight_persistence(c: &mut Criterion) {
     });
 
     group.finish();
-    rt.block_on(async { drop(nats) });
+    drop(sync);
 }
 
 criterion_group!(benches, bench_sigterm_drain_in_flight_persistence);

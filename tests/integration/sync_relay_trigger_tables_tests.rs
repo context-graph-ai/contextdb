@@ -1,16 +1,14 @@
 use contextdb_core::{Error, Lsn, TxId, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange, SyncDirection,
+    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,
 };
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::identity::FabricIdentity;
+use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
 fn no_params() -> HashMap<String, Value> {
@@ -87,7 +85,7 @@ fn open_relay_hub() -> Database {
 fn open_edge_with_widget_trigger() -> Database {
     let edge = Database::open_memory();
     edge.execute(
-        "CREATE TABLE widgets (id UUID PRIMARY KEY, label TEXT)",
+        "CREATE TABLE widgets (id UUID PRIMARY KEY, label TEXT) SYNC TWO WAY",
         &no_params(),
     )
     .unwrap();
@@ -100,34 +98,6 @@ fn open_edge_with_widget_trigger() -> Database {
         .unwrap();
     edge.complete_initialization().unwrap();
     edge
-}
-
-struct NatsFixture {
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
-}
-
-async fn start_nats() -> NatsFixture {
-    let nats_conf = format!(
-        "{}/../contextdb-server/tests/nats.conf",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_exposed_port(9222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-    let container = image
-        .with_mount(Mount::bind_mount(&nats_conf, "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"])
-        .start()
-        .await
-        .expect("start nats");
-    let host = container.get_host().await.expect("nats host");
-    let port = container.get_host_port_ipv4(4222).await.expect("nats port");
-    NatsFixture {
-        nats_url: format!("nats://{host}:{port}"),
-        _container: container,
-    }
 }
 
 #[test]
@@ -481,13 +451,13 @@ fn relay_apply_does_not_fabricate_trigger_cascade_rows() {
 
 #[tokio::test]
 async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tenant_id = "relay-trigger";
 
     let hub_db = Arc::new(Database::open_memory());
     hub_db
         .execute(
-            "CREATE TABLE widgets (id UUID PRIMARY KEY, label TEXT)",
+            "CREATE TABLE widgets (id UUID PRIMARY KEY, label TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST",
             &no_params(),
         )
         .unwrap();
@@ -499,12 +469,19 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
         .unwrap();
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let server = Arc::new(SyncServer::new(
-        Arc::clone(&hub_db),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant_id),
-        server_wins(),
-    ));
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            Arc::clone(&hub_db),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(tenant_id),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
     let constructor_id = wuuid(6);
     let constructor_apply = hub_db.apply_changes(
         ChangeSet {
@@ -534,9 +511,30 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move { server.run_until(shutdown).await })
     };
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant_id,
+        )),
+    )
+    .await
+    .expect("relay sync server route");
 
-    let edge_db = Arc::new(open_edge_with_widget_trigger());
+    let edge_db = Arc::new(Database::open_memory());
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        Arc::clone(&edge_db),
+        fabric.client_as(&edge_node_id),
+        contextdb_core::TenantId::from(tenant_id),
+        edge_identity,
+    );
+    client
+        .pull_default()
+        .await
+        .expect("edge learns the relay hub's trigger-table schema before writing");
+    edge_db
+        .register_trigger_callback("widget_guard", |_, _| Ok(()))
+        .unwrap();
+    edge_db.complete_initialization().unwrap();
     let id = wuuid(7);
     edge_db
         .execute(
@@ -544,15 +542,23 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
             &widget_params(id, "w7"),
         )
         .unwrap();
-
-    let client = SyncClient::new(
-        Arc::clone(&edge_db),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant_id),
+    let pending = client.pending_push_change_count().unwrap();
+    let raw = edge_db.changes_since(Lsn(0));
+    let direction = edge_db
+        .table_meta("widgets")
+        .and_then(|meta| meta.sync_direction);
+    assert_eq!(
+        pending,
+        1,
+        "the local trigger-table row must remain eligible under the received PUSH ONLY declaration; \
+         direction={direction:?}, push_watermark={:?}, current_lsn={:?}, raw_rows={:?}",
+        client.push_watermark(),
+        edge_db.current_lsn(),
+        raw.rows
+            .iter()
+            .map(|row| (&row.table, row.lsn, row.deleted))
+            .collect::<Vec<_>>()
     );
-    client
-        .set_table_direction("widgets", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
     let pushed = client.push().await;
     assert!(
         pushed.is_ok(),
@@ -562,7 +568,7 @@ async fn oss_syncserver_relay_hub_accepts_pushed_trigger_table_row() {
     assert_eq!(
         widget_label(&hub_db, id).as_deref(),
         Some("w7"),
-        "the relay hub must have filed the pushed trigger-table row"
+        "the relay hub must have filed the pushed trigger-table row; push result: {pushed:?}"
     );
 
     shutdown.store(true, Ordering::SeqCst);

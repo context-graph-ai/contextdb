@@ -3,36 +3,24 @@ use contextdb_core::*;
 use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, NaturalKey, RowChange};
-#[cfg(feature = "nats-tests")]
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::identity::FabricIdentity;
+use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::process::{Child, Command};
-#[cfg(feature = "nats-tests")]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-#[cfg(feature = "nats-tests")]
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-#[cfg(feature = "nats-tests")]
-use testcontainers::runners::AsyncRunner;
-#[cfg(feature = "nats-tests")]
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
 const CLI_BAD_PATH: &str = "/nonexistent/deeply/nested/path/test.db";
 const CLI_SPAWN_STABILITY_WORKERS: usize = 16;
 const CLI_SPAWN_STABILITY_OUTER_ITERATIONS: usize = 3;
-
-#[cfg(feature = "nats-tests")]
-struct NatsFixture {
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
-}
 
 type BadPathCliOutput = (usize, std::result::Result<std::process::Output, String>);
 type MemoryModeCliOutput = (
@@ -360,27 +348,6 @@ fn brute_force_top_k(vectors: &[(RowId, Vec<f32>)], query: &[f32], k: usize) -> 
         .collect::<Vec<_>>();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     scored.into_iter().take(k).map(|(rid, _)| rid).collect()
-}
-
-#[cfg(feature = "nats-tests")]
-fn setup_nats_conf() -> String {
-    format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"))
-}
-
-#[cfg(feature = "nats-tests")]
-async fn start_nats() -> NatsFixture {
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-    let request = image
-        .with_mount(Mount::bind_mount(setup_nats_conf(), "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
-    let container = request.start().await.unwrap();
-    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
-    NatsFixture {
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
-    }
 }
 
 #[test]
@@ -1345,37 +1312,57 @@ fn p16_state_propagation_survives_restart() {
     assert_eq!(text(&row, "status"), "invalidated");
 }
 
-#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn p17_edge_pushes_to_server_both_survive_restart() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let edge_tmp = TempDir::new().unwrap();
     let server_tmp = TempDir::new().unwrap();
     let edge_path = edge_tmp.path().join("edge.db");
     let server_path = server_tmp.path().join("server.db");
     let edge_db = Arc::new(Database::open(&edge_path).unwrap());
     let server_db = Arc::new(Database::open(&server_path).unwrap());
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let empty = HashMap::new();
-    edge_db
-        .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
-        .unwrap();
     server_db
-        .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
+        .execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT) SYNC CONFLICT KEEP FIRST",
+            &empty,
+        )
         .unwrap();
 
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("p17"),
-        policies.clone(),
-    ));
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from("p17"),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn({
         let server = server.clone();
-        async move { server.run().await }
+        let shutdown = shutdown.clone();
+        async move { server.run_until(shutdown).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric
+            .wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject("p17")),
+    )
+    .await
+    .expect("p17 server route");
 
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_db.clone(),
+        fabric.client_as(&edge_node_id),
+        contextdb_core::TenantId::from("p17"),
+        edge_identity,
+    );
+    client.pull_default().await.unwrap();
     let id = Uuid::new_v4();
     edge_db
         .execute(
@@ -1386,15 +1373,10 @@ async fn p17_edge_pushes_to_server_both_survive_restart() {
             ]),
         )
         .unwrap();
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("p17"),
-    );
     client.push().await.unwrap();
 
-    handle.abort();
-    let _ = handle.await;
+    shutdown.store(true, Ordering::SeqCst);
+    handle.await.expect("p17 server task");
     drop(client);
     drop(server);
     drop(edge_db);
@@ -1691,12 +1673,6 @@ fn cli_bad_path_exit_code_is_deterministic_under_concurrent_load() {
             );
         }
     }
-}
-
-#[cfg(feature = "nats-tests")]
-#[tokio::test]
-async fn p23_server_started_with_db_path_survives_restart() {
-    let _ = start_nats().await;
 }
 
 #[test]
@@ -2180,10 +2156,9 @@ fn p32_deleted_vectors_excluded_from_ann_after_reopen() {
     assert_eq!(db2.scan("obs", db2.snapshot()).unwrap().len(), 3);
 }
 
-#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn p33_bidirectional_sync_with_persistence() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
 
     let edge_tmp = TempDir::new().unwrap();
     let server_tmp = TempDir::new().unwrap();
@@ -2192,37 +2167,14 @@ async fn p33_bidirectional_sync_with_persistence() {
 
     let edge_db = Arc::new(Database::open(&edge_path).unwrap());
     let server_db = Arc::new(Database::open(&server_path).unwrap());
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let empty = HashMap::new();
 
-    edge_db
-        .execute(
-            "CREATE TABLE t (id UUID PRIMARY KEY, source TEXT, seq INTEGER)",
-            &empty,
-        )
-        .unwrap();
     server_db
         .execute(
-            "CREATE TABLE t (id UUID PRIMARY KEY, source TEXT, seq INTEGER)",
+            "CREATE TABLE t (id UUID PRIMARY KEY, source TEXT, seq INTEGER) SYNC CONFLICT KEEP FIRST",
             &empty,
         )
         .unwrap();
-
-    let mut edge_ids = Vec::new();
-    for i in 0..50 {
-        let id = Uuid::new_v4();
-        edge_db
-            .execute(
-                "INSERT INTO t (id, source, seq) VALUES ($id, $source, $seq)",
-                &HashMap::from([
-                    ("id".to_string(), Value::Uuid(id)),
-                    ("source".to_string(), Value::Text("edge".to_string())),
-                    ("seq".to_string(), Value::Int64(i)),
-                ]),
-            )
-            .unwrap();
-        edge_ids.push(id);
-    }
 
     let mut server_ids = Vec::new();
     for i in 0..50 {
@@ -2240,25 +2192,57 @@ async fn p33_bidirectional_sync_with_persistence() {
         server_ids.push(id);
     }
 
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("p33"),
-        policies.clone(),
-    ));
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from("p33"),
+            hub_node_id.clone(),
+            hub_identity.clone(),
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn({
         let server = server.clone();
-        async move { server.run().await }
+        let shutdown = shutdown.clone();
+        async move { server.run_until(shutdown).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric
+            .wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject("p33")),
+    )
+    .await
+    .expect("p33 server route");
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("p33"),
+        edge_identity.clone(),
     );
+    client.pull_default().await.unwrap();
+
+    let mut edge_ids = Vec::new();
+    for i in 0..50 {
+        let id = Uuid::new_v4();
+        edge_db
+            .execute(
+                "INSERT INTO t (id, source, seq) VALUES ($id, $source, $seq)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    ("source".to_string(), Value::Text("edge".to_string())),
+                    ("seq".to_string(), Value::Int64(i)),
+                ]),
+            )
+            .unwrap();
+        edge_ids.push(id);
+    }
     client.push().await.unwrap();
-    client.pull(&policies).await.unwrap();
 
     let edge_row_0 = edge_db
         .point_lookup("t", "id", &Value::Uuid(edge_ids[0]), edge_db.snapshot())
@@ -2286,9 +2270,9 @@ async fn p33_bidirectional_sync_with_persistence() {
         .max()
         .unwrap();
 
+    shutdown.store(true, Ordering::SeqCst);
+    handle.await.expect("p33 first server task");
     drop(server);
-    handle.abort();
-    let _ = handle.await;
     drop(client);
     Arc::try_unwrap(edge_db).unwrap().close().unwrap();
     Arc::try_unwrap(server_db).unwrap().close().unwrap();
@@ -2413,25 +2397,37 @@ async fn p33_bidirectional_sync_with_persistence() {
         )
         .unwrap();
 
-    let server2 = Arc::new(SyncServer::new(
-        server_db2.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("p33"),
-        policies.clone(),
-    ));
+    let server2 = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db2.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from("p33"),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
+    let shutdown2 = Arc::new(AtomicBool::new(false));
     let handle2 = tokio::spawn({
         let s = server2.clone();
-        async move { s.run().await }
+        let shutdown = shutdown2.clone();
+        async move { s.run_until(shutdown).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric
+            .wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject("p33")),
+    )
+    .await
+    .expect("restarted p33 server route");
 
-    let client2 = SyncClient::new(
+    let client2 = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db2.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("p33"),
+        edge_identity,
     );
     client2.push().await.unwrap();
-    client2.pull(&policies).await.unwrap();
+    client2.pull_default().await.unwrap();
 
     let server_rows2 = server_db2.scan("t", server_db2.snapshot()).unwrap();
     assert_eq!(
@@ -2479,9 +2475,9 @@ async fn p33_bidirectional_sync_with_persistence() {
         Some(&Value::Text("server_post_reopen".to_string()))
     );
 
+    shutdown2.store(true, Ordering::SeqCst);
+    handle2.await.expect("p33 restarted server task");
     drop(server2);
-    handle2.abort();
-    let _ = handle2.await;
 }
 
 #[test]

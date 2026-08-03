@@ -36,7 +36,6 @@ tracing = "0.1.44"
 pest = "2.8.6"
 pest_derive = "2.8.6"
 rustyline = "17.0.2"
-async-nats = "0.49.1"
 tokio = { version = "1", features = ["full"] }
 rmp-serde = "1"
 clap = { version = "4", features = ["derive", "env"] }

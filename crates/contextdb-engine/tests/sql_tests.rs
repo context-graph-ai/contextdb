@@ -588,6 +588,53 @@ fn test_schema_render_txid_roundtrips() {
     );
 }
 
+#[test]
+fn schema_render_roundtrips_multiple_table_unique_constraints() {
+    use contextdb_engine::cli_render::render_table_meta;
+
+    let db_a = Database::open_memory();
+    let empty = HashMap::new();
+    db_a
+        .execute(
+            "CREATE TABLE access_grants (tenant_id UUID NOT NULL, principal_id UUID NOT NULL, resource_id UUID NOT NULL, scope_id UUID NOT NULL, PRIMARY KEY (tenant_id, principal_id), UNIQUE (tenant_id, principal_id, resource_id, scope_id), UNIQUE (principal_id, resource_id, scope_id))",
+            &empty,
+        )
+        .expect("source table with composite keys and UNIQUE constraints must parse");
+
+    let meta_a = db_a
+        .table_meta("access_grants")
+        .expect("source table metadata must exist");
+    let rendered = render_table_meta("access_grants", &meta_a);
+    assert!(
+        rendered.contains("PRIMARY KEY (tenant_id, principal_id)"),
+        "rendered .schema output must retain the table-level composite primary key, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("UNIQUE (tenant_id, principal_id, resource_id, scope_id)"),
+        "rendered .schema output must retain the four-column table UNIQUE constraint, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("UNIQUE (principal_id, resource_id, scope_id)"),
+        "rendered .schema output must retain the overlapping three-column table UNIQUE constraint, got:\n{rendered}"
+    );
+
+    let db_b = Database::open_memory();
+    db_b.execute(&rendered, &empty).unwrap_or_else(|error| {
+        panic!("rendered DDL must parse on a fresh database: {error:?}\nrendered:\n{rendered}")
+    });
+    let meta_b = db_b
+        .table_meta("access_grants")
+        .expect("round-tripped table metadata must exist");
+    assert_eq!(
+        meta_b.primary_key_columns, meta_a.primary_key_columns,
+        "rendered DDL must preserve the composite primary key"
+    );
+    assert_eq!(
+        meta_b.unique_constraints, meta_a.unique_constraints,
+        "rendered DDL must preserve every table-level composite UNIQUE constraint"
+    );
+}
+
 // ======== T12 ========
 #[test]
 fn test_insert_value_txid_within_watermark_succeeds() {

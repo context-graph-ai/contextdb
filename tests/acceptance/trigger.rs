@@ -1,6 +1,4 @@
 use super::common::{count_rows, empty_params};
-#[cfg(feature = "nats-tests")]
-use super::common::{start_nats, wait_for_sync_server_ready};
 use contextdb_core::{
     CallbackKind, ContextId, Error, Lsn, Principal, Result, RowId, ScopeLabel, SortDirection, TxId,
     UpsertResult, Value, VectorIndexRef, VersionedRow,
@@ -12,11 +10,12 @@ use contextdb_engine::sync_types::{
 use contextdb_engine::{
     Database, TriggerAuditFilter, TriggerAuditStatus, TriggerAuditStatusFilter, TriggerEvent,
 };
-use contextdb_server::protocol::WireChangeSet;
-#[cfg(feature = "nats-tests")]
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::protocol::{
+    WireChangeSet, WireDdlProvenance, canonical_ddl_provenance_digest,
+};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -57,6 +56,16 @@ fn setup_host_tables(db: &Database) {
         &empty(),
     )
     .unwrap();
+}
+
+fn declare_host_sync_keep_latest(db: &Database) {
+    for table in ["host_writes", "host_audits"] {
+        db.execute(
+            &format!("ALTER TABLE {table} SET SYNC CONFLICT KEEP LATEST"),
+            &empty(),
+        )
+        .unwrap();
+    }
 }
 
 fn setup_ready_host_write_trigger(db: &Database) {
@@ -347,7 +356,6 @@ fn live_vector_count(db: &Database, table: &str) -> usize {
         .count()
 }
 
-#[cfg(feature = "nats-tests")]
 fn audited_edge_count(db: &Database, ids: &[Uuid]) -> usize {
     ids.iter()
         .copied()
@@ -5918,12 +5926,16 @@ fn t3_sync_originator_fires_receiver_does_not_refire() {
     );
 }
 
-#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
-    let nats = start_nats().await;
-    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+    let fabric = InProcessBroker::new();
     let tenant_id = "t3-trigger-ddl-sync";
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let edge_a_identity = Arc::new(FabricIdentity::generate());
+    let edge_b_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let edge_a_node_id = edge_a_identity.node_id();
+    let edge_b_node_id = edge_b_identity.node_id();
 
     let db_tmp = TempDir::new().unwrap();
     let server_path = db_tmp.path().join("server.redb");
@@ -5932,36 +5944,48 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let server_db = Arc::new(Database::open(&server_path).unwrap());
     let edge_a_db = Arc::new(Database::open(&edge_a_path).unwrap());
     let mut edge_b_db = Arc::new(Database::open(&edge_b_path).unwrap());
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant_id),
-        policies.clone(),
-    ));
-    let server_task = server.clone();
-    tokio::spawn(async move { server_task.run().await });
-    assert!(
-        wait_for_sync_server_ready(&nats.nats_url, tenant_id, Duration::from_secs(5)).await,
-        "sync server must be ready before trigger DDL push/pull assertions"
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(tenant_id),
+            hub_node_id.clone(),
+            hub_identity,
+        ),
     );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_task = server.clone();
+    let shutdown_task = shutdown.clone();
+    let task = tokio::spawn(async move { server_task.run_until(shutdown_task).await });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant_id,
+        )),
+    )
+    .await
+    .expect("sync server must register its status route before trigger DDL assertions");
 
     setup_host_tables(&edge_a_db);
+    declare_host_sync_keep_latest(&edge_a_db);
     let edge_a_fires = Arc::new(AtomicUsize::new(0));
     register_audit_callback(&edge_a_db, edge_a_fires.clone());
     edge_a_db.complete_initialization().unwrap();
 
-    let edge_a = SyncClient::new(
+    let edge_a = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_a_db.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_a_node_id),
         contextdb_core::TenantId::from(tenant_id),
+        edge_a_identity,
     );
-    let mut edge_b = SyncClient::new(
+    let mut edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_b_db.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_b_node_id),
         contextdb_core::TenantId::from(tenant_id),
+        edge_b_identity.clone(),
     );
     let create_push = edge_a.push().await;
-    let create_pull = edge_b.pull(&policies).await;
+    let create_pull = edge_b.pull_default().await;
     let server_trigger_after_create = server_db.list_triggers();
     let edge_b_trigger_after_create = edge_b_db.list_triggers();
     let edge_b_missing_callback = edge_b_db.complete_initialization();
@@ -6003,10 +6027,11 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     );
     reopened_edge_b_after_create.close().unwrap();
     edge_b_db = Arc::new(Database::open(&edge_b_path).unwrap());
-    edge_b = SyncClient::new(
+    edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_b_db.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_b_node_id),
         contextdb_core::TenantId::from(tenant_id),
+        edge_b_identity,
     );
 
     let server_fires = Arc::new(AtomicUsize::new(0));
@@ -6059,7 +6084,7 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
 
     let edge_b_data_since = edge_b_db.current_lsn();
     let edge_b_rx = edge_b_db.subscribe();
-    let data_pull = edge_b.pull(&policies).await;
+    let data_pull = edge_b.pull_default().await;
     let edge_b_groups =
         row_group_signatures(&edge_b_db, edge_b_db.changes_since(edge_b_data_since));
     let mut edge_b_events = Vec::new();
@@ -6113,10 +6138,24 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let data_push_noop = edge_a.push().await;
     let server_noop_changes = server_db.changes_since(server_noop_since);
     let server_noop_event = server_noop_rx.recv_timeout(Duration::from_millis(300));
+    let server_noop_user_rows = server_noop_changes
+        .rows
+        .iter()
+        .filter(|row| matches!(row.table.as_str(), "host_writes" | "host_audits"))
+        .count();
+    let server_noop_user_event = server_noop_event.as_ref().is_ok_and(|event| {
+        event
+            .tables_changed
+            .iter()
+            .any(|table| matches!(table.as_str(), "host_writes" | "host_audits"))
+    });
     assert!(
         data_push_noop.is_ok()
-            && !changeset_has_data(&server_noop_changes)
-            && server_noop_event.is_err()
+            && server_noop_user_rows == 0
+            && server_noop_changes.edges.is_empty()
+            && server_noop_changes.vectors.is_empty()
+            && server_noop_changes.ddl.is_empty()
+            && !server_noop_user_event
             && server_fires.load(Ordering::SeqCst) == 0
             && fired_trigger_history(&server_db, "host_write_trigger")
                 == server_history_before_noop
@@ -6124,7 +6163,7 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
             && count_rows(&server_db, "host_audits") == expected_ids.len()
             && audited_edge_count(&server_db, &expected_ids) == expected_ids.len()
             && live_vector_count(&server_db, "host_audits") == expected_ids.len(),
-        "repeating SyncClient push after data is already applied must be a no-op: no events, audit entries, rows, edges, vectors, or DDL; push={data_push_noop:?}, changes={server_noop_changes:?}, event={server_noop_event:?}, fires={}, history_before={server_history_before_noop:?}, history_after={:?}, counts=({}, {}, edges {}, vectors {})",
+        "repeating SyncClient push after data is already applied must add no user-table events, audit entries, rows, edges, vectors, or DDL; the authenticated work_node_contacts update remains expected; push={data_push_noop:?}, changes={server_noop_changes:?}, event={server_noop_event:?}, fires={}, history_before={server_history_before_noop:?}, history_after={:?}, counts=({}, {}, edges {}, vectors {})",
         server_fires.load(Ordering::SeqCst),
         fired_trigger_history(&server_db, "host_write_trigger"),
         count_rows(&server_db, "host_writes"),
@@ -6137,7 +6176,7 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let edge_b_ddl_before_noop = format!("{:?}", edge_b_db.changes_since(Lsn(0)).ddl);
     let edge_b_noop_since = edge_b_db.current_lsn();
     let edge_b_noop_rx = edge_b_db.subscribe();
-    let data_pull_noop = edge_b.pull(&policies).await;
+    let data_pull_noop = edge_b.pull_default().await;
     let edge_b_noop_changes = edge_b_db.changes_since(edge_b_noop_since);
     let edge_b_noop_event = edge_b_noop_rx.recv_timeout(Duration::from_millis(300));
     assert!(
@@ -6164,13 +6203,17 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
 
     let drop = edge_a_db.execute("DROP TRIGGER host_write_trigger", &empty());
     let drop_push = edge_a.push().await;
-    let drop_pull = edge_b.pull(&policies).await;
+    let drop_pull = edge_b.pull_default().await;
     let edge_b_ready_after_drop = edge_b_db.complete_initialization();
     let edge_b_ddl_history = edge_b_db.changes_since(Lsn(0)).ddl;
     let edge_b_tables = edge_b_ddl_history
         .iter()
         .filter_map(|change| match change {
-            DdlChange::CreateTable { name, .. } => Some(name.clone()),
+            DdlChange::CreateTable { name, .. }
+                if matches!(name.as_str(), "host_writes" | "host_audits") =>
+            {
+                Some(name.clone())
+            }
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -6218,18 +6261,32 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let edge_b_drop_noop_since = edge_b_db.current_lsn();
     let edge_b_drop_noop_rx = edge_b_db.subscribe();
     let drop_push_noop = edge_a.push().await;
-    let drop_pull_noop = edge_b.pull(&policies).await;
+    let drop_pull_noop = edge_b.pull_default().await;
     let server_drop_noop_changes = server_db.changes_since(server_drop_noop_since);
     let edge_b_drop_noop_changes = edge_b_db.changes_since(edge_b_drop_noop_since);
     let server_drop_noop_event = server_drop_noop_rx.recv_timeout(Duration::from_millis(300));
     let edge_b_drop_noop_event = edge_b_drop_noop_rx.recv_timeout(Duration::from_millis(300));
     let edge_b_drop_ddl_after_noop = format!("{:?}", edge_b_db.changes_since(Lsn(0)).ddl);
+    let server_drop_noop_user_rows = server_drop_noop_changes
+        .rows
+        .iter()
+        .filter(|row| matches!(row.table.as_str(), "host_writes" | "host_audits"))
+        .count();
+    let server_drop_noop_user_event = server_drop_noop_event.as_ref().is_ok_and(|event| {
+        event
+            .tables_changed
+            .iter()
+            .any(|table| matches!(table.as_str(), "host_writes" | "host_audits"))
+    });
     assert!(
         drop_push_noop.is_ok()
             && drop_pull_noop.is_ok()
-            && !changeset_has_data(&server_drop_noop_changes)
+            && server_drop_noop_user_rows == 0
+            && server_drop_noop_changes.edges.is_empty()
+            && server_drop_noop_changes.vectors.is_empty()
+            && server_drop_noop_changes.ddl.is_empty()
             && !changeset_has_data(&edge_b_drop_noop_changes)
-            && server_drop_noop_event.is_err()
+            && !server_drop_noop_user_event
             && edge_b_drop_noop_event.is_err()
             && server_db.list_triggers().is_empty()
             && edge_b_db.list_triggers().is_empty()
@@ -6240,7 +6297,7 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
             && count_rows(&edge_b_db, "host_audits") == expected_ids.len()
             && audited_edge_count(&edge_b_db, &expected_ids) == expected_ids.len()
             && live_vector_count(&edge_b_db, "host_audits") == expected_ids.len(),
-        "repeating SyncClient push/pull after trigger tombstone is already applied must be idempotent: no duplicate tombstone, events, audit entries, rows, edges, or vectors; push={drop_push_noop:?}, pull={drop_pull_noop:?}, server_changes={server_drop_noop_changes:?}, edge_changes={edge_b_drop_noop_changes:?}, server_event={server_drop_noop_event:?}, edge_event={edge_b_drop_noop_event:?}, ddl_before={edge_b_drop_ddl_before_noop:?}, ddl_after={edge_b_drop_ddl_after_noop:?}, history_before={edge_b_drop_history_before_noop:?}, history_after={:?}, counts=({}, {}, edges {}, vectors {})",
+        "repeating SyncClient push/pull after trigger tombstone is already applied must be idempotent: no duplicate tombstone, user-table events, audit entries, rows, edges, or vectors; the authenticated work_node_contacts update remains expected; push={drop_push_noop:?}, pull={drop_pull_noop:?}, server_changes={server_drop_noop_changes:?}, edge_changes={edge_b_drop_noop_changes:?}, server_event={server_drop_noop_event:?}, edge_event={edge_b_drop_noop_event:?}, ddl_before={edge_b_drop_ddl_before_noop:?}, ddl_after={edge_b_drop_ddl_after_noop:?}, history_before={edge_b_drop_history_before_noop:?}, history_after={:?}, counts=({}, {}, edges {}, vectors {})",
         fired_trigger_history(&edge_b_db, "host_write_trigger"),
         count_rows(&edge_b_db, "host_writes"),
         count_rows(&edge_b_db, "host_audits"),
@@ -6325,6 +6382,10 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
         count_rows(&reopened_edge_b, "host_audits")
     );
     reopened_edge_b.close().unwrap();
+    std::mem::drop(edge_a);
+    std::mem::drop(edge_b);
+    shutdown.store(true, Ordering::SeqCst);
+    task.await.expect("sync server task");
 }
 
 #[test]
@@ -6344,8 +6405,37 @@ fn t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure() {
         ddl_lsn: vec![Lsn(5), Lsn(9)],
         ..Default::default()
     };
-    let encoded = rmp_serde::to_vec(&WireChangeSet::from(wire_changes))
-        .expect("trigger DDL WireChangeSet must encode");
+    let mut wire_changes = WireChangeSet::from(wire_changes);
+    wire_changes.ddl_provenance = wire_changes
+        .ddl
+        .iter()
+        .zip(&wire_changes.ddl_lsn)
+        .map(|(ddl, source_ddl_lsn)| {
+            let (table, table_generation) = match ddl {
+                contextdb_server::protocol::WireDdlChange::CreateTrigger { table, .. } => {
+                    (Some(table.clone()), Some(1))
+                }
+                contextdb_server::protocol::WireDdlChange::DropTrigger { .. } => (None, None),
+                other => panic!("unexpected trigger DDL in fixture: {other:?}"),
+            };
+            let ordinal = 0;
+            WireDdlProvenance {
+                source_ddl_lsn: *source_ddl_lsn,
+                ordinal,
+                digest: canonical_ddl_provenance_digest(
+                    ddl,
+                    *source_ddl_lsn,
+                    ordinal,
+                    table.as_deref(),
+                    table_generation,
+                )
+                .expect("trigger DDL provenance digest must encode"),
+                table,
+                table_generation,
+            }
+        })
+        .collect();
+    let encoded = rmp_serde::to_vec(&wire_changes).expect("trigger DDL WireChangeSet must encode");
     let decoded_wire: WireChangeSet =
         rmp_serde::from_slice(&encoded).expect("trigger DDL WireChangeSet must decode");
     let decoded_changes =
@@ -6624,12 +6714,14 @@ fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
     }
 }
 
-#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() {
-    let nats = start_nats().await;
-    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
+    let fabric = InProcessBroker::new();
     let tenant_id = "t3-trigger-bootstrap-pull";
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let fresh_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let fresh_node_id = fresh_identity.node_id();
 
     let db_tmp = TempDir::new().unwrap();
     let server_path = db_tmp.path().join("server.redb");
@@ -6638,6 +6730,7 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
     let fresh_db = Arc::new(Database::open(&fresh_path).unwrap());
 
     setup_host_tables(&server_seed);
+    declare_host_sync_keep_latest(&server_seed);
     let server_fires = Arc::new(AtomicUsize::new(0));
     register_audit_callback(&server_seed, server_fires.clone());
     server_seed.complete_initialization().unwrap();
@@ -6656,25 +6749,35 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
     server_seed.close().unwrap();
     let server_db = Arc::new(Database::open(&server_path).unwrap());
 
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant_id),
-        policies.clone(),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(tenant_id),
+            hub_node_id.clone(),
+            hub_identity,
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = server.clone();
-    tokio::spawn(async move { server_task.run().await });
-    assert!(
-        wait_for_sync_server_ready(&nats.nats_url, tenant_id, Duration::from_secs(5)).await,
-        "sync server must be ready before fresh trigger bootstrap pull"
-    );
+    let shutdown_task = shutdown.clone();
+    let task = tokio::spawn(async move { server_task.run_until(shutdown_task).await });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant_id,
+        )),
+    )
+    .await
+    .expect("sync server must register its status route before trigger bootstrap pull");
 
-    let fresh = SyncClient::new(
+    let fresh = SyncClient::with_authenticated_transport_and_identity_for_test(
         fresh_db.clone(),
-        &nats.nats_url,
+        fabric.client_as(&fresh_node_id),
         contextdb_core::TenantId::from(tenant_id),
+        fresh_identity,
     );
-    let first_pull = fresh.pull(&policies).await;
+    let first_pull = fresh.pull_default().await;
     let missing_callback = fresh_db.complete_initialization();
     assert!(
         first_pull.is_ok()
@@ -6700,7 +6803,7 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
     register_audit_callback(&fresh_db, fresh_fires.clone());
     fresh_db.complete_initialization().unwrap();
     let fresh_since = fresh_db.current_lsn();
-    let second_pull = fresh.pull(&policies).await;
+    let second_pull = fresh.pull_default().await;
 
     assert!(
         second_pull.is_ok()
@@ -6716,6 +6819,9 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
         count_rows(&fresh_db, "host_writes"),
         count_rows(&fresh_db, "host_audits")
     );
+    drop(fresh);
+    shutdown.store(true, Ordering::SeqCst);
+    task.await.expect("sync server task");
 }
 
 #[test]

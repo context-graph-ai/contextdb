@@ -1,6 +1,7 @@
 use contextdb_core::Lsn;
 use contextdb_core::{Error, Value, VersionedRow};
-use contextdb_engine::{ConflictPolicies, ConflictPolicy, Database};
+use contextdb_engine::Database;
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use std::collections::HashMap;
 use uuid::Uuid;
 

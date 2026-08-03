@@ -21,8 +21,7 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
 - `cargo bench -p contextdb-server --bench server_throughput`
   - CLI smoke bench
 - `cargo bench -p contextdb-server --bench server_sync_system`
-  - system sync bench with a real NATS broker via testcontainers; broker-backed,
-    so it requires `--features nats-tests` and Docker (the deprecated NATS path)
+  - system sync bench with authenticated Iroh and file-backed CLI/server processes
 - `cargo bench -p contextdb-server --bench sync_pr`
   - bounded PR-tier sync workloads using direct sync APIs
 
@@ -35,8 +34,8 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
   run is a correctness/locality failure first and a performance result second.
 - Use `mixed_workflows_pr` and `subscriptions_pr` for realistic engine-level PR regression coverage.
 - Use `sync_pr` when you want realistic sync regression coverage without CLI/process overhead in the timed path.
-- Use `server_sync_system` only when you are intentionally testing sync/system behavior. It exercises the deprecated NATS broker path, so it requires a build with `--features nats-tests` and a running Docker daemon. The default dial-by-key benches need no broker.
-- The server sync bench is heavier because it uses release binaries, a real NATS container, and file-backed CLI/server processes.
+- Use `server_sync_system` only when you are intentionally testing sync/system behavior.
+- The server sync bench is heavier because it uses release binaries and file-backed CLI/server processes.
 
 ## Suggested Commands
 
@@ -50,8 +49,8 @@ ContextDB now has explicit benchmark tiers instead of one undifferentiated suite
   - `timeout 180s cargo bench -p contextdb-engine --bench mixed_workflows_pr -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
   - `timeout 180s cargo bench -p contextdb-engine --bench subscriptions_pr -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
   - `timeout 180s cargo bench -p contextdb-server --bench sync_pr -- chunked_large_pull_600_rows --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
-- system (deprecated NATS path — needs `--features nats-tests` and Docker):
-  - `timeout 180s cargo bench -p contextdb-server --features nats-tests --bench server_sync_system -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
+- system:
+  - `timeout 180s cargo bench -p contextdb-server --bench server_sync_system -- --sample-size 10 --measurement-time 0.05 --warm-up-time 0.05`
 
 Always use `timeout` on heavier runs. If a benchmark spends the whole run on setup/build noise and never reaches useful Criterion output, treat that as a benchmark-shape problem to fix rather than a valid perf result.
 

@@ -6,6 +6,7 @@ shutdown
 db
 transfer_receipts
 has_pending_push_changes
+pending_push_change_count
 push
 pull_default
 push_watermark

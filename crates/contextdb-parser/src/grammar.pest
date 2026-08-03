@@ -23,6 +23,7 @@ stmt = _{
     | create_route_stmt
     | drop_route_stmt
     | insert_stmt
+    | purge_stmt
     | delete_stmt
     | update_stmt
     | show_sync_conflict_policy
@@ -412,6 +413,8 @@ on_conflict_clause = {
     ~ ("," ~ assignment)*
 }
 assignment = { identifier ~ "=" ~ expr }
+
+purge_stmt = { ^"PURGE" ~ ^"FROM" ~ identifier ~ where_clause? }
 
 delete_stmt = { ^"DELETE" ~ ^"FROM" ~ identifier ~ where_clause? }
 

@@ -4023,68 +4023,70 @@ fn t40_sync_wire_substring_contract() {
 
 // ============================================================================
 // t40b_sync_push_response_error_carries_typed_substrings_over_wire
-// End-to-end wire test. A real contextdb-server child process is spawned
-// alongside testcontainers NATS; a SyncClient pushes a ChangeSet whose
-// receiver-side apply_changes hits B2 (parked trigger callback on the
-// a separate database in the same process). The PushResponse.error wraps the
-// engine's typed Display string; SyncClient::push surfaces that string via
-// Err(SyncError(_)).
-// We assert the received error string contains BOTH "callback active on
-// another thread" (kind-agnostic) AND "trigger callback" (kind disambiguator).
-// Without this, a future engine PR that redacts the error string at
-// sync_server.rs:237/256/294 would silently break the wire substring while
-// the in-process t40 still passed.
+// End-to-end authenticated transport test. A SyncClient pushes while a trigger
+// callback is parked on a separate database in the server process. This proves
+// unrelated trigger activity does not poison the sync apply path.
 // ============================================================================
 //
 // Harness shape mirrors tests/acceptance/sync.rs::sync_e2e_value_txid_round_trip
-// (uses common::start_nats and SyncClient/SyncServer in-process via tokio
-// rather than spawn_server, since we need to register a trigger callback on
-// the server-side Database — spawn_server uses the contextdb-server binary
-// which has no trigger-callback registration surface across the process boundary).
+// and keeps the server in-process because this test must register a callback on
+// the server-side Database.
 //
 // IMPORTANT: this test runs the server-side Database in-process under a
-// tokio runtime, which is sufficient to exercise the wire path (NATS round
-// trip + PushResponse encoding/decoding). It is functionally equivalent to
-// spawning the server binary for the purposes of the cross-DB independence
-// contract.
-#[cfg(feature = "nats-tests")]
+// tokio runtime, which exercises the authenticated request/response path.
 #[tokio::test]
 #[serial]
 async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
-    use super::common::{start_nats, wait_for_sync_server_ready};
-    use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-    use contextdb_server::{SyncClient, SyncServer};
+    use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tenant = "t40b_wire_substring";
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let edge_node_id = edge_identity.node_id();
 
     // Server-side database: no local trigger. A parked trigger on an unrelated
     // in-process DB must not poison the sync wire path.
     let server_db = Arc::new(Database::open_memory());
     let _server_pause = server_db.pause_cron_tickler_for_test();
     server_db
-        .execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
+        .execute(
+            "CREATE TABLE applied (id UUID PRIMARY KEY) SYNC CONFLICT KEEP FIRST",
+            &empty(),
+        )
         .unwrap();
 
     // Edge-side database: same DDL so ChangeSet conversion succeeds.
     let edge_db = Arc::new(Database::open_memory());
     edge_db
-        .execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
+        .execute(
+            "CREATE TABLE applied (id UUID PRIMARY KEY) SYNC CONFLICT KEEP FIRST",
+            &empty(),
+        )
         .unwrap();
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-        policies.clone(),
-    ));
-    let server_handle = server.clone();
-    tokio::spawn(async move { server_handle.run().await });
-    assert!(
-        wait_for_sync_server_ready(&nats.nats_url, tenant, Duration::from_secs(15)).await,
-        "sync server must be ready before t40b parks the trigger callback"
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(tenant),
+            hub_node_id,
+            hub_identity,
+        ),
     );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_handle = server.clone();
+    let shutdown_handle = shutdown.clone();
+    let server_task = tokio::spawn(async move { server_handle.run_until(shutdown_handle).await });
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant,
+        )),
+    )
+    .await
+    .expect("sync server must register its status route before t40b parks the callback");
 
     // Park an unrelated trigger callback in-process while sync push is in
     // flight. The server-side apply_changes targets server_db, not trigger_db.
@@ -4107,10 +4109,11 @@ async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
 
     // Now push from the edge. Cross-DB trigger activity must not surface as a
     // sync-wire error for an unrelated server database.
-    let edge_client = SyncClient::new(
+    let edge_client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from(tenant),
+        edge_identity,
     );
     // Insert a row on the edge so push has something to send.
     {
@@ -4145,6 +4148,8 @@ async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
         1,
         "server DB should receive the pushed row"
     );
+    shutdown.store(true, AtomicOrdering::SeqCst);
+    server_task.await.expect("sync server task");
 }
 
 // t41 lives in tests/acceptance/trigger.rs. It guards against

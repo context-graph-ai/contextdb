@@ -35,12 +35,6 @@ struct Args {
     #[arg(long, env = "CONTEXTDB_SYNC_ENDPOINT")]
     sync_endpoint: Option<String>,
 
-    /// DEPRECATED: broker URL for the retained NATS adapter (requires a
-    /// contextdb-server build with the `nats` cargo feature). Use
-    /// --sync-endpoint instead.
-    #[arg(long, env = "CONTEXTDB_NATS_URL")]
-    nats_url: Option<String>,
-
     /// Tenant ID for sync
     #[arg(long, env = "CONTEXTDB_TENANT_ID")]
     tenant_id: Option<String>,
@@ -87,19 +81,17 @@ fn main() {
         json: args.json,
         all: args.all,
     };
-    let accountant = args
+    let memory_limit = args
         .memory_limit
         .as_ref()
-        .map(|limit| parse_size_limit(limit).map(contextdb_core::MemoryAccountant::with_budget))
+        .map(|limit| parse_size_limit(limit))
         .transpose()
         .unwrap_or_else(|err| {
             // The invocation is wrong and nothing ran: a usage error, not a
             // failure of the run.
             output.report_error(ErrorClass::Usage, &format!("invalid --memory-limit: {err}"));
             std::process::exit(EXIT_USAGE);
-        })
-        .map(Arc::new)
-        .unwrap_or_else(|| Arc::new(contextdb_core::MemoryAccountant::no_limit()));
+        });
     let disk_limit = args
         .disk_limit
         .as_ref()
@@ -127,25 +119,13 @@ fn main() {
     // attempted — which has to include not creating a database file on a fresh
     // path for a command that was never going to run.
     let sync_endpoint = args.tenant_id.as_ref().map(|_| {
-        let endpoint = args
-            .sync_endpoint
-            .clone()
-            .or_else(|| {
-                args.nats_url.as_ref().map(|url| {
-                    output.report_notice(
-                        ErrorClass::Sync,
-                        "Warning: --nats-url is deprecated; use --sync-endpoint with the server's ticket.",
-                    );
-                    url.clone()
-                })
-            })
-            .unwrap_or_else(|| {
-                output.report_error(
-                    ErrorClass::Usage,
-                    "--tenant-id needs a sync endpoint. Pass --sync-endpoint with the server's ticket.",
-                );
-                std::process::exit(EXIT_USAGE);
-            });
+        let endpoint = args.sync_endpoint.clone().unwrap_or_else(|| {
+            output.report_error(
+                ErrorClass::Usage,
+                "--tenant-id needs a sync endpoint. Pass --sync-endpoint with the server's ticket.",
+            );
+            std::process::exit(EXIT_USAGE);
+        });
         // A bare ticket gets the edge's own fabric identity pinned to it
         // (derived from the database path), so this machine dials as its
         // enrolled identity instead of an ephemeral key. In-memory databases
@@ -168,47 +148,38 @@ fn main() {
     });
 
     debug!(path = %args.path, "opening database");
-    let db = if args.path == ":memory:" {
+    let opened = if args.path == ":memory:" {
         if let Some(ref plugin) = sync_plugin_arc {
-            contextdb_engine::Database::open_memory_with_plugin_and_accountant(
-                plugin.clone(),
-                accountant.clone(),
-            )
-            .expect("failed to open memory database with plugin")
+            contextdb_engine::database::open_memory_with_startup_limit(plugin.clone(), memory_limit)
         } else {
-            contextdb_engine::Database::open_memory_with_accountant(accountant.clone())
+            contextdb_engine::database::open_memory_with_startup_limit(
+                Arc::new(contextdb_engine::plugin::CorePlugin),
+                memory_limit,
+            )
         }
     } else if let Some(ref plugin) = sync_plugin_arc {
-        match contextdb_engine::Database::open_with_config_and_disk_limit(
+        contextdb_engine::database::open_with_startup_limits(
             std::path::Path::new(&args.path),
             plugin.clone(),
-            accountant.clone(),
+            memory_limit,
             disk_limit,
-        ) {
-            Ok(db) => db,
-            Err(e) => {
-                output.report_error(
-                    ErrorClass::of(&e),
-                    &format!("failed to open database at '{}': {e}", args.path),
-                );
-                std::process::exit(EXIT_ERROR);
-            }
-        }
+        )
     } else {
-        match contextdb_engine::Database::open_with_config_and_disk_limit(
+        contextdb_engine::database::open_with_startup_limits(
             std::path::Path::new(&args.path),
             Arc::new(contextdb_engine::plugin::CorePlugin),
-            accountant.clone(),
+            memory_limit,
             disk_limit,
-        ) {
-            Ok(db) => db,
-            Err(e) => {
-                output.report_error(
-                    ErrorClass::of(&e),
-                    &format!("failed to open database at '{}': {e}", args.path),
-                );
-                std::process::exit(EXIT_ERROR);
-            }
+        )
+    };
+    let db = match opened {
+        Ok(db) => db,
+        Err(e) => {
+            output.report_error(
+                ErrorClass::of(&e),
+                &format!("failed to open database at '{}': {e}", args.path),
+            );
+            std::process::exit(EXIT_ERROR);
         }
     };
 
@@ -294,8 +265,8 @@ fn main() {
                     Ok(auto_sync::PushOutcome {
                         conflicts: result
                             .conflicts
-                            .into_iter()
-                            .filter_map(|conflict| conflict.reason)
+                            .iter()
+                            .map(contextdb_engine::cli_render::sync_conflict_document)
                             .collect::<Vec<_>>(),
                         caught_up: client.push_watermark() >= plugin.pending_lsn(),
                     })
@@ -303,7 +274,13 @@ fn main() {
             },
             // The worker keeps retrying, so its report is a notice, not a
             // failure of this run.
-            move |msg| output.report_notice(ErrorClass::Sync, &msg),
+            move |report| match report {
+                auto_sync::AutoSyncReport::Conflict(conflict) => output
+                    .report_notice_document(ErrorClass::Sync, "sync conflict", &conflict),
+                auto_sync::AutoSyncReport::Message(message) => {
+                    output.report_notice(ErrorClass::Sync, &message)
+                }
+            },
         )))
     } else {
         None

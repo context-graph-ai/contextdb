@@ -1,7 +1,8 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Once;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -75,22 +76,24 @@ pub fn run_cli_script(db_path: &Path, args: &[&str], script: &str) -> Output {
     child.wait_with_output().expect("CLI should finish")
 }
 
-pub fn spawn_server(db_path: &Path, tenant_id: &str, nats_url: &str) -> Child {
+pub fn spawn_server(db_path: &Path, tenant_id: &str, bind_spec: &str) -> Child {
     ensure_release_binaries();
-    Command::new(server_bin())
+    let mut child = Command::new(server_bin())
         .args([
             "--db-path",
             db_path.to_str().expect("utf-8 path"),
             "--tenant-id",
             tenant_id,
-            "--nats-url",
-            nats_url,
+            "--sync-endpoint",
+            bind_spec,
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("server should spawn")
+        .expect("server should spawn");
+    wait_for_server_bound(&mut child);
+    child
 }
 
 pub fn stop_child(child: &mut Child) {
@@ -102,7 +105,7 @@ pub fn stop_child(child: &mut Child) {
 pub fn spawn_server_with_barrier(
     db_path: &Path,
     tenant_id: &str,
-    nats_url: &str,
+    bind_spec: &str,
     barrier_path: &Path,
     release_path: &Path,
     min_rows: usize,
@@ -110,23 +113,71 @@ pub fn spawn_server_with_barrier(
 ) -> Child {
     ensure_release_binaries();
     let stderr_file = std::fs::File::create(stderr_path).expect("server stderr");
-    Command::new(server_bin())
+    let mut child = Command::new(server_bin())
         .args([
             "--db-path",
             db_path.to_str().expect("utf-8 path"),
             "--tenant-id",
             tenant_id,
-            "--nats-url",
-            nats_url,
+            "--sync-endpoint",
+            bind_spec,
         ])
         .env("CONTEXTDB_TEST_PUSH_BARRIER_MIN_ROWS", min_rows.to_string())
         .env("CONTEXTDB_TEST_PUSH_BARRIER_FILE", barrier_path)
         .env("CONTEXTDB_TEST_PUSH_RELEASE_FILE", release_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_file))
         .spawn()
-        .expect("server should spawn")
+        .expect("server should spawn");
+    wait_for_server_bound(&mut child);
+    child
+}
+
+fn wait_for_server_bound(child: &mut Child) {
+    let stdout = child.stdout.take().expect("server stdout pipe");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut seen = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let mut signaled = false;
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => {
+                    if !signaled {
+                        let _ = tx.send(String::from_utf8_lossy(&seen).into_owned());
+                    }
+                    break;
+                }
+                Ok(read) => {
+                    if signaled {
+                        continue;
+                    }
+                    seen.extend_from_slice(&chunk[..read]);
+                    let rendered = String::from_utf8_lossy(&seen);
+                    if rendered.contains("enrollment ticket:") {
+                        let _ = tx.send(rendered.into_owned());
+                        signaled = true;
+                        seen.clear();
+                    }
+                }
+                Err(err) => {
+                    if !signaled {
+                        let _ = tx.send(format!("server stdout read error: {err}"));
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    let ready = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("server must bind within 15 seconds");
+    assert!(
+        ready.contains("enrollment ticket:"),
+        "server must publish its enrollment ticket after binding; stdout={ready}"
+    );
 }
 
 pub fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {

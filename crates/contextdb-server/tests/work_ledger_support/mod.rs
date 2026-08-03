@@ -15,9 +15,8 @@
 #![allow(dead_code)]
 
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_engine::work_ledger::install_work_ledger_schema;
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -33,12 +32,17 @@ pub fn start_hub(
     tenant: &str,
 ) -> (Arc<Database>, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
     let hub_db = Arc::new(Database::open_memory());
-    let server = Arc::new(SyncServer::with_transport(
-        hub_db.clone(),
-        broker.server(),
-        contextdb_core::TenantId::from(tenant),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db.clone(),
+            broker.server_as(&node_id),
+            contextdb_core::TenantId::from(tenant),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -49,12 +53,22 @@ pub fn start_hub(
 }
 
 pub fn edge(broker: &InProcessBroker, tenant: &str) -> (Arc<Database>, SyncClient) {
+    edge_with_identity(broker, tenant, Arc::new(FabricIdentity::generate()))
+}
+
+pub fn edge_with_identity(
+    broker: &InProcessBroker,
+    tenant: &str,
+    identity: Arc<FabricIdentity>,
+) -> (Arc<Database>, SyncClient) {
     let db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&db).expect("install ledger schema on edge");
-    let client = SyncClient::with_transport(
+    let node_id = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client(),
+        broker.client_as(&node_id),
         contextdb_core::TenantId::from(tenant),
+        identity,
     );
     (db, client)
 }

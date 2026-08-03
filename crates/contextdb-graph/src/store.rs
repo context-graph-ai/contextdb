@@ -7,6 +7,13 @@ pub struct GraphStore {
     pub reverse_adj: RwLock<HashMap<NodeId, Vec<AdjEntry>>>,
 }
 
+/// Both adjacency directions, constructed together before received-schema
+/// durability.  Publishing this payload only swaps the two maps.
+pub struct PreparedGraphPublication {
+    forward_adj: HashMap<NodeId, Vec<AdjEntry>>,
+    reverse_adj: HashMap<NodeId, Vec<AdjEntry>>,
+}
+
 impl Default for GraphStore {
     fn default() -> Self {
         Self::new()
@@ -19,6 +26,32 @@ impl GraphStore {
             forward_adj: RwLock::new(HashMap::new()),
             reverse_adj: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn prepare_received_schema_publication(entries: Vec<AdjEntry>) -> PreparedGraphPublication {
+        let mut forward_adj = HashMap::new();
+        let mut reverse_adj = HashMap::new();
+        for entry in entries {
+            reverse_adj
+                .entry(entry.target)
+                .or_insert_with(Vec::new)
+                .push(entry.clone());
+            forward_adj
+                .entry(entry.source)
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+        PreparedGraphPublication {
+            forward_adj,
+            reverse_adj,
+        }
+    }
+
+    pub fn publish_prepared_received_schema(&self, publication: PreparedGraphPublication) {
+        let mut forward = self.forward_adj.write();
+        let mut reverse = self.reverse_adj.write();
+        *forward = publication.forward_adj;
+        *reverse = publication.reverse_adj;
     }
 
     pub fn apply_inserts(&self, inserts: Vec<AdjEntry>) {

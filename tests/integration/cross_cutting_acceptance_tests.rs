@@ -1,48 +1,22 @@
 use super::helpers::*;
 use contextdb_core::Value;
 use contextdb_engine::Database;
-#[cfg(feature = "nats-tests")]
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-#[cfg(feature = "nats-tests")]
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::identity::FabricIdentity;
+use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
-#[cfg(feature = "nats-tests")]
 use std::sync::Arc;
-#[cfg(feature = "nats-tests")]
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
-#[cfg(feature = "nats-tests")]
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-#[cfg(feature = "nats-tests")]
-use testcontainers::runners::AsyncRunner;
-#[cfg(feature = "nats-tests")]
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-#[cfg(feature = "nats-tests")]
-struct NatsFixture {
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
-}
-
-#[cfg(feature = "nats-tests")]
-fn setup_nats_conf() -> String {
-    format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"))
-}
-
-#[cfg(feature = "nats-tests")]
-async fn start_nats() -> NatsFixture {
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-    let request = image
-        .with_mount(Mount::bind_mount(setup_nats_conf(), "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
-    let container = request.start().await.unwrap();
-    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
-    NatsFixture {
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
-    }
+async fn wait_for_sync_server(fabric: &InProcessBroker, tenant: &str) {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant,
+        )),
+    )
+    .await
+    .expect("sync server must register its status route");
 }
 
 #[test]
@@ -102,10 +76,9 @@ fn oom_does_not_partially_commit_visible_state() {
     );
 }
 
-#[cfg(feature = "nats-tests")]
 #[tokio::test]
 async fn restart_preserves_committed_sync_visibility() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let edge_tmp = TempDir::new().unwrap();
     let server_tmp = TempDir::new().unwrap();
     let edge_path = edge_tmp.path().join("edge.db");
@@ -113,13 +86,12 @@ async fn restart_preserves_committed_sync_visibility() {
 
     let edge_db = Arc::new(Database::open(&edge_path).unwrap());
     let server_db = Arc::new(Database::open(&server_path).unwrap());
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
     let empty = HashMap::new();
-    edge_db
-        .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
-        .unwrap();
     server_db
-        .execute("CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)", &empty)
+        .execute(
+            "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT) SYNC CONFLICT KEEP FIRST",
+            &empty,
+        )
         .unwrap();
 
     let first_id = uuid::Uuid::new_v4();
@@ -136,29 +108,39 @@ async fn restart_preserves_committed_sync_visibility() {
             .unwrap();
     }
 
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("t02"),
-        policies.clone(),
-    ));
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from("t02"),
+            hub_node_id.clone(),
+            hub_identity.clone(),
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn({
         let server = server.clone();
-        async move { server.run().await }
+        let shutdown = shutdown.clone();
+        async move { server.run_until(shutdown).await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_sync_server(&fabric, "t02").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("t02"),
+        edge_identity.clone(),
     );
-    let initial_pull = client.pull(&policies).await.unwrap();
+    let initial_pull = client.pull_default().await.unwrap();
     assert_eq!(initial_pull.applied_rows, 2);
     assert_eq!(initial_pull.skipped_rows, 0);
 
-    handle.abort();
-    let _ = handle.await;
+    shutdown.store(true, Ordering::SeqCst);
+    handle.await.unwrap();
     drop(server);
     drop(client);
     drop(edge_db);
@@ -177,24 +159,28 @@ async fn restart_preserves_committed_sync_visibility() {
         )
         .unwrap();
 
-    let restarted_server = Arc::new(SyncServer::new(
-        reopened_server.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("t02"),
-        policies.clone(),
-    ));
+    let restarted_server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            reopened_server.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from("t02"),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
     let restarted_handle = tokio::spawn({
         let server = restarted_server.clone();
         async move { server.run().await }
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_sync_server(&fabric, "t02").await;
 
-    let restarted_client = SyncClient::new(
+    let restarted_client = SyncClient::with_authenticated_transport_and_identity_for_test(
         reopened_edge.clone(),
-        &nats.nats_url,
+        fabric.client_as(&edge_node_id),
         contextdb_core::TenantId::from("t02"),
+        edge_identity,
     );
-    let delta_pull = restarted_client.pull(&policies).await.unwrap();
+    let delta_pull = restarted_client.pull_default().await.unwrap();
     assert_eq!(
         delta_pull.applied_rows, 1,
         "fresh client after restart should receive only the post-restart delta"

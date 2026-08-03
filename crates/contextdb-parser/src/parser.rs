@@ -57,6 +57,7 @@ pub fn parse(input: &str) -> Result<Statement> {
         Rule::create_route_stmt => build_create_route(inner)?,
         Rule::drop_route_stmt => build_drop_route(inner)?,
         Rule::insert_stmt => Statement::Insert(build_insert(inner)?),
+        Rule::purge_stmt => Statement::Purge(build_purge(inner)?),
         Rule::delete_stmt => Statement::Delete(build_delete(inner)?),
         Rule::update_stmt => Statement::Update(build_update(inner)?),
         Rule::select_stmt => Statement::Select(build_select(inner)?),
@@ -1825,8 +1826,8 @@ fn build_sync_conflict_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::Co
         .next()
         .ok_or_else(|| Error::ParseError("SYNC CONFLICT clause missing a policy".to_string()))?;
     Ok(match policy.as_rule() {
-        Rule::conflict_keep_first => ConflictPolicy::InsertIfNotExists,
-        Rule::conflict_keep_latest => ConflictPolicy::LatestWins,
+        Rule::conflict_keep_first => ConflictPolicy::KEEP_FIRST,
+        Rule::conflict_keep_latest => ConflictPolicy::KEEP_LATEST,
         other => return Err(unexpected_rule(other, "build_sync_conflict_option")),
     })
 }
@@ -2611,6 +2612,24 @@ fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
 
     Ok(Delete {
         table: table.ok_or_else(|| Error::ParseError("DELETE missing table".to_string()))?,
+        where_clause,
+    })
+}
+
+fn build_purge(pair: Pair<'_, Rule>) -> Result<Purge> {
+    let mut table = None;
+    let mut where_clause = None;
+
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::identifier => table = Some(parse_identifier(p.as_str())),
+            Rule::where_clause => where_clause = Some(build_where_clause(p)?),
+            other => return Err(unexpected_rule(other, "build_purge")),
+        }
+    }
+
+    Ok(Purge {
+        table: table.ok_or_else(|| Error::ParseError("PURGE missing table".to_string()))?,
         where_clause,
     })
 }

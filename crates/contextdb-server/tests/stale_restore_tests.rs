@@ -8,52 +8,19 @@
 //!
 //! Before this change, sr1–sr3 fail: a sync with nothing locally new is
 //! short-circuited to a no-op and never contacts the server, so a freshly
-//! restored (stale) server's regression goes undetected. sr4–sr8 are
+//! restored (stale) server's regression goes undetected. sr4–sr6 are
 //! regression guards.
 
 use contextdb_core::{Lsn, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-use contextdb_server::protocol::{
-    MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireApplyResult,
-    WireChangeSet, decode, encode,
-};
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
-struct NatsFixture {
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
-}
-
-async fn start_nats() -> NatsFixture {
-    let nats_conf = format!("{}/tests/nats.conf", env!("CARGO_MANIFEST_DIR"));
-
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-
-    let request = image
-        .with_mount(Mount::bind_mount(nats_conf, "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
-
-    let container: ContainerAsync<GenericImage> = request.start().await.unwrap();
-    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
-
-    NatsFixture {
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
-    }
-}
-
 /// A SyncServer generation that can be stopped deterministically, so a second
-/// generation can take over the same tenant subjects without double-responders.
+/// generation can take over the same tenant routes without double-responders.
 struct ServerGen {
     shutdown: Arc<AtomicBool>,
     handle: tokio::task::JoinHandle<()>,
@@ -61,21 +28,43 @@ struct ServerGen {
 
 async fn start_server(
     db: Arc<Database>,
-    nats_url: &str,
+    fabric: &InProcessBroker,
     tenant: &str,
-    policies: ConflictPolicies,
+    identity: Arc<FabricIdentity>,
 ) -> ServerGen {
-    let server = Arc::new(SyncServer::new(
-        db,
-        nats_url,
-        contextdb_core::TenantId::from(tenant),
-        policies,
-    ));
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db,
+            fabric.server_as(&node_id),
+            contextdb_core::TenantId::from(tenant),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = shutdown.clone();
     let handle = tokio::spawn(async move { server.run_until(flag).await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant,
+        )),
+    )
+    .await
+    .expect("stale-restore server must register its status route");
     ServerGen { shutdown, handle }
+}
+
+fn edge_client(db: Arc<Database>, fabric: &InProcessBroker, tenant: &str) -> SyncClient {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
+        db,
+        fabric.client_as(&node_id),
+        contextdb_core::TenantId::from(tenant),
+        identity,
+    )
 }
 
 async fn stop_server(server_gen: ServerGen) {
@@ -93,17 +82,16 @@ async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
         .expect("sync operation must complete within 60s")
 }
 
-/// Tight 10s bound: pins the no-hang property of the status probe against
-/// servers that do not answer the status subject.
+/// Tight 10s bound for the bounded regression-guard sync cycles.
 async fn bounded10<T>(fut: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(std::time::Duration::from_secs(10), fut)
         .await
-        .expect("sync op against a status-less server must complete within 10s — the probe must never hang a sync")
+        .expect("regression-guard sync operation must complete within 10s")
 }
 
 fn create_t(db: &Database) {
     db.execute(
-        "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)",
+        "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT) SYNC CONFLICT KEEP FIRST",
         &HashMap::new(),
     )
     .unwrap();
@@ -164,22 +152,17 @@ fn expect_rows(pairs: &[(Uuid, &str)]) -> BTreeSet<(Uuid, String)> {
 // this test fails at the restored-server row-set assertion.
 #[tokio::test]
 async fn sr1_restored_server_reconverges_after_edge_repush() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant = "sr1-stale-restore-journey";
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-
     let server_db = Arc::new(Database::open(tmp.path().join("server-gen1.db")).unwrap());
     let edge_db = Arc::new(Database::open(tmp.path().join("edge.db")).unwrap());
     create_t(&server_db);
     create_t(&edge_db);
 
-    let gen1 = start_server(server_db.clone(), &nats.nats_url, tenant, policies.clone()).await;
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let gen1 = start_server(server_db.clone(), &fabric, tenant, hub_identity.clone()).await;
+    let client = edge_client(edge_db.clone(), &fabric, tenant);
 
     // Push A (acked).
     let a1 = Uuid::new_v4();
@@ -196,8 +179,15 @@ async fn sr1_restored_server_reconverges_after_edge_repush() {
 
     // Export the artifact at the snapshot point = after A.
     let artifact = tmp.path().join("server-checkpoint.cdb");
-    let report = server_db.export_snapshot(&artifact).unwrap();
-    assert_eq!(report.rows, 2, "artifact must capture exactly the A rows");
+    server_db.export_snapshot(&artifact).unwrap();
+    {
+        let artifact_db = Database::open(&artifact).expect("open exported artifact");
+        assert_eq!(
+            row_set(&artifact_db),
+            expect_rows(&[(a1, "a1"), (a2, "a2")]),
+            "artifact must capture exactly the A application rows"
+        );
+    }
 
     // Push B (acked). Server gen1 now holds A ∪ B.
     let b1 = Uuid::new_v4();
@@ -225,13 +215,7 @@ async fn sr1_restored_server_reconverges_after_edge_repush() {
         expect_rows(&[(a1, "a1"), (a2, "a2")]),
         "precondition: artifact is stale — rows = A only"
     );
-    let gen2 = start_server(
-        restored_db.clone(),
-        &nats.nats_url,
-        tenant,
-        policies.clone(),
-    )
-    .await;
+    let gen2 = start_server(restored_db.clone(), &fabric, tenant, hub_identity).await;
 
     // THE moment under test: edge re-pushes on its next sync, no user action.
     within(client.push()).await.unwrap();
@@ -255,12 +239,8 @@ async fn sr1_restored_server_reconverges_after_edge_repush() {
     // test's local Arc<Database> handle.
     let observer_db = Arc::new(Database::open_memory());
     create_t(&observer_db);
-    let observer = SyncClient::new(
-        observer_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
-    within(observer.pull(&policies)).await.unwrap();
+    let observer = edge_client(observer_db.clone(), &fabric, tenant);
+    within(observer.pull_default()).await.unwrap();
     assert_eq!(
         row_set(&observer_db),
         union,
@@ -296,7 +276,7 @@ async fn sr1_restored_server_reconverges_after_edge_repush() {
     // Post-recovery commit, server → edge.
     let s1 = Uuid::new_v4();
     insert_row(&restored_db, s1, "s1");
-    within(client.pull(&policies)).await.unwrap();
+    within(client.pull_default()).await.unwrap();
     converged.insert((s1, "s1".to_string()));
     assert_eq!(
         row_set(&edge_db),
@@ -320,22 +300,17 @@ async fn sr1_restored_server_reconverges_after_edge_repush() {
 // the union assertion fails.
 #[tokio::test]
 async fn sr2_push_with_nothing_new_still_converges_restored_server() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant = "sr2-empty-push-probe";
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-
     let server_db = Arc::new(Database::open(tmp.path().join("server-gen1.db")).unwrap());
     let edge_db = Arc::new(Database::open_memory());
     create_t(&server_db);
     create_t(&edge_db);
 
-    let gen1 = start_server(server_db.clone(), &nats.nats_url, tenant, policies.clone()).await;
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let gen1 = start_server(server_db.clone(), &fabric, tenant, hub_identity.clone()).await;
+    let client = edge_client(edge_db.clone(), &fabric, tenant);
 
     let a1 = Uuid::new_v4();
     insert_row(&edge_db, a1, "a1");
@@ -357,13 +332,7 @@ async fn sr2_push_with_nothing_new_still_converges_restored_server() {
         expect_rows(&[(a1, "a1")]),
         "precondition: artifact predates B"
     );
-    let gen2 = start_server(
-        restored_db.clone(),
-        &nats.nats_url,
-        tenant,
-        policies.clone(),
-    )
-    .await;
+    let gen2 = start_server(restored_db.clone(), &fabric, tenant, hub_identity).await;
 
     // The edge has NOTHING locally new: the next pushes are pure probes.
     assert!(
@@ -400,29 +369,24 @@ async fn sr2_push_with_nothing_new_still_converges_restored_server() {
 // commit (s4, stamped below the stale watermark) is skipped forever.
 #[tokio::test]
 async fn sr3_pull_resumes_from_restored_server_position_and_delivers_new_commits() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tmp = tempfile::TempDir::new().unwrap();
     let tenant = "sr3-pull-regression";
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-
     let server_db = Arc::new(Database::open(tmp.path().join("server-gen1.db")).unwrap());
     let edge_db = Arc::new(Database::open_memory());
     create_t(&server_db);
     create_t(&edge_db);
 
-    let gen1 = start_server(server_db.clone(), &nats.nats_url, tenant, policies.clone()).await;
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let gen1 = start_server(server_db.clone(), &fabric, tenant, hub_identity.clone()).await;
+    let client = edge_client(edge_db.clone(), &fabric, tenant);
 
     // Server commits s1, s2; edge pulls them.
     let s1 = Uuid::new_v4();
     let s2 = Uuid::new_v4();
     insert_row(&server_db, s1, "s1");
     insert_row(&server_db, s2, "s2");
-    let pull_1 = within(client.pull(&policies)).await.unwrap();
+    let pull_1 = within(client.pull_default()).await.unwrap();
     assert_eq!(pull_1.applied_rows, 2);
     assert_eq!(row_set(&edge_db), expect_rows(&[(s1, "s1"), (s2, "s2")]));
 
@@ -437,7 +401,7 @@ async fn sr3_pull_resumes_from_restored_server_position_and_delivers_new_commits
     let s3b = Uuid::new_v4();
     insert_row(&server_db, s3a, "s3a");
     insert_row(&server_db, s3b, "s3b");
-    let pull_2 = within(client.pull(&policies)).await.unwrap();
+    let pull_2 = within(client.pull_default()).await.unwrap();
     assert_eq!(pull_2.applied_rows, 2);
     let stale_watermark = client.pull_watermark();
 
@@ -464,15 +428,9 @@ async fn sr3_pull_resumes_from_restored_server_position_and_delivers_new_commits
         "fixture: the new commit must remain below the stale watermark to expose the skip"
     );
 
-    let gen2 = start_server(
-        restored_db.clone(),
-        &nats.nats_url,
-        tenant,
-        policies.clone(),
-    )
-    .await;
+    let gen2 = start_server(restored_db.clone(), &fabric, tenant, hub_identity).await;
 
-    within(client.pull(&policies)).await.unwrap();
+    within(client.pull_default()).await.unwrap();
     let edge_expected = expect_rows(&[
         (s1, "s1"),
         (s2, "s2"),
@@ -490,7 +448,7 @@ async fn sr3_pull_resumes_from_restored_server_position_and_delivers_new_commits
 
     // Re-pull: idempotent re-delivery, exact set stable, no duplicates
     // (row_set panics on any duplicate).
-    within(client.pull(&policies)).await.unwrap();
+    within(client.pull_default()).await.unwrap();
     assert_eq!(
         row_set(&edge_db),
         edge_expected,
@@ -515,21 +473,20 @@ async fn sr3_pull_resumes_from_restored_server_position_and_delivers_new_commits
 // zero duplicates so the fix cannot buy convergence with blanket re-pushes.
 #[tokio::test]
 async fn sr4_guard_steady_state_push_counts_and_no_duplicates() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tenant = "sr4-steady-push";
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     create_t(&server_db);
     create_t(&edge_db);
-    let server_gen =
-        start_server(server_db.clone(), &nats.nats_url, tenant, policies.clone()).await;
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
+    let server_gen = start_server(
+        server_db.clone(),
+        &fabric,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    )
+    .await;
+    let client = edge_client(edge_db.clone(), &fabric, tenant);
 
     let a1 = Uuid::new_v4();
     insert_row(&edge_db, a1, "a1");
@@ -585,28 +542,27 @@ async fn sr4_guard_steady_state_push_counts_and_no_duplicates() {
 // Passes today. Pins pull counts, no-op watermark stability, and exact sets.
 #[tokio::test]
 async fn sr5_guard_steady_state_pull_counts_and_watermark() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tenant = "sr5-steady-pull";
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     create_t(&server_db);
     create_t(&edge_db);
-    let server_gen =
-        start_server(server_db.clone(), &nats.nats_url, tenant, policies.clone()).await;
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
+    let server_gen = start_server(
+        server_db.clone(),
+        &fabric,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    )
+    .await;
+    let client = edge_client(edge_db.clone(), &fabric, tenant);
 
     let s1 = Uuid::new_v4();
     let s2 = Uuid::new_v4();
     insert_row(&server_db, s1, "s1");
     insert_row(&server_db, s2, "s2");
 
-    let r1 = within(client.pull(&policies)).await.unwrap();
+    let r1 = within(client.pull_default()).await.unwrap();
     assert_eq!(r1.applied_rows, 2, "first pull must apply exactly 2 rows");
     assert_eq!(r1.skipped_rows, 0, "first pull must skip 0 rows");
     let wm1 = client.pull_watermark();
@@ -614,7 +570,7 @@ async fn sr5_guard_steady_state_pull_counts_and_watermark() {
     assert_eq!(row_set(&edge_db), expect_rows(&[(s1, "s1"), (s2, "s2")]));
 
     // No-op pull: zero applied/skipped, watermark stable, set unchanged.
-    let r2 = within(client.pull(&policies)).await.unwrap();
+    let r2 = within(client.pull_default()).await.unwrap();
     assert_eq!(
         r2.applied_rows, 0,
         "no-op pull must apply 0 rows in steady state"
@@ -633,7 +589,7 @@ async fn sr5_guard_steady_state_pull_counts_and_watermark() {
     // New server data still flows with exact counts and no duplicates.
     let s3 = Uuid::new_v4();
     insert_row(&server_db, s3, "s3");
-    let r3 = within(client.pull(&policies)).await.unwrap();
+    let r3 = within(client.pull_default()).await.unwrap();
     assert_eq!(
         r3.applied_rows, 1,
         "incremental pull must apply exactly the new row"
@@ -652,32 +608,26 @@ async fn sr5_guard_steady_state_pull_counts_and_watermark() {
     stop_server(server_gen).await;
 }
 
-// ======== sr6 — REGRESSION GUARD: new client + old server ========
+// ======== sr6 — REGRESSION GUARD: bounded steady-state sync cycle ========
 //
-// "Old server" means: a server that does not answer the status subject. Before
-// the fix the real SyncServer is exactly that, so this runs the genuine
-// no-responders path today. After the fix the real SyncServer answers status
-// and this becomes a bounded steady-state guard; sr8's hand-rolled fixture keeps
-// the no-responder path covered durably. Every op carries the tight 10s
-// bound: an unanswered probe must never hang, error, churn watermarks, or
-// re-push.
+// Every operation carries the tight 10s bound. A steady-state cycle must never
+// hang, churn watermarks, or re-push already-acknowledged rows.
 #[tokio::test]
-async fn sr6_guard_new_client_with_old_server_completes_bounded_and_inert() {
-    let nats = start_nats().await;
+async fn sr6_guard_sync_cycle_completes_bounded_and_inert() {
+    let fabric = InProcessBroker::new();
     let tenant = "sr6-new-client-old-server";
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-
     let server_db = Arc::new(Database::open_memory());
     let edge_db = Arc::new(Database::open_memory());
     create_t(&server_db);
     create_t(&edge_db);
-    let server_gen =
-        start_server(server_db.clone(), &nats.nats_url, tenant, policies.clone()).await;
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
+    let server_gen = start_server(
+        server_db.clone(),
+        &fabric,
+        tenant,
+        Arc::new(FabricIdentity::generate()),
+    )
+    .await;
+    let client = edge_client(edge_db.clone(), &fabric, tenant);
 
     // Push with data: bounded, normal counts, watermark advances.
     let a1 = Uuid::new_v4();
@@ -685,7 +635,7 @@ async fn sr6_guard_new_client_with_old_server_completes_bounded_and_inert() {
     let push = bounded10(client.push()).await.unwrap();
     assert_eq!(
         push.applied_rows, 1,
-        "push must apply normally against an old server"
+        "push must apply normally in the bounded sync cycle"
     );
     let push_wm = client.push_watermark();
     assert!(push_wm > Lsn(0), "push watermark must advance normally");
@@ -693,10 +643,10 @@ async fn sr6_guard_new_client_with_old_server_completes_bounded_and_inert() {
     // Pull with data: bounded, normal counts, watermark advances.
     let s1 = Uuid::new_v4();
     insert_row(&server_db, s1, "s1");
-    let pull = bounded10(client.pull(&policies)).await.unwrap();
+    let pull = bounded10(client.pull_default()).await.unwrap();
     assert_eq!(
         pull.applied_rows, 1,
-        "pull must apply normally against an old server"
+        "pull must apply normally in the bounded sync cycle"
     );
     assert!(
         client.pull_watermark() > Lsn(0),
@@ -735,153 +685,6 @@ async fn sr6_guard_new_client_with_old_server_completes_bounded_and_inert() {
     stop_server(server_gen).await;
 }
 
-// sr7 (the frozen wire-bytes regression guard) moved to the default-run
-// `wire_format_freeze_tests.rs`: it is pure encode/decode against fixed
-// fixtures, needs no broker, and this file's `[[test]]` entry gates the
-// WHOLE binary on `required-features = ["nats"]` for the tests below that
-// genuinely need one -- so it never ran in the default suite.
-
-// ======== sr8 — REGRESSION GUARD: no status responder, bounded + exactly-once ========
-//
-// Durable no-responder fixture: a hand-rolled old server answers push and pull
-// and — by construction, forever — never subscribes to the status subject.
-// Unlike sr6 (real SyncServer, which gains a status responder once the fix
-// lands), this keeps the no-responders path covered after implementation.
-// A full sync cycle must complete with every op bounded to 10s, the single
-// real row must cross the wire exactly once, and the push watermark must not
-// churn.
-#[cfg(feature = "nats")]
-#[tokio::test]
-async fn sr8_guard_sync_cycle_bounded_when_status_subject_has_no_responder() {
-    use contextdb_server::protocol::SyncStatusResponse;
-    use futures_util::StreamExt;
-    use std::sync::atomic::AtomicUsize;
-
-    let nats = start_nats().await;
-    let tenant = "sr8-no-status-responder";
-
-    // The status subject is dedicated: it must never collide with the data
-    // subjects (otherwise this fixture could accidentally answer probes).
-    let status = contextdb_server::subjects::status_subject(tenant);
-    assert_ne!(status, contextdb_server::subjects::push_subject(tenant));
-    assert_ne!(status, contextdb_server::subjects::pull_subject(tenant));
-
-    // A defaulted status reply carries no regression signal — absent = inert.
-    let inert = SyncStatusResponse::default();
-    assert_eq!(inert.applied_push_watermark, None);
-    assert_eq!(inert.server_current_lsn, None);
-
-    // Old server: push + pull responders only.
-    let responder = async_nats::connect(&nats.nats_url).await.unwrap();
-    let mut push_sub = responder
-        .subscribe(contextdb_server::subjects::push_subject(tenant))
-        .await
-        .unwrap();
-    let mut pull_sub = responder
-        .subscribe(contextdb_server::subjects::pull_subject(tenant))
-        .await
-        .unwrap();
-
-    let rows_seen = Arc::new(AtomicUsize::new(0));
-    let rows_seen_push = rows_seen.clone();
-    let push_conn = responder.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = push_sub.next().await {
-            // Decode exactly as a shipped old server would; a failure here
-            // leaves the client unanswered and fails the test via its bound.
-            let envelope = decode(&msg.payload).expect("old server: envelope decode");
-            assert!(
-                matches!(envelope.message_type, MessageType::PushRequest),
-                "old server: only plain push requests expected on the push subject"
-            );
-            let request: PushRequest = rmp_serde::from_slice(&envelope.payload)
-                .expect("old server must decode the client's push request unchanged");
-            let row_count = request.changeset.rows.len();
-            rows_seen_push.fetch_add(row_count, Ordering::SeqCst);
-            if let Some(reply) = msg.reply {
-                let response = PushResponse {
-                    result: Some(WireApplyResult {
-                        applied_rows: row_count,
-                        skipped_rows: 0,
-                        conflicts: Vec::new(),
-                        new_lsn: Lsn(2),
-                    }),
-                    error: None,
-                };
-                let payload = encode(MessageType::PushResponse, &response).unwrap();
-                push_conn.publish(reply, payload.into()).await.unwrap();
-            }
-        }
-    });
-
-    let pull_conn = responder.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = pull_sub.next().await {
-            let envelope = decode(&msg.payload).expect("old server: envelope decode");
-            assert!(
-                matches!(envelope.message_type, MessageType::PullRequest),
-                "old server: only plain pull requests expected on the pull subject"
-            );
-            let _request: PullRequest = rmp_serde::from_slice(&envelope.payload)
-                .expect("old server must decode the client's pull request unchanged");
-            if let Some(reply) = msg.reply {
-                let response = PullResponse {
-                    changeset: WireChangeSet::default(),
-                    has_more: false,
-                    cursor: None,
-                    source: None,
-                };
-                let payload = encode(MessageType::PullResponse, &response).unwrap();
-                pull_conn.publish(reply, payload.into()).await.unwrap();
-            }
-        }
-    });
-
-    let edge_db = Arc::new(Database::open_memory());
-    create_t(&edge_db);
-    let a1 = Uuid::new_v4();
-    insert_row(&edge_db, a1, "a1");
-
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(tenant),
-    );
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-
-    // Full sync cycle, every op bounded to 10s.
-    let r1 = bounded10(client.push()).await.unwrap();
-    assert_eq!(
-        r1.applied_rows, 1,
-        "real push must succeed against the old server"
-    );
-    let wm1 = client.push_watermark();
-    assert!(wm1 > Lsn(0));
-
-    let r2 = bounded10(client.push()).await.unwrap();
-    assert_eq!(
-        r2.applied_rows, 0,
-        "nothing-new push must stay inert without a status responder"
-    );
-    assert_eq!(
-        client.push_watermark(),
-        wm1,
-        "no watermark churn without a status responder"
-    );
-    let r3 = bounded10(client.push()).await.unwrap();
-    assert_eq!(r3.applied_rows, 0);
-    assert_eq!(client.push_watermark(), wm1);
-
-    let pull = bounded10(client.pull(&policies)).await.unwrap();
-    assert_eq!(
-        pull.applied_rows, 0,
-        "empty pull from the old server must apply nothing"
-    );
-
-    assert_eq!(
-        rows_seen.load(Ordering::SeqCst),
-        1,
-        "the single real row must cross the wire exactly once — an unanswered \
-         status probe must never trigger spurious re-pushes"
-    );
-}
+// sr7 (the frozen wire-bytes regression guard) lives in
+// `wire_format_freeze_tests.rs`; it is pure encode/decode against fixed
+// fixtures.

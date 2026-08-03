@@ -14,10 +14,29 @@ categories.workspace = true
 
 [features]
 test-seams = ["contextdb-vector/test-seams"]
-# Marker for the demoted broker-bound test modules: the deprecated NATS
-# transport suites build and run only under `--features nats-tests` (with a
-# Docker daemon). The default `cargo test --workspace` gate needs no broker.
-nats-tests = ["contextdb-server/nats"]
+# Build-only validation facility used by the installed release smoke. It keeps
+# the real Iroh path and exposes only two fixed crash checkpoints; it does not
+# enable the broader test seam.
+production-smoke-driver = ["iroh"]
+sync-orchestration = [
+    "dep:tokio",
+]
+iroh = [
+    "sync-orchestration",
+    "dep:iroh",
+    "dep:iroh-blobs",
+    "dep:bao-tree",
+    "dep:bytes",
+    "dep:futures-util",
+    "dep:irpc",
+    "dep:iroh-tickets",
+    "dep:range-collections",
+    "dep:url",
+    "dep:rustls-pki-types",
+]
+# LAN-local mDNS address lookup stays opt-in after sync orchestration moved
+# into this crate. It is never enabled by the default engine/server feature set.
+mdns = ["iroh", "dep:iroh-mdns-address-lookup"]
 # Marker for the nightly test tier: stress/journey tests too heavy for the
 # default gate build and run only under `--features nightly-tests`, executed
 # by .github/workflows/nightly.yml on a daily schedule.
@@ -37,21 +56,36 @@ parking_lot.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_bytes = "0.11"
 tracing.workspace = true
 redb = { workspace = true }
 bincode = { workspace = true }
 smallvec = "1"
 time.workspace = true
+tempfile.workspace = true
 fs2 = "0.4"
+libc = "0.2"
 blake3 = "1"
+tokio = { workspace = true, optional = true }
+thiserror.workspace = true
+iroh = { version = "1.0.2", optional = true, default-features = false, features = ["tls-ring", "metrics"] }
+iroh-blobs = { version = "0.103.0", optional = true, default-features = false }
+bao-tree = { version = "0.16", optional = true, default-features = false, features = ["experimental-mixed", "tokio_fsm", "validate", "serde"] }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true }
+irpc = { version = "0.17.0", optional = true, default-features = false, features = ["spans", "stream", "derive", "varint-util"] }
+iroh-tickets = { version = "1.0.0", optional = true }
+range-collections = { version = "0.4.6", optional = true, features = ["serde"] }
+url = { version = "2", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+ed25519-dalek = "2"
+getrandom = "0.3"
+# LAN-local address lookup for `lookup=mdns`; enabled only by `mdns` above.
+iroh-mdns-address-lookup = { version = "0.4", optional = true }
 
 [dev-dependencies]
-contextdb-server = { path = "../contextdb-server" }
+contextdb-server = { path = "../contextdb-server", features = ["test-seams"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-futures-util = "0.3"
-async-nats.workspace = true
-testcontainers = "0.27"
-tempfile = "3"
 num_cpus = "1.16"
 criterion = { version = "0.8", features = ["html_reports"] }
 regex = "1"
@@ -189,7 +223,6 @@ path = "../../benches/commit_write_volume_scaling.rs"
 
 [[bench]]
 name = "sigterm_drain_in_flight_persistence"
-required-features = ["nats-tests"]
 harness = false
 path = "../../benches/sigterm_drain_in_flight_persistence.rs"
 

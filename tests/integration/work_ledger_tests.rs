@@ -1013,8 +1013,9 @@ fn wl_g02_ledger_source_is_class_blind_and_transport_blind() {
         // workspace-wide transport-word sweep does not count this guard's
         // own needle list as a violation.
         let dial_by_key_transport = ["ir", "oh"].concat();
+        let removed_transport = ["na", "ts"].concat();
         for forbidden in [
-            "nats",
+            removed_transport.as_str(),
             dial_by_key_transport.as_str(),
             "relay",
             "broker", // transport words

@@ -1,6 +1,7 @@
 use super::helpers::{embedding384, make_params, setup_ontology_db, setup_ontology_db_with_dag};
 use contextdb_core::Lsn;
-use contextdb_core::{Direction, Error, MemoryAccountant, UpsertResult, Value, VersionedRow};
+use contextdb_core::{Direction, Error, UpsertResult, Value, VersionedRow};
+use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
 use contextdb_parser::{Statement as AstStatement, parse as parse_sql};
 use roaring::RoaringTreemap;

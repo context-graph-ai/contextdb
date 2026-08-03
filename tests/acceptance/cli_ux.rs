@@ -1,12 +1,10 @@
 use super::common::*;
-#[cfg(feature = "nats-tests")]
-use contextdb_core::Value;
-#[cfg(feature = "nats-tests")]
+use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::Database;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use tempfile::TempDir;
-#[cfg(feature = "nats-tests")]
 use uuid::Uuid;
 
 /// I piped a SQL script into the CLI, and it ran every command and showed me results.
@@ -25,37 +23,40 @@ fn f28_scripted_usage_via_stdin_pipe() {
     assert!(output_string(&output.stdout).contains("hello"));
 }
 
-/// I asked for sync status while connected, and it showed me the tenant, URL, connection state, and LSN — not a cryptic blob.
-#[cfg(feature = "nats-tests")]
+/// I asked for sync status while connected, and it showed me the tenant, endpoint, connection state, and LSN — not a cryptic blob.
 #[tokio::test]
 async fn f29_sync_status_shows_meaningful_info_when_connected() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f29.db");
     let server_path = temp_db_file(&tmp, "f29-server.db");
-    let nats = start_nats().await;
-    let mut server = spawn_server(&server_path, "f29", &nats.nats_url);
+    let sync = start_sync_fixture().await;
+    let mut server = spawn_server(&server_path, "f29", &sync.bind_spec);
     let output = run_cli_script(
         &db_path,
-        &["--tenant-id", "f29", "--nats-url", &nats.ws_url],
+        &["--tenant-id", "f29", "--sync-endpoint", &sync.ticket],
         ".sync status\n.quit\n",
     );
     stop_child(&mut server);
     let stdout = output_string(&output.stdout);
     assert!(stdout.contains("tenant=f29"));
-    assert!(stdout.contains(&nats.ws_url));
+    assert!(stdout.contains(&sync.ticket));
     assert!(stdout.contains("connected"));
     assert!(stdout.contains("LSN"));
 }
 
 /// I asked for sync status when the server was down, and it told me "unreachable" instead of crashing.
-#[cfg(feature = "nats-tests")]
 #[test]
-fn f30_sync_status_when_nats_is_unreachable() {
+fn f30_sync_status_when_endpoint_is_unreachable() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "f30.db");
     let output = run_cli_script(
         &db_path,
-        &["--tenant-id", "f30", "--nats-url", "nats://127.0.0.1:65532"],
+        &[
+            "--tenant-id",
+            "f30",
+            "--sync-endpoint",
+            "iroh:invalid-test-ticket",
+        ],
         ".sync status\n.quit\n",
     );
     assert!(output.status.success());
@@ -723,22 +724,44 @@ fn f117c_cli_renders_parse_error_with_positional_hint() {
              got: {error_line}"
     );
 }
-/// I started contextdb-server with a NATS testcontainer, pushed an IN-FLIGHT commit through a sync client,
-/// then sent SIGTERM. The server drained, committed the in-flight write, and exited 0. On reopen the
-/// in-flight row was durable. A no-drain `exit(0)` impl loses the in-flight commit and fails this test.
+/// I started contextdb-server with an Iroh endpoint, parked an authenticated push after the server
+/// accepted its apply task, then sent SIGTERM. The server stopped admission, drained and acknowledged
+/// that accepted work, and exited 0. On reopen every accepted row was durable. A no-drain `exit(0)`
+/// implementation loses the acknowledgement or the accepted work and fails this test.
 /// Unix-only: contextdb has no Windows CI target.
-#[cfg(feature = "nats-tests")]
 #[cfg(unix)]
 #[tokio::test]
 async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits() {
     use std::process::Command;
     use std::time::Duration;
 
-    let nats = start_nats().await;
+    async fn wait_for_fixture_path(
+        path: std::path::PathBuf,
+        timeout: Duration,
+        contract: &'static str,
+    ) {
+        let observed_path = path.clone();
+        let observed =
+            tokio::task::spawn_blocking(move || wait_until(timeout, || observed_path.exists()))
+                .await
+                .expect("fixture path observer must not panic");
+        assert!(observed, "{contract}: {}", path.display());
+    }
+
+    let sync = start_sync_fixture().await;
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("drain.db");
     let barrier_path = tmp.path().join("push-started.barrier");
     let release_path = tmp.path().join("push-release.barrier");
+    let shutdown_quiesced_path = tmp.path().join("shutdown-quiesced.barrier");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&release_path)
+            .status()
+            .expect("mkfifo must execute")
+            .success(),
+        "create deterministic push-release channel"
+    );
 
     // Pre-create the schema; the server will open this database when spawned.
     {
@@ -754,20 +777,24 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     ensure_release_binaries();
     let stderr_path = tmp.path().join("server.stderr");
     let stderr_file = std::fs::File::create(&stderr_path).expect("server stderr");
-    let child = Command::new(server_bin())
+    let mut child = Command::new(server_bin())
         .args([
             "--db-path",
             db_path.to_str().expect("utf-8 db path"),
             "--tenant-id",
             "f121",
-            "--nats-url",
-            &nats.nats_url,
+            "--sync-endpoint",
+            &sync.bind_spec,
         ])
         .env("CONTEXTDB_TEST_PUSH_BARRIER_MIN_ROWS", "100")
         .env("CONTEXTDB_TEST_PUSH_BARRIER_FILE", &barrier_path)
         .env("CONTEXTDB_TEST_PUSH_RELEASE_FILE", &release_path)
+        .env(
+            "CONTEXTDB_TEST_SHUTDOWN_QUIESCED_FILE",
+            &shutdown_quiesced_path,
+        )
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .expect("server should spawn");
@@ -785,44 +812,96 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     }
     let _stderr_dump = ServerStderrDump { path: &stderr_path };
 
+    let ready =
+        wait_for_child_stdout_contains(&mut child, "enrollment ticket:", Duration::from_secs(15));
     assert!(
-        wait_for_sync_server_ready(&nats.nats_url, "f121", Duration::from_secs(15)).await,
-        "sync server must respond before SIGTERM drain test starts"
+        ready.contains("enrollment ticket:"),
+        "sync server must publish its enrollment ticket before SIGTERM drain starts; stdout={ready}"
     );
 
-    // Push an IN-FLIGHT row through the running server via a sync client. Use the same path other
-    // acceptance tests use (NatsFixture-driven; an edge client opens its own Database, writes, and
-    // pushes the changeset to the server's NATS subject). The server applies the change against the
-    // db file. This is the "in-flight commit" that the drain must persist.
+    // Start with one blank, stable file-backed edge. Its authenticated pull installs the hub's
+    // pre-created schema; this same database and client author both pushes below.
+    let edge_path = tmp.path().join("drain-edge.db");
+    let edge_db = Arc::new(Database::open(&edge_path).expect("open blank edge db"));
+    let identity_path = tmp.path().join("drain-edge-identity.key");
+    let dial_spec = contextdb_server::peer_dial_spec(&sync.ticket, &identity_path);
+    let client = Arc::new(contextdb_server::SyncClient::new(
+        edge_db.clone(),
+        &dial_spec,
+        contextdb_core::TenantId::from("f121"),
+    ));
+    client
+        .pull_default()
+        .await
+        .expect("authenticated pull must install the hub schema on the blank edge");
+
+    // Push a baseline row through the running server via an authenticated sync client. It proves the
+    // edge can write through this exact hub before the drain boundary is exercised below.
     let in_flight_id = Uuid::new_v4();
     let in_flight_vec = vec![0.5_f32, 0.5, 0.5, 0.5];
-    push_change_through_server(
-        &nats.nats_url,
-        "f121",
-        "evidence",
-        in_flight_id,
-        in_flight_vec.clone(),
-    )
-    .await;
+    let baseline_tx = edge_db.begin_or_panic();
+    let baseline_row = edge_db
+        .insert_row(
+            baseline_tx,
+            "evidence",
+            values(vec![("id", Value::Uuid(in_flight_id))]),
+        )
+        .expect("insert edge baseline row");
+    edge_db
+        .insert_vector(
+            baseline_tx,
+            VectorIndexRef::new("evidence", "vector_text"),
+            baseline_row,
+            in_flight_vec.clone(),
+        )
+        .expect("insert edge baseline vector");
+    edge_db
+        .commit(baseline_tx)
+        .expect("commit edge baseline row");
+    client
+        .push()
+        .await
+        .expect("push baseline change through server");
+
     // Start a larger follow-up push and send SIGTERM only after the client has begun the server push.
     // A server that exits 0 without draining active handlers can lose this batch while still passing a
     // quiescent-shutdown test.
     let batch_ids: Vec<Uuid> = (0..128).map(|_| Uuid::new_v4()).collect();
-    let batch_for_task = batch_ids.clone();
-    let nats_url = nats.nats_url.clone();
+    let batch_tx = edge_db.begin_or_panic();
+    for (offset, id) in batch_ids.iter().copied().enumerate() {
+        let row_id = edge_db
+            .insert_row(batch_tx, "evidence", values(vec![("id", Value::Uuid(id))]))
+            .expect("insert edge batch row");
+        let mut vector = vec![0.0_f32; 4];
+        vector[offset % 4] = 1.0;
+        edge_db
+            .insert_vector(
+                batch_tx,
+                VectorIndexRef::new("evidence", "vector_text"),
+                row_id,
+                vector,
+            )
+            .expect("insert edge batch vector");
+    }
+    edge_db.commit(batch_tx).expect("commit edge batch rows");
+
+    let client_for_task = client.clone();
     let task_barrier_path = barrier_path.clone();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let pending_push = tokio::spawn(async move {
-        push_many_changes_through_server(
-            &nats_url,
-            "f121",
-            "evidence",
-            batch_for_task,
-            4,
-            Some(started_tx),
-            Some(task_barrier_path),
+        let push_task = tokio::spawn(async move { client_for_task.push().await });
+        wait_for_fixture_path(
+            task_barrier_path,
+            Duration::from_secs(10),
+            "in-flight push must reach the server-side SIGTERM barrier",
         )
         .await;
+        let _ = started_tx.send(());
+
+        tokio::time::timeout(Duration::from_secs(45), push_task)
+            .await
+            .expect("direct push must respond after graceful drain")
+            .expect("direct push task must not panic")
     });
     started_rx
         .await
@@ -837,30 +916,54 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
         kill_status.success(),
         "kill -TERM must signal the server; status: {kill_status:?}"
     );
+    wait_for_fixture_path(
+        shutdown_quiesced_path.clone(),
+        Duration::from_secs(10),
+        "server must observe SIGTERM and close sync admission before the accepted apply is released",
+    )
+    .await;
+    let shutdown_state =
+        std::fs::read_to_string(&shutdown_quiesced_path).expect("read shutdown admission marker");
+    assert!(
+        !shutdown_state.contains("active_requests=0"),
+        "the accepted push reply must still hold a drain lease when admission closes: {shutdown_state}"
+    );
     std::fs::write(&release_path, b"release").expect("release in-flight push barrier");
 
+    let push_result = tokio::time::timeout(Duration::from_secs(30), pending_push)
+        .await
+        .expect("in-flight push must complete during graceful drain")
+        .expect("in-flight push task must not panic");
     let exit = wait_for_child_output(child, Duration::from_secs(30), "graceful drain").status;
+    let completed_shutdown_state =
+        std::fs::read_to_string(&shutdown_quiesced_path).expect("read completed shutdown marker");
+    let reply_position = completed_shutdown_state
+        .find("reply-acknowledged active_requests=1")
+        .unwrap_or_else(|| {
+            panic!("accepted push reply was not acknowledged under its drain lease:\n{completed_shutdown_state}")
+        });
+    let drained_position = completed_shutdown_state
+        .find("drain-complete active_requests=0")
+        .unwrap_or_else(|| {
+            panic!("server did not reach a zero-work drain frontier:\n{completed_shutdown_state}")
+        });
+    assert!(
+        reply_position < drained_position,
+        "reply acknowledgement must precede endpoint drain completion:\n{completed_shutdown_state}"
+    );
+    push_result.unwrap_or_else(|err| {
+        panic!(
+            "direct push response must include apply result: {err}; shutdown state:\n{completed_shutdown_state}"
+        )
+    });
     assert!(
         exit.success(),
         "contextdb-server must exit 0 on SIGTERM; status: {exit:?}"
     );
-    tokio::time::timeout(Duration::from_secs(30), pending_push)
-        .await
-        .expect("in-flight push must complete during graceful drain")
-        .expect("in-flight push task must not panic");
 
-    // Reopen and assert BOTH in-flight commits are durable. A no-drain `exit(0)` impl loses any
-    // in-flight apply that hadn't fsynced yet — typically the most recent push.
-    let reopened = (0..5)
-        .find_map(|attempt| match Database::open(&db_path) {
-            Ok(db) => Some(db),
-            Err(_) if attempt < 4 => {
-                std::thread::sleep(Duration::from_millis(50 * (attempt as u64 + 1)));
-                None
-            }
-            Err(e) => panic!("reopen after drain failed: {e:?}"),
-        })
-        .expect("reopen after drain succeeds within 5 attempts");
+    // Reopen and assert the baseline plus every row from the accepted apply are durable. A no-drain
+    // `exit(0)` implementation loses work or its acknowledgement at this boundary.
+    let reopened = Database::open(&db_path).expect("reopen after the server process exits");
 
     let r = reopened
         .execute("SELECT id FROM evidence", &empty_params())
@@ -877,13 +980,22 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
             "every row from the in-flight batch must survive graceful drain; missing {id}"
         );
     }
+    let vector_hits = reopened
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &in_flight_vec,
+            batch_ids.len() + 1,
+            None,
+            reopened.snapshot(),
+        )
+        .expect("search vectors after graceful drain reopen");
+    assert_eq!(
+        vector_hits.len(),
+        batch_ids.len() + 1,
+        "the baseline and every accepted batch vector must remain searchable after reopen"
+    );
 }
 
-// Helper: push a single-row INSERT through the server via NATS, wait for ack. Lives in
-// tests/acceptance/common.rs as `pub(crate) async fn push_change_through_server(...)`. The test plan's
-// mechanical-call-site list adds this helper to common.rs alongside the existing spawn_server and
-// start_nats helpers — it wraps the existing wire-protocol primitives (encode/decode + push subject)
-// already used by the sync acceptance tests.
 /// I ran `contextdb-server --version` and got binary version + supported protocol version on stdout, exit 0 — so an
 /// operator deciding whether to roll forward a fleet has a single command that answers "what wire version does this
 /// node speak?"

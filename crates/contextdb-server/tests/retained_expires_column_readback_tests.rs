@@ -24,8 +24,7 @@
 
 use contextdb_core::{TenantId, Value, Wallclock};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,7 +38,6 @@ async fn within<F: std::future::Future>(fut: F) -> F::Output {
 
 const T0: u64 = 1_700_000_000_000;
 const TENANT: &str = "expires-readback";
-const HUB_NODE: &str = "hub-node-a";
 const MINUTE: u64 = 60 * 1000;
 
 /// The table this suite exists for: a retained, two-way table that also names a
@@ -47,10 +45,11 @@ const MINUTE: u64 = 60 * 1000;
 /// timestamp column that can pin a row past the window or retire it early.
 const WINDOWS_DDL: &str = "CREATE TABLE windows \
      (id INTEGER PRIMARY KEY, body TEXT, expires_at TIMESTAMP EXPIRES) \
-     RETAIN 1 HOURS SYNC TWO WAY";
+     RETAIN 1 HOURS SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 /// Non-retained control: proves the pull path itself worked in every test that
 /// asserts a retained row is absent.
-const CONTROL_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+const CONTROL_DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -140,12 +139,17 @@ fn declare_tables(db: &Database) {
 fn start_hub(broker: &InProcessBroker) -> RunningHub {
     let db = Arc::new(Database::open_memory());
     declare_tables(&db);
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -161,11 +165,14 @@ fn open_edge() -> Arc<Database> {
     db
 }
 
-fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
-    SyncClient::with_transport(
+fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> SyncClient {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&node_id),
         TenantId::from(TENANT),
+        identity,
     )
 }
 

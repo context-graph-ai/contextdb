@@ -267,6 +267,22 @@ fn main() {
     let _ = ConflictPolicy::LatestWins;
     let _ = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
 }
+#[cfg(feature = "legacy_source_mutation")]
+fn main() {
+    let source = Database::open_legacy_for_migration("legacy.db").expect("legacy source");
+    let _ = source.execute(
+        "CREATE TABLE forged (id UUID PRIMARY KEY)",
+        &Default::default(),
+    );
+}
+#[cfg(feature = "raw_blob_repository_type")]
+fn main() {
+    let _: contextdb_engine::blob_repository::BlobRepository = panic!("type must stay private");
+}
+#[cfg(feature = "raw_blob_repository_accessor")]
+fn main() {
+    let _ = db().blob_repository();
+}
 
 #[cfg(not(any(
     feature = "accountant_accessor",
@@ -305,6 +321,9 @@ fn main() {
     feature = "raw_policy_apply",
     feature = "raw_apply_changes",
     feature = "raw_apply_changes_with_receipt",
-    feature = "role_relative_policy_types"
+    feature = "role_relative_policy_types",
+    feature = "legacy_source_mutation",
+    feature = "raw_blob_repository_type",
+    feature = "raw_blob_repository_accessor"
 )))]
 fn main() {}

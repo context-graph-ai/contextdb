@@ -186,7 +186,11 @@ fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
         if !scoped || !(rel.ends_with(".rs") || rel.ends_with(".md")) {
             continue;
         }
-        let body = std::fs::read_to_string(root.join(rel))
+        let path = root.join(rel);
+        if !path.is_file() {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read tracked implementation file {rel}: {error}"));
         for (line_number, line) in body.lines().enumerate() {
             let lower = line.to_ascii_lowercase();

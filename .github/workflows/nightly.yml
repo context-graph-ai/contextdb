@@ -1,10 +1,9 @@
 name: Nightly
 
 # Nightly test tier. Stress/journey tests re-tiered out of the default gate are marked
-# `#[cfg(feature = "nightly-tests")]` (the same mechanism as the deprecated nats-tests
-# marker) and build/run only here. This deliberately does NOT use `--include-ignored`:
-# the tree carries `#[ignore]` tests that must stay skipped everywhere (pinned RED,
-# quarantined, platform- and corpus-gated). Deprecated NATS suites stay off.
+# `#[cfg(feature = "nightly-tests")]` and build/run only here. This deliberately does
+# NOT use `--include-ignored`: the tree carries `#[ignore]` tests that must stay skipped
+# everywhere (known-failing quarantined, platform- and corpus-gated).
 on:
   schedule:
     - cron: '0 3 * * *'

@@ -12,6 +12,7 @@ pub enum PhysicalPlan {
     CreateIndex(CreateIndexPlan),
     DropIndex(DropIndexPlan),
     Insert(InsertPlan),
+    Purge(PurgePlan),
     Delete(DeletePlan),
     Update(UpdatePlan),
     Scan {
@@ -146,6 +147,7 @@ impl PhysicalPlan {
             PhysicalPlan::Scan { table, .. } => format!("Scan(table={})", table),
             PhysicalPlan::AlterTable(p) => format!("AlterTable(table={})", p.table),
             PhysicalPlan::Insert(p) => format!("Insert(table={})", p.table),
+            PhysicalPlan::Purge(p) => format!("Purge(table={})", p.table),
             PhysicalPlan::Delete(p) => format!("Delete(table={})", p.table),
             PhysicalPlan::Update(p) => format!("Update(table={})", p.table),
             PhysicalPlan::Pipeline(plans) => plans
@@ -259,6 +261,12 @@ pub struct OnConflictPlan {
 
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
+    pub table: String,
+    pub where_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PurgePlan {
     pub table: String,
     pub where_clause: Option<Expr>,
 }

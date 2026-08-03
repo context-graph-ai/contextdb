@@ -159,7 +159,7 @@ fn pre_declaration_root_gains_all_three_builtin_declarations_on_reopen() {
     );
     assert_eq!(
         capabilities.conflict_policy,
-        Some(ConflictPolicy::LatestWins),
+        Some(ConflictPolicy::KEEP_LATEST),
         "work_capabilities must gain SYNC CONFLICT KEEP LATEST on reconcile"
     );
 
@@ -173,7 +173,7 @@ fn pre_declaration_root_gains_all_three_builtin_declarations_on_reopen() {
     );
     assert_eq!(
         peers.conflict_policy,
-        Some(ConflictPolicy::LatestWins),
+        Some(ConflictPolicy::KEEP_LATEST),
         "peer_directory must gain SYNC CONFLICT KEEP LATEST on reconcile"
     );
 

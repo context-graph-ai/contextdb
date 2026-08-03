@@ -1,4 +1,5 @@
 use super::*;
+use std::cell::Cell;
 
 const EVENT_TYPES_CONFIG_KEY: &str = "__event_bus_event_types";
 const SINKS_CONFIG_KEY: &str = "__event_bus_sinks";
@@ -12,6 +13,12 @@ pub(crate) struct EventBusState {
     definitions: Mutex<EventBusDefinitions>,
     callbacks: RwLock<HashMap<String, SinkRegistration>>,
     queues: Mutex<HashMap<String, VecDeque<SinkQueueEntry>>>,
+    /// Stops new queue checkouts while an authoritative-purge snapshot is
+    /// owned through its future durable commit and direct swap. Mutations take
+    /// this state before queue locks; an in-flight user callback is the one
+    /// deliberate reentrant exception so it can finish its own DB work.
+    queue_mutation_state: Arc<Mutex<QueueMutationState>>,
+    queue_mutation_waiters: Arc<Condvar>,
     staged_for_persistence: Mutex<HashMap<Lsn, Arc<Vec<PreparedSinkEvent>>>>,
     staged_ddl_for_persistence: Mutex<HashMap<Lsn, StagedEventBusDdlCommit>>,
     metrics: Mutex<HashMap<String, SinkMetricsState>>,
@@ -24,7 +31,7 @@ pub(crate) struct EventBusState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct EventBusDefinitions {
+pub(super) struct EventBusDefinitions {
     event_types: BTreeMap<String, EventTypeDef>,
     sinks: BTreeMap<String, SinkDef>,
     routes: BTreeMap<String, RouteDef>,
@@ -81,13 +88,261 @@ pub(crate) struct SinkQueueEntry {
     gate: EventGateSnapshot,
 }
 
+#[derive(Default)]
+struct QueueMutationState {
+    checkout_paused: bool,
+    mutation_blocked: bool,
+    checked_out: HashSet<(String, u64)>,
+    active_mutations: u64,
+}
+
+thread_local! {
+    static EVENT_BUS_CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct EventBusCallbackGuard;
+
+impl EventBusCallbackGuard {
+    fn enter() -> Self {
+        EVENT_BUS_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for EventBusCallbackGuard {
+    fn drop(&mut self) {
+        EVENT_BUS_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Phase one of authoritative purge: new dispatcher checkout is paused and
+/// every callback already checked out has settled.  It deliberately leaves
+/// ordinary queue mutations enabled so callback-owned database work can finish
+/// before the purge takes the transaction commit mutex.
+pub(crate) struct AuthoritativePurgeQueueDrainGuard {
+    state: Arc<Mutex<QueueMutationState>>,
+    waiters: Arc<Condvar>,
+    promoted_to_mutation_freeze: bool,
+}
+
+impl Drop for AuthoritativePurgeQueueDrainGuard {
+    fn drop(&mut self) {
+        if self.promoted_to_mutation_freeze {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.checkout_paused = false;
+        state.mutation_blocked = false;
+        self.waiters.notify_all();
+    }
+}
+
+/// Phase two of authoritative purge. It can only be created by consuming a
+/// drained checkout guard after the caller has entered the transaction commit
+/// mutex. Dropping it reopens ordinary queue mutations if preparation aborts
+/// before publication.
+pub(crate) struct AuthoritativePurgeQueueMutationToken {
+    state: Arc<Mutex<QueueMutationState>>,
+    waiters: Arc<Condvar>,
+}
+
+impl Drop for AuthoritativePurgeQueueMutationToken {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.checkout_paused = false;
+        state.mutation_blocked = false;
+        self.waiters.notify_all();
+    }
+}
+
+impl AuthoritativePurgeQueueDrainGuard {
+    /// Freeze mutations only after the future purge kernel owns the
+    /// transaction commit mutex. Consuming the phase-one guard makes the lock
+    /// order explicit: drain callback work first, then enter the commit path,
+    /// then wait for durable/memory queue leases to settle.
+    pub(crate) fn freeze_for_commit_locked_purge(mut self) -> AuthoritativePurgeQueueMutationToken {
+        let mut state = self.state.lock();
+        debug_assert!(state.checkout_paused);
+        debug_assert!(!state.mutation_blocked);
+        state.mutation_blocked = true;
+        while state.active_mutations != 0 {
+            self.waiters.wait(&mut state);
+        }
+        drop(state);
+        self.promoted_to_mutation_freeze = true;
+        AuthoritativePurgeQueueMutationToken {
+            state: self.state.clone(),
+            waiters: self.waiters.clone(),
+        }
+    }
+}
+
+/// A normal queue mutation lease. It covers the durable queue operation and
+/// its corresponding memory publication; phase-two purge waits for all such
+/// leases before copying the replacement map.
+pub(crate) struct QueueMutationLease {
+    state: Arc<Mutex<QueueMutationState>>,
+    waiters: Arc<Condvar>,
+}
+
+impl Drop for QueueMutationLease {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.active_mutations = state.active_mutations.saturating_sub(1);
+        self.waiters.notify_all();
+    }
+}
+
+impl EventBusState {
+    fn queue_checkout_guard(&self) -> parking_lot::MutexGuard<'_, QueueMutationState> {
+        let mut state = self.queue_mutation_state.lock();
+        while state.checkout_paused {
+            self.queue_mutation_waiters.wait(&mut state);
+        }
+        state
+    }
+
+    pub(crate) fn begin_queue_mutation(&self) -> QueueMutationLease {
+        let mut state = self.queue_mutation_state.lock();
+        while state.mutation_blocked {
+            self.queue_mutation_waiters.wait(&mut state);
+        }
+        state.active_mutations = state.active_mutations.saturating_add(1);
+        drop(state);
+        QueueMutationLease {
+            state: self.queue_mutation_state.clone(),
+            waiters: self.queue_mutation_waiters.clone(),
+        }
+    }
+
+    /// Phase one of the authoritative-purge queue protocol. Call this before
+    /// taking the transaction commit mutex, then move the returned guard into
+    /// `freeze_for_commit_locked_purge` from that mutex's active-prepare
+    /// callback.
+    pub(crate) fn begin_authoritative_purge_queue_drain(
+        &self,
+    ) -> Result<AuthoritativePurgeQueueDrainGuard> {
+        if EVENT_BUS_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
+            return Err(Error::SyncError(
+                "authoritative purge cannot begin from an event-bus callback".to_string(),
+            ));
+        }
+        let mut state = self.queue_mutation_state.lock();
+        while state.checkout_paused || state.mutation_blocked {
+            self.queue_mutation_waiters.wait(&mut state);
+        }
+        // No new dispatcher checkout, while normal durable queue mutations
+        // remain allowed so callbacks and child DB work can settle.
+        state.checkout_paused = true;
+        while !state.checked_out.is_empty() {
+            self.queue_mutation_waiters.wait(&mut state);
+        }
+        drop(state);
+        Ok(AuthoritativePurgeQueueDrainGuard {
+            state: self.queue_mutation_state.clone(),
+            waiters: self.queue_mutation_waiters.clone(),
+            promoted_to_mutation_freeze: false,
+        })
+    }
+
+    fn finish_checked_out_entry(&self, sink: &str, entry_id: u64) {
+        let mut state = self.queue_mutation_state.lock();
+        state.checked_out.remove(&(sink.to_string(), entry_id));
+        self.queue_mutation_waiters.notify_all();
+    }
+
+    /// Build the complete post-purge queue image before durability.  The
+    /// payload, attempt count, and access gate remain in their original
+    /// `SinkQueueEntry`; publication later swaps this opaque VecDeque map.
+    pub(crate) fn prepare_authoritative_purge_queue_replacement(
+        &self,
+        queue_mutation_token: AuthoritativePurgeQueueMutationToken,
+        durable_sink_names: BTreeSet<String>,
+        table: &str,
+        row_ids: &HashSet<RowId>,
+    ) -> PreparedAuthoritativePurgeEventBusPublication {
+        let mut sink_names = durable_sink_names;
+        sink_names.extend(self.queues.lock().keys().cloned());
+        let mut queues = self.queues.lock().clone();
+        for sink in &sink_names {
+            let entries = queues.entry(sink.clone()).or_default();
+            entries.retain(|entry| entry.event.table != table || !row_ids.contains(&entry.row_id));
+        }
+        PreparedAuthoritativePurgeEventBusPublication {
+            queues,
+            sink_names,
+            _queue_mutation_token: queue_mutation_token,
+        }
+    }
+
+    /// The later commit kernel may call only this direct swap after its
+    /// durable transaction succeeds.  Preparation itself never calls it.
+    pub(crate) fn publish_prepared_authoritative_purge_queue_replacement(
+        &self,
+        publication: PreparedAuthoritativePurgeEventBusPublication,
+    ) {
+        // `publication` owns the paused-checkout token acquired during preparation.
+        // This direct swap therefore cannot discard an enqueue or an in-flight
+        // worker acknowledgement that arrived after the snapshot.
+        *self.queues.lock() = publication.queues;
+        self.waiters.notify_all();
+    }
+
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn authoritative_purge_memory_sink_queue_for_test(
+        &self,
+        sink: &str,
+    ) -> BTreeMap<RowId, HashMap<String, Value>> {
+        self.queues
+            .lock()
+            .get(sink)
+            .into_iter()
+            .flatten()
+            .map(|entry| (entry.row_id, entry.event.row_values.clone()))
+            .collect()
+    }
+}
+
+/// Opaque full queue replacement for authoritative purge.  Keeping the
+/// VecDeque private prevents a later kernel from rebuilding entries after
+/// durability and accidentally losing retry or gate state.
+pub(crate) struct PreparedAuthoritativePurgeEventBusPublication {
+    queues: HashMap<String, VecDeque<SinkQueueEntry>>,
+    sink_names: BTreeSet<String>,
+    _queue_mutation_token: AuthoritativePurgeQueueMutationToken,
+}
+
+impl PreparedAuthoritativePurgeEventBusPublication {
+    pub(crate) fn authoritative_purge_sink_names(&self) -> &BTreeSet<String> {
+        &self.sink_names
+    }
+}
+
 pub(crate) type PreparedSinkEvent = (String, SinkQueueEntry);
+
+/// A received-schema stage must not reserve queue ids until the matching
+/// Redb transaction has committed.  This carries the pure projection and the
+/// counter value to publish afterwards.
+pub(crate) struct PreparedReceivedSinkEvents {
+    pub(crate) events: Vec<PreparedSinkEvent>,
+    pub(crate) next_queue_id: u64,
+}
 type EncodedConfigValues = Vec<(&'static str, Vec<u8>)>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EventBusPersistenceCommit {
-    pub(crate) config_values: EncodedConfigValues,
+    pub(crate) config_values: Vec<(String, Vec<u8>)>,
     pub(crate) ddl: Vec<DdlChange>,
+    pub(crate) generation_sidecars: Vec<super::DurableDdlGenerationSidecar>,
+}
+
+/// Event definitions and their encoded durable config, prepared before the
+/// received-schema transaction commits.  The inner definitions remain
+/// private: this is an engine staging handle, not a public schema API.
+#[derive(Clone)]
+pub(crate) struct PreparedEventBusPublication {
+    definitions: EventBusDefinitions,
+    pub(crate) config_values: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +447,8 @@ impl EventBusState {
             definitions: Mutex::new(EventBusDefinitions::default()),
             callbacks: RwLock::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
+            queue_mutation_state: Arc::new(Mutex::new(QueueMutationState::default())),
+            queue_mutation_waiters: Arc::new(Condvar::new()),
             staged_for_persistence: Mutex::new(HashMap::new()),
             staged_ddl_for_persistence: Mutex::new(HashMap::new()),
             metrics: Mutex::new(HashMap::new()),
@@ -267,6 +524,98 @@ impl EventBusState {
 }
 
 impl Database {
+    /// Project every event-bus declaration against the caller's complete
+    /// post-DDL table view, and encode all durable values before publication.
+    /// Source-order coordination belongs to `ReceivedSchemaStage`; this helper
+    /// deliberately does not append category-local DDL to the log.
+    #[allow(dead_code)] // consumed when Phase B joins the staged Redb transaction
+    pub(super) fn prepare_received_event_bus_publication(
+        &self,
+        ddl: &[DdlChange],
+        projected_tables: &HashMap<String, TableMeta>,
+    ) -> Result<PreparedEventBusPublication> {
+        let mut definitions = self.received_event_bus_projection();
+        for change in ddl {
+            self.apply_received_event_bus_ddl_to_projection(
+                &mut definitions,
+                change,
+                projected_tables,
+            )?;
+        }
+        self.prepare_received_event_bus_publication_from_projection(definitions)
+    }
+
+    pub(super) fn received_event_bus_projection(&self) -> EventBusDefinitions {
+        self.event_bus.definitions.lock().clone()
+    }
+
+    /// Seed a detached received-schema adjudicator with the receiver's live
+    /// declarations. Received DDL is replayed in source order on top of this
+    /// projection, so separately committed event type, sink, and route
+    /// declarations remain idempotent when a later mixed DDL/data unit arrives.
+    pub(super) fn seed_received_event_bus_projection(&self, definitions: EventBusDefinitions) {
+        *self.event_bus.definitions.lock() = definitions;
+    }
+
+    pub(super) fn apply_received_event_bus_ddl_to_projection(
+        &self,
+        definitions: &mut EventBusDefinitions,
+        ddl: &DdlChange,
+        projected_tables: &HashMap<String, TableMeta>,
+    ) -> Result<()> {
+        Self::apply_event_bus_ddl_to_definitions_with_table_lookup(definitions, ddl, &|table| {
+            projected_tables.contains_key(table)
+        })
+    }
+
+    pub(super) fn prepare_received_event_bus_publication_from_projection(
+        &self,
+        definitions: EventBusDefinitions,
+    ) -> Result<PreparedEventBusPublication> {
+        let config_values = Self::encoded_event_bus_config_values(&definitions)?
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+        Ok(PreparedEventBusPublication {
+            definitions,
+            config_values,
+        })
+    }
+
+    /// Publish a received-schema event-bus replacement while the caller holds
+    /// the mutation lease spanning its durable transaction.
+    pub(super) fn publish_prepared_event_bus_publication_under_queue_mutation_lease(
+        &self,
+        publication: PreparedEventBusPublication,
+        received_events: Vec<PreparedSinkEvent>,
+    ) {
+        let sink_names = publication
+            .definitions
+            .sinks
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        *self.event_bus.definitions.lock() = publication.definitions;
+        self.event_bus
+            .callbacks
+            .write()
+            .retain(|sink, _| sink_names.contains(sink));
+        let mut queues = self.event_bus.queues.lock();
+        queues.retain(|sink, _| sink_names.contains(sink));
+        for sink in &sink_names {
+            queues.entry(sink.clone()).or_default();
+        }
+        for (sink, entry) in received_events {
+            let queue = queues.entry(sink).or_default();
+            if queue.len() == MAX_SINK_QUEUE_DEPTH {
+                queue.pop_front();
+            }
+            queue.push_back(entry);
+        }
+        drop(queues);
+        self.event_bus.waiters.notify_all();
+    }
+
     pub(super) fn load_event_bus_state_from_persistence(&self) -> Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
@@ -302,6 +651,7 @@ impl Database {
         let sink_names = definitions.sinks.keys().cloned().collect::<Vec<_>>();
         *self.event_bus.definitions.lock() = definitions;
 
+        let _queue_mutation = self.event_bus.begin_queue_mutation();
         let mut queues = self.event_bus.queues.lock();
         queues.clear();
         let mut max_id = 0u64;
@@ -418,34 +768,64 @@ impl Database {
         self.apply_event_bus_ddl_batch(ddl)
     }
 
-    pub(super) fn stage_event_bus_ddl_for_commit(&self, lsn: Lsn, ddl: &[DdlChange]) -> Result<()> {
+    pub(super) fn stage_event_bus_ddl_for_commit(
+        &self,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+    ) -> Result<u32> {
         if ddl.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let mut projected = self.event_bus.definitions.lock().clone();
         for change in ddl {
             self.apply_event_bus_ddl_to_definitions(&mut projected, change)?;
         }
         if *self.event_bus.definitions.lock() == projected {
-            return Ok(());
+            return Ok(0);
         }
+        let ddl_count = u32::try_from(ddl.len())
+            .map_err(|_| Error::SyncError("event-bus DDL ordinal overflow".to_string()))?;
+        let mut config_values = Self::encoded_event_bus_config_values(&projected)?
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<Vec<_>>();
+        // PersistentCompositeStore writes event-bus DDL before trigger DDL in
+        // this commit, so event-bus provenance owns the leading ordinals.
+        let generation_sidecars = self.ddl_generation_sidecars(ddl)?;
+        let provenance_values = self.ddl_generation_sidecar_values(lsn, ddl, 0)?;
+        config_values.extend(provenance_values);
         let persistence = EventBusPersistenceCommit {
-            config_values: Self::encoded_event_bus_config_values(&projected)?,
+            config_values,
             ddl: ddl.to_vec(),
+            generation_sidecars,
         };
         self.event_bus
             .stage_event_bus_ddl_commit(lsn, projected, persistence);
-        Ok(())
+        Ok(ddl_count)
     }
 
     pub(super) fn publish_staged_event_bus_ddl_commit(&self, lsn: Lsn) {
+        let _queue_mutation = self.event_bus.begin_queue_mutation();
+        self.publish_staged_event_bus_ddl_commit_under_queue_mutation_lease(lsn);
+    }
+
+    /// Publish staged DDL while the matching durable commit still owns its
+    /// mutation lease.
+    pub(super) fn publish_staged_event_bus_ddl_commit_under_queue_mutation_lease(&self, lsn: Lsn) {
         let staged = self
             .event_bus
             .staged_ddl_for_persistence
             .lock()
             .remove(&lsn);
         if let Some(staged) = staged {
-            self.apply_event_bus_definitions_to_memory(staged.definitions);
+            self.publish_in_memory_ddl_generation_sidecars(
+                lsn,
+                0,
+                &staged.persistence.generation_sidecars,
+            );
+            self.apply_event_bus_definitions_to_memory_under_queue_mutation_lease(
+                staged.definitions,
+            );
             let mut ddl_log = self.ddl_log.write();
             ddl_log.extend(
                 staged
@@ -565,6 +945,21 @@ impl Database {
             }
             DdlChange::DropRoute { name, .. } => {
                 let _ = Self::drop_route_def_from(definitions, name);
+                Ok(())
+            }
+            DdlChange::DropTable { name } => {
+                let removed_event_types = definitions
+                    .event_types
+                    .values()
+                    .filter(|event_type| event_type.table == *name)
+                    .map(|event_type| event_type.name.clone())
+                    .collect::<HashSet<_>>();
+                definitions
+                    .event_types
+                    .retain(|event_type, _| !removed_event_types.contains(event_type));
+                definitions
+                    .routes
+                    .retain(|_, route| !removed_event_types.contains(&route.event_type));
                 Ok(())
             }
             _ => Ok(()),
@@ -728,6 +1123,7 @@ impl Database {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn __debug_register_sink_with_constraints_for_test<F>(
         &self,
         name: &str,
@@ -775,6 +1171,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn sink_metrics_for_test(&self, sink: &str) -> SinkMetrics {
         let _operation = self.assert_open_operation();
         let queued = self
@@ -800,7 +1197,27 @@ impl Database {
         }
     }
 
+    /// Ordered in-memory queue identity/payload view for received-schema race
+    /// tests. The accessor is compiled only for tests; production dispatch
+    /// continues to own and mutate the queue privately.
+    #[cfg(test)]
+    pub fn sink_queue_entries_for_test(&self, sink: &str) -> Vec<(u64, SinkEvent)> {
+        let _operation = self.assert_open_operation();
+        self.event_bus
+            .queues
+            .lock()
+            .get(sink)
+            .map(|queue| {
+                queue
+                    .iter()
+                    .map(|entry| (entry.id, entry.event.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn runtimes_count_for_test(&self, sink: &str) -> usize {
         let _operation = self.assert_open_operation();
         self.event_bus
@@ -812,6 +1229,7 @@ impl Database {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn runtime_starts_count_for_test(&self, sink: &str) -> u64 {
         let _operation = self.assert_open_operation();
         self.event_bus
@@ -882,6 +1300,168 @@ impl Database {
             );
         }
         Ok(out)
+    }
+
+    /// Build sink work from the already-finalized received WriteSet and the
+    /// projected definitions.  Unlike the normal commit path this never
+    /// touches `next_queue_id`: abandoning a received stage must leave the
+    /// live allocator exactly where it was.
+    pub(super) fn prepare_received_sink_events_from_projection(
+        &self,
+        ws: &contextdb_tx::WriteSet,
+        definitions: &EventBusDefinitions,
+        projected_rows: &HashMap<String, Vec<VersionedRow>>,
+        projected_tables: &HashMap<String, TableMeta>,
+    ) -> PreparedReceivedSinkEvents {
+        let mut next_queue_id = self.event_bus.next_queue_id.load(Ordering::SeqCst);
+        let Some(lsn) = ws.commit_lsn else {
+            return PreparedReceivedSinkEvents {
+                events: Vec::new(),
+                next_queue_id,
+            };
+        };
+        if definitions.event_types.is_empty() || definitions.routes.is_empty() {
+            return PreparedReceivedSinkEvents {
+                events: Vec::new(),
+                next_queue_id,
+            };
+        }
+
+        let mut deleted = HashMap::<(String, RowId), VersionedRow>::new();
+        for (table, row_id, _) in &ws.relational_deletes {
+            if let Some(row) = projected_rows
+                .get(table)
+                .and_then(|rows| rows.iter().rev().find(|row| row.row_id == *row_id))
+            {
+                deleted.insert((table.clone(), *row_id), row.clone());
+            }
+        }
+        let mut consumed_deletes = HashSet::new();
+        let mut events = Vec::new();
+        for (table, row) in &ws.relational_inserts {
+            let same_row = (table.clone(), row.row_id);
+            let same_identity = deleted.iter().find_map(|((old_table, old_id), old)| {
+                (old_table == table
+                    && old.values.contains_key("id")
+                    && old.values.get("id") == row.values.get("id"))
+                .then_some((old_table.clone(), *old_id))
+            });
+            let update_key = deleted
+                .contains_key(&same_row)
+                .then_some(same_row)
+                .or(same_identity);
+            let trigger = if let Some(key) = update_key {
+                consumed_deletes.insert(key);
+                EventTrigger::Update
+            } else {
+                EventTrigger::Insert
+            };
+            Self::append_received_sink_events_for_candidate(
+                &mut events,
+                definitions,
+                RowEventCandidateRef {
+                    table,
+                    trigger,
+                    row_id: row.row_id,
+                    values: &row.values,
+                },
+                lsn,
+                projected_tables,
+                projected_rows,
+                &mut next_queue_id,
+            );
+        }
+        for ((table, row_id), row) in deleted {
+            if !consumed_deletes.contains(&(table.clone(), row_id)) {
+                Self::append_received_sink_events_for_candidate(
+                    &mut events,
+                    definitions,
+                    RowEventCandidateRef {
+                        table: &table,
+                        trigger: EventTrigger::Delete,
+                        row_id,
+                        values: &row.values,
+                    },
+                    lsn,
+                    projected_tables,
+                    projected_rows,
+                    &mut next_queue_id,
+                );
+            }
+        }
+        PreparedReceivedSinkEvents {
+            events,
+            next_queue_id,
+        }
+    }
+
+    pub(super) fn prepare_received_sink_events_for_publication(
+        &self,
+        ws: &contextdb_tx::WriteSet,
+        publication: &PreparedEventBusPublication,
+        projected_rows: &HashMap<String, Vec<VersionedRow>>,
+        projected_tables: &HashMap<String, TableMeta>,
+    ) -> PreparedReceivedSinkEvents {
+        self.prepare_received_sink_events_from_projection(
+            ws,
+            &publication.definitions,
+            projected_rows,
+            projected_tables,
+        )
+    }
+
+    fn append_received_sink_events_for_candidate(
+        out: &mut Vec<PreparedSinkEvent>,
+        definitions: &EventBusDefinitions,
+        candidate: RowEventCandidateRef<'_>,
+        lsn: Lsn,
+        projected_tables: &HashMap<String, TableMeta>,
+        projected_rows: &HashMap<String, Vec<VersionedRow>>,
+        next_queue_id: &mut u64,
+    ) {
+        for event_type in definitions.event_types.values() {
+            if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
+                continue;
+            }
+            let severity = candidate
+                .values
+                .get("severity")
+                .and_then(Value::as_text)
+                .unwrap_or("")
+                .to_string();
+            let gate = event_gate_snapshot_from_projected_payload(
+                projected_tables.get(candidate.table),
+                candidate.values,
+                projected_tables,
+                projected_rows,
+            );
+            for route in definitions
+                .routes
+                .values()
+                .filter(|route| route.event_type == event_type.name)
+            {
+                if !route_matches(route, candidate.values) {
+                    continue;
+                }
+                out.push((
+                    route.sink.clone(),
+                    SinkQueueEntry {
+                        id: *next_queue_id,
+                        event: SinkEvent {
+                            event_type: event_type.name.clone(),
+                            table: candidate.table.to_string(),
+                            severity: severity.clone(),
+                            row_values: candidate.values.clone(),
+                            at_lsn: lsn,
+                        },
+                        row_id: candidate.row_id,
+                        attempts: 0,
+                        gate: gate.clone(),
+                    },
+                ));
+                *next_queue_id = next_queue_id.saturating_add(1);
+            }
+        }
     }
 
     fn append_prepared_sink_events_for_candidate(
@@ -1044,6 +1624,19 @@ impl Database {
         if events.is_empty() {
             return;
         }
+        let _queue_mutation = self.event_bus.begin_queue_mutation();
+        self.publish_prepared_sink_events_to_memory_under_queue_mutation_lease(events);
+    }
+
+    /// Append prepared events while the caller retains the lease that spans
+    /// their durable queue write and this memory publication.
+    pub(super) fn publish_prepared_sink_events_to_memory_under_queue_mutation_lease(
+        &self,
+        events: Vec<PreparedSinkEvent>,
+    ) {
+        if events.is_empty() {
+            return;
+        }
         let mut queues = self.event_bus.queues.lock();
         for (sink, entry) in events {
             let queue = queues.entry(sink).or_default();
@@ -1054,6 +1647,12 @@ impl Database {
         }
         drop(queues);
         self.event_bus.waiters.notify_all();
+    }
+
+    pub(super) fn advance_received_sink_event_id(&self, next_queue_id: u64) {
+        self.event_bus
+            .next_queue_id
+            .fetch_max(next_queue_id, Ordering::SeqCst);
     }
 
     pub(super) fn stop_event_bus_threads(&self) -> EventBusThreadShutdown {
@@ -1174,14 +1773,31 @@ impl Database {
             if *self.event_bus.definitions.lock() == projected {
                 return Ok(());
             }
+            // `allocate_ddl_lsn` has the transaction commit mutex before
+            // entering this closure. Keep this lease across the durable DDL
+            // write and the matching in-memory queue-definition publication.
+            let _queue_mutation = self.event_bus.begin_queue_mutation();
             if let Some(persistence) = &self.persistence {
+                let mut config_values: Vec<(&str, Vec<u8>)> =
+                    Self::encoded_event_bus_config_values(&projected)?
+                        .into_iter()
+                        .map(|(key, value)| (key as &str, value))
+                        .collect();
+                let provenance_values = self.ddl_generation_sidecar_values(lsn, &ddl, 0)?;
+                config_values.extend(
+                    provenance_values
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.clone())),
+                );
                 persistence.flush_encoded_config_values_and_append_ddl_log(
-                    Self::encoded_event_bus_config_values(&projected)?,
+                    config_values,
                     lsn,
                     &ddl,
                 )?;
+            } else {
+                self.record_ddl_generation_sidecars(lsn, &ddl)?;
             }
-            self.apply_event_bus_definitions_to_memory(projected);
+            self.apply_event_bus_definitions_to_memory_under_queue_mutation_lease(projected);
             self.ddl_log
                 .write()
                 .extend(ddl.into_iter().map(|change| (lsn, change)));
@@ -1190,6 +1806,16 @@ impl Database {
     }
 
     fn apply_event_bus_definitions_to_memory(&self, definitions: EventBusDefinitions) {
+        let _queue_mutation = self.event_bus.begin_queue_mutation();
+        self.apply_event_bus_definitions_to_memory_under_queue_mutation_lease(definitions);
+    }
+
+    /// Update queue definitions while the caller already holds the spanning
+    /// mutation lease.
+    fn apply_event_bus_definitions_to_memory_under_queue_mutation_lease(
+        &self,
+        definitions: EventBusDefinitions,
+    ) {
         let sink_names = definitions.sinks.keys().cloned().collect::<Vec<_>>();
         *self.event_bus.definitions.lock() = definitions;
         let mut queues = self.event_bus.queues.lock();
@@ -1301,15 +1927,21 @@ impl EventBusWorker {
                 self.wait(&shutdown, Duration::from_millis(100));
                 continue;
             };
+            // Checkout and checked-out registration share this state guard, so
+            // a purge cannot pause between cloning an entry and recording it
+            // as in-flight. The callback itself runs without the guard.
+            let mut queue_mutation = self.event_bus.queue_checkout_guard();
             let entries = {
                 let mut queues = self.event_bus.queues.lock();
                 let Some(queue) = queues.get_mut(&self.sink) else {
                     drop(queues);
+                    drop(queue_mutation);
                     self.wait(&shutdown, Duration::from_millis(250));
                     continue;
                 };
                 let Some(front) = queue.front().cloned() else {
                     drop(queues);
+                    drop(queue_mutation);
                     self.wait(&shutdown, Duration::from_millis(250));
                     continue;
                 };
@@ -1320,6 +1952,7 @@ impl EventBusWorker {
                     drop(queues);
                     self.record_examined(1);
                     self.event_bus.waiters.notify_all();
+                    drop(queue_mutation);
                     self.wait(&shutdown, Duration::from_millis(10));
                     continue;
                 }
@@ -1330,6 +1963,12 @@ impl EventBusWorker {
                     .cloned()
                     .collect::<Vec<_>>()
             };
+            for entry in &entries {
+                queue_mutation
+                    .checked_out
+                    .insert((self.sink.clone(), entry.id));
+            }
+            drop(queue_mutation);
 
             if entries.is_empty() {
                 self.wait(&shutdown, Duration::from_millis(250));
@@ -1340,14 +1979,21 @@ impl EventBusWorker {
             let mut delivered_count = 0u64;
             let mut permanent_failure_count = 0u64;
             let mut examined_count = 0u64;
-            for entry in entries {
+            for (entry_position, entry) in entries.iter().cloned().enumerate() {
                 if shutdown.load(Ordering::SeqCst) {
+                    for pending in entries.iter().skip(entry_position) {
+                        self.event_bus
+                            .finish_checked_out_entry(&self.sink, pending.id);
+                    }
                     break;
                 }
                 examined_count = examined_count.saturating_add(1);
                 self.add_in_flight(1);
                 let callback = registration.callback.clone();
-                let result = catch_unwind(AssertUnwindSafe(|| callback(&entry.event)));
+                let result = {
+                    let _callback = EventBusCallbackGuard::enter();
+                    catch_unwind(AssertUnwindSafe(|| callback(&entry.event)))
+                };
                 self.add_in_flight(-1);
 
                 match result {
@@ -1369,6 +2015,10 @@ impl EventBusWorker {
                         );
                         let attempts = self.bump_attempts(entry.id).unwrap_or(entry.attempts + 1);
                         let backoff = retry_backoff(attempts);
+                        for pending in entries.iter().skip(entry_position + 1) {
+                            self.event_bus
+                                .finish_checked_out_entry(&self.sink, pending.id);
+                        }
                         self.wait(&shutdown, backoff);
                         continue 'dispatch;
                     }
@@ -1474,47 +2124,60 @@ impl EventBusWorker {
     }
 
     fn bump_attempts(&self, entry_id: u64) -> Result<u32> {
-        let updated = {
-            let mut queues = self.event_bus.queues.lock();
-            let Some(queue) = queues.get_mut(&self.sink) else {
-                return Ok(1);
-            };
-            let Some(entry) = queue.front_mut().filter(|entry| entry.id == entry_id) else {
-                return Ok(1);
-            };
-            let mut updated = entry.clone();
-            updated.attempts = updated.attempts.saturating_add(1);
-            persist_sink_queue_update(&self.persistence, &self.sink, None, Some(&updated))?;
-            entry.attempts = updated.attempts;
-            updated
+        let result = {
+            let _queue_mutation = self.event_bus.begin_queue_mutation();
+            (|| -> Result<Option<SinkQueueEntry>> {
+                let mut queues = self.event_bus.queues.lock();
+                let Some(queue) = queues.get_mut(&self.sink) else {
+                    return Ok(None);
+                };
+                let Some(entry) = queue.front_mut().filter(|entry| entry.id == entry_id) else {
+                    return Ok(None);
+                };
+                let mut updated = entry.clone();
+                updated.attempts = updated.attempts.saturating_add(1);
+                persist_sink_queue_update(&self.persistence, &self.sink, None, Some(&updated))?;
+                entry.attempts = updated.attempts;
+                Ok(Some(updated))
+            })()
         };
-        Ok(updated.attempts)
+        self.event_bus
+            .finish_checked_out_entry(&self.sink, entry_id);
+        result.map(|updated| updated.map(|entry| entry.attempts).unwrap_or(1))
     }
 
     fn ack_front_entries(&self, entry_ids: &[u64]) -> Result<()> {
         if entry_ids.is_empty() {
             return Ok(());
         }
-        {
-            let mut queues = self.event_bus.queues.lock();
-            if let Some(queue) = queues.get_mut(&self.sink) {
-                let removable = entry_ids
-                    .iter()
-                    .copied()
-                    .zip(queue.iter())
-                    .take_while(|(id, entry)| *id == entry.id)
-                    .map(|(id, _)| id)
-                    .collect::<Vec<_>>();
-                if !removable.is_empty() {
-                    persist_sink_queue_removals(&self.persistence, &self.sink, &removable)?;
-                    for _ in 0..removable.len() {
-                        queue.pop_front();
+        let result = {
+            let _queue_mutation = self.event_bus.begin_queue_mutation();
+            (|| -> Result<()> {
+                let mut queues = self.event_bus.queues.lock();
+                if let Some(queue) = queues.get_mut(&self.sink) {
+                    let removable = entry_ids
+                        .iter()
+                        .copied()
+                        .zip(queue.iter())
+                        .take_while(|(id, entry)| *id == entry.id)
+                        .map(|(id, _)| id)
+                        .collect::<Vec<_>>();
+                    if !removable.is_empty() {
+                        persist_sink_queue_removals(&self.persistence, &self.sink, &removable)?;
+                        for _ in 0..removable.len() {
+                            queue.pop_front();
+                        }
                     }
                 }
-            }
+                Ok(())
+            })()
+        };
+        for entry_id in entry_ids {
+            self.event_bus
+                .finish_checked_out_entry(&self.sink, *entry_id);
         }
         self.event_bus.waiters.notify_all();
-        Ok(())
+        result
     }
 }
 
@@ -1603,6 +2266,59 @@ fn event_gate_snapshot_from_meta(meta: &TableMeta) -> EventGateSnapshot {
             }),
         acl: None,
     }
+}
+
+/// The received-schema stage owns a complete post-apply row projection, not
+/// the live store that remains unchanged until durability.  Build the same
+/// route-time gate used by ordinary commits from that projection so ACL grant
+/// inserts, deletes, and updates in the received unit are captured inside the
+/// queued event itself.
+fn event_gate_snapshot_from_projected_payload(
+    meta: Option<&TableMeta>,
+    values: &HashMap<String, Value>,
+    projected_tables: &HashMap<String, TableMeta>,
+    projected_rows: &HashMap<String, Vec<VersionedRow>>,
+) -> EventGateSnapshot {
+    let Some(meta) = meta else {
+        return EventGateSnapshot::default();
+    };
+    let mut gate = event_gate_snapshot_from_meta(meta);
+    let acl = meta
+        .columns
+        .iter()
+        .find(|column| column.acl_ref.is_some())
+        .and_then(|column| {
+            let acl_ref = column.acl_ref.as_ref()?.clone();
+            let acl_id = match values.get(&column.name) {
+                Some(Value::Uuid(acl_id)) => Some(*acl_id),
+                _ => None,
+            };
+            let grant_gate = projected_tables
+                .get(&acl_ref.ref_table)
+                .map(event_gate_snapshot_from_meta)
+                .unwrap_or_default();
+            let grant_rows = projected_rows
+                .get(&acl_ref.ref_table)
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    row.deleted_tx.is_none()
+                        && acl_id.is_some_and(|acl_id| {
+                            row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+                        })
+                })
+                .map(|row| row.values.clone())
+                .collect();
+            Some(EventAclGate {
+                column: column.name.clone(),
+                ref_table: acl_ref.ref_table,
+                ref_column: acl_ref.ref_column,
+                grant_gate: Box::new(grant_gate),
+                grant_rows,
+            })
+        });
+    gate.acl = acl;
+    gate
 }
 
 fn gate_allows_payload(

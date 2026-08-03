@@ -43,10 +43,22 @@
 //! # }
 //! ```
 
+// With this opt-in, the authenticated sync orchestration compiles beside
+// `Database`; raw apply and progress writers therefore remain crate-private.
+// The server crate exposes the stable safe façade instead of a capability.
+extern crate self as contextdb_engine;
+
+mod blob_repository;
+#[cfg(feature = "iroh")]
+pub mod blob_store;
 pub mod cli_render;
 pub mod composite_store;
 pub mod database;
 pub mod executor;
+#[cfg(not(feature = "test-seams"))]
+mod memory_accounting;
+#[cfg(feature = "test-seams")]
+pub mod memory_accounting;
 pub mod peer_directory;
 pub mod persistence;
 pub mod persistent_store;
@@ -57,6 +69,33 @@ pub mod sync;
 pub mod sync_types;
 pub mod work_ledger;
 
+#[cfg(feature = "sync-orchestration")]
+pub mod error;
+#[cfg(not(feature = "sync-orchestration"))]
+mod error;
+#[cfg(feature = "sync-orchestration")]
+pub mod identity;
+#[cfg(not(feature = "sync-orchestration"))]
+pub(crate) mod identity;
+#[cfg(feature = "sync-orchestration")]
+pub mod protocol;
+#[cfg(not(feature = "sync-orchestration"))]
+pub(crate) mod protocol;
+#[cfg(feature = "sync-orchestration")]
+pub mod subjects;
+#[cfg(feature = "sync-orchestration")]
+pub mod sync_client;
+#[cfg(feature = "sync-orchestration")]
+pub mod sync_server;
+#[cfg(feature = "sync-orchestration")]
+mod sync_system_tables;
+#[cfg(feature = "sync-orchestration")]
+pub mod transfer_receipts;
+#[cfg(feature = "sync-orchestration")]
+pub mod transport;
+
+#[cfg(feature = "iroh")]
+pub use blob_store::{BlobStore, ResolveError};
 #[doc(hidden)]
 pub use database::CommitStageStats;
 pub use database::TriggerProgressTelemetrySnapshot;
@@ -74,5 +113,14 @@ pub use database::{
     TableSizeEstimate,
 };
 pub use database::{SearchResult, SemanticQuery};
-pub use sync::{ChangeApplication, ChangeTracking};
-pub use sync_types::*;
+#[cfg(feature = "sync-orchestration")]
+pub use identity::FabricIdentity;
+pub use sync::ChangeTracking;
+#[cfg(feature = "sync-orchestration")]
+pub use sync_client::SyncClient;
+#[cfg(feature = "sync-orchestration")]
+pub use sync_server::SyncServer;
+pub use sync_types::{
+    ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, SyncAdoption,
+    SyncDirection, VectorChange, natural_key_columns_for_meta,
+};

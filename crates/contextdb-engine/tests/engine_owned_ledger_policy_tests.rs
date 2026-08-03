@@ -62,7 +62,9 @@
 //! adopt back door, without ever going through the refused local `ALTER`
 //! shape. See the tests below for both.
 
-use contextdb_core::{Error, HistoryPolicy, Lsn, SyncDirection, Value};
+use contextdb_core::{
+    ConflictPolicy as DeclaredConflictPolicy, Error, HistoryPolicy, Lsn, SyncDirection, Value,
+};
 use contextdb_engine::Database;
 use contextdb_engine::peer_directory::install_peer_directory_schema;
 use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange};
@@ -190,7 +192,10 @@ fn set_sync_conflict_keep_first_on_work_capabilities_refuses() {
     );
 
     let meta = db.table_meta("work_capabilities").expect("exists");
-    assert_eq!(meta.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(
+        meta.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
+    );
 }
 
 #[test]
@@ -269,7 +274,10 @@ fn equivalent_alter_on_a_user_table_still_works() {
         "the DROP RETAIN above must have taken effect"
     );
     assert_eq!(meta.history_policy, Some(HistoryPolicy::CurrentOnly));
-    assert_eq!(meta.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(
+        meta.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
+    );
 }
 
 /// The reconcile arms stay exactly as they were written -- their own exact
@@ -380,7 +388,7 @@ fn arriving_sync_ddl_refuses_engine_owned_mutation_sibling_table_still_applies()
     let capabilities_meta = hub.table_meta("work_capabilities").expect("exists");
     assert_eq!(
         capabilities_meta.conflict_policy,
-        Some(ConflictPolicy::LatestWins),
+        Some(DeclaredConflictPolicy::KEEP_LATEST),
         "the built-in's declared policy must be untouched by the refused batch"
     );
     let notes_meta = hub.table_meta("notes").expect("exists");
@@ -405,7 +413,10 @@ fn arriving_sync_ddl_refuses_engine_owned_mutation_sibling_table_still_applies()
     )
     .expect("the sibling table's identical mutation must still apply on its own");
     let notes_meta = hub.table_meta("notes").expect("exists");
-    assert_eq!(notes_meta.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(
+        notes_meta.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -476,7 +487,7 @@ fn arriving_alter_silent_on_history_and_conflict_preserves_work_capabilities_pol
     );
     assert_eq!(
         meta.conflict_policy,
-        Some(ConflictPolicy::LatestWins),
+        Some(DeclaredConflictPolicy::KEEP_LATEST),
         "silence on SYNC CONFLICT must PRESERVE the declared policy, never clear it"
     );
 }
@@ -577,7 +588,7 @@ fn arriving_create_table_adopt_keep_first_on_work_capabilities_refuses() {
         .expect("work_capabilities exists");
     assert_eq!(
         meta.conflict_policy,
-        Some(ConflictPolicy::LatestWins),
+        Some(DeclaredConflictPolicy::KEEP_LATEST),
         "a refused CreateTable-adopt must apply no part of itself"
     );
 }
@@ -617,9 +628,10 @@ fn arriving_create_table_adopt_sync_off_on_work_capabilities_refuses() {
         .table_meta("work_capabilities")
         .expect("work_capabilities exists");
     assert_eq!(
-        meta.sync_direction, None,
+        meta.sync_direction,
+        Some(SyncDirection::Both),
         "a refused CreateTable-adopt must apply no part of itself -- work_capabilities stays \
-         undeclared (default direction), not SYNC OFF"
+         explicitly SYNC TWO WAY, not SYNC OFF"
     );
 }
 
@@ -642,7 +654,7 @@ fn arriving_create_table_adopt_sync_safe_on_work_inputs_refuses() {
     };
     let err = apply_single_ddl(&db, offending_create).expect_err(
         "an arriving CreateTable adopting work_inputs with SYNC SAFE must refuse -- \
-         work_inputs declares plain RETAIN with no delivery promise",
+         work_inputs declares SYNC TWO WAY but no SYNC SAFE",
     );
     let reason = schema_invalid_reason(err);
     assert!(
@@ -671,6 +683,7 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_still_applies() {
         columns: work_capabilities_columns(),
         constraints: vec![
             "HISTORY CURRENT ONLY".to_string(),
+            "SYNC TWO WAY".to_string(),
             "SYNC CONFLICT KEEP LATEST".to_string(),
         ],
         foreign_keys: Vec::new(),
@@ -686,7 +699,11 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_still_applies() {
         .table_meta("work_capabilities")
         .expect("work_capabilities exists");
     assert_eq!(meta.history_policy, Some(HistoryPolicy::CurrentOnly));
-    assert_eq!(meta.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(
+        meta.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
+    );
+    assert_eq!(meta.sync_direction, Some(SyncDirection::Both));
 }
 
 /// Green guard: a CreateTable-adopt against a LEGACY pre-declaration
@@ -726,6 +743,7 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
         columns: work_capabilities_columns(),
         constraints: vec![
             "HISTORY CURRENT ONLY".to_string(),
+            "SYNC TWO WAY".to_string(),
             "SYNC CONFLICT KEEP LATEST".to_string(),
         ],
         foreign_keys: Vec::new(),
@@ -739,7 +757,11 @@ fn arriving_create_table_adopt_verbatim_canonical_shape_heals_a_legacy_root() {
         .table_meta("work_capabilities")
         .expect("work_capabilities exists");
     assert_eq!(healed.history_policy, Some(HistoryPolicy::CurrentOnly));
-    assert_eq!(healed.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(
+        healed.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
+    );
+    assert_eq!(healed.sync_direction, Some(SyncDirection::Both));
 }
 
 /// An older binary
@@ -811,7 +833,10 @@ fn drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile(
         .table_meta("work_capabilities")
         .expect("work_capabilities exists");
     assert_eq!(reconciled.history_policy, Some(HistoryPolicy::CurrentOnly));
-    assert_eq!(reconciled.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(
+        reconciled.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -823,9 +848,8 @@ fn drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile(
 
 /// RED shape: `SET SYNC OFF` on `work_capabilities` must refuse exactly like
 /// `SET RETAIN` / `SET HISTORY` / `SET SYNC CONFLICT` already do --
-/// `work_capabilities` declares no explicit direction at all (the default
-/// governs), so ANY explicit `SET SYNC` on it differs from that canonical
-/// silence.
+/// `work_capabilities` declares `SYNC TWO WAY`, so any other explicit `SET
+/// SYNC` direction differs from that canonical declaration.
 #[test]
 fn set_sync_off_on_work_capabilities_refuses() {
     let db = Database::open_memory();
@@ -843,9 +867,10 @@ fn set_sync_off_on_work_capabilities_refuses() {
 
     let meta = db.table_meta("work_capabilities").expect("exists");
     assert_eq!(
-        meta.sync_direction, None,
+        meta.sync_direction,
+        Some(SyncDirection::Both),
         "a refused SET SYNC must apply no part of itself -- work_capabilities \
-         stays undeclared (default direction), not SYNC OFF"
+         stays explicitly SYNC TWO WAY, not SYNC OFF"
     );
 }
 
@@ -951,13 +976,23 @@ fn installer_fresh_create_still_works_under_the_reserved_name_door() {
     );
     assert_eq!(
         capabilities.conflict_policy,
-        Some(ConflictPolicy::LatestWins)
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
     );
+    assert_eq!(capabilities.sync_direction, Some(SyncDirection::Both));
     let inputs = db.table_meta("work_inputs").expect("exists");
     assert_eq!(inputs.default_ttl_seconds, Some(7 * 24 * 60 * 60));
+    assert_eq!(
+        inputs.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_FIRST)
+    );
+    assert_eq!(inputs.sync_direction, Some(SyncDirection::Both));
     let peers = db.table_meta("peer_directory").expect("exists");
     assert_eq!(peers.history_policy, Some(HistoryPolicy::CurrentOnly));
-    assert_eq!(peers.conflict_policy, Some(ConflictPolicy::LatestWins));
+    assert_eq!(
+        peers.conflict_policy,
+        Some(DeclaredConflictPolicy::KEEP_LATEST)
+    );
+    assert_eq!(peers.sync_direction, Some(SyncDirection::Both));
 }
 
 /// Green guard: the column-shape half tolerates silence on policy -- a local
@@ -1221,7 +1256,7 @@ fn drop_then_recreate_work_capabilities_with_wrong_explicit_policy_over_sync_ref
         .expect("work_capabilities must still exist");
     assert_eq!(
         meta.conflict_policy,
-        Some(ConflictPolicy::LatestWins),
+        Some(DeclaredConflictPolicy::KEEP_LATEST),
         "work_capabilities must retain its original SYNC CONFLICT after refused batch"
     );
 }

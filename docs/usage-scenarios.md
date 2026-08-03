@@ -399,7 +399,7 @@ contextdb> SELECT * FROM sensors;
 
 The applied count reports data rows; the `CREATE TABLE` replicates too (instance 2's schema is created on pull) but does not add to the row tally.
 
-Sync is bidirectional, per-table configurable:
+Sync behavior is declared per table:
 
 ```sql
 -- Conflict resolution is declared on the table itself (keep-first is the default)
@@ -407,9 +407,9 @@ CREATE TABLE observations (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FI
 ```
 
 ```
-contextdb> .sync direction observations Push
-contextdb> .sync direction decisions Both
-contextdb> .sync direction scratch None
+contextdb> ALTER TABLE observations SET SYNC PUSH ONLY
+contextdb> ALTER TABLE decisions SET SYNC TWO WAY
+contextdb> ALTER TABLE scratch SET SYNC OFF
 ```
 
 Each instance stores its data in a single file. No WAL directories, no journal files, no auxiliary indexes. Back up the file, copy it to another machine, or embed it in a container image.

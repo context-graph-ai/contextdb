@@ -13,7 +13,6 @@
 
 use contextdb_core::{TenantId, Value, Wallclock};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
 use contextdb_engine::work_ledger::{BlobHash, MovementPolicy, install_work_ledger_schema};
 use contextdb_server::blob_resolver::BlobStore;
 use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
@@ -22,11 +21,12 @@ use contextdb_server::transport::{
     ClientTransport, TransportError, TransportFuture, TransportResult, TransportStatusFuture,
 };
 use contextdb_server::{
-    InProcessBroker, SyncClient, SyncServer, TransferDirection, TransferPlane, TransferReceipt,
+    FabricIdentity, InProcessBroker, SyncClient, SyncServer, TransferDirection, TransferPlane,
+    TransferReceipt,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 #[path = "media_support/mod.rs"]
@@ -45,6 +45,26 @@ const OTHER_HUB_NODE: &str = "hub-node-b";
 const RETAINED_DDL: &str = "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
      RETAIN 1 HOURS SYNC SAFE SYNC PUSH ONLY";
 const CONTROL_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+
+/// The in-process transport still has to present the same real node identity
+/// that signs a row's immutable lineage.  Role labels keep the fixture prose
+/// readable; this keyring turns them into stable fabric identities for the
+/// full lifetime of this binary, including an edge's reopen journey.
+fn fixture_identity(role: &str) -> Arc<FabricIdentity> {
+    static IDENTITIES: OnceLock<Mutex<HashMap<String, Arc<FabricIdentity>>>> = OnceLock::new();
+    let identities = IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut identities = identities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    identities
+        .entry(role.to_string())
+        .or_insert_with(|| Arc::new(FabricIdentity::generate()))
+        .clone()
+}
+
+fn fixture_node_id(role: &str) -> String {
+    fixture_identity(role).node_id()
+}
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -130,44 +150,21 @@ fn start_hub(broker: &InProcessBroker) -> RunningHub {
     start_hub_as(broker, HUB_NODE)
 }
 
-fn start_hub_with_policies(
-    broker: &InProcessBroker,
-    node_id: &str,
-    policies: ConflictPolicies,
-) -> RunningHub {
-    let db = Arc::new(Database::open_memory());
-    db.execute(RETAINED_DDL, &p()).expect("hub retained table");
-    db.execute(CONTROL_DDL, &p()).expect("hub control table");
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(node_id),
-        TenantId::from(TENANT),
-        policies,
-    ));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn({
-        let server = server.clone();
-        let shutdown = shutdown.clone();
-        async move { server.run_until(shutdown).await }
-    });
-    RunningHub {
-        db,
-        server,
-        shutdown,
-        task,
-    }
-}
-
 fn start_hub_as(broker: &InProcessBroker, node_id: &str) -> RunningHub {
     let db = Arc::new(Database::open_memory());
     db.execute(RETAINED_DDL, &p()).expect("hub retained table");
     db.execute(CONTROL_DDL, &p()).expect("hub control table");
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(node_id),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = fixture_identity(node_id);
+    let authenticated_node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&authenticated_node_id),
+            TenantId::from(TENANT),
+            authenticated_node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -195,10 +192,12 @@ fn open_edge(path: Option<&std::path::Path>) -> Arc<Database> {
 }
 
 fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = fixture_identity(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&identity.node_id()),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -208,23 +207,48 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> S
 /// `c9_an_unauthenticated_peer_produces_no_transfer_receipt`).
 fn receipt<'a>(
     receipts: &'a [TransferReceipt],
-    peer: &str,
+    peer_node_id: &str,
     plane: TransferPlane,
     direction: TransferDirection,
 ) -> &'a TransferReceipt {
     receipts
         .iter()
-        .find(|r| r.peer_node_id == peer && r.plane == plane && r.direction == direction)
+        .find(|r| r.peer_node_id == peer_node_id && r.plane == plane && r.direction == direction)
         .unwrap_or_else(|| {
-            panic!("no {plane:?}/{direction:?} receipt for peer {peer} in {receipts:?}")
+            panic!("no {plane:?}/{direction:?} receipt for peer {peer_node_id} in {receipts:?}")
         })
 }
 
-/// A transport that is simply not there — the worker-offline condition, with no
-/// sleeping and no timing.
-struct OfflineTransport;
+fn receipt_for_role<'a>(
+    receipts: &'a [TransferReceipt],
+    peer_role: &str,
+    plane: TransferPlane,
+    direction: TransferDirection,
+) -> &'a TransferReceipt {
+    receipt(receipts, &fixture_node_id(peer_role), plane, direction)
+}
+
+/// An authenticated edge that knows its configured hub, but cannot reach it.
+/// The failure is immediate and deterministic: no sleeps or timing are needed
+/// to prove that an unconfirmed backlog remains protected.
+struct OfflineTransport {
+    local_node_id: String,
+    peer_node_id: String,
+}
 
 impl ClientTransport for OfflineTransport {
+    fn peer_node_id(&self) -> Option<String> {
+        Some(self.peer_node_id.clone())
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        Some(self.local_node_id.clone())
+    }
+
+    fn has_stable_edge_identity(&self) -> bool {
+        true
+    }
+
     fn request<'a>(
         &'a self,
         _subject: &'a str,
@@ -235,6 +259,19 @@ impl ClientTransport for OfflineTransport {
             TransportResult::Err(TransportError::Other("edge is offline".to_string()))
         })
     }
+}
+
+fn offline_client(db: &Arc<Database>, role: &str) -> SyncClient {
+    let identity = fixture_identity(role);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        Arc::new(OfflineTransport {
+            local_node_id: identity.node_id(),
+            peer_node_id: fixture_node_id(HUB_NODE),
+        }),
+        TenantId::from(TENANT),
+        identity,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -360,14 +397,14 @@ async fn c3_unconfirmed_rows_are_never_pruned() {
     let edge = open_edge(None);
     insert_windows(&edge, 1..21);
 
-    let offline = SyncClient::with_transport(
-        edge.clone(),
-        Arc::new(OfflineTransport),
-        TenantId::from(TENANT),
-    );
-    within(offline.push())
+    let offline = offline_client(&edge, "offline-edge");
+    let error = within(offline.push())
         .await
         .expect_err("an offline push cannot be confirmed");
+    assert!(
+        error.to_string().contains("edge is offline"),
+        "the authenticated offline fixture reaches its deterministic transport failure: {error}"
+    );
 
     // Age the whole backlog well past its retention window.
     clock.advance(48 * 60 * 60 * 1000);
@@ -397,14 +434,14 @@ async fn c3_offline_backlog_prunes_only_after_reconnect_and_confirm() {
     let edge = open_edge(None);
     insert_windows(&edge, 1..21);
 
-    let offline = SyncClient::with_transport(
-        edge.clone(),
-        Arc::new(OfflineTransport),
-        TenantId::from(TENANT),
-    );
-    within(offline.push())
+    let offline = offline_client(&edge, "edge-a");
+    let error = within(offline.push())
         .await
         .expect_err("offline push fails");
+    assert!(
+        error.to_string().contains("edge is offline"),
+        "the authenticated offline fixture reaches its deterministic transport failure: {error}"
+    );
     clock.advance(48 * 60 * 60 * 1000);
     assert_eq!(
         edge.run_pruning_cycle_checked().expect("prune").pruned_rows,
@@ -516,6 +553,8 @@ async fn c4_one_way_policy_holds_after_restart_without_app_reregistration() {
 #[tokio::test]
 async fn c4_pushing_a_retained_table_registers_the_hub_and_a_second_hub_is_refused() {
     let (_clock, _guard) = MockClock::install(T0);
+    let first_hub_node_id = fixture_node_id(HUB_NODE);
+    let second_hub_node_id = fixture_node_id(OTHER_HUB_NODE);
     let first_broker = InProcessBroker::new();
     let first_hub = start_hub_as(&first_broker, HUB_NODE);
     let edge = open_edge(None);
@@ -530,7 +569,7 @@ async fn c4_pushing_a_retained_table_registers_the_hub_and_a_second_hub_is_refus
     within(client.push()).await.expect("first hub push");
     assert_eq!(
         edge.retention_sync_peer().as_deref(),
-        Some(HUB_NODE),
+        Some(first_hub_node_id.as_str()),
         "the client itself registers the authenticated hub it delivered to"
     );
 
@@ -548,7 +587,7 @@ async fn c4_pushing_a_retained_table_registers_the_hub_and_a_second_hub_is_refus
         .expect_err("a retained table may not be delivered to a second hub");
     let message = err.to_string();
     assert!(
-        message.contains(OTHER_HUB_NODE) && message.contains(HUB_NODE),
+        message.contains(&second_hub_node_id) && message.contains(&first_hub_node_id),
         "the refusal must name both hubs, got: {message}"
     );
     assert_eq!(
@@ -558,7 +597,7 @@ async fn c4_pushing_a_retained_table_registers_the_hub_and_a_second_hub_is_refus
     );
     assert_eq!(
         edge.retention_sync_peer().as_deref(),
-        Some(HUB_NODE),
+        Some(first_hub_node_id.as_str()),
         "the established hub is unchanged"
     );
 
@@ -726,13 +765,13 @@ async fn c9_sync_receipts_count_items_and_bytes_per_peer_and_direction() {
     within(client_b.pull_default()).await.expect("edge-b pull");
 
     let receipts = hub.server.transfer_receipts();
-    let from_a = receipt(
+    let from_a = receipt_for_role(
         &receipts,
         "edge-a",
         TransferPlane::Sync,
         TransferDirection::Received,
     );
-    let from_b = receipt(
+    let from_b = receipt_for_role(
         &receipts,
         "edge-b",
         TransferPlane::Sync,
@@ -748,7 +787,7 @@ async fn c9_sync_receipts_count_items_and_bytes_per_peer_and_direction() {
         "payload bytes track the peer's own traffic: {receipts:?}"
     );
 
-    let sent_to_b = receipt(
+    let sent_to_b = receipt_for_role(
         &receipts,
         "edge-b",
         TransferPlane::Sync,
@@ -790,13 +829,13 @@ async fn c9_client_receipts_record_both_directions_against_the_hub_node_id() {
     within(client.push()).await.expect("push");
 
     let receipts = client.transfer_receipts();
-    let sent = receipt(
+    let sent = receipt_for_role(
         &receipts,
         HUB_NODE,
         TransferPlane::Sync,
         TransferDirection::Sent,
     );
-    let received = receipt(
+    let received = receipt_for_role(
         &receipts,
         HUB_NODE,
         TransferPlane::Sync,
@@ -815,16 +854,18 @@ async fn c9_client_receipts_record_both_directions_against_the_hub_node_id() {
         "both directions carry payload bytes: {receipts:?}"
     );
     assert!(
-        receipts.iter().all(|r| r.peer_node_id == HUB_NODE),
+        receipts
+            .iter()
+            .all(|r| r.peer_node_id == fixture_node_id(HUB_NODE)),
         "the client talks to exactly one hub, so every receipt names it: {receipts:?}"
     );
 
     hub.stop().await;
 }
 
-/// The contract behind a non-optional `peer_node_id`: a transport that
-/// authenticates no peer produces NO transfer receipt, rather than an unkeyed
-/// one that would quietly aggregate every anonymous peer together.
+/// The contract behind a non-optional authenticated edge identity: an
+/// identityless transport cannot enter the v6 sync plane, so it mutates
+/// nothing and produces no unkeyed transfer receipt.
 #[tokio::test]
 async fn c9_an_unauthenticated_peer_produces_no_transfer_receipt() {
     let (_clock, _guard) = MockClock::install(T0);
@@ -844,17 +885,27 @@ async fn c9_an_unauthenticated_peer_produces_no_transfer_receipt() {
         "one authenticated peer, one receipt: {after_known:?}"
     );
 
-    // `broker.client()` presents no node id — the deprecated broker path.
+    // This identity-refusal transport deliberately presents no node id.
     let anonymous = open_edge(None);
     insert_notes(&anonymous, 100..104);
-    let anonymous_client =
-        SyncClient::with_transport(anonymous.clone(), broker.client(), TenantId::from(TENANT));
-    within(anonymous_client.push())
+    let anonymous_client = SyncClient::with_authenticated_transport_for_test(
+        anonymous.clone(),
+        broker.client(),
+        TenantId::from(TENANT),
+    );
+    let refusal = within(anonymous_client.push())
         .await
-        .expect("the push itself still works");
+        .expect_err("an identityless transport is refused before it can push");
     assert!(
-        row_count(&hub.db, "notes") >= 7,
-        "the rows really did land — this is not a failed-transfer tautology"
+        refusal
+            .to_string()
+            .contains("stable authenticated edge identity"),
+        "the refusal names the missing stable authenticated edge identity: {refusal}"
+    );
+    assert_eq!(
+        row_count(&hub.db, "notes"),
+        3,
+        "the refused anonymous rows never reach the hub"
     );
 
     let after_anonymous = hub.server.transfer_receipts();
@@ -864,7 +915,7 @@ async fn c9_an_unauthenticated_peer_produces_no_transfer_receipt() {
         "an unauthenticated transfer adds no receipt at all: {after_anonymous:?}"
     );
     assert_eq!(
-        receipt(
+        receipt_for_role(
             &after_anonymous,
             "edge-a",
             TransferPlane::Sync,
@@ -896,7 +947,7 @@ async fn c9_sync_receipts_count_payload_bytes_only_never_transport_framing() {
         .map(|exchange| exchange.request_bytes.len())
         .sum();
     let receipts = hub.server.transfer_receipts();
-    let received = receipt(
+    let received = receipt_for_role(
         &receipts,
         "edge-a",
         TransferPlane::Sync,
@@ -927,7 +978,7 @@ async fn c9_receipts_are_monotonic_and_never_restored_from_the_database() {
     insert_notes(&edge, 1..6);
     let client = edge_client(&edge, &broker, "edge-a");
     within(client.push()).await.expect("first push");
-    let first = receipt(
+    let first = receipt_for_role(
         &hub.server.transfer_receipts(),
         "edge-a",
         TransferPlane::Sync,
@@ -938,7 +989,7 @@ async fn c9_receipts_are_monotonic_and_never_restored_from_the_database() {
 
     insert_notes(&edge, 6..11);
     within(client.push()).await.expect("second push");
-    let second = receipt(
+    let second = receipt_for_role(
         &hub.server.transfer_receipts(),
         "edge-a",
         TransferPlane::Sync,
@@ -1097,20 +1148,10 @@ async fn c9_blob_receipts_split_serve_and_fetch_by_peer() {
 // ---------------------------------------------------------------------------
 // The delivery promise cannot be revoked from the side
 //
-// `set_table_direction` is public and unguarded. Setting `None` or `Pull` on a
-// `SYNC SAFE` table drops its rows from the outbound changeset while the GLOBAL
-// watermark keeps advancing on other tables' confirmations — so the gate opens
-// on rows the hub never received and retention deletes them. The call is
-// self-contradictory (a table that promises delete-after-DELIVERY, configured
-// not to deliver), and its keyless sibling already earns a loud refusal, so this
-// one may not stay silent and destructive.
-//
-// Registration order, the honest semantics: the client refuses at the FIRST
-// point it can see the conflict. If the table's meta is already known, that is
-// the `set_table_direction` call itself; if the direction was set before the
-// table existed, nothing is knowable then and the conflict first becomes visible
-// at push — so the push refuses rather than silently shipping an incomplete
-// changeset. Both doors are covered below.
+// A durable non-delivering direction on a `SYNC SAFE` table would drop its rows
+// from the outbound changeset while another table's confirmation advances the
+// global watermark. The declaration is self-contradictory and must be refused
+// before it can strand rows that retention later deletes.
 // ---------------------------------------------------------------------------
 
 fn assert_delivery_promise_refusal(message: &str, table: &str) {
@@ -1139,15 +1180,18 @@ async fn c3_a_non_push_direction_on_a_sync_safe_table_is_refused() {
     let edge = open_edge(None);
     insert_windows(&edge, 1..6);
 
-    let client = edge_client(&edge, &broker, "edge-a");
-    for refused in [SyncDirection::None, SyncDirection::Pull] {
-        let err = client
-            .set_table_direction("windows", refused)
-            .expect_err("a non-Push direction on a SYNC SAFE table must be refused");
+    for declaration in [
+        "ALTER TABLE windows SET SYNC OFF",
+        "ALTER TABLE windows SET SYNC PULL ONLY",
+    ] {
+        let err = edge
+            .execute(declaration, &p())
+            .expect_err("a non-delivering declaration on a SYNC SAFE table must be refused");
         assert_delivery_promise_refusal(&err.to_string(), "windows");
     }
 
-    // The refusals changed nothing: the table still delivers.
+    // The refused declarations changed nothing: the table still delivers.
+    let client = edge_client(&edge, &broker, "edge-a");
     within(client.push()).await.expect("push");
     assert_eq!(
         row_count(&hub.db, "windows"),
@@ -1158,10 +1202,8 @@ async fn c3_a_non_push_direction_on_a_sync_safe_table_is_refused() {
     hub.stop().await;
 }
 
-/// The allowed calls must stay allowed, or the guard is just a wall: `Push` on a
-/// `SYNC SAFE` table is the one consistent setting, and a table that made no
-/// delivery promise may still be configured however the app likes — including
-/// out of the outbound changeset entirely.
+/// The allowed declarations must stay allowed: `SYNC PUSH ONLY` is consistent
+/// with a `SYNC SAFE` table, while an ordinary table may be declared `SYNC OFF`.
 #[tokio::test]
 async fn c3_push_on_a_sync_safe_table_and_any_direction_elsewhere_stay_allowed() {
     let (_clock, _guard) = MockClock::install(T0);
@@ -1169,16 +1211,14 @@ async fn c3_push_on_a_sync_safe_table_and_any_direction_elsewhere_stay_allowed()
     let hub = start_hub(&broker);
     let edge = open_edge(None);
     insert_windows(&edge, 1..6);
+
+    edge.execute("ALTER TABLE windows SET SYNC PUSH ONLY", &p())
+        .expect("SYNC PUSH ONLY is consistent with a SYNC SAFE table");
+    edge.execute("ALTER TABLE notes SET SYNC OFF", &p())
+        .expect("an ordinary table may be declared SYNC OFF");
     insert_notes(&edge, 1..4);
 
     let client = edge_client(&edge, &broker, "edge-a");
-    client
-        .set_table_direction("windows", SyncDirection::Push)
-        .expect("Push is the consistent setting for a SYNC SAFE table");
-    client
-        .set_table_direction("notes", SyncDirection::None)
-        .expect("a table with no delivery promise may be configured freely");
-
     within(client.push()).await.expect("push");
     assert_eq!(
         row_count(&hub.db, "windows"),
@@ -1190,50 +1230,6 @@ async fn c3_push_on_a_sync_safe_table_and_any_direction_elsewhere_stay_allowed()
         0,
         "and the ordinary table's direction still takes effect"
     );
-
-    hub.stop().await;
-}
-
-/// The registration-order case: the direction is set before the table exists, so
-/// the client cannot see the conflict yet. It becomes visible at push — and the
-/// push must refuse rather than ship a changeset that silently omits the table
-/// while the watermark advances over everything else in it.
-#[tokio::test]
-async fn c3_a_direction_set_before_the_table_existed_is_refused_at_push() {
-    let (clock, _guard) = MockClock::install(T0);
-    let broker = InProcessBroker::new();
-    let hub = start_hub(&broker);
-    let edge = Arc::new(Database::open_memory());
-    edge.execute(CONTROL_DDL, &p()).expect("control table");
-
-    let client = edge_client(&edge, &broker, "edge-a");
-    client
-        .set_table_direction("windows", SyncDirection::None)
-        .expect("nothing is knowable about a table that does not exist yet");
-
-    // Now the table arrives, carrying the promise the direction contradicts.
-    edge.execute(RETAINED_DDL, &p()).expect("retained table");
-    insert_windows(&edge, 1..6);
-    insert_notes(&edge, 1..4);
-
-    let err = within(client.push())
-        .await
-        .expect_err("the push must refuse the contradiction it can now see");
-    assert_delivery_promise_refusal(&err.to_string(), "windows");
-
-    assert_eq!(
-        edge.sync_watermark(),
-        contextdb_core::Lsn(0),
-        "a refused push may not advance the gate on ANY table — that is the \
-         mechanism that would strand the undelivered rows"
-    );
-    clock.advance(48 * 60 * 60 * 1000);
-    let report = edge.run_pruning_cycle_checked().expect("prune cycle");
-    assert_eq!(
-        report.pruned_rows, 0,
-        "so nothing may be pruned, however old: {report:?}"
-    );
-    assert_eq!(row_count(&edge, "windows"), 5);
 
     hub.stop().await;
 }
@@ -1253,11 +1249,13 @@ async fn c3_a_direction_set_before_the_table_existed_is_refused_at_push() {
 async fn c9_hub_receipts_count_transmitted_rows_even_when_conflict_policy_skips_them() {
     let (_clock, _guard) = MockClock::install(T0);
     let broker = InProcessBroker::new();
-    let hub = start_hub_with_policies(
-        &broker,
-        HUB_NODE,
-        ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
-    );
+    let hub = start_hub_as(&broker, HUB_NODE);
+    hub.db
+        .execute(
+            "ALTER TABLE notes SET SYNC CONFLICT KEEP FIRST",
+            &HashMap::new(),
+        )
+        .expect("declare the receipt fixture's keep-first policy");
 
     // First writer wins the keys.
     let first = open_edge(None);
@@ -1297,13 +1295,13 @@ async fn c9_hub_receipts_count_transmitted_rows_even_when_conflict_policy_skips_
     );
 
     let receipts = hub.server.transfer_receipts();
-    let from_first = receipt(
+    let from_first = receipt_for_role(
         &receipts,
         "edge-a",
         TransferPlane::Sync,
         TransferDirection::Received,
     );
-    let from_second = receipt(
+    let from_second = receipt_for_role(
         &receipts,
         "edge-b",
         TransferPlane::Sync,
@@ -1353,6 +1351,10 @@ struct LoseAckAfterApply {
 impl ClientTransport for LoseAckAfterApply {
     fn peer_node_id(&self) -> Option<String> {
         self.inner.peer_node_id()
+    }
+
+    fn local_node_id(&self) -> Option<String> {
+        self.inner.local_node_id()
     }
 
     fn has_stable_edge_identity(&self) -> bool {
@@ -1433,10 +1435,11 @@ fn lost_ack_client(
     node_id: &str,
     confirmable: bool,
 ) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = fixture_identity(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(LoseAckAfterApply {
-            inner: broker.client_as(node_id),
+            inner: broker.client_as(&identity.node_id()),
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable,
@@ -1444,6 +1447,7 @@ fn lost_ack_client(
             after_push_apply: None,
         }),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -1454,10 +1458,11 @@ fn lost_ack_client_with_newer_hub_edit(
     hub_db: Arc<Database>,
     fail_reconciliation_pull: bool,
 ) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = fixture_identity(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(LoseAckAfterApply {
-            inner: broker.client_as(node_id),
+            inner: broker.client_as(&identity.node_id()),
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable: true,
@@ -1469,6 +1474,7 @@ fn lost_ack_client_with_newer_hub_edit(
             })),
         }),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -1477,10 +1483,11 @@ fn lost_ack_client_with_failed_reconciliation_pull(
     broker: &InProcessBroker,
     node_id: &str,
 ) -> SyncClient {
-    SyncClient::with_transport(
+    let identity = fixture_identity(node_id);
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
         Arc::new(LoseAckAfterApply {
-            inner: broker.client_as(node_id),
+            inner: broker.client_as(&identity.node_id()),
             push_subject: push_subject(TENANT),
             status_subject: status_subject(TENANT),
             confirmable: true,
@@ -1488,6 +1495,7 @@ fn lost_ack_client_with_failed_reconciliation_pull(
             after_push_apply: None,
         }),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -1520,7 +1528,7 @@ async fn c9_a_push_whose_ack_was_lost_but_landed_records_its_sent_receipt_once()
     );
 
     let receipts = client.transfer_receipts();
-    let sent = receipt(
+    let sent = receipt_for_role(
         &receipts,
         HUB_NODE,
         TransferPlane::Sync,
@@ -1553,7 +1561,7 @@ async fn c9_a_push_whose_ack_was_lost_but_landed_records_its_sent_receipt_once()
     within(client.push())
         .await
         .expect("a retry after a reconciled push is a no-op");
-    let after_retry = receipt(
+    let after_retry = receipt_for_role(
         &client.transfer_receipts(),
         HUB_NODE,
         TransferPlane::Sync,
@@ -1584,6 +1592,11 @@ async fn lost_ack_recovery_pulls_a_newer_hub_edit_without_replaying_the_stale_ed
 
     // Establish schema/cursors before the one-row request under test, so its
     // lost acknowledgement covers the authored row rather than bootstrap DDL.
+    hub.db
+        .execute("ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST", &p())
+        .expect("the recovery fixture needs latest-wins resolution at the hub");
+    edge.execute("ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST", &p())
+        .expect("the recovery fixture needs latest-wins resolution");
     within(edge_client(&edge, &broker, "edge-a").push())
         .await
         .expect("bootstrap push");
@@ -1633,6 +1646,11 @@ async fn reopened_edge_reconciles_pending_lost_ack_before_it_can_resend_old_rows
     let dir = tempfile::tempdir().expect("edge dir");
     let path = dir.path().join("edge.redb");
     let edge = open_edge(Some(&path));
+    hub.db
+        .execute("ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST", &p())
+        .expect("the recovery fixture needs latest-wins resolution at the hub");
+    edge.execute("ALTER TABLE notes SET SYNC CONFLICT KEEP LATEST", &p())
+        .expect("the recovery fixture needs latest-wins resolution");
     within(edge_client(&edge, &broker, "edge-a").push())
         .await
         .expect("bootstrap push");
@@ -1766,7 +1784,7 @@ async fn c9_a_lost_ack_push_the_hub_cannot_confirm_records_nothing() {
     // the edge has recorded exactly ONE batch's worth.
     let healthy = edge_client(&edge, &broker, "edge-a");
     within(healthy.push()).await.expect("re-push the backlog");
-    let recorded = receipt(
+    let recorded = receipt_for_role(
         &healthy.transfer_receipts(),
         HUB_NODE,
         TransferPlane::Sync,

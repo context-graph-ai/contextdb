@@ -19,10 +19,16 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn allowed_transport_types(file: &Path) -> &'static [&'static str] {
-    if file == from_manifest("src/blob_resolver.rs") {
+    if file == from_manifest("../contextdb-engine/src/blob_store.rs") {
         &["IrohServer"]
     } else if file == from_manifest("src/main.rs") {
         &["EndpointSpec", "IrohServer"]
+    } else if file == from_manifest("src/smoke_driver.rs") {
+        &[
+            "ProductionSmokeCheckpoint",
+            "ProductionSmokeGateKind",
+            "arm_production_smoke_gate",
+        ]
     } else {
         &[]
     }
@@ -142,7 +148,7 @@ fn fetch_backend_type_is_contained_to_the_transport_adapter() {
         );
     }
 
-    let adapter = from_manifest("src/transport");
+    let adapter = from_manifest("../contextdb-engine/src/transport");
     let mut files = Vec::new();
     collect_rs(&from_manifest("src"), &mut files);
     collect_rs(&from_manifest("../contextdb-engine/src"), &mut files);
@@ -161,16 +167,19 @@ fn fetch_backend_type_is_contained_to_the_transport_adapter() {
         assert_no_unsanctioned_transport_type(&file, &text);
     }
 
-    let file = from_manifest("src/blob_resolver.rs");
-    let text = std::fs::read_to_string(&file).expect("blob_resolver.rs");
+    let file = from_manifest("../contextdb-engine/src/blob_store.rs");
+    let text = std::fs::read_to_string(&file).expect("engine blob_store.rs");
     let transport_lines: Vec<_> = text
         .lines()
         .filter(|line| line.contains("transport"))
         .collect();
     assert_eq!(
         transport_lines,
-        ["use crate::transport::iroh::IrohServer;"],
-        "the resolver's only transport reference must be the sanctioned IrohServer import"
+        [
+            "use crate::transport::adapter::{self, BlobStoreHandle, FetchFailure, FetchVerdict};",
+            "use crate::transport::iroh::IrohServer;",
+        ],
+        "the resolver may name only IrohServer and the transport-neutral blob adapter facade"
     );
     assert!(
         !text.lines().any(|line| {
@@ -179,16 +188,17 @@ fn fetch_backend_type_is_contained_to_the_transport_adapter() {
         "the resolver must not re-export IrohServer behind a neutral type alias"
     );
     assert!(
-        text.contains("contextdb_engine::work_ledger") && text.contains("BlobHash"),
+        text.contains("crate::work_ledger") && text.contains("BlobHash"),
         "the resolver must carry contextdb's own work_ledger::BlobHash"
     );
 }
 
 #[test]
 fn resolver_surface_carries_no_media_or_detector_type() {
-    let adapter = from_manifest("src/transport");
+    let adapter = from_manifest("../contextdb-engine/src/transport");
     let mut files = Vec::new();
     collect_rs(&from_manifest("src"), &mut files);
+    files.push(from_manifest("../contextdb-engine/src/blob_store.rs"));
     for file in files {
         if file.starts_with(&adapter) {
             continue;

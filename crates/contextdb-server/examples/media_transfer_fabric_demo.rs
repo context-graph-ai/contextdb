@@ -37,8 +37,8 @@ use contextdb_engine::work_ledger::{
 };
 use contextdb_server::blob_resolver::{BlobStore, ResolveError};
 use contextdb_server::exit_codes::{EXIT_ERROR, verdict_exit_code};
-use contextdb_server::transport::iroh::IrohServer;
-use contextdb_server::{FabricIdentity, SyncClient};
+use contextdb_server::transport::iroh::{EndpointSpec, IrohServer};
+use contextdb_server::{FabricIdentity, SyncClient, peer_dial_spec};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -214,10 +214,15 @@ fn open_node(
     install_work_ledger_schema(&db).expect("install work ledger schema");
     install_peer_directory_schema(&db).expect("install peer directory schema");
 
-    let endpoint = if endpoint.contains('?') && !endpoint.contains("identity=") {
-        format!("{endpoint}&identity={}", identity_path.display())
-    } else {
-        endpoint.to_string()
+    let endpoint = match EndpointSpec::parse(endpoint) {
+        Some(spec) if spec.dial_ticket().is_some() && spec.identity_path().is_none() => {
+            if endpoint.contains('?') {
+                format!("{endpoint}&identity={}", identity_path.display())
+            } else {
+                peer_dial_spec(spec.dial_ticket().expect("checked above"), &identity_path)
+            }
+        }
+        _ => endpoint.to_string(),
     };
     let client = SyncClient::new(
         db.clone(),

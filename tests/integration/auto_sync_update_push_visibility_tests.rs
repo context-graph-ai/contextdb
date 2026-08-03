@@ -1,52 +1,19 @@
 use contextdb_core::{Lsn, Value};
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
-    ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, NaturalKey, RowChange,
-    SyncDirection,
+    ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, NaturalKey, RowChange, SyncAdoption,
 };
-use contextdb_server::protocol::{MessageType, PushRequest, PushResponse, decode, encode};
-use contextdb_server::subjects::push_subject;
-use contextdb_server::{SyncClient, SyncServer};
-use futures_util::StreamExt;
+use contextdb_server::subjects::{push_subject, status_subject};
+use contextdb_server::transport::HandlerRegistration;
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
-const TABLE_SQL: &str = "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT)";
-
-struct NatsFixture {
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
-}
-
-async fn start_nats() -> NatsFixture {
-    let nats_conf = format!(
-        "{}/../contextdb-server/tests/nats.conf",
-        env!("CARGO_MANIFEST_DIR")
-    );
-
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_exposed_port(9222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-
-    let request = image
-        .with_mount(Mount::bind_mount(&nats_conf, "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
-
-    let container = request.start().await.unwrap();
-    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
-
-    NatsFixture {
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
-    }
-}
+const TABLE_SQL: &str =
+    "CREATE TABLE t (id UUID PRIMARY KEY, v TEXT) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 
 fn uuid(n: u128) -> Uuid {
     Uuid::from_u128(n)
@@ -108,6 +75,20 @@ fn changeset(rows: Vec<RowChange>) -> ChangeSet {
 
 fn apply_latest(db: &Database, rows: Vec<RowChange>) -> ApplyResult {
     db.apply_changes(changeset(rows), &latest_wins()).unwrap()
+}
+
+fn apply_latest_with_arrivals(
+    db: &Database,
+    rows: Vec<RowChange>,
+    arrivals: HashMap<Lsn, Option<Lsn>>,
+) -> ApplyResult {
+    db.apply_synced_changes(
+        changeset(rows),
+        &latest_wins(),
+        &arrivals,
+        SyncAdoption::Continuing,
+    )
+    .unwrap()
 }
 
 fn text_at(db: &Database, key: Uuid) -> Option<String> {
@@ -187,71 +168,74 @@ fn tenant() -> String {
     format!("tenant_{}", Uuid::new_v4().simple())
 }
 
+async fn wait_for_server_route(fabric: &InProcessBroker, tenant_id: &str) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&status_subject(tenant_id)),
+    )
+    .await
+    .expect("sync server must register its status route");
+}
+
 async fn spawn_latest_wins_server(
     db: Arc<Database>,
-    nats_url: &str,
+    fabric: &InProcessBroker,
     tenant_id: &str,
+    hub_identity: Arc<FabricIdentity>,
 ) -> tokio::task::JoinHandle<()> {
-    let server = Arc::new(SyncServer::new(
-        db,
-        nats_url,
-        contextdb_core::TenantId::from(tenant_id),
-        latest_wins(),
-    ));
+    let hub_node_id = hub_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db,
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(tenant_id),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
     let server_task = Arc::clone(&server);
     let handle = tokio::spawn(async move { server_task.run().await });
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_server_route(fabric, tenant_id).await;
     handle
 }
 
-async fn spawn_reject_once_push_responder(
-    nats_url: &str,
+async fn spawn_lost_ack_push_responder(
+    fabric: &InProcessBroker,
     tenant_id: &str,
-    expected_key: Uuid,
+    hub_identity: Arc<FabricIdentity>,
 ) -> tokio::task::JoinHandle<()> {
-    let nats = async_nats::connect(nats_url).await.unwrap();
-    let mut sub = nats.subscribe(push_subject(tenant_id)).await.unwrap();
-    nats.flush().await.unwrap();
-
-    tokio::spawn(async move {
-        let msg = tokio::time::timeout(Duration::from_secs(5), sub.next())
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let handler_shutdown = Arc::clone(&shutdown);
+    let handler = Arc::new(
+        move |request: contextdb_server::transport::IncomingRequest| {
+            let handler_shutdown = Arc::clone(&handler_shutdown);
+            Box::pin(async move {
+                // The request reached the transport, but the edge receives no
+                // acknowledgement and therefore cannot know whether the hub
+                // committed it. Dropping the responder exercises that indeterminate
+                // path without fabricating an arbitration result.
+                drop(request.responder);
+                handler_shutdown.store(true, Ordering::SeqCst);
+                Ok(())
+            }) as contextdb_server::transport::TransportFuture<'static, ()>
+        },
+    );
+    let transport = fabric.server_as(&hub_identity.node_id());
+    let subject = push_subject(tenant_id);
+    let registered_subject = subject.clone();
+    let task = tokio::spawn(async move {
+        transport
+            .serve(vec![HandlerRegistration { subject, handler }], shutdown)
             .await
-            .unwrap()
-            .expect("fake push responder must receive one push");
-        let envelope = decode(&msg.payload).unwrap();
-        assert_eq!(envelope.message_type, MessageType::PushRequest);
-        let request: PushRequest = rmp_serde::from_slice(&envelope.payload).unwrap();
-        let changes = ChangeSet::try_from(request.changeset).unwrap();
-        let update = changes
-            .rows
-            .iter()
-            .find(|row| row.natural_key.value == Value::Uuid(expected_key))
-            .expect("push must include the pending updated row");
-        assert_eq!(
-            update.values.get("v").and_then(Value::as_text),
-            Some("updated")
-        );
-        let response = PushResponse {
-            result: Some(
-                ApplyResult {
-                    applied_rows: 0,
-                    skipped_rows: 1,
-                    conflicts: vec![Conflict {
-                        natural_key: update.natural_key.clone(),
-                        resolution: ConflictPolicy::LatestWins,
-                        reason: Some("local_lsn_newer_or_equal".to_string()),
-                    }],
-                    new_lsn: Lsn(0),
-                }
-                .into(),
-            ),
-            error: None,
-        };
-        let reply = msg.reply.expect("push request must carry a reply inbox");
-        let payload = encode(MessageType::PushResponse, &response).unwrap();
-        nats.publish(reply, payload.into()).await.unwrap();
-        nats.flush().await.unwrap();
-    })
+            .unwrap();
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&registered_subject),
+    )
+    .await
+    .expect("lost-ack responder must register its route");
+    task
 }
 
 #[test]
@@ -307,9 +291,10 @@ fn red_apply_mixed_changeset_partial_application() {
     let colliding_key = uuid(3);
     let server_newer_key = uuid(4);
 
-    let insert_result = apply_latest(
+    let insert_result = apply_latest_with_arrivals(
         &receiver,
         vec![row_change(colliding_key, "original", Lsn(2))],
+        HashMap::from([(Lsn(2), Some(Lsn(2)))]),
     );
     assert_single_row_applied_without_conflict(&insert_result, "mixed changeset initial insert");
     assert_text(&receiver, colliding_key, "original");
@@ -317,34 +302,25 @@ fn red_apply_mixed_changeset_partial_application() {
     insert_sql(&receiver, server_newer_key, "server-newer");
     assert!(receiver.current_lsn() > Lsn(3));
 
-    let result = apply_latest(
+    let result = apply_latest_with_arrivals(
         &receiver,
         vec![
             row_change(colliding_key, "updated", Lsn(3)),
             row_change(server_newer_key, "edge-old", Lsn(3)),
         ],
+        HashMap::from([(Lsn(3), Some(Lsn(3)))]),
     );
     assert_eq!(
         result.applied_rows, 1,
         "colliding single-author row must apply in the mixed changeset"
     );
     assert_eq!(
-        result.skipped_rows, 1,
-        "only the genuine two-writer loser may be skipped"
+        result.skipped_rows, 0,
+        "a stale LatestWins arrival is a convergence no-op, not refused work"
     );
     assert!(
-        result
-            .conflicts
-            .iter()
-            .any(|conflict| conflict.natural_key.value == Value::Uuid(server_newer_key)),
-        "the genuine two-writer loser must be reported as a conflict"
-    );
-    assert!(
-        !result
-            .conflicts
-            .iter()
-            .any(|conflict| conflict.natural_key.value == Value::Uuid(colliding_key)),
-        "the colliding single-author row must not be reported as a conflict"
+        result.conflicts.is_empty(),
+        "an accepted stale arrival must not be reported as an arbitration conflict"
     );
 
     assert_text(&receiver, colliding_key, "updated");
@@ -352,42 +328,50 @@ fn red_apply_mixed_changeset_partial_application() {
 }
 
 #[tokio::test]
-async fn red_e2e_single_writer_update_converges_over_nats() {
-    let nats = start_nats().await;
+async fn red_e2e_single_writer_update_converges_over_authenticated_transport() {
+    let fabric = InProcessBroker::new();
     let tenant_id = tenant();
 
     let server_db = Arc::new(Database::open_memory());
     create_t(&server_db);
     pad_tables(&server_db, 2);
-    let _server =
-        spawn_latest_wins_server(Arc::clone(&server_db), &nats.nats_url, &tenant_id).await;
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let _server = spawn_latest_wins_server(
+        Arc::clone(&server_db),
+        &fabric,
+        &tenant_id,
+        Arc::clone(&hub_identity),
+    )
+    .await;
 
     let writer_db = Arc::new(Database::open_memory());
-    create_t(&writer_db);
-    let client = SyncClient::new(
+    let writer_identity = Arc::new(FabricIdentity::generate());
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         Arc::clone(&writer_db),
-        &nats.nats_url,
+        fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
+        writer_identity,
+    );
+    let peer_db = Arc::new(Database::open_memory());
+    let peer_identity = Arc::new(FabricIdentity::generate());
+    let peer = SyncClient::with_authenticated_transport_and_identity_for_test(
+        Arc::clone(&peer_db),
+        fabric.client_as(&peer_identity.node_id()),
+        contextdb_core::TenantId::from(&tenant_id),
+        peer_identity,
     );
     client
-        .set_table_direction("t", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
-
-    let peer_db = Arc::new(Database::open_memory());
-    create_t(&peer_db);
-    let peer = SyncClient::new(
-        Arc::clone(&peer_db),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(&tenant_id),
-    );
-    peer.set_table_direction("t", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
-
+        .pull_default()
+        .await
+        .expect("writer must adopt the hub-authored schema before writing");
+    peer.pull_default()
+        .await
+        .expect("peer must adopt the hub-authored schema before observing data");
     let key = uuid(5);
     insert_sql(&writer_db, key, "original");
     client.push().await.unwrap();
     assert_text(&server_db, key, "original");
-    peer.pull(&latest_wins()).await.unwrap();
+    peer.pull_default().await.unwrap();
     assert_eq!(selected_text_at(&peer_db, key).as_deref(), Some("original"));
 
     update_sql(&writer_db, key, "updated");
@@ -399,48 +383,62 @@ async fn red_e2e_single_writer_update_converges_over_nats() {
 
     assert_text(&server_db, key, "updated");
 
-    let pull_result = peer.pull(&latest_wins()).await.unwrap();
+    let pull_result = peer.pull_default().await.unwrap();
     assert_single_row_applied_without_conflict(&pull_result, "delta pull after server collision");
     assert_eq!(selected_text_at(&peer_db, key).as_deref(), Some("updated"));
 }
 
 #[tokio::test]
 async fn red_e2e_dirty_peer_pull_update_converges() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tenant_id = tenant();
 
     let server_db = Arc::new(Database::open_memory());
     create_t(&server_db);
-    let _server =
-        spawn_latest_wins_server(Arc::clone(&server_db), &nats.nats_url, &tenant_id).await;
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let _server = spawn_latest_wins_server(
+        Arc::clone(&server_db),
+        &fabric,
+        &tenant_id,
+        Arc::clone(&hub_identity),
+    )
+    .await;
 
     let writer_db = Arc::new(Database::open_memory());
-    create_t(&writer_db);
-    let writer = SyncClient::new(
+    let writer_identity = Arc::new(FabricIdentity::generate());
+    let writer = SyncClient::with_authenticated_transport_and_identity_for_test(
         Arc::clone(&writer_db),
-        &nats.nats_url,
+        fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
+        writer_identity,
+    );
+    let peer_db = Arc::new(Database::open_memory());
+    let peer_identity = Arc::new(FabricIdentity::generate());
+    let peer = SyncClient::with_authenticated_transport_and_identity_for_test(
+        Arc::clone(&peer_db),
+        fabric.client_as(&peer_identity.node_id()),
+        contextdb_core::TenantId::from(&tenant_id),
+        peer_identity,
     );
     writer
-        .set_table_direction("t", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
-
-    let peer_db = Arc::new(Database::open_memory());
-    create_t(&peer_db);
+        .pull_default()
+        .await
+        .expect("writer must adopt the hub-authored schema before writing");
+    peer.pull_default()
+        .await
+        .expect("peer must adopt the hub-authored schema before observing data");
+    let peer_schema_frontier = peer_db.current_lsn();
     pad_tables(&peer_db, 3);
-    let peer = SyncClient::new(
-        Arc::clone(&peer_db),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(&tenant_id),
+    let dirty_peer_frontier = peer_db.current_lsn();
+    assert!(
+        dirty_peer_frontier > peer_schema_frontier,
+        "the peer must carry unrelated local commits after adopting the shared schema"
     );
-    peer.set_table_direction("t", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
-
     let key = uuid(6);
     insert_sql(&writer_db, key, "original");
     writer.push().await.unwrap();
 
-    peer.pull(&latest_wins()).await.unwrap();
+    peer.pull_default().await.unwrap();
     assert_text(&peer_db, key, "original");
 
     update_sql(&writer_db, key, "updated");
@@ -450,9 +448,12 @@ async fn red_e2e_dirty_peer_pull_update_converges() {
         "server update before dirty peer pull",
     );
     assert_text(&server_db, key, "updated");
-    assert!(peer_db.current_lsn() >= server_db.current_lsn());
+    assert!(
+        peer_db.current_lsn() >= dirty_peer_frontier,
+        "the peer's local commit frontier must remain monotonic while it is dirty"
+    );
 
-    let pull_result = peer.pull(&latest_wins()).await.unwrap();
+    let pull_result = peer.pull_default().await.unwrap();
     assert_single_row_applied_without_conflict(&pull_result, "dirty peer update pull");
 
     assert_eq!(selected_text_at(&peer_db, key).as_deref(), Some("updated"));
@@ -460,7 +461,7 @@ async fn red_e2e_dirty_peer_pull_update_converges() {
 
 #[tokio::test]
 async fn red_e2e_writer_restart_pending_update_converges() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tenant_id = tenant();
     let writer_tmp = tempfile::TempDir::new().unwrap();
     let writer_path = writer_tmp.path().join("writer.redb");
@@ -468,31 +469,39 @@ async fn red_e2e_writer_restart_pending_update_converges() {
     let server_db = Arc::new(Database::open_memory());
     create_t(&server_db);
     pad_tables(&server_db, 2);
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let server = Arc::new(SyncServer::new(
-        Arc::clone(&server_db),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(&tenant_id),
-        latest_wins(),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            Arc::clone(&server_db),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(&tenant_id),
+            hub_node_id,
+            Arc::clone(&hub_identity),
+        ),
+    );
     let server_task = {
         let server = Arc::clone(&server);
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move { server.run_until(shutdown).await })
     };
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_server_route(&fabric, &tenant_id).await;
 
     let writer_db = Arc::new(Database::open(&writer_path).unwrap());
-    create_t(&writer_db);
-    let client = SyncClient::new(
-        Arc::clone(&writer_db),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(&tenant_id),
+    let writer_identity = Arc::new(FabricIdentity::generate());
+    let client = Arc::new(
+        SyncClient::with_authenticated_transport_and_identity_for_test(
+            Arc::clone(&writer_db),
+            fabric.client_as(&writer_identity.node_id()),
+            contextdb_core::TenantId::from(&tenant_id),
+            Arc::clone(&writer_identity),
+        ),
     );
     client
-        .set_table_direction("t", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
-
+        .pull_default()
+        .await
+        .expect("writer must adopt the hub-authored schema before writing");
     let key = uuid(7);
     let sibling = uuid(8);
     insert_sql(&writer_db, sibling, "synced");
@@ -508,17 +517,21 @@ async fn red_e2e_writer_restart_pending_update_converges() {
         .unwrap();
     drop(server);
 
-    let reject_once = spawn_reject_once_push_responder(&nats.nats_url, &tenant_id, key).await;
     update_sql(&writer_db, key, "updated");
     let update_sender_lsn = writer_db.current_lsn();
-    let rejected = client.push().await.unwrap();
-    reject_once.await.unwrap();
+    let lost_ack =
+        spawn_lost_ack_push_responder(&fabric, &tenant_id, Arc::clone(&hub_identity)).await;
+    let unconfirmed = client
+        .push()
+        .await
+        .expect_err("a vanished push acknowledgement must leave the update unconfirmed");
+    lost_ack.await.unwrap();
     assert!(
-        rejected
-            .conflicts
-            .iter()
-            .any(|conflict| conflict.reason.as_deref() == Some("local_lsn_newer_or_equal")),
-        "first update push must observe the nonterminal LSN-clock conflict"
+        matches!(
+            unconfirmed,
+            contextdb_core::Error::SyncPushUnconfirmed { .. }
+        ),
+        "a lost acknowledgement must never be reported as a terminal conflict or success"
     );
     assert!(
         client.push_watermark() < update_sender_lsn,
@@ -526,16 +539,19 @@ async fn red_e2e_writer_restart_pending_update_converges() {
     );
     drop(client);
 
-    let retry_server =
-        spawn_latest_wins_server(Arc::clone(&server_db), &nats.nats_url, &tenant_id).await;
-    let restarted = SyncClient::new(
+    let retry_server = spawn_latest_wins_server(
+        Arc::clone(&server_db),
+        &fabric,
+        &tenant_id,
+        Arc::clone(&hub_identity),
+    )
+    .await;
+    let restarted = SyncClient::with_authenticated_transport_and_identity_for_test(
         Arc::clone(&writer_db),
-        &nats.nats_url,
+        fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
+        writer_identity,
     );
-    restarted
-        .set_table_direction("t", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
     let retry_result = restarted.push().await.unwrap();
     assert_single_row_applied_without_conflict(&retry_result, "restart retry push");
 
@@ -546,7 +562,7 @@ async fn red_e2e_writer_restart_pending_update_converges() {
 
 #[tokio::test]
 async fn red_e2e_single_writer_update_durable_after_server_restart() {
-    let nats = start_nats().await;
+    let fabric = InProcessBroker::new();
     let tenant_id = tenant();
     let server_tmp = tempfile::TempDir::new().unwrap();
     let server_path = server_tmp.path().join("server.redb");
@@ -554,31 +570,37 @@ async fn red_e2e_single_writer_update_durable_after_server_restart() {
     let server_db = Arc::new(Database::open(&server_path).unwrap());
     create_t(&server_db);
     pad_tables(&server_db, 2);
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let server = Arc::new(SyncServer::new(
-        Arc::clone(&server_db),
-        &nats.nats_url,
-        contextdb_core::TenantId::from(&tenant_id),
-        latest_wins(),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            Arc::clone(&server_db),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(&tenant_id),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
     let server_task = {
         let server = Arc::clone(&server);
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move { server.run_until(shutdown).await })
     };
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_server_route(&fabric, &tenant_id).await;
 
     let writer_db = Arc::new(Database::open_memory());
-    create_t(&writer_db);
-    let client = SyncClient::new(
+    let writer_identity = Arc::new(FabricIdentity::generate());
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         Arc::clone(&writer_db),
-        &nats.nats_url,
+        fabric.client_as(&writer_identity.node_id()),
         contextdb_core::TenantId::from(&tenant_id),
+        writer_identity,
     );
     client
-        .set_table_direction("t", SyncDirection::Both)
-        .expect("an ordinary table accepts any direction");
-
+        .pull_default()
+        .await
+        .expect("writer must adopt the hub-authored schema before writing");
     let key = uuid(9);
     insert_sql(&writer_db, key, "original");
     client.push().await.unwrap();
@@ -669,15 +691,22 @@ fn guard_two_writer_latest_wins_server_value_survives() {
     insert_sql(&receiver, key, "server-newer");
     assert!(receiver.current_lsn() > edge.current_lsn());
 
+    let changes = edge.changes_since(Lsn(1));
+    let arrivals = changes
+        .rows
+        .iter()
+        .map(|row| (row.lsn, Some(row.lsn)))
+        .collect::<HashMap<_, _>>();
     let result = receiver
-        .apply_changes(edge.changes_since(Lsn(1)), &latest_wins())
+        .apply_synced_changes(changes, &latest_wins(), &arrivals, SyncAdoption::Continuing)
         .unwrap();
 
     assert_text(&receiver, key, "server-newer");
-    assert!(
-        result.skipped_rows >= 1,
-        "older incoming writer value must be skipped"
+    assert_eq!(
+        result.skipped_rows, 0,
+        "a stale LatestWins arrival is a convergence no-op, not refused work"
     );
+    assert!(result.conflicts.is_empty());
 }
 
 #[test]
@@ -792,21 +821,14 @@ fn red_identical_redelivery_is_a_ledger_no_op() {
 //
 // Scenario: a single writer streams sequential updates to a row while its sender
 // clock stays low. A second client (a `.sync pull` session with Both direction)
-// pulls those rows and applies them to its OWN database, which restamps them onto
-// the reader's local commit clock — a clock that has been inflated far past the
-// writer's LSN range by unrelated traffic (e.g. the 60-row pull). When that reader
-// echoes a now-stale value back, the echo carries the reader's inflated LSN, not
-// the writer's. The server's LatestWins apply lets the inflated echo win and
-// records the reader's inflated LSN as the row's source provenance. Every
-// subsequent genuine update from the writer then carries a sender LSN below that
-// poisoned provenance and is rejected `latest_wins_local_lsn_newer_or_equal`,
-// freezing the server on the stale value while the writer believes it is caught
-// up. The fix must keep a row's provenance anchored to the originating writer's
-// LSN so a downstream reader's echo cannot strand the source.
+// pulls those rows and applies them to its OWN database, which may commit them at
+// an inflated local clock. When that reader echoes a now-stale value back, the
+// wire record must still carry its original accepted arrival, not the reader's
+// local commit position. The server must keep provenance anchored to the
+// originating writer so the stale echo cannot strand later writer updates.
 //
 // The echo is reproduced here through the engine apply path: a same-table
-// LatestWins re-delivery of a stale value carrying an inflated sender LSN, which
-// is the wire-accurate shape of the reader's echo push.
+// LatestWins re-delivery of a stale value with its original accepted arrival.
 #[test]
 fn red_apply_concurrent_reader_echo_must_not_strand_writer() {
     let receiver = Database::open_memory();
@@ -827,9 +849,8 @@ fn red_apply_concurrent_reader_echo_must_not_strand_writer() {
     for n in 0..60u128 {
         insert_sql(&receiver, uuid(20_000 + n), "filler");
     }
-    let inflated_clock = receiver.current_lsn();
     assert!(
-        inflated_clock > Lsn(8),
+        receiver.current_lsn() > Lsn(8),
         "receiver clock must be inflated past the writer sender LSN range"
     );
 
@@ -838,12 +859,24 @@ fn red_apply_concurrent_reader_echo_must_not_strand_writer() {
     assert_single_row_applied_without_conflict(&s3_result, "echo-poison third update");
     assert_text(&receiver, key, "s3");
 
-    // A concurrent bidirectional reader echoes a now-stale value ("s2") back,
-    // carrying its inflated local LSN rather than the writer's. This must NOT be
-    // allowed to overwrite the genuinely newer "s3" nor to poison the row's
-    // provenance with the inflated LSN.
-    let echo_lsn = inflated_clock;
-    apply_latest(&receiver, vec![row_change(key, "s2", echo_lsn)]);
+    // A concurrent bidirectional reader echoes a now-stale value ("s2") back.
+    // Its local clock is inflated, but the wire arrival remains the original
+    // accepted writer position Lsn(3), so this is a no-op against "s3".
+    let echo = apply_latest_with_arrivals(
+        &receiver,
+        vec![row_change(key, "s2", Lsn(3))],
+        HashMap::from([(Lsn(3), Some(Lsn(3)))]),
+    );
+    assert_eq!(echo.applied_rows, 0, "stale reader echo must be a no-op");
+    assert_eq!(
+        echo.skipped_rows, 0,
+        "stale reader echo is not refused work"
+    );
+    assert!(
+        echo.conflicts.is_empty(),
+        "stale reader echo is not a conflict"
+    );
+    assert_text(&receiver, key, "s3");
 
     // The writer keeps streaming with its own low sender LSNs. Every update must
     // continue to apply and the row must converge on the final value.

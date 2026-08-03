@@ -44,23 +44,24 @@ friends are example tables the docs define; you define your own and attach polic
 
 ### Verification Gate
 
-All five must pass before any commit, release, or "done" claim:
+All five must pass before any commit, release, or "done" claim. The fifth
+installs isolated release binaries and drives the production ticketed-Iroh
+durability smoke:
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release
-cargo check --workspace --tests --features contextdb-engine/nats-tests,contextdb-server/nats
+install_root="$(mktemp -d)"
+cargo install --locked --path crates/contextdb-cli --root "$install_root"
+cargo install --locked --path crates/contextdb-server --root "$install_root" \
+  --features production-smoke-driver --bins
+CONTEXTDB_CLI="$install_root/bin/contextdb" \
+CONTEXTDB_SMOKE_DRIVER="$install_root/bin/contextdb-smoke-driver" \
+CONTEXTDB_SERVER="$install_root/bin/contextdb-server" \
+  scripts/installed-release-durable-sync-smoke.sh
 ```
-
-The fifth step is **compile-only** (no Docker, no broker, seconds): the deprecated
-broker suites are feature-gated — `tests/integration.rs` hides several modules behind
-`#[cfg(feature = "nats-tests")]`, and `contextdb-server`'s `sync_integration` needs
-`nats` — so `cargo test --workspace` never builds them and an API change can break
-them with every other step still green. That is not hypothetical: adding a field to
-`RowChange` and a return type to `SyncClient::set_table_direction` broke both suites,
-and several full green gates ran before anyone compiled them.
 
 `CONTRIBUTING.md` lists the same five steps for outside contributors; the two documents
 agree.
@@ -71,7 +72,6 @@ Never run multiple cargo commands in parallel. They share an exclusive lock on `
 
 ### Testing
 
-- Tests use **testcontainers** for NATS. Never start Docker containers or NATS manually.
 - Test suites: `cargo test -p contextdb-engine --test acceptance`, `--test integration`, `--test sql_surface_tests`
 - Run the full workspace: `cargo test --workspace`
 

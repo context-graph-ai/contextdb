@@ -67,7 +67,6 @@
 use clap::{Parser, Subcommand};
 use contextdb_core::{TenantId, Value, Wallclock};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_engine::work_ledger::{
     BlobHash, ClaimInsert, InputRef, JobSpec, MovementPolicy, insert_claim,
     install_work_ledger_schema, submit_job,
@@ -943,11 +942,10 @@ async fn run_hub(
     write_atomically(ticket_file, &ticket.to_string());
     emit("hub.ticket_file", ticket_file.display());
 
-    let server = Arc::new(SyncServer::with_transport(
+    let server = Arc::new(SyncServer::new(
         db.clone(),
-        endpoint.transport(),
+        &endpoint,
         TenantId::from(tenant),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
     ));
 
     let shutdown = Arc::new(AtomicBool::new(false));

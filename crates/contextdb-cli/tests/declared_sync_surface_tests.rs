@@ -3,8 +3,8 @@
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
 use contextdb_engine::work_ledger::install_work_ledger_schema;
-use contextdb_server::SyncServer;
 use contextdb_server::transport::iroh::IrohServer;
+use contextdb_server::{FabricIdentity, SyncServer};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -14,7 +14,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-fn run_cli_at(path: &std::path::Path, input: &str, json: bool) -> (String, String) {
+fn run_cli_at_with_status(
+    path: &std::path::Path,
+    input: &str,
+    json: bool,
+) -> (ExitStatus, String, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_contextdb"));
     if json {
         command.arg("--json");
@@ -33,7 +37,11 @@ fn run_cli_at(path: &std::path::Path, input: &str, json: bool) -> (String, Strin
         .write_all(input.as_bytes())
         .expect("write CLI input");
     drop(child.stdin.take());
-    let (status, stdout, stderr) = wait_with_bounded_output(child, "simple CLI journey");
+    wait_with_bounded_output(child, "simple CLI journey")
+}
+
+fn run_cli_at(path: &std::path::Path, input: &str, json: bool) -> (String, String) {
+    let (status, stdout, stderr) = run_cli_at_with_status(path, input, json);
     assert!(
         status.success(),
         "simple CLI journey exits cleanly: {status}"
@@ -90,7 +98,12 @@ fn removed_sync_commands_are_unknown_and_role_mechanic_words_are_absent() {
         ("policy", ".sync policy notes LatestWins\n.quit\n"),
         ("direction", ".sync direction notes Both\n.quit\n"),
     ] {
-        let (output, error) = run_cli(command, false);
+        let (status, output, error) =
+            run_cli_at_with_status(std::path::Path::new(":memory:"), command, false);
+        assert!(
+            !status.success(),
+            "removed .sync {name} is a scripted usage error and must exit nonzero"
+        );
         let rendered = format!("{output}\n{error}").to_ascii_lowercase();
         assert!(
             rendered.contains("unknown") || rendered.contains("unrecognized"),
@@ -167,6 +180,8 @@ async fn within<F: std::future::Future>(future: F) -> F::Output {
 
 async fn start_hub(root: &std::path::Path, tenant: &str) -> RunningHub {
     let identity = root.join("hub.db.fabric-identity.key");
+    let fabric_identity =
+        Arc::new(FabricIdentity::load_or_generate(&identity).expect("load real Iroh hub identity"));
     let (ticket, node_id, transport) = {
         let endpoint = within(IrohServer::bind(&format!(
             "iroh:?identity={}",
@@ -176,17 +191,26 @@ async fn start_hub(root: &std::path::Path, tenant: &str) -> RunningHub {
         .expect("bind real Iroh hub");
         (endpoint.ticket(), endpoint.node_id(), endpoint.transport())
     };
+    assert_eq!(
+        fabric_identity.node_id(),
+        node_id,
+        "sync server signer must be the identity advertised by its Iroh endpoint"
+    );
     let db = Arc::new(Database::open(root.join("hub.db")).expect("open hub database"));
     db.execute(
         "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST",
         &HashMap::new(),
     )
     .expect("hub schema");
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        db.clone(),
-        transport,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            transport,
+            TenantId::from(tenant),
+            node_id.clone(),
+            fabric_identity,
+        ),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let stop = stop.clone();
@@ -427,7 +451,7 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn manual CLI");
-    let manual_sql = ".sync push\n.quit\n";
+    let manual_sql = ".sync push\n.sync pull\n.quit\n";
     let mut manual = manual;
     manual
         .stdin
@@ -448,7 +472,11 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
     );
     let manual_db = Database::open(&manual_path).expect("reopen manual edge");
     assert_eq!(body(&hub.db, manual_id).as_deref(), Some("hub winner"));
-    assert_eq!(body(&manual_db, manual_id).as_deref(), Some("hub winner"));
+    assert_eq!(
+        body(&manual_db, manual_id).as_deref(),
+        Some("hub winner"),
+        "manual CLI did not reconcile the hub winner; status={manual_status}; stdout={manual_stdout}; stderr={manual_stderr}"
+    );
 
     let auto_id = Uuid::new_v4();
     insert(&hub.db, auto_id, "second hub winner");
@@ -488,7 +516,7 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
     let (report_rx, readers) = start_output_readers(&mut auto);
     let notification_id = Uuid::new_v4();
     let auto_sql = format!(
-        "INSERT INTO notes (id, body) VALUES ('{notification_id}', 'post-launch notification');\n"
+        ".sync auto on\nINSERT INTO notes (id, body) VALUES ('{notification_id}', 'post-launch notification');\n"
     );
     let mut auto_stdin = auto.stdin.take().expect("auto stdin");
     auto_stdin
@@ -537,7 +565,9 @@ async fn manual_push_and_auto_sync_render_complete_refusal_diagnostic() {
         }
     };
     assert_no_role_mechanic_words(&auto_event.to_string(), "automatic refusal event");
-    auto_stdin.write_all(b".quit\n").expect("quit auto CLI");
+    auto_stdin
+        .write_all(b".sync pull\n.quit\n")
+        .expect("reconcile the automatic refusal and quit auto CLI");
     drop(auto_stdin);
     let status = wait_for_exit(&mut auto, "auto CLI");
     assert!(status.success(), "auto CLI exits cleanly: {status}");

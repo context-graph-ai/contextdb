@@ -2,10 +2,12 @@
 //! group must delete its matching local ANN entry without consuming the next
 //! owner's mapping.
 
-use contextdb_core::{Lsn, Value, VectorIndexRef};
+use contextdb_core::{Lsn, TenantId, Value, VectorIndexRef};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncAdoption};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{
+    FabricIdentity, InProcessBroker, SyncClient, SyncServer,
+    acceptance_stamped_push_batches_for_test,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,13 +95,15 @@ fn assert_exact_mixed_vector_outbound_provenance(db: &Database, since: Lsn) {
 /// owner whose incoming value KEEP FIRST refuses. The retained owner is
 /// re-emitted as AcceptedLocal in that same table and commit. Provenance must
 /// therefore be exact per owner, and the distinction must survive reopen.
-#[test]
-fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
+#[tokio::test]
+async fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
     const KEEP_FIRST_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR(3)) SYNC CONFLICT KEEP FIRST";
+    let tenant = TenantId::from("mixed-vector-provenance");
+    let broker = InProcessBroker::new();
     let temp = tempfile::TempDir::new().expect("tempdir");
     let edge_path = temp.path().join("mixed-vector-provenance.db");
-    let source = Database::open_memory();
-    let edge = Database::open(&edge_path).expect("open durable edge");
+    let source = Arc::new(Database::open_memory());
+    let edge = Arc::new(Database::open(&edge_path).expect("open durable edge"));
     for db in [&source, &edge] {
         db.execute(KEEP_FIRST_DDL, &empty())
             .expect("declare keep-first vector table");
@@ -130,47 +134,92 @@ fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
         "fixture rows and vectors share one source commit"
     );
 
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            source.clone(),
+            broker.server_as(&hub_node_id),
+            tenant.clone(),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn({
+        let server = server.clone();
+        let shutdown = shutdown.clone();
+        async move { server.run_until(shutdown).await }
+    });
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge.clone(),
+        broker.client_as(&edge_node_id),
+        tenant,
+        edge_identity,
+    );
+
     let edge_before = edge.current_lsn();
-    let result = edge
-        .apply_synced_changes(
-            incoming,
-            &edge.conflict_policies(),
-            &HashMap::from([(source_lsn, Some(Lsn(500)))]),
-            SyncAdoption::Continuing,
-        )
-        .expect("apply mixed source commit");
+    let result = client
+        .pull_default()
+        .await
+        .expect("pull authenticated mixed source commit");
     assert_eq!(result.applied_rows, 1, "A is newly pulled");
     assert_eq!(result.skipped_rows, 1, "B is refused and re-emitted");
     assert_exact_mixed_vector_outbound_provenance(&edge, edge_before);
 
+    drop(client);
+    shutdown.store(true, Ordering::SeqCst);
+    task.await.expect("server task must stop");
     edge.close().expect("close durable edge");
     drop(edge);
     let reopened = Database::open(&edge_path).expect("reopen durable edge");
     assert_exact_mixed_vector_outbound_provenance(&reopened, edge_before);
 }
 
-#[test]
-fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
-    let sender = Database::open_memory();
-    let receiver = Database::open_memory();
+#[tokio::test]
+async fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
+    let tenant = TenantId::from("same-lsn-vector-delete");
+    let broker = InProcessBroker::new();
+    let sender = Arc::new(Database::open_memory());
+    let receiver = Arc::new(Database::open_memory());
     for db in [&sender, &receiver] {
         db.execute(DDL, &empty()).expect("declare vector table");
     }
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            receiver.clone(),
+            broker.server_as(&hub_node_id),
+            tenant.clone(),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn({
+        let server = server.clone();
+        let shutdown = shutdown.clone();
+        async move { server.run_until(shutdown).await }
+    });
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        sender.clone(),
+        broker.client_as(&edge_node_id),
+        tenant,
+        edge_identity,
+    );
+
     sender
         .execute(
             "INSERT INTO notes VALUES (1, 'first', '[1,0,0]'), (2, 'second', '[0,1,0]')",
             &empty(),
         )
         .expect("seed two vector owners in one commit");
-    let policies = sender.conflict_policies();
-    receiver
-        .apply_synced_changes(
-            sender.changes_since(Lsn(0)),
-            &policies,
-            &HashMap::new(),
-            SyncAdoption::Continuing,
-        )
-        .expect("apply seed");
+    client.push().await.expect("push authenticated seed");
 
     let seed_lsn = sender.current_lsn();
     sender
@@ -187,14 +236,10 @@ fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
         2,
         "both owner tombstones travel in the delete group"
     );
-    receiver
-        .apply_synced_changes(
-            deletes,
-            &policies,
-            &HashMap::new(),
-            SyncAdoption::Continuing,
-        )
-        .expect("apply both owner deletes");
+    client
+        .push()
+        .await
+        .expect("push both authenticated owner deletes");
 
     assert!(
         receiver
@@ -219,35 +264,29 @@ fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
             "each deleted owner is absent from ANN"
         );
     }
+
+    shutdown.store(true, Ordering::SeqCst);
+    task.await.expect("server task must stop");
 }
 
-/// A retained history can contain the owner's earlier relational insert and
-/// later relational/vector tombstones while omitting the superseded vector
-/// insert. A fresh receiver must pair the tombstone with the delete row, not
-/// consume it while visiting the older live row.
+/// A pending local delete coalesces its older live row from public outbound
+/// history. The relational and vector tombstones must still travel together.
 #[test]
-fn fresh_receiver_applies_retained_vector_tombstone_history() {
+fn non_recreated_delete_retains_relational_and_vector_tombstones() {
     let sender = Database::open_memory();
-    let temp = tempfile::TempDir::new().expect("tempdir");
-    let receiver =
-        Database::open(temp.path().join("fresh-receiver.db")).expect("open durable receiver");
-    for db in [&sender, &receiver] {
-        db.execute(DDL, &empty()).expect("declare vector table");
-        db.execute(
+    sender.execute(DDL, &empty()).expect("declare vector table");
+    sender
+        .execute(
             "CREATE TABLE filler (id INTEGER PRIMARY KEY) SYNC OFF",
             &empty(),
         )
         .expect("declare row-id filler");
-    }
     sender
         .execute(
             "INSERT INTO filler VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)",
             &empty(),
         )
         .expect("skew sender row ids");
-    receiver
-        .execute("INSERT INTO filler VALUES (1),(2),(3)", &empty())
-        .expect("skew receiver row ids differently");
     let before_insert = sender.current_lsn();
     sender
         .execute(
@@ -259,52 +298,137 @@ fn fresh_receiver_applies_retained_vector_tombstone_history() {
         .execute("DELETE FROM notes WHERE id = 1", &empty())
         .expect("delete vector owner");
     let retained = sender.changes_since(before_insert);
-    assert_eq!(
-        retained.rows.iter().filter(|row| !row.deleted).count(),
-        1,
-        "retained history carries the earlier live owner row"
+    assert!(
+        retained.rows.iter().all(|row| row.deleted),
+        "pending-delete reconciliation omits the older live owner row"
     );
     assert_eq!(
         retained.rows.iter().filter(|row| row.deleted).count(),
         1,
-        "retained history carries the later owner tombstone"
+        "outbound history retains exactly one relational tombstone"
     );
-    assert!(
-        retained
-            .vectors
-            .iter()
-            .all(|vector| vector.vector.is_empty()),
-        "the superseded vector insert is omitted"
+    let row_delete = retained
+        .rows
+        .iter()
+        .find(|row| row.deleted)
+        .expect("retained relational tombstone");
+    let vector_deletes = retained
+        .vectors
+        .iter()
+        .filter(|vector| vector.vector.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vector_deletes.len(),
+        1,
+        "outbound history retains exactly one vector tombstone"
+    );
+    assert_eq!(
+        vector_deletes[0].index.table, row_delete.table,
+        "the vector tombstone belongs to the relational tombstone's table"
+    );
+    assert_eq!(
+        vector_deletes[0].lsn, row_delete.lsn,
+        "the relational and vector tombstones remain one dependency group"
+    );
+}
+
+/// Recreating a natural key supersedes its earlier delete. A destination
+/// rebuild must receive only the recreated owner and vector, never a detached
+/// vector tombstone for the original owner.
+#[test]
+fn same_key_recreation_cannot_leave_orphan_vector_tombstone_in_destination_rebuild() {
+    let sender = Database::open_memory();
+    sender.execute(DDL, &empty()).expect("declare vector table");
+
+    sender
+        .execute(
+            "INSERT INTO notes VALUES (1, 'original-owner', '[1,0,0]')",
+            &empty(),
+        )
+        .expect("insert original vector owner");
+    let original_vector_owner = sender
+        .changes_since(Lsn(0))
+        .vectors
+        .into_iter()
+        .find(|vector| !vector.vector.is_empty())
+        .expect("original live vector")
+        .row_id;
+
+    let before_delete = sender.current_lsn();
+    sender
+        .execute("DELETE FROM notes WHERE id = 1", &empty())
+        .expect("delete original vector owner");
+    let original_delete_history = sender.changes_since(before_delete);
+    let original_delete = original_delete_history
+        .rows
+        .iter()
+        .find(|row| row.deleted)
+        .expect("original relational delete");
+    let original_delete_lsn = original_delete.lsn;
+
+    let before_recreate = sender.current_lsn();
+    sender
+        .record_hub_accepted_rows(std::slice::from_ref(original_delete), Lsn(800), Some("hub"))
+        .expect("record accepted original delete");
+    sender
+        .execute(
+            "INSERT INTO notes VALUES (1, 'recreated-owner', '[0,1,0]')",
+            &empty(),
+        )
+        .expect("recreate same natural key with a new vector owner");
+    let recreated_vector_owner = sender
+        .changes_since(before_recreate)
+        .vectors
+        .into_iter()
+        .find(|vector| !vector.vector.is_empty())
+        .expect("recreated live vector")
+        .row_id;
+    assert_ne!(
+        recreated_vector_owner, original_vector_owner,
+        "recreation allocates a new vector owner"
     );
 
-    receiver
-        .apply_synced_changes(
-            retained,
-            &sender.conflict_policies(),
-            &HashMap::new(),
-            SyncAdoption::Continuing,
-        )
-        .expect("fresh receiver applies retained tombstone history");
+    let history = sender.changes_since(Lsn(0));
     assert!(
-        receiver
-            .execute("SELECT * FROM notes", &empty())
-            .expect("query receiver")
-            .rows
-            .is_empty(),
-        "the owner is absent after replay"
+        history.rows.iter().any(|row| {
+            !row.deleted
+                && row.natural_key.value == Value::Int64(1)
+                && row.values.get("body") == Some(&Value::Text("recreated-owner".to_string()))
+        }),
+        "full outbound history retains the recreated live row"
     );
     assert!(
-        receiver
-            .query_vector(
-                VectorIndexRef::new("notes", "embedding"),
-                &[1.0, 0.0, 0.0],
-                1,
-                None,
-                receiver.snapshot(),
-            )
-            .expect("query receiver ANN")
-            .is_empty(),
-        "the ANN owner is absent after replay"
+        history.vectors.iter().any(|vector| {
+            vector.row_id == recreated_vector_owner && vector.vector == vec![0.0, 1.0, 0.0]
+        }),
+        "full outbound history retains the recreated live vector"
+    );
+    assert!(
+        !history
+            .rows
+            .iter()
+            .any(|row| row.deleted && row.natural_key.value == Value::Int64(1)),
+        "natural-key dedup omits the original relational delete"
+    );
+    assert!(
+        !history
+            .vectors
+            .iter()
+            .any(|vector| { vector.row_id == original_vector_owner && vector.vector.is_empty() }),
+        "natural-key dedup also omits the original owner's vector tombstone"
+    );
+    assert!(
+        !acceptance_stamped_push_batches_for_test(history.clone())
+            .iter()
+            .any(|batch| {
+                batch.rows.is_empty()
+                    && batch.vectors.iter().any(|vector| {
+                        vector.lsn == original_delete_lsn
+                            && vector.row_id == original_vector_owner
+                            && vector.vector.is_empty()
+                    })
+            }),
+        "the old delete LSN has no zero-row outbound batch containing an orphan vector tombstone"
     );
 }
 
@@ -324,12 +448,17 @@ async fn deleting_edge_pulls_its_own_vector_tombstone_with_remote_row_id() {
         &empty(),
     )
     .expect("hub prefix owner");
-    let server = Arc::new(SyncServer::with_transport(
-        hub.clone(),
-        broker.server_as("hub-vector"),
-        tenant.clone(),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub.clone(),
+            broker.server_as(&hub_node_id),
+            tenant.clone(),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -345,7 +474,14 @@ async fn deleting_edge_pulls_its_own_vector_tombstone_with_remote_row_id() {
         &empty(),
     )
     .expect("edge owners");
-    let client = SyncClient::with_transport(edge.clone(), broker.client_as("edge-vector"), tenant);
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge.clone(),
+        broker.client_as(&edge_node_id),
+        tenant,
+        edge_identity,
+    );
     client.push().await.expect("seed hub from edge");
     edge.execute("DELETE FROM notes WHERE id = 1", &empty())
         .expect("local vector delete");
@@ -421,12 +557,17 @@ async fn pulled_vector_groups_do_not_echo_but_later_local_vector_work_does() {
         &empty(),
     )
     .expect("hub vector owners");
-    let server = Arc::new(SyncServer::with_transport(
-        hub.clone(),
-        broker.server_as("hub-pulled-vector"),
-        tenant.clone(),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub.clone(),
+            broker.server_as(&hub_node_id),
+            tenant.clone(),
+            hub_node_id,
+            hub_identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -435,8 +576,14 @@ async fn pulled_vector_groups_do_not_echo_but_later_local_vector_work_does() {
     });
     let edge = Arc::new(Database::open_memory());
     edge.execute(DDL, &empty()).expect("edge table");
-    let client =
-        SyncClient::with_transport(edge.clone(), broker.client_as("edge-pulled-vector"), tenant);
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    let edge_node_id = edge_identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge.clone(),
+        broker.client_as(&edge_node_id),
+        tenant,
+        edge_identity,
+    );
     client.push().await.expect("publish edge schema");
     client.pull_default().await.expect("pull vector owner");
     assert!(
@@ -542,7 +689,7 @@ fn accepted_local_and_pending_vector_insert_and_delete_remain_outbound() {
         .iter()
         .find(|vector| !vector.vector.is_empty())
         .expect("local live vector");
-    db.record_hub_accepted_rows(std::slice::from_ref(live_row), Lsn(800))
+    db.record_hub_accepted_rows(std::slice::from_ref(live_row), Lsn(800), Some("hub"))
         .expect("record AcceptedLocal live owner");
     assert!(
         !db.vector_change_arrived_by_sync(live_vector),
@@ -569,7 +716,7 @@ fn accepted_local_and_pending_vector_insert_and_delete_remain_outbound() {
         .iter()
         .find(|vector| vector.vector.is_empty())
         .expect("local delete vector");
-    db.record_hub_accepted_rows(std::slice::from_ref(delete_row), Lsn(900))
+    db.record_hub_accepted_rows(std::slice::from_ref(delete_row), Lsn(900), Some("hub"))
         .expect("record AcceptedLocal delete owner");
     assert!(
         !db.vector_change_arrived_by_sync(delete_vector),

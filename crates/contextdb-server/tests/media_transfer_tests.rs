@@ -7,6 +7,7 @@ use contextdb_engine::work_ledger::{
     BlobHash, ClaimInsert, InputRef, JobSpec, MovementPolicy, cancel_job, insert_claim,
     install_work_ledger_schema, record_failure, submit_job,
 };
+use contextdb_server::FabricIdentity;
 use contextdb_server::blob_resolver::{BlobFetchPolicy, BlobStore, ResolveError};
 use contextdb_server::transport::iroh::IrohServer;
 use std::collections::HashMap;
@@ -885,8 +886,6 @@ async fn blob_exceeding_the_frame_ceiling_transfers_over_the_streaming_surface()
 
 #[tokio::test]
 async fn hub_holds_only_the_reference_never_the_blob_bytes() {
-    use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
-    use contextdb_engine::work_ledger::apply_work_ledger_policy_overrides;
     use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -894,14 +893,17 @@ async fn hub_holds_only_the_reference_never_the_blob_bytes() {
     let tenant = "hub-bypass";
     let hub_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&hub_db).expect("hub schema");
-    let mut hub_policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
-    apply_work_ledger_policy_overrides(&mut hub_policies);
-    let hub = Arc::new(SyncServer::with_transport(
-        hub_db.clone(),
-        broker.server(),
-        contextdb_core::TenantId::from(tenant),
-        hub_policies,
-    ));
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let hub_node = hub_identity.node_id();
+    let hub = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db.clone(),
+            broker.server_as(&hub_node),
+            contextdb_core::TenantId::from(tenant),
+            hub_node,
+            hub_identity,
+        ),
+    );
     let hub_shutdown = Arc::new(AtomicBool::new(false));
     let hub_task = tokio::spawn({
         let hub = hub.clone();
@@ -929,10 +931,13 @@ async fn hub_holds_only_the_reference_never_the_blob_bytes() {
         &[] as &[&[u8]],
     )
     .expect("submit");
-    let holder_client = SyncClient::with_transport(
+    let holder_sync_identity =
+        Arc::new(FabricIdentity::load_or_generate(&holder_key).expect("load holder sync identity"));
+    let holder_client = SyncClient::with_authenticated_transport_and_identity_for_test(
         holder_db.clone(),
-        broker.client(),
+        broker.client_as(&holder_node),
         contextdb_core::TenantId::from(tenant),
+        holder_sync_identity,
     );
     within(holder_client.push())
         .await
@@ -954,10 +959,14 @@ async fn hub_holds_only_the_reference_never_the_blob_bytes() {
 
     let consumer_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&consumer_db).expect("consumer schema");
-    let consumer_client = SyncClient::with_transport(
+    let consumer_sync_identity = Arc::new(
+        FabricIdentity::load_or_generate(&consumer_key).expect("load consumer sync identity"),
+    );
+    let consumer_client = SyncClient::with_authenticated_transport_and_identity_for_test(
         consumer_db.clone(),
-        broker.client(),
+        broker.client_as(&consumer_node),
         contextdb_core::TenantId::from(tenant),
+        consumer_sync_identity,
     );
     within(consumer_client.pull_default())
         .await
@@ -1517,38 +1526,19 @@ async fn blackhole_holder_dial_returns_bounded_holder_unreachable() {
     assert!(sink.is_empty(), "a failed dial writes nothing to the sink");
 }
 
-/// Faithful to the p1-fresh-embed-probe layout: the holder and consumer
-/// identity files live in the SAME parent directory (distinct filenames), so
-/// their `store_root()` collides on one `<dir>/blob-store`. The holder opens
-/// (and keeps open) that content store when it ingests + serves; the consumer
-/// then opens the SAME store inside `resolve_blob_ref`, BEFORE the entitlement
-/// pre-check or any dial. That second open contends for the redb file lock.
-///
-/// The bug this guards: the store open is awaited SYNCHRONOUSLY (a spawned
-/// thread joined in `BlobStoreHandle::open`), so an unbounded wait there
-/// wedges the calling worker in a way no caller-side `tokio::time::timeout`
-/// can reclaim — exactly the transcript's ">30s, needed an OS kill." The
-/// promise (USR-2/INT-17): a fetch must ALWAYS return a bounded, typed
-/// `ResolveError`, never an un-cancellable hang.
-///
-/// Because a `tokio::time::timeout` cannot reclaim a synchronous wedge, this
-/// test drives the resolve on a dedicated OS thread and bounds it with an
-/// OS-level `recv_timeout`. Pre-fix the thread wedges and the guard fires
-/// (the test fails without hanging CI); post-fix the resolve returns a typed
-/// `LocalStoreUnavailable` well within the guard.
+/// Two distinct fabric identities may share a parent directory while each
+/// database owns its own media repository. A consumer without a live claim
+/// receives a bounded authorization refusal before any provider bytes move.
 #[test]
-fn shared_store_root_resolve_returns_bounded_typed_error_not_uncancellable_hang() {
-    let dir = tempfile::tempdir().expect("shared dir");
-    // Distinct identity FILENAMES, one shared PARENT dir → colliding store root.
+fn same_parent_identities_with_independent_repositories_refuse_unentitled_fetch_within_bound() {
+    let dir = tempfile::tempdir().expect("same-parent identity directory");
     let holder_key = dir.path().join("probe-blob-holder-identity.key");
     let consumer_key = dir.path().join("probe-blob-consumer-identity.key");
     let holder_node = node_id_of(&holder_key);
     let consumer_node = node_id_of(&consumer_key);
-    let content = marked("SHARED-ROOT-1234", 64 * 1024);
+    let content = marked("UNENTITLED-SAME-PARENT-1234", 64 * 1024);
     let h = BlobHash::of(&content);
 
-    // A small runtime for the setup (bind/serve); the holder keeps its store
-    // handle — and therefore the redb lock — open for the whole test.
     let setup_rt = tokio::runtime::Runtime::new().expect("setup runtime");
     let holder_db = Arc::new(Database::open_memory());
     install_work_ledger_schema(&holder_db).expect("holder schema");
@@ -1578,14 +1568,9 @@ fn shared_store_root_resolve_returns_bounded_typed_error_not_uncancellable_hang(
         consumer_key,
     );
     consumer.set_test_clock(T0);
-    // Trim the fail-fast bound so the (now-bounded) contended open returns
-    // quickly; production keeps its full default. This only trims the wait a
-    // test observes — the production guarantee is unchanged.
-    consumer.set_store_open_timeout_ms_for_test(2_000);
 
-    // Drive the resolve on its OWN OS thread with its OWN runtime and bound it
-    // at the OS level: a synchronous store-open wedge cannot be reclaimed by a
-    // tokio timeout, so the guard must sit beneath the runtime.
+    // Keep this ownership boundary in an OS thread: the test's receiver is
+    // the bounded acceptance guard for the complete authorization attempt.
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("resolve runtime");
@@ -1599,20 +1584,17 @@ fn shared_store_root_resolve_returns_bounded_typed_error_not_uncancellable_hang(
         Ok((outcome, sink_len)) => {
             let _ = worker.join();
             assert!(
-                matches!(outcome, Err(ResolveError::LocalStoreUnavailable)),
-                "a colliding store root must surface as a typed LocalStoreUnavailable, got {outcome:?}"
+                matches!(outcome, Err(ResolveError::Unentitled)),
+                "a consumer without a claim must receive a typed authorization refusal, got {outcome:?}"
             );
-            assert_eq!(sink_len, 0, "a failed local store-open writes nothing");
+            assert_eq!(sink_len, 0, "an authorization refusal writes nothing");
+            assert_eq!(holder.fetch_requests_received_for_test(), 0);
+            assert_eq!(holder.payload_bytes_emitted_for_test(), 0);
         }
-        Err(_) => panic!(
-            "resolve_blob_ref did not return within the guard: the local store-open wedged \
-             (un-cancellable synchronous hang) instead of returning a bounded, typed error"
-        ),
+        Err(_) => {
+            panic!("an unentitled resolve did not return within the bounded acceptance guard")
+        }
     }
-
-    // Restore the process-global open bound (the production default) so a later
-    // parallel test in this binary is not held to the trimmed 2s window.
-    holder.set_store_open_timeout_ms_for_test(10_000);
 
     setup_rt.block_on(endpoint.close());
 }
@@ -1730,12 +1712,15 @@ async fn resolve_blob_ref_wedged_fetch_phase_returns_typed_timeout_within_declar
 /// the fetch attempt yet) and must stay green once the deadline is wired in.
 #[test]
 fn resolve_blob_ref_body_has_no_bare_duration_literal() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/blob_resolver.rs");
-    let source = std::fs::read_to_string(path).expect("read blob_resolver.rs");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../contextdb-engine/src/blob_store.rs"
+    );
+    let source = std::fs::read_to_string(path).expect("read engine blob_store.rs");
     let start_marker = "pub async fn resolve_blob_ref(";
     let start = source
         .find(start_marker)
-        .expect("resolve_blob_ref signature must exist in blob_resolver.rs");
+        .expect("resolve_blob_ref signature must exist in engine blob_store.rs");
     // Walk forward from the signature to the function's opening brace, then
     // track brace depth to find the matching close.
     let body_start = source[start..]

@@ -6,7 +6,6 @@ mod alter_table_tests;
 mod anti_tests;
 #[path = "integration/arithmetic_division_by_zero_tests.rs"]
 mod arithmetic_division_by_zero_tests;
-#[cfg(feature = "nats-tests")]
 #[path = "integration/auto_sync_update_push_visibility_tests.rs"]
 mod auto_sync_update_push_visibility_tests;
 #[path = "support/binary_path.rs"]
@@ -41,7 +40,6 @@ mod ddl_sync_tests;
 mod explain_plan_time_validation_tests;
 #[path = "integration/gate_a_primitives.rs"]
 mod gate_a_primitives;
-#[cfg(feature = "nats-tests")]
 #[path = "integration/gate_a_sync.rs"]
 mod gate_a_sync;
 #[path = "integration/gate_b_workflows.rs"]
@@ -101,10 +99,8 @@ mod subscription_tests;
 mod sync_apply_stampless_arrival_race_tests;
 #[path = "integration/sync_direction_tests.rs"]
 mod sync_direction_tests;
-#[cfg(feature = "nats-tests")]
 #[path = "integration/sync_relay_trigger_tables_tests.rs"]
 mod sync_relay_trigger_tables_tests;
-#[cfg(feature = "nats-tests")]
 #[path = "integration/sync_server_nonblocking_apply.rs"]
 mod sync_server_nonblocking_apply;
 #[path = "integration/trigger_audit_retention_config_tests.rs"]

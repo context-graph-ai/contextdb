@@ -23,9 +23,11 @@ use contextdb_engine::Database;
 use contextdb_engine::sync_types::{
     ChangeSet, ConflictPolicies, ConflictPolicy, NaturalKey, RowChange,
 };
-use contextdb_server::protocol::{MessageType, PullRequest, PullResponse, decode, encode};
+use contextdb_server::protocol::{
+    DependencyCompletePullResponse, MessageType, PullRequest, PullResponse, decode, encode,
+};
 use contextdb_server::subjects::pull_subject;
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,26 +42,26 @@ async fn within<F: std::future::Future>(fut: F) -> F::Output {
 
 const T0: u64 = 1_700_000_000_000;
 const TENANT: &str = "readback";
-const HUB_NODE: &str = "hub-node-a";
 const MINUTE: u64 = 60 * 1000;
 
 /// The retained table this item exists for: history that ages out on a window
 /// AND is readable back from the server — the recovery/dashboard shape.
 const TWO_WAY_DDL: &str = "CREATE TABLE windows (id INTEGER PRIMARY KEY, body TEXT) \
-     RETAIN 1 HOURS SYNC SAFE SYNC TWO WAY";
+     RETAIN 1 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 /// The same retention window, opposite declared direction: never sent back.
 const PUSH_ONLY_DDL: &str = "CREATE TABLE outbox (id INTEGER PRIMARY KEY, body TEXT) \
-     RETAIN 1 HOURS SYNC SAFE SYNC PUSH ONLY";
+     RETAIN 1 HOURS SYNC SAFE SYNC PUSH ONLY SYNC CONFLICT KEEP LATEST";
 /// A retained two-way table with NO `SYNC SAFE`. `RETAIN` bounds when its rows
 /// expire; `SYNC TWO WAY` alone says they are served back. Serve-back must
 /// follow from the declared direction, never from a delivery-safety promise —
 /// a serve path gated on `meta.sync_safe && direction == Both` would strand
 /// exactly this table, so it gets its own by-value readback proof.
 const PLAIN_TWO_WAY_DDL: &str = "CREATE TABLE ledger (id INTEGER PRIMARY KEY, body TEXT) \
-     RETAIN 1 HOURS SYNC TWO WAY";
+     RETAIN 1 HOURS SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 /// Non-retained control: proves the pull path itself worked in every test that
 /// asserts a retained table is absent.
-const CONTROL_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+const CONTROL_DDL: &str =
+    "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST";
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -155,12 +157,17 @@ fn declare_plain_only(db: &Database) {
 fn start_hub_with(broker: &InProcessBroker, declare: fn(&Database)) -> RunningHub {
     let db = Arc::new(Database::open_memory());
     declare(&db);
-    let server = Arc::new(SyncServer::with_transport(
-        db.clone(),
-        broker.server_as(HUB_NODE),
-        TenantId::from(TENANT),
-        ConflictPolicies::uniform(ConflictPolicy::LatestWins),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db.clone(),
+            broker.server_as(&node_id),
+            TenantId::from(TENANT),
+            node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -186,11 +193,14 @@ fn open_edge() -> Arc<Database> {
     open_edge_with(declare_tables)
 }
 
-fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, node_id: &str) -> SyncClient {
-    SyncClient::with_transport(
+fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> SyncClient {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&node_id),
         TenantId::from(TENANT),
+        identity,
     )
 }
 
@@ -650,14 +660,24 @@ async fn c2d_the_expired_row_is_excluded_from_the_hubs_pull_response_itself() {
     .await
     .expect("the hub must answer the pull");
     let envelope = decode(&reply).expect("decode pull reply");
-    let response: PullResponse =
-        rmp_serde::from_slice(&envelope.payload).expect("decode pull response");
+    let (response, dependency_units) = match envelope.message_type {
+        MessageType::PullResponse => (
+            rmp_serde::from_slice::<PullResponse>(&envelope.payload)
+                .expect("decode ordinary pull response"),
+            Vec::new(),
+        ),
+        MessageType::DependencyCompletePullResponse => {
+            let page: DependencyCompletePullResponse = rmp_serde::from_slice(&envelope.payload)
+                .expect("decode dependency-complete pull response");
+            (page.ordinary, page.units)
+        }
+        other => panic!("raw pull must return a pull response, got {other:?}"),
+    };
 
     // The bodies the HUB actually put on the wire for the windows table.
-    let mut served: Vec<String> = response
-        .changeset
-        .rows
-        .iter()
+    let mut served: Vec<String> = std::iter::once(&response.changeset)
+        .chain(dependency_units.iter())
+        .flat_map(|changeset| changeset.rows.iter())
         .filter(|row| row.table == "windows" && !row.deleted)
         .map(|row| match row.values.get("body") {
             Some(Value::Text(text)) => text.clone(),

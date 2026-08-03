@@ -10,8 +10,14 @@ pub struct AutoSyncConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushOutcome {
-    pub conflicts: Vec<String>,
+    pub conflicts: Vec<serde_json::Value>,
     pub caught_up: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoSyncReport {
+    Conflict(serde_json::Value),
+    Message(String),
 }
 
 impl Default for AutoSyncConfig {
@@ -31,7 +37,7 @@ pub async fn run_loop<P, Fut, R>(
 ) where
     P: FnMut() -> Fut,
     Fut: Future<Output = Result<PushOutcome, String>>,
-    R: FnMut(String),
+    R: FnMut(AutoSyncReport),
 {
     let mut next_delay = None;
 
@@ -63,17 +69,17 @@ pub async fn run_loop<P, Fut, R>(
 
         match push().await {
             Ok(outcome) => {
-                for reason in outcome.conflicts {
-                    report(format!("sync conflict: {reason}"));
+                for conflict in outcome.conflicts {
+                    report(AutoSyncReport::Conflict(conflict));
                 }
                 if !outcome.caught_up && !rx.is_closed() {
                     next_delay = Some(config.retry_backoff);
                 }
             }
             Err(err) => {
-                report(format!(
+                report(AutoSyncReport::Message(format!(
                     "Background auto-sync could not push pending local changes: {err}. It will retry automatically; run `.sync status` to check connectivity."
-                ));
+                )));
                 if rx.is_closed() {
                     break;
                 }
@@ -93,7 +99,7 @@ mod tests {
     async fn auto_sync_retries_until_success_after_error() {
         let (tx, rx) = mpsc::unbounded_channel();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let reports = Arc::new(Mutex::new(Vec::<String>::new()));
+        let reports = Arc::new(Mutex::new(Vec::<AutoSyncReport>::new()));
         let attempts_for_task = attempts.clone();
         let reports_for_task = reports.clone();
 
@@ -135,7 +141,7 @@ mod tests {
         assert!(
             reports
                 .iter()
-                .any(|msg| msg.contains("could not push pending local changes")),
+                .any(|report| matches!(report, AutoSyncReport::Message(message) if message.contains("could not push pending local changes"))),
             "auto-sync should surface push failures"
         );
     }
@@ -179,11 +185,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_sync_reports_conflicts() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let reports = Arc::new(Mutex::new(Vec::<String>::new()));
-        let reports_for_task = reports.clone();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(run_loop(
             rx,
@@ -193,26 +198,31 @@ mod tests {
             },
             || async {
                 Ok(PushOutcome {
-                    conflicts: vec!["edge_wins".to_string()],
+                    conflicts: vec![serde_json::json!({ "reason": "keep_first" })],
                     caught_up: true,
                 })
             },
             move |msg| {
-                reports_for_task.lock().unwrap().push(msg);
+                report_tx
+                    .send(msg)
+                    .expect("test report receiver remains open")
             },
         ));
 
         tx.send(()).unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let report = report_rx
+            .recv()
+            .await
+            .expect("auto-sync reports the conflict after the virtual debounce");
         drop(tx);
         handle.await.unwrap();
 
-        let reports = reports.lock().unwrap();
-        assert!(
-            reports
-                .iter()
-                .any(|msg| msg.contains("sync conflict: edge_wins")),
-            "auto-sync should surface conflict reasons"
+        assert_eq!(
+            report,
+            AutoSyncReport::Conflict(serde_json::json!({ "reason": "keep_first" })),
+            "auto-sync should surface the complete conflict document"
         );
     }
 

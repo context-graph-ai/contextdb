@@ -6,6 +6,7 @@ pub enum Statement {
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
     Insert(Insert),
+    Purge(Purge),
     Delete(Delete),
     Update(Update),
     Select(SelectStatement),
@@ -510,6 +511,12 @@ pub enum VectorQuantization {
 
 #[derive(Debug, Clone)]
 pub struct Delete {
+    pub table: String,
+    pub where_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Purge {
     pub table: String,
     pub where_clause: Option<Expr>,
 }

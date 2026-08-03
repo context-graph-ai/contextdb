@@ -30,12 +30,12 @@ impl FabricIdentity {
     }
 
     fn load(path: &Path) -> contextdb_core::Result<Self> {
-        let bytes = std::fs::read(path).map_err(|err| {
-            Error::SyncError(format!("cannot read fabric identity at {path:?}: {err}"))
+        let bytes = std::fs::read(path).map_err(|_| {
+            Error::SyncError("cannot read fabric identity file".to_string())
         })?;
         let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
             Error::SyncError(format!(
-                "fabric identity file {path:?} is corrupt: expected 32 secret-seed bytes, found {}",
+                "fabric identity file is corrupt: expected 32 secret-seed bytes, found {}",
                 bytes.len()
             ))
         })?;
@@ -46,10 +46,8 @@ impl FabricIdentity {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                Error::SyncError(format!(
-                    "cannot create fabric identity directory {parent:?}: {err}"
-                ))
+            std::fs::create_dir_all(parent).map_err(|_| {
+                Error::SyncError("cannot create fabric identity directory".to_string())
             })?;
         }
         let mut options = std::fs::OpenOptions::new();
@@ -59,11 +57,11 @@ impl FabricIdentity {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path).map_err(|err| {
-            Error::SyncError(format!("cannot create fabric identity at {path:?}: {err}"))
+        let mut file = options.open(path).map_err(|_| {
+            Error::SyncError("cannot create fabric identity file".to_string())
         })?;
-        file.write_all(&self.seed).map_err(|err| {
-            Error::SyncError(format!("cannot write fabric identity at {path:?}: {err}"))
+        file.write_all(&self.seed).map_err(|_| {
+            Error::SyncError("cannot write fabric identity file".to_string())
         })?;
         Ok(())
     }
@@ -93,9 +91,66 @@ impl FabricIdentity {
             .to_bytes()
     }
 
-    /// The raw ed25519 secret seed, handed to the transport adapter as the
-    /// endpoint's identity. Never logged, never synced.
-    pub fn secret_seed(&self) -> [u8; 32] {
+    /// Sign immutable row-lineage bytes.  The byte construction remains in
+    /// the sync boundary; this type only owns the fabric key material.
+    pub(crate) fn sign_lineage(&self, bytes: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer as _;
+
+        ed25519_dalek::SigningKey::from_bytes(&self.seed)
+            .sign(bytes)
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// Verify a lineage signature using the creator identity carried on the
+    /// wire.  `node_id` is the lowercase hex Ed25519 public key used by the
+    /// fabric, so verification never needs a local key registry.
+    pub(crate) fn verify_lineage_by_node_id(
+        node_id: &str,
+        bytes: &[u8],
+        signature: &[u8],
+    ) -> contextdb_core::Result<()> {
+        use ed25519_dalek::Verifier as _;
+
+        let public_bytes = hex_node_id(node_id)?;
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&public_bytes).map_err(|err| {
+            Error::SyncError(format!("invalid lineage author node identity: {err}"))
+        })?;
+        let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|err| {
+            Error::SyncError(format!("invalid lineage signature encoding: {err}"))
+        })?;
+        verifying.verify(bytes, &signature).map_err(|_| {
+            Error::SyncError(
+                "wire row lineage signature does not verify for its author".to_string(),
+            )
+        })
+    }
+
+    /// The raw ed25519 secret seed, handed only to this crate's transport
+    /// adapter. Never logged, synced, or exposed to embedding callers.
+    pub(crate) fn secret_seed(&self) -> [u8; 32] {
         self.seed
     }
+}
+
+fn hex_node_id(node_id: &str) -> contextdb_core::Result<[u8; 32]> {
+    if node_id.len() != 64
+        || !node_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(Error::SyncError(
+            "lineage author node identity must be 32 lowercase hex bytes".to_string(),
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    for (index, pair) in node_id.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).map_err(|_| {
+            Error::SyncError("lineage author node identity is not valid hex".to_string())
+        })?;
+        bytes[index] = u8::from_str_radix(text, 16).map_err(|_| {
+            Error::SyncError("lineage author node identity is not valid hex".to_string())
+        })?;
+    }
+    Ok(bytes)
 }

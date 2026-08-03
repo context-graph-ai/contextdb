@@ -10,16 +10,13 @@
 //! each other's write — not an edge re-observing the row it just sent, unchanged,
 //! a moment ago.
 //!
-//! Mechanism: a client's default conflict policy is
-//! `ConflictPolicy::ServerWins` (`sync_client.rs::build`), and `pull()` remaps it
-//! through `remap_pull_policies` to `ConflictPolicy::EdgeWins` for the apply
-//! direction. The `(Some(local), ConflictPolicy::EdgeWins)` arm in
-//! `apply_changes_single_lsn_group` (`contextdb-engine/src/database.rs`) must
-//! never unconditionally push a `Conflict { reason: "edge_wins", .. }` and
-//! count the row as applied for ANY natural-key collision with an existing
-//! local row — it must check whether the incoming row is byte-identical to
-//! what is already there (i.e. the edge's own prior write echoing back
-//! through the hub) before treating it as a conflict.
+//! Mechanism: the table durably declares `SYNC CONFLICT KEEP FIRST`, so a
+//! genuinely different incoming row at an occupied key is refused with an
+//! `InsertIfNotExists` / `keep_first` conflict and increments `skipped_rows`.
+//! Before that policy arm, `apply_changes_single_lsn_group`
+//! (`contextdb-engine/src/database.rs`) must check whether the incoming row is
+//! byte-identical to what is already there (i.e. the edge's own prior write
+//! echoing back through the hub). An identical row is not a refusal.
 //!
 //! An identical-row check ahead of the conflict-policy arms must not merely
 //! route the re-delivery into `skipped_rows` instead of counting it nowhere —
@@ -35,15 +32,14 @@
 
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, NaturalKey};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_engine::sync_types::{ConflictPolicy, NaturalKey};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const HUB_NODE: &str = "hub-node-a";
-const DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+const DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP FIRST";
 
 fn p() -> HashMap<String, Value> {
     HashMap::new()
@@ -110,19 +106,23 @@ impl RunningHub {
     }
 }
 
-/// A hub built the ordinary way (uniform `InsertIfNotExists`, matching how the
-/// other in-process sync test files in this crate stand up a hub) — the hub's
-/// own policy is irrelevant to this defect, which lives entirely in what the
-/// PULLING edge does with its own default conflict policy.
+/// A hub built the ordinary way. Every participant creates the same table, so
+/// the durable `KEEP FIRST` declaration — not a caller-local override — governs
+/// genuine collisions at both hub and edge.
 fn start_hub(broker: &InProcessBroker, tenant: &str) -> RunningHub {
     let db = Arc::new(Database::open_memory());
     db.execute(DDL, &p()).expect("hub table");
-    let server = Arc::new(SyncServer::with_transport(
-        db,
-        broker.server_as(HUB_NODE),
-        TenantId::from(tenant),
-        ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
-    ));
+    let identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = identity.node_id();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            db,
+            broker.server_as(&hub_node_id),
+            TenantId::from(tenant),
+            hub_node_id,
+            identity,
+        ),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
@@ -138,20 +138,17 @@ fn open_edge() -> Arc<Database> {
     db
 }
 
-/// The plain constructor with NO explicit conflict-policy override — this is
-/// the client's shipped default (`ServerWins`, remapped to `EdgeWins` on pull),
-/// exactly what an ordinary `cg`/`contextdb-cli` session gets with no `.sync
-/// policy` override.
-fn edge_client(
-    db: &Arc<Database>,
-    broker: &InProcessBroker,
-    node_id: &str,
-    tenant: &str,
-) -> SyncClient {
-    SyncClient::with_transport(
+/// The plain constructor with no private conflict-policy override, exactly what
+/// an ordinary `cg`/`contextdb-cli` session gets. The table's durable
+/// `KEEP FIRST` declaration remains authoritative.
+fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> SyncClient {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    SyncClient::with_authenticated_transport_and_identity_for_test(
         db.clone(),
-        broker.client_as(node_id),
+        broker.client_as(&node_id),
         TenantId::from(tenant),
+        identity,
     )
 }
 
@@ -168,7 +165,7 @@ async fn pull_right_after_push_does_not_self_echo_as_a_conflict() {
     let hub = start_hub(&broker, tenant);
 
     let edge = open_edge();
-    let client = edge_client(&edge, &broker, "edge-a", tenant);
+    let client = edge_client(&edge, &broker, tenant);
     insert_note(&edge, 1, "mine-1");
     insert_note(&edge, 2, "mine-2");
 
@@ -215,8 +212,8 @@ async fn pull_right_after_push_does_not_self_echo_as_a_conflict() {
 /// independently holds a DIFFERENT value at that same key=1 (a real,
 /// never-synced divergence) and ALSO has an unrelated key=2 row it already
 /// pushed to the hub itself (a genuine self-echo). One pull on A must resolve
-/// them independently: exactly one conflict, naming key=1, and the key=2
-/// self-echo contributing to NONE of applied/skipped/conflicts.
+/// them independently: exactly one keep-first refusal naming key=1, while the
+/// key=2 self-echo contributes to NONE of applied/skipped/conflicts.
 #[tokio::test]
 async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
     let tenant = "self-echo-mixed";
@@ -226,14 +223,14 @@ async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
     // Edge B writes and pushes a value at key=1 first — the hub now holds B's
     // value, and edge A has never seen it.
     let edge_b = open_edge();
-    let client_b = edge_client(&edge_b, &broker, "edge-b", tenant);
+    let client_b = edge_client(&edge_b, &broker, tenant);
     insert_note(&edge_b, 1, "edge-b-version");
     within(client_b.push()).await.expect("edge B push");
 
     // Edge A pushes an UNRELATED row (key=2) that is entirely its own — the
     // genuine self-echo half of this scenario.
     let edge_a = open_edge();
-    let client_a = edge_client(&edge_a, &broker, "edge-a", tenant);
+    let client_a = edge_client(&edge_a, &broker, tenant);
     insert_note(&edge_a, 2, "edge-a-only");
     let pushed_a = within(client_a.push()).await.expect("edge A push");
     assert_eq!(
@@ -268,25 +265,30 @@ async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
     );
     assert_eq!(
         conflict.resolution,
-        ConflictPolicy::EdgeWins,
-        "the conflict's resolution must be the pull's actual apply-direction \
-         policy. Got {conflict:?}"
+        ConflictPolicy::InsertIfNotExists,
+        "the conflict's resolution must honor the table's durable KEEP FIRST \
+         declaration. Got {conflict:?}"
     );
     assert_eq!(
         conflict.reason.as_deref(),
-        Some("edge_wins"),
+        Some("keep_first"),
         "the conflict's reason must name the policy that resolved it. Got {conflict:?}"
     );
 
     assert_eq!(
-        pulled.applied_rows, 1,
-        "only the genuine key=1 conflict resolution is real work; the key=2 \
-         self-echo must not inflate this count. Got {pulled:?}"
+        pulled.applied_rows, 0,
+        "KEEP FIRST must not overwrite key=1, and the key=2 self-echo is a \
+         no-op. Got {pulled:?}"
     );
     assert_eq!(
-        pulled.skipped_rows, 0,
-        "the key=2 self-echo must not be counted as skipped either — nothing \
-         was refused, there was nothing to do. Got {pulled:?}"
+        pulled.skipped_rows, 1,
+        "only the genuinely divergent key=1 row is refused; the key=2 \
+         self-echo must not inflate the skipped count. Got {pulled:?}"
+    );
+    assert_eq!(
+        only_body(&edge_a, 1),
+        "edge-a-version",
+        "KEEP FIRST must retain edge A's existing local value"
     );
 
     hub.stop().await;
@@ -297,8 +299,9 @@ async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
 /// the SAME natural key — with no shared history, no push/pull between them —
 /// is a genuine divergence, and must still surface as a pull conflict when the
 /// second edge pulls the first edge's already-committed value, carrying the
-/// right natural key and resolution/reason, and must still actually apply the
-/// incoming value locally (never a silent no-op over real diverging content).
+/// right natural key and resolution/reason. With the table's durable
+/// `KEEP FIRST` declaration, the existing local value must remain and the
+/// refusal must be counted as skipped rather than silently disappearing.
 #[tokio::test]
 async fn genuine_two_edge_divergence_still_reports_a_pull_conflict() {
     let tenant = "self-echo-divergence-guard";
@@ -307,14 +310,14 @@ async fn genuine_two_edge_divergence_still_reports_a_pull_conflict() {
 
     // Edge A writes and pushes id=1 first — the hub now holds A's value.
     let edge_a = open_edge();
-    let client_a = edge_client(&edge_a, &broker, "edge-a", tenant);
+    let client_a = edge_client(&edge_a, &broker, tenant);
     insert_note(&edge_a, 1, "edge-a-version");
     within(client_a.push()).await.expect("edge A push");
 
     // Edge B, independently and with NO shared history, writes its OWN
     // different value at the same natural key — never pushed, never pulled.
     let edge_b = open_edge();
-    let client_b = edge_client(&edge_b, &broker, "edge-b", tenant);
+    let client_b = edge_client(&edge_b, &broker, tenant);
     insert_note(&edge_b, 1, "edge-b-version");
 
     // Edge B pulls: the incoming row (A's committed value) collides with B's
@@ -339,24 +342,29 @@ async fn genuine_two_edge_divergence_still_reports_a_pull_conflict() {
     );
     assert_eq!(
         conflict.resolution,
-        ConflictPolicy::EdgeWins,
-        "the reported resolution must be the pull's actual apply-direction \
-         policy. Got {conflict:?}"
+        ConflictPolicy::InsertIfNotExists,
+        "the reported resolution must honor the table's durable KEEP FIRST \
+         declaration. Got {conflict:?}"
     );
     assert_eq!(
         conflict.reason.as_deref(),
-        Some("edge_wins"),
+        Some("keep_first"),
         "the reported reason must name the policy that resolved it. Got {conflict:?}"
     );
 
-    // The genuine conflict must actually resolve, overwriting B's local value
-    // with the hub's (A's) committed one — never a silent no-op that leaves
-    // two machines disagreeing while reporting a conflict for show.
     assert_eq!(
         only_body(&edge_b, 1),
-        "edge-a-version",
-        "the genuine conflict must actually apply the hub's committed value \
-         locally, not merely report itself"
+        "edge-b-version",
+        "KEEP FIRST must retain edge B's existing local value"
+    );
+    assert_eq!(
+        pulled.applied_rows, 0,
+        "a KEEP FIRST refusal must not claim it changed local state: {pulled:?}"
+    );
+    assert_eq!(
+        pulled.skipped_rows, 1,
+        "the one genuinely divergent incoming row must be counted as refused: \
+         {pulled:?}"
     );
 
     hub.stop().await;
@@ -379,7 +387,7 @@ async fn self_echo_leaves_the_row_completely_untouched() {
     let hub = start_hub(&broker, tenant);
 
     let edge = open_edge();
-    let client = edge_client(&edge, &broker, "edge-a", tenant);
+    let client = edge_client(&edge, &broker, tenant);
     insert_note(&edge, 1, "mine");
     within(client.push()).await.expect("push must succeed");
 
@@ -414,12 +422,12 @@ async fn a_sync_arrived_row_is_never_offered_back_on_a_later_push() {
     let hub = start_hub(&broker, tenant);
 
     let edge_a = open_edge();
-    let client_a = edge_client(&edge_a, &broker, "edge-a", tenant);
+    let client_a = edge_client(&edge_a, &broker, tenant);
     insert_note(&edge_a, 1, "from-a");
     within(client_a.push()).await.expect("A push");
 
     let edge_b = open_edge();
-    let client_b = edge_client(&edge_b, &broker, "edge-b", tenant);
+    let client_b = edge_client(&edge_b, &broker, tenant);
     // Push once first, purely so B's OWN local DDL (its `CREATE TABLE`) is
     // no longer pending — otherwise `has_pending_push_changes` would read
     // true for that unrelated reason and this guard would prove nothing

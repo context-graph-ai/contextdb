@@ -1,57 +1,74 @@
-//! Gate A9 — Sync Engine Tests + NT — NATS Integration Tests
+//! Sync engine and authenticated transport integration tests.
 //!
-//! All 25 tests define the sync contract for contextDB.
-//! A9-xx tests verify in-process sync mechanics (ChangeTracking + ChangeApplication traits).
-//! NT-xx tests verify NATS wire-protocol round-trips.
-//!
-//! Sync contract tests. A9-xx test engine sync mechanics. NT-xx test NATS transport.
+//! The engine cases verify in-process sync mechanics. The transport cases
+//! verify complete authenticated request/response round trips.
 
-use contextdb_core::{Direction, MemoryAccountant, Value};
+use contextdb_core::{Direction, Value};
 use contextdb_core::{Lsn, RowId};
 use contextdb_engine::Database;
+use contextdb_engine::memory_accounting::MemoryAccountant;
 #[allow(unused_imports)]
 use contextdb_engine::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
-    NaturalKey, RowChange, SyncDirection, VectorChange,
+    NaturalKey, RowChange, SyncAdoption, SyncDirection, VectorChange,
 };
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-struct NatsFixture {
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
+struct SyncFixture {
+    fabric: Arc<InProcessBroker>,
+    hub_identity: Arc<FabricIdentity>,
+    edge_identity: Arc<FabricIdentity>,
 }
 
-async fn start_nats() -> NatsFixture {
-    let nats_conf = format!(
-        "{}/../contextdb-server/tests/nats.conf",
-        env!("CARGO_MANIFEST_DIR")
-    );
+impl SyncFixture {
+    fn server(&self) -> Arc<dyn contextdb_server::transport::ServerTransport> {
+        self.fabric.server_as(&self.hub_identity.node_id())
+    }
 
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_exposed_port(9222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
+    fn client(&self) -> Arc<dyn contextdb_server::transport::ClientTransport> {
+        self.client_for(&self.edge_identity)
+    }
 
-    let request = image
-        .with_mount(Mount::bind_mount(&nats_conf, "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
+    fn client_for(
+        &self,
+        identity: &FabricIdentity,
+    ) -> Arc<dyn contextdb_server::transport::ClientTransport> {
+        self.fabric.client_as(&identity.node_id())
+    }
 
-    let container: ContainerAsync<GenericImage> = request.start().await.unwrap();
-    let nats_port = container.get_host_port_ipv4(4222.tcp()).await.unwrap();
+    fn hub_identity(&self) -> Arc<FabricIdentity> {
+        Arc::clone(&self.hub_identity)
+    }
 
-    NatsFixture {
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
+    fn edge_identity(&self) -> Arc<FabricIdentity> {
+        Arc::clone(&self.edge_identity)
+    }
+
+    async fn wait_for_server(&self, tenant: &str) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.fabric.wait_for_registered_route_for_test(
+                &contextdb_server::subjects::status_subject(tenant),
+            ),
+        )
+        .await
+        .expect("sync server must register its status route");
+    }
+}
+
+async fn start_sync_fixture() -> SyncFixture {
+    SyncFixture {
+        fabric: Arc::new(InProcessBroker::new()),
+        hub_identity: Arc::new(FabricIdentity::generate()),
+        edge_identity: Arc::new(FabricIdentity::generate()),
     }
 }
 
@@ -160,6 +177,39 @@ fn setup_sync_db_with_tables(tables: &[&str]) -> Database {
         }
     }
     db
+}
+
+fn setup_declared_sync_db_with_tables(tables: &[&str]) -> Database {
+    let db = setup_sync_db_with_tables(tables);
+    for table in tables {
+        let declared_table = match *table {
+            "observations"
+            | "observations_384"
+            | "observations_seq"
+            | "observations_text"
+            | "observations_src"
+            | "observations_simple" => "observations",
+            "entities" | "entities_status" => "entities",
+            "decisions" | "decisions_sm" => "decisions",
+            other => other,
+        };
+        db.execute(
+            &format!("ALTER TABLE {declared_table} SET SYNC CONFLICT KEEP FIRST"),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+    db
+}
+
+fn declare_keep_first(db: &Database, tables: &[&str]) {
+    for table in tables {
+        db.execute(
+            &format!("ALTER TABLE {table} SET SYNC CONFLICT KEEP FIRST"),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
 }
 
 // =========================================================================
@@ -533,12 +583,12 @@ fn a9_03_pull_conflict_server_wins() {
 // =========================================================================
 #[test]
 fn a9_04_pull_conflict_latest_wins() {
-    // --- Scenario 1: edge LSN > server LSN -> edge wins ---
+    // --- Scenario 1: edge's accepted position follows the server -> edge wins ---
     let edge1 = setup_sync_db_with_tables(&["entities"]);
     let server1 = setup_sync_db_with_tables(&["entities"]);
     let uuid_1 = Uuid::new_v4();
 
-    // Server inserts first (lower LSN)
+    // Server inserts first.
     let tx_s = server1.begin_or_panic();
     server1
         .insert_row(
@@ -552,7 +602,8 @@ fn a9_04_pull_conflict_latest_wins() {
         .unwrap();
     server1.commit(tx_s).unwrap();
 
-    // Edge inserts later — bump LSN with a padding commit first
+    // Edge inserts later. Its source LSN is used below as an explicit fixture
+    // acceptance position, rather than being compared as a cross-node clock.
     let padding_uuid = Uuid::new_v4();
     let tx_e1 = edge1.begin_or_panic();
     edge1
@@ -579,17 +630,24 @@ fn a9_04_pull_conflict_latest_wins() {
         .unwrap();
     edge1.commit(tx_e2).unwrap();
 
-    // Guard: edge LSN must be higher than server LSN
+    // The explicit accepted position below is later than the server's row.
     assert!(
         edge1.current_lsn() > server1.current_lsn(),
-        "edge must have higher LSN than server for scenario 1"
+        "fixture acceptance positions must be ordered for scenario 1"
     );
 
     let changeset = edge1.changes_since(Lsn(0));
+    let arrivals = changeset
+        .rows
+        .iter()
+        .map(|row| (row.lsn, Some(row.lsn)))
+        .collect::<HashMap<_, _>>();
     let _result = server1
-        .apply_changes(
+        .apply_synced_changes(
             changeset,
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+            &arrivals,
+            SyncAdoption::Continuing,
         )
         .unwrap();
 
@@ -600,15 +658,15 @@ fn a9_04_pull_conflict_latest_wins() {
     assert_eq!(
         row.values.get("name").and_then(Value::as_text),
         Some("edge-newer"),
-        "LatestWins scenario 1: edge had higher LSN, so edge value must win"
+        "LatestWins scenario 1: the later accepted edge value must win"
     );
 
-    // --- Scenario 2: server LSN > edge LSN -> server wins ---
+    // --- Scenario 2: server's accepted position follows the edge -> server wins ---
     let edge2 = setup_sync_db_with_tables(&["entities"]);
     let server2 = setup_sync_db_with_tables(&["entities"]);
     let uuid_2 = Uuid::new_v4();
 
-    // Edge inserts first (lower LSN)
+    // Edge inserts first.
     let tx_e = edge2.begin_or_panic();
     edge2
         .insert_row(
@@ -622,7 +680,8 @@ fn a9_04_pull_conflict_latest_wins() {
         .unwrap();
     edge2.commit(tx_e).unwrap();
 
-    // Server inserts later (higher LSN via extra commits)
+    // Server inserts later. The incoming edge row below is explicitly stamped
+    // with its earlier accepted position.
     let padding2_uuid = Uuid::new_v4();
     let tx_s1 = server2.begin_or_panic();
     server2
@@ -649,17 +708,24 @@ fn a9_04_pull_conflict_latest_wins() {
         .unwrap();
     server2.commit(tx_s2).unwrap();
 
-    // Guard: server LSN must be higher than edge LSN
+    // The server's local position is later than the fixture's edge arrival.
     assert!(
         server2.current_lsn() > edge2.current_lsn(),
-        "server must have higher LSN than edge for scenario 2"
+        "fixture acceptance positions must be ordered for scenario 2"
     );
 
     let changeset2 = edge2.changes_since(Lsn(0));
+    let arrivals2 = changeset2
+        .rows
+        .iter()
+        .map(|row| (row.lsn, Some(row.lsn)))
+        .collect::<HashMap<_, _>>();
     let result2 = server2
-        .apply_changes(
+        .apply_synced_changes(
             changeset2,
             &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+            &arrivals2,
+            SyncAdoption::Continuing,
         )
         .unwrap();
 
@@ -670,11 +736,11 @@ fn a9_04_pull_conflict_latest_wins() {
     assert_eq!(
         row2.values.get("name").and_then(Value::as_text),
         Some("server-newer"),
-        "LatestWins scenario 2: server had higher LSN, so server value must win"
+        "LatestWins scenario 2: the later accepted server value must win"
     );
-    assert!(
-        result2.skipped_rows >= 1,
-        "at least 1 row should be skipped when server wins"
+    assert_eq!(
+        result2.skipped_rows, 0,
+        "a stale LatestWins arrival is a convergence no-op, not refused work"
     );
 }
 
@@ -889,7 +955,7 @@ fn a9_06_observations_never_conflict() {
         );
     }
 
-    // Re-push: same 3 observations are skipped (idempotent)
+    // Re-push: the same 3 observations are confirmed convergence no-ops.
     let result2 = server
         .apply_changes(
             cs,
@@ -898,8 +964,12 @@ fn a9_06_observations_never_conflict() {
         .unwrap();
     assert_eq!(result2.applied_rows, 0, "re-push must apply 0 rows");
     assert_eq!(
-        result2.skipped_rows, 3,
-        "re-push must skip all 3 already-present rows"
+        result2.skipped_rows, 0,
+        "an identical re-delivery is not refused work"
+    );
+    assert!(
+        result2.conflicts.is_empty(),
+        "an identical re-delivery is not a conflict"
     );
 
     let all2 = server.scan("observations", server.snapshot()).unwrap();
@@ -1637,52 +1707,59 @@ fn a9_13_apply_changes_concurrent_with_local_writes() {
 // =========================================================================
 // A9-14: selective_sync_direction_filtering
 // =========================================================================
-#[test]
-fn a9_14_selective_sync_direction_filtering() {
-    let edge = Database::open_memory();
-    let server = Database::open_memory();
+#[tokio::test]
+async fn a9_14_selective_sync_direction_filtering() {
+    let sync = start_sync_fixture().await;
+    let edge = Arc::new(Database::open_memory());
+    let server = Arc::new(Database::open_memory());
     let params = HashMap::new();
 
-    // Create tables on both sides (except scratch which is edge-only)
+    // Direction is a durable schema declaration, never a caller-supplied
+    // filter map. The edge may send observations, receive patterns, and keep
+    // scratch data local.
     edge.execute(
-        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT) IMMUTABLE",
+        "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT) IMMUTABLE SYNC PUSH ONLY",
         &params,
     )
     .unwrap();
     edge.execute(
-        "CREATE TABLE patterns (id UUID PRIMARY KEY, pattern_type TEXT)",
-        &params,
-    )
-    .unwrap();
-    edge.execute(
-        "CREATE TABLE scratch (id UUID PRIMARY KEY, temp TEXT)",
+        "CREATE TABLE scratch (id UUID PRIMARY KEY, temp TEXT) SYNC OFF",
         &params,
     )
     .unwrap();
     server
         .execute(
-            "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT) IMMUTABLE",
+            "CREATE TABLE patterns (id UUID PRIMARY KEY, pattern_type TEXT) SYNC PULL ONLY",
             &params,
         )
         .unwrap();
-    server
-        .execute(
-            "CREATE TABLE patterns (id UUID PRIMARY KEY, pattern_type TEXT)",
-            &params,
-        )
-        .unwrap();
+
+    let server_task = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            Arc::clone(&server),
+            sync.server(),
+            contextdb_core::TenantId::from("a9_14"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
+    let server_handle = Arc::clone(&server_task);
+    tokio::spawn(async move { server_handle.run().await });
+    sync.wait_for_server("a9_14").await;
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        Arc::clone(&edge),
+        sync.client(),
+        contextdb_core::TenantId::from("a9_14"),
+        sync.edge_identity(),
+    );
+    client.pull_default().await.unwrap();
 
     let uuid_obs = Uuid::new_v4();
     let uuid_pat_local = Uuid::new_v4();
     let uuid_scratch = Uuid::new_v4();
 
-    // Direction map
-    let mut directions = HashMap::new();
-    directions.insert("observations".to_string(), SyncDirection::Push);
-    directions.insert("patterns".to_string(), SyncDirection::Pull);
-    directions.insert("scratch".to_string(), SyncDirection::None);
-
-    // Edge inserts into all 3 tables
+    // Edge owns observations and scratch. Patterns arrive from the hub before
+    // this local pull-only write proves it cannot travel back.
     let tx = edge.begin_or_panic();
     edge.insert_row(
         tx,
@@ -1713,16 +1790,7 @@ fn a9_14_selective_sync_direction_filtering() {
     .unwrap();
     edge.commit(tx).unwrap();
 
-    // Push with direction filter: only Push and Both tables
-    let full_cs = edge.changes_since(Lsn(0));
-    let push_cs =
-        full_cs.filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
-    server
-        .apply_changes(
-            push_cs,
-            &ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists),
-        )
-        .unwrap();
+    client.push().await.unwrap();
 
     // Server got observations
     let obs_row = server
@@ -1738,10 +1806,23 @@ fn a9_14_selective_sync_direction_filtering() {
         "server must receive observations (Push direction)"
     );
 
-    // Server did NOT get scratch (table doesn't even exist on server)
+    // Schema travels as one authenticated vector, but SYNC OFF keeps scratch
+    // data on the edge.
     assert!(
-        !server.table_names().contains(&"scratch".to_string()),
-        "scratch table must NOT be on server"
+        server.table_names().contains(&"scratch".to_string()),
+        "the received schema must retain the edge's SYNC OFF declaration"
+    );
+    let scratch_on_hub = server
+        .point_lookup(
+            "scratch",
+            "id",
+            &Value::Uuid(uuid_scratch),
+            server.snapshot(),
+        )
+        .unwrap();
+    assert!(
+        scratch_on_hub.is_none(),
+        "SYNC OFF scratch data must never leave the edge"
     );
 
     // Server did NOT get edge's local pattern guess
@@ -1773,27 +1854,7 @@ fn a9_14_selective_sync_direction_filtering() {
         .unwrap();
     server.commit(tx_s).unwrap();
 
-    // Edge pulls with direction filter: only Pull and Both tables
-    let server_full_cs = server.changes_since(Lsn(0));
-    let pull_cs = server_full_cs
-        .filter_by_direction(&directions, &[SyncDirection::Pull, SyncDirection::Both]);
-
-    // Negative assertion: pull changeset must NOT contain observations
-    let pull_obs: Vec<&RowChange> = pull_cs
-        .rows
-        .iter()
-        .filter(|r| r.table == "observations")
-        .collect();
-    assert!(
-        pull_obs.is_empty(),
-        "pull changeset must NOT contain observations (Push-only table)"
-    );
-
-    edge.apply_changes(
-        pull_cs,
-        &ConflictPolicies::uniform(ConflictPolicy::ServerWins),
-    )
-    .unwrap();
+    client.pull_default().await.unwrap();
 
     // Edge got server's pattern
     let pat_real = edge
@@ -2043,12 +2104,12 @@ fn a9_15_archive_not_delete_status_transition_sync() {
 }
 
 // =========================================================================
-// NT-01: push round-trip via NATS
+// NT-01: authenticated push round-trip
 // =========================================================================
 #[tokio::test]
-async fn nt_01_push_round_trip_via_nats() {
-    let nats = start_nats().await;
-    let client_db = setup_sync_db_with_tables(&["observations"]);
+async fn nt_01_authenticated_push_round_trip() {
+    let sync = start_sync_fixture().await;
+    let client_db = setup_declared_sync_db_with_tables(&["observations"]);
 
     let uuid_1 = Uuid::new_v4();
     let uuid_2 = Uuid::new_v4();
@@ -2110,23 +2171,26 @@ async fn nt_01_push_round_trip_via_nats() {
         3
     );
 
-    let server_db = Arc::new(setup_sync_db_with_tables(&["observations"]));
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
+    let server_db = Arc::new(Database::open_memory());
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
     let client_db = Arc::new(client_db);
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         client_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 3);
@@ -2144,7 +2208,7 @@ async fn nt_01_push_round_trip_via_nats() {
     assert_eq!(
         row_1.values.get("data").and_then(Value::as_text),
         Some(r#"{"site":"موقع البناء","temp":25}"#),
-        "Arabic Unicode data must survive NATS round-trip"
+        "Arabic Unicode data must survive the authenticated round-trip"
     );
     assert_eq!(
         row_1.values.get("source").and_then(Value::as_text),
@@ -2192,7 +2256,7 @@ async fn nt_01_push_round_trip_via_nats() {
     assert_eq!(
         row_3.values.get("data").and_then(Value::as_text),
         Some(r#"{"note":"مراقبة الأمن","temp":22}"#),
-        "Arabic Unicode data must survive NATS round-trip"
+        "Arabic Unicode data must survive the authenticated round-trip"
     );
     assert_eq!(
         row_3.values.get("source").and_then(Value::as_text),
@@ -2201,11 +2265,11 @@ async fn nt_01_push_round_trip_via_nats() {
 }
 
 // =========================================================================
-// NT-02: pull round-trip via NATS
+// NT-02: authenticated pull round-trip
 // =========================================================================
 #[tokio::test]
-async fn nt_02_pull_round_trip_via_nats() {
-    let nats = start_nats().await;
+async fn nt_02_authenticated_pull_round_trip() {
+    let sync = start_sync_fixture().await;
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
     server_db
@@ -2252,23 +2316,27 @@ async fn nt_02_pull_round_trip_via_nats() {
         "guard: client must NOT have patterns table before pull"
     );
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies.clone(),
-    ));
+    declare_keep_first(&server_db, &["patterns"]);
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         client_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
-    let _result = client.pull(&policies).await.unwrap();
+    let _result = client.pull_default().await.unwrap();
 
     // Table was created via DDL sync
     assert!(
@@ -2281,7 +2349,7 @@ async fn nt_02_pull_round_trip_via_nats() {
         let row = client_db
             .point_lookup("patterns", "id", &Value::Uuid(*uuid), client_db.snapshot())
             .unwrap()
-            .expect("client must have pattern row after NATS pull");
+            .expect("client must have pattern row after authenticated pull");
         assert_eq!(
             row.values.get("pattern_type").and_then(Value::as_text),
             Some("correlation")
@@ -2295,18 +2363,39 @@ async fn nt_02_pull_round_trip_via_nats() {
 }
 
 // =========================================================================
-// NT-03: bidirectional sync via NATS
+// NT-03: bidirectional authenticated sync
 // =========================================================================
 #[tokio::test]
-async fn nt_03_bidirectional_sync_via_nats() {
-    let nats = start_nats().await;
-    let edge_db = Arc::new(setup_sync_db_with_tables(&["items"]));
-    let server_db = Arc::new(setup_sync_db_with_tables(&["items"]));
+async fn nt_03_bidirectional_authenticated_sync() {
+    let sync = start_sync_fixture().await;
+    let edge_db = Arc::new(Database::open_memory());
+    let server_db = Arc::new(setup_declared_sync_db_with_tables(&["items"]));
 
     let uuid_a = Uuid::new_v4();
     let uuid_b = Uuid::new_v4();
     let uuid_c = Uuid::new_v4();
     let uuid_d = Uuid::new_v4();
+
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    sync.wait_for_server("test_tenant").await;
+
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_db.clone(),
+        sync.client(),
+        contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
+    );
+    client.pull_default().await.unwrap();
 
     // Edge has A, B
     let tx_e = edge_db.begin_or_panic();
@@ -2363,27 +2452,10 @@ async fn nt_03_bidirectional_sync_via_nats() {
         2
     );
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies.clone(),
-    ));
-    let server_handle = server.clone();
-    tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-    );
-
     // Push: edge -> server
     client.push().await.unwrap();
     // Pull: server -> edge
-    client.pull(&policies).await.unwrap();
+    client.pull_default().await.unwrap();
 
     // Both sides have all 4
     let edge_rows = edge_db.scan("items", edge_db.snapshot()).unwrap();
@@ -2409,8 +2481,8 @@ async fn nt_03_bidirectional_sync_via_nats() {
 // =========================================================================
 #[tokio::test]
 async fn nt_04_chunking_large_vector_payload() {
-    let nats = start_nats().await;
-    let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_384"]));
+    let sync = start_sync_fixture().await;
+    let edge_db = Arc::new(setup_declared_sync_db_with_tables(&["observations_384"]));
 
     // Generate a known vector for later search assertion
     let known_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
@@ -2454,22 +2526,25 @@ async fn nt_04_chunking_large_vector_payload() {
         200
     );
 
-    let server_db = Arc::new(setup_sync_db_with_tables(&["observations_384"]));
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
+    let server_db = Arc::new(Database::open_memory());
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 200);
@@ -2499,28 +2574,50 @@ async fn nt_04_chunking_large_vector_payload() {
 }
 
 // =========================================================================
-// NT-05: Reconnection after NATS restart
+// NT-05: reconnection after hub restart
 //
-// TODO(sync): This test currently validates watermark-based delta push
-// (only new rows sent on second push). The full NT-05 scenario requires:
+// This validates the full restart journey:
 //   1. Push batch_1 (succeeds, watermark advances)
 //   2. Insert batch_2
-//   3. Stop NATS container
+//   3. Stop the hub
 //   4. Push fails (assert Err — connection error)
 //   5. Watermark does NOT advance on failed push
-//   6. Restart NATS container
+//   6. Restart the hub
 //   7. Push succeeds — sends batch_2 only (watermark-based delta)
 //   8. No duplicate rows on server
-// Steps 3-6 are deferred until testcontainers or Docker helper is available.
 // =========================================================================
 #[tokio::test]
-async fn nt_05_reconnection_after_nats_restart() {
-    let nats = start_nats().await;
-    let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_text"]));
+async fn nt_05_reconnection_after_hub_restart() {
+    let sync = start_sync_fixture().await;
+    let edge_db = Arc::new(Database::open_memory());
+    let server_db = Arc::new(setup_declared_sync_db_with_tables(&["observations_text"]));
 
     let uuid_1 = Uuid::new_v4();
     let uuid_2 = Uuid::new_v4();
     let uuid_3 = Uuid::new_v4();
+
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_handle = server.clone();
+    let server_shutdown = shutdown.clone();
+    let server_task = tokio::spawn(async move { server_handle.run_until(server_shutdown).await });
+    sync.wait_for_server("test_tenant").await;
+
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_db.clone(),
+        sync.client(),
+        contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
+    );
+    client.pull_default().await.unwrap();
 
     // Insert first batch
     let tx1 = edge_db.begin_or_panic();
@@ -2545,24 +2642,6 @@ async fn nt_05_reconnection_after_nats_restart() {
         )
         .unwrap();
     edge_db.commit(tx1).unwrap();
-
-    let server_db = Arc::new(setup_sync_db_with_tables(&["observations_text"]));
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
-    let server_handle = server.clone();
-    tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-    );
 
     // First push succeeds
     let result1 = client.push().await.unwrap();
@@ -2589,7 +2668,30 @@ async fn nt_05_reconnection_after_nats_restart() {
         .unwrap();
     edge_db.commit(tx2).unwrap();
 
-    // The push below simulates the retry after reconnection.
+    let watermark_before_failure = client.push_watermark();
+    shutdown.store(true, Ordering::SeqCst);
+    server_task.await.unwrap();
+
+    let failed = client.push().await;
+    assert!(failed.is_err(), "push while the hub is stopped must fail");
+    assert_eq!(
+        client.push_watermark(),
+        watermark_before_failure,
+        "a failed push must not advance the watermark"
+    );
+
+    let restarted = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
+    let restarted_handle = restarted.clone();
+    tokio::spawn(async move { restarted_handle.run().await });
+    sync.wait_for_server("test_tenant").await;
 
     // Push again — should only add the new row from batch_2
     let result2 = client.push().await.unwrap();
@@ -2609,7 +2711,7 @@ async fn nt_05_reconnection_after_nats_restart() {
 // =========================================================================
 #[tokio::test]
 async fn nt_06_initial_sync_empty_edge() {
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
 
@@ -2755,23 +2857,27 @@ async fn nt_06_initial_sync_empty_edge() {
         "guard: edge must start with no tables"
     );
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies.clone(),
-    ));
+    declare_keep_first(&server_db, &["entities", "decisions", "observations"]);
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
-    let _result = client.initial_sync(&policies).await.unwrap();
+    let _result = client.pull_default().await.unwrap();
 
     // DDL synced — all 3 tables created
     let edge_tables = edge_db.table_names();
@@ -2863,8 +2969,8 @@ async fn nt_06_initial_sync_empty_edge() {
 // =========================================================================
 #[tokio::test]
 async fn nt_07_offline_accumulate_batch_sync() {
-    let nats = start_nats().await;
-    let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_seq"]));
+    let sync = start_sync_fixture().await;
+    let edge_db = Arc::new(setup_declared_sync_db_with_tables(&["observations_seq"]));
 
     // Simulate 8 hours of offline recording: 1000 observations across separate txns
     let mut uuids = Vec::with_capacity(1000);
@@ -2903,22 +3009,25 @@ async fn nt_07_offline_accumulate_batch_sync() {
         "changes_since(0) must return all 1000 observations without truncation"
     );
 
-    let server_db = Arc::new(setup_sync_db_with_tables(&["observations_seq"]));
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
+    let server_db = Arc::new(Database::open_memory());
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
     let result = client.push().await.unwrap();
     assert_eq!(result.applied_rows, 1000);
@@ -2952,7 +3061,7 @@ async fn nt_07_offline_accumulate_batch_sync() {
 // =========================================================================
 #[tokio::test]
 async fn nt_08_ddl_sync_with_state_machine() {
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
 
@@ -2990,23 +3099,27 @@ async fn nt_08_ddl_sync_with_state_machine() {
     // Guard: edge has NO configs table
     assert!(!edge_db.table_names().contains(&"configs".to_string()));
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies.clone(),
-    ));
+    declare_keep_first(&server_db, &["configs"]);
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
-    client.pull(&policies).await.unwrap();
+    client.pull_default().await.unwrap();
 
     // Table exists with state machine
     assert!(edge_db.table_names().contains(&"configs".to_string()));
@@ -3079,7 +3192,7 @@ async fn nt_08_ddl_sync_with_state_machine() {
 // =========================================================================
 #[tokio::test]
 async fn nt_09_cross_edge_embedding_clustering() {
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     // 3 edges with similar face embeddings push to 1 server
     let base_embedding = vec![0.9f32, 0.1, 0.1];
     let edge_embeddings = [
@@ -3098,27 +3211,31 @@ async fn nt_09_cross_edge_embedding_clustering() {
         )
         .unwrap();
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
+    declare_keep_first(&server_db, &["observations"]);
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
     // Set up 3 edge DBs and push each
     for i in 0..3 {
         let edge_db = Arc::new(Database::open_memory());
-        let params = HashMap::new();
-        edge_db
-            .execute(
-                "CREATE TABLE observations (id UUID PRIMARY KEY, source TEXT, context_id UUID, embedding VECTOR(3)) IMMUTABLE",
-                &params,
-            )
-            .unwrap();
+        let edge_identity = Arc::new(FabricIdentity::generate());
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+            edge_db.clone(),
+            sync.client_for(&edge_identity),
+            contextdb_core::TenantId::from("test_tenant"),
+            edge_identity,
+        );
+        client.pull_default().await.unwrap();
 
         let obs_id = Uuid::new_v4();
         let tx = edge_db.begin_or_panic();
@@ -3145,20 +3262,27 @@ async fn nt_09_cross_edge_embedding_clustering() {
         edge_db.commit(tx).unwrap();
         obs_uuids.push(obs_id);
 
-        // Guard: each edge has 1 observation
+        // Each later edge has already pulled the observations accepted from
+        // earlier edges. Prove this edge added its own row without assuming a
+        // blank local database after schema/bootstrap convergence.
+        let local_observation = edge_db
+            .point_lookup(
+                "observations",
+                "id",
+                &Value::Uuid(obs_id),
+                edge_db.snapshot(),
+            )
+            .unwrap()
+            .expect("the submitting edge must retain its own observation");
+        let expected_source = format!("cam_{i}");
         assert_eq!(
-            edge_db
-                .scan("observations", edge_db.snapshot())
-                .unwrap()
-                .len(),
-            1
+            local_observation
+                .values
+                .get("source")
+                .and_then(Value::as_text),
+            Some(expected_source.as_str())
         );
 
-        let client = SyncClient::new(
-            edge_db.clone(),
-            &nats.nats_url,
-            contextdb_core::TenantId::from("test_tenant"),
-        );
         client.push().await.unwrap();
     }
 
@@ -3213,27 +3337,56 @@ async fn nt_09_cross_edge_embedding_clustering() {
 // =========================================================================
 #[tokio::test]
 async fn nt_10_invalidation_sync_round_trip() {
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
 
-    for db in [&edge_db, &server_db] {
-        db.execute(
+    server_db
+        .execute(
             "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT) IMMUTABLE",
             &params,
         )
         .unwrap();
-        db.execute(
+    server_db
+        .execute(
             "CREATE TABLE decisions (id UUID PRIMARY KEY, description TEXT, status TEXT)",
             &params,
         )
         .unwrap();
-        db.execute(
+    server_db
+        .execute(
             "CREATE TABLE invalidations (id UUID PRIMARY KEY, affected_decision_id UUID, trigger_observation_id UUID, basis_diff TEXT, status TEXT, severity TEXT, resolution_decision_id UUID) STATE MACHINE (status: pending -> [acknowledged, dismissed], acknowledged -> [resolved, dismissed])",
             &params,
         ).unwrap();
-    }
+
+    declare_keep_first(&server_db, &["observations", "decisions"]);
+    server_db
+        .execute(
+            "ALTER TABLE invalidations SET SYNC CONFLICT KEEP LATEST",
+            &params,
+        )
+        .unwrap();
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    sync.wait_for_server("test_tenant").await;
+
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_db.clone(),
+        sync.client(),
+        contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
+    );
+    client.pull_default().await.unwrap();
 
     let obs_id = Uuid::new_v4();
     let decision_id = Uuid::new_v4();
@@ -3352,23 +3505,6 @@ async fn nt_10_invalidation_sync_round_trip() {
         0
     );
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
-    let server_handle = server.clone();
-    tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-    );
-
     // Push to server
     client.push().await.unwrap();
 
@@ -3459,6 +3595,25 @@ async fn nt_10_invalidation_sync_round_trip() {
         .unwrap();
     server_db.commit(tx_s).unwrap();
 
+    let acknowledged_pull = client.pull_default().await.unwrap();
+    assert_eq!(
+        edge_db
+            .point_lookup(
+                "invalidations",
+                "id",
+                &Value::Uuid(inv_id),
+                edge_db.snapshot(),
+            )
+            .unwrap()
+            .expect("edge must receive the acknowledged transition")
+            .values
+            .get("status")
+            .and_then(Value::as_text),
+        Some("acknowledged"),
+        "the first pull must carry the legal pending-to-acknowledged transition; \
+         pull result: {acknowledged_pull:?}"
+    );
+
     let tx_s2 = server_db.begin_or_panic();
     server_db
         .upsert_row(
@@ -3483,9 +3638,8 @@ async fn nt_10_invalidation_sync_round_trip() {
         .unwrap();
     server_db.commit(tx_s2).unwrap();
 
-    // Edge pulls resolution
-    let pull_policies = ConflictPolicies::uniform(ConflictPolicy::ServerWins);
-    client.pull(&pull_policies).await.unwrap();
+    // Edge pulls the hub-accepted resolution under the durable declaration.
+    let resolution_pull = client.pull_default().await.unwrap();
 
     let inv_edge = edge_db
         .point_lookup(
@@ -3499,7 +3653,7 @@ async fn nt_10_invalidation_sync_round_trip() {
     assert_eq!(
         inv_edge.values.get("status").and_then(Value::as_text),
         Some("resolved"),
-        "edge must receive server's resolved status"
+        "edge must receive server's resolved status; pull result: {resolution_pull:?}"
     );
     assert_eq!(
         inv_edge
@@ -3517,7 +3671,7 @@ async fn nt_10_invalidation_sync_round_trip() {
 // =========================================================================
 #[tokio::test]
 async fn nt_11_push_large_mixed_payload_chunked() {
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     let edge_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
     edge_db
@@ -3583,27 +3737,24 @@ async fn nt_11_push_large_mixed_payload_chunked() {
     }
 
     let server_db = Arc::new(Database::open_memory());
-    server_db
-        .execute(
-            "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(384)) IMMUTABLE",
-            &params,
-        )
-        .unwrap();
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
     let result = client.push().await.unwrap();
 
@@ -3657,8 +3808,8 @@ async fn nt_11_push_large_mixed_payload_chunked() {
 // =========================================================================
 #[tokio::test]
 async fn nt_12_push_single_oversized_text_blob() {
-    let nats = start_nats().await;
-    let edge_db = Arc::new(setup_sync_db_with_tables(&["observations_text"]));
+    let sync = start_sync_fixture().await;
+    let edge_db = Arc::new(setup_declared_sync_db_with_tables(&["observations_text"]));
 
     let blob = "x".repeat(1_126_400);
     let uuid_blob = Uuid::new_v4();
@@ -3695,22 +3846,25 @@ async fn nt_12_push_single_oversized_text_blob() {
         );
     }
 
-    let server_db = Arc::new(setup_sync_db_with_tables(&["observations_text"]));
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies,
-    ));
+    let server_db = Arc::new(Database::open_memory());
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
     let result = client.push().await.unwrap();
 
@@ -3740,7 +3894,7 @@ async fn nt_12_push_single_oversized_text_blob() {
 // =========================================================================
 #[tokio::test]
 async fn nt_13_pull_large_dataset_chunked() {
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
     server_db
@@ -3795,23 +3949,27 @@ async fn nt_13_pull_large_dataset_chunked() {
         "guard: edge must start with no tables"
     );
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies.clone(),
-    ));
+    declare_keep_first(&server_db, &["observations"]);
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = server.clone();
     tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sync.wait_for_server("test_tenant").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        &nats.nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
     );
-    client.pull(&policies).await.unwrap();
+    client.pull_default().await.unwrap();
 
     assert!(
         edge_db.table_names().contains(&"observations".to_string()),
@@ -3852,18 +4010,39 @@ async fn nt_13_pull_large_dataset_chunked() {
 // =========================================================================
 #[tokio::test]
 async fn nt_14_large_bidirectional_vector_sync() {
-    let nats = start_nats().await;
+    let sync = start_sync_fixture().await;
     let edge_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let params = HashMap::new();
     let ddl = "CREATE TABLE observations (id UUID PRIMARY KEY, data TEXT, embedding VECTOR(384)) IMMUTABLE";
-    edge_db.execute(ddl, &params).unwrap();
     server_db.execute(ddl, &params).unwrap();
 
     let known_edge_vector: Vec<f32> = (0..384).map(|i| (i as f32) / 384.0).collect();
     let known_server_vector: Vec<f32> = (0..384).map(|i| 1.0 - (i as f32) / 384.0).collect();
     let mut known_edge_uuid: Option<Uuid> = None;
     let mut known_server_uuid: Option<Uuid> = None;
+
+    declare_keep_first(&server_db, &["observations"]);
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("test_tenant"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
+    let server_handle = server.clone();
+    tokio::spawn(async move { server_handle.run().await });
+    sync.wait_for_server("test_tenant").await;
+
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_db.clone(),
+        sync.client(),
+        contextdb_core::TenantId::from("test_tenant"),
+        sync.edge_identity(),
+    );
+    client.pull_default().await.unwrap();
 
     let tx_e = edge_db.begin_or_panic();
     for i in 0..400usize {
@@ -3961,30 +4140,13 @@ async fn nt_14_large_bidirectional_vector_sync() {
         );
     }
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::InsertIfNotExists);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-        policies.clone(),
-    ));
-    let server_handle = server.clone();
-    tokio::spawn(async move { server_handle.run().await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let client = SyncClient::new(
-        edge_db.clone(),
-        &nats.nats_url,
-        contextdb_core::TenantId::from("test_tenant"),
-    );
-
     let push_result = client.push().await.unwrap();
     assert_eq!(
         push_result.applied_rows, 400,
         "push must deliver all 400 edge rows to server"
     );
 
-    client.pull(&policies).await.unwrap();
+    client.pull_default().await.unwrap();
 
     assert_eq!(
         server_db
@@ -4190,8 +4352,7 @@ fn cp06_conflict_policy_wired_to_apply_changes() {
 /// Edge inserts a row, pushes, updates the row, pushes again. Server must have the updated value.
 #[tokio::test]
 async fn cp07_row_update_propagates_through_sync() {
-    let nats = start_nats().await;
-    let nats_url = &nats.nats_url;
+    let sync = start_sync_fixture().await;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let edge_path = tmp.path().join("cp07-edge.db");
@@ -4202,7 +4363,7 @@ async fn cp07_row_update_propagates_through_sync() {
 
     edge_db
         .execute(
-            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP LATEST",
             &HashMap::new(),
         )
         .unwrap();
@@ -4219,23 +4380,26 @@ async fn cp07_row_update_propagates_through_sync() {
         .unwrap();
 
     // Start server, push initial data
-    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        nats_url,
-        contextdb_core::TenantId::from("cp07"),
-        policies,
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("cp07"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let handle = tokio::spawn({
         let server = server.clone();
         async move { server.run().await }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sync.wait_for_server("cp07").await;
 
-    let client = SyncClient::new(
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
         edge_db.clone(),
-        nats_url,
+        sync.client(),
         contextdb_core::TenantId::from("cp07"),
+        sync.edge_identity(),
     );
     client.push().await.unwrap();
 
@@ -4284,8 +4448,13 @@ async fn cp07_row_update_propagates_through_sync() {
 /// Push must succeed, not fail.
 #[tokio::test]
 async fn cp08_push_retry_succeeds_when_server_starts_late() {
-    let nats = start_nats().await;
-    let nats_url = &nats.nats_url;
+    let sync = start_sync_fixture().await;
+    let edge_identity = Arc::new(FabricIdentity::generate());
+    // A caller knows which hub it is dialing before that hub has registered
+    // its routes. Advertise the stable hub identity without starting a server
+    // so the first push exercises retry-after-no-responder, not identity
+    // discovery failure.
+    let _announced_hub = sync.server();
 
     let tmp = tempfile::TempDir::new().unwrap();
     let edge_path = tmp.path().join("cp08-edge.db");
@@ -4296,7 +4465,7 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
 
     edge_db
         .execute(
-            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT)",
+            "CREATE TABLE items (id UUID PRIMARY KEY, name TEXT) SYNC CONFLICT KEEP FIRST",
             &HashMap::new(),
         )
         .unwrap();
@@ -4314,30 +4483,43 @@ async fn cp08_push_retry_succeeds_when_server_starts_late() {
     // Start push BEFORE server is running — it must retry
     let push_handle = {
         tokio::spawn({
-            let nats_url = nats_url.to_string();
+            let fabric = sync.fabric.clone();
             let edge_db = edge_db.clone();
+            let edge_identity = Arc::clone(&edge_identity);
             async move {
-                let client =
-                    SyncClient::new(edge_db, &nats_url, contextdb_core::TenantId::from("cp08"));
+                let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+                    edge_db,
+                    fabric.client_as(&edge_identity.node_id()),
+                    contextdb_core::TenantId::from("cp08"),
+                    edge_identity,
+                );
                 client.push().await
             }
         })
     };
 
-    // Wait 1 second, THEN start server — push is retrying during this time
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sync.fabric
+            .wait_for_request_attempt_for_test(&contextdb_server::subjects::push_subject("cp08")),
+    )
+    .await
+    .expect("the first push attempt must happen before the server starts");
 
-    let policies = ConflictPolicies::uniform(ConflictPolicy::LatestWins);
-    let server = Arc::new(SyncServer::new(
-        server_db.clone(),
-        nats_url,
-        contextdb_core::TenantId::from("cp08"),
-        policies,
-    ));
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            server_db.clone(),
+            sync.server(),
+            contextdb_core::TenantId::from("cp08"),
+            sync.hub_identity().node_id(),
+            sync.hub_identity(),
+        ),
+    );
     let server_handle = tokio::spawn({
         let server = server.clone();
         async move { server.run().await }
     });
+    sync.wait_for_server("cp08").await;
 
     // Push must succeed (retried and found server)
     let push_result = tokio::time::timeout(std::time::Duration::from_secs(15), push_handle)

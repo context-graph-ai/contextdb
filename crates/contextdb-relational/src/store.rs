@@ -1,6 +1,6 @@
 use contextdb_core::{
-    DirectedValue, IndexKey, Lsn, RowId, SortDirection, TableMeta, TableName, TotalOrdAsc,
-    TotalOrdDesc, TxId, Value, VersionedRow,
+    DirectedValue, IndexKey, IndexKind, Lsn, RowId, SortDirection, TableMeta, TableName,
+    TotalOrdAsc, TotalOrdDesc, TxId, Value, VersionedRow,
 };
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
@@ -28,6 +28,10 @@ struct ExactBucket {
 }
 
 type ExactMap = HashMap<u64, Vec<ExactBucket>, BuildHasherDefault<IdentityHasher>>;
+type RowPositionMaps = (
+    HashMap<(TableName, RowId), usize>,
+    HashMap<(TableName, RowId), Vec<usize>>,
+);
 
 const EXACT_FILTER_WORDS: usize = 8192;
 const EXACT_FILTER_BITS: u64 = (EXACT_FILTER_WORDS as u64) * 64;
@@ -168,6 +172,32 @@ pub struct IndexStorage {
     exact: ExactMap,
     exact_filter: Box<[u64; EXACT_FILTER_WORDS]>,
     exact_only: bool,
+}
+
+/// A complete, already-indexed replacement for one table.  Received-schema
+/// application builds these before it takes any of the relational publication
+/// locks, then publishes every affected table as one infallible memory step
+/// after the matching durable transaction commits.
+#[derive(Debug)]
+pub struct TableProjection {
+    pub table: String,
+    pub meta: TableMeta,
+    pub rows: Vec<VersionedRow>,
+    pub indexes: HashMap<String, IndexStorage>,
+    pub sync_sources: Vec<(RowId, Lsn, SyncSourceKind)>,
+}
+
+/// Complete relational replacement, including the derived row maps and sync
+/// provenance sidecars.  It is constructed before durability; publication
+/// only swaps these already-owned maps under the established lock order.
+pub struct PreparedRelationalPublication {
+    tables: HashMap<TableName, Vec<VersionedRow>>,
+    table_meta: HashMap<TableName, TableMeta>,
+    indexes: HashMap<TableName, HashMap<String, IndexStorage>>,
+    row_positions: HashMap<(TableName, RowId), usize>,
+    row_version_positions: HashMap<(TableName, RowId), Vec<usize>>,
+    sync_source_lsns: HashMap<TableName, HashMap<RowId, Lsn>>,
+    sync_source_kinds: HashMap<TableName, HashMap<RowId, SyncSourceKind>>,
 }
 
 impl Default for IndexStorage {
@@ -408,6 +438,21 @@ impl RelationalStore {
         RowId(self.next_row_id.fetch_add(1, Ordering::SeqCst))
     }
 
+    /// The next allocator value without reserving it.  Received-schema
+    /// planning uses this to give a detached projected image its own cursor;
+    /// a failed plan must never consume an ID from the live store.
+    pub fn next_row_id(&self) -> RowId {
+        RowId(self.next_row_id.load(Ordering::SeqCst))
+    }
+
+    /// Advance, but never rewind, the live allocator after a prepared image
+    /// has become durable.  A concurrent ordinary transaction can allocate
+    /// while schema preparation is in flight, so publication must use max
+    /// rather than assigning the detached cursor unconditionally.
+    pub fn fetch_max_next_row_id(&self, next_row_id: RowId) {
+        self.next_row_id.fetch_max(next_row_id.0, Ordering::SeqCst);
+    }
+
     pub fn sync_source_lsn(&self, table: &str, row_id: RowId) -> Option<Lsn> {
         self.sync_source_lsns
             .read()
@@ -422,6 +467,26 @@ impl RelationalStore {
             .get(table)
             .and_then(|rows| rows.get(&row_id))
             .copied()
+    }
+
+    /// Snapshot sync provenance while preparing a complete received-schema
+    /// replacement.  Publication never derives sidecars after durability.
+    pub fn sync_source_sidecars_snapshot(
+        &self,
+    ) -> HashMap<(TableName, RowId), (Lsn, SyncSourceKind)> {
+        let lsns = self.sync_source_lsns.read();
+        let kinds = self.sync_source_kinds.read();
+        lsns.iter()
+            .flat_map(|(table, by_row)| {
+                by_row.iter().filter_map(|(row_id, lsn)| {
+                    kinds
+                        .get(table)
+                        .and_then(|by_row| by_row.get(row_id))
+                        .copied()
+                        .map(|kind| ((table.clone(), *row_id), (*lsn, kind)))
+                })
+            })
+            .collect()
     }
 
     pub fn set_sync_source_lsns(&self, entries: impl IntoIterator<Item = (TableName, RowId, Lsn)>) {
@@ -1046,6 +1111,238 @@ impl RelationalStore {
             }
         }
         table_indexes.insert(name.to_string(), rebuilt);
+    }
+
+    /// Build every physical index for a projected table before the caller
+    /// publishes it.  Keeping this work outside the store locks prevents an
+    /// index-planned reader from observing a newly published TableMeta before
+    /// its matching postings exist.
+    pub fn projected_index_storage(
+        meta: &TableMeta,
+        rows: &[VersionedRow],
+    ) -> HashMap<String, IndexStorage> {
+        let mut indexes = HashMap::new();
+        for decl in &meta.indexes {
+            // Match create_exact_index_storage: duplicate auto constraint
+            // indexes with identical keys deliberately share no second
+            // physical store.
+            if decl.kind == IndexKind::Auto
+                && indexes.values().any(|storage: &IndexStorage| {
+                    storage.exact_only() && storage.columns == decl.columns
+                })
+            {
+                continue;
+            }
+            let storage = match decl.kind {
+                IndexKind::Auto => IndexStorage::new_exact_only(decl.columns.clone()),
+                IndexKind::UserDeclared => IndexStorage::new(decl.columns.clone()),
+            };
+            indexes.insert(decl.name.clone(), storage);
+        }
+
+        let mut sorted: Vec<&VersionedRow> = rows.iter().collect();
+        sorted.sort_by_key(|row| row.row_id);
+        for storage in indexes.values_mut() {
+            for row in &sorted {
+                let key = index_key_for_row(&storage.columns, &row.values);
+                storage.insert_posting(
+                    key,
+                    IndexEntry {
+                        row_id: row.row_id,
+                        created_tx: row.created_tx,
+                        deleted_tx: row.deleted_tx,
+                    },
+                );
+            }
+        }
+        indexes
+    }
+
+    /// Construct one complete table replacement while no relational write
+    /// locks are held.  Index construction is intentionally part of the
+    /// fallible-preparation side of received-schema staging, never the
+    /// post-durability publication side.
+    pub fn table_projection(
+        table: impl Into<String>,
+        meta: TableMeta,
+        rows: Vec<VersionedRow>,
+    ) -> TableProjection {
+        let indexes = Self::projected_index_storage(&meta, &rows);
+        TableProjection {
+            table: table.into(),
+            meta,
+            rows,
+            indexes,
+            sync_sources: Vec::new(),
+        }
+    }
+
+    pub fn with_sync_sources(
+        mut projection: TableProjection,
+        sync_sources: Vec<(RowId, Lsn, SyncSourceKind)>,
+    ) -> TableProjection {
+        projection.sync_sources = sync_sources;
+        projection
+    }
+
+    fn position_maps_for_tables(tables: &HashMap<TableName, Vec<VersionedRow>>) -> RowPositionMaps {
+        let capacity = tables.values().map(Vec::len).sum();
+        let mut positions = HashMap::with_capacity(capacity);
+        let mut version_positions = HashMap::with_capacity(capacity);
+        for (table, rows) in tables {
+            Self::rebuild_position_maps_for_table(
+                table,
+                rows,
+                &mut positions,
+                &mut version_positions,
+            );
+        }
+        (positions, version_positions)
+    }
+
+    /// Snapshot and prebuild a complete received-schema relational replacement.
+    /// All index construction, row-map construction, sidecar reconciliation,
+    /// and drop lifecycle work happens here, before durability.
+    pub fn prepare_received_schema_publication(
+        &self,
+        projections: Vec<TableProjection>,
+        dropped_tables: impl IntoIterator<Item = String>,
+    ) -> PreparedRelationalPublication {
+        let mut tables = self.tables.read().clone();
+        let mut table_meta = self.table_meta.read().clone();
+        let mut source_lsns = self.sync_source_lsns.read().clone();
+        let mut source_kinds = self.sync_source_kinds.read().clone();
+        for table in dropped_tables {
+            tables.remove(&table);
+            table_meta.remove(&table);
+            source_lsns.remove(&table);
+            source_kinds.remove(&table);
+        }
+        for projection in projections {
+            source_lsns.remove(&projection.table);
+            source_kinds.remove(&projection.table);
+            if !projection.sync_sources.is_empty() {
+                let mut lsns = HashMap::with_capacity(projection.sync_sources.len());
+                let mut kinds = HashMap::with_capacity(projection.sync_sources.len());
+                for (row_id, lsn, kind) in projection.sync_sources {
+                    lsns.insert(row_id, lsn);
+                    kinds.insert(row_id, kind);
+                }
+                source_lsns.insert(projection.table.clone(), lsns);
+                source_kinds.insert(projection.table.clone(), kinds);
+            }
+            tables.insert(projection.table.clone(), projection.rows);
+            table_meta.insert(projection.table.clone(), projection.meta);
+        }
+        let indexes = table_meta
+            .iter()
+            .map(|(table, meta)| {
+                let rows = tables.get(table).map(Vec::as_slice).unwrap_or_default();
+                (table.clone(), Self::projected_index_storage(meta, rows))
+            })
+            .collect();
+        let (row_positions, row_version_positions) = Self::position_maps_for_tables(&tables);
+        PreparedRelationalPublication {
+            tables,
+            table_meta,
+            indexes,
+            row_positions,
+            row_version_positions,
+            sync_source_lsns: source_lsns,
+            sync_source_kinds: source_kinds,
+        }
+    }
+
+    /// Infallibly publish a fully prebuilt received-schema replacement.  Do
+    /// not add any construction, collection, or per-row mutation here: this
+    /// runs only after the matching durable transaction has succeeded.
+    pub fn publish_prepared_received_schema(&self, publication: PreparedRelationalPublication) {
+        let mut indexes = self.indexes.write();
+        let mut tables = self.tables.write();
+        let mut table_meta = self.table_meta.write();
+        let mut positions = self.row_positions.write();
+        let mut version_positions = self.row_version_positions.write();
+        let mut source_lsns = self.sync_source_lsns.write();
+        let mut source_kinds = self.sync_source_kinds.write();
+        *indexes = publication.indexes;
+        *tables = publication.tables;
+        *table_meta = publication.table_meta;
+        *positions = publication.row_positions;
+        *version_positions = publication.row_version_positions;
+        *source_lsns = publication.sync_source_lsns;
+        *source_kinds = publication.sync_source_kinds;
+    }
+
+    /// Publish complete replacements for every affected table.  This method
+    /// has no validation or allocation path: callers prepare the complete
+    /// projections before Redb commits, so once durability succeeds this is
+    /// only lock-ordered memory replacement.
+    pub fn publish_table_projections(&self, projections: Vec<TableProjection>) {
+        if projections.is_empty() {
+            return;
+        }
+
+        // Keep the established relational writer order for the entire batch,
+        // rather than taking it once per table and briefly exposing a mixed
+        // received-schema generation to a concurrent reader.
+        let mut all_indexes = self.indexes.write();
+        let mut tables = self.tables.write();
+        let mut table_meta = self.table_meta.write();
+        let mut positions = self.row_positions.write();
+        let mut version_positions = self.row_version_positions.write();
+        for projection in projections {
+            let table = projection.table;
+            tables.insert(table.clone(), projection.rows);
+            table_meta.insert(table.clone(), projection.meta);
+            all_indexes.insert(table.clone(), projection.indexes);
+            positions.retain(|(entry_table, _), _| entry_table != &table);
+            version_positions.retain(|(entry_table, _), _| entry_table != &table);
+            if let Some(rows) = tables.get(&table) {
+                Self::rebuild_position_maps_for_table(
+                    &table,
+                    rows,
+                    &mut positions,
+                    &mut version_positions,
+                );
+            }
+        }
+    }
+
+    /// Replace one table's rows, metadata and physical indexes as one
+    /// publication.  The expensive index construction is deliberately done
+    /// by `projected_index_storage` before this method acquires the locks.
+    pub fn publish_table_projection(
+        &self,
+        table: &str,
+        meta: TableMeta,
+        rows: Vec<VersionedRow>,
+        indexes: HashMap<String, IndexStorage>,
+    ) -> bool {
+        // This is the same lock order as apply_inserts/apply_deletes. Holding
+        // all of them through replacement keeps row lookup maps aligned with
+        // the rows an index posting names.
+        let mut all_indexes = self.indexes.write();
+        let mut tables = self.tables.write();
+        let mut table_meta = self.table_meta.write();
+        let mut positions = self.row_positions.write();
+        let mut version_positions = self.row_version_positions.write();
+        if !table_meta.contains_key(table) {
+            return false;
+        }
+        tables.insert(table.to_string(), rows);
+        table_meta.insert(table.to_string(), meta);
+        all_indexes.insert(table.to_string(), indexes);
+        positions.retain(|(entry_table, _), _| entry_table != table);
+        version_positions.retain(|(entry_table, _), _| entry_table != table);
+        if let Some(rows) = tables.get(table) {
+            Self::rebuild_position_maps_for_table(
+                table,
+                rows,
+                &mut positions,
+                &mut version_positions,
+            );
+        }
+        true
     }
 
     /// Introspect total postings across all indexes (including tombstones).
