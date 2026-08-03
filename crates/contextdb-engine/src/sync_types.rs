@@ -126,9 +126,12 @@ impl ChangeSet {
     }
 
     pub fn has_create_trigger_ddl(&self) -> bool {
-        self.ddl
-            .iter()
-            .any(|ddl| matches!(ddl, DdlChange::CreateTrigger { .. }))
+        self.ddl.iter().any(|ddl| {
+            matches!(
+                ddl,
+                DdlChange::CreateTrigger { .. } | DdlChange::CreateTriggerIncludingSync { .. }
+            )
+        })
     }
 
     pub fn split_at_trigger_bootstrap_barriers(self) -> Vec<ChangeSet> {
@@ -609,6 +612,14 @@ pub enum DdlChange {
         name: String,
         table: String,
     },
+    /// Opt-in trigger declaration that also fires for authenticated rows
+    /// accepted by sync. Appended to preserve every earlier variant's binary
+    /// discriminant and the legacy `CreateTrigger` payload layout.
+    CreateTriggerIncludingSync {
+        name: String,
+        table: String,
+        on_events: Vec<String>,
+    },
 }
 
 impl<'de> Deserialize<'de> for DdlChange {
@@ -629,6 +640,7 @@ impl<'de> Deserialize<'de> for DdlChange {
             CreateSink,
             CreateRoute,
             DropRoute,
+            CreateTriggerIncludingSync,
         }
 
         struct DdlChangeVisitor;
@@ -732,6 +744,14 @@ impl<'de> Deserialize<'de> for DdlChange {
                             table: fields.table,
                         })
                     }
+                    Variant::CreateTriggerIncludingSync => {
+                        let fields = access.newtype_variant::<CreateTriggerFields>()?;
+                        Ok(DdlChange::CreateTriggerIncludingSync {
+                            name: fields.name,
+                            table: fields.table,
+                            on_events: fields.on_events,
+                        })
+                    }
                 }
             }
         }
@@ -748,6 +768,7 @@ impl<'de> Deserialize<'de> for DdlChange {
             "CreateSink",
             "CreateRoute",
             "DropRoute",
+            "CreateTriggerIncludingSync",
         ];
         deserializer.deserialize_enum("DdlChange", VARIANTS, DdlChangeVisitor)
     }
@@ -1126,3 +1147,64 @@ pub struct Conflict {
 // that persists it, so the DDL clause, the stored declaration and this filter
 // can never drift into two different enums.
 pub use contextdb_core::SyncDirection;
+
+#[cfg(test)]
+mod trigger_ddl_binary_compatibility_tests {
+    use super::DdlChange;
+    use serde::Serialize;
+
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum LegacyDdlChange {
+        CreateTable,
+        DropTable,
+        AlterTable,
+        CreateIndex,
+        DropIndex,
+        CreateTrigger {
+            name: String,
+            table: String,
+            on_events: Vec<String>,
+        },
+        DropTrigger,
+        CreateEventType,
+        CreateSink,
+        CreateRoute,
+        DropRoute,
+    }
+
+    #[test]
+    fn legacy_create_trigger_binary_decodes_as_default_sync_silent_variant() {
+        let legacy = LegacyDdlChange::CreateTrigger {
+            name: "ordinary".to_string(),
+            table: "events".to_string(),
+            on_events: vec!["INSERT".to_string()],
+        };
+        let bytes = bincode::serde::encode_to_vec(legacy, bincode::config::standard()).unwrap();
+        let (decoded, consumed): (DdlChange, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert!(matches!(
+            decoded,
+            DdlChange::CreateTrigger { name, table, on_events }
+                if name == "ordinary"
+                    && table == "events"
+                    && on_events == vec!["INSERT".to_string()]
+        ));
+    }
+
+    #[test]
+    fn including_sync_trigger_binary_roundtrips_as_separate_appended_variant() {
+        let declaration = DdlChange::CreateTriggerIncludingSync {
+            name: "received".to_string(),
+            table: "events".to_string(),
+            on_events: vec!["INSERT".to_string()],
+        };
+        let bytes =
+            bincode::serde::encode_to_vec(&declaration, bincode::config::standard()).unwrap();
+        let (decoded, consumed): (DdlChange, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, declaration);
+    }
+}

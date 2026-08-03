@@ -2747,6 +2747,22 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             "DELETE trigger must be rejected with a typed error; got {delete_trigger:?}"
         ));
     }
+    let sync_delete_trigger = db.execute(
+        "CREATE TRIGGER sync_delete_trigger ON host_writes WHEN DELETE INCLUDING SYNC",
+        &empty(),
+    );
+    if !matches!(
+        sync_delete_trigger,
+        Err(Error::TriggerEventUnsupported { ref event }) if event == "DELETE"
+    ) || db
+        .list_triggers()
+        .iter()
+        .any(|trigger| trigger.name == "sync_delete_trigger")
+    {
+        failures.push(format!(
+            "DELETE INCLUDING SYNC must be refused before declaration persistence; got {sync_delete_trigger:?}"
+        ));
+    }
 
     let trigger_map = db
         .list_triggers()
@@ -7808,4 +7824,812 @@ fn t3_audit_records_panic_rollback_and_engine_survives() {
         "file-backed durable audit history filters must survive reopen for sibling triggers"
     );
     reopened_audit_db.close().unwrap();
+}
+
+fn setup_received_insert_trigger(db: &Database, including_sync: bool) {
+    db.execute(
+        "CREATE TABLE sync_trigger_source (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sync_trigger_derived (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    let suffix = if including_sync {
+        " INCLUDING SYNC"
+    } else {
+        ""
+    };
+    db.execute(
+        &format!("CREATE TRIGGER received_insert ON sync_trigger_source WHEN INSERT{suffix}"),
+        &empty(),
+    )
+    .unwrap();
+}
+
+fn received_source_change(id: Uuid, lsn: Lsn) -> ChangeSet {
+    ChangeSet {
+        rows: vec![RowChange {
+            table: "sync_trigger_source".to_string(),
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("content".to_string(), Value::Text("received".to_string())),
+            ]),
+            deleted: false,
+            lsn,
+            created_at: None,
+        }],
+        ..Default::default()
+    }
+}
+
+fn register_received_derived_callback(db: &Database) {
+    db.register_trigger_callback("received_insert", |handle, ctx| {
+        let id = ctx.row_values["id"].as_uuid().copied().unwrap();
+        let params = HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            (
+                "content".to_string(),
+                Value::Text("hub-derived".to_string()),
+            ),
+        ]);
+        match handle.execute_in_tx(
+            ctx.tx,
+            "INSERT INTO sync_trigger_derived (id, content) VALUES ($id, $content)",
+            &params,
+        ) {
+            Ok(_) | Err(Error::UniqueViolation { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn including_sync_default_is_silent_and_opt_in_fires_once_on_received_insert() {
+    for (including_sync, expected_fires) in [(false, 0), (true, 1)] {
+        let db = Database::open_memory();
+        setup_received_insert_trigger(&db, including_sync);
+        assert_eq!(db.list_triggers()[0].including_sync, including_sync);
+        let fires = Arc::new(AtomicUsize::new(0));
+        let callback_fires = fires.clone();
+        db.register_trigger_callback("received_insert", move |handle, ctx| {
+            callback_fires.fetch_add(1, Ordering::SeqCst);
+            let id = ctx.row_values["id"].as_uuid().copied().unwrap();
+            handle.execute_in_tx(
+                ctx.tx,
+                "INSERT INTO sync_trigger_derived (id, content) VALUES ($id, $content)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(id)),
+                    ("content".to_string(), Value::Text("derived".to_string())),
+                ]),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+
+        let incoming_id = uuid(0x51_000 + expected_fires as u128);
+        let changes = received_source_change(incoming_id, Lsn(51));
+        db.apply_changes(
+            changes.clone(),
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+        assert_eq!(fires.load(Ordering::SeqCst), expected_fires);
+        assert_eq!(count_rows(&db, "sync_trigger_source"), 1);
+        assert_eq!(count_rows(&db, "sync_trigger_derived"), expected_fires);
+
+        db.apply_changes(
+            changes,
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            expected_fires,
+            "replaying an already accepted row must be a deterministic no-op"
+        );
+    }
+}
+
+#[test]
+fn including_sync_delete_received_ddl_is_typed_and_never_persisted() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE sync_trigger_source (id UUID PRIMARY KEY, content TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.complete_initialization().unwrap();
+    let before = db.current_lsn();
+    let result = db.apply_changes(
+        ChangeSet {
+            ddl: vec![DdlChange::CreateTriggerIncludingSync {
+                name: "delete_received".to_string(),
+                table: "sync_trigger_source".to_string(),
+                on_events: vec!["DELETE".to_string()],
+            }],
+            ddl_lsn: vec![Lsn(91)],
+            ..Default::default()
+        },
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    assert!(
+        matches!(result, Err(Error::TriggerEventUnsupported { ref event }) if event == "DELETE"),
+        "received DELETE INCLUDING SYNC DDL must fail with the same typed declaration error: {result:?}"
+    );
+    assert_eq!(db.current_lsn(), before);
+    assert!(
+        db.list_triggers()
+            .iter()
+            .all(|trigger| trigger.name != "delete_received")
+    );
+    assert!(db
+        .ddl_log_since(before)
+        .iter()
+        .all(|ddl| !matches!(ddl, DdlChange::CreateTriggerIncludingSync { name, .. } if name == "delete_received")));
+}
+
+#[test]
+fn including_sync_callback_failure_rolls_back_incoming_and_derived_rows() {
+    let db = Database::open_memory();
+    setup_received_insert_trigger(&db, true);
+    db.register_trigger_callback("received_insert", |handle, ctx| {
+        let id = ctx.row_values["id"].as_uuid().copied().unwrap();
+        handle.execute_in_tx(
+            ctx.tx,
+            "INSERT INTO sync_trigger_derived (id, content) VALUES ($id, $content)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                (
+                    "content".to_string(),
+                    Value::Text("must-roll-back".to_string()),
+                ),
+            ]),
+        )?;
+        Err(Error::Other(
+            "deliberate received-trigger failure".to_string(),
+        ))
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+
+    let result = db.apply_changes(
+        received_source_change(uuid(0x52_001), Lsn(52)),
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    );
+    assert!(
+        matches!(result, Err(Error::Other(ref reason)) if reason == "deliberate received-trigger failure"),
+        "callback failure must be returned, not reported as accepted: {result:?}"
+    );
+    assert_eq!(count_rows(&db, "sync_trigger_source"), 0);
+    assert_eq!(count_rows(&db, "sync_trigger_derived"), 0);
+}
+
+#[test]
+fn including_sync_forbidden_effect_families_are_typed_atomic_and_audited() {
+    #[derive(Clone, Copy, Debug)]
+    enum Effect {
+        UpdateReceivedRow,
+        DeleteRelationalRow,
+        DeferredUpsertUpdate,
+        GraphInsert,
+        GraphDelete,
+        VectorInsert,
+        VectorDelete,
+        Ddl,
+    }
+    impl Effect {
+        fn expected_family(self) -> &'static str {
+            match self {
+                Self::UpdateReceivedRow
+                | Self::DeleteRelationalRow
+                | Self::DeferredUpsertUpdate => "relational update/delete",
+                Self::GraphInsert | Self::GraphDelete => "graph insert/delete",
+                Self::VectorInsert | Self::VectorDelete => "vector insert/delete/move",
+                Self::Ddl => "DDL/control operation",
+            }
+        }
+    }
+
+    for effect in [
+        Effect::UpdateReceivedRow,
+        Effect::DeleteRelationalRow,
+        Effect::DeferredUpsertUpdate,
+        Effect::GraphInsert,
+        Effect::GraphDelete,
+        Effect::VectorInsert,
+        Effect::VectorDelete,
+        Effect::Ddl,
+    ] {
+        let db = Database::open_memory();
+        setup_received_insert_trigger(&db, true);
+        db.execute(
+            "ALTER TABLE sync_trigger_derived ADD COLUMN embedding VECTOR(2)",
+            &empty(),
+        )
+        .unwrap();
+        let fixture_id = uuid(0x52_210);
+        db.execute(
+            "INSERT INTO sync_trigger_derived (id, content, embedding) VALUES ($id, 'fixture', $embedding)",
+            &HashMap::from([
+                ("id".to_string(), Value::Uuid(fixture_id)),
+                ("embedding".to_string(), Value::Vector(vec![0.0, 1.0])),
+            ]),
+        )
+        .unwrap();
+        let fixture_row_id = db.scan("sync_trigger_derived", db.snapshot()).unwrap()[0].row_id;
+        let graph_source = uuid(0x52_200);
+        let graph_target = uuid(0x52_201);
+        let graph_tx = db.begin().unwrap();
+        db.insert_edge(
+            graph_tx,
+            graph_source,
+            graph_target,
+            "fixture".to_string(),
+            HashMap::new(),
+        )
+        .unwrap();
+        db.commit(graph_tx).unwrap();
+        db.register_trigger_callback("received_insert", move |handle, ctx| {
+            let id = ctx.row_values["id"].as_uuid().copied().unwrap();
+            match effect {
+                Effect::UpdateReceivedRow => handle
+                    .execute_in_tx(
+                        ctx.tx,
+                        "UPDATE sync_trigger_source SET content = 'forbidden' WHERE id = $id",
+                        &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+                    )
+                    .map(|_| ()),
+                Effect::DeleteRelationalRow => handle
+                    .execute_in_tx(
+                        ctx.tx,
+                        "DELETE FROM sync_trigger_derived WHERE id = $id",
+                        &HashMap::from([("id".to_string(), Value::Uuid(fixture_id))]),
+                    )
+                    .map(|_| ()),
+                Effect::DeferredUpsertUpdate => handle
+                    .execute_in_tx(
+                        ctx.tx,
+                        "INSERT INTO sync_trigger_derived (id, content) VALUES ($id, 'upserted') ON CONFLICT (id) DO UPDATE SET content = 'upserted'",
+                        &HashMap::from([("id".to_string(), Value::Uuid(fixture_id))]),
+                    )
+                    .map(|_| ()),
+                Effect::GraphInsert => handle
+                    .insert_edge(
+                        ctx.tx,
+                        uuid(0x52_200),
+                        uuid(0x52_201),
+                        "forbidden".to_string(),
+                        HashMap::new(),
+                    )
+                    .map(|_| ()),
+                Effect::GraphDelete => handle.delete_edge(
+                    ctx.tx,
+                    graph_source,
+                    graph_target,
+                    "fixture",
+                ),
+                Effect::VectorInsert => handle
+                    .execute_in_tx(
+                        ctx.tx,
+                        "INSERT INTO sync_trigger_derived (id, content, embedding) VALUES ($id, 'forbidden', $embedding)",
+                        &HashMap::from([
+                            ("id".to_string(), Value::Uuid(id)),
+                            ("embedding".to_string(), Value::Vector(vec![1.0, 2.0])),
+                        ]),
+                    )
+                    .map(|_| ()),
+                Effect::VectorDelete => handle.delete_vector(
+                    ctx.tx,
+                    VectorIndexRef::new("sync_trigger_derived", "embedding"),
+                    fixture_row_id,
+                ),
+                Effect::Ddl => handle
+                    .execute_in_tx(
+                        ctx.tx,
+                        "CREATE TABLE forbidden_callback_ddl (id UUID PRIMARY KEY)",
+                        &empty(),
+                    )
+                    .map(|_| ()),
+            }
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+        let before = db.current_lsn();
+        let result = db.apply_changes(
+            received_source_change(uuid(0x52_300 + before.0 as u128), Lsn(70 + before.0)),
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        );
+        assert!(
+            matches!(result, Err(Error::SyncTriggerEffectNotAllowed { effect: actual, .. }) if actual == effect.expected_family()),
+            "{effect:?} must return the dedicated received-trigger effect error: {result:?}"
+        );
+        assert_eq!(
+            db.current_lsn(),
+            before,
+            "{effect:?} must not commit an LSN"
+        );
+        assert_eq!(count_rows(&db, "sync_trigger_source"), 0);
+        assert_eq!(count_rows(&db, "sync_trigger_derived"), 1);
+        assert!(db.changes_since(before).is_empty());
+        let audits = db
+            .trigger_audit_history(TriggerAuditFilter {
+                trigger_name: Some("received_insert".to_string()),
+                status: Some(TriggerAuditStatusFilter::RolledBack),
+            })
+            .unwrap();
+        assert_eq!(audits.len(), 1, "{effect:?} must leave one rollback audit");
+    }
+}
+
+#[test]
+fn local_trigger_callback_keeps_graph_mutation_api() {
+    let db = Database::open_memory();
+    setup_received_insert_trigger(&db, false);
+    db.register_trigger_callback("received_insert", |handle, ctx| {
+        handle
+            .insert_edge(
+                ctx.tx,
+                uuid(0x52_400),
+                uuid(0x52_401),
+                "local_allowed".to_string(),
+                HashMap::new(),
+            )
+            .map(|_| ())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+    db.execute(
+        "INSERT INTO sync_trigger_source (id, content) VALUES ($id, 'local')",
+        &HashMap::from([("id".to_string(), Value::Uuid(uuid(0x52_402)))]),
+    )
+    .unwrap();
+    assert_eq!(db.changes_since(Lsn(0)).edges.len(), 1);
+}
+
+#[test]
+fn including_sync_rewrites_only_callback_txid_placeholders() {
+    let db = Database::open_memory();
+    let control = Database::open_memory();
+    for target in [&db, &control] {
+        target
+            .execute(
+                "CREATE TABLE sync_trigger_source (id UUID PRIMARY KEY, token TXID)",
+                &empty(),
+            )
+            .unwrap();
+        target
+            .execute(
+                "CREATE TABLE sync_trigger_derived (id UUID PRIMARY KEY, token TXID)",
+                &empty(),
+            )
+            .unwrap();
+    }
+    db.execute(
+        "CREATE TRIGGER received_insert ON sync_trigger_source WHEN INSERT INCLUDING SYNC",
+        &empty(),
+    )
+    .unwrap();
+    control
+        .execute(
+            "CREATE TRIGGER received_insert ON sync_trigger_source WHEN INSERT",
+            &empty(),
+        )
+        .unwrap();
+    db.register_trigger_callback("received_insert", move |handle, ctx| {
+        handle
+            .execute_in_tx(
+                ctx.tx,
+                "INSERT INTO sync_trigger_derived (id, token) VALUES ($id, $token)",
+                &HashMap::from([
+                    ("id".to_string(), ctx.row_values["id"].clone()),
+                    ("token".to_string(), Value::TxId(ctx.tx)),
+                ]),
+            )
+            .map(|_| ())
+    })
+    .unwrap();
+    control
+        .register_trigger_callback("received_insert", |_, _| Ok(()))
+        .unwrap();
+    db.complete_initialization().unwrap();
+    control.complete_initialization().unwrap();
+    let id = uuid(0x52_500);
+    let incoming = ChangeSet {
+        rows: vec![RowChange {
+            table: "sync_trigger_source".to_string(),
+            natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
+            values: HashMap::from([
+                ("id".to_string(), Value::Uuid(id)),
+                ("token".to_string(), Value::TxId(TxId(999))),
+            ]),
+            deleted: false,
+            lsn: Lsn(92),
+            created_at: Some(contextdb_core::Wallclock(1_785_795_000_000)),
+        }],
+        ..Default::default()
+    };
+    control
+        .apply_changes(
+            incoming.clone(),
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+    db.apply_changes(
+        incoming,
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+    let source = &db.scan("sync_trigger_source", db.snapshot()).unwrap()[0];
+    let control_source = &control
+        .scan("sync_trigger_source", control.snapshot())
+        .unwrap()[0];
+    let derived = &db.scan("sync_trigger_derived", db.snapshot()).unwrap()[0];
+    assert_eq!(
+        source, control_source,
+        "trigger dispatch must leave the received row identical to an otherwise-equal no-sync-trigger apply"
+    );
+    assert_eq!(derived.values["token"], Value::TxId(derived.created_tx));
+}
+
+#[test]
+fn including_sync_txid_identity_placeholder_is_typed_while_fixed_and_local_are_allowed() {
+    for active_placeholder in [true, false] {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE sync_trigger_source (id UUID PRIMARY KEY)",
+            &empty(),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE sync_trigger_derived (token TXID PRIMARY KEY, note TEXT)",
+            &empty(),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TRIGGER received_insert ON sync_trigger_source WHEN INSERT INCLUDING SYNC",
+            &empty(),
+        )
+        .unwrap();
+        db.register_trigger_callback("received_insert", move |handle, ctx| {
+            handle
+                .execute_in_tx(
+                    ctx.tx,
+                    "INSERT INTO sync_trigger_derived (token, note) VALUES ($token, 'derived')",
+                    &HashMap::from([(
+                        "token".to_string(),
+                        Value::TxId(if active_placeholder { ctx.tx } else { TxId(0) }),
+                    )]),
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+        db.complete_initialization().unwrap();
+        let before = db.current_lsn();
+        let result = db.apply_changes(
+            ChangeSet {
+                rows: vec![RowChange {
+                    table: "sync_trigger_source".to_string(),
+                    natural_key: NaturalKey::single(
+                        "id".to_string(),
+                        Value::Uuid(uuid(0x52_600 + active_placeholder as u128)),
+                    ),
+                    values: HashMap::from([(
+                        "id".to_string(),
+                        Value::Uuid(uuid(0x52_600 + active_placeholder as u128)),
+                    )]),
+                    deleted: false,
+                    lsn: Lsn(93),
+                    created_at: Some(contextdb_core::Wallclock(1_785_795_000_001)),
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        );
+        if active_placeholder {
+            assert!(matches!(
+                result,
+                Err(Error::SyncTriggerEffectNotAllowed {
+                    effect: "TXID identity placeholder",
+                    ..
+                })
+            ));
+            assert_eq!(db.current_lsn(), before);
+            assert_eq!(count_rows(&db, "sync_trigger_source"), 0);
+            assert_eq!(count_rows(&db, "sync_trigger_derived"), 0);
+            assert_eq!(
+                db.trigger_audit_history(TriggerAuditFilter {
+                    trigger_name: Some("received_insert".to_string()),
+                    status: Some(TriggerAuditStatusFilter::RolledBack),
+                })
+                .unwrap()
+                .len(),
+                1
+            );
+        } else {
+            result.unwrap();
+            let derived = &db.scan("sync_trigger_derived", db.snapshot()).unwrap()[0];
+            assert_eq!(derived.values["token"], Value::TxId(TxId(0)));
+        }
+    }
+
+    let local = Database::open_memory();
+    local
+        .execute(
+            "CREATE TABLE sync_trigger_source (id UUID PRIMARY KEY)",
+            &empty(),
+        )
+        .unwrap();
+    local
+        .execute(
+            "CREATE TABLE sync_trigger_derived (token TXID PRIMARY KEY)",
+            &empty(),
+        )
+        .unwrap();
+    local
+        .execute(
+            "CREATE TRIGGER received_insert ON sync_trigger_source WHEN INSERT",
+            &empty(),
+        )
+        .unwrap();
+    local
+        .register_trigger_callback("received_insert", |handle, ctx| {
+            handle
+                .execute_in_tx(
+                    ctx.tx,
+                    "INSERT INTO sync_trigger_derived (token) VALUES ($token)",
+                    &HashMap::from([("token".to_string(), Value::TxId(ctx.tx))]),
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    local.complete_initialization().unwrap();
+    local
+        .execute(
+            "INSERT INTO sync_trigger_source (id) VALUES ($id)",
+            &HashMap::from([("id".to_string(), Value::Uuid(uuid(0x52_700)))]),
+        )
+        .unwrap();
+    let derived = &local
+        .scan("sync_trigger_derived", local.snapshot())
+        .unwrap()[0];
+    assert_eq!(derived.values["token"], Value::TxId(derived.created_tx));
+}
+
+#[test]
+fn including_sync_fires_when_received_schema_and_data_commit_together() {
+    let db = Database::open_memory();
+    setup_received_insert_trigger(&db, true);
+    register_received_derived_callback(&db);
+    db.complete_initialization().unwrap();
+    let mut changes = received_source_change(uuid(0x52_101), Lsn(53));
+    changes.ddl = vec![DdlChange::CreateIndex {
+        table: "sync_trigger_source".to_string(),
+        name: "sync_trigger_source_content".to_string(),
+        columns: vec![("content".to_string(), SortDirection::Asc)],
+    }];
+    changes.ddl_lsn = vec![Lsn(53)];
+
+    db.apply_changes(
+        changes,
+        &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+    )
+    .unwrap();
+    assert_eq!(count_rows(&db, "sync_trigger_source"), 1);
+    assert_eq!(count_rows(&db, "sync_trigger_derived"), 1);
+    assert!(
+        db.table_meta("sync_trigger_source")
+            .unwrap()
+            .indexes
+            .iter()
+            .any(|index| index.name == "sync_trigger_source_content")
+    );
+}
+
+#[test]
+fn including_sync_declaration_persists_reopens_and_transports_as_typed_ddl() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("including-sync.redb");
+    let source = Database::open(&path).unwrap();
+    setup_received_insert_trigger(&source, true);
+    let ddl = source.changes_since(Lsn(0));
+    assert!(ddl.ddl.iter().any(|change| matches!(
+        change,
+        DdlChange::CreateTriggerIncludingSync { name, table, on_events }
+            if name == "received_insert"
+                && table == "sync_trigger_source"
+                && on_events == &vec!["INSERT".to_string()]
+    )));
+    source.close().unwrap();
+
+    let reopened = Database::open(&path).unwrap();
+    assert!(
+        reopened
+            .list_triggers()
+            .iter()
+            .any(|trigger| { trigger.name == "received_insert" && trigger.including_sync })
+    );
+    reopened.close().unwrap();
+
+    let receiver = Database::open_memory();
+    receiver
+        .apply_changes(ddl, &ConflictPolicies::uniform(ConflictPolicy::LatestWins))
+        .unwrap();
+    assert!(
+        receiver
+            .list_triggers()
+            .iter()
+            .any(|trigger| { trigger.name == "received_insert" && trigger.including_sync })
+    );
+}
+
+#[tokio::test]
+async fn including_sync_hub_derivation_reaches_another_edge_without_outbound_echo() {
+    let fabric = InProcessBroker::new();
+    let tenant_id = "including-sync-lineage";
+    let hub_identity = Arc::new(FabricIdentity::generate());
+    let edge_a_identity = Arc::new(FabricIdentity::generate());
+    let edge_b_identity = Arc::new(FabricIdentity::generate());
+    let hub_node_id = hub_identity.node_id();
+    let edge_a_node_id = edge_a_identity.node_id();
+    let edge_b_node_id = edge_b_identity.node_id();
+
+    let tmp = TempDir::new().unwrap();
+    let hub_path = tmp.path().join("hub.redb");
+    let edge_a_path = tmp.path().join("edge-a.redb");
+    let edge_b_path = tmp.path().join("edge-b.redb");
+    let hub_db = Arc::new(Database::open(&hub_path).unwrap());
+    let edge_a_db = Arc::new(Database::open(&edge_a_path).unwrap());
+    let mut edge_b_db = Arc::new(Database::open(&edge_b_path).unwrap());
+
+    let server = Arc::new(
+        SyncServer::with_authenticated_transport_and_identity_for_test(
+            hub_db.clone(),
+            fabric.server_as(&hub_node_id),
+            contextdb_core::TenantId::from(tenant_id),
+            hub_node_id.clone(),
+            hub_identity,
+        ),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_task = server.clone();
+    let shutdown_task = shutdown.clone();
+    let task = tokio::spawn(async move { server_task.run_until(shutdown_task).await });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
+            tenant_id,
+        )),
+    )
+    .await
+    .expect("sync server route must be ready");
+
+    setup_received_insert_trigger(&edge_a_db, true);
+    for table in ["sync_trigger_source", "sync_trigger_derived"] {
+        edge_a_db
+            .execute(
+                &format!("ALTER TABLE {table} SET SYNC CONFLICT KEEP LATEST"),
+                &empty(),
+            )
+            .unwrap();
+    }
+    edge_a_db
+        .register_trigger_callback("received_insert", |_, _| Ok(()))
+        .unwrap();
+    edge_a_db.complete_initialization().unwrap();
+
+    let edge_a = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_a_db.clone(),
+        fabric.client_as(&edge_a_node_id),
+        contextdb_core::TenantId::from(tenant_id),
+        edge_a_identity,
+    );
+    let edge_b_identity_for_reopen = edge_b_identity.clone();
+    let edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_b_db.clone(),
+        fabric.client_as(&edge_b_node_id),
+        contextdb_core::TenantId::from(tenant_id),
+        edge_b_identity,
+    );
+
+    edge_a.push().await.unwrap();
+    edge_b.pull_default().await.unwrap();
+    register_received_derived_callback(&hub_db);
+    hub_db.complete_initialization().unwrap();
+    register_received_derived_callback(&edge_b_db);
+    edge_b_db.complete_initialization().unwrap();
+
+    let id = uuid(0x53_001);
+    let source_since = edge_a_db.current_lsn();
+    edge_a_db
+        .execute(
+            "INSERT INTO sync_trigger_source (id, content) VALUES ($id, 'edge-authored')",
+            &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+        )
+        .unwrap();
+    let graph_source = uuid(0x53_100);
+    let graph_target = uuid(0x53_101);
+    let graph_tx = edge_a_db.begin().unwrap();
+    edge_a_db
+        .insert_edge(
+            graph_tx,
+            graph_source,
+            graph_target,
+            "received_graph".to_string(),
+            HashMap::new(),
+        )
+        .unwrap();
+    edge_a_db.commit(graph_tx).unwrap();
+    let source_only = edge_a_db.changes_since(source_since);
+    assert_eq!(source_only.rows.len(), 1);
+    assert_eq!(source_only.edges.len(), 1);
+    assert!(
+        source_only
+            .rows
+            .iter()
+            .all(|row| row.table == "sync_trigger_source"),
+        "the first source-LSN page must precede the hub-derived row"
+    );
+    edge_b_db
+        .apply_changes(
+            source_only,
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+    assert_eq!(count_rows(&edge_b_db, "sync_trigger_derived"), 1);
+    assert_eq!(
+        edge_b.pending_push_change_count().unwrap(),
+        0,
+        "an edge-derived materialization of the source-only page is not outbound"
+    );
+
+    edge_a.push().await.unwrap();
+    assert_eq!(count_rows(&hub_db, "sync_trigger_source"), 1);
+    assert_eq!(count_rows(&hub_db, "sync_trigger_derived"), 1);
+
+    edge_b.pull_default().await.unwrap();
+    assert_eq!(count_rows(&edge_b_db, "sync_trigger_source"), 1);
+    assert_eq!(count_rows(&edge_b_db, "sync_trigger_derived"), 1);
+    assert_eq!(edge_b.pending_push_change_count().unwrap(), 0);
+
+    drop(edge_b);
+    edge_b_db.close().unwrap();
+    edge_b_db = Arc::new(Database::open(&edge_b_path).unwrap());
+    register_received_derived_callback(&edge_b_db);
+    edge_b_db.complete_initialization().unwrap();
+    let reopened_edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
+        edge_b_db.clone(),
+        fabric.client_as(&edge_b_node_id),
+        contextdb_core::TenantId::from(tenant_id),
+        edge_b_identity_for_reopen,
+    );
+    assert_eq!(reopened_edge_b.pending_push_change_count().unwrap(), 0);
+    reopened_edge_b.pull_default().await.unwrap();
+    assert_eq!(count_rows(&edge_b_db, "sync_trigger_source"), 1);
+    assert_eq!(count_rows(&edge_b_db, "sync_trigger_derived"), 1);
+    assert_eq!(reopened_edge_b.pending_push_change_count().unwrap(), 0);
+
+    let local_graph_delete = edge_b_db.begin().unwrap();
+    edge_b_db
+        .delete_edge(
+            local_graph_delete,
+            graph_source,
+            graph_target,
+            "received_graph",
+        )
+        .unwrap();
+    edge_b_db.commit(local_graph_delete).unwrap();
+    assert_eq!(
+        reopened_edge_b.pending_push_change_count().unwrap(),
+        1,
+        "a later local delete of the same received graph identity must replace its pulled marker and propagate"
+    );
+
+    shutdown.store(true, Ordering::SeqCst);
+    task.await.unwrap();
 }

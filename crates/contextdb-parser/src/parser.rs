@@ -2382,6 +2382,7 @@ fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut table = None;
     let mut event = None;
+    let mut including_sync = false;
     for p in pair.into_inner() {
         match p.as_rule() {
             Rule::identifier if name.is_none() => name = Some(parse_identifier(p.as_str())),
@@ -2394,6 +2395,7 @@ fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
                     _ => return Err(Error::ParseError("invalid trigger event".to_string())),
                 });
             }
+            Rule::including_sync_clause => including_sync = true,
             other => return Err(unexpected_rule(other, "build_create_trigger")),
         }
     }
@@ -2404,6 +2406,7 @@ fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
         on_events: vec![
             event.ok_or_else(|| Error::ParseError("CREATE TRIGGER missing event".to_string()))?,
         ],
+        including_sync,
     })
 }
 

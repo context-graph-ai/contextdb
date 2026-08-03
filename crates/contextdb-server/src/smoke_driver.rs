@@ -511,7 +511,10 @@ fn ddl_targets_fixture(change: &DdlChange) -> bool {
         | DdlChange::CreateEventType { table, .. }
         | DdlChange::CreateRoute { table, .. }
         | DdlChange::DropRoute { table, .. } => table == DDL_TABLE,
-        DdlChange::CreateTrigger { name, table, .. } => name == DDL_TRIGGER || table == DDL_TABLE,
+        DdlChange::CreateTrigger { name, table, .. }
+        | DdlChange::CreateTriggerIncludingSync { name, table, .. } => {
+            name == DDL_TRIGGER || table == DDL_TABLE
+        }
         DdlChange::DropTrigger { name } => name == DDL_TRIGGER,
         DdlChange::CreateSink { .. } => false,
     }
@@ -892,6 +895,7 @@ fn ddl_kind(change: &DdlChange) -> &'static str {
     match change {
         DdlChange::CreateTable { name, .. } if name == DDL_TABLE => "create_table",
         DdlChange::CreateTrigger { name, table, .. }
+        | DdlChange::CreateTriggerIncludingSync { name, table, .. }
             if name == DDL_TRIGGER && table == DDL_TABLE =>
         {
             "create_trigger"

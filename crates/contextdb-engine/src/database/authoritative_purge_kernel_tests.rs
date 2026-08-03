@@ -66,6 +66,8 @@ struct OwnedCopies {
     survivor_deletion_state: DurableDeletionStateSnapshot,
     selected_edge_deletion_state: DurableDeletionStateSnapshot,
     survivor_edge_deletion_state: DurableDeletionStateSnapshot,
+    selected_graph_arrival: Option<DurableGraphArrival>,
+    survivor_graph_arrival: Option<DurableGraphArrival>,
 }
 
 #[derive(Clone)]
@@ -402,6 +404,24 @@ fn owned_copies(db: &Database, fixture: &Fixture) -> OwnedCopies {
             .durable_deletion_state_for_test(EDGES, &Value::Uuid(fixture.selected_edge)),
         survivor_edge_deletion_state: db
             .durable_deletion_state_for_test(EDGES, &Value::Uuid(fixture.survivor_edge)),
+        selected_graph_arrival: db
+            .sync_graph_arrivals
+            .read()
+            .get(&(
+                fixture.selected,
+                fixture.selected_graph_target,
+                EDGE_TYPE.to_string(),
+            ))
+            .cloned(),
+        survivor_graph_arrival: db
+            .sync_graph_arrivals
+            .read()
+            .get(&(
+                fixture.survivor,
+                fixture.survivor_graph_target,
+                EDGE_TYPE.to_string(),
+            ))
+            .cloned(),
     }
 }
 
@@ -931,6 +951,8 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert!(before.survivor_note_live_sidecar.is_some());
     assert!(before.selected_edge_live_sidecar.is_some());
     assert!(before.survivor_edge_live_sidecar.is_some());
+    assert!(before.selected_graph_arrival.is_some());
+    assert!(before.survivor_graph_arrival.is_some());
     assert_eq!(
         before.graph.selected_forward,
         BTreeSet::from([fixture.selected_graph_target])
@@ -1047,6 +1069,14 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     );
     assert_eq!(after_notes.graph, before.graph);
     assert_eq!(
+        after_notes.selected_graph_arrival,
+        before.selected_graph_arrival
+    );
+    assert_eq!(
+        after_notes.survivor_graph_arrival,
+        before.survivor_graph_arrival
+    );
+    assert_eq!(
         after_notes.selected_edge_live_sidecar,
         before.selected_edge_live_sidecar
     );
@@ -1071,6 +1101,11 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert_eq!(after_edges.selected_edge_disk_sync_source, None);
     assert_eq!(after_edges.selected_edge_memory_sync_source, None);
     assert_eq!(after_edges.selected_edge_live_sidecar, None);
+    assert_eq!(after_edges.selected_graph_arrival, None);
+    assert_eq!(
+        after_edges.survivor_graph_arrival,
+        before.survivor_graph_arrival
+    );
     assert_eq!(after_edges.survivor_edge_live, before.survivor_edge_live);
     assert_eq!(
         after_edges.survivor_edge_history,

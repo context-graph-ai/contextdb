@@ -340,6 +340,11 @@ pub enum WireDdlChange {
         #[serde(default)]
         table: String,
     },
+    CreateTriggerIncludingSync {
+        name: String,
+        table: String,
+        on_events: Vec<String>,
+    },
 }
 
 /// The wire mirror of `NaturalKey`: the leading key column/value plus every
@@ -492,6 +497,7 @@ fn wire_ddl_affected_table(ddl: &WireDdlChange) -> Option<&str> {
             Some(table)
         }
         WireDdlChange::CreateTrigger { table, .. }
+        | WireDdlChange::CreateTriggerIncludingSync { table, .. }
         | WireDdlChange::CreateEventType { table, .. }
         | WireDdlChange::CreateRoute { table, .. }
         | WireDdlChange::DropRoute { table, .. }
@@ -502,6 +508,7 @@ fn wire_ddl_affected_table(ddl: &WireDdlChange) -> Option<&str> {
         WireDdlChange::DropTrigger { .. }
         | WireDdlChange::CreateSink { .. }
         | WireDdlChange::CreateTrigger { .. }
+        | WireDdlChange::CreateTriggerIncludingSync { .. }
         | WireDdlChange::CreateEventType { .. }
         | WireDdlChange::CreateRoute { .. }
         | WireDdlChange::DropRoute { .. } => None,
@@ -797,6 +804,15 @@ impl From<DdlChange> for WireDdlChange {
                 where_in,
             },
             DdlChange::DropRoute { name, table } => Self::DropRoute { name, table },
+            DdlChange::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
+            } => Self::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
+            },
         }
     }
 }
@@ -900,6 +916,15 @@ impl From<WireDdlChange> for DdlChange {
                 where_in,
             },
             WireDdlChange::DropRoute { name, table } => Self::DropRoute { name, table },
+            WireDdlChange::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
+            } => Self::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
+            },
         }
     }
 }

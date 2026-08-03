@@ -2286,6 +2286,45 @@ fn drop_rows_that_arrived_by_sync_after(
         !db.vector_change_arrived_by_sync(vector)
             || reupload_through.is_some_and(|through| vector.lsn <= through)
     });
+    // Graph sync carries final edge state, not an operation log. Keep only the
+    // newest insert/delete for one identity before applying the bounded
+    // current-arrival marker. A suppressed pulled insert or delete therefore
+    // cannot expose an older opposite operation as stale resurrection.
+    let mut selected_edges = std::collections::HashMap::new();
+    for (index, edge) in changes.edges.iter().enumerate() {
+        let deleted = edge
+            .properties
+            .get("__deleted")
+            .is_some_and(|value| value == &contextdb_core::Value::Bool(true));
+        selected_edges
+            .entry((edge.source, edge.target, edge.edge_type.clone()))
+            .and_modify(|state: &mut (usize, Lsn, bool)| {
+                // Storage applies deletes before inserts in one commit, so a
+                // live state wins an equal-LSN tie. Equal states select the
+                // later change-log occurrence and its properties.
+                let newer_lsn = edge.lsn > state.1;
+                let same_lsn_wins = edge.lsn == state.1 && (!deleted || deleted == state.2);
+                if newer_lsn || same_lsn_wins {
+                    *state = (index, edge.lsn, deleted);
+                }
+            })
+            .or_insert((index, edge.lsn, deleted));
+    }
+    let selected_edge_indices = selected_edges
+        .into_values()
+        .map(|(index, _, _)| index)
+        .collect::<std::collections::HashSet<_>>();
+    changes.edges = changes
+        .edges
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, edge)| {
+            (selected_edge_indices.contains(&index)
+                && (!db.graph_change_arrived_by_sync(&edge)
+                    || reupload_through.is_some_and(|through| edge.lsn <= through)))
+            .then_some(edge)
+        })
+        .collect();
     changes
 }
 
@@ -2453,7 +2492,8 @@ mod tests {
     use contextdb_core::{RowId, Value};
     use contextdb_engine::Database;
     use contextdb_engine::sync_types::{
-        ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange, VectorChange,
+        ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
+        VectorChange,
     };
     use uuid::Uuid;
 
@@ -3065,6 +3105,37 @@ mod tests {
     }
 
     #[test]
+    fn a20_including_sync_trigger_uses_the_same_bootstrap_barrier() {
+        let id = Uuid::new_v4();
+        let changeset = ChangeSet {
+            rows: vec![RowChange {
+                table: "host_writes".to_string(),
+                natural_key: NaturalKey::single("id".to_string(), Value::Uuid(id)),
+                values: HashMap::from([("id".to_string(), Value::Uuid(id))]),
+                deleted: false,
+                lsn: Lsn(3),
+                created_at: None,
+            }],
+            ddl: vec![DdlChange::CreateTriggerIncludingSync {
+                name: "host_write_trigger".to_string(),
+                table: "host_writes".to_string(),
+                on_events: vec!["INSERT".to_string()],
+            }],
+            ddl_lsn: vec![Lsn(2)],
+            ..ChangeSet::default()
+        };
+
+        let batches = split_changeset(changeset);
+        assert!(
+            batches.len() >= 2
+                && batches[0].has_create_trigger_ddl()
+                && batches[0].data_entry_count() == 0
+                && batches.iter().skip(1).any(|batch| !batch.rows.is_empty()),
+            "INCLUDING SYNC must stop bootstrap before any trigger-attached data; batches={batches:?}"
+        );
+    }
+
+    #[test]
     fn a21_split_changeset_does_not_fabricate_cursor_for_same_lsn_trigger_data() {
         let id = Uuid::new_v4();
         let changeset = ChangeSet {
@@ -3197,5 +3268,173 @@ mod tests {
         );
         assert_eq!(batches[0].rows.len(), 2);
         assert_eq!(batches[0].max_lsn(), Some(Lsn(44)));
+    }
+
+    #[test]
+    fn pulled_graph_delete_after_move_boundary_cannot_resurrect_inherited_insert() {
+        let db = Database::open_memory();
+        db.complete_initialization().unwrap();
+        let source = Uuid::from_u128(0x991);
+        let target = Uuid::from_u128(0x992);
+        db.apply_changes(
+            ChangeSet {
+                edges: vec![EdgeChange {
+                    source,
+                    target,
+                    edge_type: "related".to_string(),
+                    properties: HashMap::new(),
+                    lsn: Lsn(98),
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+        let move_boundary = db.current_lsn();
+        let inherited = drop_rows_that_arrived_by_sync_after(
+            &db,
+            db.changes_since(Lsn(0)),
+            Some(move_boundary),
+        );
+        assert_eq!(inherited.edges.len(), 1);
+        db.apply_changes(
+            ChangeSet {
+                edges: vec![EdgeChange {
+                    source,
+                    target,
+                    edge_type: "related".to_string(),
+                    properties: HashMap::from([("__deleted".to_string(), Value::Bool(true))]),
+                    lsn: Lsn(99),
+                }],
+                ..Default::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+        let moved = drop_rows_that_arrived_by_sync_after(
+            &db,
+            db.changes_since(Lsn(0)),
+            Some(move_boundary),
+        );
+        assert!(moved.edges.is_empty());
+
+        let local_reinsert = db.begin().unwrap();
+        db.insert_edge(
+            local_reinsert,
+            source,
+            target,
+            "related".to_string(),
+            HashMap::new(),
+        )
+        .unwrap();
+        db.commit(local_reinsert).unwrap();
+        let outbound = drop_rows_that_arrived_by_sync(&db, db.changes_since(Lsn(0)));
+        assert_eq!(outbound.edges.len(), 1);
+        assert!(!matches!(
+            outbound.edges[0].properties.get("__deleted"),
+            Some(Value::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn same_lsn_graph_delete_reinsert_sends_one_live_state_and_never_echoes() {
+        let source_db = Database::open_memory();
+        source_db.complete_initialization().unwrap();
+        let source = Uuid::from_u128(0x993);
+        let target = Uuid::from_u128(0x994);
+
+        let create = source_db.begin().unwrap();
+        let edge_type = "related".to_string();
+        source_db
+            .insert_edge(create, source, target, edge_type, HashMap::new())
+            .unwrap();
+        source_db.commit(create).unwrap();
+
+        let replace = source_db.begin().unwrap();
+        source_db
+            .delete_edge(replace, source, target, "related")
+            .unwrap();
+        source_db
+            .insert_edge(
+                replace,
+                source,
+                target,
+                "related".to_string(),
+                HashMap::from([("generation".to_string(), Value::Int64(2))]),
+            )
+            .unwrap();
+        source_db.commit(replace).unwrap();
+
+        let replacement_lsn = source_db.current_lsn();
+        let raw = source_db.changes_since(Lsn(0));
+        let replacement_entries = raw
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.source == source
+                    && edge.target == target
+                    && edge.edge_type == "related"
+                    && edge.lsn == replacement_lsn
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replacement_entries.len(), 2);
+        let deleted = |edge: &&EdgeChange| {
+            matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)))
+        };
+        assert_eq!(replacement_entries.iter().filter(deleted).count(), 1);
+        let mut live_count = 0;
+        for edge in &replacement_entries {
+            if !deleted(edge) {
+                live_count += 1;
+            }
+        }
+        assert_eq!(live_count, 1);
+
+        let outbound = drop_rows_that_arrived_by_sync(&source_db, raw);
+        assert_eq!(outbound.edges.len(), 1);
+        assert_eq!(
+            outbound.edges[0].properties.get("generation"),
+            Some(&Value::Int64(2))
+        );
+        assert!(!matches!(
+            outbound.edges[0].properties.get("__deleted"),
+            Some(Value::Bool(true))
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let receiver_path = temp.path().join("receiver.redb");
+        {
+            let receiver = Database::open(&receiver_path).unwrap();
+            receiver.complete_initialization().unwrap();
+            receiver
+                .apply_changes(
+                    outbound,
+                    &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+                )
+                .unwrap();
+            assert_eq!(
+                receiver
+                    .get_edge_properties(source, target, "related", receiver.snapshot())
+                    .unwrap()
+                    .and_then(|properties| properties.get("generation").cloned()),
+                Some(Value::Int64(2))
+            );
+            let received_changes = receiver.changes_since(Lsn(0));
+            let pending = drop_rows_that_arrived_by_sync(&receiver, received_changes);
+            assert!(pending.edges.is_empty());
+        }
+
+        let reopened = Database::open(&receiver_path).unwrap();
+        reopened.complete_initialization().unwrap();
+        assert_eq!(
+            reopened
+                .get_edge_properties(source, target, "related", reopened.snapshot())
+                .unwrap()
+                .and_then(|properties| properties.get("generation").cloned()),
+            Some(Value::Int64(2))
+        );
+        let reopened_changes = reopened.changes_since(Lsn(0));
+        let pending = drop_rows_that_arrived_by_sync(&reopened, reopened_changes);
+        assert!(pending.edges.is_empty());
     }
 }

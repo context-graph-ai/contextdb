@@ -97,6 +97,43 @@ fn sync_protocol_types_roundtrip_under_rmp_serde() {
     );
 }
 
+#[test]
+fn including_sync_trigger_roundtrips_through_both_wire_mirrors() {
+    use contextdb_engine::protocol::WireDdlChange as EngineWireDdlChange;
+    use contextdb_engine::sync_types::DdlChange;
+    use contextdb_server::protocol::WireDdlChange as ServerWireDdlChange;
+
+    let declaration = DdlChange::CreateTriggerIncludingSync {
+        name: "received_insert".to_string(),
+        table: "events".to_string(),
+        on_events: vec!["INSERT".to_string()],
+    };
+
+    let engine_wire = EngineWireDdlChange::from(declaration.clone());
+    let engine_bytes = rmp_serde::to_vec(&engine_wire).unwrap();
+    let engine_decoded: EngineWireDdlChange = rmp_serde::from_slice(&engine_bytes).unwrap();
+    assert_eq!(DdlChange::from(engine_decoded), declaration);
+
+    let server_wire = ServerWireDdlChange::from(declaration.clone());
+    let server_bytes = rmp_serde::to_vec(&server_wire).unwrap();
+    let server_decoded: ServerWireDdlChange = rmp_serde::from_slice(&server_bytes).unwrap();
+    assert_eq!(DdlChange::from(server_decoded), declaration);
+
+    let legacy = DdlChange::CreateTrigger {
+        name: "ordinary".to_string(),
+        table: "events".to_string(),
+        on_events: vec!["INSERT".to_string()],
+    };
+    assert!(matches!(
+        DdlChange::from(EngineWireDdlChange::from(legacy.clone())),
+        DdlChange::CreateTrigger { .. }
+    ));
+    assert!(matches!(
+        DdlChange::from(ServerWireDdlChange::from(legacy)),
+        DdlChange::CreateTrigger { .. }
+    ));
+}
+
 // ======== protocol version wire constant ========
 
 #[test]

@@ -33,6 +33,7 @@ pub enum Statement {
         name: String,
         table: String,
         on_events: Vec<TriggerEvent>,
+        including_sync: bool,
     },
     DropTrigger {
         name: String,

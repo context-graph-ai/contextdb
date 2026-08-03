@@ -4057,6 +4057,19 @@ struct TerminalRefusalMarkerRecord {
     generation: u64,
 }
 
+const SYNC_GRAPH_ARRIVAL_PREFIX: &str = "sync_graph_arrival.v1.";
+type GraphIdentity = (NodeId, NodeId, EdgeType);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DurableGraphArrival {
+    source: NodeId,
+    target: NodeId,
+    edge_type: EdgeType,
+    local_lsn: Lsn,
+    deleted: bool,
+    pulled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TerminalRefusalScanState {
     pub(crate) source: Option<Incarnation>,
@@ -5061,6 +5074,7 @@ struct AuthoritativePurgePublicationReplacements {
     vector: PreparedVectorPublication,
     event_bus: event_bus::PreparedAuthoritativePurgeEventBusPublication,
     accepted_author_memory_mirror: HashMap<(String, Vec<u8>), String>,
+    graph_arrival_memory_mirror: HashMap<GraphIdentity, DurableGraphArrival>,
     memory_swap: PreparedMemorySwapAccounting,
 }
 
@@ -5080,6 +5094,7 @@ struct AuthoritativePurgePreparedSet {
     disk_source_provenance: Vec<(String, RowId, Lsn, u8)>,
     lineage_config_owners: Vec<AuthoritativePurgeLineageConfigOwners>,
     durable_sink_entries: Vec<AuthoritativePurgeSinkEntryKey>,
+    graph_arrival_config_keys: Vec<String>,
     publication_replacements: AuthoritativePurgePublicationReplacements,
     survivor_report: QueryResult,
 }
@@ -5151,6 +5166,10 @@ pub struct TriggerDeclaration {
     pub name: String,
     pub table: String,
     pub on_events: Vec<TriggerEvent>,
+    // Persisted separately so the legacy declaration payload retains its
+    // exact binary layout and old databases decode with the default `false`.
+    #[serde(skip)]
+    pub including_sync: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5632,6 +5651,11 @@ pub struct Database {
     /// database lifetime; rebuilding old tombstone provenance after restart is
     /// a separate retention/recovery design.
     sync_tombstone_arrivals: Arc<RwLock<HashMap<(String, String), SyncTombstoneArrival>>>,
+    /// Exact receiver-local graph occurrences that arrived through sync.
+    /// Unlike a current-state flag, retaining the local LSN lets a later
+    /// local mutation of the same edge propagate without resurrecting the
+    /// older pulled occurrence.
+    sync_graph_arrivals: Arc<RwLock<HashMap<GraphIdentity, DurableGraphArrival>>>,
     /// Private, exact-version markers for rows the hub terminally refused.
     /// They are reconciliation state, never a queryable rejection inbox.
     terminal_refusal_markers:
@@ -7747,6 +7771,7 @@ impl Database {
             change_log_lsn_refcounts,
             ddl_log,
             sync_tombstone_arrivals: Arc::new(RwLock::new(HashMap::new())),
+            sync_graph_arrivals: Arc::new(RwLock::new(HashMap::new())),
             terminal_refusal_markers: Arc::new(RwLock::new(HashMap::new())),
             terminal_refusal_scans: Arc::new(RwLock::new(HashMap::new())),
             accepted_sync_row_authors: Arc::new(RwLock::new(HashMap::new())),
@@ -8020,6 +8045,7 @@ impl Database {
             change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),
             sync_tombstone_arrivals: self.sync_tombstone_arrivals.clone(),
+            sync_graph_arrivals: self.sync_graph_arrivals.clone(),
             terminal_refusal_markers: self.terminal_refusal_markers.clone(),
             terminal_refusal_scans: self.terminal_refusal_scans.clone(),
             accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),
@@ -8429,6 +8455,7 @@ impl Database {
         );
 
         db.load_received_ddl_arrivals_from_persistence()?;
+        db.load_graph_arrivals_from_persistence()?;
 
         for meta in all_meta.values() {
             if !meta.dag_edge_types.is_empty() {
@@ -9045,6 +9072,11 @@ impl Database {
                 name,
                 table,
                 on_events,
+            }
+            | DdlChange::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
             } => name
                 .len()
                 .saturating_add(table.len())
@@ -9186,7 +9218,9 @@ impl Database {
     fn stage_local_trigger_ddl(&self, tx: TxId, ddl: DdlChange) -> Result<()> {
         self.ensure_no_pending_event_bus_ddl_for_local_schema(tx)?;
         self.require_admin_trigger_ddl(match &ddl {
-            DdlChange::CreateTrigger { .. } => "CREATE TRIGGER",
+            DdlChange::CreateTrigger { .. } | DdlChange::CreateTriggerIncludingSync { .. } => {
+                "CREATE TRIGGER"
+            }
             DdlChange::DropTrigger { .. } => "DROP TRIGGER",
             _ => "trigger DDL",
         })?;
@@ -10360,6 +10394,7 @@ impl Database {
             trigger_ddl,
             None,
             None,
+            false,
         )
     }
 
@@ -10371,8 +10406,11 @@ impl Database {
         trigger_ddl: &[DdlChange],
         sync_pull_trigger_audit_projection: Option<&BTreeMap<String, TriggerDeclaration>>,
         sync_tombstones: Option<&[AcceptedSyncTombstone]>,
+        sync_trigger_derived_rows_are_local: bool,
     ) -> Result<CommitValidationOutcome> {
         let pending_trigger_audits = std::cell::RefCell::new(Vec::new());
+        let sync_pull_pre_trigger_creation_keys = std::cell::RefCell::new(HashSet::<String>::new());
+        let sync_pull_pre_trigger_rows = std::cell::RefCell::new(HashSet::<(String, RowId)>::new());
         let pending_trigger_active_guards =
             std::cell::RefCell::new(Vec::<TriggerCallbackThreadGuard>::new());
         let mut pending_sink_events = Vec::new();
@@ -10384,11 +10422,15 @@ impl Database {
             std::cell::RefCell::new(None::<event_bus::QueueMutationLease>);
         let mut committed_trigger_audit_entries = Vec::new();
         let in_memory_lineage_delta = std::cell::RefCell::new(None);
+        let committed_graph_arrivals =
+            std::cell::RefCell::new(Vec::<(GraphIdentity, DurableGraphArrival)>::new());
         let validation_noop_count = std::cell::Cell::new(0_u64);
         let pre_apply_index_maintenance_visits = std::cell::Cell::new(0_u64);
         #[cfg(feature = "test-seams")]
         let apply_started = std::cell::Cell::new(None::<Instant>);
         let delete_release_bytes = std::cell::RefCell::new(DeleteReleaseBytes::default());
+        let sync_trigger_dispatch_required = source != CommitSource::SyncPull
+            || self.has_matching_sync_trigger_for_tx(tx, sync_pull_trigger_audit_projection)?;
         let (lsn, ws) = {
             match self.tx_mgr.commit_with_lsn_active_prepare_and_applied_mut(
                 tx,
@@ -10400,8 +10442,12 @@ impl Database {
                     // refusal, not an ordinary lost-update result.
                     self.tx_mgr
                         .with_write_set(tx, |ws| self.reject_purged_lineage_recreation(ws))??;
-                    if source != CommitSource::SyncPull {
-                        let outcome = match self.prepare_active_trigger_write_set_for_dispatch(tx) {
+                    if sync_trigger_dispatch_required {
+                        let outcome = match if source == CommitSource::SyncPull {
+                            self.prepare_active_sync_trigger_write_set_for_dispatch(tx)
+                        } else {
+                            self.prepare_active_trigger_write_set_for_dispatch(tx)
+                        } {
                             Ok(outcome) => outcome,
                             Err(error) => {
                                 let reason = error.to_string();
@@ -10418,7 +10464,33 @@ impl Database {
                                 .get()
                                 .saturating_add(outcome.conditional_noop_count),
                         );
-                        match self.dispatch_triggers_for_tx(tx) {
+                        if source == CommitSource::SyncPull {
+                            let (creation_keys, rows) = self.tx_mgr.with_write_set(tx, |ws| {
+                                let creation_keys = ws
+                                    .config_writes
+                                    .iter()
+                                    .filter(|(key, _)| key.starts_with("sync_creation_lineage.v1."))
+                                    .map(|(key, _)| key.clone())
+                                    .collect();
+                                let rows = ws
+                                    .relational_inserts
+                                    .iter()
+                                    .map(|(table, row)| (table.clone(), row.row_id))
+                                    .collect();
+                                (creation_keys, rows)
+                            })?;
+                            *sync_pull_pre_trigger_creation_keys.borrow_mut() = creation_keys;
+                            *sync_pull_pre_trigger_rows.borrow_mut() = rows;
+                        }
+                        let dispatch = if source == CommitSource::SyncPull {
+                            self.dispatch_sync_triggers_for_tx(
+                                tx,
+                                sync_pull_trigger_audit_projection,
+                            )
+                        } else {
+                            self.dispatch_triggers_for_tx(tx)
+                        };
+                        match dispatch {
                             Ok(outcome) => {
                                 *pending_trigger_audits.borrow_mut() = outcome.pending;
                                 pending_trigger_active_guards
@@ -10433,7 +10505,32 @@ impl Database {
                                 return Err(failure.error);
                             }
                         }
-                        let outcome = self.prepare_active_trigger_write_set_for_dispatch(tx)?;
+                        if source == CommitSource::SyncPull && !sync_trigger_derived_rows_are_local
+                        {
+                            let pre_trigger_rows = sync_pull_pre_trigger_rows.borrow();
+                            self.tx_mgr.with_write_set(tx, |ws| {
+                                let derived_rows = ws
+                                    .relational_inserts
+                                    .iter()
+                                    .filter(|(table, row)| {
+                                        !pre_trigger_rows.contains(&(table.clone(), row.row_id))
+                                    })
+                                    .map(|(table, row)| (table.clone(), row.row_id))
+                                    .collect::<Vec<_>>();
+                                for (table, row_id) in derived_rows {
+                                    ws.set_relational_insert_source_lsn(
+                                        table,
+                                        row_id,
+                                        SYNC_SOURCE_LSN_OWN_COMMIT,
+                                    );
+                                }
+                            })?;
+                        }
+                        let outcome = if source == CommitSource::SyncPull {
+                            self.prepare_active_sync_trigger_write_set_for_dispatch(tx)?
+                        } else {
+                            self.prepare_active_trigger_write_set_for_dispatch(tx)?
+                        };
                         Self::reject_user_conditional_update_conflicts(source, &outcome)?;
                         validation_noop_count.set(
                             validation_noop_count
@@ -10445,15 +10542,33 @@ impl Database {
                 },
                 |ws| {
                     if !ws.is_empty() {
+                        if source == CommitSource::SyncPull && sync_trigger_dispatch_required {
+                            self.rewrite_txid_placeholders_for_rows_not_in(
+                                tx,
+                                ws,
+                                &sync_pull_pre_trigger_rows.borrow(),
+                            );
+                        }
                         if source == CommitSource::SyncPull {
                             // A received row has only the authenticated wire
                             // sidecar staged by sync apply. Never leave local
                             // unbound creation evidence behind: after a later
                             // sidecar loss it could be rebound as a false
                             // local author.
-                            ws.config_writes
-                                .retain(|(key, _)| !key.starts_with("sync_creation_lineage.v1."));
-                            self.stamp_durable_delete_positions_at_commit(ws)?;
+                            let received_creation_keys =
+                                sync_pull_pre_trigger_creation_keys.borrow();
+                            ws.config_writes.retain(|(key, _)| {
+                                if !key.starts_with("sync_creation_lineage.v1.") {
+                                    return true;
+                                }
+                                sync_trigger_derived_rows_are_local
+                                    && !received_creation_keys.contains(key)
+                            });
+                            // An authoritative hub owns callback-derived rows,
+                            // so only that role retains and stamps post-snapshot
+                            // creation evidence. An edge materialization stays
+                            // Pulled and owns no new fleet creation identity.
+                            self.stamp_unbound_creation_lineages_at_commit(ws)?;
                         } else {
                             self.stamp_unbound_creation_lineages_at_commit(ws)?;
                         }
@@ -10468,6 +10583,11 @@ impl Database {
                                 .get()
                                 .saturating_add(final_validation.conditional_noop_count),
                         );
+                        *committed_graph_arrivals.borrow_mut() = self.stage_pulled_graph_arrivals(
+                            ws,
+                            source == CommitSource::SyncPull
+                                && !sync_trigger_derived_rows_are_local,
+                        )?;
                         if let Some(lsn) = ws.commit_lsn {
                             let trigger_ddl_start =
                                 self.stage_event_bus_ddl_for_commit(lsn, event_bus_ddl)?;
@@ -10505,11 +10625,18 @@ impl Database {
                                     self.staged_trigger_declarations_for_commit(lsn);
                                 let audit_projection = sync_pull_trigger_audit_projection
                                     .or(projected_declarations.as_ref());
-                                self.committed_sync_pull_trigger_audits_for_write_set(
+                                let mut entries = self
+                                    .committed_sync_pull_trigger_audits_for_write_set(
+                                        ws,
+                                        lsn,
+                                        audit_projection,
+                                    )?;
+                                entries.extend(self.committed_trigger_audits_for_pending(
+                                    &pending_trigger_audits.borrow(),
                                     ws,
                                     lsn,
-                                    audit_projection,
-                                )?
+                                ));
+                                entries
                             } else {
                                 let pending = pending_trigger_audits.borrow();
                                 self.committed_trigger_audits_for_pending(&pending, ws, lsn)
@@ -10560,6 +10687,11 @@ impl Database {
                         }
                         if let Some(delta) = in_memory_lineage_delta.borrow_mut().take() {
                             self.publish_in_memory_lineage_delta(delta);
+                        }
+                        if !committed_graph_arrivals.borrow().is_empty() {
+                            self.sync_graph_arrivals
+                                .write()
+                                .extend(committed_graph_arrivals.borrow_mut().drain(..));
                         }
                         let index_maintenance_visits = self
                             .relational_store
@@ -11238,10 +11370,9 @@ impl Database {
                 name,
                 table,
                 on_events,
-            } => Some(DdlChange::CreateTrigger {
-                name: name.clone(),
-                table: table.clone(),
-                on_events: on_events
+                including_sync,
+            } => {
+                let on_events = on_events
                     .iter()
                     .map(|event| match event {
                         contextdb_parser::ast::TriggerEvent::Insert => "INSERT",
@@ -11249,8 +11380,21 @@ impl Database {
                         contextdb_parser::ast::TriggerEvent::Delete => "DELETE",
                     })
                     .map(str::to_string)
-                    .collect(),
-            }),
+                    .collect();
+                Some(if *including_sync {
+                    DdlChange::CreateTriggerIncludingSync {
+                        name: name.clone(),
+                        table: table.clone(),
+                        on_events,
+                    }
+                } else {
+                    DdlChange::CreateTrigger {
+                        name: name.clone(),
+                        table: table.clone(),
+                        on_events,
+                    }
+                })
+            }
             Statement::DropTrigger { name } => Some(DdlChange::DropTrigger { name: name.clone() }),
             Statement::CreateSink {
                 name,
@@ -11724,6 +11868,77 @@ impl Database {
             })
     }
 
+    fn graph_arrival_config_key(record: &DurableGraphArrival) -> Result<String> {
+        let identity = rmp_serde::to_vec(&(record.source, record.target, &record.edge_type))
+            .map_err(|error| {
+                Error::SyncError(format!("graph arrival identity encode failed: {error}"))
+            })?;
+        Ok(format!(
+            "{SYNC_GRAPH_ARRIVAL_PREFIX}{}",
+            blake3::hash(&identity).to_hex()
+        ))
+    }
+
+    fn graph_arrival_key(record: &DurableGraphArrival) -> GraphIdentity {
+        (record.source, record.target, record.edge_type.clone())
+    }
+
+    fn stage_pulled_graph_arrivals(
+        &self,
+        ws: &mut WriteSet,
+        pulled: bool,
+    ) -> Result<Vec<(GraphIdentity, DurableGraphArrival)>> {
+        let Some(local_lsn) = ws.commit_lsn else {
+            return Ok(Vec::new());
+        };
+        let mut records = ws
+            .adj_deletes
+            .iter()
+            .map(|(source, edge_type, target, _)| DurableGraphArrival {
+                source: *source,
+                target: *target,
+                edge_type: edge_type.clone(),
+                local_lsn,
+                deleted: true,
+                pulled,
+            })
+            .collect::<Vec<_>>();
+        // Storage applies deletes before inserts, so a same-commit
+        // delete+reinsert is live. Insert markers must win that exact tie.
+        records.extend(ws.adj_inserts.iter().map(|edge| DurableGraphArrival {
+            source: edge.source,
+            target: edge.target,
+            edge_type: edge.edge_type.clone(),
+            local_lsn,
+            deleted: false,
+            pulled,
+        }));
+        let markers = records
+            .iter()
+            .map(|record| (Self::graph_arrival_key(record), record.clone()))
+            .collect();
+        for record in records {
+            ws.config_writes.push((
+                Self::graph_arrival_config_key(&record)?,
+                RedbPersistence::encode_config_value(&record)?,
+            ));
+        }
+        Ok(markers)
+    }
+
+    /// Whether this exact receiver-local graph occurrence came from sync.
+    /// Insert and delete are distinct so a later local operation on the same
+    /// `(source,target,type)` is never mistaken for an echo.
+    pub fn graph_change_arrived_by_sync(&self, edge: &EdgeChange) -> bool {
+        let deleted = matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)));
+        self.sync_graph_arrivals
+            .read()
+            .get(&(edge.source, edge.target, edge.edge_type.clone()))
+            .is_some_and(|marker| {
+                marker.pulled && marker.local_lsn == edge.lsn && marker.deleted == deleted
+            })
+    }
+
     /// Whether this exact vector-owner mutation arrived by sync. Vector
     /// RowIds are local-store identities, so outbound echo filtering must use
     /// the owner plus its local commit LSN rather than a table/LSN group.
@@ -11982,6 +12197,26 @@ impl Database {
         state.unbound_creations.extend(delta.unbound_creations);
         state.row_sidecars.extend(delta.row_sidecars);
         state.records.extend(delta.records);
+    }
+
+    fn load_graph_arrivals_from_persistence(&self) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let mut arrivals = HashMap::new();
+        for (key, record) in persistence
+            .load_config_values_with_prefix::<DurableGraphArrival>(SYNC_GRAPH_ARRIVAL_PREFIX)?
+        {
+            if key != Self::graph_arrival_config_key(&record)? {
+                return Err(Error::StoreCorrupted {
+                    path: key,
+                    reason: "graph-arrival key disagrees with its canonical record".to_string(),
+                });
+            }
+            arrivals.insert(Self::graph_arrival_key(&record), record);
+        }
+        *self.sync_graph_arrivals.write() = arrivals;
+        Ok(())
     }
 
     fn durable_lineage_config_key(
@@ -12602,6 +12837,12 @@ impl Database {
         *working.in_memory_applied_push_watermarks.lock() =
             self.in_memory_applied_push_watermarks.lock().clone();
         *working.lineage_state_lock.lock() = self.lineage_state_lock.lock().clone();
+        *working.trigger.declarations.lock() = self.trigger.declarations.lock().clone();
+        *working.trigger.callbacks.write() = self.trigger.callbacks.read().clone();
+        working
+            .trigger
+            .ready
+            .store(self.trigger.ready.load(Ordering::SeqCst), Ordering::SeqCst);
         Ok(working)
     }
 
@@ -13986,6 +14227,7 @@ impl Database {
                 Some(table)
             }
             DdlChange::CreateTrigger { table, .. }
+            | DdlChange::CreateTriggerIncludingSync { table, .. }
             | DdlChange::CreateEventType { table, .. }
             | DdlChange::CreateRoute { table, .. }
             | DdlChange::DropRoute { table, .. }
@@ -13996,6 +14238,7 @@ impl Database {
             DdlChange::DropTrigger { .. }
             | DdlChange::CreateSink { .. }
             | DdlChange::CreateTrigger { .. }
+            | DdlChange::CreateTriggerIncludingSync { .. }
             | DdlChange::CreateEventType { .. }
             | DdlChange::CreateRoute { .. }
             | DdlChange::DropRoute { .. } => None,
@@ -16974,6 +17217,25 @@ impl Database {
             );
         }
         Ok(())
+    }
+
+    fn rewrite_txid_placeholders_for_rows_not_in(
+        &self,
+        origin_tx: TxId,
+        ws: &mut WriteSet,
+        baseline: &HashSet<(String, RowId)>,
+    ) {
+        for (table, row) in &mut ws.relational_inserts {
+            if baseline.contains(&(table.clone(), row.row_id)) {
+                continue;
+            }
+            self.rewrite_txid_placeholders_in_values(
+                table,
+                origin_tx,
+                row.created_tx,
+                &mut row.values,
+            );
+        }
     }
 
     fn rewrite_txid_placeholders_in_values(
@@ -22631,6 +22893,40 @@ impl Database {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let selected_graph_occurrences = edge_insert_witnesses
+            .iter()
+            .map(|(source, target, edge_type, lsn)| {
+                (*source, *target, edge_type.clone(), *lsn, false)
+            })
+            .chain(
+                edge_delete_witnesses
+                    .iter()
+                    .map(|(source, target, edge_type, lsn)| {
+                        (*source, *target, edge_type.clone(), *lsn, true)
+                    }),
+            )
+            .collect::<HashSet<_>>();
+        let mut graph_arrival_memory_mirror = self.sync_graph_arrivals.read().clone();
+        let removed_graph_arrivals = graph_arrival_memory_mirror
+            .iter()
+            .filter(|((source, target, edge_type), marker)| {
+                selected_graph_occurrences.contains(&(
+                    *source,
+                    *target,
+                    edge_type.clone(),
+                    marker.local_lsn,
+                    marker.deleted,
+                ))
+            })
+            .map(|(identity, marker)| (identity.clone(), marker.clone()))
+            .collect::<Vec<_>>();
+        let graph_arrival_config_keys = removed_graph_arrivals
+            .iter()
+            .map(|(_, marker)| Self::graph_arrival_config_key(marker))
+            .collect::<Result<Vec<_>>>()?;
+        for (identity, _) in removed_graph_arrivals {
+            graph_arrival_memory_mirror.remove(&identity);
+        }
         let selected_change_log_positions = change_log
             .iter()
             .enumerate()
@@ -22925,6 +23221,7 @@ impl Database {
             vector,
             event_bus,
             accepted_author_memory_mirror,
+            graph_arrival_memory_mirror,
             memory_swap,
         };
         Ok(AuthoritativePurgePreparedSet {
@@ -22935,6 +23232,7 @@ impl Database {
             disk_source_provenance,
             lineage_config_owners,
             durable_sink_entries,
+            graph_arrival_config_keys,
             publication_replacements,
             survivor_report,
         })
@@ -23358,6 +23656,7 @@ impl Database {
                                 owner.accepted_author_key.clone(),
                             ]
                         })
+                        .chain(prepared.graph_arrival_config_keys.iter().cloned())
                         .collect(),
                     lifecycle_records: lifecycle_records
                         .into_iter()
@@ -23397,6 +23696,9 @@ impl Database {
                 *self.accepted_sync_row_authors.write() = prepared
                     .publication_replacements
                     .accepted_author_memory_mirror;
+                *self.sync_graph_arrivals.write() = prepared
+                    .publication_replacements
+                    .graph_arrival_memory_mirror;
                 *self.lineage_state_lock.lock() = lineage_memory_replacement;
                 memory_swap.commit_after_swap();
                 Ok(Some(outcome))
@@ -27972,6 +28274,7 @@ impl Database {
             }
             DdlChange::CreateEventType { .. }
             | DdlChange::CreateTrigger { .. }
+            | DdlChange::CreateTriggerIncludingSync { .. }
             | DdlChange::DropTrigger { .. }
             | DdlChange::CreateSink { .. }
             | DdlChange::CreateRoute { .. }
@@ -28268,6 +28571,7 @@ impl Database {
                 }
                 DdlChange::CreateEventType { .. }
                 | DdlChange::CreateTrigger { .. }
+                | DdlChange::CreateTriggerIncludingSync { .. }
                 | DdlChange::DropTrigger { .. }
                 | DdlChange::CreateSink { .. }
                 | DdlChange::CreateRoute { .. }
@@ -29916,6 +30220,7 @@ impl Database {
                 | DdlChange::CreateIndex { .. }
                 | DdlChange::DropIndex { .. }
                 | DdlChange::CreateTrigger { .. }
+                | DdlChange::CreateTriggerIncludingSync { .. }
                 | DdlChange::DropTrigger { .. }
                 | DdlChange::CreateEventType { .. }
                 | DdlChange::CreateSink { .. }
@@ -32553,11 +32858,16 @@ impl Database {
             if let Some(trigger_ddl) = changes.ddl.iter().find(|ddl| {
                 matches!(
                     ddl,
-                    DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. }
+                    DdlChange::CreateTrigger { .. }
+                        | DdlChange::CreateTriggerIncludingSync { .. }
+                        | DdlChange::DropTrigger { .. }
                 )
             }) {
                 let operation = match trigger_ddl {
-                    DdlChange::CreateTrigger { .. } => "apply_changes CREATE TRIGGER",
+                    DdlChange::CreateTrigger { .. }
+                    | DdlChange::CreateTriggerIncludingSync { .. } => {
+                        "apply_changes CREATE TRIGGER"
+                    }
                     DdlChange::DropTrigger { .. } => "apply_changes DROP TRIGGER",
                     _ => "apply_changes trigger DDL",
                 };
@@ -33498,14 +33808,21 @@ impl Database {
                         table_meta_cache.remove(&table);
                     }
                     trigger_change @ (DdlChange::CreateTrigger { .. }
+                    | DdlChange::CreateTriggerIncludingSync { .. }
                     | DdlChange::DropTrigger { .. }) => {
                         let trigger_table = match &trigger_change {
-                            DdlChange::CreateTrigger { table, .. } => Some(table.clone()),
+                            DdlChange::CreateTrigger { table, .. }
+                            | DdlChange::CreateTriggerIncludingSync { table, .. } => {
+                                Some(table.clone())
+                            }
                             DdlChange::DropTrigger { .. } => None,
                             _ => None,
                         };
                         self.require_admin_trigger_ddl(match &trigger_change {
-                            DdlChange::CreateTrigger { .. } => "apply_changes CREATE TRIGGER",
+                            DdlChange::CreateTrigger { .. }
+                            | DdlChange::CreateTriggerIncludingSync { .. } => {
+                                "apply_changes CREATE TRIGGER"
+                            }
                             DdlChange::DropTrigger { .. } => "apply_changes DROP TRIGGER",
                             _ => "apply_changes trigger DDL",
                         })?;
@@ -34954,6 +35271,7 @@ impl Database {
             accepted_author_entries,
             terminal_refusal_context,
             terminal_marker_clears,
+            hub_local_author.is_some(),
         )?;
         let committed_lsn = self.current_lsn();
         result.new_lsn = committed_lsn;
@@ -34976,6 +35294,7 @@ impl Database {
         accepted_author_entries: Vec<(String, Vec<u8>, String)>,
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
         terminal_marker_clears: Vec<(String, NaturalKey)>,
+        sync_trigger_derived_rows_are_local: bool,
     ) -> Result<()> {
         // The transaction-manager callback publishes accepted delete
         // provenance while it still holds the commit lock, after relational
@@ -34987,6 +35306,7 @@ impl Database {
             trigger_ddl,
             sync_pull_trigger_audit_projection,
             Some(accepted_sync_tombstones),
+            sync_trigger_derived_rows_are_local,
         )?;
         if !accepted_author_entries.is_empty() {
             self.accepted_sync_row_authors.write().extend(

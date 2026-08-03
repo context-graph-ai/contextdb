@@ -365,6 +365,13 @@ pub enum Error {
         trigger_name: String,
         reason: String,
     },
+    #[error(
+        "sync trigger `{trigger_name}` attempted forbidden effect `{effect}`; INCLUDING SYNC callbacks may only insert relational rows"
+    )]
+    SyncTriggerEffectNotAllowed {
+        trigger_name: String,
+        effect: &'static str,
+    },
     #[error("trigger operation requires an admin database handle: {operation}")]
     TriggerRequiresAdmin { operation: String },
     #[error("schema invalid: {reason}")]

@@ -765,6 +765,7 @@ impl Database {
             change_log_lsn_refcounts: self.change_log_lsn_refcounts.clone(),
             ddl_log: self.ddl_log.clone(),
             sync_tombstone_arrivals: self.sync_tombstone_arrivals.clone(),
+            sync_graph_arrivals: self.sync_graph_arrivals.clone(),
             terminal_refusal_markers: self.terminal_refusal_markers.clone(),
             terminal_refusal_scans: self.terminal_refusal_scans.clone(),
             accepted_sync_row_authors: self.accepted_sync_row_authors.clone(),

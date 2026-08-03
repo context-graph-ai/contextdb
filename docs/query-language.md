@@ -78,6 +78,7 @@ DROP TABLE t
 ```sql
 CREATE TRIGGER document_seen ON documents WHEN INSERT;
 CREATE TRIGGER item_changed ON items WHEN UPDATE;
+CREATE TRIGGER synced_item_seen ON items WHEN INSERT INCLUDING SYNC;
 DROP TRIGGER document_seen;
 ```
 
@@ -87,6 +88,24 @@ activated by `Database::complete_initialization`. Triggers are for
 transactional observation and cascade writes; they are not validation triggers.
 Use `STATE MACHINE`, `IMMUTABLE`, `DAG`, and `PROPAGATE` for engine-enforced
 invariants.
+
+By default, a trigger fires only for local writes. `INCLUDING SYNC` also fires
+an `INSERT` or `UPDATE` trigger for authenticated sync rows that this database
+accepts. `DELETE` triggers, with or without `INCLUDING SYNC`, are refused at
+declaration time with `TriggerEventUnsupported`. The incoming row,
+callback writes, and callback outcome share one transaction: either all commit,
+or callback failure rolls all of them back. On this received-sync path the
+callback may only append relational `INSERT` rows (plus engine-owned lineage
+sidecars). Relational updates/deletes, graph or vector mutations, DDL, and
+non-engine configuration are refused with a typed trigger-effect error and the
+whole received transaction is rolled back. The same callback invoked by a
+local write retains the full callback API. A received-sync callback may use an
+active-transaction `TXID` placeholder in a non-identity column; the engine
+canonicalizes it after final transaction assignment. The same placeholder in
+any sync identity column (an explicit natural key, every primary-key column,
+or the `id` fallback) is refused as
+`TXID identity placeholder`; a fixed non-placeholder `TXID` identity remains
+valid.
 
 Concurrency: the callback runs inside the firing transaction. Same-DB
 cross-thread writers wait-and-proceed, unrelated databases proceed

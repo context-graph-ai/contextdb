@@ -53,6 +53,30 @@ fn parse_valid_sql_subset() {
 }
 
 #[test]
+fn create_trigger_including_sync_is_an_explicit_opt_in() {
+    let ordinary = parse("CREATE TRIGGER ordinary ON events WHEN INSERT").unwrap();
+    assert!(matches!(
+        ordinary,
+        Statement::CreateTrigger {
+            including_sync: false,
+            ..
+        }
+    ));
+
+    let received = parse("CREATE TRIGGER received ON events WHEN INSERT INCLUDING SYNC").unwrap();
+    assert!(matches!(
+        received,
+        Statement::CreateTrigger {
+            name,
+            table,
+            including_sync: true,
+            ..
+        } if name == "received" && table == "events"
+    ));
+    assert!(parse("CREATE TRIGGER bad ON events WHEN INSERT INCLUDING").is_err());
+}
+
+#[test]
 fn anti_tests_rejected_constructs() {
     assert!(matches!(
         parse("WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t"),

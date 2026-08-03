@@ -401,6 +401,7 @@ impl DatabasePlugin for DdlVetoPlugin {
             DdlChange::CreateIndex { .. } => "CreateIndex",
             DdlChange::DropIndex { .. } => "DropIndex",
             DdlChange::CreateTrigger { .. } => "CreateTrigger",
+            DdlChange::CreateTriggerIncludingSync { .. } => "CreateTriggerIncludingSync",
             DdlChange::DropTrigger { .. } => "DropTrigger",
             DdlChange::CreateEventType { .. } => "CreateEventType",
             DdlChange::CreateSink { .. } => "CreateSink",

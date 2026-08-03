@@ -132,6 +132,7 @@ fn ds02_ddl_in_changeset_after_reopen() {
         DdlChange::CreateIndex { .. }
         | DdlChange::DropIndex { .. }
         | DdlChange::CreateTrigger { .. }
+        | DdlChange::CreateTriggerIncludingSync { .. }
         | DdlChange::DropTrigger { .. }
         | DdlChange::CreateEventType { .. }
         | DdlChange::CreateSink { .. }
@@ -163,6 +164,7 @@ fn ds02_ddl_in_changeset_after_reopen() {
         DdlChange::CreateIndex { .. }
         | DdlChange::DropIndex { .. }
         | DdlChange::CreateTrigger { .. }
+        | DdlChange::CreateTriggerIncludingSync { .. }
         | DdlChange::DropTrigger { .. }
         | DdlChange::CreateEventType { .. }
         | DdlChange::CreateSink { .. }

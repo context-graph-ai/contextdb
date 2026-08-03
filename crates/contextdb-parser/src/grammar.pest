@@ -359,7 +359,9 @@ create_trigger_stmt = {
     ^"CREATE" ~ ^"TRIGGER" ~ identifier
     ~ ^"ON" ~ identifier
     ~ ^"WHEN" ~ event_trigger
+    ~ including_sync_clause?
 }
+including_sync_clause = { ^"INCLUDING" ~ ^"SYNC" }
 drop_trigger_stmt = { ^"DROP" ~ ^"TRIGGER" ~ identifier }
 
 create_event_type_stmt = {

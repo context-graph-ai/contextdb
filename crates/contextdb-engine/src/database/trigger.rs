@@ -1,6 +1,7 @@
 use super::*;
 
 const TRIGGER_DECLARATIONS_CONFIG_KEY: &str = "__trigger_declarations";
+const TRIGGER_INCLUDING_SYNC_CONFIG_KEY: &str = "__trigger_including_sync";
 pub(super) const TRIGGER_CASCADE_DEPTH_CAP: u32 = 16;
 pub(crate) const TRIGGER_AUDIT_RING_CAPACITY: usize = 1024;
 
@@ -100,6 +101,18 @@ struct TriggerDispatchSnapshot {
 struct TriggerFiring {
     event: TriggerEvent,
     row: VersionedRow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TriggerDispatchMode {
+    Local,
+    IncludingSync,
+}
+
+impl TriggerDispatchMode {
+    fn includes(self, declaration: &TriggerDeclaration) -> bool {
+        self == Self::Local || declaration.including_sync
+    }
 }
 
 pub(super) struct TriggerCallbackThreadGuard {
@@ -340,9 +353,15 @@ impl Database {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
         };
-        let declarations = persistence
+        let mut declarations = persistence
             .load_config_value::<Vec<TriggerDeclaration>>(TRIGGER_DECLARATIONS_CONFIG_KEY)?
             .unwrap_or_default();
+        let including_sync = persistence
+            .load_config_value::<BTreeSet<String>>(TRIGGER_INCLUDING_SYNC_CONFIG_KEY)?
+            .unwrap_or_default();
+        for declaration in &mut declarations {
+            declaration.including_sync = including_sync.contains(&declaration.name);
+        }
         self.replace_trigger_declarations(declarations);
 
         let (ring_history, next_index) =
@@ -386,10 +405,21 @@ impl Database {
         declarations: &BTreeMap<String, TriggerDeclaration>,
     ) -> Result<Vec<(&'static str, Vec<u8>)>> {
         let values = declarations.values().cloned().collect::<Vec<_>>();
-        Ok(vec![(
-            TRIGGER_DECLARATIONS_CONFIG_KEY,
-            RedbPersistence::encode_config_value(&values)?,
-        )])
+        let including_sync = declarations
+            .values()
+            .filter(|declaration| declaration.including_sync)
+            .map(|declaration| declaration.name.clone())
+            .collect::<BTreeSet<_>>();
+        Ok(vec![
+            (
+                TRIGGER_DECLARATIONS_CONFIG_KEY,
+                RedbPersistence::encode_config_value(&values)?,
+            ),
+            (
+                TRIGGER_INCLUDING_SYNC_CONFIG_KEY,
+                RedbPersistence::encode_config_value(&including_sync)?,
+            ),
+        ])
     }
 
     pub(super) fn trigger_snapshot_ddl_for_tables(
@@ -401,14 +431,25 @@ impl Database {
             .lock()
             .values()
             .filter(|declaration| live_tables.contains(&declaration.table))
-            .map(|declaration| DdlChange::CreateTrigger {
-                name: declaration.name.clone(),
-                table: declaration.table.clone(),
-                on_events: declaration
+            .map(|declaration| {
+                let on_events = declaration
                     .on_events
                     .iter()
                     .map(|event| event.as_ddl_str().to_string())
-                    .collect(),
+                    .collect();
+                if declaration.including_sync {
+                    DdlChange::CreateTriggerIncludingSync {
+                        name: declaration.name.clone(),
+                        table: declaration.table.clone(),
+                        on_events,
+                    }
+                } else {
+                    DdlChange::CreateTrigger {
+                        name: declaration.name.clone(),
+                        table: declaration.table.clone(),
+                        on_events,
+                    }
+                }
             })
             .collect()
     }
@@ -494,7 +535,9 @@ impl Database {
 
     pub(super) fn apply_trigger_ddl_from_user(&self, ddl: DdlChange) -> Result<()> {
         self.require_admin_trigger_ddl(match &ddl {
-            DdlChange::CreateTrigger { .. } => "CREATE TRIGGER",
+            DdlChange::CreateTrigger { .. } | DdlChange::CreateTriggerIncludingSync { .. } => {
+                "CREATE TRIGGER"
+            }
             DdlChange::DropTrigger { .. } => "DROP TRIGGER",
             _ => "trigger DDL",
         })?;
@@ -508,11 +551,16 @@ impl Database {
         projected_tables: &HashMap<String, TableMeta>,
     ) -> Result<()> {
         match ddl {
-            DdlChange::CreateTrigger {
+            change @ (DdlChange::CreateTrigger {
                 name,
                 table,
                 on_events,
-            } => {
+            }
+            | DdlChange::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
+            }) => {
                 if !projected_tables.contains_key(table) {
                     return Err(Error::TableNotFound(table.clone()));
                 }
@@ -520,10 +568,12 @@ impl Database {
                     .iter()
                     .map(|event| TriggerEvent::from_ddl_str(event))
                     .collect::<Result<Vec<_>>>()?;
+                let including_sync = matches!(change, DdlChange::CreateTriggerIncludingSync { .. });
                 let incoming = TriggerDeclaration {
                     name: name.clone(),
                     table: table.clone(),
                     on_events: events,
+                    including_sync,
                 };
                 if let Some(existing) = projected.get(name) {
                     if existing == &incoming {
@@ -655,7 +705,9 @@ impl Database {
 
     fn trigger_ddl_has_transient_lifecycle(ddl: &[DdlChange]) -> bool {
         ddl.iter().enumerate().any(|(index, change)| {
-            let DdlChange::CreateTrigger { name, table, .. } = change else {
+            let (DdlChange::CreateTrigger { name, table, .. }
+            | DdlChange::CreateTriggerIncludingSync { name, table, .. }) = change
+            else {
                 return false;
             };
             ddl.iter().skip(index + 1).any(|later| match later {
@@ -675,11 +727,16 @@ impl Database {
         let mut projected = self.trigger.declarations.lock().clone();
         for (index, change) in ddl.iter().enumerate() {
             match change {
-                DdlChange::CreateTrigger {
+                trigger_change @ (DdlChange::CreateTrigger {
                     name,
                     table,
                     on_events,
-                } if self.table_meta(table).is_none() => {
+                }
+                | DdlChange::CreateTriggerIncludingSync {
+                    name,
+                    table,
+                    on_events,
+                }) if self.table_meta(table).is_none() => {
                     let removed_later = ddl.iter().skip(index + 1).any(|later| match later {
                         DdlChange::DropTrigger { name: dropped } => dropped == name,
                         DdlChange::DropTable {
@@ -694,10 +751,13 @@ impl Database {
                         .iter()
                         .map(|event| TriggerEvent::from_ddl_str(event))
                         .collect::<Result<Vec<_>>>()?;
+                    let including_sync =
+                        matches!(trigger_change, DdlChange::CreateTriggerIncludingSync { .. });
                     let incoming = TriggerDeclaration {
                         name: name.clone(),
                         table: table.clone(),
                         on_events: events,
+                        including_sync,
                     };
                     if let Some(existing) = projected.get(name) {
                         if existing != &incoming {
@@ -791,11 +851,16 @@ impl Database {
         ddl: &DdlChange,
     ) -> Result<()> {
         match ddl {
-            DdlChange::CreateTrigger {
+            change @ (DdlChange::CreateTrigger {
                 name,
                 table,
                 on_events,
-            } => {
+            }
+            | DdlChange::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
+            }) => {
                 if self.table_meta(table).is_none() {
                     return Err(Error::TableNotFound(table.clone()));
                 }
@@ -803,11 +868,13 @@ impl Database {
                     .iter()
                     .map(|event| TriggerEvent::from_ddl_str(event))
                     .collect::<Result<Vec<_>>>()?;
+                let including_sync = matches!(change, DdlChange::CreateTriggerIncludingSync { .. });
                 if let Some(existing) = declarations.get(name) {
                     let incoming = TriggerDeclaration {
                         name: name.clone(),
                         table: table.clone(),
                         on_events: events,
+                        including_sync,
                     };
                     if existing == &incoming {
                         return Ok(());
@@ -822,6 +889,7 @@ impl Database {
                         name: name.clone(),
                         table: table.clone(),
                         on_events: events,
+                        including_sync,
                     },
                 );
                 Ok(())
@@ -878,14 +946,6 @@ impl Database {
             .any(|declaration| declaration.table == table)
     }
 
-    fn triggers_for_table_event(
-        &self,
-        table: &str,
-        event: TriggerEvent,
-    ) -> Vec<TriggerDeclaration> {
-        self.triggers_for_table_event_from(None, table, event)
-    }
-
     fn triggers_for_table_event_from(
         &self,
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
@@ -908,6 +968,19 @@ impl Database {
             .collect()
     }
 
+    fn triggers_for_table_event_for_dispatch(
+        &self,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        table: &str,
+        event: TriggerEvent,
+        mode: TriggerDispatchMode,
+    ) -> Vec<TriggerDeclaration> {
+        self.triggers_for_table_event_from(declarations, table, event)
+            .into_iter()
+            .filter(|declaration| mode.includes(declaration))
+            .collect()
+    }
+
     fn trigger_declarations_from(
         &self,
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
@@ -923,7 +996,57 @@ impl Database {
         &self,
         tx: TxId,
     ) -> std::result::Result<TriggerDispatchOutcome, Box<TriggerDispatchFailure>> {
-        if self.trigger.declarations.lock().is_empty() {
+        self.dispatch_triggers_for_tx_from(tx, None, TriggerDispatchMode::Local)
+    }
+
+    pub(super) fn dispatch_sync_triggers_for_tx(
+        &self,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+    ) -> std::result::Result<TriggerDispatchOutcome, Box<TriggerDispatchFailure>> {
+        self.dispatch_triggers_for_tx_from(tx, declarations, TriggerDispatchMode::IncludingSync)
+    }
+
+    /// Keep the ordinary received-write commit path byte-for-byte quiet unless
+    /// an opted-in declaration can actually observe one of its staged rows.
+    /// In particular, running sync validation merely because an unrelated
+    /// INCLUDING SYNC trigger exists can reject otherwise valid vector/schema
+    /// arrivals.
+    pub(super) fn has_matching_sync_trigger_for_tx(
+        &self,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+    ) -> Result<bool> {
+        let tables = self.tx_mgr.with_write_set(tx, |ws| {
+            ws.relational_inserts
+                .iter()
+                .map(|(table, _)| table.clone())
+                .collect::<HashSet<_>>()
+        })?;
+        Ok(self
+            .trigger_declarations_from(declarations)
+            .iter()
+            .any(|declaration| {
+                declaration.including_sync
+                    && tables.contains(&declaration.table)
+                    && declaration
+                        .on_events
+                        .iter()
+                        .any(|event| matches!(event, TriggerEvent::Insert | TriggerEvent::Update))
+            }))
+    }
+
+    fn dispatch_triggers_for_tx_from(
+        &self,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
+    ) -> std::result::Result<TriggerDispatchOutcome, Box<TriggerDispatchFailure>> {
+        if self
+            .trigger_declarations_from(declarations)
+            .iter()
+            .all(|declaration| !mode.includes(declaration))
+        {
             return Ok(TriggerDispatchOutcome {
                 pending: Vec::new(),
                 active_guards: Vec::new(),
@@ -943,7 +1066,9 @@ impl Database {
                     active_guards: Vec::new(),
                 })
             })?;
-        if let Err(error) = self.dispatch_trigger_range(tx, 0, initial_len, 1, &mut run) {
+        if let Err(error) =
+            self.dispatch_trigger_range(tx, 0, initial_len, 1, &mut run, declarations, mode)
+        {
             let reason = error.to_string();
             if let Err(audit_error) =
                 self.append_rolled_back_trigger_audits(&run.pending, tx, &reason)
@@ -989,6 +1114,19 @@ impl Database {
         })?
     }
 
+    pub(super) fn prepare_active_sync_trigger_write_set_for_dispatch(
+        &self,
+        tx: TxId,
+    ) -> Result<CommitValidationOutcome> {
+        self.tx_mgr.with_write_set_detached(tx, |ws| {
+            ws.canonicalize_final_state();
+            if ws.is_empty() {
+                return Ok(CommitValidationOutcome::default());
+            }
+            Ok(self.commit_validate(tx, ws)?)
+        })?
+    }
+
     fn dispatch_trigger_range(
         &self,
         tx: TxId,
@@ -996,8 +1134,10 @@ impl Database {
         end: usize,
         depth: u32,
         run: &mut TriggerDispatchRun,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
     ) -> Result<()> {
-        let mut snapshot = self.trigger_dispatch_snapshot(tx)?;
+        let mut snapshot = self.trigger_dispatch_snapshot(tx, declarations, mode)?;
         let mut index = start;
         while index < end {
             let maybe_row = self.tx_mgr.with_write_set(tx, |ws| {
@@ -1030,7 +1170,9 @@ impl Database {
             } else {
                 TriggerEvent::Insert
             };
-            for declaration in self.triggers_for_table_event(&table, event) {
+            for declaration in
+                self.triggers_for_table_event_for_dispatch(declarations, &table, event, mode)
+            {
                 if !run
                     .processed
                     .insert((table.clone(), row.row_id, declaration.name.clone()))
@@ -1047,9 +1189,11 @@ impl Database {
                     depth,
                     run,
                     &snapshot.triggered_tables,
+                    declarations,
+                    mode,
                 )?;
                 if index.saturating_add(1) < end {
-                    snapshot = self.trigger_dispatch_snapshot(tx)?;
+                    snapshot = self.trigger_dispatch_snapshot(tx, declarations, mode)?;
                 }
             }
             index += 1;
@@ -1057,12 +1201,16 @@ impl Database {
         Ok(())
     }
 
-    fn trigger_dispatch_snapshot(&self, tx: TxId) -> Result<TriggerDispatchSnapshot> {
+    fn trigger_dispatch_snapshot(
+        &self,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
+    ) -> Result<TriggerDispatchSnapshot> {
         let triggered_tables = self
-            .trigger
-            .declarations
-            .lock()
-            .values()
+            .trigger_declarations_from(declarations)
+            .into_iter()
+            .filter(|declaration| mode.includes(declaration))
             .map(|declaration| declaration.table.clone())
             .collect::<HashSet<_>>();
         let (latest_insert_index, deleted_rows) = self.tx_mgr.with_write_set(tx, |ws| {
@@ -1094,6 +1242,8 @@ impl Database {
         depth: u32,
         run: &mut TriggerDispatchRun,
         triggered_tables: &HashSet<String>,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        mode: TriggerDispatchMode,
     ) -> Result<()> {
         if depth > TRIGGER_CASCADE_DEPTH_CAP {
             let entry = TriggerAuditEntry {
@@ -1120,6 +1270,9 @@ impl Database {
                 trigger_name: declaration.name.clone(),
             })?;
         let before = self.write_set_counts(tx)?;
+        let before_write_set = (mode == TriggerDispatchMode::IncludingSync)
+            .then(|| self.tx_mgr.cloned_write_set(tx))
+            .transpose()?;
         let ctx = TriggerContext {
             trigger_name: declaration.name.clone(),
             table: declaration.table.clone(),
@@ -1131,7 +1284,25 @@ impl Database {
         let callback_thread =
             TriggerState::enter_callback_thread_scope(&self.trigger, &ctx.trigger_name, tx);
         run.active_guards.push(callback_thread);
-        let callback_result = self.run_trigger_callback(tx, &ctx, callback);
+        let callback_result = self
+            .run_trigger_callback(tx, &ctx, callback)
+            .map_err(|error| {
+                let effect = if mode == TriggerDispatchMode::IncludingSync {
+                    match &error {
+                        Error::TriggerRequiresAdmin { .. } => Some("DDL"),
+                        Error::CallbackReentry {
+                            kind: CallbackKind::Trigger,
+                        } => Some("DDL/control operation"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                effect.map_or(error, |effect| Error::SyncTriggerEffectNotAllowed {
+                    trigger_name: declaration.name.clone(),
+                    effect,
+                })
+            });
         if let Err(error) = callback_result {
             let entry = TriggerAuditEntry {
                 trigger_name: declaration.name,
@@ -1145,6 +1316,32 @@ impl Database {
             };
             self.append_trigger_audit(entry)?;
             return Err(error);
+        }
+        if let Some(before_write_set) = before_write_set.as_ref() {
+            // Classify raw callback effects before schema/vector validation
+            // can obscure the dedicated effect error. Then normalize and
+            // prove the normalized delta remains append-only. Derived TXID
+            // placeholders are rewritten later, after final Tx reassignment.
+            let validation = self
+                .validate_sync_trigger_effects(tx, &declaration.name, before_write_set)
+                .and_then(|_| self.prepare_active_sync_trigger_write_set_for_dispatch(tx))
+                .and_then(|_| {
+                    self.validate_sync_trigger_effects(tx, &declaration.name, before_write_set)
+                });
+            if let Err(error) = validation {
+                let entry = TriggerAuditEntry {
+                    trigger_name: declaration.name,
+                    firing_tx: tx,
+                    firing_lsn: Lsn(0),
+                    depth,
+                    cascade_row_count: 0,
+                    status: TriggerAuditStatus::RolledBack {
+                        reason: error.to_string(),
+                    },
+                };
+                self.append_trigger_audit(entry)?;
+                return Err(error);
+            }
         }
 
         let after = self.write_set_counts(tx).unwrap_or(before);
@@ -1166,7 +1363,12 @@ impl Database {
             return Ok(());
         }
 
-        if let Err(error) = self.prepare_active_trigger_write_set_for_dispatch(tx) {
+        let preparation = if mode == TriggerDispatchMode::IncludingSync {
+            self.prepare_active_sync_trigger_write_set_for_dispatch(tx)
+        } else {
+            self.prepare_active_trigger_write_set_for_dispatch(tx)
+        };
+        if let Err(error) = preparation {
             let entry = TriggerAuditEntry {
                 trigger_name: declaration.name,
                 firing_tx: tx,
@@ -1195,7 +1397,70 @@ impl Database {
                 nested_end,
                 depth.saturating_add(1),
                 run,
+                declarations,
+                mode,
             )?;
+        }
+        Ok(())
+    }
+
+    fn validate_sync_trigger_effects(
+        &self,
+        tx: TxId,
+        trigger_name: &str,
+        before: &contextdb_tx::WriteSet,
+    ) -> Result<()> {
+        let after = self.tx_mgr.cloned_write_set(tx)?;
+        let forbidden = if after.relational_inserts.len() < before.relational_inserts.len()
+            || !after
+                .relational_inserts
+                .starts_with(&before.relational_inserts)
+            || after.relational_deletes != before.relational_deletes
+            || after.relational_delete_predicates != before.relational_delete_predicates
+        {
+            Some("relational update/delete")
+        } else if after.relational_inserts[before.relational_inserts.len()..]
+            .iter()
+            .any(|(table, row)| {
+                self.table_meta(table)
+                    .and_then(|meta| natural_key_columns_for_meta(&meta))
+                    .is_some_and(|columns| {
+                        columns.iter().any(|column| {
+                            matches!(row.values.get(column), Some(Value::TxId(value)) if *value == tx)
+                        })
+                    })
+            })
+        {
+            Some("TXID identity placeholder")
+        } else if after.adj_inserts != before.adj_inserts || after.adj_deletes != before.adj_deletes
+        {
+            Some("graph insert/delete")
+        } else if after.vector_inserts != before.vector_inserts
+            || after.vector_deletes != before.vector_deletes
+            || after.vector_moves != before.vector_moves
+        {
+            Some("vector insert/delete/move")
+        } else if after.config_max_u64_keys != before.config_max_u64_keys
+            || after.config_writes.len() < before.config_writes.len()
+            || !after.config_writes.starts_with(&before.config_writes)
+            || after
+                .config_writes
+                .get(before.config_writes.len()..)
+                .is_none_or(|writes| {
+                    writes
+                        .iter()
+                        .any(|(key, _)| !key.starts_with("sync_creation_lineage.v1."))
+                })
+        {
+            Some("non-owned configuration")
+        } else {
+            None
+        };
+        if let Some(effect) = forbidden {
+            return Err(Error::SyncTriggerEffectNotAllowed {
+                trigger_name: trigger_name.to_string(),
+                effect,
+            });
         }
         Ok(())
     }
@@ -1334,7 +1599,10 @@ impl Database {
                 continue;
             }
             firing_rows.insert((table.clone(), row.row_id));
-            for declaration in declarations {
+            for declaration in declarations
+                .into_iter()
+                .filter(|declaration| !declaration.including_sync)
+            {
                 audits.push(TriggerAuditEntry {
                     trigger_name: declaration.name,
                     firing_tx,
@@ -1362,18 +1630,25 @@ impl Database {
                 name,
                 table,
                 on_events,
+            }
+            | DdlChange::CreateTriggerIncludingSync {
+                name,
+                table,
+                on_events,
             } = change
             {
                 let events = on_events
                     .iter()
                     .map(|event| TriggerEvent::from_ddl_str(event))
                     .collect::<Result<Vec<_>>>()?;
+                let including_sync = matches!(change, DdlChange::CreateTriggerIncludingSync { .. });
                 projected.insert(
                     name.clone(),
                     TriggerDeclaration {
                         name: name.clone(),
                         table: table.clone(),
                         on_events: events,
+                        including_sync,
                     },
                 );
             }
@@ -1805,4 +2080,37 @@ fn logical_write_set_data_entry_count(
         .saturating_add(ws.vector_inserts.len())
         .saturating_add(ws.vector_deletes.len())
         .saturating_add(ws.vector_moves.len())
+}
+
+#[cfg(test)]
+mod sync_effect_tests {
+    use super::*;
+
+    #[test]
+    fn vector_move_delta_is_a_typed_received_trigger_effect() {
+        let db = Database::open_memory();
+        let tx = db.begin().unwrap();
+        let before = db.tx_mgr.cloned_write_set(tx).unwrap();
+        db.tx_mgr
+            .with_write_set(tx, |ws| {
+                ws.vector_moves.push((
+                    VectorIndexRef::new("items", "embedding"),
+                    RowId(1),
+                    RowId(2),
+                    tx,
+                ));
+            })
+            .unwrap();
+        let error = db
+            .validate_sync_trigger_effects(tx, "received_insert", &before)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::SyncTriggerEffectNotAllowed {
+                trigger_name,
+                effect: "vector insert/delete/move"
+            } if trigger_name == "received_insert"
+        ));
+        db.rollback(tx).unwrap();
+    }
 }
