@@ -3378,16 +3378,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(replacement_entries.len(), 2);
-        let deleted = |edge: &&EdgeChange| {
-            matches!(edge.properties.get("__deleted"), Some(Value::Bool(true)))
-        };
-        assert_eq!(replacement_entries.iter().filter(deleted).count(), 1);
+        let mut deleted_count = 0;
         let mut live_count = 0;
         for edge in &replacement_entries {
-            if !deleted(edge) {
+            if matches!(edge.properties.get("__deleted"), Some(Value::Bool(true))) {
+                deleted_count += 1;
+            } else {
                 live_count += 1;
             }
         }
+        assert_eq!(deleted_count, 1);
         assert_eq!(live_count, 1);
 
         let outbound = drop_rows_that_arrived_by_sync(&source_db, raw);
