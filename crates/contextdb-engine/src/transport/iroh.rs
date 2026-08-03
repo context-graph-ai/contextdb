@@ -613,6 +613,8 @@ type PeerProtocols = Arc<Mutex<HashMap<Vec<u8>, PeerHandler>>>;
 type PeerConnectionProtocols = Arc<Mutex<HashMap<Vec<u8>, PeerConnectionHandler>>>;
 type SyncRoutes = Arc<SyncRouteState>;
 type ResponseTransferKey = (String, [u8; blake3::OUT_LEN]);
+type ReplyStreamSlot = AsyncMutex<Option<(SendStream, RecvStream)>>;
+type WeakReplyStreamSlot = Weak<ReplyStreamSlot>;
 
 struct TrackedResponseTransfer {
     count: usize,
@@ -634,7 +636,7 @@ struct SyncRouteLifecycle {
     tracked_response_transfers: usize,
     response_transfers: HashMap<ResponseTransferKey, TrackedResponseTransfer>,
     draining_response_transfers: HashMap<ResponseTransferKey, usize>,
-    reply_streams: Vec<Weak<AsyncMutex<Option<(SendStream, RecvStream)>>>>,
+    reply_streams: Vec<WeakReplyStreamSlot>,
 }
 
 #[derive(Default)]
