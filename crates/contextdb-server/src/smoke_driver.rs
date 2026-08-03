@@ -135,6 +135,7 @@ enum DdlPhase {
     AuthorPush,
     PullInspect,
     InspectLocal,
+    InspectRefusal,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -345,8 +346,15 @@ async fn run_ddl_source(args: DdlSourceArgs) -> Result<(), String> {
     let database = Arc::new(
         Database::open(&args.db).map_err(|_| "cannot open DDL source database".to_string())?,
     );
-    if matches!(args.phase, DdlPhase::InspectLocal) {
-        print_ddl_vector(&database, "local_ddl_vector")?;
+    if matches!(
+        args.phase,
+        DdlPhase::InspectLocal | DdlPhase::InspectRefusal
+    ) {
+        match args.phase {
+            DdlPhase::InspectLocal => print_ddl_vector(&database, "local_ddl_vector")?,
+            DdlPhase::InspectRefusal => print_refused_ddl_state(&database)?,
+            _ => unreachable!(),
+        }
         database
             .close()
             .map_err(|_| "cannot close DDL inspection database".to_string())?;
@@ -432,7 +440,9 @@ async fn run_ddl_source(args: DdlSourceArgs) -> Result<(), String> {
                 .map_err(|_| "DDL pull failed".to_string())?;
             print_ddl_vector(&database, "received_ddl_vector")?;
         }
-        DdlPhase::InspectLocal => unreachable!("handled before transport setup"),
+        DdlPhase::InspectLocal | DdlPhase::InspectRefusal => {
+            unreachable!("handled before transport setup")
+        }
     }
     client.shutdown().await;
     database
@@ -499,6 +509,57 @@ fn ddl_targets_fixture(change: &DdlChange) -> bool {
         DdlChange::DropTrigger { name } => name == DDL_TRIGGER,
         DdlChange::CreateSink { .. } => false,
     }
+}
+
+fn print_refused_ddl_state(database: &Database) -> Result<(), String> {
+    const CONTACT_TABLE: &str = "work_node_contacts";
+    let table_names = database.table_names();
+    let canonical = Database::open_memory();
+    contextdb_server::work_ledger::install_node_contacts_schema(&canonical)
+        .map_err(|_| "cannot construct canonical transport schema".to_string())?;
+    let canonical_changes = canonical.changes_since(contextdb_core::Lsn(0));
+    let canonical_meta = canonical
+        .table_meta(CONTACT_TABLE)
+        .ok_or_else(|| "canonical transport schema has no table metadata".to_string())?;
+
+    let changes = database.changes_since(contextdb_core::Lsn(0));
+    validate_refused_ddl_state(
+        &table_names,
+        database.list_triggers().len(),
+        database.table_meta(CONTACT_TABLE).as_ref(),
+        &changes,
+        &canonical_meta,
+        &canonical_changes.ddl,
+    )?;
+    println!("{}", json!({ "event": "ddl_refusal_transport_only" }));
+    std::io::stdout()
+        .flush()
+        .map_err(|_| "stdout failed".to_string())
+}
+
+fn validate_refused_ddl_state(
+    table_names: &[String],
+    trigger_count: usize,
+    table_meta: Option<&contextdb_core::TableMeta>,
+    changes: &ChangeSet,
+    canonical_meta: &contextdb_core::TableMeta,
+    canonical_ddl: &[DdlChange],
+) -> Result<(), String> {
+    const CONTACT_TABLE: &str = "work_node_contacts";
+    if table_names.len() != 1 || table_names[0] != CONTACT_TABLE || trigger_count != 0 {
+        return Err("refused DDL published non-transport schema".to_string());
+    }
+    if changes.ddl.len() != 1
+        || changes.ddl_lsn.len() != 1
+        || changes.ddl != canonical_ddl
+        || table_meta != Some(canonical_meta)
+        || changes.rows.iter().any(|row| row.table != CONTACT_TABLE)
+        || !changes.edges.is_empty()
+        || !changes.vectors.is_empty()
+    {
+        return Err("refused DDL published non-transport data".to_string());
+    }
+    Ok(())
 }
 
 async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
@@ -815,6 +876,83 @@ mod ddl_vector_tests {
         changes.ddl_lsn[2] = Lsn(5);
 
         assert!(exact_fixture_ddl_vector(&changes).is_err());
+    }
+
+    #[test]
+    fn refused_ddl_state_allows_only_transport_contact_bookkeeping() {
+        let database = Database::open_memory();
+        database
+            .execute(
+                "CREATE TABLE work_node_contacts (node_id TEXT PRIMARY KEY, last_contact_ms TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC OFF",
+                &HashMap::new(),
+            )
+            .unwrap();
+        print_refused_ddl_state(&database).unwrap();
+
+        database
+            .execute(
+                "CREATE TABLE receiver_injected_table (id UUID PRIMARY KEY)",
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert!(print_refused_ddl_state(&database).is_err());
+    }
+
+    #[test]
+    fn refused_ddl_state_rejects_empty_database() {
+        assert!(print_refused_ddl_state(&Database::open_memory()).is_err());
+    }
+
+    #[test]
+    fn refused_ddl_state_rejects_duplicate_transport_ddl() {
+        let database = Database::open_memory();
+        database
+            .execute(
+                "CREATE TABLE work_node_contacts (node_id TEXT PRIMARY KEY, last_contact_ms TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC OFF",
+                &HashMap::new(),
+            )
+            .unwrap();
+        database
+            .execute("DROP TABLE work_node_contacts", &HashMap::new())
+            .unwrap();
+        database
+            .execute(
+                "CREATE TABLE work_node_contacts (node_id TEXT PRIMARY KEY, last_contact_ms TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC OFF",
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        assert!(print_refused_ddl_state(&database).is_err());
+    }
+
+    #[test]
+    fn refused_ddl_state_rejects_wrong_transport_shape() {
+        let database = Database::open_memory();
+        database
+            .execute(
+                "CREATE TABLE work_node_contacts (node_id TEXT PRIMARY KEY, last_contact_ms TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC OFF",
+                &HashMap::new(),
+            )
+            .unwrap();
+        let mut changes = database.changes_since(Lsn(0));
+        let canonical_ddl = changes.ddl.clone();
+        let canonical_meta = database.table_meta("work_node_contacts").unwrap();
+        let DdlChange::CreateTable { columns, .. } = &mut changes.ddl[0] else {
+            panic!("contact schema must begin with CREATE TABLE");
+        };
+        columns[0].1 = "INTEGER PRIMARY KEY".to_string();
+
+        assert!(
+            validate_refused_ddl_state(
+                &database.table_names(),
+                database.list_triggers().len(),
+                Some(&canonical_meta),
+                &changes,
+                &canonical_meta,
+                &canonical_ddl,
+            )
+            .is_err()
+        );
     }
 }
 

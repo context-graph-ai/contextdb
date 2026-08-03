@@ -291,21 +291,22 @@ pass "restart and wipe-restore render the authored schema identically"
 printf 'CHECK every receiving-plugin DDL rewrite is refused with no durable mutation\n'
 for receiver in ddl-add ddl-remove ddl-replace ddl-reorder; do
   case_root="$work/rewrite-$receiver"
-  start_hub "$case_root/hub" core observe
-  stop_hub
-  baseline="$(snapshot_state "$case_root/hub/hub.db" "$case_root/before.snapshot")"
   start_hub "$case_root/hub" "$receiver" observe
   "$driver" ddl-source \
     --db "$case_root/source.db" --identity "$case_root/source.identity" \
     --ticket-file "$case_root/hub/ticket" --tenant-id installed-smoke \
     --phase author-push --expect immutable-ddl-refusal >"$case_root/source.log"
   stop_hub
-  after="$(snapshot_state "$case_root/hub/hub.db" "$case_root/after.snapshot")"
-  [[ "$baseline" == "$after" ]] || fail "$receiver refusal left every durable apply category unchanged"
+  "$driver" ddl-source \
+    --db "$case_root/hub/hub.db" --identity "$case_root/hub/hub.identity" \
+    --ticket-file "$case_root/hub/ticket" --tenant-id installed-smoke \
+    --phase inspect-refusal --expect success >"$case_root/refusal-state.log"
   require_file_text "$case_root/source.log" \
     'authenticated received DDL is immutable after transport validation' \
     "$receiver received the typed immutable-DDL refusal"
-  pass "$receiver refusal left every durable apply category unchanged"
+  require_file_text "$case_root/refusal-state.log" \
+    '"event":"ddl_refusal_transport_only"' \
+    "$receiver refusal published no non-transport mutation"
 done
 
 printf 'CHECK oversized dependency unit resumes after fragment-persisted hub death\n'
