@@ -8,7 +8,7 @@ use contextdb_core::{
 };
 use serde::de::VariantAccess;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 /// The durable direction declarations that governed each table generation.
@@ -246,18 +246,38 @@ impl ChangeSet {
         directions: &HashMap<String, SyncDirection>,
         include: &[SyncDirection],
     ) -> ChangeSet {
-        self.filter_by_direction_at(
-            |table, _| {
-                let dir = directions
-                    .get(table)
-                    .copied()
-                    .unwrap_or(SyncDirection::Both);
-                include.contains(&dir)
-            },
-            directions.is_empty(),
-            false,
-            |_, _| true,
-        )
+        ChangeSet {
+            rows: self
+                .rows
+                .iter()
+                .filter(|row| {
+                    let direction = directions
+                        .get(&row.table)
+                        .copied()
+                        .unwrap_or(SyncDirection::Both);
+                    include.contains(&direction)
+                })
+                .cloned()
+                .collect(),
+            edges: self.edges.clone(),
+            vectors: self
+                .vectors
+                .iter()
+                .filter(|vector| {
+                    let direction = directions
+                        .get(&vector.index.table)
+                        .copied()
+                        .unwrap_or(SyncDirection::Both);
+                    include.contains(&direction)
+                })
+                .cloned()
+                .collect(),
+            // A receiver-side row filter cannot slice an authenticated schema
+            // commit into a different vector. Source-side eligibility uses the
+            // durable-history path below before any schema reaches the wire.
+            ddl: self.ddl.clone(),
+            ddl_lsn: self.ddl_lsn.clone(),
+        }
     }
 
     /// Filters internal outbound work against the declaration that governed
@@ -268,46 +288,161 @@ impl ChangeSet {
         history: &SyncDirectionHistory,
         include: &[SyncDirection],
     ) -> ChangeSet {
-        self.filter_by_direction_at(
-            |table, lsn| history.includes(table, lsn, include),
-            !history.has_declarations(),
-            true,
-            |trigger, lsn| history.includes_trigger_drop(trigger, lsn, include),
-        )
-    }
+        let keep_schema_lsn = if self.ddl_lsn.len() == self.ddl.len() {
+            let mut groups = BTreeMap::<Lsn, Vec<&DdlChange>>::new();
+            for (change, lsn) in self.ddl.iter().zip(&self.ddl_lsn) {
+                groups.entry(*lsn).or_default().push(change);
+            }
+            groups
+                .into_iter()
+                .filter_map(|(lsn, changes)| {
+                    let include_event_table = |table: &str| {
+                        !history.has_declarations()
+                            || (!table.is_empty() && history.includes(table, lsn, include))
+                    };
+                    changes
+                        .iter()
+                        .any(|change| match change {
+                            DdlChange::CreateTable { name, .. }
+                            | DdlChange::DropTable { name }
+                            | DdlChange::AlterTable { name, .. } => {
+                                history.includes(name, lsn, include)
+                            }
+                            DdlChange::CreateIndex { table, .. }
+                            | DdlChange::DropIndex { table, .. }
+                            | DdlChange::CreateTrigger { table, .. } => {
+                                history.includes(table, lsn, include)
+                            }
+                            DdlChange::DropTrigger { name } => {
+                                history.includes_trigger_drop(name, lsn, include)
+                            }
+                            DdlChange::CreateEventType { table, .. }
+                            | DdlChange::CreateRoute { table, .. }
+                            | DdlChange::DropRoute { table, .. } => include_event_table(table),
+                            // Sinks are global schema. A route that needs one
+                            // can be authored in a later commit or page, so a
+                            // source-side direction filter must not strand the
+                            // future route by discarding its prerequisite.
+                            DdlChange::CreateSink { .. } => true,
+                        })
+                        .then_some(lsn)
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            // Malformed public changesets are rejected by the wire/apply
+            // cardinality gates. Never turn one into an apparently valid but
+            // partial schema vector here.
+            self.ddl_lsn.iter().copied().collect()
+        };
 
-    fn filter_by_direction_at<F, G>(
-        &self,
-        include_dir: F,
-        _no_declarations: bool,
-        _require_ddl_lsn: bool,
-        _include_drop_trigger: G,
-    ) -> ChangeSet
-    where
-        F: Fn(&str, Lsn) -> bool,
-        G: Fn(&str, Lsn) -> bool,
-    {
+        let (ddl, ddl_lsn) = if self.ddl_lsn.len() == self.ddl.len() {
+            self.ddl
+                .iter()
+                .cloned()
+                .zip(self.ddl_lsn.iter().copied())
+                .filter(|(_, lsn)| keep_schema_lsn.contains(lsn))
+                .unzip()
+        } else {
+            (self.ddl.clone(), self.ddl_lsn.clone())
+        };
+
         ChangeSet {
             rows: self
                 .rows
                 .iter()
-                .filter(|r| include_dir(&r.table, r.lsn))
+                .filter(|row| history.includes(&row.table, row.lsn, include))
                 .cloned()
                 .collect(),
             edges: self.edges.clone(),
             vectors: self
                 .vectors
                 .iter()
-                .filter(|v| include_dir(&v.index.table, v.lsn))
+                .filter(|vector| history.includes(&vector.index.table, vector.lsn, include))
                 .cloned()
                 .collect(),
-            // Sync direction governs row flow. Authenticated schema is one
-            // attested source vector and must never be filtered, regrouped,
-            // or have its paired LSNs rebuilt by a receiver-side direction
-            // decision.
-            ddl: self.ddl.clone(),
-            ddl_lsn: self.ddl_lsn.clone(),
+            ddl,
+            ddl_lsn,
         }
+    }
+}
+
+#[cfg(test)]
+mod direction_history_tests {
+    use super::*;
+
+    fn create_table(name: &str) -> DdlChange {
+        DdlChange::CreateTable {
+            name: name.to_string(),
+            columns: Vec::new(),
+            constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn historical_direction_drops_only_whole_schema_commits() {
+        let mut history = SyncDirectionHistory::default();
+        history.record_create("local".to_string(), Lsn(1), SyncDirection::None);
+        history.record_drop("local".to_string(), Lsn(2));
+        history.record_create("shared".to_string(), Lsn(2), SyncDirection::Both);
+        let changes = ChangeSet {
+            ddl: vec![
+                create_table("local"),
+                DdlChange::DropTable {
+                    name: "local".to_string(),
+                },
+                create_table("shared"),
+            ],
+            ddl_lsn: vec![Lsn(1), Lsn(2), Lsn(2)],
+            ..ChangeSet::default()
+        };
+
+        let filtered = changes
+            .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
+
+        assert_eq!(
+            filtered.ddl,
+            vec![
+                DdlChange::DropTable {
+                    name: "local".to_string(),
+                },
+                create_table("shared"),
+            ],
+            "an entirely local schema commit stays local, while one eligible item keeps its whole authenticated schema vector"
+        );
+        assert_eq!(filtered.ddl_lsn, vec![Lsn(2), Lsn(2)]);
+    }
+
+    #[test]
+    fn historical_direction_keeps_a_global_sink_for_a_later_shared_route() {
+        let mut history = SyncDirectionHistory::default();
+        history.record_create("shared".to_string(), Lsn(1), SyncDirection::Both);
+        let changes = ChangeSet {
+            ddl: vec![
+                DdlChange::CreateSink {
+                    name: "archive".to_string(),
+                    sink_type: "CALLBACK".to_string(),
+                    url: None,
+                },
+                DdlChange::CreateRoute {
+                    name: "shared_archive".to_string(),
+                    event_type: "shared_change".to_string(),
+                    sink: "archive".to_string(),
+                    table: "shared".to_string(),
+                    where_in: None,
+                },
+            ],
+            ddl_lsn: vec![Lsn(1), Lsn(2)],
+            ..ChangeSet::default()
+        };
+
+        let filtered = changes
+            .filter_by_direction_history(&history, &[SyncDirection::Push, SyncDirection::Both]);
+
+        assert_eq!(filtered.ddl, changes.ddl);
+        assert_eq!(filtered.ddl_lsn, changes.ddl_lsn);
     }
 }
 
