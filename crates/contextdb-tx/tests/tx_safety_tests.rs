@@ -46,6 +46,7 @@ impl BlockingStore {
     }
 
     fn release_apply(&self) {
+        let _state = self.state.lock();
         self.release_apply.store(true, Ordering::SeqCst);
         self.waiters.notify_all();
     }
@@ -53,10 +54,10 @@ impl BlockingStore {
 
 impl WriteSetApplicator for BlockingStore {
     fn apply(&self, ws: &WriteSet) -> Result<()> {
+        let mut state = self.state.lock();
         self.apply_entered.store(true, Ordering::SeqCst);
         self.waiters.notify_all();
 
-        let mut state = self.state.lock();
         while !self.release_apply.load(Ordering::SeqCst) {
             self.waiters.wait(&mut state);
         }
