@@ -602,10 +602,10 @@ fn smoke_driver_without_authorized_orchestration(src: &str) -> String {
     // names here.
     for (authorized_use, expected_count) in [
         ("fn on_sync_pull(&self, changes: &mut ChangeSet)", 1),
-        // The three fixed smoke subcommands all open the caller-selected
-        // database argument. Do not suppress a future open at any other
-        // callsite.
-        ("Database::open(&args.db)", 3),
+        // The three fixed smoke subcommands plus the two stopped-hub crash
+        // verifier phases open the caller-selected database argument. Do not
+        // suppress a future open at any other callsite.
+        ("Database::open(&args.db)", 5),
         ("database.changes_since(", 3),
         ("let canonical = Database::open_memory();", 1),
         ("let database = Database::open_memory();", 3),
