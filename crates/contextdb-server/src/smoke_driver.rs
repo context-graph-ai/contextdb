@@ -4,7 +4,7 @@
 //! controls.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use contextdb_core::{TenantId, Value};
+use contextdb_core::{Incarnation, TenantId, Value};
 use contextdb_engine::database::open_with_startup_limits;
 use contextdb_engine::plugin::{CorePlugin, DatabasePlugin};
 use contextdb_engine::sync_types::{ChangeSet, DdlChange};
@@ -149,13 +149,17 @@ struct OversizedSourceArgs {
     #[arg(long)]
     db: PathBuf,
     #[arg(long)]
-    identity: PathBuf,
+    identity: Option<PathBuf>,
     #[arg(long)]
-    ticket_file: PathBuf,
+    ticket_file: Option<PathBuf>,
     #[arg(long)]
     tenant_id: String,
     #[arg(long, value_enum)]
     phase: OversizedPhase,
+    #[arg(long)]
+    source_node_id: Option<String>,
+    #[arg(long)]
+    source_incarnation: Option<String>,
     #[arg(long, value_enum, default_value_t = RequestFixture::OversizedDependency)]
     fixture: RequestFixture,
 }
@@ -163,6 +167,8 @@ struct OversizedSourceArgs {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OversizedPhase {
     BootstrapAndSeed,
+    InitializeHub,
+    InspectHub,
     PushExisting,
 }
 
@@ -563,12 +569,30 @@ fn validate_refused_ddl_state(
 }
 
 async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
-    let ticket = read_ticket(&args.ticket_file)?;
+    if matches!(args.phase, OversizedPhase::InitializeHub) {
+        return run_oversized_hub_initialization(&args);
+    }
+    if matches!(args.phase, OversizedPhase::InspectHub) {
+        return run_oversized_hub_inspection(&args);
+    }
+
+    let identity_path = args
+        .identity
+        .as_ref()
+        .ok_or_else(|| "oversized source phase requires --identity".to_string())?;
+    let ticket_file = args
+        .ticket_file
+        .as_ref()
+        .ok_or_else(|| "oversized source phase requires --ticket-file".to_string())?;
+    let ticket = read_ticket(ticket_file)?;
     let database = Arc::new(
         Database::open(&args.db)
             .map_err(|_| "cannot open oversized source database".to_string())?,
     );
-    let dial = peer_dial_spec(&ticket, &args.identity);
+    let source_identity = FabricIdentity::load_or_generate(identity_path)
+        .map_err(|_| "cannot load oversized source fabric identity".to_string())?;
+    let source_node_id = source_identity.node_id();
+    let dial = peer_dial_spec(&ticket, identity_path);
     let client = SyncClient::new(
         database.clone(),
         &dial,
@@ -608,6 +632,9 @@ async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
                 0
             }
         };
+        let source_incarnation = database
+            .production_smoke_sync_incarnation(&TenantId::from(args.tenant_id.as_str()))
+            .map_err(|_| "cannot inspect oversized source incarnation".to_string())?;
         println!(
             "{}",
             json!({
@@ -618,6 +645,8 @@ async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
                 "body_bytes": body_bytes,
                 "parent_id": PARENT_ID,
                 "child_id": CHILD_ID,
+                "source_node_id": source_node_id,
+                "source_incarnation": source_incarnation.to_hex(),
             })
         );
         client.shutdown().await;
@@ -686,6 +715,82 @@ async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
     database
         .close()
         .map_err(|_| "cannot close oversized source database".to_string())?;
+    Ok(())
+}
+
+fn run_oversized_hub_initialization(args: &OversizedSourceArgs) -> Result<(), String> {
+    let tenant_id = TenantId::from(args.tenant_id.as_str());
+    let database = Database::open(&args.db)
+        .map_err(|_| "cannot open stopped hub database for initialization".to_string())?;
+    let hub_incarnation = database
+        .production_smoke_sync_incarnation(&tenant_id)
+        .map_err(|_| "cannot initialize hub sync incarnation".to_string())?;
+    database
+        .close()
+        .map_err(|_| "cannot close stopped hub database after initialization".to_string())?;
+    println!(
+        "{}",
+        json!({
+            "event": "oversized_hub_initialized",
+            "tenant_id": args.tenant_id,
+            "hub_incarnation": hub_incarnation.to_hex(),
+        })
+    );
+    Ok(())
+}
+
+fn run_oversized_hub_inspection(args: &OversizedSourceArgs) -> Result<(), String> {
+    let source_node_id = args
+        .source_node_id
+        .as_deref()
+        .ok_or_else(|| "inspect-hub requires --source-node-id".to_string())?;
+    let source_incarnation_hex = args
+        .source_incarnation
+        .as_deref()
+        .ok_or_else(|| "inspect-hub requires --source-incarnation".to_string())?;
+    let source_incarnation = Incarnation::from_hex(source_incarnation_hex)
+        .ok_or_else(|| "inspect-hub source incarnation is not valid hex".to_string())?;
+    let tenant_id = TenantId::from(args.tenant_id.as_str());
+    let database = Database::open(&args.db)
+        .map_err(|_| "cannot open stopped hub database for inspection".to_string())?;
+    let (push_watermark, pull_watermark) = database
+        .persisted_sync_watermarks(&tenant_id)
+        .map_err(|_| "cannot inspect hub sync watermarks".to_string())?;
+    let pending_push_confirmation = database
+        .persisted_sync_pending_push_confirmation(&tenant_id)
+        .map_err(|_| "cannot inspect hub pending push confirmation".to_string())?;
+    let pull_cursor = database
+        .persisted_sync_pull_cursor(&tenant_id)
+        .map_err(|_| "cannot inspect hub pull cursor".to_string())?;
+    let applied_push_watermark = database
+        .persisted_sync_applied_push_watermark(&tenant_id)
+        .map_err(|_| "cannot inspect hub applied-push watermark".to_string())?;
+    let source_receipt = database
+        .persisted_sync_applied_push_watermark_for_node_incarnation(
+            &tenant_id,
+            source_node_id,
+            source_incarnation,
+        )
+        .map_err(|_| "cannot inspect exact source receipt".to_string())?;
+    let report = json!({
+        "event": "oversized_hub_progress",
+        "tenant_id": args.tenant_id,
+        "push_watermark": push_watermark.0,
+        "pull_watermark": pull_watermark.0,
+        "pending_push_confirmation": pending_push_confirmation.map(|lsn| lsn.0),
+        "pull_cursor": pull_cursor.map(|(source, lsn)| json!({
+            "source_incarnation": source.to_hex(),
+            "lsn": lsn.0,
+        })),
+        "applied_push_watermark": applied_push_watermark.map(|lsn| lsn.0),
+        "source_node_id": source_node_id,
+        "source_incarnation": source_incarnation.to_hex(),
+        "source_receipt": source_receipt.map(|lsn| lsn.0),
+    });
+    database
+        .close()
+        .map_err(|_| "cannot close stopped hub database after inspection".to_string())?;
+    println!("{report}");
     Ok(())
 }
 

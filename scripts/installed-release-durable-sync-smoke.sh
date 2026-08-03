@@ -119,10 +119,53 @@ snapshot_state() {
   "$cli" inspect sync-apply-state "$artifact" --json
 }
 
-schema_json() {
+normalize_sync_apply_state() {
+  local state="$1"
+  # Authenticated status bookkeeping intentionally updates work_node_contacts.
+  # These are the only aggregate fields that row changes; every other durable
+  # category remains an exact crash-boundary comparison.
+  printf '%s\n' "$state" | sed -E \
+    -e 's/"change_log_entries":[0-9]+,//' \
+    -e 's/"commit_index_entries":[0-9]+,//' \
+    -e 's/"current_lsn":[0-9]+,//' \
+    -e 's/"digest":"[^"]*",//' \
+    -e 's/"index_postings":[0-9]+,//' \
+    -e 's/"retained_row_versions":[0-9]+,//'
+}
+
+hub_progress() {
   local db="$1"
-  printf '.schema authored_migration\n.quit\n' | "$cli" "$db" --json \
-    | grep '"table":"authored_migration"' | tail -n 1
+  local source_node_id="$2"
+  local source_incarnation="$3"
+  "$driver" oversized-source \
+    --db "$db" --tenant-id installed-smoke --phase inspect-hub \
+    --source-node-id "$source_node_id" \
+    --source-incarnation "$source_incarnation"
+}
+
+parent_key_state() {
+  local artifact="$1"
+  "$cli" inspect key "$artifact" --table smoke_parents \
+    --key-json '{"column":"id","value":{"Uuid":"11111111-1111-4111-8111-111111111111"},"rest":[]}' \
+    --json
+}
+
+child_key_state() {
+  local artifact="$1"
+  "$cli" inspect key "$artifact" --table smoke_children \
+    --key-json '{"column":"id","value":{"Uuid":"22222222-2222-4222-8222-222222222222"},"rest":[]}' \
+    --json
+}
+
+table_schema_json() {
+  local db="$1"
+  local table="$2"
+  printf '.schema %s\n.quit\n' "$table" | "$cli" "$db" --json \
+    | grep -F "\"table\":\"${table}\"" | tail -n 1
+}
+
+schema_json() {
+  table_schema_json "$1" authored_migration
 }
 
 json_number() {
@@ -137,6 +180,31 @@ json_file_number() {
   local value
   value="$(sed -n "s/.*\"${field}\":\([0-9][0-9]*\).*/\1/p" "$file")"
   [[ "$value" =~ ^[0-9]+$ ]] || fail "$file has exactly one numeric $field"
+  printf '%s\n' "$value"
+}
+
+json_event_file_number() {
+  local file="$1"
+  local event="$2"
+  local field="$3"
+  local event_line
+  local value
+  event_line="$(grep -F "\"event\":\"${event}\"" "$file" || true)"
+  [[ -n "$event_line" && "$event_line" != *$'\n'* ]] \
+    || fail "$file has exactly one event $event"
+  value="$(printf '%s\n' "$event_line" \
+    | sed -n "s/.*\"${field}\":\([0-9][0-9]*\).*/\1/p")"
+  [[ "$value" =~ ^[0-9]+$ ]] \
+    || fail "$file has exactly one numeric $field on event $event"
+  printf '%s\n' "$value"
+}
+
+json_file_string() {
+  local file="$1"
+  local field="$2"
+  local value
+  value="$(sed -n "s/.*\"${field}\":\"\([^\"]*\)\".*/\1/p" "$file")"
+  [[ -n "$value" ]] || fail "$file has exactly one string $field"
   printf '%s\n' "$value"
 }
 
@@ -317,7 +385,25 @@ start_hub "$fragment/hub" core observe
   --ticket-file "$fragment/hub/ticket" --tenant-id installed-smoke \
   --phase bootstrap-and-seed >"$fragment/prepare.log"
 stop_hub
+fragment_source_node_id="$(json_file_string "$fragment/prepare.log" source_node_id)"
+fragment_source_incarnation="$(json_file_string "$fragment/prepare.log" source_incarnation)"
+"$driver" oversized-source \
+  --db "$fragment/hub/hub.db" --tenant-id installed-smoke \
+  --phase initialize-hub >"$fragment/hub-initialized.log"
+require_file_text "$fragment/hub-initialized.log" \
+  '"event":"oversized_hub_initialized"' \
+  "fragment-crash baseline includes the hub sync identity"
 fragment_baseline="$(snapshot_state "$fragment/hub/hub.db" "$fragment/before.snapshot")"
+fragment_baseline_progress="$(hub_progress "$fragment/hub/hub.db" \
+  "$fragment_source_node_id" "$fragment_source_incarnation")"
+fragment_parent_before="$(parent_key_state "$fragment/before.snapshot")"
+fragment_child_before="$(child_key_state "$fragment/before.snapshot")"
+fragment_parent_schema_before="$(table_schema_json \
+  "$fragment/before.snapshot" smoke_parents)"
+fragment_child_schema_before="$(table_schema_json \
+  "$fragment/before.snapshot" smoke_children)"
+fragment_contacts_schema_before="$(table_schema_json \
+  "$fragment/before.snapshot" work_node_contacts)"
 start_hub "$fragment/hub" core after-fragment0
 "$timeout_bin" 180 "$driver" oversized-source \
   --db "$fragment/edge.db" --identity "$fragment/edge.identity" \
@@ -338,9 +424,35 @@ fragment_watermark_after="$(json_file_number "$fragment/interrupted.log" push_wa
   || fail "fragment interruption advanced the edge push watermark without confirmation"
 pass "fragment interruption left the edge push watermark unadvanced"
 fragment_after="$(snapshot_state "$fragment/hub/hub.db" "$fragment/after-kill.snapshot")"
-[[ "$fragment_baseline" == "$fragment_after" ]] \
-  || fail "partial request changed hub rows, schema, lineage, receipt, cursor, or watermark"
-pass "partial request changed no hub durable apply state"
+fragment_after_progress="$(hub_progress "$fragment/hub/hub.db" \
+  "$fragment_source_node_id" "$fragment_source_incarnation")"
+fragment_parent_after="$(parent_key_state "$fragment/after-kill.snapshot")"
+fragment_child_after="$(child_key_state "$fragment/after-kill.snapshot")"
+fragment_parent_schema_after="$(table_schema_json \
+  "$fragment/after-kill.snapshot" smoke_parents)"
+fragment_child_schema_after="$(table_schema_json \
+  "$fragment/after-kill.snapshot" smoke_children)"
+fragment_contacts_schema_after="$(table_schema_json \
+  "$fragment/after-kill.snapshot" work_node_contacts)"
+[[ "$(normalize_sync_apply_state "$fragment_baseline")" \
+   == "$(normalize_sync_apply_state "$fragment_after")" ]] \
+  || fail "partial request changed hub schema or non-contact durable apply state"
+pass "partial request changed no hub schema or non-contact durable apply state"
+[[ "$fragment_parent_schema_before" == "$fragment_parent_schema_after" \
+   && "$fragment_child_schema_before" == "$fragment_child_schema_after" \
+   && "$fragment_contacts_schema_before" == "$fragment_contacts_schema_after" ]] \
+  || fail "partial request changed an exact rendered hub schema"
+pass "partial request preserved every exact rendered hub schema"
+[[ "$fragment_baseline_progress" == "$fragment_after_progress" ]] \
+  || fail "partial request changed a sync watermark, receipt, pending marker, or pull cursor"
+pass "partial request changed no sync watermark, receipt, pending marker, or pull cursor"
+empty_key_state='{"lineage":null,"retained_versions":[],"total_retained_versions":0,"versions_truncated":false}'
+[[ "$fragment_parent_before" == "$empty_key_state" \
+   && "$fragment_parent_after" == "$empty_key_state" \
+   && "$fragment_child_before" == "$empty_key_state" \
+   && "$fragment_child_after" == "$empty_key_state" ]] \
+  || fail "partial request created a parent or child row, retained version, or lineage"
+pass "partial request created no parent or child row, retained version, or lineage"
 start_hub "$fragment/hub" core observe
 "$driver" oversized-source \
   --db "$fragment/edge.db" --identity "$fragment/edge.identity" \
@@ -349,19 +461,34 @@ start_hub "$fragment/hub" core observe
 stop_hub
 require_file_text "$fragment/resumed.log" '"event":"oversized_push_confirmed"' \
   "resumed oversized unit received final confirmation"
-fragment_source_lsn="$(json_file_number "$fragment/resumed.log" source_lsn)"
-fragment_push_before="$(json_file_number "$fragment/resumed.log" push_watermark_before)"
-fragment_push_after="$(json_file_number "$fragment/resumed.log" push_watermark_after)"
+fragment_source_lsn="$(json_event_file_number \
+  "$fragment/resumed.log" oversized_push_confirmed source_lsn)"
+fragment_push_before="$(json_event_file_number \
+  "$fragment/resumed.log" oversized_push_started push_watermark_before)"
+fragment_push_after="$(json_event_file_number \
+  "$fragment/resumed.log" oversized_push_confirmed push_watermark_after)"
 [[ "$fragment_push_after" -eq "$fragment_source_lsn" \
    && "$fragment_push_after" -gt "$fragment_push_before" ]] \
   || fail "confirmed resumed unit advanced the edge watermark to its exact source position"
 pass "confirmed resumed unit advanced the edge watermark to its exact source position"
 fragment_final="$(snapshot_state "$fragment/hub/hub.db" "$fragment/final.snapshot")"
-fragment_before_lsn="$(json_number "$fragment_baseline" current_lsn)"
+fragment_final_progress="$(hub_progress "$fragment/hub/hub.db" \
+  "$fragment_source_node_id" "$fragment_source_incarnation")"
+fragment_parent_final="$(parent_key_state "$fragment/final.snapshot")"
+fragment_child_final="$(child_key_state "$fragment/final.snapshot")"
+fragment_hub_lsn="$(json_event_file_number \
+  "$fragment/resumed.log" oversized_push_confirmed hub_lsn)"
 fragment_final_lsn="$(json_number "$fragment_final" current_lsn)"
-[[ "$fragment_final_lsn" -eq $((fragment_before_lsn + 1)) ]] \
-  || fail "resumed dependency unit committed at exactly one hub position"
-pass "resumed dependency unit committed at exactly one hub position"
+fragment_final_applied="$(json_number "$fragment_final_progress" applied_push_watermark)"
+fragment_final_receipt="$(json_number "$fragment_final_progress" source_receipt)"
+[[ "$fragment_final_lsn" -eq "$fragment_hub_lsn" \
+   && "$fragment_final_applied" -eq "$fragment_source_lsn" \
+   && "$fragment_final_receipt" -eq "$fragment_source_lsn" ]] \
+  || fail "resumed dependency unit did not land at its reported hub and source positions"
+[[ "$fragment_parent_final" == *'"total_retained_versions":1'* \
+   && "$fragment_child_final" == *'"total_retained_versions":1'* ]] \
+  || fail "resumed dependency unit did not publish both rows exactly once"
+pass "resumed dependency unit committed both rows atomically at its reported hub position"
 
 printf 'CHECK oversized dependency unit reconciles after committed hub dies before success reply\n'
 lost_ack="$work/oversized-lost-ack"
@@ -371,7 +498,22 @@ start_hub "$lost_ack/hub" core observe
   --ticket-file "$lost_ack/hub/ticket" --tenant-id installed-smoke \
   --phase bootstrap-and-seed >"$lost_ack/prepare.log"
 stop_hub
+lost_source_node_id="$(json_file_string "$lost_ack/prepare.log" source_node_id)"
+lost_source_incarnation="$(json_file_string "$lost_ack/prepare.log" source_incarnation)"
+"$driver" oversized-source \
+  --db "$lost_ack/hub/hub.db" --tenant-id installed-smoke \
+  --phase initialize-hub >"$lost_ack/hub-initialized.log"
+require_file_text "$lost_ack/hub-initialized.log" \
+  '"event":"oversized_hub_initialized"' \
+  "lost-ack baseline includes the hub sync identity"
 lost_baseline="$(snapshot_state "$lost_ack/hub/hub.db" "$lost_ack/before.snapshot")"
+lost_baseline_progress="$(hub_progress "$lost_ack/hub/hub.db" \
+  "$lost_source_node_id" "$lost_source_incarnation")"
+lost_parent_before="$(parent_key_state "$lost_ack/before.snapshot")"
+lost_child_before="$(child_key_state "$lost_ack/before.snapshot")"
+[[ "$lost_parent_before" == "$empty_key_state" \
+   && "$lost_child_before" == "$empty_key_state" ]] \
+  || fail "lost-ack baseline already contains the dependency unit"
 start_hub "$lost_ack/hub" core after-apply
 "$timeout_bin" 180 "$driver" oversized-source \
   --db "$lost_ack/edge.db" --identity "$lost_ack/edge.identity" \
@@ -395,11 +537,25 @@ lost_watermark_after="$(json_file_number "$lost_ack/interrupted.log" push_waterm
   || fail "lost final acknowledgement advanced the edge push watermark without confirmation"
 pass "lost final acknowledgement left the edge push watermark unadvanced"
 lost_committed="$(snapshot_state "$lost_ack/hub/hub.db" "$lost_ack/committed.snapshot")"
-lost_before_lsn="$(json_number "$lost_baseline" current_lsn)"
+lost_committed_progress="$(hub_progress "$lost_ack/hub/hub.db" \
+  "$lost_source_node_id" "$lost_source_incarnation")"
+lost_parent_committed="$(parent_key_state "$lost_ack/committed.snapshot")"
+lost_child_committed="$(child_key_state "$lost_ack/committed.snapshot")"
+lost_source_lsn_at_checkpoint="$(json_number "$checkpoint" source_lsn)"
+lost_hub_lsn_at_checkpoint="$(json_number "$checkpoint" hub_lsn)"
 lost_committed_lsn="$(json_number "$lost_committed" current_lsn)"
-[[ "$lost_committed_lsn" -eq $((lost_before_lsn + 1)) ]] \
-  || fail "lost-ack unit had exactly one committed hub position"
-pass "lost-ack unit had exactly one committed hub position"
+lost_committed_applied="$(json_number "$lost_committed_progress" applied_push_watermark)"
+lost_committed_receipt="$(json_number "$lost_committed_progress" source_receipt)"
+[[ "$lost_committed_lsn" -eq "$lost_hub_lsn_at_checkpoint" \
+   && "$lost_committed_applied" -eq "$lost_source_lsn_at_checkpoint" \
+   && "$lost_committed_receipt" -eq "$lost_source_lsn_at_checkpoint" ]] \
+  || fail "lost-ack unit did not persist its reported hub position and exact receipt"
+[[ "$lost_parent_committed" == *'"total_retained_versions":1'* \
+   && "$lost_child_committed" == *'"total_retained_versions":1'* ]] \
+  || fail "lost-ack unit did not commit both rows exactly once"
+[[ "$lost_baseline_progress" != "$lost_committed_progress" ]] \
+  || fail "lost-ack unit did not advance exact hub sync progress"
+pass "lost-ack unit committed both rows and its exact receipt at one reported hub position"
 start_hub "$lost_ack/hub" core observe
 "$driver" oversized-source \
   --db "$lost_ack/edge.db" --identity "$lost_ack/edge.identity" \
@@ -407,17 +563,33 @@ start_hub "$lost_ack/hub" core observe
   --phase push-existing >"$lost_ack/reconciled.log"
 stop_hub
 lost_final="$(snapshot_state "$lost_ack/hub/hub.db" "$lost_ack/final.snapshot")"
-[[ "$lost_committed" == "$lost_final" ]] \
+lost_final_progress="$(hub_progress "$lost_ack/hub/hub.db" \
+  "$lost_source_node_id" "$lost_source_incarnation")"
+lost_parent_final="$(parent_key_state "$lost_ack/final.snapshot")"
+lost_child_final="$(child_key_state "$lost_ack/final.snapshot")"
+[[ "$(normalize_sync_apply_state "$lost_committed")" \
+   == "$(normalize_sync_apply_state "$lost_final")" \
+   && "$lost_committed_progress" == "$lost_final_progress" \
+   && "$lost_parent_committed" == "$lost_parent_final" \
+   && "$lost_child_committed" == "$lost_child_final" ]] \
   || fail "lost-ack reconciliation duplicated or otherwise mutated the committed unit"
 require_file_text "$lost_ack/reconciled.log" '"event":"oversized_push_confirmed"' \
   "edge reconciled the already-committed unit"
-lost_source_lsn="$(json_file_number "$lost_ack/reconciled.log" source_lsn)"
-lost_push_before="$(json_file_number "$lost_ack/reconciled.log" push_watermark_before)"
-lost_push_after="$(json_file_number "$lost_ack/reconciled.log" push_watermark_after)"
+lost_applied_rows="$(json_event_file_number \
+  "$lost_ack/reconciled.log" oversized_push_confirmed applied_rows)"
+[[ "$lost_applied_rows" -eq 0 ]] \
+  || fail "lost-ack reconciliation applied the dependency unit a second time"
+pass "lost-ack reconciliation applied zero dependency-unit rows"
+lost_source_lsn="$(json_event_file_number \
+  "$lost_ack/reconciled.log" oversized_push_confirmed source_lsn)"
+lost_push_before="$(json_event_file_number \
+  "$lost_ack/reconciled.log" oversized_push_started push_watermark_before)"
+lost_push_after="$(json_event_file_number \
+  "$lost_ack/reconciled.log" oversized_push_confirmed push_watermark_after)"
 [[ "$lost_push_after" -eq "$lost_source_lsn" && "$lost_push_after" -gt "$lost_push_before" ]] \
   || fail "reconciliation advanced the edge watermark to the confirmed source position"
 pass "reconciliation advanced the edge watermark to the confirmed source position"
-pass "lost-ack reconciliation made no second hub commit"
+pass "lost-ack reconciliation made no second dependency-unit application"
 
 printf 'CHECK fitting dependency and unrelated ordinary work stay on one request with no staging\n'
 for fixture in fitting-dependency ordinary; do
@@ -439,8 +611,10 @@ for fixture in fitting-dependency ordinary; do
   require_text "$request_path" '"chunked":false' \
     "$fixture used one ordinary request without durable staging"
   stop_hub
-  fixture_source_lsn="$(json_file_number "$request_root/push.log" source_lsn)"
-  fixture_push_after="$(json_file_number "$request_root/push.log" push_watermark_after)"
+  fixture_source_lsn="$(json_event_file_number \
+    "$request_root/push.log" oversized_push_confirmed source_lsn)"
+  fixture_push_after="$(json_event_file_number \
+    "$request_root/push.log" oversized_push_confirmed push_watermark_after)"
   [[ "$fixture_push_after" -eq "$fixture_source_lsn" ]] \
     || fail "$fixture advanced to its exact confirmed source position"
   pass "$fixture advanced to its exact confirmed source position"
