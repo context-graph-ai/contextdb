@@ -1171,8 +1171,8 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-seams"))]
-    pub fn sink_metrics_for_test(&self, sink: &str) -> SinkMetrics {
+    /// Current delivery counters and durable queue depth for a declared sink.
+    pub fn sink_metrics(&self, sink: &str) -> SinkMetrics {
         let _operation = self.assert_open_operation();
         let queued = self
             .event_bus
@@ -1195,6 +1195,11 @@ impl Database {
             permanent_failures: metrics.permanent_failures,
             examined: metrics.examined,
         }
+    }
+
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn sink_metrics_for_test(&self, sink: &str) -> SinkMetrics {
+        self.sink_metrics(sink)
     }
 
     /// Ordered in-memory queue identity/payload view for received-schema race

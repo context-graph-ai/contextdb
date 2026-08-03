@@ -87,6 +87,7 @@ set_memory_limit
 set_maintenance_policy
 set_pruning_interval
 set_trigger_audit_retention
+sink_metrics
 snapshot
 snapshot_at
 subscribe

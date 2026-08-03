@@ -1806,23 +1806,12 @@ async fn a9_14_selective_sync_direction_filtering() {
         "server must receive observations (Push direction)"
     );
 
-    // Schema travels as one authenticated vector, but SYNC OFF keeps scratch
-    // data on the edge.
+    // A wholly local schema commit stays on its author, together with its
+    // rows. The source filter never slices an authenticated commit: this
+    // CREATE was its own complete commit, so it is excluded as one unit.
     assert!(
-        server.table_names().contains(&"scratch".to_string()),
-        "the received schema must retain the edge's SYNC OFF declaration"
-    );
-    let scratch_on_hub = server
-        .point_lookup(
-            "scratch",
-            "id",
-            &Value::Uuid(uuid_scratch),
-            server.snapshot(),
-        )
-        .unwrap();
-    assert!(
-        scratch_on_hub.is_none(),
-        "SYNC OFF scratch data must never leave the edge"
+        !server.table_names().contains(&"scratch".to_string()),
+        "the SYNC OFF scratch declaration and its data must never leave the edge"
     );
 
     // Server did NOT get edge's local pattern guess
