@@ -59,6 +59,63 @@ fn ddl_vector() -> Vec<DdlChange> {
     ]
 }
 
+fn structured_table_ddl_with_including_sync_trigger() -> Vec<DdlChange> {
+    let owner_columns = vec![
+        ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+        ("tenant".to_string(), "TEXT".to_string()),
+    ];
+    let note_columns = vec![
+        ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+        ("tenant".to_string(), "TEXT".to_string()),
+        ("owner_id".to_string(), "INTEGER".to_string()),
+        ("slug".to_string(), "TEXT".to_string()),
+    ];
+    let note_foreign_keys = vec![contextdb_core::SingleColumnForeignKey {
+        child_column: "owner_id".to_string(),
+        parent_table: "retry_owners".to_string(),
+        parent_column: "id".to_string(),
+    }];
+    let note_composite_foreign_keys = vec![contextdb_core::CompositeForeignKey {
+        child_columns: vec!["tenant".to_string(), "owner_id".to_string()],
+        parent_table: "retry_owners".to_string(),
+        parent_columns: vec!["tenant".to_string(), "id".to_string()],
+    }];
+    let note_composite_unique = vec![vec!["tenant".to_string(), "slug".to_string()]];
+    let mut altered_note_columns = note_columns.clone();
+    altered_note_columns.push(("content".to_string(), "TEXT".to_string()));
+    vec![
+        DdlChange::CreateTable {
+            name: "retry_owners".to_string(),
+            columns: owner_columns,
+            constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: vec![vec!["tenant".to_string(), "id".to_string()]],
+        },
+        DdlChange::CreateTable {
+            name: "retry_notes".to_string(),
+            columns: note_columns,
+            constraints: Vec::new(),
+            foreign_keys: note_foreign_keys.clone(),
+            composite_foreign_keys: note_composite_foreign_keys.clone(),
+            composite_unique: note_composite_unique.clone(),
+        },
+        DdlChange::AlterTable {
+            name: "retry_notes".to_string(),
+            columns: altered_note_columns,
+            constraints: Vec::new(),
+            foreign_keys: note_foreign_keys,
+            composite_foreign_keys: note_composite_foreign_keys,
+            composite_unique: note_composite_unique,
+        },
+        DdlChange::CreateTriggerIncludingSync {
+            name: "retry_note_audit".to_string(),
+            table: "retry_notes".to_string(),
+            on_events: vec!["INSERT".to_string()],
+        },
+    ]
+}
+
 type ReceivedSchemaFixture = (
     ChangeSet,
     crate::protocol::ReceivedDdlContext,
@@ -214,6 +271,107 @@ fn reopen_if_requested(db: Database, path: &std::path::Path, reopen: bool) -> Da
     db.close().unwrap();
     drop(db);
     Database::open(path).unwrap()
+}
+
+fn assert_structured_received_schema_has_no_pending_ddl(db: &Database) {
+    let trigger_arrival = db
+        .received_ddl_arrivals
+        .read()
+        .keys()
+        .find(|(_, ordinal)| *ordinal == 3)
+        .copied()
+        .expect("the INCLUDING SYNC trigger keeps source-order ordinal three");
+    assert!(matches!(
+        db.raw_ddl_log_occurrence(trigger_arrival.0, trigger_arrival.1)
+            .unwrap(),
+        DdlChange::CreateTriggerIncludingSync { ref name, ref table, ref on_events }
+            if name == "retry_note_audit"
+                && table == "retry_notes"
+                && on_events == &vec!["INSERT".to_string()]
+    ));
+
+    let (pending, provenance) = db.changes_since_base(Lsn(0));
+    let outbound = db
+        .filter_outbound_received_ddl(pending, &provenance, None)
+        .expect("received structured DDL must bind its local durable occurrence");
+    assert!(outbound.ddl.is_empty());
+
+    let meta = db.table_meta("retry_notes").unwrap();
+    assert_eq!(meta.composite_foreign_keys.len(), 1);
+    assert!(
+        meta.unique_constraints
+            .iter()
+            .any(|columns| { columns == &vec!["tenant".to_string(), "slug".to_string()] })
+    );
+    assert!(
+        meta.columns
+            .iter()
+            .any(|column| { column.name == "owner_id" && column.references.is_some() })
+    );
+    assert!(meta.columns.iter().any(|column| column.name == "content"));
+
+    let visible = db.changes_since(Lsn(0));
+    for ddl in visible.ddl.iter().filter(|ddl| {
+        matches!(
+            ddl,
+            DdlChange::CreateTable { name, .. } | DdlChange::AlterTable { name, .. }
+                if name == "retry_notes"
+        )
+    }) {
+        match ddl {
+            DdlChange::CreateTable {
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+                ..
+            }
+            | DdlChange::AlterTable {
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+                ..
+            } => {
+                assert_eq!(foreign_keys.len(), 1);
+                assert_eq!(composite_foreign_keys.len(), 1);
+                assert_eq!(composite_unique.len(), 1);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn structured_received_table_ddl_and_including_sync_trigger_stay_non_pending_across_reopen() {
+    let ddl = structured_table_ddl_with_including_sync_trigger();
+    let (changes, received, lineages) = received_migration(ddl.clone(), false);
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().join("structured-received-ddl.redb");
+    let db = Database::open(&path).unwrap();
+    apply_received(&db, &changes, &received, &lineages).unwrap();
+    assert_structured_received_schema_has_no_pending_ddl(&db);
+
+    let before_retry = snapshot(&db);
+    let mut changed_ddl = ddl;
+    let DdlChange::AlterTable {
+        composite_unique, ..
+    } = &mut changed_ddl[2]
+    else {
+        unreachable!()
+    };
+    composite_unique.push(vec!["owner_id".to_string(), "slug".to_string()]);
+    let (changed, changed_received, changed_lineages) = received_migration(changed_ddl, false);
+    let error = apply_received(&db, &changed, &changed_received, &changed_lineages)
+        .expect_err("authenticated structured-field mutation must not reuse the source manifest");
+    assert!(
+        matches!(&error, Error::SyncError(reason) if reason.contains("retry changes the digest")),
+        "the full authenticated source digest remains authoritative: {error:?}"
+    );
+    assert_eq!(snapshot(&db), before_retry);
+
+    db.close().unwrap();
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    assert_structured_received_schema_has_no_pending_ddl(&reopened);
 }
 
 #[test]

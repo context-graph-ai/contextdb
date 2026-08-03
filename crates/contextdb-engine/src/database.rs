@@ -12376,8 +12376,17 @@ impl Database {
         persisted_ordinal: u32,
         generation: &DurableDdlGenerationSidecar,
     ) -> Result<Vec<u8>> {
+        // The receiver-local marker binds the durable DDL-log occurrence, not
+        // the authenticated source spelling (whose full-fidelity digest is
+        // validated separately before this point). DdlChange's compatibility
+        // decoder deliberately projects structured table fields to the legacy
+        // persisted shape, so normalize through that exact codec here. This
+        // keeps one arrival digest stable before and after reopen without
+        // weakening the source migration manifest.
+        let durable_bytes = RedbPersistence::encode_config_value(ddl)?;
+        let durable_ddl: DdlChange = RedbPersistence::decode_config_value(&durable_bytes)?;
         crate::protocol::canonical_ddl_provenance_digest(
-            &crate::protocol::WireDdlChange::from(ddl.clone()),
+            &crate::protocol::WireDdlChange::from(durable_ddl),
             local_lsn,
             persisted_ordinal,
             generation.table.as_deref(),
