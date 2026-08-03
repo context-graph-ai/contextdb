@@ -3270,6 +3270,8 @@ mod received_schema_atomic_retry_tests;
 #[cfg(test)]
 mod received_schema_atomic_side_effects_tests;
 #[cfg(test)]
+mod received_schema_bootstrap_echo_tests;
+#[cfg(test)]
 mod retired_generation_refusal_tests;
 
 #[derive(Debug, Clone)]
