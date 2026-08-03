@@ -83,11 +83,7 @@ pub fn validate_dml(
             }
 
             for row in &p.values {
-                for column in table_meta
-                    .columns
-                    .iter()
-                    .filter(|column| !column.nullable && !column.primary_key)
-                {
+                for column in table_meta.columns.iter().filter(|column| !column.nullable) {
                     if matches!(column.column_type, ColumnType::TxId) {
                         continue;
                     }

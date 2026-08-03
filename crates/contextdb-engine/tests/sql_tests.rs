@@ -1,6 +1,8 @@
 use contextdb_core::{Error, Lsn, Value};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::DdlChange;
+use contextdb_engine::sync_types::{
+    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -54,6 +56,121 @@ fn create_insert_select_roundtrip() {
 
     let q = db.execute("SELECT * FROM test", &HashMap::new()).unwrap();
     assert_eq!(q.rows.len(), 1);
+}
+
+#[test]
+fn primary_key_is_not_nullable_before_and_after_reopen() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("primary-key-nullability.redb");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE primary_key_contract (id UUID PRIMARY KEY, body TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE composite_key_contract (tenant_id UUID, item_id UUID, body TEXT, PRIMARY KEY (tenant_id, item_id))",
+        &HashMap::new(),
+    )
+    .unwrap();
+    let id = &db.table_meta("primary_key_contract").unwrap().columns[0];
+    assert!(id.primary_key);
+    assert!(!id.nullable, "a SQL primary key is implicitly NOT NULL");
+    let composite = db.table_meta("composite_key_contract").unwrap();
+    assert_eq!(
+        composite
+            .columns
+            .iter()
+            .take(2)
+            .map(|column| column.nullable)
+            .collect::<Vec<_>>(),
+        [false, false],
+        "every member of a table-level primary key is implicitly NOT NULL"
+    );
+
+    assert!(
+        db.execute(
+            "INSERT INTO primary_key_contract (id, body) VALUES (NULL, 'inline')",
+            &HashMap::new(),
+        )
+        .is_err(),
+        "SQL must refuse NULL in an inline primary key"
+    );
+    let item_id = Uuid::new_v4();
+    assert!(
+        db.execute(
+            "INSERT INTO composite_key_contract (tenant_id, item_id, body) VALUES (NULL, $item_id, 'composite')",
+            &params(vec![("item_id", Value::Uuid(item_id))]),
+        )
+        .is_err(),
+        "SQL must refuse NULL in any composite primary-key member"
+    );
+
+    let tx = db.begin_or_panic();
+    assert!(
+        db.insert_row(
+            tx,
+            "composite_key_contract",
+            HashMap::from([
+                ("tenant_id".to_string(), Value::Null),
+                ("item_id".to_string(), Value::Uuid(item_id)),
+                ("body".to_string(), Value::Text("library".to_string())),
+            ]),
+        )
+        .is_err(),
+        "the library write door must refuse NULL primary keys"
+    );
+    db.rollback(tx).unwrap();
+
+    let sync_values = HashMap::from([
+        ("tenant_id".to_string(), Value::Null),
+        ("item_id".to_string(), Value::Uuid(item_id)),
+        ("body".to_string(), Value::Text("sync".to_string())),
+    ]);
+    let sync_result = db
+        .apply_changes(
+            ChangeSet {
+                rows: vec![RowChange {
+                    table: "composite_key_contract".to_string(),
+                    natural_key: NaturalKey::from_pairs(vec![
+                        ("tenant_id".to_string(), Value::Null),
+                        ("item_id".to_string(), Value::Uuid(item_id)),
+                    ])
+                    .unwrap(),
+                    values: sync_values,
+                    deleted: false,
+                    lsn: Lsn(77),
+                    created_at: None,
+                }],
+                ..ChangeSet::default()
+            },
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+    assert_eq!(sync_result.applied_rows, 0);
+    assert_eq!(sync_result.skipped_rows, 1);
+    assert!(
+        db.scan("composite_key_contract", db.snapshot())
+            .unwrap()
+            .is_empty(),
+        "the sync write door must not publish a NULL primary key"
+    );
+    db.close().unwrap();
+    drop(db);
+
+    let reopened = Database::open(&path).unwrap();
+    let id = &reopened.table_meta("primary_key_contract").unwrap().columns[0];
+    assert!(id.primary_key);
+    assert!(!id.nullable, "reopen must preserve primary-key NOT NULL");
+    let composite = reopened.table_meta("composite_key_contract").unwrap();
+    assert!(
+        composite
+            .columns
+            .iter()
+            .take(2)
+            .all(|column| !column.nullable),
+        "reopen must preserve composite primary-key NOT NULL"
+    );
 }
 
 #[test]

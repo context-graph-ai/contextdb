@@ -144,6 +144,68 @@ mod received_schema_stage_tests {
     }
 
     #[test]
+    fn internal_sync_and_prepared_replacement_refuse_legacy_null_primary_key() {
+        let db = Database::open_memory();
+        db.execute(
+            "CREATE TABLE guarded_state (id UUID, tenant_id UUID, state TEXT, PRIMARY KEY (id, tenant_id)) STATE MACHINE (state: pending -> [done])",
+            &HashMap::new(),
+        )
+        .unwrap();
+        let id = uuid::Uuid::new_v4();
+        let legacy_values = HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("tenant_id".to_string(), Value::Null),
+            ("state".to_string(), Value::Text("pending".to_string())),
+        ]);
+
+        let tx = db.begin().unwrap();
+        assert!(
+            db.insert_synced_row_at(
+                tx,
+                "guarded_state",
+                RowId(1),
+                legacy_values.clone(),
+                db.snapshot(),
+                None,
+            )
+            .is_err(),
+            "the final synced-row writer must refuse a NULL primary-key member"
+        );
+        db.rollback(tx).unwrap();
+
+        let existing = VersionedRow {
+            row_id: RowId(2),
+            values: legacy_values.clone(),
+            created_tx: TxId(1),
+            deleted_tx: None,
+            lsn: Lsn(1),
+            created_at: None,
+        };
+        let mut next_values = legacy_values;
+        next_values.insert("state".to_string(), Value::Text("done".to_string()));
+        let mut write_set = WriteSet::default();
+        let mut options = PreparedPropagationOptions {
+            tx: TxId(2),
+            snapshot: db.snapshot(),
+            lookup_delta: None,
+        };
+        assert!(
+            db.upsert_row_in_prepared_write_set(
+                &mut write_set,
+                "guarded_state",
+                "state",
+                &existing,
+                next_values,
+                &mut options,
+            )
+            .is_err(),
+            "prepared state propagation must not republish a legacy NULL primary key"
+        );
+        assert!(write_set.relational_inserts.is_empty());
+        assert!(write_set.relational_deletes.is_empty());
+    }
+
+    #[test]
     fn received_schema_source_order_keeps_create_trigger_alter_exactly_as_authored() {
         let ddl = vec![create_table(), create_trigger(), alter_table()];
         let (order, payload) = plan_received_schema_source_order(
@@ -3530,6 +3592,9 @@ pub(crate) struct ReceivedSchemaStage {
 
 pub(crate) type ReceivedSchemaStageRegistry = Arc<Mutex<HashMap<Lsn, ReceivedSchemaStage>>>;
 
+type DdlGenerationKey = (Lsn, u32);
+type DdlGenerationValue = (Option<String>, Option<u64>);
+
 /// A locally authored table-schema vector held privately until its owning
 /// transaction receives a commit LSN.  Unlike received-schema staging, this
 /// carries no sync receipts or lineage adjudication: it is solely the
@@ -3538,7 +3603,7 @@ pub(crate) struct LocalSchemaStage {
     relational: Vec<TableProjection>,
     trigger: trigger::PreparedTriggerPublication,
     table_generations: Vec<(String, u64)>,
-    ddl_generations: Vec<((Lsn, u32), (Option<String>, Option<u64>))>,
+    ddl_generations: Vec<(DdlGenerationKey, DdlGenerationValue)>,
     ddl_log: Vec<(Lsn, DdlChange)>,
     memory_swap: PreparedMemorySwap,
     _temporary_memory: TemporaryMemoryReservation,
@@ -5542,7 +5607,7 @@ fn global_callback_active_count() -> &'static AtomicUsize {
 /// dropping the last handle when deterministic shutdown matters; a waiter that
 /// wakes after close observes the normal closed-handle error.
 type AcceptedSyncRowAuthors = HashMap<(String, Vec<u8>), String>;
-type InMemoryDdlGenerations = HashMap<(Lsn, u32), (Option<String>, Option<u64>)>;
+type InMemoryDdlGenerations = HashMap<DdlGenerationKey, DdlGenerationValue>;
 type OutboundRowLineages = HashMap<(String, Vec<u8>, Lsn), crate::protocol::WireRowLineage>;
 type AuthoritativePurgeBlobReferences = (BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>);
 
@@ -11279,6 +11344,7 @@ impl Database {
         let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
         self.complete_insert_access_values(table, &mut values)?;
+        self.validate_primary_key_values_present(table, &values)?;
         let creation_key = self
             .table_meta(table)
             .and_then(|meta| natural_key_from_row_values(&meta, &values));
@@ -11347,6 +11413,7 @@ impl Database {
         let mut values =
             self.coerce_row_for_insert(table, values, Some(self.committed_watermark()), Some(tx))?;
         self.complete_insert_access_values(table, &mut values)?;
+        self.validate_primary_key_values_present(table, &values)?;
         if !self.trigger_callback_tx_bound_matches(tx) {
             self.validate_row_constraints(tx, table, &values, Some(old_row_id))?;
         }
@@ -11363,6 +11430,7 @@ impl Database {
         values: HashMap<ColName, Value>,
         snapshot: SnapshotId,
     ) -> Result<RowId> {
+        self.validate_primary_key_values_present(table, &values)?;
         self.relational.delete(tx, table, row_id)?;
         self.relational
             .insert_with_row_id(tx, table, row_id, values, snapshot)
@@ -11376,6 +11444,7 @@ impl Database {
         values: HashMap<ColName, Value>,
         context: UpdateReplacementContext<'_>,
     ) -> Result<(RowId, WriteSetCounts, WriteSetCounts)> {
+        self.validate_primary_key_values_present(table, &values)?;
         if context.meta.immutable {
             return Err(Error::ImmutableTable(table.to_string()));
         }
@@ -11540,6 +11609,7 @@ impl Database {
         snapshot: SnapshotId,
         created_at: Option<Wallclock>,
     ) -> Result<RowId> {
+        self.validate_primary_key_values_present(table, &values)?;
         match created_at {
             Some(created_at) => self
                 .relational
@@ -16157,6 +16227,30 @@ impl Database {
         Ok(out)
     }
 
+    fn validate_primary_key_values_present(
+        &self,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+    ) -> Result<()> {
+        let meta = self
+            .table_meta(table)
+            .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+        for column in &meta.columns {
+            let is_primary_key = column.primary_key
+                || meta
+                    .primary_key_columns
+                    .iter()
+                    .any(|name| name == &column.name);
+            if is_primary_key && matches!(values.get(&column.name), None | Some(Value::Null)) {
+                return Err(Error::ColumnNotNullable {
+                    table: table.to_string(),
+                    column: column.name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn insert_row_with_unique_noop(
         &self,
         tx: TxId,
@@ -16340,6 +16434,20 @@ impl Database {
         let meta = metas
             .get(table)
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
+
+        for column in &meta.columns {
+            let is_primary_key = column.primary_key
+                || meta
+                    .primary_key_columns
+                    .iter()
+                    .any(|name| name == &column.name);
+            if is_primary_key && matches!(values.get(&column.name), None | Some(Value::Null)) {
+                return Err(Error::ColumnNotNullable {
+                    table: table.to_string(),
+                    column: column.name.clone(),
+                });
+            }
+        }
 
         // Scan the whole table only when no index covers any PK / UNIQUE
         // column we need to probe. Pulled lazily so the fast path skips it.
@@ -19666,6 +19774,8 @@ impl Database {
         if !changed {
             return Ok(false);
         }
+
+        self.validate_primary_key_values_present(table, &next_values)?;
 
         let meta = self
             .table_meta(table)
@@ -28615,7 +28725,7 @@ impl Database {
                     }
                 }
                 for column in &table_meta.columns {
-                    if column.nullable || column.primary_key || column.default.is_some() {
+                    if column.nullable || column.default.is_some() {
                         continue;
                     }
                     match row.values.get(&column.name) {
@@ -29494,7 +29604,7 @@ impl Database {
             .ok_or_else(|| Error::TableNotFound(table.to_string()))?;
 
         for col_def in &meta.columns {
-            if !col_def.nullable && !col_def.primary_key && col_def.default.is_none() {
+            if !col_def.nullable && col_def.default.is_none() {
                 match values.get(&col_def.name) {
                     None | Some(Value::Null) => {
                         return Ok(Some(format!(
@@ -33875,10 +33985,7 @@ impl Database {
                         let mut constraint_error: Option<String> = None;
 
                         for col_def in &meta.columns {
-                            if !col_def.nullable
-                                && !col_def.primary_key
-                                && col_def.default.is_none()
-                            {
+                            if !col_def.nullable && col_def.default.is_none() {
                                 match values.get(&col_def.name) {
                                     None | Some(Value::Null) => {
                                         constraint_error = Some(format!(

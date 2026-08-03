@@ -152,12 +152,16 @@ fn execute_plan_once(
                     .columns
                     .iter()
                     .map(|c| {
-                        core_column_from_ast(
+                        let mut column = core_column_from_ast(
                             c,
                             resolved_policies
                                 .get(&c.name)
                                 .map(|resolved| resolved.policy.clone()),
-                        )
+                        );
+                        if p.primary_key_columns.contains(&c.name) {
+                            column.nullable = false;
+                        }
+                        column
                     })
                     .collect(),
                 immutable: p.immutable,
@@ -9685,7 +9689,9 @@ fn core_column_from_ast(
     contextdb_core::ColumnDef {
         name: col.name.clone(),
         column_type: map_column_type(&col.data_type),
-        nullable: col.nullable,
+        // SQL primary-key columns are implicitly NOT NULL even when the
+        // declaration does not repeat that constraint explicitly.
+        nullable: col.nullable && !col.primary_key,
         primary_key: col.primary_key,
         unique: col.unique,
         default: col.default.as_ref().map(stored_default_expr),

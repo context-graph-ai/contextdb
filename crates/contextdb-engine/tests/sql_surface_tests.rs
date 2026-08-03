@@ -5652,6 +5652,83 @@ fn trigger_written_cross_context_row_anchor_read_under_scoped_handle_reports_typ
     }
 }
 
+#[test]
+fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
+    let db = Database::open_memory();
+    db.execute(
+        "CREATE TABLE callback_source (id UUID PRIMARY KEY, action TEXT)",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE callback_target (tenant_id UUID, item_id UUID, body TEXT, PRIMARY KEY (tenant_id, item_id))",
+        &empty(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER callback_pk_guard ON callback_source WHEN INSERT",
+        &empty(),
+    )
+    .unwrap();
+    let tenant_id = Uuid::new_v4();
+    let item_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO callback_target (tenant_id, item_id, body) VALUES ($tenant_id, $item_id, 'kept')",
+        &params(vec![
+            ("tenant_id", Value::Uuid(tenant_id)),
+            ("item_id", Value::Uuid(item_id)),
+        ]),
+    )
+    .unwrap();
+    db.register_trigger_callback("callback_pk_guard", move |db_handle, ctx| {
+        match ctx.row_values.get("action").and_then(Value::as_text) {
+            Some("insert") => {
+                db_handle.insert_row(
+                    ctx.tx,
+                    "callback_target",
+                    HashMap::from([
+                        ("tenant_id".to_string(), Value::Null),
+                        ("item_id".to_string(), Value::Uuid(Uuid::new_v4())),
+                        ("body".to_string(), Value::Text("bad insert".to_string())),
+                    ]),
+                )?;
+            }
+            Some("update") => {
+                db_handle.execute_in_tx(
+                    ctx.tx,
+                    "UPDATE callback_target SET tenant_id = NULL WHERE item_id = $item_id",
+                    &params(vec![("item_id", Value::Uuid(item_id))]),
+                )?;
+            }
+            _ => return Err(Error::Other("unknown callback action".to_string())),
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.complete_initialization().unwrap();
+
+    for action in ["insert", "update"] {
+        assert!(
+            db.execute(
+                "INSERT INTO callback_source (id, action) VALUES ($id, $action)",
+                &params(vec![
+                    ("id", Value::Uuid(Uuid::new_v4())),
+                    ("action", Value::Text(action.to_string())),
+                ]),
+            )
+            .is_err(),
+            "callback {action} must refuse a NULL primary-key member"
+        );
+    }
+    let rows = db
+        .execute("SELECT * FROM callback_target", &empty())
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Uuid(tenant_id));
+    assert_eq!(rows[0][2], Value::Text("kept".to_string()));
+}
+
 // ============================================================
 // Group 8: Constraints
 // ============================================================
