@@ -443,27 +443,62 @@ async fn run_ddl_source(args: DdlSourceArgs) -> Result<(), String> {
 
 fn print_ddl_vector(database: &Database, event: &str) -> Result<(), String> {
     let authored = database.changes_since(contextdb_core::Lsn(0));
-    let kinds = authored.ddl.iter().map(ddl_kind).collect::<Vec<_>>();
-    if kinds != ["create_table", "create_trigger", "alter_table"]
-        || authored.ddl_lsn.len() != 3
-        || authored
-            .ddl_lsn
-            .iter()
-            .any(|lsn| *lsn != authored.ddl_lsn[0])
-    {
-        return Err("DDL is not one exact same-LSN three-item vector".to_string());
-    }
+    let (kinds, ddl_lsn) = exact_fixture_ddl_vector(&authored)?;
     println!(
         "{}",
         json!({
             "event": event,
             "order": kinds,
-            "source_lsn": authored.ddl_lsn[0].0,
+            "source_lsn": ddl_lsn.0,
         })
     );
     std::io::stdout()
         .flush()
         .map_err(|_| "stdout failed".to_string())
+}
+
+fn exact_fixture_ddl_vector(
+    changes: &ChangeSet,
+) -> Result<(Vec<&'static str>, contextdb_core::Lsn), String> {
+    if changes.ddl.len() != changes.ddl_lsn.len() {
+        return Err("DDL is not one exact same-LSN three-item vector".to_string());
+    }
+    let fixture_entries = changes
+        .ddl
+        .iter()
+        .zip(changes.ddl_lsn.iter().copied())
+        .filter(|(change, _)| ddl_targets_fixture(change))
+        .collect::<Vec<_>>();
+    let kinds = fixture_entries
+        .iter()
+        .map(|(change, _)| ddl_kind(change))
+        .collect::<Vec<_>>();
+    let Some((_, ddl_lsn)) = fixture_entries.first() else {
+        return Err("DDL is not one exact same-LSN three-item vector".to_string());
+    };
+    if kinds != ["create_table", "create_trigger", "alter_table"]
+        || fixture_entries.len() != 3
+        || fixture_entries.iter().any(|(_, lsn)| lsn != ddl_lsn)
+    {
+        return Err("DDL is not one exact same-LSN three-item vector".to_string());
+    }
+    Ok((kinds, *ddl_lsn))
+}
+
+fn ddl_targets_fixture(change: &DdlChange) -> bool {
+    match change {
+        DdlChange::CreateTable { name, .. }
+        | DdlChange::DropTable { name }
+        | DdlChange::AlterTable { name, .. } => name == DDL_TABLE,
+        DdlChange::CreateIndex { table, .. }
+        | DdlChange::DropIndex { table, .. }
+        | DdlChange::CreateEventType { table, .. }
+        | DdlChange::CreateRoute { table, .. }
+        | DdlChange::DropRoute { table, .. } => table == DDL_TABLE,
+        DdlChange::CreateTrigger { name, table, .. } => name == DDL_TRIGGER || table == DDL_TABLE,
+        DdlChange::DropTrigger { name } => name == DDL_TRIGGER,
+        DdlChange::CreateSink { .. } => false,
+    }
 }
 
 async fn run_oversized_source(args: OversizedSourceArgs) -> Result<(), String> {
@@ -690,9 +725,96 @@ fn request_fixture_name(fixture: RequestFixture) -> &'static str {
 fn ddl_kind(change: &DdlChange) -> &'static str {
     match change {
         DdlChange::CreateTable { name, .. } if name == DDL_TABLE => "create_table",
-        DdlChange::CreateTrigger { name, .. } if name == DDL_TRIGGER => "create_trigger",
+        DdlChange::CreateTrigger { name, table, .. }
+            if name == DDL_TRIGGER && table == DDL_TABLE =>
+        {
+            "create_trigger"
+        }
         DdlChange::AlterTable { name, .. } if name == DDL_TABLE => "alter_table",
         _ => "unexpected",
+    }
+}
+
+#[cfg(test)]
+mod ddl_vector_tests {
+    use super::*;
+    use contextdb_core::Lsn;
+
+    fn fixture_vector(lsn: Lsn) -> ChangeSet {
+        ChangeSet {
+            ddl: vec![
+                DdlChange::CreateTable {
+                    name: DDL_TABLE.to_string(),
+                    columns: vec![("id".to_string(), "UUID PRIMARY KEY".to_string())],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                },
+                DdlChange::CreateTrigger {
+                    name: DDL_TRIGGER.to_string(),
+                    table: DDL_TABLE.to_string(),
+                    on_events: vec!["INSERT".to_string()],
+                },
+                DdlChange::AlterTable {
+                    name: DDL_TABLE.to_string(),
+                    columns: vec![
+                        ("id".to_string(), "UUID PRIMARY KEY".to_string()),
+                        ("detail".to_string(), "TEXT".to_string()),
+                    ],
+                    constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    composite_foreign_keys: Vec::new(),
+                    composite_unique: Vec::new(),
+                },
+            ],
+            ddl_lsn: vec![lsn; 3],
+            ..ChangeSet::default()
+        }
+    }
+
+    fn unrelated_hub_table() -> DdlChange {
+        DdlChange::CreateTable {
+            name: "work_node_contacts".to_string(),
+            columns: vec![("node_id".to_string(), "TEXT PRIMARY KEY".to_string())],
+            constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            composite_foreign_keys: Vec::new(),
+            composite_unique: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_fixture_vector_ignores_unrelated_hub_schema() {
+        let mut changes = fixture_vector(Lsn(4));
+        changes.ddl.insert(0, unrelated_hub_table());
+        changes.ddl_lsn.insert(0, Lsn(1));
+
+        let (kinds, lsn) = exact_fixture_ddl_vector(&changes).unwrap();
+
+        assert_eq!(kinds, ["create_table", "create_trigger", "alter_table"]);
+        assert_eq!(lsn, Lsn(4));
+    }
+
+    #[test]
+    fn exact_fixture_vector_rejects_extra_fixture_ddl() {
+        let mut changes = fixture_vector(Lsn(4));
+        changes.ddl.push(DdlChange::CreateIndex {
+            table: DDL_TABLE.to_string(),
+            name: "unexpected_fixture_index".to_string(),
+            columns: vec![("detail".to_string(), contextdb_core::SortDirection::Asc)],
+        });
+        changes.ddl_lsn.push(Lsn(4));
+
+        assert!(exact_fixture_ddl_vector(&changes).is_err());
+    }
+
+    #[test]
+    fn exact_fixture_vector_rejects_split_receiver_lsns() {
+        let mut changes = fixture_vector(Lsn(4));
+        changes.ddl_lsn[2] = Lsn(5);
+
+        assert!(exact_fixture_ddl_vector(&changes).is_err());
     }
 }
 
