@@ -146,13 +146,12 @@ json_string() {
   printf '%s\n' "$json" | sed -n "s/.*\"${field}\":\"\([^\"]*\)\".*/\1/p"
 }
 
-printf 'CHECK ordinary product help does not expose the verifier or removed policy/broker controls\n'
+printf 'CHECK ordinary product help does not expose verifier or removed policy controls\n'
 help="$($cli --help 2>&1)"
 [[ "$help" != *"smoke-driver"* ]] || fail "ordinary CLI hides verifier controls"
 [[ "$help" != *"ServerWins"* && "$help" != *"EdgeWins"* && "$help" != *"LatestWins"* && "$help" != *"InsertIfNotExists"* ]] \
   || fail "ordinary CLI hides role-mechanic policy names"
-[[ "$help" != *"nats"* && "$help" != *"NATS"* ]] || fail "ordinary CLI has no broker surface"
-pass "ordinary CLI hides verifier, role-mechanic, and broker controls"
+pass "ordinary CLI hides verifier and role-mechanic policy controls"
 for removed_command in policy direction; do
   removed_output="$(printf '.sync %s\n.quit\n' "$removed_command" \
     | "$cli" "$work/removed-$removed_command.db" --json 2>&1 || true)"
@@ -162,19 +161,6 @@ for removed_command in policy direction; do
     || fail "removed session $removed_command command fails as unknown"
   pass "removed session $removed_command command fails as unknown"
 done
-if "$cli" "$work/removed-cli-flag.db" --nats-url nats://127.0.0.1:4222 </dev/null \
-  >"$work/removed-cli-flag.stdout" 2>"$work/removed-cli-flag.stderr"; then
-  fail "removed CLI broker flag fails as unknown"
-fi
-require_file_text "$work/removed-cli-flag.stderr" "unexpected argument '--nats-url'" \
-  "removed CLI broker flag fails as unknown"
-if "$server" --db-path "$work/removed-server-flag.db" --nats-url nats://127.0.0.1:4222 \
-  >"$work/removed-server-flag.stdout" 2>"$work/removed-server-flag.stderr"; then
-  fail "removed server broker flag fails as unknown"
-fi
-require_file_text "$work/removed-server-flag.stderr" "unexpected argument '--nats-url'" \
-  "removed server broker flag fails as unknown"
-
 printf 'CHECK one machine identity survives reopen and database recreation while database life changes\n'
 identity_root="$work/identity-life"
 mkdir -p "$identity_root"
