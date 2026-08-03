@@ -492,6 +492,29 @@ async fn run_installed_cli_refusals(
         .stdin
         .take()
         .ok_or_else(|| "auto-sync CLI stdin is unavailable".to_string())?;
+    writeln!(stdin, ".sync auto on")
+        .map_err(|_| "cannot enable installed auto-sync".to_string())?;
+    stdin
+        .flush()
+        .map_err(|_| "cannot flush installed auto-sync enablement".to_string())?;
+    let enable_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = enable_deadline.saturating_duration_since(Instant::now());
+        let (_, line) = reports
+            .recv_timeout(remaining)
+            .map_err(|_| "installed CLI did not acknowledge auto-sync enablement".to_string())?;
+        let Some(line) = line else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_str::<JsonValue>(&line) else {
+            continue;
+        };
+        if document["sync_auto"]["configured"] == JsonValue::Bool(true)
+            && document["sync_auto"]["enabled"] == JsonValue::Bool(true)
+        {
+            break;
+        }
+    }
     writeln!(
         stdin,
         "INSERT INTO notes (id, body) VALUES ('{trigger_id}', 'auto-sync-trigger');"
@@ -564,20 +587,7 @@ fn find_cli_conflict<'a>(
         let Ok(document) = serde_json::from_str::<JsonValue>(line) else {
             continue;
         };
-        let mut leaves = Vec::new();
-        json_leaves(&document, &mut leaves);
-        let rendered = document.to_string().to_ascii_lowercase();
-        if (rendered.contains("conflict") || rendered.contains("refus"))
-            && leaves.iter().any(|value| value.as_str() == Some("notes"))
-            && leaves
-                .iter()
-                .any(|value| value.as_str() == Some(id.as_str()))
-            && leaves
-                .iter()
-                .any(|value| value.as_str() == Some(mutation_kind))
-            && leaves.iter().any(|value| value.as_str() == Some(author))
-            && leaves.iter().any(|value| value.as_u64() == Some(position))
-        {
+        if contains_exact_cli_conflict(&document, id.as_str(), mutation_kind, author, position) {
             return Ok(document);
         }
     }
@@ -1086,19 +1096,45 @@ fn read_all(mut reader: impl Read) -> Result<String, String> {
     Ok(output)
 }
 
-fn json_leaves<'a>(document: &'a JsonValue, leaves: &mut Vec<&'a JsonValue>) {
+fn contains_exact_cli_conflict(
+    document: &JsonValue,
+    id: &str,
+    mutation_kind: &str,
+    author: &str,
+    position: u64,
+) -> bool {
     match document {
-        JsonValue::Array(values) => {
-            for value in values {
-                json_leaves(value, leaves);
-            }
-        }
+        JsonValue::Array(values) => values
+            .iter()
+            .any(|value| contains_exact_cli_conflict(value, id, mutation_kind, author, position)),
         JsonValue::Object(values) => {
-            for value in values.values() {
-                json_leaves(value, leaves);
-            }
+            let natural_key = values.get("natural_key");
+            let exact = values.get("reason").and_then(JsonValue::as_str)
+                == Some("dependency_complete_refused")
+                && values.get("table").and_then(JsonValue::as_str) == Some("notes")
+                && values.get("mutation_kind").and_then(JsonValue::as_str) == Some(mutation_kind)
+                && values
+                    .get("winning_author_node_id")
+                    .and_then(JsonValue::as_str)
+                    == Some(author)
+                && values
+                    .get("hub_acceptance_position")
+                    .and_then(JsonValue::as_u64)
+                    == Some(position)
+                && natural_key.and_then(|key| key.get("column"))
+                    == Some(&JsonValue::String("id".to_string()))
+                && natural_key.and_then(|key| key.get("rest")) == Some(&json!([]))
+                && natural_key
+                    .and_then(|key| key.get("value"))
+                    .and_then(|value| value.get("Uuid"))
+                    .and_then(JsonValue::as_str)
+                    == Some(id);
+            exact
+                || values.values().any(|value| {
+                    contains_exact_cli_conflict(value, id, mutation_kind, author, position)
+                })
         }
-        leaf => leaves.push(leaf),
+        _ => false,
     }
 }
 

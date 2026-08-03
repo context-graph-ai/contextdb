@@ -42,7 +42,7 @@ use super::{
     ServerTransport, TransportError, TransportFuture, TransportResult, TransportStatusFuture,
 };
 use crate::identity::FabricIdentity;
-use iroh::endpoint::{Connection, RelayMode};
+use iroh::endpoint::{Connection, RecvStream, RelayMode, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey, Watcher};
 use iroh_tickets::endpoint::EndpointTicket;
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ use std::sync::OnceLock;
 #[cfg(feature = "test-seams")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -634,12 +634,15 @@ struct SyncRouteLifecycle {
     tracked_response_transfers: usize,
     response_transfers: HashMap<ResponseTransferKey, TrackedResponseTransfer>,
     draining_response_transfers: HashMap<ResponseTransferKey, usize>,
+    reply_streams: Vec<Weak<AsyncMutex<Option<(SendStream, RecvStream)>>>>,
 }
 
 #[derive(Default)]
 struct SyncRouteState {
     lifecycle: Mutex<SyncRouteLifecycle>,
     idle: Notify,
+    reply_owners_cancelled: AtomicBool,
+    reply_owner_cancelled: Notify,
     #[cfg(feature = "test-seams")]
     successful_reply_receipts: AtomicUsize,
     #[cfg(feature = "test-seams")]
@@ -649,11 +652,13 @@ struct SyncRouteState {
 impl SyncRouteState {
     fn begin_serving(&self, routes: Arc<HashMap<String, super::RequestHandler>>) {
         let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|err| err.into_inner());
+        self.reply_owners_cancelled.store(false, Ordering::SeqCst);
         lifecycle.routes = Some(routes);
         lifecycle.reserved_response_transfers = 0;
         lifecycle.tracked_response_transfers = 0;
         lifecycle.response_transfers.clear();
         lifecycle.draining_response_transfers.clear();
+        lifecycle.reply_streams.clear();
     }
 
     fn admit(
@@ -682,6 +687,49 @@ impl SyncRouteState {
             .iter()
             .map(|(key, transfer)| (key.clone(), transfer.count))
             .collect();
+    }
+
+    fn register_reply_stream(
+        &self,
+        slot: &Arc<AsyncMutex<Option<(SendStream, RecvStream)>>>,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|err| err.into_inner());
+        if self.reply_owners_cancelled.load(Ordering::SeqCst) {
+            return false;
+        }
+        lifecycle
+            .reply_streams
+            .retain(|stream| stream.strong_count() > 0);
+        lifecycle.reply_streams.push(Arc::downgrade(slot));
+        true
+    }
+
+    async fn cancel_reply_owners(&self) {
+        self.reply_owners_cancelled.store(true, Ordering::SeqCst);
+        self.reply_owner_cancelled.notify_waiters();
+        let slots = {
+            let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|err| err.into_inner());
+            lifecycle
+                .reply_streams
+                .drain(..)
+                .filter_map(|stream| stream.upgrade())
+                .collect::<Vec<_>>()
+        };
+        for slot in slots {
+            drop(slot.lock().await.take());
+        }
+    }
+
+    async fn reply_owner_cancelled(&self) {
+        loop {
+            let cancelled = self.reply_owner_cancelled.notified();
+            tokio::pin!(cancelled);
+            cancelled.as_mut().enable();
+            if self.reply_owners_cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            cancelled.as_mut().await;
+        }
     }
 
     fn reserve_response_transfer(self: &Arc<Self>) -> Option<ResponseTransferReservation> {
@@ -1211,6 +1259,7 @@ struct LargeRequestTestControlState {
     routes_ready_notice: Notify,
     shutdown_admission_closed: AtomicBool,
     shutdown_admission_closed_notice: Notify,
+    force_graceful_drain_timeout: AtomicBool,
 }
 
 #[cfg(feature = "test-seams")]
@@ -1249,6 +1298,7 @@ impl Default for LargeRequestTestControlState {
             routes_ready_notice: Notify::new(),
             shutdown_admission_closed: AtomicBool::new(false),
             shutdown_admission_closed_notice: Notify::new(),
+            force_graceful_drain_timeout: AtomicBool::new(false),
         }
     }
 }
@@ -1391,6 +1441,13 @@ impl LargeRequestTestController {
             }
             notice.await;
         }
+    }
+
+    pub fn force_graceful_drain_timeout_for_test(&self) {
+        self.stage
+            .control
+            .force_graceful_drain_timeout
+            .store(true, Ordering::SeqCst);
     }
 
     /// Wait until every accepted ordinary request has either received its
@@ -1846,8 +1903,9 @@ impl DurableLargeRequestStage {
 /// connection by its ALPN: sync connections go to the routes the sync
 /// `ServerTransport` installed, everything else to a registered peer
 /// protocol. The loop holds its own endpoint handle, so dropping this struct
-/// never tears down an actively serving transport; the endpoint is closed
-/// when the sync serve loop exits (freeing the port for a rebind).
+/// never tears down an actively serving transport. A joined sync serve loop
+/// relinquishes its bound-transport handle; once every other endpoint owner
+/// also drops, Iroh releases the port for a rebind.
 pub struct IrohServer {
     endpoint: Endpoint,
     ticket: String,
@@ -1859,6 +1917,8 @@ pub struct IrohServer {
     large_request_stage: DurableLargeRequestStage,
     pre_admission: PreAdmissionGuardrails,
     accept_loop: Arc<AcceptLoopLifecycle>,
+    transport_endpoint: Arc<AsyncMutex<Option<Endpoint>>>,
+    serve_lifecycle: Arc<ServeLifecycle>,
 }
 
 #[derive(Clone)]
@@ -1905,6 +1965,146 @@ struct AcceptLoopLifecycle {
     handle: AsyncMutex<Option<JoinHandle<()>>>,
 }
 
+const SERVE_IDLE: u8 = 0;
+const SERVE_ACTIVE: u8 = 1;
+const SERVE_RELEASE_FAILED: u8 = 2;
+
+struct ServeLifecycle {
+    state: std::sync::atomic::AtomicU8,
+    idle: tokio::sync::Notify,
+}
+
+impl ServeLifecycle {
+    fn new() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(SERVE_IDLE),
+            idle: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn begin(self: &Arc<Self>, endpoint: Endpoint) -> ActiveServingEndpoint {
+        self.state
+            .compare_exchange(
+                SERVE_IDLE,
+                SERVE_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .expect("the one-shot Iroh serving lease cannot be active twice");
+        ActiveServingEndpoint {
+            endpoint: Some(endpoint),
+            lifecycle: self.clone(),
+        }
+    }
+
+    fn finish(&self) {
+        self.state.store(SERVE_IDLE, Ordering::Release);
+        self.idle.notify_waiters();
+    }
+
+    fn fail(&self) {
+        self.state.store(SERVE_RELEASE_FAILED, Ordering::Release);
+        self.idle.notify_waiters();
+    }
+
+    async fn wait_idle(&self) -> Result<(), String> {
+        loop {
+            let idle = self.idle.notified();
+            match self.state.load(Ordering::Acquire) {
+                SERVE_IDLE => return Ok(()),
+                SERVE_RELEASE_FAILED => {
+                    return Err(
+                        "the active Iroh serving socket could not be synchronously released"
+                            .to_string(),
+                    );
+                }
+                SERVE_ACTIVE => idle.await,
+                state => return Err(format!("invalid Iroh serve lifecycle state {state}")),
+            }
+        }
+    }
+}
+
+struct ActiveServingEndpoint {
+    endpoint: Option<Endpoint>,
+    lifecycle: Arc<ServeLifecycle>,
+}
+
+impl std::ops::Deref for ActiveServingEndpoint {
+    type Target = Endpoint;
+
+    fn deref(&self) -> &Self::Target {
+        self.endpoint
+            .as_ref()
+            .expect("an active serving endpoint retains its lease")
+    }
+}
+
+impl ActiveServingEndpoint {
+    async fn release(mut self) -> Result<(), String> {
+        let endpoint = self
+            .endpoint
+            .take()
+            .expect("an active serving endpoint releases exactly once");
+        let lifecycle = self.lifecycle.clone();
+        let failed_lifecycle = lifecycle.clone();
+        let (released, release_complete) = tokio::sync::oneshot::channel();
+        let release_thread = std::thread::Builder::new()
+            .name("contextdb-iroh-serving-socket-release".to_string())
+            .spawn(move || {
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(endpoint)));
+                if outcome.is_ok() {
+                    lifecycle.finish();
+                } else {
+                    lifecycle.fail();
+                }
+                let _ = released.send(outcome.is_ok());
+                if let Err(payload) = outcome {
+                    std::panic::resume_unwind(payload);
+                }
+            })
+            .map_err(|err| {
+                failed_lifecycle.fail();
+                format!("cannot start the Iroh serving socket-release thread: {err}")
+            })?;
+        let released = release_complete
+            .await
+            .map_err(|_| "the Iroh serving socket-release thread stopped early".to_string())?;
+        let joined = release_thread.join();
+        if !released || joined.is_err() {
+            self.lifecycle.fail();
+            return Err("the Iroh serving socket-release thread panicked".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ActiveServingEndpoint {
+    fn drop(&mut self) {
+        let Some(endpoint) = self.endpoint.take() else {
+            return;
+        };
+        let lifecycle = self.lifecycle.clone();
+        let failed_lifecycle = lifecycle.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("contextdb-iroh-cancelled-serve-release".to_string())
+            .spawn(move || {
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(endpoint)));
+                if outcome.is_ok() {
+                    lifecycle.finish();
+                } else {
+                    lifecycle.fail();
+                }
+            })
+        {
+            failed_lifecycle.fail();
+            panic!("cannot start the cancelled Iroh serve-release thread: {err}");
+        }
+    }
+}
+
 impl AcceptLoopLifecycle {
     fn new() -> Self {
         Self {
@@ -1925,6 +2125,38 @@ impl AcceptLoopLifecycle {
             *handle = None;
         }
     }
+}
+
+/// Drop closed Iroh endpoint handles outside Tokio's runtime context and wait
+/// until their operating-system sockets are actually released.
+///
+/// `iroh` 1.0 delegates its final `netwatch::UdpSocket` drop to an unjoined
+/// `spawn_blocking` task when the last `Endpoint` is dropped on a Tokio
+/// thread.  That makes `Endpoint::close().await` followed by an immediate
+/// same-port bind race the deferred `libc::close`.  On a plain thread,
+/// netwatch performs that final close synchronously; the acknowledgement keeps
+/// this function as the deterministic release boundary.
+async fn release_closed_endpoint_handles(endpoints: Vec<Endpoint>) -> Result<(), String> {
+    let (released, release_complete) = tokio::sync::oneshot::channel();
+    let release_thread = std::thread::Builder::new()
+        .name("contextdb-iroh-socket-release".to_string())
+        .spawn(move || {
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(endpoints)));
+            let _ = released.send(outcome.is_ok());
+            if let Err(payload) = outcome {
+                std::panic::resume_unwind(payload);
+            }
+        })
+        .map_err(|err| format!("cannot start the Iroh socket-release thread: {err}"))?;
+    let released = release_complete
+        .await
+        .map_err(|_| "the Iroh socket-release thread stopped early".to_string())?;
+    let joined = release_thread.join();
+    if !released || joined.is_err() {
+        return Err("the Iroh socket-release thread panicked".to_string());
+    }
+    Ok(())
 }
 
 impl IrohServer {
@@ -2017,6 +2249,9 @@ impl IrohServer {
             Ok(addr) => addr,
             Err(err) => {
                 endpoint.close().await;
+                release_closed_endpoint_handles(vec![endpoint])
+                    .await
+                    .map_err(TransportError::Other)?;
                 return Err(err);
             }
         };
@@ -2046,6 +2281,9 @@ impl IrohServer {
                     // stale on restart — refuse loudly rather than print a
                     // lying ticket.
                     endpoint.close().await;
+                    release_closed_endpoint_handles(vec![endpoint])
+                        .await
+                        .map_err(TransportError::Other)?;
                     return Err(TransportError::Unreachable(
                         "cannot persist the remembered sync port (the enrollment ticket would not survive a restart; fix permissions or pass an explicit port=)".to_string(),
                     ));
@@ -2074,9 +2312,16 @@ impl IrohServer {
             .and_then(|result| result);
             if let Err(err) = cleanup {
                 endpoint.close().await;
+                release_closed_endpoint_handles(vec![endpoint])
+                    .await
+                    .map_err(TransportError::Other)?;
                 return Err(err);
             }
         }
+        // Every transport() handle shares this one serving lease. That keeps
+        // pre-serve Arc clones useful while making a second serve a loud
+        // error rather than a second retained UDP-socket owner.
+        let transport_endpoint = Arc::new(AsyncMutex::new(Some(endpoint.clone())));
         let server = Self {
             endpoint,
             ticket,
@@ -2098,6 +2343,8 @@ impl IrohServer {
                 parsed.request_read_idle(),
             ),
             accept_loop: Arc::new(AcceptLoopLifecycle::new()),
+            transport_endpoint,
+            serve_lifecycle: Arc::new(ServeLifecycle::new()),
         };
         server.spawn_accept_loop().await;
         Ok(server)
@@ -2121,7 +2368,12 @@ impl IrohServer {
     /// down an actively serving transport.
     pub fn transport(&self) -> Arc<dyn ServerTransport> {
         Arc::new(IrohServerTransport {
-            endpoint: self.endpoint.clone(),
+            // Iroh releases the UDP socket only when its final Endpoint clone
+            // drops. `serve` takes this clone and drops it before reporting
+            // shutdown complete, so retaining SyncServer after run_until()
+            // cannot keep a stopped hub bound.
+            endpoint: self.transport_endpoint.clone(),
+            serve_lifecycle: self.serve_lifecycle.clone(),
             sync_routes: self.sync_routes.clone(),
             accept_loop: self.accept_loop.clone(),
             #[cfg(feature = "test-seams")]
@@ -2143,10 +2395,29 @@ impl IrohServer {
         Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)))
     }
 
-    /// Close the endpoint gracefully, releasing its port.
+    /// Ask every endpoint clone to close and wait for the accept loop. A
+    /// self-sufficient serving transport remains responsible for dropping its
+    /// own handle when its serve task exits.
     pub async fn close(self) {
         self.endpoint.close().await;
         self.accept_loop.await_termination().await;
+        // Iroh closes its UDP sockets only after every Endpoint clone drops.
+        // Drop both bound handles before this async close reports completion;
+        // leaving them as fields of the completed future makes an immediate
+        // sticky-port rebind depend on when the caller drops that future.
+        let mut endpoints = vec![self.endpoint];
+        if let Some(endpoint) = self.transport_endpoint.lock().await.take() {
+            endpoints.push(endpoint);
+        }
+        release_closed_endpoint_handles(endpoints)
+            .await
+            .unwrap_or_else(|err| panic!("Iroh socket release failed during shutdown: {err}"));
+        self.serve_lifecycle
+            .wait_idle()
+            .await
+            .unwrap_or_else(|err| {
+                panic!("Iroh active serve release failed during shutdown: {err}")
+            });
     }
 
     /// Register a CONNECTION-level protocol label: the handler receives each
@@ -2206,64 +2477,102 @@ impl IrohServer {
         let large_request_stage = self.large_request_stage.clone();
         let pre_admission = self.pre_admission.clone();
         let task = tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                let Some(connection_permit) = pre_admission.try_reserve_connection() else {
-                    incoming.refuse();
-                    continue;
-                };
-                let protocols = protocols.clone();
-                let connection_protocols = connection_protocols.clone();
-                let sync_routes = sync_routes.clone();
-                let large_request_stage = large_request_stage.clone();
-                let pre_admission = pre_admission.clone();
-                tokio::spawn(async move {
-                    let _connection_permit = connection_permit;
-                    let Ok(connection) = incoming.await else {
-                        return;
-                    };
-                    let alpn = connection.alpn().to_vec();
-                    if alpn == SYNC_ALPN {
-                        serve_sync_connection(
-                            connection,
-                            sync_routes,
-                            large_request_stage,
-                            pre_admission,
-                        )
-                        .await;
-                        return;
+            let mut connection_tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    incoming = endpoint.accept() => {
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
+                        let Some(connection_permit) = pre_admission.try_reserve_connection() else {
+                            incoming.refuse();
+                            continue;
+                        };
+                        let protocols = protocols.clone();
+                        let connection_protocols = connection_protocols.clone();
+                        let sync_routes = sync_routes.clone();
+                        let large_request_stage = large_request_stage.clone();
+                        let pre_admission = pre_admission.clone();
+                        connection_tasks.spawn(async move {
+                            let _connection_permit = connection_permit;
+                            let Ok(connection) = incoming.await else {
+                                return;
+                            };
+                            let alpn = connection.alpn().to_vec();
+                            if alpn == SYNC_ALPN {
+                                serve_sync_connection(
+                                    connection,
+                                    sync_routes,
+                                    large_request_stage,
+                                    pre_admission,
+                                )
+                                .await;
+                                return;
+                            }
+                            let handler = {
+                                let protocols =
+                                    protocols.lock().unwrap_or_else(|err| err.into_inner());
+                                protocols.get(&alpn).cloned()
+                            };
+                            if let Some(handler) = handler {
+                                serve_peer_connection(connection, handler, pre_admission).await;
+                                return;
+                            }
+                            let connection_handler = {
+                                let protocols = connection_protocols
+                                    .lock()
+                                    .unwrap_or_else(|err| err.into_inner());
+                                protocols.get(&alpn).cloned()
+                            };
+                            let Some(handler) = connection_handler else {
+                                connection.close(1u32.into(), b"unknown protocol");
+                                return;
+                            };
+                            let keepalive = connection.clone();
+                            let peer = PeerConnection {
+                                remote_node_id: hex_node_id(&connection.remote_id()),
+                                connection,
+                                endpoint: None,
+                            };
+                            if let Err(err) = handler(peer).await {
+                                tracing::debug!(
+                                    error = %err,
+                                    "peer connection handler ended with error"
+                                );
+                            }
+                            // Keep the server side alive until the remote closes, so
+                            // replies written by the handler are never cut off by an
+                            // early local drop.
+                            let _ = keepalive.closed().await;
+                        });
                     }
-                    let handler = {
-                        let protocols = protocols.lock().unwrap_or_else(|err| err.into_inner());
-                        protocols.get(&alpn).cloned()
-                    };
-                    if let Some(handler) = handler {
-                        serve_peer_connection(connection, handler, pre_admission).await;
-                        return;
+                    completed = connection_tasks.join_next(),
+                        if !connection_tasks.is_empty() =>
+                    {
+                        if let Some(Err(err)) = completed
+                            && !err.is_cancelled()
+                        {
+                            tracing::warn!(
+                                error = %err,
+                                "Iroh connection task ended with a join error"
+                            );
+                        }
                     }
-                    let connection_handler = {
-                        let protocols = connection_protocols
-                            .lock()
-                            .unwrap_or_else(|err| err.into_inner());
-                        protocols.get(&alpn).cloned()
-                    };
-                    let Some(handler) = connection_handler else {
-                        connection.close(1u32.into(), b"unknown protocol");
-                        return;
-                    };
-                    let keepalive = connection.clone();
-                    let peer = PeerConnection {
-                        remote_node_id: hex_node_id(&connection.remote_id()),
-                        connection,
-                        endpoint: None,
-                    };
-                    if let Err(err) = handler(peer).await {
-                        tracing::debug!(error = %err, "peer connection handler ended with error");
-                    }
-                    // Keep the server side alive until the remote closes, so
-                    // replies written by the handler are never cut off by an
-                    // early local drop.
-                    let _ = keepalive.closed().await;
-                });
+                }
+            }
+            // Endpoint close is the hard boundary after the graceful route
+            // drain. No detached request or peer task may retain connection
+            // state—and therefore the bound socket—past the joined accept loop.
+            connection_tasks.abort_all();
+            while let Some(result) = connection_tasks.join_next().await {
+                if let Err(err) = result
+                    && !err.is_cancelled()
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "Iroh connection task ended with a join error during shutdown"
+                    );
+                }
             }
         });
         self.accept_loop.install(task).await;
@@ -3004,7 +3313,9 @@ impl ServerTransport for LazyBoundServerTransport {
                 "sync endpoint bound; enroll edges with this ticket"
             );
             let transport = server.transport();
-            transport.serve(handlers, shutdown).await
+            let result = transport.serve(handlers, shutdown).await;
+            server.close().await;
+            result
         })
     }
 }
@@ -3014,7 +3325,12 @@ impl ServerTransport for LazyBoundServerTransport {
 /// the endpoint (freeing the port for a rebind — a restarted hub with the
 /// same identity and port reproduces the same ticket).
 struct IrohServerTransport {
-    endpoint: Endpoint,
+    // A bound transport is single-use: taking the endpoint into serve makes
+    // its ownership and its post-shutdown drop point explicit. In particular,
+    // an otherwise long-lived SyncServer may retain this transport after its
+    // serving task exits without retaining the UDP socket.
+    endpoint: Arc<AsyncMutex<Option<Endpoint>>>,
+    serve_lifecycle: Arc<ServeLifecycle>,
     sync_routes: SyncRoutes,
     accept_loop: Arc<AcceptLoopLifecycle>,
     #[cfg(feature = "test-seams")]
@@ -3028,6 +3344,16 @@ impl ServerTransport for IrohServerTransport {
         shutdown: Arc<AtomicBool>,
     ) -> TransportFuture<'a, ()> {
         Box::pin(async move {
+            let endpoint = {
+                let mut lease = self.endpoint.lock().await;
+                let endpoint = lease.take().ok_or_else(|| {
+                    TransportError::Other(
+                        "a bound sync endpoint may be served only once; bind a new endpoint before restarting"
+                            .to_string(),
+                    )
+                })?;
+                self.serve_lifecycle.begin(endpoint)
+            };
             let mut routes: HashMap<String, super::RequestHandler> = HashMap::new();
             for registration in handlers {
                 routes.insert(registration.subject, registration.handler);
@@ -3045,8 +3371,15 @@ impl ServerTransport for IrohServerTransport {
             production_smoke_routes_ready();
 
             let mut shutdown_poll = tokio::time::interval(SHUTDOWN_POLL_INTERVAL);
-            while !shutdown.load(Ordering::SeqCst) {
-                shutdown_poll.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown_poll.tick() => {
+                        if shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    _ = endpoint.closed() => break,
+                }
             }
 
             self.sync_routes.stop_accepting();
@@ -3060,29 +3393,47 @@ impl ServerTransport for IrohServerTransport {
                     .notify_waiters();
             }
             mark_test_shutdown_quiesced(&self.sync_routes);
-            tokio::select! {
-                drain = tokio::time::timeout(
-                    GRACEFUL_DRAIN_TIMEOUT,
-                    self.sync_routes.wait_idle(),
-                ) => {
-                    if drain.is_err() {
-                        tracing::warn!(
-                            timeout_seconds = GRACEFUL_DRAIN_TIMEOUT.as_secs(),
-                            "sync graceful drain deadline elapsed; closing stalled peer requests"
-                        );
-                        self.sync_routes.abandon_response_transfers();
+            #[cfg(feature = "test-seams")]
+            let force_graceful_drain_timeout = self
+                .control
+                .force_graceful_drain_timeout
+                .swap(false, Ordering::SeqCst);
+            #[cfg(not(feature = "test-seams"))]
+            let force_graceful_drain_timeout = false;
+            if force_graceful_drain_timeout {
+                self.sync_routes.abandon_response_transfers();
+                self.sync_routes.cancel_reply_owners().await;
+            } else {
+                tokio::select! {
+                    drain = tokio::time::timeout(
+                        GRACEFUL_DRAIN_TIMEOUT,
+                        self.sync_routes.wait_idle(),
+                    ) => {
+                        if drain.is_err() {
+                            tracing::warn!(
+                                timeout_seconds = GRACEFUL_DRAIN_TIMEOUT.as_secs(),
+                                "sync graceful drain deadline elapsed; closing stalled peer requests"
+                            );
+                            self.sync_routes.abandon_response_transfers();
+                            self.sync_routes.cancel_reply_owners().await;
+                        }
                     }
-                }
-                _ = self.endpoint.closed() => {
-                    // An owner-forced endpoint close is the crash/restart path:
-                    // durable response stages resume on the rebound endpoint,
-                    // while this endpoint can no longer serve continuations.
-                    self.sync_routes.abandon_response_transfers();
+                    _ = endpoint.closed() => {
+                        // An owner-forced endpoint close is the crash/restart path:
+                        // durable response stages resume on the rebound endpoint,
+                        // while this endpoint can no longer serve continuations.
+                        self.sync_routes.abandon_response_transfers();
+                        self.sync_routes.cancel_reply_owners().await;
+                    }
                 }
             }
             append_test_shutdown_state(&self.sync_routes, "drain-complete");
-            self.endpoint.close().await;
+            endpoint.close().await;
             self.accept_loop.await_termination().await;
+            // `endpoint` is deliberately owned by this serve invocation, not
+            // the retained transport. Its release is joined so a successful
+            // shutdown cannot race netwatch's deferred operating-system close.
+            endpoint.release().await.map_err(TransportError::Other)?;
             Ok(())
         })
     }
@@ -3632,6 +3983,11 @@ async fn serve_sync_connection(
         // The responder owns both stream halves; the handler may reply from a
         // spawned task (the push apply path does).
         let send_slot = Arc::new(tokio::sync::Mutex::new(Some((send, recv))));
+        if !sync_routes.register_reply_stream(&send_slot) {
+            drop(send_slot.lock().await.take());
+            drop(request_lease);
+            return;
+        }
         let response_subject = subject.clone();
         let response_request_digest = request_digest;
         let response_node_id = remote_node_id.clone();
@@ -3647,171 +4003,188 @@ async fn serve_sync_connection(
                 let response_subject = response_subject.clone();
                 let response_node_id = response_node_id.clone();
                 Box::pin(async move {
-                    // Keep admission charged until the peer has acknowledged
-                    // the reply. An unused underscore binding may be dropped
-                    // before the later awaits, which lets shutdown close the
-                    // endpoint after commit but before confirmation reaches
-                    // the edge.
-                    let request_lease = responder_request_lease;
-                    let oversized_response = response_bytes.len() > MAX_FRAME_BYTES;
-                    let response_transfer_reservation = if oversized_response {
-                        Some(
-                            responder_sync_routes
-                                .reserve_response_transfer()
-                                .ok_or_else(|| {
-                                    TransportError::Other(
-                                        "too many unfinished oversized response transfers"
-                                            .to_string(),
-                                    )
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
-                    let mut slot = send_slot.lock().await;
-                    let Some((mut send, mut recv)) = slot.take() else {
-                        return Err(TransportError::Other(
-                            "reply already sent on this stream".to_string(),
-                        ));
-                    };
-                    #[cfg(feature = "test-seams")]
-                    large_request_stage.record_authenticated_pull_reply_after_reset_for_test(
-                        &response_subject,
-                        response_bytes.len(),
-                    );
-                    #[cfg(feature = "test-seams")]
-                    if completed_stage.is_some()
-                        && large_request_stage.take_completed_reply_drop_for_test()
-                    {
-                        // Reset the actual reply stream instead of merely
-                        // withholding its bytes. The client observes a
-                        // deterministic transport failure and takes its
-                        // ordinary reconnect/reconciliation path.
-                        large_request_stage.record_injected_reply_reset_for_test();
-                        let _ = send.reset(0u32.into());
+                    let cancellation = responder_sync_routes.clone();
+                    let reply = async move {
+                        // Keep admission charged until the peer has acknowledged
+                        // the reply. An unused underscore binding may be dropped
+                        // before the later awaits, which lets shutdown close the
+                        // endpoint after commit but before confirmation reaches
+                        // the edge.
+                        let request_lease = responder_request_lease;
+                        let oversized_response = response_bytes.len() > MAX_FRAME_BYTES;
+                        let response_transfer_reservation = if oversized_response {
+                            Some(
+                                responder_sync_routes
+                                    .reserve_response_transfer()
+                                    .ok_or_else(|| {
+                                        TransportError::Other(
+                                            "too many unfinished oversized response transfers"
+                                                .to_string(),
+                                        )
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
+                        let mut slot = send_slot.lock().await;
+                        let Some((mut send, mut recv)) = slot.take() else {
+                            return Err(TransportError::Other(
+                                "reply already sent on this stream".to_string(),
+                            ));
+                        };
+                        #[cfg(feature = "test-seams")]
+                        large_request_stage.record_authenticated_pull_reply_after_reset_for_test(
+                            &response_subject,
+                            response_bytes.len(),
+                        );
+                        #[cfg(feature = "test-seams")]
+                        if completed_stage.is_some()
+                            && large_request_stage.take_completed_reply_drop_for_test()
+                        {
+                            // Reset the actual reply stream instead of merely
+                            // withholding its bytes. The client observes a
+                            // deterministic transport failure and takes its
+                            // ordinary reconnect/reconciliation path.
+                            large_request_stage.record_injected_reply_reset_for_test();
+                            let _ = send.reset(0u32.into());
+                            if let Some(path) = completed_stage {
+                                remove_stage_after_reply(&large_request_stage, path).await;
+                            }
+                            return Err(TransportError::Unreachable(
+                                "sync endpoint closed before replying".to_string(),
+                            ));
+                        }
+                        let mut registered_response_transfer = None;
+                        let reply = if response_bytes.len() > MAX_FRAME_BYTES {
+                            let _guard = large_request_stage.lock.lock().await;
+                            let stage_root = large_request_stage.root.clone();
+                            let response_staging_budget =
+                                large_request_stage.response_staging_budget;
+                            let protected = responder_sync_routes.protected_response_paths();
+                            let subject = response_subject.clone();
+                            let node_id = response_node_id.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                stage_large_response_with_budget(
+                                    &stage_root,
+                                    &node_id,
+                                    &subject,
+                                    response_request_digest,
+                                    &response_bytes,
+                                    response_staging_budget,
+                                    &protected,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(Ok(manifest)) => {
+                                    let encoded = manifest.encode()?;
+                                    let transfer_key =
+                                        (response_node_id.clone(), manifest.transfer_digest()?);
+                                    response_transfer_reservation
+                                        .expect("oversized response reserved before staging")
+                                        .activate(
+                                            transfer_key.clone(),
+                                            ResponseTransferPaths {
+                                                stage: response_stage_path(
+                                                    &large_request_stage.root,
+                                                    &manifest,
+                                                ),
+                                                completion: response_completion_path(
+                                                    &large_request_stage.root,
+                                                    &manifest,
+                                                ),
+                                            },
+                                        );
+                                    registered_response_transfer =
+                                        Some((transfer_key, manifest.clone()));
+                                    #[cfg(feature = "test-seams")]
+                                    large_request_stage.record_staged_response_for_test(&manifest);
+                                    Ok(encoded)
+                                }
+                                Ok(Err(err)) => Err(err),
+                                Err(err) => Err(TransportError::Other(format!(
+                                    "oversized response staging task failed: {err}"
+                                ))),
+                            }
+                        } else {
+                            Ok(response_bytes)
+                        };
+                        let (result, _receipt_consumed) = match reply {
+                            Ok(reply) if oversized_response => {
+                                let result =
+                                    write_reply(&mut send, &mut recv, REPLY_LARGE_RESPONSE, &reply)
+                                        .await;
+                                let consumed = result.is_ok();
+                                (result, consumed)
+                            }
+                            Ok(reply) => {
+                                let result =
+                                    write_reply(&mut send, &mut recv, REPLY_OK, &reply).await;
+                                let consumed = result.is_ok();
+                                (result, consumed)
+                            }
+                            Err(err) => {
+                                let detail = err.to_string();
+                                let consumed = write_reply(
+                                    &mut send,
+                                    &mut recv,
+                                    REPLY_HANDLER_ERROR,
+                                    detail.as_bytes(),
+                                )
+                                .await
+                                .is_ok();
+                                (Err(err), consumed)
+                            }
+                        };
+                        #[cfg(feature = "test-seams")]
+                        responder_sync_routes.record_reply_receipt_for_test(_receipt_consumed);
+                        let reply_event = match &result {
+                            Ok(()) => "reply-acknowledged".to_string(),
+                            Err(err) => format!("reply-failed error={err}"),
+                        };
+                        append_test_shutdown_state(&responder_sync_routes, &reply_event);
+                        if result.is_err()
+                            && let Some((key, manifest)) = registered_response_transfer.as_ref()
+                            && responder_sync_routes.complete_response_transfer(key)
+                        {
+                            let _guard = large_request_stage.lock.lock().await;
+                            let stage_root = large_request_stage.root.clone();
+                            let authenticated_node_id = response_node_id.clone();
+                            let manifest = manifest.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                abandon_large_response(
+                                    &stage_root,
+                                    &authenticated_node_id,
+                                    &manifest,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => tracing::warn!(
+                                    error = %err,
+                                    "undelivered oversized response stage could not be removed"
+                                ),
+                                Err(err) => tracing::warn!(
+                                    error = %err,
+                                    "undelivered oversized response cleanup task failed"
+                                ),
+                            }
+                        }
                         if let Some(path) = completed_stage {
                             remove_stage_after_reply(&large_request_stage, path).await;
                         }
-                        return Err(TransportError::Unreachable(
-                            "sync endpoint closed before replying".to_string(),
-                        ));
-                    }
-                    let mut registered_response_transfer = None;
-                    let reply = if response_bytes.len() > MAX_FRAME_BYTES {
-                        let _guard = large_request_stage.lock.lock().await;
-                        let stage_root = large_request_stage.root.clone();
-                        let response_staging_budget = large_request_stage.response_staging_budget;
-                        let protected = responder_sync_routes.protected_response_paths();
-                        let subject = response_subject.clone();
-                        let node_id = response_node_id.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            stage_large_response_with_budget(
-                                &stage_root,
-                                &node_id,
-                                &subject,
-                                response_request_digest,
-                                &response_bytes,
-                                response_staging_budget,
-                                &protected,
-                            )
-                        })
-                        .await
-                        {
-                            Ok(Ok(manifest)) => {
-                                let encoded = manifest.encode()?;
-                                let transfer_key =
-                                    (response_node_id.clone(), manifest.transfer_digest()?);
-                                response_transfer_reservation
-                                    .expect("oversized response reserved before staging")
-                                    .activate(
-                                        transfer_key.clone(),
-                                        ResponseTransferPaths {
-                                            stage: response_stage_path(
-                                                &large_request_stage.root,
-                                                &manifest,
-                                            ),
-                                            completion: response_completion_path(
-                                                &large_request_stage.root,
-                                                &manifest,
-                                            ),
-                                        },
-                                    );
-                                registered_response_transfer =
-                                    Some((transfer_key, manifest.clone()));
-                                #[cfg(feature = "test-seams")]
-                                large_request_stage.record_staged_response_for_test(&manifest);
-                                Ok(encoded)
-                            }
-                            Ok(Err(err)) => Err(err),
-                            Err(err) => Err(TransportError::Other(format!(
-                                "oversized response staging task failed: {err}"
-                            ))),
-                        }
-                    } else {
-                        Ok(response_bytes)
+                        drop(request_lease);
+                        result
                     };
-                    let (result, _receipt_consumed) = match reply {
-                        Ok(reply) if oversized_response => {
-                            let result =
-                                write_reply(&mut send, &mut recv, REPLY_LARGE_RESPONSE, &reply)
-                                    .await;
-                            let consumed = result.is_ok();
-                            (result, consumed)
-                        }
-                        Ok(reply) => {
-                            let result = write_reply(&mut send, &mut recv, REPLY_OK, &reply).await;
-                            let consumed = result.is_ok();
-                            (result, consumed)
-                        }
-                        Err(err) => {
-                            let detail = err.to_string();
-                            let consumed = write_reply(
-                                &mut send,
-                                &mut recv,
-                                REPLY_HANDLER_ERROR,
-                                detail.as_bytes(),
-                            )
-                            .await
-                            .is_ok();
-                            (Err(err), consumed)
-                        }
-                    };
-                    #[cfg(feature = "test-seams")]
-                    responder_sync_routes.record_reply_receipt_for_test(_receipt_consumed);
-                    let reply_event = match &result {
-                        Ok(()) => "reply-acknowledged".to_string(),
-                        Err(err) => format!("reply-failed error={err}"),
-                    };
-                    append_test_shutdown_state(&responder_sync_routes, &reply_event);
-                    if result.is_err()
-                        && let Some((key, manifest)) = registered_response_transfer.as_ref()
-                        && responder_sync_routes.complete_response_transfer(key)
-                    {
-                        let _guard = large_request_stage.lock.lock().await;
-                        let stage_root = large_request_stage.root.clone();
-                        let authenticated_node_id = response_node_id.clone();
-                        let manifest = manifest.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            abandon_large_response(&stage_root, &authenticated_node_id, &manifest)
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => tracing::warn!(
-                                error = %err,
-                                "undelivered oversized response stage could not be removed"
+                    tokio::select! {
+                        result = reply => result,
+                        _ = cancellation.reply_owner_cancelled() => Err(
+                            TransportError::Unreachable(
+                                "sync endpoint closed before replying".to_string(),
                             ),
-                            Err(err) => tracing::warn!(
-                                error = %err,
-                                "undelivered oversized response cleanup task failed"
-                            ),
-                        }
+                        ),
                     }
-                    if let Some(path) = completed_stage {
-                        remove_stage_after_reply(&large_request_stage, path).await;
-                    }
-                    drop(request_lease);
-                    result
                 }) as TransportFuture<'static, ()>
             }
         });
@@ -4990,16 +5363,14 @@ mod sticky_port_tests {
             .expect("unset threshold preserves state");
         assert!(response_stage_path(&root, &first).exists());
         assert!(response_completion_path(&root, &second).exists());
-        server.endpoint.close().await;
-        drop(server);
+        server.close().await;
         let pressured = format!("{spec}&response-staging-bytes=1");
         let server = IrohServer::bind(&pressured)
             .await
             .expect("configured startup cleanup");
         assert!(!response_stage_path(&root, &first).exists());
         assert!(!response_completion_path(&root, &second).exists());
-        server.endpoint.close().await;
-        drop(server);
+        server.close().await;
 
         #[cfg(unix)]
         {
@@ -5021,7 +5392,7 @@ mod sticky_port_tests {
             let rebound = IrohServer::bind(&failed_spec)
                 .await
                 .expect("failed sweep closed the explicit port");
-            rebound.endpoint.close().await;
+            rebound.close().await;
         }
     }
 }

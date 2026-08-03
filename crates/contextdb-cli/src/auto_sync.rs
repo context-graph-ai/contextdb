@@ -189,18 +189,34 @@ mod tests {
     async fn auto_sync_reports_conflicts() {
         let (tx, rx) = mpsc::unbounded_channel();
         let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+        let expected = serde_json::json!({
+            "reason": "dependency_complete_refused",
+            "mutation_kind": "delete",
+            "table": "notes",
+            "hub_acceptance_position": 38,
+            "natural_key": {
+                "column": "id",
+                "rest": [],
+                "value": { "Uuid": "77777777-7777-4777-8777-777777777777" }
+            },
+            "winning_author_node_id": "26fc275910b30ab764bc1acfde67aa18453dbd60fa97b467aa4f6b7cb318545a"
+        });
+        let pushed_conflict = expected.clone();
 
         let handle = tokio::spawn(run_loop(
             rx,
             AutoSyncConfig {
-                debounce: Duration::from_millis(1),
+                debounce: Duration::ZERO,
                 retry_backoff: Duration::from_millis(1),
             },
-            || async {
-                Ok(PushOutcome {
-                    conflicts: vec![serde_json::json!({ "reason": "keep_first" })],
-                    caught_up: true,
-                })
+            move || {
+                let pushed_conflict = pushed_conflict.clone();
+                async move {
+                    Ok(PushOutcome {
+                        conflicts: vec![pushed_conflict],
+                        caught_up: true,
+                    })
+                }
             },
             move |msg| {
                 report_tx
@@ -211,17 +227,16 @@ mod tests {
 
         tx.send(()).unwrap();
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(1)).await;
         let report = report_rx
             .recv()
             .await
-            .expect("auto-sync reports the conflict after the virtual debounce");
+            .expect("zero-debounce auto-sync reports the complete conflict");
         drop(tx);
         handle.await.unwrap();
 
         assert_eq!(
             report,
-            AutoSyncReport::Conflict(serde_json::json!({ "reason": "keep_first" })),
+            AutoSyncReport::Conflict(expected),
             "auto-sync should surface the complete conflict document"
         );
     }

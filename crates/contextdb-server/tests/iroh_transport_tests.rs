@@ -25,6 +25,13 @@ async fn within<F: std::future::Future>(fut: F) -> F::Output {
         .expect("bounded iroh transport operation exceeded 30s")
 }
 
+// A restart owns the UDP port it just released.  These are real localhost
+// endpoint journeys, so serialise them within this test binary instead of
+// letting another journey win a remembered port between close and rebind.
+// This is resource ownership, not a timing workaround: no test sleeps or
+// retries for port availability.
+static REAL_IROH_JOURNEY_PERMIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[test]
 fn sync_alpn_is_frozen_at_v6() {
     assert_eq!(
@@ -489,6 +496,313 @@ impl RunningHub {
     }
 }
 
+#[tokio::test]
+async fn retained_sync_server_releases_the_stopped_hub_port_for_rebind() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let identity = identity_file(&dir);
+    let port = free_udp_port();
+    let spec = bind_spec_with_port(&identity, port);
+    let endpoint = within(IrohServer::bind(&spec))
+        .await
+        .expect("bind original hub");
+    let controller = endpoint.large_request_test_controller();
+    let retained_server = Arc::new(SyncServer::new(
+        Arc::new(Database::open_memory()),
+        &endpoint,
+        contextdb_core::TenantId::from("retained-server-port-release"),
+    ));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let serve_task = tokio::spawn({
+        let retained_server = retained_server.clone();
+        let shutdown = shutdown.clone();
+        async move { retained_server.run_until(shutdown).await }
+    });
+    controller.wait_until_routes_ready_for_test().await;
+
+    // The caller has released its bind handle, but deliberately retains the
+    // SyncServer after its task ends — the production shape that previously
+    // left the transport's Endpoint clone holding the UDP socket.
+    drop(endpoint);
+    shutdown.store(true, Ordering::SeqCst);
+    within(serve_task)
+        .await
+        .expect("retained sync server finishes shutdown");
+
+    let rebound = within(IrohServer::bind(&spec))
+        .await
+        .expect("joined shutdown releases the port despite retained SyncServer");
+    within(rebound.close()).await;
+    drop(retained_server);
+}
+
+#[tokio::test]
+async fn owner_forced_close_joins_an_active_serve_before_rebind() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let identity = identity_file(&dir);
+    let port = free_udp_port();
+    let spec = bind_spec_with_port(&identity, port);
+    let endpoint = within(IrohServer::bind(&spec))
+        .await
+        .expect("bind original hub");
+    let controller = endpoint.large_request_test_controller();
+    let retained_server = Arc::new(SyncServer::new(
+        Arc::new(Database::open_memory()),
+        &endpoint,
+        contextdb_core::TenantId::from("owner-forced-active-close"),
+    ));
+    let serve_task = tokio::spawn({
+        let retained_server = retained_server.clone();
+        async move {
+            retained_server
+                .run_until(Arc::new(AtomicBool::new(false)))
+                .await
+        }
+    });
+    controller.wait_until_routes_ready_for_test().await;
+
+    // No graceful-shutdown flag is set and the retained SyncServer is still
+    // alive. The owner's consuming close must wake and join that active serve
+    // before it reports that the remembered port is reusable.
+    within(endpoint.close()).await;
+    let rebound = within(IrohServer::bind(&spec))
+        .await
+        .expect("owner-forced close releases the active serve port before returning");
+    within(rebound.close()).await;
+    within(serve_task)
+        .await
+        .expect("owner-forced close joins the serve task");
+    drop(retained_server);
+}
+
+#[tokio::test]
+async fn owner_forced_close_releases_a_detached_responder_before_rebind() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let identity = identity_file(&hub_dir);
+    let port = free_udp_port();
+    let spec = bind_spec_with_port(&identity, port);
+    let endpoint = within(IrohServer::bind(&spec))
+        .await
+        .expect("bind original hub");
+    let controller = endpoint.large_request_test_controller();
+    let transport = endpoint.transport();
+    let responder_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_responder = Arc::new(tokio::sync::Semaphore::new(0));
+    let responder_finished = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler: RequestHandler = Arc::new({
+        let responder_started = responder_started.clone();
+        let release_responder = release_responder.clone();
+        let responder_finished = responder_finished.clone();
+        move |incoming: IncomingRequest| {
+            let responder_started = responder_started.clone();
+            let release_responder = release_responder.clone();
+            let responder_finished = responder_finished.clone();
+            tokio::spawn(async move {
+                // Model the push-apply path: the handler returns after moving
+                // the stream-owning responder into a detached task.
+                responder_started.add_permits(1);
+                let permit = release_responder
+                    .acquire()
+                    .await
+                    .expect("responder release semaphore remains open");
+                permit.forget();
+                drop(incoming.responder);
+                responder_finished.add_permits(1);
+            });
+            Box::pin(async { Ok(()) }) as contextdb_server::transport::TransportFuture<'static, ()>
+        }
+    });
+    let serve_task = tokio::spawn(async move {
+        transport
+            .serve(
+                vec![HandlerRegistration {
+                    subject: "detached-responder".to_string(),
+                    handler,
+                }],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+    });
+    controller.wait_until_routes_ready_for_test().await;
+    let edge_dir = tempfile::tempdir().expect("edge tempdir");
+    let client = client_transport(&format!(
+        "iroh:?to={}&identity={}",
+        endpoint.ticket(),
+        identity_file(&edge_dir).display()
+    ));
+    let request_task = tokio::spawn(async move {
+        client
+            .request(
+                "detached-responder",
+                b"hold reply ownership".to_vec(),
+                Duration::from_secs(30),
+            )
+            .await
+    });
+    responder_started
+        .acquire()
+        .await
+        .expect("detached responder starts")
+        .forget();
+
+    // The detached task deliberately retains the responder after close. The
+    // owner close must cancel its stream ownership before reporting success.
+    within(endpoint.close()).await;
+    let rebound = within(IrohServer::bind(&spec))
+        .await
+        .expect("detached responder cannot retain the closed hub port");
+    within(rebound.close()).await;
+    within(serve_task)
+        .await
+        .expect("owner-forced close joins serving transport")
+        .expect("serving transport exits cleanly");
+
+    release_responder.add_permits(1);
+    responder_finished
+        .acquire()
+        .await
+        .expect("detached responder finishes")
+        .forget();
+    let _ = within(request_task)
+        .await
+        .expect("closed request task joins");
+}
+
+#[tokio::test]
+async fn graceful_drain_deadline_releases_a_detached_responder_before_rebind() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let identity = identity_file(&hub_dir);
+    let port = free_udp_port();
+    let spec = bind_spec_with_port(&identity, port);
+    let endpoint = within(IrohServer::bind(&spec))
+        .await
+        .expect("bind original hub");
+    let controller = endpoint.large_request_test_controller();
+    let transport = endpoint.transport();
+    let responder_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_responder = Arc::new(tokio::sync::Semaphore::new(0));
+    let responder_finished = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler: RequestHandler = Arc::new({
+        let responder_started = responder_started.clone();
+        let release_responder = release_responder.clone();
+        let responder_finished = responder_finished.clone();
+        move |incoming: IncomingRequest| {
+            let responder_started = responder_started.clone();
+            let release_responder = release_responder.clone();
+            let responder_finished = responder_finished.clone();
+            tokio::spawn(async move {
+                responder_started.add_permits(1);
+                let permit = release_responder
+                    .acquire()
+                    .await
+                    .expect("responder release semaphore remains open");
+                permit.forget();
+                drop(incoming.responder);
+                responder_finished.add_permits(1);
+            });
+            Box::pin(async { Ok(()) }) as contextdb_server::transport::TransportFuture<'static, ()>
+        }
+    });
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let serve_task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            transport
+                .serve(
+                    vec![HandlerRegistration {
+                        subject: "deadline-detached-responder".to_string(),
+                        handler,
+                    }],
+                    shutdown,
+                )
+                .await
+        }
+    });
+    controller.wait_until_routes_ready_for_test().await;
+    let edge_dir = tempfile::tempdir().expect("edge tempdir");
+    let client = client_transport(&format!(
+        "iroh:?to={}&identity={}",
+        endpoint.ticket(),
+        identity_file(&edge_dir).display()
+    ));
+    let request_task = tokio::spawn(async move {
+        client
+            .request(
+                "deadline-detached-responder",
+                b"hold reply ownership through drain".to_vec(),
+                Duration::from_secs(30),
+            )
+            .await
+    });
+    responder_started
+        .acquire()
+        .await
+        .expect("detached responder starts")
+        .forget();
+
+    // Select the deadline branch directly: the assertion is about ownership
+    // cleanup, not elapsed wall time. The detached task remains alive while
+    // the old hub shuts down and the exact port is rebound.
+    controller.force_graceful_drain_timeout_for_test();
+    shutdown.store(true, Ordering::SeqCst);
+    within(serve_task)
+        .await
+        .expect("deadline shutdown joins serving transport")
+        .expect("deadline shutdown exits cleanly");
+    within(endpoint.close()).await;
+    let rebound = within(IrohServer::bind(&spec))
+        .await
+        .expect("drain deadline cannot leave a detached responder holding the hub port");
+    within(rebound.close()).await;
+
+    release_responder.add_permits(1);
+    responder_finished
+        .acquire()
+        .await
+        .expect("detached responder finishes")
+        .forget();
+    let _ = within(request_task)
+        .await
+        .expect("closed request task joins");
+}
+
+#[tokio::test]
+async fn bound_transport_refuses_a_second_serve_after_shutdown() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let endpoint = within(IrohServer::bind(&bind_spec(&identity_file(&dir))))
+        .await
+        .expect("bind one-shot transport");
+    let controller = endpoint.large_request_test_controller();
+    let transport = endpoint.transport();
+    let second_transport_handle = endpoint.transport();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let serve_task = tokio::spawn({
+        let transport = transport.clone();
+        let shutdown = shutdown.clone();
+        async move { transport.serve(Vec::new(), shutdown).await }
+    });
+    controller.wait_until_routes_ready_for_test().await;
+    shutdown.store(true, Ordering::SeqCst);
+    within(serve_task)
+        .await
+        .expect("first serve task joins")
+        .expect("first serve exits cleanly");
+
+    let error = second_transport_handle
+        .serve(Vec::new(), Arc::new(AtomicBool::new(false)))
+        .await
+        .expect_err("a bound transport cannot silently serve a dropped endpoint twice");
+    assert!(
+        error.to_string().contains("served only once"),
+        "the second serve must explain that a restart needs a new endpoint: {error}"
+    );
+    within(endpoint.close()).await;
+}
+
 // Identity is fabric-owned.
 
 #[test]
@@ -558,6 +872,7 @@ fn identity_file_written_with_owner_only_permissions() {
 
 #[tokio::test]
 async fn bound_endpoint_uses_the_fabric_identity_not_a_transport_minted_one() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = identity_file(&dir);
     let identity = FabricIdentity::load_or_generate(&path).expect("identity");
@@ -632,6 +947,7 @@ fn unrelated_urls_are_not_iroh_endpoints() {
 
 #[tokio::test]
 async fn sync_push_pull_status_over_iroh() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let tenant = "iroh-e2e";
     let hub = start_hub(&bind_spec(&identity_file(&dir)), tenant).await;
@@ -691,6 +1007,7 @@ async fn sync_push_pull_status_over_iroh() {
 
 #[tokio::test]
 async fn large_changeset_moves_in_one_stream_over_iroh() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     // A large payload must arrive as one framed Iroh message with full
     // integrity.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -737,6 +1054,7 @@ async fn large_changeset_moves_in_one_stream_over_iroh() {
 
 #[tokio::test]
 async fn oversized_authenticated_request_reaches_its_handler_only_after_complete_validation() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const FRAME_CEILING: usize = 64 * 1024 * 1024;
 
     let hub_dir = tempfile::tempdir().expect("hub tempdir");
@@ -1013,6 +1331,7 @@ async fn oversized_authenticated_request_reaches_its_handler_only_after_complete
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_authenticated_response_stages_and_reassembles_over_real_iroh() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const FRAME_CEILING: usize = 64 * 1024 * 1024;
     const RESPONSE_BYTES: usize = 69 * 1024 * 1024 + 137;
 
@@ -1101,6 +1420,7 @@ async fn oversized_authenticated_response_stages_and_reassembles_over_real_iroh(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identical_oversized_response_publications_complete_independently_over_real_iroh() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const RESPONSE_BYTES: usize = 69 * 1024 * 1024 + 137;
     const SUBJECT: &str = "identical-oversized-response-publications";
 
@@ -1251,6 +1571,7 @@ async fn identical_oversized_response_publications_complete_independently_over_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_response_staging_budget_refuses_and_cleans_an_over_budget_publication() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const RESPONSE_BYTES: usize = 69 * 1024 * 1024 + 137;
     const SUBJECT: &str = "runtime-response-staging-budget";
 
@@ -1331,6 +1652,7 @@ async fn runtime_response_staging_budget_refuses_and_cleans_an_over_budget_publi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_response_restarts_at_the_lost_chunk_without_replaying_the_handler() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const RESPONSE_BYTES: usize = 69 * 1024 * 1024 + 137;
     const LOST_SEQUENCE: u64 = 1;
     const SUBJECT: &str = "oversized-response-restart";
@@ -1535,6 +1857,7 @@ async fn oversized_response_restarts_at_the_lost_chunk_without_replaying_the_han
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_drains_an_accepted_oversized_response_but_refuses_fresh_work() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const RESPONSE_BYTES: usize = 69 * 1024 * 1024 + 137;
     const PAUSED_SEQUENCE: u64 = 0;
     const SUBJECT: &str = "oversized-response-shutdown-drain";
@@ -1720,16 +2043,19 @@ async fn shutdown_drains_an_accepted_oversized_response_but_refuses_fresh_work()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_response_retries_completion_when_the_stream_resets_before_durability() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     assert_oversized_response_completion_reset(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_response_retries_receipt_backed_completion_when_its_ack_is_lost() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     assert_oversized_response_completion_reset(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const FRAME_CEILING: usize = 64 * 1024 * 1024;
     const MAX_OVERSIZED_RECONCILIATION_ATTEMPTS: usize = 5;
     let root = tempfile::tempdir().expect("tempdir");
@@ -2072,6 +2398,7 @@ async fn row_only_oversized_push_reconciles_after_the_real_iroh_reply_is_lost() 
 
 #[tokio::test]
 async fn reconnect_after_hub_restart_over_iroh() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let tenant = "iroh-restart";
     let identity = identity_file(&dir);
@@ -2137,6 +2464,7 @@ async fn reconnect_after_hub_restart_over_iroh() {
 
 #[tokio::test]
 async fn backlog_accumulated_offline_reaches_hub_over_iroh() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let tenant = "iroh-backlog";
     let identity = identity_file(&dir);
@@ -2183,6 +2511,7 @@ async fn backlog_accumulated_offline_reaches_hub_over_iroh() {
 
 #[tokio::test]
 async fn unreachable_hub_maps_to_transport_neutral_errors() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     // Bind to learn a real ticket, then stop serving entirely.
     let hub = start_hub(&bind_spec(&identity_file(&dir)), "iroh-downed").await;
@@ -2217,6 +2546,7 @@ async fn unreachable_hub_maps_to_transport_neutral_errors() {
 
 #[tokio::test]
 async fn ticket_round_trips_as_opaque_config_string() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let hub = start_hub(&bind_spec(&identity_file(&dir)), "iroh-ticket").await;
 
@@ -2249,6 +2579,7 @@ async fn ticket_round_trips_as_opaque_config_string() {
 
 #[tokio::test]
 async fn second_alpn_peer_stream_exchanges_bytes_without_hub() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let endpoint = within(IrohServer::bind(&bind_spec(&identity_file(&dir))))
         .await
@@ -2300,6 +2631,7 @@ async fn second_alpn_peer_stream_exchanges_bytes_without_hub() {
 
 #[tokio::test]
 async fn dial_spec_with_identity_pins_the_edge_fabric_identity() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let hub_dir = tempfile::tempdir().expect("hub tempdir");
     let tenant = "iroh-edge-id";
     let hub = start_hub(&bind_spec(&identity_file(&hub_dir)), tenant).await;
@@ -2387,6 +2719,7 @@ async fn run_local_relay_with_ca_file(
 
 #[tokio::test]
 async fn ticket_relay_url_enables_relay_dialing() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let relay_dir = tempfile::tempdir().expect("relay tempdir");
     let (relay_url, relay_ca, _relay_guard) = run_local_relay_with_ca_file(&relay_dir).await;
 
@@ -2607,6 +2940,7 @@ fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[tokio::test]
 async fn hub_restart_without_port_keeps_the_same_ticket() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     // Port stickiness by default: a hub bound WITHOUT port= records its
     // chosen port beside the identity key and reuses it, so tickets survive
     // restarts (a live-smoke trap: a restarted hub minted a new random port
@@ -2647,6 +2981,7 @@ async fn hub_restart_without_port_keeps_the_same_ticket() {
 
 #[tokio::test]
 async fn enrollment_ticket_failures_redact_the_ticket_at_every_entrypoint() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let secret = iroh::SecretKey::from_bytes(&[0x5a; 32]);
     let ticket =
         iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::new(secret.public()))
@@ -2894,6 +3229,7 @@ async fn enrollment_ticket_failures_redact_the_ticket_at_every_entrypoint() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_stage_diagnostics_redact_bearer_tokens_from_identity_filenames() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     const FRAME_CEILING: usize = 64 * 1024 * 1024;
     let ticket = deterministic_bearer_ticket();
     let mut diagnostics = Vec::new();
@@ -3112,6 +3448,7 @@ fn lookup_and_publish_are_explicit_opt_in_knobs() {
 
 #[tokio::test]
 async fn published_hub_announces_to_the_operator_lookup_service() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     // The PUBLISH knob end to end against a real (local) lookup service: the
     // hub opted into publish=<url> and its signed announce must arrive there.
     let (dns_pkarr, _lookup_url, pkarr_url) = start_local_dns_pkarr().await;
@@ -3136,6 +3473,7 @@ async fn published_hub_announces_to_the_operator_lookup_service() {
 #[cfg(feature = "mdns")]
 #[tokio::test]
 async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     // The LOOKUP knob end to end with zero third-party anything: both sides
     // opt into lookup=mdns (LAN-local), the edge's ticket carries ONLY the
     // hub's identity — no addresses — and the dial resolves via mDNS. An
@@ -3198,6 +3536,7 @@ async fn mdns_lookup_resolves_identity_only_tickets_on_the_lan() {
 
 #[tokio::test]
 async fn peer_connection_protocol_exposes_raw_streams() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     // The streaming half of the peer surface: the protocol owner gets the
     // raw connection (plus the caller's authenticated identity) and drives
     // its own streams — the media-transfer path's substrate.
@@ -3288,6 +3627,7 @@ async fn unsupported_server_spec_fails_serve_immediately() {
 
 #[tokio::test]
 async fn sync_status_reports_unreachable_after_hub_dies() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let tenant = "iroh-liveness";
     let hub = start_hub(&bind_spec(&identity_file(&dir)), tenant).await;
@@ -3340,6 +3680,7 @@ async fn sync_status_reports_unreachable_after_hub_dies() {
 #[cfg(unix)]
 #[tokio::test]
 async fn unwritable_identity_dir_fails_bind_loudly_before_ticket() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
     let identity = identity_file(&dir);
@@ -3381,6 +3722,7 @@ fn free_udp_port() -> u16 {
 
 #[tokio::test]
 async fn iroh_client_reports_the_dialed_hub_as_its_authenticated_peer() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let hub = start_hub(&bind_spec(&identity_file(&dir)), "peer-identity").await;
 
@@ -3398,6 +3740,7 @@ async fn iroh_client_reports_the_dialed_hub_as_its_authenticated_peer() {
 
 #[tokio::test]
 async fn iroh_push_arms_the_retention_hub_and_records_client_receipts() {
+    let _journey = REAL_IROH_JOURNEY_PERMIT.lock().await;
     use contextdb_server::{TransferDirection, TransferPlane};
 
     let dir = tempfile::tempdir().expect("tempdir");

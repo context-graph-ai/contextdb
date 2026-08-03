@@ -25,12 +25,19 @@ work="$(mktemp -d)"
 hub_pid=""
 
 cleanup() {
+  local status=$?
+  trap - EXIT
   if [[ -n "$hub_pid" ]] && kill -0 "$hub_pid" 2>/dev/null; then
     kill -KILL "$hub_pid" 2>/dev/null || true
     wait "$hub_pid" 2>/dev/null || true
   fi
-  exec 9<&- 2>/dev/null || true
-  rm -rf "$work"
+  exec 9<&- || true
+  if [[ "$status" -eq 0 && "${CONTEXTDB_SMOKE_KEEP_WORK:-0}" != "1" ]]; then
+    rm -rf "$work"
+  else
+    printf 'ARTIFACTS retained at %s\n' "$work" >&2
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
