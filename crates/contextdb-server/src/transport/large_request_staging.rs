@@ -969,7 +969,9 @@ impl StageDir {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                if opened.dev() != created_stat.st_dev || opened.ino() != created_stat.st_ino {
+                let created_identity =
+                    canonical_raw_stat_identity(created_stat.st_dev, created_stat.st_ino, what)?;
+                if (opened.dev(), opened.ino()) != created_identity {
                     return Err(TransportError::IncompleteReply(format!(
                         "{what} changed after creation"
                     )));
@@ -1043,7 +1045,9 @@ impl StageDir {
                 )
             })?;
             use std::os::unix::fs::MetadataExt;
-            if opened.dev() != created_stat.st_dev || opened.ino() != created_stat.st_ino {
+            let created_identity =
+                canonical_raw_stat_identity(created_stat.st_dev, created_stat.st_ino, what)?;
+            if (opened.dev(), opened.ino()) != created_identity {
                 return Err(TransportError::IncompleteReply(format!(
                     "{what} changed after creation"
                 )));
@@ -1436,7 +1440,9 @@ impl StageDir {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if child_meta.dev() != current.st_dev || child_meta.ino() != current.st_ino {
+            let current_identity =
+                canonical_raw_stat_identity(current.st_dev, current.st_ino, what)?;
+            if (child_meta.dev(), child_meta.ino()) != current_identity {
                 return Err(TransportError::IncompleteReply(format!(
                     "{what} changed before cleanup could unlink it"
                 )));
@@ -1648,10 +1654,15 @@ impl StageDir {
                 std::io::Error::last_os_error(),
             ));
         }
-        if current.st_mode & libc::S_IFMT != libc::S_IFREG
-            || current.st_dev != expected.st_dev
-            || current.st_ino != expected.st_ino
-        {
+        if current.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(TransportError::IncompleteReply(format!(
+                "{what} changed before cleanup could unlink it"
+            )));
+        }
+        let current_identity = canonical_raw_stat_identity(current.st_dev, current.st_ino, what)?;
+        let expected_identity =
+            canonical_raw_stat_identity(expected.st_dev, expected.st_ino, what)?;
+        if current_identity != expected_identity {
             return Err(TransportError::IncompleteReply(format!(
                 "{what} changed before cleanup could unlink it"
             )));
@@ -3106,12 +3117,14 @@ fn collect_response_stage_units_at(
         let child = root.child_existing(&name, "oversized response stage")?;
         let path = relative.join(&name);
         if depth == 1 {
+            let (dev, ino) =
+                canonical_raw_stat_identity(stat.st_dev, stat.st_ino, "oversized response stage")?;
             units.push(PressureUnit {
                 modified: stat_modified(&stat),
                 bytes: child.directory_bytes("oversized response stage")?,
                 relative: path,
-                dev: stat.st_dev,
-                ino: stat.st_ino,
+                dev,
+                ino,
                 directory: true,
             });
         } else {
@@ -3140,12 +3153,17 @@ fn collect_response_receipts_at(
                         .to_string(),
                 ));
             }
+            let (dev, ino) = canonical_raw_stat_identity(
+                stat.st_dev,
+                stat.st_ino,
+                "oversized response receipt",
+            )?;
             units.push(PressureUnit {
                 modified: stat_modified(&stat),
                 bytes: stat.st_size.max(0) as u64,
                 relative: relative.join(&node).join(&name),
-                dev: stat.st_dev,
-                ino: stat.st_ino,
+                dev,
+                ino,
                 directory: false,
             });
         }
@@ -3201,7 +3219,12 @@ fn evict_pressure_unit(root: &StageDir, unit: &PressureUnit) -> TransportResult<
                 std::io::Error::last_os_error(),
             ));
         }
-        if current.st_dev != unit.dev || current.st_ino != unit.ino {
+        let current_identity = canonical_raw_stat_identity(
+            current.st_dev,
+            current.st_ino,
+            "oversized response pressure unit",
+        )?;
+        if current_identity != (unit.dev, unit.ino) {
             return Err(TransportError::IncompleteReply(
                 "oversized response pressure unit changed after inventory".to_string(),
             ));
@@ -3210,6 +3233,24 @@ fn evict_pressure_unit(root: &StageDir, unit: &PressureUnit) -> TransportResult<
         pause_after_pinned_parent_for_test(PausePoint::Pressure);
         parent.unlink_regular_if_same(&leaf, &current, "oversized response pressure receipt")
     }
+}
+
+fn canonical_raw_stat_identity<D, I>(dev: D, ino: I, what: &str) -> TransportResult<(u64, u64)>
+where
+    D: TryInto<u64>,
+    I: TryInto<u64>,
+{
+    let dev = dev.try_into().map_err(|_| {
+        TransportError::IncompleteReply(format!(
+            "{what} has an unrepresentable filesystem device identity"
+        ))
+    })?;
+    let ino = ino.try_into().map_err(|_| {
+        TransportError::IncompleteReply(format!(
+            "{what} has an unrepresentable filesystem inode identity"
+        ))
+    })?;
+    Ok((dev, ino))
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -3230,6 +3271,25 @@ fn stat_modified(stat: &libc::stat) -> (i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_stat_identity_rejects_negative_or_unrepresentable_components() {
+        let negative_device = canonical_raw_stat_identity(-1_i64, 7_i64, "test file")
+            .expect_err("negative device identity must fail closed");
+        assert!(matches!(
+            negative_device,
+            TransportError::IncompleteReply(message)
+                if message == "test file has an unrepresentable filesystem device identity"
+        ));
+
+        let oversized_inode = canonical_raw_stat_identity(7_u128, u128::MAX, "test file")
+            .expect_err("oversized inode identity must fail closed");
+        assert!(matches!(
+            oversized_inode,
+            TransportError::IncompleteReply(message)
+                if message == "test file has an unrepresentable filesystem inode identity"
+        ));
+    }
 
     #[cfg(unix)]
     fn outside_sentinel(outside: &Path) -> PathBuf {

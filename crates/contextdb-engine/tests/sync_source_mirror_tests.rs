@@ -39,6 +39,10 @@ fn server_sync_sources_are_exact_engine_audit_mirrors() {
         &engine.join("src/transport/iroh.rs"),
         &server.join("transport/iroh.rs"),
     );
+    assert_exact_mirror(
+        &engine.join("src/transport/large_request_staging.rs"),
+        &server.join("transport/large_request_staging.rs"),
+    );
 }
 
 #[test]
