@@ -3259,6 +3259,8 @@ macro_rules! sync_test_seam {
     };
 }
 
+#[cfg(test)]
+mod ddl_constraint_rendering_tests;
 #[cfg(all(test, feature = "sync-orchestration"))]
 mod in_memory_lineage_tests;
 #[cfg(test)]
@@ -3267,8 +3269,6 @@ mod projected_generation_accepted_delete_replay_tests;
 mod query_trace_rows_examined_contract_tests;
 #[cfg(test)]
 mod received_row_restatement_tests;
-#[cfg(test)]
-mod ddl_constraint_rendering_tests;
 #[cfg(test)]
 mod received_schema_atomic_retry_tests;
 #[cfg(test)]
@@ -39823,13 +39823,20 @@ fn create_table_constraints_from_ast(ct: &CreateTable) -> Vec<String> {
     }
 
     if let Some(sm) = &ct.state_machine {
-        let transitions = sm
+        // The transition map is unordered; render it sorted by source state
+        // so every machine spells the same declared constraint identically —
+        // the spelling participates in schema identity comparisons.
+        let mut clauses = sm
             .transitions
             .iter()
             .map(|(from, tos)| format!("{from} -> [{}]", tos.join(", ")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        constraints.push(format!("STATE MACHINE ({}: {})", sm.column, transitions));
+            .collect::<Vec<_>>();
+        clauses.sort();
+        constraints.push(format!(
+            "STATE MACHINE ({}: {})",
+            sm.column,
+            clauses.join(", ")
+        ));
     }
 
     if !ct.dag_edge_types.is_empty() {
@@ -39913,13 +39920,18 @@ fn create_table_constraints_from_meta(meta: &TableMeta) -> Vec<String> {
     }
 
     if let Some(sm) = &meta.state_machine {
-        let states = sm
+        // Sorted for the same one-spelling reason as the AST renderer above.
+        let mut clauses = sm
             .transitions
             .iter()
             .map(|(from, to)| format!("{from} -> [{}]", to.join(", ")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        constraints.push(format!("STATE MACHINE ({}: {})", sm.column, states));
+            .collect::<Vec<_>>();
+        clauses.sort();
+        constraints.push(format!(
+            "STATE MACHINE ({}: {})",
+            sm.column,
+            clauses.join(", ")
+        ));
     }
 
     if !meta.dag_edge_types.is_empty() {
