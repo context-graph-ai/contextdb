@@ -201,7 +201,7 @@ fn identical_pulled_row_clears_local_push_obligation_on_keep_first_table() {
 }
 
 #[test]
-fn divergent_pulled_row_keeps_current_keep_first_behavior() {
+fn divergent_pulled_row_adopts_hub_value_and_reports_the_conflict() {
     let root = tempfile::tempdir().unwrap();
     let tenant = TenantId::from("row-restatement-divergent-tenant");
     let path = root.path().join("row-restatement-divergent.redb");
@@ -212,6 +212,11 @@ fn divergent_pulled_row_keeps_current_keep_first_behavior() {
     insert(&db, id, "original");
 
     let (changes, entries) = pulled_row_batch(&root, &tenant, id, "divergent");
+    let incoming_lsn = changes.rows[0].lsn;
+    // The same persisted "creator" identity `pulled_row_batch` signed the
+    // batch with -- `identity()` loads the same keypair back from the
+    // shared `root` rather than minting a new one.
+    let creator = identity(&root, "creator");
     let result = db
         .apply_authenticated_received_changes_with_lineages(
             changes,
@@ -223,47 +228,67 @@ fn divergent_pulled_row_keeps_current_keep_first_behavior() {
             None,
             false,
         )
-        .expect("a divergent incoming row under KEEP FIRST is a handled refusal, not an error");
+        .expect(
+            "a divergent incoming row under KEEP FIRST is a handled hub adoption, not an error",
+        );
 
-    // Pinning today's exact KEEP FIRST semantics (database.rs's
-    // `(Some(local), ConflictPolicy::InsertIfNotExists)` arm): the incoming
-    // row is skipped and reported as a keep_first conflict, and the local
-    // value is untouched.
-    assert_eq!(
-        result.skipped_rows, 1,
-        "a genuinely divergent incoming row is still refused under KEEP FIRST"
-    );
+    // Product contract (run-B2 intent §3.2): on a table whose declaration
+    // includes a pull leg, KEEP FIRST means the edge ADOPTS the hub-accepted
+    // value on pull -- the edge's losing value is surfaced as a complete
+    // typed diagnostic, never silently kept.
     assert_eq!(
         result.conflicts.len(),
         1,
-        "a genuinely divergent incoming row still reports exactly one keep_first conflict"
+        "a divergent incoming row reports exactly one keep-first hub-adoption conflict, got {:?}",
+        result.conflicts
+    );
+    let conflict = &result.conflicts[0];
+    assert_eq!(
+        conflict.natural_key,
+        NaturalKey::single("id".to_string(), Value::Uuid(id)),
+        "the conflict names the adopted row's natural key"
     );
     assert_eq!(
-        result.conflicts[0].reason.as_deref(),
-        Some("keep_first"),
-        "the conflict reason for a divergent row stays keep_first"
+        conflict.reason.as_deref(),
+        Some("keep_first_hub_adopted"),
+        "the conflict reason names hub adoption, not a bare refusal"
     );
     assert_eq!(
-        note_body(&db, id),
-        "original",
-        "KEEP FIRST must keep the local value against a divergent incoming row"
+        conflict.table.as_deref(),
+        Some("notes"),
+        "the conflict names the adopted row's table"
+    );
+    assert_eq!(
+        conflict.mutation_kind.as_deref(),
+        Some("edit"),
+        "adopting a divergent value over an existing local row is an edit"
+    );
+    assert_eq!(
+        conflict.winning_author_node_id.as_deref(),
+        Some(creator.node_id().as_str()),
+        "the winning author is the hub-side row's authenticated creator"
+    );
+    assert_eq!(
+        conflict.hub_acceptance_position,
+        Some(incoming_lsn),
+        "the hub acceptance position is the adopted row's established arrival"
     );
 
-    let assert_local_row_stays_pending = |db: &Database, when: &str| {
-        let outbound = outbound_pending_rows(db);
+    assert_eq!(
+        note_body(&db, id),
+        "divergent",
+        "KEEP FIRST on a pull-leg-declared table adopts the hub's value over the edge's own losing value"
+    );
+
+    let assert_push_obligation_cleared = |db: &Database, when: &str| {
         assert_eq!(
-            outbound.len(),
-            1,
-            "the local row must remain push-eligible against a divergent incoming row {when}, got {outbound:?}"
-        );
-        assert_eq!(
-            outbound[0].natural_key,
-            NaturalKey::single("id".to_string(), Value::Uuid(id)),
-            "the surviving pending row must be the local note {when}"
+            outbound_pending_rows(db),
+            Vec::new(),
+            "adopting the hub's value must clear the local push obligation {when}"
         );
     };
 
-    assert_local_row_stays_pending(&db, "immediately after apply");
+    assert_push_obligation_cleared(&db, "immediately after apply");
     let db = reopen(db, &path);
-    assert_local_row_stays_pending(&db, "after reopen");
+    assert_push_obligation_cleared(&db, "after reopen");
 }

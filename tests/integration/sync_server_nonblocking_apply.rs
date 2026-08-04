@@ -1251,42 +1251,123 @@ async fn ss05_conflict_policy_parity_matches_inline_apply() {
                 .expect("server conflict push reply"),
         );
 
-        assert_eq!(actual.applied_rows, expected.applied_rows);
-        assert_eq!(actual.skipped_rows, expected.skipped_rows);
+        // The fresh row never collides locally on either surface (the
+        // `(None, _)` apply arm), so it inserts identically regardless of
+        // policy or which leg (push vs. receipt-less inline) applied it.
+        assert_eq!(
+            item_name(&server_db, fresh_id),
+            item_name(&inline_db, fresh_id)
+        );
 
         match policy {
             ConflictPolicy::InsertIfNotExists => {
+                // Narrowed per the declared-policy pull-adoption contract
+                // (Settled Policy 9 / §3.2): full push/inline parity no
+                // longer holds for KEEP FIRST. The hub's one-decision
+                // contract governs the PUSH leg (this server exchange,
+                // carrying an authenticated receipt) -- it still refuses the
+                // conflicting row exactly as before. The receipt-less
+                // inline `apply_changes` call above now stands in for the
+                // PULL leg, which ADOPTS the already-established value
+                // instead of silently keeping the caller's own losing one.
+                // The two surfaces are asserted explicitly below rather than
+                // compared for equality.
+
+                // Receipt-less side (pull leg): adopts the existing row and
+                // reports the typed hub-adoption diagnostic.
+                assert_eq!(
+                    expected.applied_rows, 2,
+                    "the receipt-less apply adopts the existing row and inserts \
+                     the fresh one: {expected:?}"
+                );
+                assert_eq!(
+                    expected.skipped_rows, 0,
+                    "adoption is not a refusal: {expected:?}"
+                );
+                assert_eq!(
+                    expected.conflicts.len(),
+                    1,
+                    "exactly one hub-adoption diagnostic: {expected:?}"
+                );
+                let inline_conflict = &expected.conflicts[0];
+                assert_eq!(inline_conflict.natural_key.value, Value::Uuid(existing_id));
+                assert_eq!(
+                    inline_conflict.resolution,
+                    ConflictPolicy::InsertIfNotExists
+                );
+                assert_eq!(
+                    inline_conflict.reason.as_deref(),
+                    Some("keep_first_hub_adopted"),
+                    "the reason must name hub adoption, not a bare refusal: {inline_conflict:?}"
+                );
+                assert_eq!(
+                    inline_conflict.table.as_deref(),
+                    Some(TABLE),
+                    "{inline_conflict:?}"
+                );
+                assert_eq!(
+                    inline_conflict.mutation_kind.as_deref(),
+                    Some("edit"),
+                    "{inline_conflict:?}"
+                );
+                assert_eq!(
+                    item_name(&inline_db, existing_id),
+                    "client-conflict",
+                    "the receipt-less apply adopts the incoming value over its own"
+                );
+
+                // Push side: the hub's one-decision refusal contract, now
+                // carrying the same complete typed diagnostic shape as the
+                // pull leg's adoption (observed at HEAD: reason
+                // "dependency_complete_refused", not the old bare
+                // "keep_first" -- an authenticated push is a dependency-
+                // complete unit, so its refusal reports the established hub
+                // winner instead of a bare policy tag).
                 assert_eq!(actual.applied_rows, 1);
                 assert_eq!(actual.skipped_rows, 1);
                 assert_eq!(actual.conflicts.len(), 1);
+                let push_conflict = &actual.conflicts[0];
+                assert_eq!(push_conflict.natural_key.value, Value::Uuid(existing_id));
+                assert_eq!(push_conflict.resolution, ConflictPolicy::InsertIfNotExists);
                 assert_eq!(
-                    actual.conflicts[0].natural_key.value,
-                    Value::Uuid(existing_id)
+                    push_conflict.reason.as_deref(),
+                    Some("dependency_complete_refused"),
+                    "the push leg keeps the hub's one-decision refusal contract: {actual:?}"
                 );
+                assert_eq!(push_conflict.table.as_deref(), Some(TABLE), "{actual:?}");
                 assert_eq!(
-                    actual.conflicts[0].resolution,
-                    ConflictPolicy::InsertIfNotExists
+                    push_conflict.mutation_kind.as_deref(),
+                    Some("edit"),
+                    "{actual:?}"
+                );
+                assert!(
+                    push_conflict.winning_author_node_id.is_some(),
+                    "the refused push names the hub's established winner: {actual:?}"
+                );
+                assert!(
+                    push_conflict.hub_acceptance_position.is_some(),
+                    "the refused push names the hub's acceptance position: {actual:?}"
                 );
                 assert_eq!(item_name(&server_db, existing_id), "server-value");
             }
             ConflictPolicy::LatestWins => {
+                // Unaffected by the pull-adoption contract: full parity
+                // still holds for this policy.
+                assert_eq!(actual.applied_rows, expected.applied_rows);
+                assert_eq!(actual.skipped_rows, expected.skipped_rows);
                 assert_eq!(actual.applied_rows, 2);
                 assert_eq!(actual.skipped_rows, 0);
                 assert!(actual.conflicts.is_empty());
                 assert_eq!(item_name(&server_db, existing_id), "client-conflict");
+                assert_eq!(
+                    item_name(&server_db, existing_id),
+                    item_name(&inline_db, existing_id)
+                );
             }
             ConflictPolicy::ServerWins | ConflictPolicy::EdgeWins => {
                 unreachable!("only schema-declarable conflict policies are under test")
             }
         }
-        assert_eq!(
-            item_name(&server_db, existing_id),
-            item_name(&inline_db, existing_id)
-        );
-        assert_eq!(
-            item_name(&server_db, fresh_id),
-            item_name(&inline_db, fresh_id)
-        );
         server.abort();
     }
 }

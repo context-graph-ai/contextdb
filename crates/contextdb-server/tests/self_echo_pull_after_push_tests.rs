@@ -152,6 +152,26 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, tenant: &str) -> Sy
     )
 }
 
+/// Same as `edge_client`, but also hands back this edge's own 64-hex node
+/// id so a caller can assert it as the `winning_author_node_id` on a later
+/// pull-leg KEEP FIRST hub-adoption diagnostic (a plain `SyncClient` does not
+/// expose its own identity).
+fn edge_client_with_identity(
+    db: &Arc<Database>,
+    broker: &InProcessBroker,
+    tenant: &str,
+) -> (SyncClient, String) {
+    let identity = Arc::new(FabricIdentity::generate());
+    let node_id = identity.node_id();
+    let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+        db.clone(),
+        broker.client_as(&node_id),
+        TenantId::from(tenant),
+        identity,
+    );
+    (client, node_id)
+}
+
 /// The self-echo: a single edge pushes its own new rows, then
 /// immediately pulls — on the shipped default policy path (no explicit policy
 /// override). The pulled rows are the edge's OWN data, already present locally
@@ -221,9 +241,9 @@ async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
     let hub = start_hub(&broker, tenant);
 
     // Edge B writes and pushes a value at key=1 first — the hub now holds B's
-    // value, and edge A has never seen it.
+    // hub-accepted value, and edge A has never seen it.
     let edge_b = open_edge();
-    let client_b = edge_client(&edge_b, &broker, tenant);
+    let (client_b, node_id_b) = edge_client_with_identity(&edge_b, &broker, tenant);
     insert_note(&edge_b, 1, "edge-b-version");
     within(client_b.push()).await.expect("edge B push");
 
@@ -243,8 +263,12 @@ async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
     // what edge B already put on the hub.
     insert_note(&edge_a, 1, "edge-a-version");
 
-    // One pull now mixes both cases: key=1 (genuine two-edge divergence) and
-    // key=2 (A's own row echoing back).
+    // One pull now mixes both cases: key=1 (genuine two-edge divergence,
+    // adopted per the declared-policy pull-adoption contract — Settled
+    // Policy 9 / §3.2: the hub-accepted value is the one observable "first",
+    // so the pull leg adopts it rather than silently keeping the edge's own
+    // losing value) and key=2 (A's own row echoing back, still a pure
+    // no-op).
     let pulled = within(client_a.pull_default())
         .await
         .expect("edge A mixed pull must succeed");
@@ -252,7 +276,7 @@ async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
     assert_eq!(
         pulled.conflicts.len(),
         1,
-        "exactly one genuine conflict must surface — the self-echoed key=2 row \
+        "exactly one adoption diagnostic must surface — the self-echoed key=2 row \
          must not inflate this list. Got {:?}",
         pulled.conflicts
     );
@@ -271,24 +295,50 @@ async fn mixed_pull_isolates_the_genuine_conflict_from_the_self_echo() {
     );
     assert_eq!(
         conflict.reason.as_deref(),
-        Some("keep_first"),
-        "the conflict's reason must name the policy that resolved it. Got {conflict:?}"
+        Some("keep_first_hub_adopted"),
+        "the conflict's reason must name hub adoption, not a bare refusal. Got {conflict:?}"
+    );
+    assert_eq!(
+        conflict.table.as_deref(),
+        Some("notes"),
+        "the conflict must name the adopted row's table. Got {conflict:?}"
+    );
+    assert_eq!(
+        conflict.mutation_kind.as_deref(),
+        Some("edit"),
+        "adopting a divergent value over an existing local row is an edit. Got {conflict:?}"
+    );
+    assert_eq!(
+        conflict.winning_author_node_id.as_deref(),
+        Some(node_id_b.as_str()),
+        "the winning author is edge B, whose value the hub accepted first. Got {conflict:?}"
+    );
+    assert!(
+        conflict.hub_acceptance_position.is_some(),
+        "the adopted row's established hub arrival must be present. Got {conflict:?}"
     );
 
     assert_eq!(
-        pulled.applied_rows, 0,
-        "KEEP FIRST must not overwrite key=1, and the key=2 self-echo is a \
-         no-op. Got {pulled:?}"
+        pulled.applied_rows, 1,
+        "adopting key=1's hub-accepted value is an applied change; key=2's \
+         self-echo is still a no-op. Got {pulled:?}"
     );
     assert_eq!(
-        pulled.skipped_rows, 1,
-        "only the genuinely divergent key=1 row is refused; the key=2 \
-         self-echo must not inflate the skipped count. Got {pulled:?}"
+        pulled.skipped_rows, 0,
+        "nothing is refused now: the adopted key=1 row is applied, not \
+         skipped, and the key=2 self-echo was never a refusal either. Got {pulled:?}"
     );
     assert_eq!(
         only_body(&edge_a, 1),
-        "edge-a-version",
-        "KEEP FIRST must retain edge A's existing local value"
+        "edge-b-version",
+        "the pull leg of a declared KEEP FIRST table adopts the hub-accepted \
+         value — edge A's own losing value must not survive"
+    );
+    assert_eq!(
+        only_body(&edge_a, 2),
+        "edge-a-only",
+        "the self-echoed key=2 row must remain untouched by the adoption \
+         logic applied to key=1"
     );
 
     hub.stop().await;
@@ -308,9 +358,10 @@ async fn genuine_two_edge_divergence_still_reports_a_pull_conflict() {
     let broker = InProcessBroker::new();
     let hub = start_hub(&broker, tenant);
 
-    // Edge A writes and pushes id=1 first — the hub now holds A's value.
+    // Edge A writes and pushes id=1 first — the hub now holds A's
+    // hub-accepted value.
     let edge_a = open_edge();
-    let client_a = edge_client(&edge_a, &broker, tenant);
+    let (client_a, node_id_a) = edge_client_with_identity(&edge_a, &broker, tenant);
     insert_note(&edge_a, 1, "edge-a-version");
     within(client_a.push()).await.expect("edge A push");
 
@@ -320,9 +371,13 @@ async fn genuine_two_edge_divergence_still_reports_a_pull_conflict() {
     let client_b = edge_client(&edge_b, &broker, tenant);
     insert_note(&edge_b, 1, "edge-b-version");
 
-    // Edge B pulls: the incoming row (A's committed value) collides with B's
-    // own different local value at the same key — a genuine two-machine
-    // conflict, not a self-echo.
+    // Edge B pulls: the incoming row (A's committed, hub-accepted value)
+    // collides with B's own different local value at the same key — a
+    // genuine two-machine divergence, not a self-echo. Per the
+    // declared-policy pull-adoption contract (Settled Policy 9 / §3.2): the
+    // hub-accepted value is the one observable "first", so the pull leg
+    // ADOPTS it and reports a typed diagnostic rather than silently keeping
+    // the edge's own losing value.
     let pulled = within(client_b.pull_default())
         .await
         .expect("edge B pull must succeed");
@@ -348,22 +403,42 @@ async fn genuine_two_edge_divergence_still_reports_a_pull_conflict() {
     );
     assert_eq!(
         conflict.reason.as_deref(),
-        Some("keep_first"),
-        "the reported reason must name the policy that resolved it. Got {conflict:?}"
+        Some("keep_first_hub_adopted"),
+        "the reported reason must name hub adoption, not a bare refusal. Got {conflict:?}"
+    );
+    assert_eq!(
+        conflict.table.as_deref(),
+        Some("notes"),
+        "the conflict must name the adopted row's table. Got {conflict:?}"
+    );
+    assert_eq!(
+        conflict.mutation_kind.as_deref(),
+        Some("edit"),
+        "adopting a divergent value over an existing local row is an edit. Got {conflict:?}"
+    );
+    assert_eq!(
+        conflict.winning_author_node_id.as_deref(),
+        Some(node_id_a.as_str()),
+        "the winning author is edge A, whose value the hub accepted first. Got {conflict:?}"
+    );
+    assert!(
+        conflict.hub_acceptance_position.is_some(),
+        "the adopted row's established hub arrival must be present. Got {conflict:?}"
     );
 
     assert_eq!(
         only_body(&edge_b, 1),
-        "edge-b-version",
-        "KEEP FIRST must retain edge B's existing local value"
+        "edge-a-version",
+        "the pull leg of a declared KEEP FIRST table adopts the hub-accepted \
+         value — edge B's own losing value must not survive"
     );
     assert_eq!(
-        pulled.applied_rows, 0,
-        "a KEEP FIRST refusal must not claim it changed local state: {pulled:?}"
+        pulled.applied_rows, 1,
+        "adopting the hub's value is an applied change, not a silent keep: {pulled:?}"
     );
     assert_eq!(
-        pulled.skipped_rows, 1,
-        "the one genuinely divergent incoming row must be counted as refused: \
+        pulled.skipped_rows, 0,
+        "an adopted row is not a refusal, so it must not count as skipped: \
          {pulled:?}"
     );
 
