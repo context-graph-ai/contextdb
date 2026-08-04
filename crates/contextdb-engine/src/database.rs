@@ -3436,6 +3436,30 @@ struct DurableReceivedDdlArrival {
     digest: Vec<u8>,
 }
 
+/// Receiver-local proof that one locally authored DDL occurrence is already
+/// represented by authoritative schema this node received. It is deliberately
+/// a separate mark class from `DurableReceivedDdlArrival`: an arrival names an
+/// occurrence this node received and replayed, and destination rebuild proves
+/// itself by replaying exactly those occurrences. A superseded occurrence was
+/// authored here and is never part of that replay; it only stops outbound echo
+/// of schema the peer demonstrably already has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableSupersededDdlOccurrence {
+    local_lsn: Lsn,
+    persisted_ordinal: u32,
+    digest: Vec<u8>,
+}
+
+/// One locally authored DDL occurrence being considered against an incoming
+/// authenticated vector, carrying the persisted spelling the comparison uses
+/// and the digest its mark would bind.
+struct SupersedableLocalDdl {
+    key: (Lsn, u32),
+    persisted_shape: DdlChange,
+    digest: Vec<u8>,
+    matched: bool,
+}
+
 /// One complete, ordered received-DDL vector and the exact outcome published
 /// by its original receiver commit. Individual markers prove per-item
 /// provenance; this record makes retries an all-or-nothing operation.
@@ -3492,6 +3516,7 @@ struct ReceivedSchemaPersistencePayload {
     generation_values: Vec<(String, Vec<u8>)>,
     marker_values: Vec<(String, Vec<u8>)>,
     received_arrival_values: Vec<(String, Vec<u8>)>,
+    superseded_occurrence_values: Vec<(String, Vec<u8>)>,
     lineage_values: Vec<(String, Vec<u8>)>,
     accepted_author_values: Vec<(String, Vec<u8>)>,
     source_state_values: Vec<(String, Vec<u8>)>,
@@ -3526,6 +3551,7 @@ struct ReceivedSchemaMemoryMirrors {
     table_generations: HashMap<String, u64>,
     ddl_generations: HashMap<(Lsn, u32), (Option<String>, Option<u64>)>,
     received_ddl_arrivals: HashMap<(Lsn, u32), DurableReceivedDdlArrival>,
+    superseded_ddl_occurrences: HashMap<(Lsn, u32), DurableSupersededDdlOccurrence>,
     source_state: HashMap<(String, String), SyncTombstoneArrival>,
     accepted_authors: HashMap<(String, Vec<u8>), String>,
     terminal_markers: HashMap<TerminalRefusalMarkerKey, TerminalRefusalMarkerRecord>,
@@ -3543,6 +3569,7 @@ impl ReceivedSchemaMemoryMirrors {
             table_generations: HashMap::new(),
             ddl_generations: HashMap::new(),
             received_ddl_arrivals: HashMap::new(),
+            superseded_ddl_occurrences: HashMap::new(),
             source_state: HashMap::new(),
             accepted_authors: HashMap::new(),
             terminal_markers: HashMap::new(),
@@ -3860,6 +3887,7 @@ fn plan_received_schema_source_order(
             generation_values,
             marker_values,
             received_arrival_values,
+            superseded_occurrence_values: Vec::new(),
             lineage_values: Vec::new(),
             accepted_author_values: Vec::new(),
             source_state_values: Vec::new(),
@@ -5756,6 +5784,10 @@ pub struct Database {
     /// opens hydrate this from its dedicated config prefix; memory databases
     /// publish it only after the staged commit has become durable.
     received_ddl_arrivals: Arc<RwLock<HashMap<(Lsn, u32), DurableReceivedDdlArrival>>>,
+    /// Locally authored DDL occurrences an authenticated received vector has
+    /// since restated. Hydrated and published exactly like the arrival
+    /// evidence above, and consumed only by outbound echo classification.
+    superseded_ddl_occurrences: Arc<RwLock<HashMap<(Lsn, u32), DurableSupersededDdlOccurrence>>>,
     cron: Arc<CronState>,
     event_bus: Arc<EventBusState>,
     trigger: Arc<TriggerState>,
@@ -7820,6 +7852,7 @@ impl Database {
             in_memory_table_generations: Arc::new(Mutex::new(HashMap::new())),
             in_memory_ddl_generations: Arc::new(Mutex::new(HashMap::new())),
             received_ddl_arrivals: Arc::new(RwLock::new(HashMap::new())),
+            superseded_ddl_occurrences: Arc::new(RwLock::new(HashMap::new())),
             cron: Arc::new(CronState::new()),
             event_bus,
             trigger,
@@ -8097,6 +8130,7 @@ impl Database {
             in_memory_table_generations: self.in_memory_table_generations.clone(),
             in_memory_ddl_generations: self.in_memory_ddl_generations.clone(),
             received_ddl_arrivals: self.received_ddl_arrivals.clone(),
+            superseded_ddl_occurrences: self.superseded_ddl_occurrences.clone(),
             cron: self.cron.clone(),
             event_bus: self.event_bus.clone(),
             trigger: self.trigger.clone(),
@@ -8457,6 +8491,7 @@ impl Database {
         );
 
         db.load_received_ddl_arrivals_from_persistence()?;
+        db.load_superseded_ddl_occurrences_from_persistence()?;
         db.load_graph_arrivals_from_persistence()?;
 
         for meta in all_meta.values() {
@@ -10400,6 +10435,7 @@ impl Database {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_with_source_and_sync_ddl_and_trigger_audit_projection(
         &self,
         tx: TxId,
@@ -12372,6 +12408,147 @@ impl Database {
         Ok(())
     }
 
+    const DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX: &str = "sync_ddl_superseded.v1.";
+
+    fn durable_superseded_ddl_occurrence_key(local_lsn: Lsn, persisted_ordinal: u32) -> String {
+        format!(
+            "{}{:020}.{persisted_ordinal:06}",
+            Self::DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX,
+            local_lsn.0
+        )
+    }
+
+    fn load_superseded_ddl_occurrences_from_persistence(&self) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let mut superseded = HashMap::new();
+        for (key, occurrence) in persistence
+            .load_config_values_with_prefix::<DurableSupersededDdlOccurrence>(
+                Self::DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX,
+            )?
+        {
+            let expected_key = Self::durable_superseded_ddl_occurrence_key(
+                occurrence.local_lsn,
+                occurrence.persisted_ordinal,
+            );
+            if key != expected_key
+                || superseded
+                    .insert(
+                        (occurrence.local_lsn, occurrence.persisted_ordinal),
+                        occurrence,
+                    )
+                    .is_some()
+            {
+                return Err(Error::StoreCorrupted {
+                    path: key,
+                    reason: "superseded DDL key does not bind one exact local occurrence"
+                        .to_string(),
+                });
+            }
+        }
+        *self.superseded_ddl_occurrences.write() = superseded;
+        Ok(())
+    }
+
+    /// The spelling one `DdlChange` takes once it has crossed the durable
+    /// config codec. That codec's compatibility decoder projects structured
+    /// table fields down to the legacy persisted shape, so this is the only
+    /// comparison that can hold between a declaration this node parsed and the
+    /// same declaration a peer serves back out of its own store.
+    fn persisted_ddl_shape(change: &DdlChange) -> Result<DdlChange> {
+        let encoded = RedbPersistence::encode_config_value(change)?;
+        RedbPersistence::decode_config_value(&encoded)
+    }
+
+    /// Decide which locally authored DDL occurrences an incoming authenticated
+    /// vector restates, given the local DDL log as it stood before that vector
+    /// was appended. Occurrences already carrying arrival or superseded
+    /// evidence are left alone, and each incoming declaration consumes at most
+    /// the first still-unmatched local occurrence with the same persisted
+    /// spelling, so duplicate DDL cannot be counted twice.
+    ///
+    /// A local schema commit is superseded only in full: marking part of one
+    /// commit would let a later push carry a fragment of a transaction whose
+    /// remaining statements the peer has never seen.
+    fn superseded_local_ddl_occurrences(
+        &self,
+        local_ddl_log: &[(Lsn, DdlChange)],
+        received_ddl: &[DdlChange],
+    ) -> Result<Vec<((Lsn, u32), DurableSupersededDdlOccurrence)>> {
+        let arrivals = self.received_ddl_arrivals.read().clone();
+        let already_superseded = self.superseded_ddl_occurrences.read().clone();
+        let mut next_ordinal = HashMap::<Lsn, u32>::new();
+        let mut candidates: Vec<SupersedableLocalDdl> = Vec::new();
+        let mut eligible_per_commit = HashMap::<Lsn, usize>::new();
+        let mut unprovable_commits = HashSet::<Lsn>::new();
+        for (lsn, change) in local_ddl_log {
+            let ordinal = next_ordinal.entry(*lsn).or_default();
+            let key = (*lsn, *ordinal);
+            *ordinal = ordinal.saturating_add(1);
+            if arrivals.contains_key(&key) || already_superseded.contains_key(&key) {
+                continue;
+            }
+            // An occurrence with no immutable generation evidence cannot be
+            // bound by a digest. Its whole commit therefore stays outbound,
+            // because marking the rest would leave that commit half-proven.
+            let Some(generation) = self.recorded_ddl_generation_sidecar(key.0, key.1)? else {
+                unprovable_commits.insert(*lsn);
+                continue;
+            };
+            *eligible_per_commit.entry(*lsn).or_default() += 1;
+            candidates.push(SupersedableLocalDdl {
+                key,
+                persisted_shape: Self::persisted_ddl_shape(change)?,
+                digest: Self::canonical_local_ddl_arrival_digest(
+                    change,
+                    key.0,
+                    key.1,
+                    &generation,
+                )?,
+                matched: false,
+            });
+        }
+
+        let mut matched_per_commit = HashMap::<Lsn, usize>::new();
+        for change in received_ddl {
+            let incoming = Self::persisted_ddl_shape(change)?;
+            if let Some(candidate) = candidates
+                .iter_mut()
+                .find(|candidate| !candidate.matched && candidate.persisted_shape == incoming)
+            {
+                candidate.matched = true;
+                *matched_per_commit.entry(candidate.key.0).or_default() += 1;
+            }
+        }
+
+        Ok(candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.matched
+                    && !unprovable_commits.contains(&candidate.key.0)
+                    && matched_per_commit
+                        .get(&candidate.key.0)
+                        .copied()
+                        .unwrap_or(0)
+                        == eligible_per_commit
+                            .get(&candidate.key.0)
+                            .copied()
+                            .unwrap_or(0)
+            })
+            .map(|candidate| {
+                (
+                    candidate.key,
+                    DurableSupersededDdlOccurrence {
+                        local_lsn: candidate.key.0,
+                        persisted_ordinal: candidate.key.1,
+                        digest: candidate.digest,
+                    },
+                )
+            })
+            .collect())
+    }
+
     fn canonical_local_ddl_arrival_digest(
         ddl: &DdlChange,
         local_lsn: Lsn,
@@ -12385,10 +12562,8 @@ impl Database {
         // persisted shape, so normalize through that exact codec here. This
         // keeps one arrival digest stable before and after reopen without
         // weakening the source migration manifest.
-        let durable_bytes = RedbPersistence::encode_config_value(ddl)?;
-        let durable_ddl: DdlChange = RedbPersistence::decode_config_value(&durable_bytes)?;
         crate::protocol::canonical_ddl_provenance_digest(
-            &crate::protocol::WireDdlChange::from(durable_ddl),
+            &crate::protocol::WireDdlChange::from(Self::persisted_ddl_shape(ddl)?),
             local_lsn,
             persisted_ordinal,
             generation.table.as_deref(),
@@ -12608,6 +12783,7 @@ impl Database {
             table_generations: self.in_memory_table_generations.lock().clone(),
             ddl_generations: self.in_memory_ddl_generations.lock().clone(),
             received_ddl_arrivals: self.received_ddl_arrivals.read().clone(),
+            superseded_ddl_occurrences: self.superseded_ddl_occurrences.read().clone(),
             source_state: self.sync_tombstone_arrivals.read().clone(),
             accepted_authors: self.accepted_sync_row_authors.read().clone(),
             terminal_markers: self.terminal_refusal_markers.read().clone(),
@@ -12841,6 +13017,8 @@ impl Database {
         *working.in_memory_table_generations.lock() = authoritative_table_generations;
         *working.in_memory_ddl_generations.lock() = self.in_memory_ddl_generations.lock().clone();
         *working.received_ddl_arrivals.write() = self.received_ddl_arrivals.read().clone();
+        *working.superseded_ddl_occurrences.write() =
+            self.superseded_ddl_occurrences.read().clone();
         *working.sync_tombstone_arrivals.write() = self.sync_tombstone_arrivals.read().clone();
         *working.accepted_sync_row_authors.write() = self.accepted_sync_row_authors.read().clone();
         *working.terminal_refusal_markers.write() = self.terminal_refusal_markers.read().clone();
@@ -13046,7 +13224,23 @@ impl Database {
     ) -> Result<ReceivedSchemaStage> {
         let (source_order, mut persistence) =
             plan_received_schema_source_order(local_lsn, &changes.ddl, &changes.ddl_lsn, received)?;
-        let mut ddl_log_replacement = self.ddl_log.read().clone();
+        let local_ddl_log_before_extension = self.ddl_log.read().clone();
+        // Schema this node authored before the vector arrived, which the
+        // vector itself restates, stops being outbound work. The comparison
+        // uses the log as it stood before the received occurrences were
+        // appended so the vector cannot match itself.
+        let superseded_occurrences =
+            self.superseded_local_ddl_occurrences(&local_ddl_log_before_extension, &changes.ddl)?;
+        for (_, occurrence) in superseded_occurrences.iter() {
+            persistence.superseded_occurrence_values.push((
+                Self::durable_superseded_ddl_occurrence_key(
+                    occurrence.local_lsn,
+                    occurrence.persisted_ordinal,
+                ),
+                RedbPersistence::encode_config_value(occurrence)?,
+            ));
+        }
+        let mut ddl_log_replacement = local_ddl_log_before_extension;
         ddl_log_replacement.extend(persistence.ddl_log_replacement);
         persistence.ddl_log_replacement = ddl_log_replacement;
         self.validate_received_schema_lineage_sidecars(changes, validated_lineages)?;
@@ -13330,6 +13524,9 @@ impl Database {
             &source_order,
             working.accepted_sync_row_authors.read().clone(),
         );
+        mirrors
+            .superseded_ddl_occurrences
+            .extend(superseded_occurrences);
         mirrors.source_state = working.sync_tombstone_arrivals.read().clone();
         mirrors.accepted_authors = working.accepted_sync_row_authors.read().clone();
         mirrors.terminal_markers = working.terminal_refusal_markers.read().clone();
@@ -13351,6 +13548,7 @@ impl Database {
         let mut durable_config_values = persistence.generation_values.clone();
         durable_config_values.extend(persistence.marker_values.iter().cloned());
         durable_config_values.extend(persistence.received_arrival_values.iter().cloned());
+        durable_config_values.extend(persistence.superseded_occurrence_values.iter().cloned());
         durable_config_values.extend(persistence.lineage_values.iter().cloned());
         durable_config_values.extend(persistence.accepted_author_values.iter().cloned());
         durable_config_values.extend(persistence.source_state_values.iter().cloned());
@@ -13478,6 +13676,7 @@ impl Database {
         *self.in_memory_table_generations.lock() = stage.mirrors.table_generations;
         *self.in_memory_ddl_generations.lock() = stage.mirrors.ddl_generations;
         *self.received_ddl_arrivals.write() = stage.mirrors.received_ddl_arrivals;
+        *self.superseded_ddl_occurrences.write() = stage.mirrors.superseded_ddl_occurrences;
         *self.sync_tombstone_arrivals.write() = stage.mirrors.source_state;
         *self.accepted_sync_row_authors.write() = stage.mirrors.accepted_authors;
         *self.terminal_refusal_markers.write() = stage.mirrors.terminal_markers;
@@ -31311,26 +31510,40 @@ impl Database {
                 table_generation,
             });
         }
-        let historical = if let Some(persistence) = &self.persistence {
+        self.recorded_ddl_generation_sidecar(entry.source_lsn, entry.ordinal)?
+            .ok_or_else(|| {
+                Error::SyncError(format!(
+                    "DDL at source LSN {} ordinal {} lacks immutable generation evidence",
+                    entry.source_lsn.0, entry.ordinal
+                ))
+            })
+    }
+
+    /// Read the immutable generation sidecar one DDL occurrence recorded when
+    /// it committed. Absence is returned rather than raised: a caller deciding
+    /// whether an occurrence may carry new evidence must be able to leave an
+    /// occurrence alone, while a caller validating existing evidence still
+    /// treats absence as corrupt provenance.
+    fn recorded_ddl_generation_sidecar(
+        &self,
+        lsn: Lsn,
+        ordinal: u32,
+    ) -> Result<Option<DurableDdlGenerationSidecar>> {
+        if let Some(persistence) = &self.persistence {
             persistence.load_config_value::<DurableDdlGenerationSidecar>(
-                &Self::durable_ddl_generation_sidecar_key(entry.source_lsn, entry.ordinal),
-            )?
+                &Self::durable_ddl_generation_sidecar_key(lsn, ordinal),
+            )
         } else {
-            self.in_memory_ddl_generations
+            Ok(self
+                .in_memory_ddl_generations
                 .lock()
-                .get(&(entry.source_lsn, entry.ordinal))
+                .get(&(lsn, ordinal))
                 .cloned()
                 .map(|(table, table_generation)| DurableDdlGenerationSidecar {
                     table,
                     table_generation,
-                })
-        };
-        historical.ok_or_else(|| {
-            Error::SyncError(format!(
-                "DDL at source LSN {} ordinal {} lacks immutable generation evidence",
-                entry.source_lsn.0, entry.ordinal
-            ))
-        })
+                }))
+        }
     }
 
     /// Return the durable raw DDL history rather than the ephemeral in-memory
@@ -31535,6 +31748,67 @@ impl Database {
         Ok(ReceivedDdlArrivalValidation::Marked(marked))
     }
 
+    /// Validate superseded evidence for every captured occurrence. Each mark
+    /// must rebind to that exact local DDL, ordinal, table, and generation, and
+    /// a local schema commit must be superseded whole; anything else is corrupt
+    /// provenance, so outbound work stops rather than guessing.
+    ///
+    /// A synthetic snapshot carries replay positions rather than local log
+    /// positions, so it holds no superseded occurrences: its own evidence is
+    /// the received-arrival proof against the destination frontier.
+    fn superseded_ddl_occurrence_marks(
+        &self,
+        source: &DdlProvenanceSource,
+    ) -> Result<HashSet<(Lsn, u32)>> {
+        if source.kind == DdlProvenanceKind::SyntheticSnapshot {
+            return Ok(HashSet::new());
+        }
+        let superseded = self.superseded_ddl_occurrences.read().clone();
+        if superseded.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut groups = HashMap::<Lsn, (bool, bool)>::new();
+        let mut marked = HashSet::new();
+        for entry in source.entries.iter() {
+            let key = (entry.source_lsn, entry.ordinal);
+            let is_superseded = if let Some(occurrence) = superseded.get(&key) {
+                let raw_ddl = self.raw_ddl_log_occurrence(entry.source_lsn, entry.ordinal)?;
+                let sidecar = self.ddl_provenance_sidecar_for_source_entry(source, entry)?;
+                let expected = Self::canonical_local_ddl_arrival_digest(
+                    &raw_ddl,
+                    entry.source_lsn,
+                    entry.ordinal,
+                    &sidecar,
+                )?;
+                if occurrence.local_lsn != entry.source_lsn
+                    || occurrence.persisted_ordinal != entry.ordinal
+                    || occurrence.digest != expected
+                {
+                    return Err(Error::SyncError(
+                        "superseded DDL evidence does not bind its local schema occurrence"
+                            .to_string(),
+                    ));
+                }
+                marked.insert(key);
+                true
+            } else {
+                false
+            };
+            let group = groups.entry(entry.source_lsn).or_insert((false, true));
+            group.0 |= is_superseded;
+            group.1 &= is_superseded;
+        }
+        if groups
+            .values()
+            .any(|(some_marked, all_marked)| *some_marked && !*all_marked)
+        {
+            return Err(Error::SyncError(
+                "superseded DDL evidence marks only part of one local schema commit".to_string(),
+            ));
+        }
+        Ok(marked)
+    }
+
     /// Apply received-DDL echo policy without changing the public change-set
     /// shape. Ordinary push never re-sends DDL learned from a hub. A destination
     /// rebuild re-sends only DDL that the edge already held at the move's
@@ -31550,6 +31824,7 @@ impl Database {
         let entries = source.surviving_entries(&changes)?;
         let arrivals =
             self.received_ddl_arrival_marks(source, &changes.ddl, destination_frontier)?;
+        let superseded = self.superseded_ddl_occurrence_marks(source)?;
         let mut ddl = Vec::with_capacity(changes.ddl.len());
         let mut ddl_lsn = Vec::with_capacity(changes.ddl_lsn.len());
         for ((change, lsn), entry) in changes
@@ -31558,6 +31833,12 @@ impl Database {
             .zip(changes.ddl_lsn.into_iter())
             .zip(entries)
         {
+            // Locally authored schema an authenticated vector has already
+            // restated is settled provenance, so it never reaches the
+            // fail-closed origin check below.
+            if superseded.contains(&(entry.source_lsn, entry.ordinal)) {
+                continue;
+            }
             let is_received = arrivals.is_received(&(entry.source_lsn, entry.ordinal));
             if let Some(frontier) = destination_frontier
                 && entry.source_lsn > frontier

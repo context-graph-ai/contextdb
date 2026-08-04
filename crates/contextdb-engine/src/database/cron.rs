@@ -811,6 +811,7 @@ impl Database {
             in_memory_table_generations: self.in_memory_table_generations.clone(),
             in_memory_ddl_generations: self.in_memory_ddl_generations.clone(),
             received_ddl_arrivals: self.received_ddl_arrivals.clone(),
+            superseded_ddl_occurrences: self.superseded_ddl_occurrences.clone(),
             cron: self.cron.clone(),
             event_bus: self.event_bus.clone(),
             trigger: self.trigger.clone(),

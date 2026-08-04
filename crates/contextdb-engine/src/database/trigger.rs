@@ -1123,10 +1123,11 @@ impl Database {
             if ws.is_empty() {
                 return Ok(CommitValidationOutcome::default());
             }
-            Ok(self.commit_validate(tx, ws)?)
+            self.commit_validate(tx, ws)
         })?
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_trigger_range(
         &self,
         tx: TxId,
@@ -1234,6 +1235,7 @@ impl Database {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fire_trigger(
         &self,
         tx: TxId,
