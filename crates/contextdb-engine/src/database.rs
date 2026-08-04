@@ -1,6 +1,4 @@
-use crate::blob_repository::BlobRepository;#[cfg(test)]
-mod sync_trigger_vector_epoch_tests;
-
+use crate::blob_repository::BlobRepository;
 use crate::composite_store::{
     ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,
     build_received_schema_change_log_entries, publish_prepared_change_log_entries,
@@ -3287,6 +3285,8 @@ mod received_schema_atomic_side_effects_tests;
 mod received_schema_bootstrap_echo_tests;
 #[cfg(test)]
 mod retired_generation_refusal_tests;
+#[cfg(test)]
+mod sync_trigger_vector_epoch_tests;
 
 #[derive(Debug, Clone)]
 #[cfg(feature = "test-seams")]
@@ -17542,11 +17542,26 @@ impl Database {
         origin_tx: TxId,
         ws: &mut WriteSet,
     ) -> Result<CommitValidationOutcome> {
-        let metadata = self
-            .pending_commit_metadata
-            .lock()
-            .remove(&origin_tx)
-            .unwrap_or_default();
+        // The guards below are one-shot: each describes work this pass is
+        // about to validate and must not be re-applied. The recorded vector
+        // schema epochs are NOT one-shot — they describe the whole
+        // transaction, which an opted-in sync trigger can bring back here
+        // more than once: dispatching a callback that writes into the applying
+        // transaction re-enters commit validation for the same tx. Draining
+        // the epochs with the guards left a later pass with nothing to compare
+        // against, and an unchanged vector index was reported as concurrently
+        // altered. They stay until the transaction itself ends, where every
+        // commit and rollback path already clears this entry.
+        let metadata = {
+            let mut pending = self.pending_commit_metadata.lock();
+            let entry = pending.entry(origin_tx).or_default();
+            PendingCommitMetadata {
+                conditional_update_guards: std::mem::take(&mut entry.conditional_update_guards),
+                sync_lineage_guards: std::mem::take(&mut entry.sync_lineage_guards),
+                upsert_intents: std::mem::take(&mut entry.upsert_intents),
+                vector_schema_epochs: entry.vector_schema_epochs.clone(),
+            }
+        };
         let snapshot = self.snapshot();
         let mut stats_guard = CommitStageStatsGuard::new(self);
         #[cfg(feature = "test-seams")]
