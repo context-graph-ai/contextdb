@@ -18,6 +18,7 @@
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
 use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,7 +53,7 @@ fn claim(db: &Database, key: &str, holder: &str) {
         tx,
         "INSERT INTO claim_groups (id, label) VALUES ($id, $label)",
         &HashMap::from([
-            ("id".to_string(), Value::Text(format!("{key}-group"))),
+            ("id".to_string(), Value::Text(format!("{key}-{holder}-group"))),
             ("label".to_string(), Value::Text(holder.to_string())),
         ]),
     )
@@ -63,7 +64,7 @@ fn claim(db: &Database, key: &str, holder: &str) {
          VALUES ($claim_key, $group_id, $holder)",
         &HashMap::from([
             ("claim_key".to_string(), Value::Text(key.to_string())),
-            ("group_id".to_string(), Value::Text(format!("{key}-group"))),
+            ("group_id".to_string(), Value::Text(format!("{key}-{holder}-group"))),
             ("holder".to_string(), Value::Text(holder.to_string())),
         ]),
     )
@@ -147,6 +148,16 @@ async fn a_refused_pusher_is_served_the_winning_claim_on_its_next_pull() {
     let broker = InProcessBroker::new();
     let hub = start_hub(&broker, tenant);
 
+    // The loser is an ESTABLISHED edge: it pulls BEFORE the race, so it carries
+    // a real pull cursor rather than starting from nothing. A cursor the
+    // refusal later advances past the winner's acceptance is invisible to an
+    // edge whose cursor still sits at zero.
+    let loser = open_edge();
+    let loser_client = edge_client(&loser, &broker, tenant);
+    within(loser_client.pull_default())
+        .await
+        .expect("the loser establishes its pull cursor before the race");
+
     // Winner: edge one claims and its push is accepted.
     let winner = open_edge();
     let winner_client = edge_client(&winner, &broker, tenant);
@@ -162,15 +173,8 @@ async fn a_refused_pusher_is_served_the_winning_claim_on_its_next_pull() {
 
     // Loser: edge two claims the same key and pushes. The hub refuses, which
     // is correct — and is the single variable this test isolates.
-    let loser = open_edge();
-    let loser_client = edge_client(&loser, &broker, tenant);
-    // The loser is an ESTABLISHED edge: it has pulled before, so it carries a
-    // pull watermark rather than starting from nothing. A cursor that the
-    // refusal then advances past the winner's acceptance is invisible to an
-    // edge whose cursor still sits at zero.
-    within(loser_client.pull_default())
-        .await
-        .expect("the loser establishes its pull cursor before racing");
+    // The loser claims the same key concurrently — it has not seen the
+    // winner's claim, which is what makes this a race.
     claim(&loser, "job-1", "edge-two");
     let refusal = within(loser_client.push())
         .await
@@ -183,6 +187,83 @@ async fn a_refused_pusher_is_served_the_winning_claim_on_its_next_pull() {
         holder(&hub.db, "job-1").as_deref(),
         Some("edge-one"),
         "the refusal leaves the winner in place on the hub"
+    );
+
+    // The refused unit mixes two kinds of member. The claim collides with a
+    // value the hub already accepted, so it reports who won and where that
+    // acceptance sits. The loser's own group row is one the hub has never
+    // seen: nobody won it, so it reports no winner at all and instead names
+    // the claim whose winner refused the unit it belongs to. Inventing a
+    // winner for it would be a lie; dropping it would leave the refusal
+    // silent about a row the pusher still holds.
+    let diagnostics = serde_json::to_value(&refusal.conflicts)
+        .expect("serialize typed refusal diagnostics")
+        .as_array()
+        .cloned()
+        .expect("diagnostics serialize as an ordered array");
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "both members of the refused unit are reported: {diagnostics:?}"
+    );
+    let claim_diagnostic = diagnostics
+        .iter()
+        .find(|entry| entry.get("table") == Some(&json!("work_claims")))
+        .expect("the colliding claim is reported");
+    assert_eq!(
+        claim_diagnostic.get("natural_key"),
+        Some(&json!({ "column": "claim_key", "value": { "Text": "job-1" }, "rest": [] })),
+        "the colliding member is identified by its claim key"
+    );
+    assert!(
+        claim_diagnostic
+            .get("winning_author_node_id")
+            .is_some_and(|author| author.is_string()),
+        "the colliding member names the edge whose claim the hub kept: {claim_diagnostic:?}"
+    );
+    assert!(
+        claim_diagnostic.get("hub_acceptance_position").is_some(),
+        "the colliding member reports where the winner was accepted: {claim_diagnostic:?}"
+    );
+    assert_eq!(
+        claim_diagnostic.get("refusal_cause"),
+        None,
+        "a member with its own winner reports that winner, not a sibling cause"
+    );
+
+    let group_diagnostic = diagnostics
+        .iter()
+        .find(|entry| entry.get("table") == Some(&json!("claim_groups")))
+        .expect("the loser's own group row is reported too");
+    assert_eq!(
+        group_diagnostic.get("natural_key"),
+        Some(&json!({
+            "column": "id",
+            "value": { "Text": "job-1-edge-two-group" },
+            "rest": [],
+        })),
+        "the winnerless member is identified by its own key"
+    );
+    assert_eq!(
+        group_diagnostic.get("winning_author_node_id"),
+        None,
+        "a row no one else ever wrote has no winning author to report: \
+         {group_diagnostic:?}"
+    );
+    assert_eq!(
+        group_diagnostic.get("hub_acceptance_position"),
+        None,
+        "a row the hub never accepted has no acceptance position: \
+         {group_diagnostic:?}"
+    );
+    assert_eq!(
+        group_diagnostic.get("refusal_cause"),
+        Some(&json!({
+            "table": "work_claims",
+            "natural_key": { "column": "claim_key", "value": { "Text": "job-1" }, "rest": [] },
+        })),
+        "the winnerless member names the claim whose winner refused the unit: \
+         {group_diagnostic:?}"
     );
 
     // The loser now pulls. It must be SERVED the winning claim: without it the
