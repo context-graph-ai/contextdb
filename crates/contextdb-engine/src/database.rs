@@ -3262,6 +3262,8 @@ macro_rules! sync_test_seam {
 #[cfg(test)]
 mod ddl_constraint_rendering_tests;
 #[cfg(all(test, feature = "sync-orchestration"))]
+mod dependency_unit_pull_adoption_tests;
+#[cfg(all(test, feature = "sync-orchestration"))]
 mod in_memory_lineage_tests;
 #[cfg(test)]
 mod projected_generation_accepted_delete_replay_tests;
