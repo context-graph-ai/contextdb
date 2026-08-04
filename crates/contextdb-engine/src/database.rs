@@ -1,4 +1,6 @@
-use crate::blob_repository::BlobRepository;
+use crate::blob_repository::BlobRepository;#[cfg(test)]
+mod sync_trigger_vector_epoch_tests;
+
 use crate::composite_store::{
     ApplyPhasePause, ChangeLogEntry, ChangeLogLsnRefcounts, ChangeLogTableIndex, CompositeStore,
     build_received_schema_change_log_entries, publish_prepared_change_log_entries,
