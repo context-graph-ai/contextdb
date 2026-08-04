@@ -28,6 +28,7 @@ explain
 export_snapshot
 force_reset
 get_edge_properties
+graph_change_arrived_by_sync
 guard_row_conditions_in_tx
 has_live_vector
 import_legacy_database

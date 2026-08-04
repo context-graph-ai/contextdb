@@ -11896,7 +11896,23 @@ impl Database {
     pub fn row_change_arrived_by_sync(&self, row: &RowChange) -> bool {
         let _operation = self.assert_open_operation();
         if !row.deleted {
-            return self.row_version_arrived_by_sync(&row.table, &row.natural_key);
+            // The sidecar describes the row's CURRENT version, so it can only
+            // answer for a change that carries that same version. A change at
+            // some other position — a surviving row republished by a later
+            // commit, whose stored version keeps its original one — is not what
+            // the sidecar speaks about. The vector half of the same group
+            // already refuses to answer there (`vector_change_arrived_by_sync`
+            // requires this identical match), and a row and its vectors must be
+            // classified as ONE group: dropping the row while its vector rides
+            // strands that vector at a peer which never received the row it
+            // belongs to.
+            let snapshot = self.snapshot_for_read();
+            let describes_current_version = self
+                .row_id_for_natural_key_full(&row.table, &row.natural_key, snapshot)
+                .and_then(|row_id| self.row_visible_at_snapshot(&row.table, row_id, snapshot))
+                .is_some_and(|current| current.lsn == row.lsn);
+            return describes_current_version
+                && self.row_version_arrived_by_sync(&row.table, &row.natural_key);
         }
         self.sync_tombstone_arrivals
             .read()
