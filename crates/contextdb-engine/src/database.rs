@@ -34336,6 +34336,7 @@ impl Database {
             // first-accepted value. The explicit apply role is the
             // discriminator; declared-direction gating below decides adoption.
             let pull_only_inbound = receipt.is_none()
+                && apply_role == SyncApplyRole::PullLeg
                 && row_meta.as_ref().is_some_and(|meta| {
                     matches!(
                         crate::executor::effective_sync_direction(meta),

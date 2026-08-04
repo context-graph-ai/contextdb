@@ -63,6 +63,43 @@ fn schema_version_value(db: &Database, id: Uuid) -> Option<String> {
     })
 }
 
+fn declare_pull_only_readings(db: &Database) {
+    db.execute(
+        "CREATE TABLE readings (id UUID PRIMARY KEY, body TEXT) SYNC PULL ONLY",
+        &HashMap::new(),
+    )
+    .expect("declare pull-only readings");
+}
+
+fn insert_reading(db: &Database, id: Uuid, body: &str) {
+    db.execute(
+        "INSERT INTO readings (id, body) VALUES ($id, $body)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(id)),
+            ("body".to_string(), Value::Text(body.to_string())),
+        ]),
+    )
+    .expect("insert reading");
+}
+
+fn reading_value(db: &Database, id: Uuid) -> Option<String> {
+    let result = db
+        .execute(
+            "SELECT body FROM readings WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+        )
+        .expect("query reading");
+    let column = result
+        .columns
+        .iter()
+        .position(|name| name == "body")
+        .expect("body column present");
+    result.rows.first().map(|row| match &row[column] {
+        Value::Text(body) => body.clone(),
+        other => panic!("unexpected body value: {other:?}"),
+    })
+}
+
 fn record_count(db: &Database) -> usize {
     db.execute("SELECT id FROM records", &HashMap::new())
         .expect("query records")
@@ -326,5 +363,53 @@ fn keyless_push_cannot_overwrite_the_hub_first_accepted_keep_first_value() {
         conflict.reason.as_deref(),
         Some("keep_first"),
         "a refused push reports the policy that kept the local value, never hub adoption"
+    );
+}
+
+/// The same unidentified pusher against the harsher table class. A
+/// `SYNC PULL ONLY` declaration names the hub as the sole writer, so an
+/// inbound row on that table is normally an authoritative overwrite. That
+/// reasoning only holds for the PULL leg: reached from a push, it would let a
+/// peer that carries no identity at all replace the hub's row unconditionally,
+/// bypassing the table's declared policy entirely.
+#[test]
+fn keyless_push_cannot_overwrite_a_pull_only_table_on_the_hub() {
+    let root = tempfile::tempdir().unwrap();
+    let tenant = TenantId::from("keyless-push-pull-only");
+    let path = root.path().join("hub-pull-only.redb");
+    let hub = Database::open(&path).unwrap();
+    declare_pull_only_readings(&hub);
+
+    let id = Uuid::new_v4();
+    insert_reading(&hub, id, "hub-authoritative");
+
+    let pusher = Database::open_memory();
+    declare_pull_only_readings(&pusher);
+    let author = identity(&root, "pull-only-pusher");
+    let incarnation = pusher
+        .sync_incarnation(&tenant)
+        .expect("pusher incarnation");
+    let before = pusher.current_lsn();
+    insert_reading(&pusher, id, "pushed-divergent-reading");
+    let changes = pusher.changes_since(before);
+    let entries = lineage_entries(&pusher, &changes, &tenant, &author, incarnation);
+
+    hub.apply_authenticated_received_changes_with_lineages_as_hub_push(
+        changes,
+        &HashMap::new(),
+        SyncAdoption::Continuing,
+        None,
+        &tenant,
+        &entries,
+        None,
+        false,
+    )
+    .expect("an unreceiptable push is a handled outcome, not an error");
+
+    assert_eq!(
+        reading_value(&hub, id).as_deref(),
+        Some("hub-authoritative"),
+        "a pull-only declaration makes the HUB the sole writer; a push -- least of all one \
+         carrying no identity -- must never overwrite the hub's own row"
     );
 }
