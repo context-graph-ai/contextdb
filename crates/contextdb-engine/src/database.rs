@@ -56,6 +56,8 @@ macro_rules! sync_test_seam {
 mod authoritative_purge_kernel_tests;
 
 #[cfg(test)]
+mod same_key_replace_apply_tests;
+#[cfg(test)]
 mod authoritative_purge_public_contract_tests;
 
 #[cfg(test)]
