@@ -56,8 +56,6 @@ macro_rules! sync_test_seam {
 mod authoritative_purge_kernel_tests;
 
 #[cfg(test)]
-mod same_key_replace_apply_tests;
-#[cfg(test)]
 mod authoritative_purge_public_contract_tests;
 
 #[cfg(test)]
@@ -3287,6 +3285,8 @@ mod received_schema_atomic_side_effects_tests;
 mod received_schema_bootstrap_echo_tests;
 #[cfg(test)]
 mod retired_generation_refusal_tests;
+#[cfg(test)]
+mod same_key_replace_apply_tests;
 #[cfg(test)]
 mod sync_trigger_vector_epoch_tests;
 
@@ -15903,10 +15903,16 @@ impl Database {
         for pending in pending {
             let row = pending.row;
             let identity = sync_identity_key(&row.table, &row.natural_key);
+            // A live row at the SAME commit position as the obligation is that
+            // commit's replacement of this key: one transaction deleted the old
+            // row and re-inserted the key with fresh content. It is not stale
+            // history to prune ahead of the deletion — it IS what the commit
+            // left behind. Pruning it published the deletion alone, so every
+            // receiver erased a key its author had just rewritten.
             changes.rows.retain(|existing| {
                 existing.deleted
                     || sync_identity_key(&existing.table, &existing.natural_key) != identity
-                    || existing.lsn > row.lsn
+                    || existing.lsn >= row.lsn
             });
             if let Some(local_row_id) = pending.local_row_id {
                 changes.vectors.retain(|vector| {
@@ -15916,12 +15922,24 @@ impl Database {
                         || vector.lsn > row.lsn
                 });
             }
-            if !changes.rows.iter().any(|existing| {
+            // The obligation is discharged by that same-commit replacement:
+            // the key is not gone, it holds new content. Re-adding the delete
+            // beside it would hand a receiver a deletion and an insertion of
+            // one key at one position, and whichever it applied last would
+            // decide whether the row survived.
+            let replaced_in_the_same_commit = changes.rows.iter().any(|existing| {
+                !existing.deleted
+                    && existing.table == row.table
+                    && existing.natural_key == row.natural_key
+                    && existing.lsn == row.lsn
+            });
+            let already_carries_the_delete = changes.rows.iter().any(|existing| {
                 existing.deleted
                     && existing.table == row.table
                     && existing.natural_key == row.natural_key
                     && existing.lsn == row.lsn
-            }) {
+            });
+            if !replaced_in_the_same_commit && !already_carries_the_delete {
                 changes.rows.push(row);
             }
         }
@@ -32857,6 +32875,12 @@ impl Database {
     sync_test_seam! {
     /// Engine-internal apply primitive. Authenticated orchestration is
     /// co-located in this crate so no downstream feature can reopen it.
+    ///
+    /// It carries no apply role, so it never adopts: a caller that has not
+    /// said which leg it is serving must not be handed the pull leg's
+    /// hub-adoption, which would let a pushed value displace the value already
+    /// held. Every production pull states its role through the sync client's
+    /// own entry point.
     fn apply_changes(
         &self,
         changes: ChangeSet,
@@ -32867,7 +32891,7 @@ impl Database {
             policies,
             &HashMap::new(),
             SyncAdoption::Continuing,
-            SyncApplyRole::PullLeg,
+            SyncApplyRole::HubPushApply,
             None,
             false,
             None,
@@ -32908,7 +32932,7 @@ impl Database {
             policies,
             arrivals,
             adoption,
-            SyncApplyRole::PullLeg,
+            SyncApplyRole::HubPushApply,
             None,
             false,
             None,
