@@ -4,6 +4,7 @@
 
 use contextdb_core::{Lsn, TenantId, Value, VectorIndexRef};
 use contextdb_engine::Database;
+use contextdb_engine::sync_types::NaturalKey;
 use contextdb_server::{
     FabricIdentity, InProcessBroker, SyncClient, SyncServer,
     acceptance_stamped_push_batches_for_test,
@@ -81,20 +82,28 @@ fn assert_exact_mixed_vector_outbound_provenance(db: &Database, since: Lsn) {
         db.vector_change_arrived_by_sync(a_vector),
         "the Pulled A vector is absent from outbound work"
     );
+    // Declared-policy pull-adoption contract (Settled Policy 9 / §3.2): B's
+    // incoming value is the hub-accepted one, so the pull leg ADOPTS it
+    // instead of keeping the edge's own losing value under an AcceptedLocal
+    // repair. B's provenance is therefore Pulled, exactly like A's, and B is
+    // no longer outbound work either.
     assert!(
-        !db.row_change_arrived_by_sync(b_row),
-        "the AcceptedLocal B repair row remains outbound"
+        db.row_change_arrived_by_sync(b_row),
+        "the adopted B row must be classified Pulled, not AcceptedLocal"
     );
     assert!(
-        !db.vector_change_arrived_by_sync(b_vector),
-        "the AcceptedLocal B repair vector remains outbound"
+        db.vector_change_arrived_by_sync(b_vector),
+        "the adopted B vector must be classified Pulled, not AcceptedLocal"
     );
 }
 
 /// One sync commit can contain a newly pulled vector owner and a different
-/// owner whose incoming value KEEP FIRST refuses. The retained owner is
-/// re-emitted as AcceptedLocal in that same table and commit. Provenance must
-/// therefore be exact per owner, and the distinction must survive reopen.
+/// owner whose local value diverges under a pull-leg KEEP FIRST table. Per
+/// the declared-policy pull-adoption contract (Settled Policy 9 / §3.2), the
+/// divergent owner is ADOPTED from the hub in that same table and commit,
+/// exactly like the newly pulled owner -- not re-emitted as an AcceptedLocal
+/// repair. Provenance must therefore be exact (both Pulled) per owner, and
+/// the distinction must survive reopen.
 #[tokio::test]
 async fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
     const KEEP_FIRST_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR(3)) SYNC CONFLICT KEEP FIRST";
@@ -165,8 +174,43 @@ async fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
         .pull_default()
         .await
         .expect("pull authenticated mixed source commit");
-    assert_eq!(result.applied_rows, 1, "A is newly pulled");
-    assert_eq!(result.skipped_rows, 1, "B is refused and re-emitted");
+    // Declared-policy pull-adoption contract (Settled Policy 9 / §3.2): on a
+    // pull-leg KEEP FIRST table the hub-accepted value is the one observable
+    // "first" -- B's divergent local value is ADOPTED from the hub rather
+    // than silently kept, alongside A's ordinary new pull.
+    assert_eq!(result.applied_rows, 2, "A is newly pulled and B is adopted");
+    assert_eq!(result.skipped_rows, 0, "adoption is not a refusal");
+    assert_eq!(
+        result.conflicts.len(),
+        1,
+        "exactly one hub-adoption diagnostic for B: {:?}",
+        result.conflicts
+    );
+    assert_eq!(
+        result.conflicts[0].natural_key,
+        NaturalKey::single("id".to_string(), Value::Int64(2)),
+        "the diagnostic must name B's key: {:?}",
+        result.conflicts[0]
+    );
+    assert_eq!(
+        result.conflicts[0].reason.as_deref(),
+        Some("keep_first_hub_adopted"),
+        "the diagnostic must name hub adoption, not a bare refusal: {:?}",
+        result.conflicts[0]
+    );
+    assert_eq!(
+        result.conflicts[0].table.as_deref(),
+        Some("notes"),
+        "{:?}",
+        result.conflicts[0]
+    );
+    assert_eq!(
+        edge.execute("SELECT body FROM notes WHERE id = 2", &empty())
+            .expect("adopted B query")
+            .rows,
+        vec![vec![Value::Text("incoming-b-refused".to_string())]],
+        "B's stored value must become the hub's adopted value, not the edge's own"
+    );
     assert_exact_mixed_vector_outbound_provenance(&edge, edge_before);
 
     drop(client);
