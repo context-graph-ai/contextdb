@@ -233,6 +233,18 @@ pub fn sync_conflict_document(conflict: &Conflict) -> serde_json::Value {
             serde_json::Value::Number(position.0.into()),
         );
     }
+    // A member with nothing of its own to report still says why it was
+    // turned away, so the reader is never left with a bare key and no cause.
+    if let Some(cause) = conflict.refusal_cause.as_ref() {
+        fields.insert(
+            "refusal_cause".to_string(),
+            serde_json::json!({
+                "table": cause.table.clone(),
+                "natural_key": serde_json::to_value(&cause.natural_key)
+                    .expect("natural keys are serializable"),
+            }),
+        );
+    }
     serde_json::Value::Object(fields)
 }
 
@@ -259,6 +271,7 @@ mod sync_conflict_tests {
             mutation_kind: Some("delete".to_string()),
             winning_author_node_id: Some("ab".repeat(32)),
             hub_acceptance_position: Some(Lsn(41)),
+            refusal_cause: None,
         };
 
         assert_eq!(
@@ -284,10 +297,39 @@ mod sync_conflict_tests {
             mutation_kind: Some("purge".to_string()),
             winning_author_node_id: None,
             hub_acceptance_position: None,
+            refusal_cause: None,
         };
 
         let document = sync_conflict_document(&conflict);
         assert!(document.get("winning_author_node_id").is_none());
         assert!(document.get("hub_acceptance_position").is_none());
+    }
+
+    #[test]
+    fn winnerless_document_names_the_row_that_caused_the_refusal() {
+        let conflict = Conflict {
+            natural_key: NaturalKey::single("id".to_string(), Value::Int64(9)),
+            resolution: ConflictPolicy::InsertIfNotExists,
+            reason: Some("dependency_complete_refused".to_string()),
+            table: Some("camera_event_groups".to_string()),
+            mutation_kind: Some("edit".to_string()),
+            winning_author_node_id: None,
+            hub_acceptance_position: None,
+            refusal_cause: Some(crate::sync_types::RefusalCause {
+                table: "camera_events".to_string(),
+                natural_key: NaturalKey::single("id".to_string(), Value::Int64(7)),
+            }),
+        };
+
+        let document = sync_conflict_document(&conflict);
+        assert!(document.get("winning_author_node_id").is_none());
+        assert!(document.get("hub_acceptance_position").is_none());
+        assert_eq!(
+            document.get("refusal_cause"),
+            Some(&serde_json::json!({
+                "table": "camera_events",
+                "natural_key": { "column": "id", "value": { "Int64": 7 }, "rest": [] },
+            }))
+        );
     }
 }

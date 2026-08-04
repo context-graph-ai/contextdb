@@ -53,7 +53,10 @@ fn claim(db: &Database, key: &str, holder: &str) {
         tx,
         "INSERT INTO claim_groups (id, label) VALUES ($id, $label)",
         &HashMap::from([
-            ("id".to_string(), Value::Text(format!("{key}-{holder}-group"))),
+            (
+                "id".to_string(),
+                Value::Text(format!("{key}-{holder}-group")),
+            ),
             ("label".to_string(), Value::Text(holder.to_string())),
         ]),
     )
@@ -64,7 +67,10 @@ fn claim(db: &Database, key: &str, holder: &str) {
          VALUES ($claim_key, $group_id, $holder)",
         &HashMap::from([
             ("claim_key".to_string(), Value::Text(key.to_string())),
-            ("group_id".to_string(), Value::Text(format!("{key}-{holder}-group"))),
+            (
+                "group_id".to_string(),
+                Value::Text(format!("{key}-{holder}-group")),
+            ),
             ("holder".to_string(), Value::Text(holder.to_string())),
         ]),
     )

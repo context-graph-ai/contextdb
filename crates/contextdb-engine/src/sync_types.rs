@@ -1122,6 +1122,14 @@ pub enum SyncAdoption {
 pub(crate) const PURGED_LINEAGE_CONFLICT_REASON: &str = "purged_lineage";
 pub(crate) const REMOVED_GENERATION_CONFLICT_REASON: &str = "removed_generation";
 
+/// The row whose already-accepted value caused a whole connected unit to be
+/// refused, named on a member that has no accepted value of its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefusalCause {
+    pub table: String,
+    pub natural_key: NaturalKey,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conflict {
     pub natural_key: NaturalKey,
@@ -1141,6 +1149,13 @@ pub struct Conflict {
     pub winning_author_node_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub_acceptance_position: Option<Lsn>,
+    /// Set only on a refused member that nobody else ever wrote, so there is
+    /// no accepted value of its own to report. It names the sibling row whose
+    /// accepted value refused the connected unit both belong to. A member that
+    /// does have an accepted value reports that value's author and position
+    /// instead, and never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_cause: Option<RefusalCause>,
 }
 
 // The direction vocabulary lives in `contextdb-core`, next to the `TableMeta`

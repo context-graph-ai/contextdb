@@ -8,7 +8,8 @@ use contextdb_core::{Incarnation, Lsn, Value};
 use contextdb_server::protocol::{
     MessageType, PullRequest, PullResponse, PushRequest, PushResponse, WireApplyResult,
     WireChangeSet, WireConflict, WireDdlChange, WireDdlProvenance, WireNaturalKey, WirePushError,
-    WireRowChange, canonical_ddl_provenance_digest, decode, encode, validate_wire_ddl_provenance,
+    WireRefusalCause, WireRowChange, canonical_ddl_provenance_digest, decode, encode,
+    validate_wire_ddl_provenance,
 };
 use std::collections::HashMap;
 
@@ -21,6 +22,13 @@ use std::collections::HashMap;
 
 fn wire_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex pair"))
+        .collect()
 }
 
 #[test]
@@ -125,9 +133,14 @@ fn filtered_schema_entry_keeps_its_original_nonzero_ordinal() {
 }
 
 const PUSH_REQUEST_WIRE: &str = "9306ab5075736852657175657374dc002ccc92cc96cc90cc90cc91cc98cca174cc93cca26964cc81cca5496e74363407cc90cc81cca26964cc81cca5496e74363407ccc207ccc0ccc0ccc0cc90cc90cc90cc920000";
-const PUSH_RESPONSE_WIRE: &str = "9306ac50757368526573706f6e7365dc0079cc92cc940101cc91cc97cc93cca26964cc81cca5496e74363407cc90ccaa6b6565705f6669727374ccaa6b6565705f6669727374cca56e6f746573cca465646974ccd940616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261622907ccc0";
+const PUSH_RESPONSE_WIRE: &str = "9306ac50757368526573706f6e7365dc007acc92cc940101cc91cc98cc93cca26964cc81cca5496e74363407cc90ccaa6b6565705f6669727374ccaa6b6565705f6669727374cca56e6f746573cca465646974ccd9406162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616229ccc007ccc0";
 const AUTHORITY_ERROR_PUSH_RESPONSE_WIRE: &str = "9306ac50757368526573706f6e7365dc0065cc93ccc0ccc0cc81ccbd50757267655265717569726573417574686f7269746174697665487562cc91ccd94063646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364";
 const GAPPED_CONFLICT_WIRE: &str =
+    "9893a2696481a5496e7436340790aa6b6565705f6669727374a57075726765a56e6f746573a57075726765c029c0";
+const CAUSED_CONFLICT_WIRE: &str = "9893a2696481a5496e7436340990aa6b6565705f6669727374bb646570656e64656e63795f636f6d706c6574655f72656675736564ab6e6f74655f67726f757073a465646974c0c092a56e6f74657393a2696481a5496e7436340790";
+/// The previous seven-slot shape, kept so a peer that predates the named-row
+/// slot is proven to still decode.
+const CONFLICT_WITHOUT_CAUSE_SLOT_WIRE: &str =
     "9793a2696481a5496e7436340790aa6b6565705f6669727374a57075726765a56e6f746573a57075726765c029";
 const PULL_REQUEST_WIRE: &str = "9306ab50756c6c5265717565737495cc922acccd01ccf4";
 const PULL_RESPONSE_WIRE: &str =
@@ -192,6 +205,7 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
                 mutation_kind: Some("edit".to_string()),
                 winning_author_node_id: Some("ab".repeat(32)),
                 hub_acceptance_position: Some(Lsn(41)),
+                refusal_cause: None,
             }],
             new_lsn: Lsn(7),
         }),
@@ -243,11 +257,47 @@ fn sr7_guard_amended_v6_push_and_pull_wire_bytes_are_frozen() {
         mutation_kind: Some("purge".to_string()),
         winning_author_node_id: None,
         hub_acceptance_position: Some(Lsn(41)),
+        refusal_cause: None,
     };
     let gapped_bytes = rmp_serde::to_vec(&gapped_conflict).unwrap();
     assert_eq!(wire_hex(&gapped_bytes), GAPPED_CONFLICT_WIRE);
     let decoded: WireConflict = rmp_serde::from_slice(&gapped_bytes).unwrap();
     assert_eq!(decoded, gapped_conflict);
+
+    // A member refused because a sibling row had already been accepted names
+    // that sibling and reports no author or position of its own. The named
+    // row rides the last slot, so every earlier slot is untouched.
+    let caused_conflict = WireConflict {
+        natural_key: WireNaturalKey {
+            column: "id".to_string(),
+            value: Value::Int64(9),
+            rest: Vec::new(),
+        },
+        resolution: "keep_first".to_string(),
+        reason: Some("dependency_complete_refused".to_string()),
+        table: Some("note_groups".to_string()),
+        mutation_kind: Some("edit".to_string()),
+        winning_author_node_id: None,
+        hub_acceptance_position: None,
+        refusal_cause: Some(WireRefusalCause {
+            table: "notes".to_string(),
+            natural_key: WireNaturalKey {
+                column: "id".to_string(),
+                value: Value::Int64(7),
+                rest: Vec::new(),
+            },
+        }),
+    };
+    let caused_bytes = rmp_serde::to_vec(&caused_conflict).unwrap();
+    assert_eq!(wire_hex(&caused_bytes), CAUSED_CONFLICT_WIRE);
+    let decoded: WireConflict = rmp_serde::from_slice(&caused_bytes).unwrap();
+    assert_eq!(decoded, caused_conflict);
+
+    // A peer that stops at the previous last slot still decodes: the named
+    // row reads as absent rather than shifting an earlier slot's meaning.
+    let without_trailing_slot: WireConflict =
+        rmp_serde::from_slice(&hex_bytes(CONFLICT_WITHOUT_CAUSE_SLOT_WIRE)).unwrap();
+    assert_eq!(without_trailing_slot, gapped_conflict);
 
     // PullRequest.
     let pull_request = PullRequest {

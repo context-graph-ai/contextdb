@@ -1157,9 +1157,22 @@ impl SyncClient {
                     conflict.winning_author_node_id.is_some(),
                     conflict.hub_acceptance_position.is_some(),
                 );
-                match (purged_lineage || removed_generation, winner_fields) {
-                    (true, (false, false)) | (false, (true, true)) => {}
-                    (false, (false, false)) => {
+                // A refused member that names the row which caused its unit
+                // to be turned away is the third honest shape: it has no
+                // accepted value at its own key, so it reports no author and
+                // no position, and reporting one anyway would be a fabricated
+                // winner. It is refused as definitively as its sibling and is
+                // retired with it.
+                let names_cause = conflict.refusal_cause.is_some();
+                match (
+                    purged_lineage || removed_generation,
+                    names_cause,
+                    winner_fields,
+                ) {
+                    (true, false, (false, false))
+                    | (false, false, (true, true))
+                    | (false, true, (false, false)) => {}
+                    (false, false, (false, false)) => {
                         if conflict.table.is_some() || conflict.mutation_kind.is_some() {
                             return Err(Error::SyncError(
                                 "ordinary accounting conflict claims a terminal row".to_string(),

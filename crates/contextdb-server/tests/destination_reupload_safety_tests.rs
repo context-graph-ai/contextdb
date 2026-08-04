@@ -540,6 +540,7 @@ async fn old_hub_reply_finishing_after_move_cannot_restore_its_frontier() {
             mutation_kind: Some("delete".to_string()),
             winning_author_node_id: Some("old-hub-winner".to_string()),
             hub_acceptance_position: Some(row_lsn),
+            refusal_cause: None,
         }],
         response_ready: response_ready.clone(),
         release_response: release_response.clone(),

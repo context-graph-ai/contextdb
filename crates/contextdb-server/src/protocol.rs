@@ -3,7 +3,8 @@ use contextdb_core::{
     CompositeForeignKey, Incarnation, Lsn, RowId, SingleColumnForeignKey, Value, VectorIndexRef,
 };
 use contextdb_engine::sync_types::{
-    ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RowChange, VectorChange,
+    ApplyResult, ChangeSet, Conflict, DdlChange, EdgeChange, NaturalKey, RefusalCause, RowChange,
+    VectorChange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -401,6 +402,36 @@ pub struct WireConflict {
     pub winning_author_node_id: Option<String>,
     #[serde(default)]
     pub hub_acceptance_position: Option<Lsn>,
+    /// Carried only by a refused member that has no accepted value of its
+    /// own, naming the row that caused its whole connected unit to be
+    /// refused. A trailing optional slot: a peer that omits it decodes as
+    /// absent, and every earlier slot keeps its position.
+    #[serde(default)]
+    pub refusal_cause: Option<WireRefusalCause>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WireRefusalCause {
+    pub table: String,
+    pub natural_key: WireNaturalKey,
+}
+
+impl From<RefusalCause> for WireRefusalCause {
+    fn from(value: RefusalCause) -> Self {
+        Self {
+            table: value.table,
+            natural_key: value.natural_key.into(),
+        }
+    }
+}
+
+impl From<WireRefusalCause> for RefusalCause {
+    fn from(value: WireRefusalCause) -> Self {
+        Self {
+            table: value.table,
+            natural_key: value.natural_key.into(),
+        }
+    }
 }
 
 pub fn encode<T: Serialize>(msg_type: MessageType, msg: &T) -> Result<Vec<u8>, SyncError> {
@@ -987,6 +1018,7 @@ impl From<Conflict> for WireConflict {
             mutation_kind: value.mutation_kind,
             winning_author_node_id: value.winning_author_node_id,
             hub_acceptance_position: value.hub_acceptance_position,
+            refusal_cause: value.refusal_cause.map(Into::into),
         }
     }
 }
@@ -1007,6 +1039,7 @@ impl From<WireConflict> for Conflict {
             mutation_kind: value.mutation_kind,
             winning_author_node_id: value.winning_author_node_id,
             hub_acceptance_position: value.hub_acceptance_position,
+            refusal_cause: value.refusal_cause.map(Into::into),
         }
     }
 }

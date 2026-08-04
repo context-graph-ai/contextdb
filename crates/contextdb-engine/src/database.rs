@@ -19,8 +19,9 @@ use crate::rank_formula::{FormulaEvalError, RankFormula};
 use crate::schema_enforcer::validate_dml;
 use crate::sync_types::{
     ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
-    NaturalKey, RowChange, SyncAdoption, SyncDirection, SyncDirectionHistory, VectorChange,
-    natural_key_column_for_meta, natural_key_columns_for_meta, natural_key_from_row_values,
+    NaturalKey, RefusalCause, RowChange, SyncAdoption, SyncDirection, SyncDirectionHistory,
+    VectorChange, natural_key_column_for_meta, natural_key_columns_for_meta,
+    natural_key_from_row_values,
 };
 use contextdb_core::*;
 use contextdb_graph::{GraphStore, MemGraphExecutor, PreparedGraphPublication};
@@ -15271,6 +15272,7 @@ impl Database {
                     mutation_kind: Some(if row.deleted { "delete" } else { "edit" }.to_string()),
                     winning_author_node_id: None,
                     hub_acceptance_position: None,
+                    refusal_cause: None,
                 });
                 continue;
             }
@@ -15410,6 +15412,7 @@ impl Database {
                 mutation_kind: Some(if row.deleted { "delete" } else { "edit" }.to_string()),
                 winning_author_node_id: None,
                 hub_acceptance_position: None,
+                refusal_cause: None,
             });
         }
         Ok(conflicts)
@@ -33733,6 +33736,7 @@ impl Database {
                                     mutation_kind: None,
                                     winning_author_node_id: None,
                                     hub_acceptance_position: None,
+                                    refusal_cause: None,
                                 });
                                 }
                             }
@@ -34577,6 +34581,7 @@ impl Database {
                                     mutation_kind: None,
                                     winning_author_node_id: None,
                                     hub_acceptance_position: None,
+                                    refusal_cause: None,
                                 });
                             }
                             ConflictPolicy::EdgeWins => unreachable!("edge wins always applies"),
@@ -34664,6 +34669,7 @@ impl Database {
                             mutation_kind: None,
                             winning_author_node_id: None,
                             hub_acceptance_position: None,
+                            refusal_cause: None,
                         });
                         result.skipped_rows += 1;
                     } else {
@@ -34906,6 +34912,7 @@ impl Database {
                                 mutation_kind: None,
                                 winning_author_node_id: None,
                                 hub_acceptance_position: None,
+                                refusal_cause: None,
                             });
                             if commit_each_row {
                                 self.commit_with_source(tx, CommitSource::SyncPull)?;
@@ -34950,6 +34957,7 @@ impl Database {
                                 mutation_kind: None,
                                 winning_author_node_id: None,
                                 hub_acceptance_position: None,
+                                refusal_cause: None,
                             });
                             if commit_each_row {
                                 self.commit_with_source(tx, CommitSource::SyncPull)?;
@@ -35062,6 +35070,7 @@ impl Database {
                                 mutation_kind: None,
                                 winning_author_node_id: None,
                                 hub_acceptance_position: None,
+                                refusal_cause: None,
                             });
                         }
                     }
@@ -35143,6 +35152,7 @@ impl Database {
                                         hub_acceptance_position: Self::resolve_incoming_arrival(
                                             &row, arrivals,
                                         ),
+                                        refusal_cause: None,
                                     });
                                 }
                                 if row_has_vector
@@ -35216,6 +35226,7 @@ impl Database {
                             mutation_kind: None,
                             winning_author_node_id: None,
                             hub_acceptance_position: None,
+                            refusal_cause: None,
                         });
                     }
                 }
@@ -35245,6 +35256,7 @@ impl Database {
                         mutation_kind: None,
                         winning_author_node_id: None,
                         hub_acceptance_position: None,
+                        refusal_cause: None,
                     });
                 }
                 (Some(local), ConflictPolicy::LatestWins) => {
@@ -35349,6 +35361,7 @@ impl Database {
                                         mutation_kind: None,
                                         winning_author_node_id: None,
                                         hub_acceptance_position: None,
+                                        refusal_cause: None,
                                     });
                                     if commit_each_row {
                                         self.commit_with_source(tx, CommitSource::SyncPull)?;
@@ -35500,6 +35513,7 @@ impl Database {
                                     mutation_kind: None,
                                     winning_author_node_id: None,
                                     hub_acceptance_position: None,
+                                    refusal_cause: None,
                                 });
                             }
                         }
@@ -35514,6 +35528,7 @@ impl Database {
                         mutation_kind: None,
                         winning_author_node_id: None,
                         hub_acceptance_position: None,
+                        refusal_cause: None,
                     });
                     let committed_source = self
                         .relational_store
@@ -35779,8 +35794,7 @@ impl Database {
                     result.conflicts.iter().any(|conflict| {
                         conflict.table.as_deref() == Some(row.table.as_str())
                             && conflict.natural_key == row.natural_key
-                            && conflict.winning_author_node_id.is_some()
-                            && conflict.hub_acceptance_position.is_some()
+                            && Self::refusal_diagnostic_is_complete(conflict)
                     })
                 });
             if !diagnostics_cover_every_member {
@@ -35813,8 +35827,7 @@ impl Database {
                     result.conflicts.iter().any(|conflict| {
                         conflict.table.as_deref() == Some(row.table.as_str())
                             && conflict.natural_key == row.natural_key
-                            && conflict.winning_author_node_id.is_some()
-                            && conflict.hub_acceptance_position.is_some()
+                            && Self::refusal_diagnostic_is_complete(conflict)
                     })
                 });
             if !diagnostics_cover_every_member {
@@ -36104,6 +36117,25 @@ impl Database {
         self.commit_with_source(tx, CommitSource::SyncPull)
     }
 
+    /// A refused member is fully accounted for one of exactly two ways: it
+    /// reports the accepted value that beat it — who wrote it and where it
+    /// was accepted — or, having no accepted value at its own key, it names
+    /// the row that caused its unit to be refused. Anything less leaves the
+    /// sender unable to explain the outcome, so the push stays resumable
+    /// instead of being retired on a half-told story.
+    fn refusal_diagnostic_is_complete(conflict: &Conflict) -> bool {
+        match conflict.refusal_cause {
+            Some(_) => {
+                conflict.winning_author_node_id.is_none()
+                    && conflict.hub_acceptance_position.is_none()
+            }
+            None => {
+                conflict.winning_author_node_id.is_some()
+                    && conflict.hub_acceptance_position.is_some()
+            }
+        }
+    }
+
     fn dependency_unit_refusal_conflicts(
         &self,
         rows: &[RowChange],
@@ -36136,6 +36168,33 @@ impl Database {
             ordered.push(remaining.remove(selected));
         }
 
+        // A connected unit can mix a member whose key already holds an
+        // accepted value with a member nobody but this sender ever wrote.
+        // Only the first kind has a winner to report. The second kind is
+        // still refused — the unit is decided whole — so it reports the
+        // member that actually caused the refusal instead of inventing an
+        // author and a position it has no basis for. Reading the cause in
+        // the same deterministic parent-first order keeps it stable across
+        // repeats of the same push.
+        let cause = ordered
+            .iter()
+            .find_map(|row| {
+                match self.visible_row_by_natural_key(
+                    &row.table,
+                    &row.natural_key,
+                    snapshot,
+                    &no_deleted,
+                ) {
+                    Ok(Some(_)) => Some(Ok(RefusalCause {
+                        table: row.table.clone(),
+                        natural_key: row.natural_key.clone(),
+                    })),
+                    Ok(None) => None,
+                    Err(err) => Some(Err(err)),
+                }
+            })
+            .transpose()?;
+
         ordered
             .into_iter()
             .map(|row| {
@@ -36150,27 +36209,41 @@ impl Database {
                     snapshot,
                     &no_deleted,
                 )?;
-                let winner_author = match winner.as_ref() {
-                    Some(winner) => {
-                        let accepted_author =
-                            self.accepted_sync_row_author(&row.table, &row.natural_key)?;
-                        match self
-                            .relational_store
-                            .sync_source_kind(&row.table, winner.row_id)
-                        {
-                            Some(contextdb_relational::store::SyncSourceKind::Pulled)
-                            | Some(
-                                contextdb_relational::store::SyncSourceKind::AcceptedLocalPending,
-                            ) => accepted_author,
-                            Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal)
-                            | None => {
-                                accepted_author.or_else(|| hub_local_author.map(str::to_string))
-                            }
+                let Some(winner) = winner else {
+                    // No accepted value at this key, so nothing of this
+                    // member's own to report. Without a cause to name there
+                    // is no honest diagnostic at all, and the caller's
+                    // completeness check keeps the push resumable.
+                    return Ok(cause.clone().map(|cause| Conflict {
+                        hub_acceptance_position: None,
+                        natural_key: row.natural_key.clone(),
+                        resolution: policy,
+                        reason: Some("dependency_complete_refused".to_string()),
+                        table: Some(row.table.clone()),
+                        mutation_kind: Some(
+                            if row.deleted { "delete" } else { "edit" }.to_string(),
+                        ),
+                        winning_author_node_id: None,
+                        refusal_cause: Some(cause),
+                    }));
+                };
+                let winner_author = {
+                    let accepted_author =
+                        self.accepted_sync_row_author(&row.table, &row.natural_key)?;
+                    match self
+                        .relational_store
+                        .sync_source_kind(&row.table, winner.row_id)
+                    {
+                        Some(contextdb_relational::store::SyncSourceKind::Pulled)
+                        | Some(contextdb_relational::store::SyncSourceKind::AcceptedLocalPending) => {
+                            accepted_author
+                        }
+                        Some(contextdb_relational::store::SyncSourceKind::AcceptedLocal) | None => {
+                            accepted_author.or_else(|| hub_local_author.map(str::to_string))
                         }
                     }
-                    None => None,
                 };
-                Ok(winner.map(|winner| Conflict {
+                Ok(Some(Conflict {
                     // A synced winner carries the accepting hub's sidecar;
                     // a hub-local winner's row LSN is already its acceptance
                     // position. Never report the rejected edge's LSN here.
@@ -36185,6 +36258,7 @@ impl Database {
                     table: Some(row.table.clone()),
                     mutation_kind: Some(if row.deleted { "delete" } else { "edit" }.to_string()),
                     winning_author_node_id: winner_author,
+                    refusal_cause: None,
                 }))
             })
             .collect::<Result<Vec<_>>>()
