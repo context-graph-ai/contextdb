@@ -232,10 +232,10 @@ fn divergent_pulled_row_adopts_hub_value_and_reports_the_conflict() {
             "a divergent incoming row under KEEP FIRST is a handled hub adoption, not an error",
         );
 
-    // Product contract (run-B2 intent §3.2): on a table whose declaration
-    // includes a pull leg, KEEP FIRST means the edge ADOPTS the hub-accepted
-    // value on pull -- the edge's losing value is surfaced as a complete
-    // typed diagnostic, never silently kept.
+    // The declared-policy contract: on a table whose declaration includes a
+    // pull leg, KEEP FIRST means the edge ADOPTS the hub-accepted value on
+    // pull -- the edge's losing value is surfaced as a complete typed
+    // diagnostic, never silently kept.
     assert_eq!(
         result.conflicts.len(),
         1,
