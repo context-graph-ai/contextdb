@@ -1195,6 +1195,7 @@ mod received_schema_stage_tests {
                     lineage("origin", 501, 3),
                 )],
                 ReceivedSchemaAdjudicationInputs {
+                    apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
                     receipt: None,
@@ -2427,6 +2428,7 @@ mod received_schema_stage_tests {
                 &received,
                 &lineages,
                 ReceivedSchemaAdjudicationInputs {
+                    apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
                     receipt: Some(receipt(6)),
@@ -2453,6 +2455,7 @@ mod received_schema_stage_tests {
                 &received,
                 &lineages,
                 ReceivedSchemaAdjudicationInputs {
+                    apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
                     receipt: Some(receipt(8)),
@@ -2714,6 +2717,7 @@ mod received_schema_stage_tests {
                     ),
                 ],
                 ReceivedSchemaAdjudicationInputs {
+                    apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
                     receipt: Some(receipt(42)),
@@ -2872,6 +2876,7 @@ mod received_schema_stage_tests {
                     lineage("terminal-author", 503, 3),
                 )],
                 ReceivedSchemaAdjudicationInputs {
+                    apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
                     receipt: Some(receipt(42)),
@@ -2900,6 +2905,7 @@ mod received_schema_stage_tests {
                     lineage("terminal-author", 503, 3),
                 )],
                 ReceivedSchemaAdjudicationInputs {
+                    apply_role: SyncApplyRole::PullLeg,
                     arrivals: &arrivals,
                     adoption: SyncAdoption::Continuing,
                     receipt: Some(receipt(42)),
@@ -3659,9 +3665,20 @@ struct PendingLocalSchemaStage {
 /// conflict/adoption adjudication.  Schema preparation must carry these
 /// unchanged; replacing them with a convenient default can accept a row that
 /// the real authenticated apply would refuse.
+/// Which leg of sync an apply is serving. An absent receipt does NOT identify
+/// the pull leg on its own: a hub applies a push from an unidentified peer
+/// receipt-less too, and there the local value is the first-accepted one that
+/// KEEP FIRST exists to protect. Only the pull leg adopts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncApplyRole {
+    PullLeg,
+    HubPushApply,
+}
+
 struct ReceivedSchemaAdjudicationInputs<'a> {
     arrivals: &'a HashMap<Lsn, Option<Lsn>>,
     adoption: SyncAdoption,
+    apply_role: SyncApplyRole,
     receipt: Option<SyncApplyReceipt>,
     dependency_complete: bool,
     terminal_refusal_context: Option<&'a TerminalRefusalPullContext>,
@@ -13225,6 +13242,7 @@ impl Database {
             received,
             validated_lineages,
             ReceivedSchemaAdjudicationInputs {
+                apply_role: SyncApplyRole::PullLeg,
                 arrivals: &arrivals,
                 adoption: SyncAdoption::Continuing,
                 receipt: None,
@@ -13287,6 +13305,7 @@ impl Database {
             &detached_policies,
             inputs.arrivals,
             inputs.adoption,
+            inputs.apply_role,
             inputs.receipt.clone(),
             inputs.dependency_complete,
             inputs.terminal_refusal_context,
@@ -13750,6 +13769,7 @@ impl Database {
         validated_lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
+        apply_role: SyncApplyRole,
         receipt: Option<SyncApplyReceipt>,
         dependency_complete: bool,
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
@@ -13790,6 +13810,7 @@ impl Database {
                         received,
                         validated_lineages,
                         ReceivedSchemaAdjudicationInputs {
+                            apply_role,
                             arrivals,
                             adoption,
                             receipt: receipt.clone(),
@@ -13869,6 +13890,7 @@ impl Database {
             validated_lineages,
             arrivals,
             SyncAdoption::Continuing,
+            SyncApplyRole::PullLeg,
             receipt,
             dependency_complete,
             None,
@@ -32826,6 +32848,7 @@ impl Database {
             policies,
             &HashMap::new(),
             SyncAdoption::Continuing,
+            SyncApplyRole::PullLeg,
             None,
             false,
             None,
@@ -32866,6 +32889,7 @@ impl Database {
             policies,
             arrivals,
             adoption,
+            SyncApplyRole::PullLeg,
             None,
             false,
             None,
@@ -32878,9 +32902,44 @@ impl Database {
     }
     }
 
+    /// The hub applying a pushed unit it cannot receipt — an unidentified peer
+    /// carries no node identity to receipt against. It is still a PUSH: the
+    /// value already here is the first-accepted one, so KEEP FIRST keeps it and
+    /// the pushed value is refused, exactly as a receipted push would be.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_authenticated_received_changes_with_lineages_as_hub_push(
+        &self,
+        changes: ChangeSet,
+        arrivals: &HashMap<Lsn, Option<Lsn>>,
+        adoption: SyncAdoption,
+        terminal_refusal_context: Option<&TerminalRefusalPullContext>,
+        tenant_id: &TenantId,
+        lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
+        received_ddl: Option<&crate::protocol::ReceivedDdlContext>,
+        dependency_complete: bool,
+    ) -> Result<ApplyResult> {
+        self.apply_authenticated_received_changes_with_lineages_impl(
+            changes,
+            arrivals,
+            adoption,
+            SyncApplyRole::HubPushApply,
+            terminal_refusal_context,
+            tenant_id,
+            lineages,
+            received_ddl,
+            dependency_complete,
+            false,
+        )
+    }
+
     /// Authenticated wire DDL carries a transport-validated source context.
     /// Keep that context private to the orchestration path: raw/test apply
     /// calls never gain authority to manufacture received schema provenance.
+    ///
+    /// The pull-leg role of the authenticated apply, exercised directly by
+    /// this crate's test harness; production pulls travel the sync client's
+    /// ordinary apply path.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_authenticated_received_changes_with_lineages(
         &self,
@@ -32897,6 +32956,7 @@ impl Database {
             changes,
             arrivals,
             adoption,
+            SyncApplyRole::PullLeg,
             terminal_refusal_context,
             tenant_id,
             lineages,
@@ -32922,6 +32982,7 @@ impl Database {
             changes,
             arrivals,
             adoption,
+            SyncApplyRole::PullLeg,
             terminal_refusal_context,
             tenant_id,
             lineages,
@@ -32937,6 +32998,7 @@ impl Database {
         changes: ChangeSet,
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
+        apply_role: SyncApplyRole,
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
         tenant_id: &TenantId,
         lineages: &[(String, NaturalKey, Lsn, crate::protocol::WireRowLineage)],
@@ -32949,6 +33011,7 @@ impl Database {
             &Self::declared_sync_policies(false),
             arrivals,
             adoption,
+            apply_role,
             None,
             dependency_complete,
             terminal_refusal_context,
@@ -32977,6 +33040,7 @@ impl Database {
                 policies,
                 arrivals,
                 adoption,
+                SyncApplyRole::HubPushApply,
                 Some(receipt.clone()),
                 receipt.dependency_complete,
                 None,
@@ -33033,6 +33097,7 @@ impl Database {
             &Self::declared_sync_policies(true),
             arrivals,
             adoption,
+            SyncApplyRole::HubPushApply,
             Some(receipt.clone()),
             receipt.dependency_complete,
             None,
@@ -33123,6 +33188,7 @@ impl Database {
         policies: &ConflictPolicies,
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
+        apply_role: SyncApplyRole,
         receipt: Option<SyncApplyReceipt>,
         dependency_complete: bool,
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
@@ -33232,6 +33298,7 @@ impl Database {
                     lineages,
                     arrivals,
                     adoption,
+                    apply_role,
                     receipt,
                     dependency_complete,
                     terminal_refusal_context,
@@ -33312,6 +33379,7 @@ impl Database {
                     policies,
                     arrivals,
                     adoption,
+                    apply_role,
                     None,
                     false,
                     terminal_refusal_context,
@@ -33339,6 +33407,7 @@ impl Database {
             policies,
             arrivals,
             adoption,
+            apply_role,
             receipt,
             dependency_complete,
             terminal_refusal_context,
@@ -33519,6 +33588,7 @@ impl Database {
         policies: &ConflictPolicies,
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
+        apply_role: SyncApplyRole,
         receipt: Option<SyncApplyReceipt>,
         dependency_complete: bool,
         terminal_refusal_context: Option<&TerminalRefusalPullContext>,
@@ -34260,6 +34330,11 @@ impl Database {
             let row_meta = cached_table_meta(self, &mut table_meta_cache, &row.table);
             let mut policy =
                 Self::sync_conflict_policy_for_table(policies, row_meta.as_ref(), &row.table);
+            // A missing receipt is NOT proof of a pull: the hub's keyless
+            // push also applies receipt-less, and letting it adopt would hand
+            // an unidentified pusher the power to overwrite the hub's
+            // first-accepted value. The explicit apply role is the
+            // discriminator; declared-direction gating below decides adoption.
             let pull_only_inbound = receipt.is_none()
                 && row_meta.as_ref().is_some_and(|meta| {
                     matches!(
@@ -34273,6 +34348,19 @@ impl Database {
                 // state regardless of the table's ordinary two-way policy.
                 policy = ConflictPolicy::EdgeWins;
             }
+            // KEEP FIRST names the value the fleet accepted first. Arriving
+            // over a declared pull leg, that is the hub's, so the edge adopts
+            // it and reports the value it gave up. A declaration with NO pull
+            // leg — push-only, or sync off — never adopts: there the local
+            // value is terminal and an inbound row is refused as before.
+            let inbound_over_declared_pull_leg = receipt.is_none()
+                && apply_role == SyncApplyRole::PullLeg
+                && row_meta.as_ref().is_some_and(|meta| {
+                    matches!(
+                        crate::executor::effective_sync_direction(meta),
+                        SyncDirection::Pull | SyncDirection::Both
+                    )
+                });
 
             let row_has_vector = row_meta.as_ref().is_some_and(|meta| {
                 meta.columns
@@ -34935,6 +35023,124 @@ impl Database {
                     }
                 }
                 (Some(local), ConflictPolicy::InsertIfNotExists) => {
+                    // The pull leg adopts the hub-accepted value; the local
+                    // value it displaces is reported, never dropped silently.
+                    // This is not special to a connected unit — the same
+                    // resolution applies to every pulled row on a table that
+                    // declares a pull leg. Refusing instead would leave a unit
+                    // member disagreeing with the siblings committing beside
+                    // it, and would strand an edge holding any divergent
+                    // structural row: it could never restore.
+                    let mut adoption_refused_by_row = false;
+                    if inbound_over_declared_pull_leg {
+                        for value in values.values() {
+                            if let Value::TxId(incoming) = value
+                                && let Err(err) =
+                                    self.tx_mgr.advance_for_sync(tx, &row.table, *incoming)
+                            {
+                                let _ = self.rollback(tx);
+                                return Err(err);
+                            }
+                        }
+                        match self.upsert_row_for_sync(
+                            tx,
+                            &row.table,
+                            &row.natural_key,
+                            values.clone(),
+                            row.created_at,
+                        ) {
+                            Ok(upsert_result) => {
+                                if !matches!(upsert_result, UpsertResult::NoOp) {
+                                    if let Err(err) = self.set_sync_row_source_lsn(
+                                        tx,
+                                        &row.table,
+                                        local.row_id,
+                                        Self::resolve_incoming_arrival(&row, arrivals)
+                                            .unwrap_or(SYNC_SOURCE_LSN_OWN_COMMIT),
+                                    ) {
+                                        let _ = self.rollback(tx);
+                                        return Err(err);
+                                    }
+                                    applied_deleted_committed_row_ids
+                                        .entry(row.table.clone())
+                                        .or_default()
+                                        .insert(local.row_id);
+                                    upsert_cached_projection(
+                                        &mut applied_rows_cache,
+                                        &row.table,
+                                        local.row_id,
+                                        values.clone(),
+                                        row.lsn,
+                                    );
+                                    accepted_authenticated_rows.push(row.clone());
+                                    result.applied_rows += 1;
+                                    // The adopted value replaced a local one, so
+                                    // the resolution is reported rather than
+                                    // applied silently. The winner is the
+                                    // authenticated author of the row just
+                                    // adopted, and its hub position is that
+                                    // row's established arrival.
+                                    result.conflicts.push(Conflict {
+                                        natural_key: row.natural_key.clone(),
+                                        resolution: ConflictPolicy::InsertIfNotExists,
+                                        reason: Some("keep_first_hub_adopted".to_string()),
+                                        table: Some(row.table.clone()),
+                                        mutation_kind: Some("edit".to_string()),
+                                        winning_author_node_id: lineages
+                                            .iter()
+                                            .find(|(table, key, lsn, _)| {
+                                                table == &row.table
+                                                    && key == &row.natural_key
+                                                    && *lsn == row.lsn
+                                            })
+                                            .map(|(_, _, _, lineage)| {
+                                                lineage.author_node_id.clone()
+                                            }),
+                                        hub_acceptance_position: Self::resolve_incoming_arrival(
+                                            &row, arrivals,
+                                        ),
+                                    });
+                                }
+                                if row_has_vector
+                                    && next_vector_row_group_matches(
+                                        &changes.vectors,
+                                        vector_row_idx,
+                                        &row,
+                                    )
+                                {
+                                    consume_vector_row_group(
+                                        &changes.vectors,
+                                        &mut vector_row_idx,
+                                        local.row_id,
+                                        &mut vector_row_map,
+                                    );
+                                }
+                            }
+                            Err(err) if is_fatal_sync_apply_error(&err) => {
+                                // A genuine apply failure, unlike a per-row
+                                // resolution, still fails the whole unit.
+                                let _ = self.rollback(tx);
+                                return Err(err);
+                            }
+                            Err(_) => {
+                                // The row itself refuses the adopted value —
+                                // an immutable column the incoming value would
+                                // rewrite is the standing case. That is a
+                                // refusal of THIS row, not of the apply that
+                                // carried it, so it falls through to the
+                                // ordinary refusal handling below: the local
+                                // value stands, counted and reported.
+                                adoption_refused_by_row = true;
+                            }
+                        }
+                        if !adoption_refused_by_row {
+                            if commit_each_row {
+                                self.commit_with_source(tx, CommitSource::SyncPull)?;
+                                tx = self.begin()?;
+                            }
+                            continue;
+                        }
+                    }
                     if row_has_vector
                         && next_vector_row_group_matches(&changes.vectors, vector_row_idx, &row)
                     {
@@ -35503,41 +35709,46 @@ impl Database {
         // transaction back before the hub can expose any connected parent or
         // sibling. Apply, constraint, and storage failures returned above stay
         // transient instead of being recast as arbitration.
-        if atomic_receipt && !semantic_refused_rows.is_empty() {
+        // Only the hub decides a connected unit as one acceptance. On the pull
+        // side there is no acceptance to withhold — the unit already IS the
+        // hub's authoritative content — so a member the local policy resolved
+        // is reported through its conflict diagnostic and the unit commits.
+        // Failing here instead left an edge unable to restore at all whenever
+        // it held one divergent row. Genuine apply, constraint, and storage
+        // failures still return above, before this point.
+        if atomic_receipt
+            && let Some(receipt) = receipt.as_ref()
+            && !semantic_refused_rows.is_empty()
+        {
             let _ = self.rollback(tx);
             // A semantic refusal is definitive, unlike a transport failure:
             // none of the member mutations survive, but the authenticated
             // edge receipt must survive so this source unit is never resent.
-            if let Some(receipt) = receipt.as_ref() {
-                result.conflicts = self.dependency_unit_refusal_conflicts(
-                    &dependency_unit_rows,
-                    policies,
-                    hub_local_author,
-                )?;
-                let diagnostics_cover_every_member = result.conflicts.len()
-                    == dependency_unit_rows.len()
-                    && dependency_unit_rows.iter().all(|row| {
-                        result.conflicts.iter().any(|conflict| {
-                            conflict.table.as_deref() == Some(row.table.as_str())
-                                && conflict.natural_key == row.natural_key
-                                && conflict.winning_author_node_id.is_some()
-                                && conflict.hub_acceptance_position.is_some()
-                        })
-                    });
-                if !diagnostics_cover_every_member {
-                    return Err(Error::SyncError(
-                        "dependency-unit refusal lacked complete winner diagnostics".to_string(),
-                    ));
-                }
-                self.commit_sync_apply_receipt_only(receipt)?;
-                result.applied_rows = 0;
-                result.skipped_rows = dependency_unit_row_count;
-                result.new_lsn = self.current_lsn();
-                return Ok(result);
+            result.conflicts = self.dependency_unit_refusal_conflicts(
+                &dependency_unit_rows,
+                policies,
+                hub_local_author,
+            )?;
+            let diagnostics_cover_every_member = result.conflicts.len()
+                == dependency_unit_rows.len()
+                && dependency_unit_rows.iter().all(|row| {
+                    result.conflicts.iter().any(|conflict| {
+                        conflict.table.as_deref() == Some(row.table.as_str())
+                            && conflict.natural_key == row.natural_key
+                            && conflict.winning_author_node_id.is_some()
+                            && conflict.hub_acceptance_position.is_some()
+                    })
+                });
+            if !diagnostics_cover_every_member {
+                return Err(Error::SyncError(
+                    "dependency-unit refusal lacked complete winner diagnostics".to_string(),
+                ));
             }
-            return Err(Error::SyncError(
-                "dependency-complete pull unit was not accepted".to_string(),
-            ));
+            self.commit_sync_apply_receipt_only(receipt)?;
+            result.applied_rows = 0;
+            result.skipped_rows = dependency_unit_row_count;
+            result.new_lsn = self.current_lsn();
+            return Ok(result);
         }
 
         // An ordinary source-LSN group can have both accepted and refused

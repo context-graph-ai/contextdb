@@ -1124,7 +1124,7 @@ async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()
                             received_ddl.as_ref(),
                         )?
                     } else {
-                        db.apply_authenticated_received_changes_with_lineages(
+                        db.apply_authenticated_received_changes_with_lineages_as_hub_push(
                             changeset,
                             &arrivals,
                             SyncAdoption::Continuing,

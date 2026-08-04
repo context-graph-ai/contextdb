@@ -258,3 +258,73 @@ fn dependency_complete_pull_unit_without_disagreement_reports_no_conflict() {
     );
     assert_eq!(result.skipped_rows, 0, "nothing was turned away");
 }
+
+/// A push the hub cannot receipt is still a PUSH. An unidentified peer reaches
+/// `spawn_apply_and_reply`'s receipt-less branch (sync_server.rs) carrying real
+/// rows, so if an absent receipt were read as "this is a pull" that peer could
+/// overwrite the hub's first-accepted value on a KEEP FIRST table — inverting
+/// the one thing KEEP FIRST protects. The hub keeps its value and refuses.
+#[test]
+fn keyless_push_cannot_overwrite_the_hub_first_accepted_keep_first_value() {
+    let root = tempfile::tempdir().unwrap();
+    let tenant = TenantId::from("keyless-push-keep-first");
+    let path = root.path().join("hub.redb");
+    let hub = Database::open(&path).unwrap();
+    declare_connected_keep_first_schema(&hub);
+
+    let schema_id = Uuid::new_v4();
+    insert_schema_version(&hub, schema_id, "hub-first-accepted");
+
+    // The pushed batch, authored on another node so it carries real lineage,
+    // exactly as an unidentified peer's push arrives.
+    let pusher = Database::open_memory();
+    declare_connected_keep_first_schema(&pusher);
+    let author = identity(&root, "keyless-pusher");
+    let incarnation = pusher
+        .sync_incarnation(&tenant)
+        .expect("pusher incarnation");
+    let before = pusher.current_lsn();
+    insert_schema_version(&pusher, schema_id, "pushed-divergent-value");
+    let changes = pusher.changes_since(before);
+    let entries = lineage_entries(&pusher, &changes, &tenant, &author, incarnation);
+
+    let result = hub
+        .apply_authenticated_received_changes_with_lineages_as_hub_push(
+            changes,
+            &HashMap::new(),
+            SyncAdoption::Continuing,
+            None,
+            &tenant,
+            &entries,
+            None,
+            false,
+        )
+        .expect("an unreceiptable push is a handled refusal, not an error");
+
+    assert_eq!(
+        schema_version_value(&hub, schema_id).as_deref(),
+        Some("hub-first-accepted"),
+        "the hub keeps the value it accepted first; an unidentified pusher cannot displace it"
+    );
+    assert_eq!(
+        result.applied_rows, 0,
+        "nothing was written: {:?}",
+        result.conflicts
+    );
+    assert_eq!(
+        result.skipped_rows, 1,
+        "the pushed row is refused and counted, not silently dropped"
+    );
+    let conflict = result
+        .conflicts
+        .iter()
+        .find(|conflict| {
+            conflict.natural_key == NaturalKey::single("id".to_string(), Value::Uuid(schema_id))
+        })
+        .expect("the refusal is reported as a typed diagnostic");
+    assert_eq!(
+        conflict.reason.as_deref(),
+        Some("keep_first"),
+        "a refused push reports the policy that kept the local value, never hub adoption"
+    );
+}
