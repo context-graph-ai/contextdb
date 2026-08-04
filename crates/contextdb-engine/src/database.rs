@@ -3268,6 +3268,8 @@ mod query_trace_rows_examined_contract_tests;
 #[cfg(test)]
 mod received_row_restatement_tests;
 #[cfg(test)]
+mod ddl_constraint_rendering_tests;
+#[cfg(test)]
 mod received_schema_atomic_retry_tests;
 #[cfg(test)]
 mod received_schema_atomic_side_effects_tests;
