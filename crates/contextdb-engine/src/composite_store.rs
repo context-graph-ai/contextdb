@@ -595,6 +595,10 @@ pub(crate) fn sync_source_lsn_updates(
             clear.push((table.clone(), row.row_id));
         }
     }
+    // Marks for rows this write set does not rewrite. They follow the staged
+    // rows so that a row both rewritten and marked in one transaction ends on
+    // the mark, which is the later statement about it.
+    set.extend(ws.sync_source_provenance_marks.iter().cloned());
     (clear, set)
 }
 

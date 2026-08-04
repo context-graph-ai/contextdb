@@ -20,6 +20,13 @@ pub struct WriteSet {
     pub commit_lsn: Option<Lsn>,
     pub relational_insert_source_lsns: HashMap<TableName, HashMap<RowId, Lsn>>,
     pub relational_insert_source_kinds: HashMap<TableName, HashMap<RowId, u8>>,
+    /// Sync provenance for rows this transaction does NOT rewrite. The sidecars
+    /// above ride a staged row version, so they cannot describe a row whose
+    /// stored values are already correct — the case where an incoming row
+    /// restates what is held, and an immutable table forbids rewriting it at
+    /// all. Carrying the mark here keeps that record in the same commit as the
+    /// apply that learned it.
+    pub sync_source_provenance_marks: Vec<(TableName, RowId, Lsn, u8)>,
     /// Engine-owned durable metadata written in the same storage transaction
     /// as this write set. Sync uses this for authenticated applied receipts.
     pub config_writes: Vec<(String, Vec<u8>)>,
@@ -50,6 +57,7 @@ impl WriteSet {
             && self.vector_deletes.is_empty()
             && self.vector_moves.is_empty()
             && self.config_writes.is_empty()
+            && self.sync_source_provenance_marks.is_empty()
             && !self.requires_commit_lsn
     }
 
@@ -167,6 +175,17 @@ impl WriteSet {
             .entry(table)
             .or_default()
             .insert(row_id, kind);
+    }
+
+    pub fn set_sync_source_provenance_mark(
+        &mut self,
+        table: impl Into<TableName>,
+        row_id: RowId,
+        lsn: Lsn,
+        kind: u8,
+    ) {
+        self.sync_source_provenance_marks
+            .push((table.into(), row_id, lsn, kind));
     }
 }
 

@@ -16669,6 +16669,28 @@ impl Database {
         })
     }
 
+    /// Record sync provenance for a row this transaction leaves exactly as it
+    /// stands. The row is not restaged: an immutable table refuses a rewrite,
+    /// and republishing correct values would put a mutation in the change log
+    /// that no peer asked for.
+    fn mark_sync_row_provenance(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+        source_lsn: Lsn,
+        kind: contextdb_relational::store::SyncSourceKind,
+    ) -> Result<()> {
+        let kind = match kind {
+            contextdb_relational::store::SyncSourceKind::Pulled => 0,
+            contextdb_relational::store::SyncSourceKind::AcceptedLocal => 1,
+            contextdb_relational::store::SyncSourceKind::AcceptedLocalPending => 2,
+        };
+        self.tx_mgr.with_write_set(tx, |ws| {
+            ws.set_sync_source_provenance_mark(table.to_string(), row_id, source_lsn, kind);
+        })
+    }
+
     /// Route each row cell through `coerce_value_for_column` for variant
     /// compatibility. The one concession to historical `insert_row` behavior
     /// is that `Value::Vector` payloads are accepted regardless of declared
@@ -34588,13 +34610,28 @@ impl Database {
                 // through sync). Recording it here is what lets a LATER,
                 // genuinely newer arrival be judged against the fleet's own
                 // ordering instead of this node's unrelated local clock.
-                // Never done when the incoming carries no arrival: there is
-                // nothing established to record.
-                if matches!(policy, ConflictPolicy::LatestWins)
-                    && let Some(arrival) = Self::resolve_incoming_arrival(&row, arrivals)
-                    && !confirmed_pending_echo
-                    && let Err(err) =
-                        self.set_sync_row_source_lsn(tx, &row.table, local.row_id, arrival)
+                //
+                // The same record settles the other half: the peer that served
+                // this row demonstrably holds it, so this node no longer owes
+                // it a push. Without the sidecar the row is indistinguishable
+                // from unsent local work and stays outbound forever — the case
+                // a wiped edge hits, where every restored row is local work
+                // this node never pushed. The record rides this apply's own
+                // transaction, so it survives reopen exactly like an
+                // ordinarily applied pulled row's.
+                //
+                // The row itself is left untouched: it already holds the right
+                // values, and the tables this matters most for are immutable,
+                // which forbids rewriting them at all.
+                if !confirmed_pending_echo
+                    && let Err(err) = self.mark_sync_row_provenance(
+                        tx,
+                        &row.table,
+                        local.row_id,
+                        Self::resolve_incoming_arrival(&row, arrivals)
+                            .unwrap_or(SYNC_SOURCE_LSN_OWN_COMMIT),
+                        contextdb_relational::store::SyncSourceKind::Pulled,
+                    )
                 {
                     let _ = self.rollback(tx);
                     return Err(err);
