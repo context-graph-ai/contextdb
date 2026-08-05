@@ -33630,7 +33630,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     fn apply_changes_single_lsn_group(
         &self,
-        changes: ChangeSet,
+        mut changes: ChangeSet,
         policies: &ConflictPolicies,
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
@@ -34348,6 +34348,24 @@ impl Database {
                 right.deleted.cmp(&left.deleted)
             }
         });
+        // A vector that arrived from a peer names its owner by the SENDER's
+        // row number, which addresses that node's storage and not this one's;
+        // the owner is identified here by pairing the vector's group with the
+        // row it was served beside. Such a page can carry groups whose row is
+        // absent from this apply — a re-read of a hub's history serves each
+        // row once at its current version while the vectors it wrote along the
+        // way all arrive. Those groups have no owner this node can name, so
+        // they are set aside and reported as skipped rather than guessed at.
+        //
+        // A locally-applied changeset is the opposite case: its row numbers
+        // are this node's own, so they are used as given.
+        let vectors_carry_sender_row_numbering = stage_verified_lineages;
+        if vectors_carry_sender_row_numbering {
+            let (owned_vectors, unowned_vector_groups) =
+                partition_owned_vector_groups(changes.vectors, &rows);
+            changes.vectors = owned_vectors;
+            result.skipped_rows += unowned_vector_groups;
+        }
         let mut accepted_sync_tombstones = Vec::<AcceptedSyncTombstone>::new();
         let mut terminal_marker_clears = Vec::<(String, NaturalKey)>::new();
         // Only these rows receive terminal diagnostics on an ordinary
@@ -35717,10 +35735,19 @@ impl Database {
             )) {
                 continue; // skip vectors for rows that failed to insert
             }
-            let local_row_id = vector_row_map
-                .get(&vector.row_id)
-                .copied()
-                .unwrap_or(vector.row_id);
+            // Only a row applied (or already held) in this group can name a
+            // received vector's owner. Without that, the sender's row number
+            // is the only thing left, and it addresses that node's storage:
+            // applying it writes an unrelated local row, or aborts the whole
+            // pull on a number this node never issued.
+            let local_row_id = match vector_row_map.get(&vector.row_id).copied() {
+                Some(local_row_id) => local_row_id,
+                None if !vectors_carry_sender_row_numbering => vector.row_id,
+                None => {
+                    result.skipped_rows += 1;
+                    continue;
+                }
+            };
             if vector.vector.is_empty() {
                 if let Err(err) = self.delete_vector(tx, vector.index.clone(), local_row_id) {
                     let _ = self.rollback(tx);
@@ -36764,6 +36791,46 @@ fn projected_sync_rows_by_table(
             .push(row.values.clone());
     }
     by_table
+}
+
+/// Split served vectors into the groups a row in this apply can own, and a
+/// count of the groups no row here can.
+///
+/// Owner pairing is positional: the n-th group carrying a given table, LSN,
+/// and liveness belongs to the n-th row carrying the same. A group beyond
+/// that count belongs to a row this apply does not carry, so it is reported
+/// rather than paired with whatever row happens to sit at the cursor.
+fn partition_owned_vector_groups(
+    vectors: Vec<VectorChange>,
+    rows: &[RowChange],
+) -> (Vec<VectorChange>, usize) {
+    let mut unclaimed_rows: HashMap<(&str, Lsn, bool), usize> = HashMap::new();
+    for row in rows {
+        *unclaimed_rows
+            .entry((row.table.as_str(), row.lsn, row.deleted))
+            .or_insert(0) += 1;
+    }
+    let mut owned = Vec::with_capacity(vectors.len());
+    let mut unowned_groups = 0usize;
+    let mut cursor = 0usize;
+    while cursor < vectors.len() {
+        let end = vector_row_group_end(&vectors, cursor);
+        let group = &vectors[cursor..end];
+        let key = (
+            group[0].index.table.as_str(),
+            group[0].lsn,
+            group[0].vector.is_empty(),
+        );
+        match unclaimed_rows.get_mut(&key) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                owned.extend_from_slice(group);
+            }
+            _ => unowned_groups += 1,
+        }
+        cursor = end;
+    }
+    (owned, unowned_groups)
 }
 
 fn consume_vector_row_group(
