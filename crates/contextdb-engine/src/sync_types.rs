@@ -134,6 +134,18 @@ impl ChangeSet {
         })
     }
 
+    /// The triggers this changeset declares, in wire order.
+    pub fn create_trigger_names(&self) -> Vec<&str> {
+        self.ddl
+            .iter()
+            .filter_map(|ddl| match ddl {
+                DdlChange::CreateTrigger { name, .. }
+                | DdlChange::CreateTriggerIncludingSync { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn split_at_trigger_bootstrap_barriers(self) -> Vec<ChangeSet> {
         let mut batches = Vec::new();
         let mut current = ChangeSet::default();

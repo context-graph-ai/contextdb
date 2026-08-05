@@ -123,9 +123,29 @@ struct AppliedPullPage {
     result: ApplyResult,
     suppressed_live_replay_only: bool,
     has_deliverable_changes: bool,
-    has_create_trigger: bool,
+    awaits_trigger_callback_registration: bool,
     received_items: u64,
     received_payload_bytes: u64,
+}
+
+/// Whether a served page declares a trigger this node has no callback for.
+///
+/// The hub serves such a declaration on a page of its own, and the pull
+/// returns after applying it so the host can register the callback before
+/// any row that fires the trigger arrives — a row applied against an
+/// unregistered trigger fails closed. A page that merely restates a trigger
+/// this node already runs asks nothing of the host, so the pull keeps paging
+/// through it instead of ending the call there; ending on it strands every
+/// later row behind history the caller already has.
+fn page_awaits_trigger_callback_registration(db: &Database, changes: &ChangeSet) -> bool {
+    let declared = changes.create_trigger_names();
+    if declared.is_empty() {
+        return false;
+    }
+    let registered = db.registered_trigger_callbacks();
+    declared
+        .into_iter()
+        .any(|name| !registered.iter().any(|callback| callback == name))
 }
 
 fn malformed_purge_page(detail: impl Into<String>) -> Error {
@@ -1861,7 +1881,8 @@ impl SyncClient {
             let ordinary_has_deliverable_changes = !ordinary.is_empty();
             let ordinary_received_items = ordinary.rows.len() as u64;
             let ordinary_payload_bytes = row_payload_bytes(&ordinary.rows);
-            let ordinary_has_create_trigger = ordinary.has_create_trigger_ddl();
+            let ordinary_awaits_trigger_callback =
+                page_awaits_trigger_callback_registration(db, &ordinary);
             let pending_refresh_rows = (adoption == SyncAdoption::ConfirmedPendingReconciliation)
                 .then(|| ordinary.rows.clone());
             let dependency_units = prepared_dependency_units;
@@ -1873,9 +1894,9 @@ impl SyncClient {
                 .iter()
                 .map(|(_, unit, _, _, _)| row_payload_bytes(&unit.rows))
                 .sum::<u64>();
-            let dependency_has_create_trigger = dependency_units
+            let dependency_awaits_trigger_callback = dependency_units
                 .iter()
-                .any(|(_, unit, _, _, _)| unit.has_create_trigger_ddl());
+                .any(|(_, unit, _, _, _)| page_awaits_trigger_callback_registration(db, unit));
             let dependency_has_deliverable_changes = !dependency_units.is_empty();
             db.preflight_incoming_authoritative_purge_batch_while_authoritative(
                 &authoritative_purges,
@@ -1956,8 +1977,8 @@ impl SyncClient {
                         has_deliverable_changes: ordinary_has_authoritative_purges
                             || ordinary_has_deliverable_changes
                             || dependency_has_deliverable_changes,
-                        has_create_trigger: ordinary_has_create_trigger
-                            || dependency_has_create_trigger,
+                        awaits_trigger_callback_registration: ordinary_awaits_trigger_callback
+                            || dependency_awaits_trigger_callback,
                         received_items: ordinary_received_items + dependency_received_items,
                         received_payload_bytes: ordinary_payload_bytes
                             + dependency_payload_bytes,
@@ -1970,7 +1991,8 @@ impl SyncClient {
             // would pair an items figure with a payload figure drawn from two
             // different sets, so a pull with skipped rows would report bytes for
             // rows its own item count denied.
-            let stop_for_trigger_bootstrap = has_more && applied_page.has_create_trigger;
+            let stop_for_trigger_bootstrap =
+                has_more && applied_page.awaits_trigger_callback_registration;
             self.receipts.record(
                 hub.as_deref(),
                 TransferPlane::Sync,
