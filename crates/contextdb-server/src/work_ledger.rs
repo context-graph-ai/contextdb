@@ -227,8 +227,10 @@ pub enum PollOutcome {
 /// arbitration verdict: a clean reply means the hub filed this claim row; a
 /// conflict naming this claim's key means someone else already holds it —
 /// the claim is then re-read after a pull, which also reconciles the losing
-/// local row to the hub's winner. An unreachable hub degrades to a
-/// locally-held claim (`Won { synced: false }`).
+/// local row to the hub's winner. A reconcile pull that fails leaves that
+/// re-read with nothing to stand on, so the refused claim is reported
+/// `Lost { holder: None }` — never as a win this node cannot show it holds.
+/// An unreachable hub degrades to a locally-held claim (`Won { synced: false }`).
 pub async fn claim_job(
     client: &SyncClient,
     job_id: &str,
@@ -267,7 +269,20 @@ pub async fn claim_job(
             // to the hub's winner, then read who actually holds it — the
             // refusal alone cannot distinguish "someone else won" from "my
             // own earlier win was re-delivered".
-            let _ = client.pull_default().await;
+            if let Err(err) = client.pull_default().await {
+                // The refusal already established that some claim row holds
+                // this key; only the pull could have shown that row is this
+                // node's own re-delivered win. Without it the local row is
+                // just what this node wrote before being refused, so it is no
+                // evidence of a win, and the holder cannot be named.
+                tracing::warn!(
+                    job_id,
+                    attempt,
+                    error = %err,
+                    "claim reconciliation pull failed; the refused claim is reported lost with no named holder"
+                );
+                return Ok(ClaimOutcome::Lost { holder: None });
+            }
             match ledger::claim_holder(client.db(), job_id, attempt)? {
                 Some(holder) if holder == node_id => Ok(ClaimOutcome::Won { synced: true }),
                 holder => Ok(ClaimOutcome::Lost { holder }),
