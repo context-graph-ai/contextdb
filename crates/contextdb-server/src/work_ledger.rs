@@ -47,7 +47,12 @@ pub const WORK_NODE_CONTACTS_TABLE: &str = "work_node_contacts";
 // CURRENT ONLY` alongside it is the `SYNC OFF` carve-out of the delivery
 // hazard `refuse_reclaimed_history_under_keep_first` guards: a table that
 // never leaves this machine has no puller to hand a stale value to.
-const CREATE_WORK_NODE_CONTACTS: &str = "CREATE TABLE work_node_contacts (\
+/// `pub` (not `pub(crate)`) so a `contextdb-engine`-side drift test can
+/// assert this stays byte-identical to the engine's own hand-duplicated
+/// copy (`contextdb_engine::executor::ENGINE_OWNED_WORK_NODE_CONTACTS_CREATE_DDL`
+/// -- see that constant's doc comment for why the duplication exists at
+/// all).
+pub const CREATE_WORK_NODE_CONTACTS: &str = "CREATE TABLE work_node_contacts (\
      node_id TEXT PRIMARY KEY, \
      last_contact_ms TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC OFF";
 

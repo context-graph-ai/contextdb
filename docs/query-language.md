@@ -273,6 +273,8 @@ SET DISK_LIMIT 'none';
 SHOW DISK_LIMIT;
 ```
 
+`SHOW SYNC_CONFLICT_POLICY` returns one `policy` column: a first row giving the bare deployment default (`keep_first`), then one `{table}={word}` row per table that declares a conflict policy, plus one such row for each built-in work-ledger table (and `peer_directory`) currently present in the store, suffixed `(engine-owned)` to distinguish it from an operator-declared row.
+
 `SHOW MEMORY_LIMIT` returns `limit`, `used`, `available`, and `startup_ceiling`.
 
 `SHOW DISK_LIMIT` returns the same columns for file-backed storage. On `:memory:` databases, disk limit commands are accepted but ignored.

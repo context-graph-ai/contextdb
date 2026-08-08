@@ -1110,7 +1110,7 @@ fn contains_exact_cli_conflict(
         JsonValue::Object(values) => {
             let natural_key = values.get("natural_key");
             let exact = values.get("reason").and_then(JsonValue::as_str)
-                == Some("dependency_complete_refused")
+                == Some("keep_first_refused")
                 && values.get("table").and_then(JsonValue::as_str) == Some("notes")
                 && values.get("mutation_kind").and_then(JsonValue::as_str) == Some(mutation_kind)
                 && values

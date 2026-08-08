@@ -11,7 +11,7 @@ use std::collections::HashMap;
 // `register_peer_ticket`'s upsert and `peer_directory_conflict_policy_entries`
 // below) — a current-truth registry, so it declares its own version-cleanup
 // eligibility in its own DDL rather than riding a hardcoded table-name list.
-const CREATE_PEER_DIRECTORY: &str = "CREATE TABLE peer_directory (\
+pub(crate) const CREATE_PEER_DIRECTORY: &str = "CREATE TABLE peer_directory (\
      node_id TEXT PRIMARY KEY, \
      ticket TEXT NOT NULL, \
      enrolled_at TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
@@ -50,6 +50,24 @@ pub fn install_peer_directory_schema(db: &Database) -> Result<()> {
 /// row fabric-wide, mirroring the row-level upsert this module does locally.
 pub(crate) fn peer_directory_conflict_policy_entries() -> [(&'static str, ConflictPolicy); 1] {
     [("peer_directory", ConflictPolicy::LatestWins)]
+}
+
+/// `peer_directory`'s entry above, in `SHOW SYNC_CONFLICT_POLICY` display
+/// vocabulary -- reuses
+/// [`crate::work_ledger::conflict_policy_display_word`] (the same
+/// word-mapping the seven work-ledger tables' engine-owned rows use), so
+/// `keep_first`/`keep_latest` are spelled identically everywhere `SHOW`
+/// renders an engine-owned row, from one source of truth.
+pub(crate) fn peer_directory_conflict_policy_display() -> Vec<(&'static str, &'static str)> {
+    peer_directory_conflict_policy_entries()
+        .into_iter()
+        .map(|(table, policy)| {
+            (
+                table,
+                crate::work_ledger::conflict_policy_display_word(policy),
+            )
+        })
+        .collect()
 }
 
 /// Merge `peer_directory`'s policy over `policies`. Sync chokepoints call

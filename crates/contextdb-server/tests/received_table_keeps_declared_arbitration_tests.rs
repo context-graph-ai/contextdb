@@ -25,7 +25,7 @@ use std::time::Duration;
 
 /// Declared exactly as the engine-owned work-fabric tables are: two-way sync,
 /// keep the first accepted value, identity on a column-level primary key.
-const DDL: &str = "CREATE TABLE work_claims (claim_key TEXT PRIMARY KEY, holder TEXT) \
+const DDL: &str = "CREATE TABLE relay_claims (claim_key TEXT PRIMARY KEY, holder TEXT) \
      SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
 fn p() -> HashMap<String, Value> {
@@ -40,7 +40,7 @@ async fn within<F: std::future::Future>(fut: F) -> F::Output {
 
 fn claim(db: &Database, key: &str, holder: &str) {
     db.execute(
-        "INSERT INTO work_claims (claim_key, holder) VALUES ($claim_key, $holder)",
+        "INSERT INTO relay_claims (claim_key, holder) VALUES ($claim_key, $holder)",
         &HashMap::from([
             ("claim_key".to_string(), Value::Text(key.to_string())),
             ("holder".to_string(), Value::Text(holder.to_string())),
@@ -52,7 +52,7 @@ fn claim(db: &Database, key: &str, holder: &str) {
 fn holder(db: &Database, key: &str) -> Option<String> {
     let result = db
         .execute(
-            "SELECT holder FROM work_claims WHERE claim_key = $claim_key",
+            "SELECT holder FROM relay_claims WHERE claim_key = $claim_key",
             &HashMap::from([("claim_key".to_string(), Value::Text(key.to_string()))]),
         )
         .expect("claim scan");
@@ -115,7 +115,7 @@ fn start_hub(broker: &InProcessBroker, tenant: &str) -> RunningHub {
 }
 
 /// An edge that has NEVER been told about this table locally. Everything it
-/// knows about `work_claims` it learns from the hub.
+/// knows about `relay_claims` it learns from the hub.
 fn open_undeclared_edge() -> Arc<Database> {
     Arc::new(Database::open_memory())
 }
@@ -154,7 +154,7 @@ async fn a_table_learned_by_sync_carries_its_authors_declared_arbitration_and_ke
     assert!(
         declared_policies(&edge)
             .iter()
-            .any(|policy| policy == "work_claims=keep_first"),
+            .any(|policy| policy == "relay_claims=keep_first"),
         "a table learned by sync must report the arbitration its author \
          declared; got {:?}",
         declared_policies(&edge)
@@ -163,8 +163,8 @@ async fn a_table_learned_by_sync_carries_its_authors_declared_arbitration_and_ke
     // And the identity that arbitration resolves against: the receiver must
     // agree with the author about which column names a row, or it cannot tell
     // a same-key disagreement from two unrelated rows.
-    let hub_meta = hub.db.table_meta("work_claims").expect("hub table meta");
-    let edge_meta = edge.table_meta("work_claims").expect("edge table meta");
+    let hub_meta = hub.db.table_meta("relay_claims").expect("hub table meta");
+    let edge_meta = edge.table_meta("relay_claims").expect("edge table meta");
     assert_eq!(
         edge_meta.conflict_policy, hub_meta.conflict_policy,
         "the receiver's arbitration must be the author's"

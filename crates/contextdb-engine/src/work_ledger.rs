@@ -55,7 +55,7 @@ pub const REF_KIND_LOCAL_PATH: &str = "local_path";
 /// Nothing in this module resolves it.
 pub const REF_KIND_BLOB_REF: &str = "blob_ref";
 
-const CREATE_WORK_JOBS: &str = "CREATE TABLE work_jobs (\
+pub(crate) const CREATE_WORK_JOBS: &str = "CREATE TABLE work_jobs (\
      job_id TEXT PRIMARY KEY, \
      work_class TEXT NOT NULL, \
      mode TEXT NOT NULL, \
@@ -69,7 +69,7 @@ const CREATE_WORK_JOBS: &str = "CREATE TABLE work_jobs (\
      provenance JSON, \
      submitted_at TIMESTAMP NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
-const CREATE_WORK_CLAIMS: &str = "CREATE TABLE work_claims (\
+pub(crate) const CREATE_WORK_CLAIMS: &str = "CREATE TABLE work_claims (\
      claim_key TEXT PRIMARY KEY, \
      job_id TEXT NOT NULL, \
      attempt INTEGER NOT NULL, \
@@ -77,7 +77,7 @@ const CREATE_WORK_CLAIMS: &str = "CREATE TABLE work_claims (\
      lease_deadline TIMESTAMP NOT NULL, \
      claimed_at TIMESTAMP NOT NULL) SYNC TWO WAY";
 
-const CREATE_WORK_RESULTS: &str = "CREATE TABLE work_results (\
+pub(crate) const CREATE_WORK_RESULTS: &str = "CREATE TABLE work_results (\
      job_id TEXT PRIMARY KEY, \
      attempt INTEGER NOT NULL, \
      executor_node_id TEXT NOT NULL, \
@@ -85,7 +85,7 @@ const CREATE_WORK_RESULTS: &str = "CREATE TABLE work_results (\
      receipt JSON NOT NULL, \
      completed_at TIMESTAMP NOT NULL) SYNC TWO WAY";
 
-const CREATE_WORK_FAILURES: &str = "CREATE TABLE work_failures (\
+pub(crate) const CREATE_WORK_FAILURES: &str = "CREATE TABLE work_failures (\
      failure_key TEXT PRIMARY KEY, \
      job_id TEXT NOT NULL, \
      attempt INTEGER NOT NULL, \
@@ -93,7 +93,7 @@ const CREATE_WORK_FAILURES: &str = "CREATE TABLE work_failures (\
      error TEXT NOT NULL, \
      failed_at TIMESTAMP NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
-const CREATE_WORK_CANCELLATIONS: &str = "CREATE TABLE work_cancellations (\
+pub(crate) const CREATE_WORK_CANCELLATIONS: &str = "CREATE TABLE work_cancellations (\
      job_id TEXT PRIMARY KEY, \
      requested_by TEXT NOT NULL, \
      reason TEXT, \
@@ -108,7 +108,7 @@ const CREATE_WORK_CANCELLATIONS: &str = "CREATE TABLE work_cancellations (\
 // all) into a reachable production path -- `materialize_inputs` must be
 // taught to distinguish the two and return `Error::WorkInputExpired` rather
 // than an empty `ExecutionInputs`.
-const CREATE_WORK_INPUTS: &str = "CREATE TABLE work_inputs (\
+pub(crate) const CREATE_WORK_INPUTS: &str = "CREATE TABLE work_inputs (\
      input_key TEXT PRIMARY KEY, \
      job_id TEXT NOT NULL, \
      seq INTEGER NOT NULL, \
@@ -121,7 +121,7 @@ const CREATE_WORK_INPUTS: &str = "CREATE TABLE work_inputs (\
 // `SYNC CONFLICT KEEP LATEST` it already gets programmatically (see
 // `work_ledger_conflict_policy_entries` below) is declared here too, so the
 // stored meta and the runtime arbitration agree and `.schema` is honest.
-const CREATE_WORK_CAPABILITIES: &str = "CREATE TABLE work_capabilities (\
+pub(crate) const CREATE_WORK_CAPABILITIES: &str = "CREATE TABLE work_capabilities (\
      capability_key TEXT PRIMARY KEY, \
      node_id TEXT NOT NULL, \
      capability_id TEXT NOT NULL, \
@@ -787,6 +787,51 @@ fn work_ledger_conflict_policy_entries_inner() -> [(&'static str, ConflictPolicy
 #[cfg(feature = "test-seams")]
 pub fn work_ledger_conflict_policy_entries() -> [(&'static str, ConflictPolicy); 7] {
     work_ledger_conflict_policy_entries_inner()
+}
+
+/// All seven work-ledger tables' real arbitration in `SHOW
+/// SYNC_CONFLICT_POLICY` display vocabulary, for two callers: `SHOW
+/// SYNC_CONFLICT_POLICY` itself (rendering every one of the seven "(engine-
+/// owned)", overriding the generic declared-`TableMeta` loop for the three
+/// whose own `CREATE TABLE` text -- `work_jobs`, `work_failures`,
+/// `work_inputs` -- also carries a `SYNC CONFLICT` clause, so no unmarked
+/// duplicate row survives), and the SYNC-CONFLICT mismatch-refusal door
+/// (`crate::executor::refuse_hub_refereed_ledger_sync_conflict_mismatch`),
+/// which further narrows this list to the five tables NOT in
+/// [`crate::executor::ENGINE_OWNED_LEDGER_TABLES`] (`work_inputs` and
+/// `work_capabilities` already get a mismatch-refusing, verbatim-restate-
+/// tolerant door from that list). `ServerWins` and `InsertIfNotExists` both
+/// mean "the first accepted value stands" -- the same `keep_first` contract
+/// a declared table names -- so both render in that word; `LatestWins`
+/// (only `work_capabilities`) renders `keep_latest`.
+pub(crate) fn engine_owned_work_ledger_conflict_policy_display() -> Vec<(&'static str, &'static str)>
+{
+    work_ledger_conflict_policy_entries_inner()
+        .into_iter()
+        .map(|(table, policy)| (table, conflict_policy_display_word(policy)))
+        .collect()
+}
+
+/// The `SHOW SYNC_CONFLICT_POLICY` display word for a work-ledger table's
+/// true arbitration. Exhaustive over [`ConflictPolicy`] even though only
+/// `ServerWins`, `InsertIfNotExists`, and `LatestWins` appear in
+/// [`work_ledger_conflict_policy_entries_inner`] today.
+pub(crate) fn conflict_policy_display_word(policy: ConflictPolicy) -> &'static str {
+    match policy {
+        ConflictPolicy::ServerWins | ConflictPolicy::InsertIfNotExists => "keep_first",
+        ConflictPolicy::LatestWins => "keep_latest",
+        // No table-level policy entry this crate declares (work-ledger's
+        // seven, or `peer_directory`'s one -- both this function's only
+        // callers' only inputs) ever carries `EdgeWins` -- it is a per-row
+        // sync-apply outcome, not a table-level arbitration policy a table
+        // declares. Panic loudly rather than silently rendering the false
+        // equivalence `EdgeWins == "keep_latest"` if a future caller ever
+        // widens what reaches this function.
+        ConflictPolicy::EdgeWins => unreachable!(
+            "conflict_policy_display_word: EdgeWins is never a table's declared \
+             arbitration policy"
+        ),
+    }
 }
 
 /// Merge the ledger's per-table policies over `policies`. Sync chokepoints

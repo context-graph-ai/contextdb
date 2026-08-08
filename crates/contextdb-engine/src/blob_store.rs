@@ -1,8 +1,11 @@
 //! The media data plane: content-address + serve local blobs (holder side)
 //! and resolve blob_ref references node-to-node (consumer side). Moves OPAQUE
-//! bytes + a hash — no work-class meaning (Rule 5). The fetch backend lives
-//! behind the adapter boundary (Rule 2); this module names only contextdb
-//! types and the adapter's opaque facade.
+//! bytes + a hash — this module carries no work-class meaning of its own;
+//! that belongs to the work ledger, which resolves a `blob_ref` input and
+//! authorizes access, never this store. The fetch backend lives behind the
+//! adapter boundary (the transport adapter purity guard: this module names
+//! only contextdb types and the adapter's opaque facade, never a transport
+//! implementation crate directly).
 //!
 //! A consumer may only resolve a blob while it holds a LIVE work-ledger
 //! claim on a job whose inputs reference that blob's hash; see
@@ -488,8 +491,8 @@ impl BlobStore {
     /// same `bind` + `serve_on` pair every two-node blob test performs), so
     /// an integration test file never has to name the network adapter or
     /// spell out its config-surface spec string itself — that stays
-    /// confined to this already-sanctioned adapter/config surface (Rule 2 /
-    /// the adapter-purity guard). Returns the same endpoint handle
+    /// confined to this already-sanctioned adapter/config surface (the
+    /// transport adapter purity guard). Returns the same endpoint handle
     /// `serve_on` takes; callers only need its existing public methods
     /// (`ticket()`, `close()`, ...).
     #[cfg(any(test, feature = "test-seams"))]

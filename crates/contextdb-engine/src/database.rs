@@ -36245,7 +36245,7 @@ impl Database {
                         hub_acceptance_position: None,
                         natural_key: row.natural_key.clone(),
                         resolution: policy,
-                        reason: Some("dependency_complete_refused".to_string()),
+                        reason: Some("keep_first_refused".to_string()),
                         table: Some(row.table.clone()),
                         mutation_kind: Some(
                             if row.deleted { "delete" } else { "edit" }.to_string(),
@@ -36281,7 +36281,7 @@ impl Database {
                         .or(Some(winner.lsn)),
                     natural_key: row.natural_key.clone(),
                     resolution: policy,
-                    reason: Some("dependency_complete_refused".to_string()),
+                    reason: Some("keep_first_refused".to_string()),
                     table: Some(row.table.clone()),
                     mutation_kind: Some(if row.deleted { "delete" } else { "edit" }.to_string()),
                     winning_author_node_id: winner_author,
@@ -39341,7 +39341,7 @@ fn normalize_schema_type(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn sync_create_table_sql(
+pub(crate) fn sync_create_table_sql(
     name: &str,
     columns: &[(String, String)],
     constraints: &[String],
@@ -39470,13 +39470,6 @@ fn schema_clause_key(value: &str) -> String {
         .collect()
 }
 
-fn ddl_vector_dimension(value: &str) -> Option<usize> {
-    let upper = value.to_ascii_uppercase();
-    let start = upper.find("VECTOR(")? + "VECTOR(".len();
-    let end = upper[start..].find(')')? + start;
-    upper[start..end].trim().parse().ok()
-}
-
 fn ddl_dag_edge_types(constraints: &[String]) -> Vec<EdgeType> {
     let mut edge_types = Vec::new();
     for constraint in constraints {
@@ -39581,24 +39574,6 @@ fn sync_vector_rename_from_constraints(constraints: &[String]) -> Option<(String
         }
     }
     None
-}
-
-fn ddl_column_reference(ty: &str) -> Option<ForeignKeyReference> {
-    let normalized = normalize_schema_type(ty);
-    let upper = normalized.to_ascii_uppercase();
-    let reference_start = upper.find("REFERENCES ")? + "REFERENCES ".len();
-    let rest = normalized[reference_start..].trim();
-    let paren = rest.find('(')?;
-    let close = rest[paren + 1..].find(')')? + paren + 1;
-    let table = rest[..paren].trim();
-    let column = rest[paren + 1..close].trim();
-    if table.is_empty() || column.is_empty() {
-        return None;
-    }
-    Some(ForeignKeyReference {
-        table: table.to_string(),
-        column: column.to_string(),
-    })
 }
 
 fn sync_table_shape_matches(
@@ -39910,6 +39885,18 @@ fn refuse_reclaimed_history_sync_ddl(change: &DdlChange) -> Result<()> {
 /// shape via [`crate::executor::refuse_engine_owned_reserved_name_shape_wire`],
 /// mirroring the local CREATE TABLE door's column-shape guard for reserved
 /// names.
+///
+/// All three shapes ALSO run
+/// [`crate::executor::refuse_hub_refereed_ledger_sync_conflict_mismatch`]
+/// after the axis check above -- the narrower, SYNC-CONFLICT-only
+/// counterpart for the five hub-refereed work-ledger tables outside
+/// [`crate::executor::ENGINE_OWNED_LEDGER_TABLES`] (`work_jobs` /
+/// `work_claims` / `work_results` / `work_failures` / `work_cancellations`),
+/// which `refuse_engine_owned_policy_axes` does not judge at all (see that
+/// function's own doc comment for why they need a separate door rather than
+/// a widened four-table list). The fresh-CreateTable arm's guard is widened
+/// to match either table set so a reserved-name column-shape and SYNC-
+/// CONFLICT check both run for these five too, not only the four.
 fn refuse_engine_owned_policy_sync_ddl(
     projected: &HashMap<String, TableMeta>,
     change: &DdlChange,
@@ -39923,6 +39910,26 @@ fn refuse_engine_owned_policy_sync_ddl(
             composite_foreign_keys,
             composite_unique,
         } => {
+            // The column-shape guard, mirroring the local ALTER door
+            // (`refuse_engine_owned_reserved_name_column_alter`): an
+            // arriving AlterTable naming one of the nine reserved names
+            // must restate their full canonical column shape.
+            // `alter_table_ddl_change` always bakes a table's FULL current
+            // shape into every emitted AlterTable (see
+            // `refuse_reclaimed_history_sync_ddl`'s doc comment), so this is
+            // not a narrower ask than the fresh-CreateTable door makes of a
+            // fresh create. Judged BEFORE the policy axes below, and before
+            // `merge_sync_alter_existing_column` at apply time can latch a
+            // hidden attribute (UNIQUE / IMMUTABLE / ...) onto an
+            // already-installed reserved table's column.
+            crate::executor::refuse_engine_owned_reserved_name_shape_wire(
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_unique,
+                composite_foreign_keys,
+            )?;
             let incoming = rough_sync_table_meta(
                 columns,
                 constraints,
@@ -39930,7 +39937,14 @@ fn refuse_engine_owned_policy_sync_ddl(
                 composite_foreign_keys,
                 composite_unique,
             );
-            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)
+            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)?;
+            // The narrower SYNC-CONFLICT-only counterpart, for the five
+            // hub-refereed work-ledger tables the full-axis door above does
+            // not cover (see that function's own doc comment).
+            crate::executor::refuse_hub_refereed_ledger_sync_conflict_mismatch(
+                name,
+                incoming.conflict_policy,
+            )
         }
         DdlChange::CreateTable {
             name,
@@ -39940,6 +39954,18 @@ fn refuse_engine_owned_policy_sync_ddl(
             composite_foreign_keys,
             composite_unique,
         } if projected.contains_key(name) => {
+            // Same column-shape guard as the AlterTable arm above: a
+            // CreateTable ADOPTING an already-existing reserved table lands
+            // on the identical merge path a peer's own multi-step reconcile
+            // uses, so it must be held to the same canonical column shape.
+            crate::executor::refuse_engine_owned_reserved_name_shape_wire(
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_unique,
+                composite_foreign_keys,
+            )?;
             let incoming = rough_sync_table_meta(
                 columns,
                 constraints,
@@ -39947,7 +39973,11 @@ fn refuse_engine_owned_policy_sync_ddl(
                 composite_foreign_keys,
                 composite_unique,
             );
-            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)
+            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)?;
+            crate::executor::refuse_hub_refereed_ledger_sync_conflict_mismatch(
+                name,
+                incoming.conflict_policy,
+            )
         }
         DdlChange::CreateTable {
             name,
@@ -39956,11 +39986,20 @@ fn refuse_engine_owned_policy_sync_ddl(
             foreign_keys,
             composite_foreign_keys,
             composite_unique,
-        } if crate::executor::ENGINE_OWNED_LEDGER_TABLES.contains(&name.as_str()) => {
+        } if crate::executor::ENGINE_OWNED_LEDGER_TABLES.contains(&name.as_str())
+            || crate::executor::is_hub_refereed_sync_conflict_table(name) =>
+        {
             // Fresh create of a reserved table (not in projected) -- guard both
             // the column shape and the policy axes, exactly like the local
             // CREATE TABLE door does.
-            crate::executor::refuse_engine_owned_reserved_name_shape_wire(name, columns)?;
+            crate::executor::refuse_engine_owned_reserved_name_shape_wire(
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_unique,
+                composite_foreign_keys,
+            )?;
             let incoming = rough_sync_table_meta(
                 columns,
                 constraints,
@@ -39968,7 +40007,11 @@ fn refuse_engine_owned_policy_sync_ddl(
                 composite_foreign_keys,
                 composite_unique,
             );
-            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)
+            crate::executor::refuse_engine_owned_policy_axes(name, &incoming)?;
+            crate::executor::refuse_hub_refereed_ledger_sync_conflict_mismatch(
+                name,
+                incoming.conflict_policy,
+            )
         }
         _ => Ok(()),
     }
@@ -40041,78 +40084,56 @@ fn rough_sync_table_meta(
     meta
 }
 
+/// Builds the applied `ColumnDef` for one arriving wire `(name, type-text)`
+/// pair by running the type text through the REAL parser -- the same
+/// reconstruct-then-parse the shape door
+/// (`crate::executor::refuse_engine_owned_reserved_name_shape_wire`) already
+/// uses to JUDGE an arriving column, now reused to APPLY it too, so the two
+/// paths can never disagree about what a wire column text means. Round 8
+/// finding: the previous implementation read `PRIMARY KEY` / `UNIQUE` /
+/// `EXPIRES` / `IMMUTABLE` / `REFERENCES` / `CONTEXT_ID` off the RAW string
+/// via `.contains(...)`, so a token sitting inside a block comment (which
+/// the grammar's own `WHITESPACE` rule treats as skippable, exactly like a
+/// space -- e.g. `TEXT /*UNIQUE*/`) was invisible to the real parser but
+/// still matched the substring check, silently latching an attribute the
+/// arriving DDL never actually declared. Applies to any table, reserved or
+/// not.
 fn rough_sync_column_def(name: &str, ty: &str) -> ColumnDef {
-    let upper = normalize_schema_type(ty).to_ascii_uppercase();
-    let primary_key = upper.contains("PRIMARY KEY");
-    let unique = upper.contains("UNIQUE");
-    let expires = upper.contains("EXPIRES");
-    let immutable = upper.contains("IMMUTABLE");
-    let quantization = if upper.contains("SQ4") {
-        VectorQuantization::SQ4
-    } else if upper.contains("SQ8") {
-        VectorQuantization::SQ8
-    } else {
-        VectorQuantization::F32
-    };
-    let column_type = if let Some(dimension) = ddl_vector_dimension(ty) {
-        ColumnType::Vector(dimension)
-    } else if upper.starts_with("UUID") {
-        ColumnType::Uuid
-    } else if upper.starts_with("TEXT") {
-        ColumnType::Text
-    } else if upper.starts_with("INTEGER") || upper.starts_with("INT") {
-        ColumnType::Integer
-    } else if upper.starts_with("REAL") || upper.starts_with("FLOAT") || upper.starts_with("DOUBLE")
+    let sql = format!("CREATE TABLE __rough_sync_column_shape ({name} {ty})");
+    if let Ok(Statement::CreateTable(table)) = contextdb_parser::parse(&sql)
+        && let Some(ast_column) = table.columns.into_iter().next()
     {
-        ColumnType::Real
-    } else if upper.starts_with("BOOLEAN") || upper.starts_with("BOOL") {
-        ColumnType::Boolean
-    } else if upper.starts_with("TIMESTAMP") {
-        ColumnType::Timestamp
-    } else if upper.starts_with("TXID") {
-        ColumnType::TxId
-    } else if upper.starts_with("JSON") {
-        ColumnType::Json
-    } else {
-        ColumnType::Text
-    };
-
-    let rank_policy = sync_rank_policy_from_column_type(name, ty);
-
+        let rank_policy = ast_column
+            .rank_policy
+            .as_deref()
+            .map(crate::executor::map_rank_policy);
+        return crate::executor::core_column_from_ast(&ast_column, rank_policy);
+    }
+    // Defensive fallback only: by the time real apply reaches this
+    // function, `ty` has already parsed successfully as part of the FULL
+    // CREATE/ALTER TABLE statement in the DDL preflight
+    // (`validate_sync_table_shape_ddl` / `validate_sync_alter_table_shape_ddl`),
+    // so this arm should not be reachable for real traffic -- it exists
+    // only for callers that run before that preflight (e.g. byte-size
+    // estimation). Never guess an attribute a comment or odd spacing could
+    // smuggle in: every flag below defaults OFF, the honest reading of "no
+    // real token seen."
     ColumnDef {
         name: name.to_string(),
-        column_type,
-        nullable: !primary_key && !upper.contains("NOT NULL"),
-        primary_key,
-        unique,
+        column_type: ColumnType::Text,
+        nullable: true,
+        primary_key: false,
+        unique: false,
         default: None,
-        references: ddl_column_reference(ty),
-        expires,
-        immutable,
-        quantization,
-        rank_policy,
-        context_id: upper.contains("CONTEXT_ID"),
+        references: None,
+        expires: false,
+        immutable: false,
+        quantization: VectorQuantization::F32,
+        rank_policy: None,
+        context_id: false,
         scope_label: None,
         acl_ref: None,
     }
-}
-
-fn sync_rank_policy_from_column_type(name: &str, ty: &str) -> Option<RankPolicy> {
-    if !normalize_schema_type(ty)
-        .to_ascii_uppercase()
-        .contains("RANK_POLICY")
-    {
-        return None;
-    }
-    let sql = format!("CREATE TABLE __sync_rank_policy ({name} {ty})");
-    let Ok(Statement::CreateTable(table)) = contextdb_parser::parse(&sql) else {
-        return None;
-    };
-    table.columns.into_iter().next().and_then(|column| {
-        column
-            .rank_policy
-            .map(|policy| crate::executor::map_rank_policy(&policy))
-    })
 }
 
 fn resolve_sync_rank_policies(table_name: &str, meta: &mut TableMeta) {

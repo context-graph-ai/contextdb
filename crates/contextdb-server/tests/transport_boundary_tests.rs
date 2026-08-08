@@ -1279,7 +1279,7 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
     );
     assert_eq!(
         conflict.reason.as_deref(),
-        Some("dependency_complete_refused"),
+        Some("keep_first_refused"),
         "the typed refusal must say the complete schema/data group was rejected under KEEP FIRST"
     );
     assert_eq!(
@@ -1300,6 +1300,121 @@ async fn ip_02_conflicting_push_reports_real_apply_result_over_fake() {
     );
 
     expect_text_value(&server_db, "claims", "owner", key, "worker-a");
+
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = server_task.await;
+}
+
+/// Operator-rendered sync diagnostics must speak declared-policy vocabulary
+/// (KEEP FIRST / KEEP LATEST) -- never the internal completeness-check
+/// mechanism that happens to produce the diagnostic. A KEEP FIRST refusal's
+/// `reason` today reads `"dependency_complete_refused"`, naming
+/// `refusal_diagnostic_is_complete`'s bookkeeping instead of the policy an
+/// operator actually declared. The decided target is `"keep_first_refused"`,
+/// with every other typed field of the diagnostic -- table, key, mutation
+/// kind, winning author, hub acceptance position -- still fully populated.
+#[tokio::test]
+async fn ip_04_keep_first_push_refusal_reason_speaks_declared_policy_vocabulary_over_fake() {
+    let broker = InProcessBroker::new();
+    let tenant = "ip-04";
+    let server_db = Arc::new(Database::open_memory());
+    let server = authenticated_server(server_db.clone(), &broker, tenant);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        let shutdown = shutdown.clone();
+        async move { server.run_until(shutdown).await }
+    });
+
+    let key = Uuid::new_v4();
+    let ddl = "CREATE TABLE vocab_claims (id UUID PRIMARY KEY, owner TEXT)";
+    server_db.execute(ddl, &HashMap::new()).expect("ddl on hub");
+    let mut first_row = HashMap::new();
+    first_row.insert("id".to_string(), Value::Uuid(key));
+    first_row.insert("owner".to_string(), Value::Text("worker-a".to_string()));
+    server_db
+        .execute(
+            "INSERT INTO vocab_claims (id, owner) VALUES ($id, $owner)",
+            &first_row,
+        )
+        .expect("insert hub winner");
+
+    let second_db = Arc::new(Database::open_memory());
+    second_db
+        .execute(ddl, &HashMap::new())
+        .expect("ddl on second writer");
+    second_db
+        .persist_sync_push_watermark(
+            &contextdb_core::TenantId::from(tenant),
+            second_db.current_lsn(),
+        )
+        .expect("mark local DDL as already synced");
+    let mut second_row = HashMap::new();
+    second_row.insert("id".to_string(), Value::Uuid(key));
+    second_row.insert("owner".to_string(), Value::Text("worker-b".to_string()));
+    second_db
+        .execute(
+            "INSERT INTO vocab_claims (id, owner) VALUES ($id, $owner)",
+            &second_row,
+        )
+        .expect("insert second");
+    let second = authenticated_client(second_db.clone(), &broker, tenant);
+    let second_push = within(second.push()).await;
+    assert!(
+        second_push.is_ok(),
+        "the losing push over the in-process fake must still succeed as a transport call"
+    );
+    let second_result = second_push.expect("checked ok above");
+
+    assert_eq!(
+        second_result.applied_rows, 0,
+        "the colliding push must not replace the existing row under the declaration's KEEP FIRST default"
+    );
+    assert_eq!(
+        second_result.conflicts.len(),
+        1,
+        "the KEEP FIRST refusal must retain its one typed conflict receipt"
+    );
+    let conflict = &second_result.conflicts[0];
+    assert_eq!(
+        conflict.resolution,
+        ConflictPolicy::InsertIfNotExists,
+        "the typed refusal must name the declaration's KEEP FIRST resolution"
+    );
+    assert_eq!(
+        conflict.reason.as_deref(),
+        Some("keep_first_refused"),
+        "a KEEP FIRST refusal must speak the declared-policy word \"keep_first_refused\", \
+         never the internal mechanism name \"dependency_complete_refused\"; got {:?}",
+        conflict.reason
+    );
+    assert_eq!(
+        conflict.table.as_deref(),
+        Some("vocab_claims"),
+        "the typed refusal must still name the refused table: {conflict:?}"
+    );
+    assert_eq!(
+        conflict.natural_key.column, "id",
+        "the typed refusal must still identify the rejected natural-key column: {conflict:?}"
+    );
+    assert_eq!(
+        conflict.natural_key.value,
+        Value::Uuid(key),
+        "the typed refusal must still identify the rejected natural key: {conflict:?}"
+    );
+    assert_eq!(
+        conflict.mutation_kind.as_deref(),
+        Some("edit"),
+        "the typed refusal must still name the mutation kind: {conflict:?}"
+    );
+    assert!(
+        conflict.winning_author_node_id.is_some(),
+        "the typed refusal must still name the hub's winning author: {conflict:?}"
+    );
+    assert!(
+        conflict.hub_acceptance_position.is_some(),
+        "the typed refusal must still name the hub's acceptance position: {conflict:?}"
+    );
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = server_task.await;

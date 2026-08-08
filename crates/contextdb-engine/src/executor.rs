@@ -71,9 +71,10 @@ fn execute_plan_once(
                 });
             }
             // Refused before anything else is validated: a consumer typing
-            // one of the four engine-owned reserved names with any other
-            // column shape never gets far enough to build a half-made table.
-            refuse_engine_owned_reserved_name_shape(&p.name, &p.columns)?;
+            // one of the nine engine-owned reserved names with any other
+            // shape (columns OR table-level options) never gets far enough
+            // to build a half-made table.
+            refuse_engine_owned_reserved_name_shape(p)?;
             // The contradiction is refused before anything is created, so a
             // rejected declaration never leaves a half-made table behind.
             refuse_promise_with_no_delivery(
@@ -202,6 +203,12 @@ fn execute_plan_once(
             // still tolerated (a legacy pre-declaration root, or this file's
             // own reconcile-heal tests, construct exactly that shape).
             refuse_engine_owned_policy_axes(&p.name, &meta)?;
+            // The narrower SYNC-CONFLICT-only counterpart of the axis door
+            // above, for the five hub-refereed work-ledger tables that door
+            // does not cover (see the function's own doc comment for why
+            // they need a separate, axis-scoped door rather than a widened
+            // `ENGINE_OWNED_LEDGER_TABLES`).
+            refuse_hub_refereed_ledger_sync_conflict_mismatch(&p.name, meta.conflict_policy)?;
             refuse_sync_safe_without_key(&p.name, &meta)?;
             // Refused before anything is created: a table that both
             // delivers and arbitrates non-overwriting must not declare
@@ -349,6 +356,15 @@ fn execute_plan_once(
             let metadata_only_projection: Option<(TableMeta, TableMeta)>;
             match &p.action {
                 AlterAction::AddColumn(col) => {
+                    // Existence first, like every other ALTER clause in this
+                    // match (see `SetSyncConflict`'s own comment): an absent
+                    // table must report "table not found", never the
+                    // engine-owned refusal, which implies a real, governed
+                    // table exists.
+                    if db.table_meta(&p.table).is_none() {
+                        return Err(Error::Other(format!("table '{}' not found", p.table)));
+                    }
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
                     if col.primary_key {
                         return Err(Error::Other(
                             "adding a primary key column via ALTER TABLE is not supported"
@@ -494,6 +510,11 @@ fn execute_plan_once(
                     column: name,
                     cascade,
                 } => {
+                    // Existence first -- see `AddColumn`'s own comment above.
+                    if db.table_meta(&p.table).is_none() {
+                        return Err(Error::Other(format!("table '{}' not found", p.table)));
+                    }
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
                     if let Some(block) = rank_policy_drop_column_blocker(db, &p.table, name) {
                         return Err(block);
                     }
@@ -674,6 +695,11 @@ fn execute_plan_once(
                     });
                 }
                 AlterAction::RenameColumn { from, to } => {
+                    // Existence first -- see `AddColumn`'s own comment above.
+                    if db.table_meta(&p.table).is_none() {
+                        return Err(Error::Other(format!("table '{}' not found", p.table)));
+                    }
+                    refuse_engine_owned_reserved_name_column_alter(&p.table)?;
                     if let Some(block) = rank_policy_drop_column_blocker(db, &p.table, from) {
                         return Err(block);
                     }
@@ -832,6 +858,13 @@ fn execute_plan_once(
                     sync_safe,
                     declared_unit,
                 } => {
+                    // Existence first, like every other ALTER clause in this
+                    // match: an absent table must report "table not found",
+                    // not the engine-owned refusal below -- that refusal
+                    // implies a real, governed table exists, which is not
+                    // true for a store that never installed the ledger.
+                    db.table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     // Refused before the write lock is taken, so a rejected
                     // ALTER applies no part of itself — not the new window,
                     // not the SYNC SAFE flag.
@@ -868,6 +901,13 @@ fn execute_plan_once(
                     metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::DropRetain => {
+                    // Existence first, like every other ALTER clause in this
+                    // match: an absent table must report "table not found",
+                    // not the engine-owned refusal below -- that refusal
+                    // implies a real, governed table exists, which is not
+                    // true for a store that never installed the ledger.
+                    db.table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     // Refused before the write lock, matching SET RETAIN's
                     // own comment.
                     refuse_engine_owned_policy_mutation(
@@ -912,14 +952,28 @@ fn execute_plan_once(
                     metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::SetSyncConflict(policy) => {
+                    // Existence first, like every other ALTER clause in this
+                    // match: an absent table must report "table not found",
+                    // not the engine-owned refusal below -- that refusal
+                    // implies a real, governed table exists, which is not
+                    // true for a store that never installed the ledger.
+                    let existing = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
+                    // A hub-refereed work-ledger table (work_jobs /
+                    // work_claims / work_results / work_failures /
+                    // work_cancellations) has no locally-settable declared
+                    // SYNC CONFLICT axis for the mirror guard below to
+                    // compare against -- but a restate of its own true
+                    // arbitration is still legal here, exactly like the
+                    // CREATE door and the four older engine-owned tables'
+                    // own ALTER door both tolerate; only a mismatch refuses.
+                    refuse_hub_refereed_ledger_sync_conflict_mismatch(&p.table, Some(*policy))?;
                     // The mirror guard: narrowing an already-declared HISTORY
                     // CURRENT ONLY table BACK to keep-first arbitration while
                     // it still delivers is exactly the CREATE-time hazard
                     // arriving through the back door, so it is refused here
                     // too, before the write lock.
-                    let existing = db
-                        .table_meta(&p.table)
-                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     let projected = TableMeta {
                         conflict_policy: Some(*policy),
                         ..existing
@@ -937,6 +991,14 @@ fn execute_plan_once(
                     metadata_only_projection = Some((old_meta, table_meta));
                 }
                 AlterAction::SetSyncDirection(direction) => {
+                    // Existence first, like every other ALTER clause in this
+                    // match: an absent table must report "table not found",
+                    // not the engine-owned refusal below -- that refusal
+                    // implies a real, governed table exists, which is not
+                    // true for a store that never installed the ledger.
+                    let existing = db
+                        .table_meta(&p.table)
+                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     // Refused before the write lock, for the same reason: a
                     // rejected ALTER applies no part of itself -- an
                     // operator's own `SET SYNC ...` on one of the four
@@ -947,9 +1009,6 @@ fn execute_plan_once(
                         &p.table,
                         EngineOwnedMutation::SyncDirection(*direction),
                     )?;
-                    let existing = db
-                        .table_meta(&p.table)
-                        .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table)))?;
                     refuse_promise_with_no_delivery(
                         &p.table,
                         existing.sync_safe,
@@ -2107,15 +2166,57 @@ fn execute_plan_once(
             // path actually uses; the runtime layer only carries the deployment
             // default.
             let mut rows = vec![vec![Value::Text("keep_first".to_string())]];
+            // One combined list, not two: every ENGINE_OWNED_LEDGER_TABLES
+            // member that actually declares a real conflict policy
+            // (`peer_directory`'s own `SYNC CONFLICT KEEP LATEST`) joins the
+            // seven work-ledger tables' engine-owned rows here, so both the
+            // skip-set below and the render loop treat them identically.
+            // `work_node_contacts` declares NO conflict policy at all
+            // (`engine_owned_ledger_policy("work_node_contacts").conflict
+            // == None`) and so has no entry to fold in -- it never renders,
+            // in any form, exactly like a plain table that never declared
+            // SYNC CONFLICT.
+            let engine_owned_display_rows: Vec<(&'static str, &'static str)> =
+                crate::work_ledger::engine_owned_work_ledger_conflict_policy_display()
+                    .into_iter()
+                    .chain(crate::peer_directory::peer_directory_conflict_policy_display())
+                    .collect();
+            let engine_owned_display_tables: std::collections::HashSet<&str> =
+                engine_owned_display_rows
+                    .iter()
+                    .map(|(table, _)| *table)
+                    .collect();
             let mut tables = db.table_names();
             tables.sort();
-            for table in tables {
-                if let Some(policy) = db.table_meta(&table).and_then(|meta| meta.conflict_policy) {
+            let existing_tables: std::collections::HashSet<&str> =
+                tables.iter().map(|t| t.as_str()).collect();
+            for table in &tables {
+                // The engine-owned tables render below, marked
+                // "(engine-owned)" with their TRUE arbitration -- skip the
+                // generic declared-`TableMeta` row here so a table whose own
+                // `CREATE TABLE` text also carries a `SYNC CONFLICT` clause
+                // (`work_jobs`, `work_failures`, `work_inputs`, `peer_directory`)
+                // never leaves an unmarked duplicate that reads as
+                // operator-settable.
+                if engine_owned_display_tables.contains(table.as_str()) {
+                    continue;
+                }
+                if let Some(policy) = db.table_meta(table).and_then(|meta| meta.conflict_policy) {
                     rows.push(vec![Value::Text(format!(
                         "{}={}",
                         table,
                         declared_conflict_policy_to_string(policy)
                     ))]);
+                }
+            }
+            for (table, word) in engine_owned_display_rows {
+                // `install_work_ledger_schema` / `install_peer_directory_schema`
+                // are opt-in -- a plain open has none of these tables.
+                // Report what actually governs THIS store: render a row
+                // only for a table that really exists here, never a ghost
+                // row for one that would exist if it were installed.
+                if existing_tables.contains(table) {
+                    rows.push(vec![Value::Text(format!("{table}={word} (engine-owned)"))]);
                 }
             }
             Ok(QueryResult {
@@ -8798,184 +8899,491 @@ pub(crate) fn refuse_engine_owned_policy_axes(table: &str, incoming: &TableMeta)
     Ok(())
 }
 
-/// The exact `(name, data type, is primary key)` column shape one of
-/// [`ENGINE_OWNED_LEDGER_TABLES`] declares in its own `CREATE TABLE` text, in
-/// declaration order -- mirrored by hand for the same reason
-/// [`engine_owned_ledger_policy`] is (`work_node_contacts` is
-/// `contextdb-server`'s table and its DDL constant is not importable from
-/// here; keep this in agreement with `CREATE_WORK_INPUTS` /
-/// `CREATE_WORK_CAPABILITIES` / `CREATE_PEER_DIRECTORY` /
-/// `contextdb_server::work_ledger::CREATE_WORK_NODE_CONTACTS` by hand if any
-/// of those four DDL strings ever changes). `None` for any table name outside
-/// the four.
-fn engine_owned_reserved_table_columns(
-    table: &str,
-) -> Option<&'static [(&'static str, DataType, bool)]> {
-    const WORK_INPUTS: &[(&str, DataType, bool)] = &[
-        ("input_key", DataType::Text, true),
-        ("job_id", DataType::Text, false),
-        ("seq", DataType::Integer, false),
-        ("payload", DataType::Text, false),
-    ];
-    const WORK_CAPABILITIES: &[(&str, DataType, bool)] = &[
-        ("capability_key", DataType::Text, true),
-        ("node_id", DataType::Text, false),
-        ("capability_id", DataType::Text, false),
-        ("tags", DataType::Json, false),
-        ("detail", DataType::Json, false),
-        ("advertised_at", DataType::Timestamp, false),
-    ];
-    const PEER_DIRECTORY: &[(&str, DataType, bool)] = &[
-        ("node_id", DataType::Text, true),
-        ("ticket", DataType::Text, false),
-        ("enrolled_at", DataType::Timestamp, false),
-    ];
-    const WORK_NODE_CONTACTS: &[(&str, DataType, bool)] = &[
-        ("node_id", DataType::Text, true),
-        ("last_contact_ms", DataType::Timestamp, false),
-    ];
+/// The installer's own `CREATE TABLE` text for one of the nine reserved
+/// names -- the SINGLE SOURCE every shape door below parses to get the
+/// canonical column shape, replacing the round-6 hand-mirrored
+/// `(name, data type, is primary key, is nullable)` tuple table (a checklist
+/// subset that silently admitted `IMMUTABLE` / `EXPIRES`, since neither was
+/// ever a column the tuple had room for). Changing one of the seven
+/// `CREATE_WORK_*` constants or `CREATE_PEER_DIRECTORY` now changes every
+/// door's canonical shape with it -- there is nothing left here to fall out
+/// of sync with the installer's real DDL by hand. `work_node_contacts` is
+/// `contextdb-server`'s table (one crate up from here, so its DDL constant
+/// is not importable) -- its text is duplicated below; keep it in agreement
+/// with `contextdb_server::work_ledger::CREATE_WORK_NODE_CONTACTS` if that
+/// string ever changes. `None` for any table name outside the nine -- an
+/// operator table name may declare any column shape at all.
+fn engine_owned_reserved_table_create_ddl(table: &str) -> Option<&'static str> {
     match table {
-        "work_inputs" => Some(WORK_INPUTS),
-        "work_capabilities" => Some(WORK_CAPABILITIES),
-        "peer_directory" => Some(PEER_DIRECTORY),
-        "work_node_contacts" => Some(WORK_NODE_CONTACTS),
+        "work_jobs" => Some(crate::work_ledger::CREATE_WORK_JOBS),
+        "work_claims" => Some(crate::work_ledger::CREATE_WORK_CLAIMS),
+        "work_results" => Some(crate::work_ledger::CREATE_WORK_RESULTS),
+        "work_failures" => Some(crate::work_ledger::CREATE_WORK_FAILURES),
+        "work_cancellations" => Some(crate::work_ledger::CREATE_WORK_CANCELLATIONS),
+        "work_inputs" => Some(crate::work_ledger::CREATE_WORK_INPUTS),
+        "work_capabilities" => Some(crate::work_ledger::CREATE_WORK_CAPABILITIES),
+        "peer_directory" => Some(crate::peer_directory::CREATE_PEER_DIRECTORY),
+        "work_node_contacts" => Some(ENGINE_OWNED_WORK_NODE_CONTACTS_CREATE_DDL),
         _ => None,
     }
 }
 
-/// Validates that arriving wire-format columns for a fresh CREATE of one of the
-/// four engine-owned reserved tables match the canonical column structure --
-/// the mirror of [`refuse_engine_owned_reserved_name_shape`] for wire format
-/// instead of AST ColumnDef. `Ok` for any table outside
-/// [`ENGINE_OWNED_LEDGER_TABLES`], `Ok` for a canonical match, `Err` for a
-/// structural mismatch.
-pub(crate) fn refuse_engine_owned_reserved_name_shape_wire(
+/// The engine's own hand-duplicated copy of `contextdb-server`'s
+/// `work_node_contacts` DDL text (`contextdb_server::work_ledger::
+/// CREATE_WORK_NODE_CONTACTS`) -- duplicated, not imported, because that
+/// table is `contextdb-server`'s (one crate up from here) and this crate
+/// cannot depend on it without an inversion. `pub` (not `pub(crate)`) so a
+/// downstream drift test (in `contextdb-server`, which already depends on
+/// this crate) can assert the two texts stay byte-identical rather than
+/// trusting a doc-comment promise alone.
+pub const ENGINE_OWNED_WORK_NODE_CONTACTS_CREATE_DDL: &str = "CREATE TABLE work_node_contacts (\
+     node_id TEXT PRIMARY KEY, \
+     last_contact_ms TIMESTAMP NOT NULL) HISTORY CURRENT ONLY SYNC OFF";
+
+/// The canonical PARSED `CreateTable` statement for one of the nine
+/// reserved names -- [`engine_owned_reserved_table_create_ddl`]'s own text,
+/// run through the REAL parser (the identical parse every operator-typed
+/// `CREATE TABLE` goes through), not a hand-typed restatement of it. The
+/// WHOLE statement, not just `.columns`: round 7 held only the column list
+/// here, so the table-LEVEL options (`IMMUTABLE` / `STATE_MACHINE` / `DAG`
+/// / `PROPAGATE`) had no canonical value to compare against and repeated
+/// round 6's exact failure one level up (round 8's finding -- see
+/// [`refuse_reserved_name_table_shape`]). `None` for any table name outside
+/// the nine.
+fn engine_owned_reserved_table_canonical_create(
     table: &str,
-    columns: &[(String, String)],
-) -> Result<()> {
-    let Some(canonical) = engine_owned_reserved_table_columns(table) else {
-        return Ok(());
-    };
-
-    if columns.len() != canonical.len() {
-        return Err(Error::SchemaInvalid {
-            reason: format!(
-                "table '{table}' is engine-owned infrastructure, not an operator table: its column \
-                 shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
-                 engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
-                 (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
-                 consumer types directly -- choose a different name for a table of your own.",
-                engine_owned_reserved_name_installer(table)
-            ),
-        });
+) -> Option<contextdb_parser::ast::CreateTable> {
+    let ddl = engine_owned_reserved_table_create_ddl(table)?;
+    match contextdb_parser::parse(ddl) {
+        Ok(contextdb_parser::ast::Statement::CreateTable(create)) => Some(create),
+        other => unreachable!(
+            "engine_owned_reserved_table_create_ddl's own text for {table} must parse as a \
+             CreateTable statement: {other:?}"
+        ),
     }
-
-    for (column, (canonical_name, canonical_type, canonical_primary_key)) in
-        columns.iter().zip(canonical.iter())
-    {
-        let (wire_name, wire_type_str) = column;
-        if wire_name != canonical_name {
-            return Err(Error::SchemaInvalid {
-                reason: format!(
-                    "table '{table}' is engine-owned infrastructure, not an operator table: its column \
-                     shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
-                     engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
-                     (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
-                     consumer types directly -- choose a different name for a table of your own.",
-                    engine_owned_reserved_name_installer(table)
-                ),
-            });
-        }
-
-        let wire_type_upper = wire_type_str.to_ascii_uppercase();
-        let wire_primary_key = wire_type_upper.contains("PRIMARY KEY");
-
-        let canonical_type_matches = match canonical_type {
-            DataType::Text => wire_type_upper.starts_with("TEXT"),
-            DataType::Integer => {
-                wire_type_upper.starts_with("INTEGER") || wire_type_upper.starts_with("INT")
-            }
-            DataType::Json => wire_type_upper.starts_with("JSON"),
-            DataType::Timestamp => wire_type_upper.starts_with("TIMESTAMP"),
-            _ => false,
-        };
-
-        if !canonical_type_matches || wire_primary_key != *canonical_primary_key {
-            return Err(Error::SchemaInvalid {
-                reason: format!(
-                    "table '{table}' is engine-owned infrastructure, not an operator table: its column \
-                     shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
-                     engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
-                     (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
-                     consumer types directly -- choose a different name for a table of your own.",
-                    engine_owned_reserved_name_installer(table)
-                ),
-            });
-        }
-    }
-
-    Ok(())
 }
 
-/// The function name of the installer that owns one of
-/// [`ENGINE_OWNED_LEDGER_TABLES`], named in
-/// [`refuse_engine_owned_reserved_name_shape`]'s refusal message.
+/// Whether `candidate` structurally matches `canonical` on EVERY field
+/// `ColumnDef` carries -- an EXHAUSTIVE destructure of `candidate`, never a
+/// `..` pattern: if a future AST change adds a field to `ColumnDef`, this
+/// fails to COMPILE until this door is told how the new field
+/// participates, instead of silently ignoring it the way the round-6
+/// count/name/type/primary-key/nullable subset let `IMMUTABLE` and
+/// `EXPIRES` slip through unseen.
+///
+/// None of the nine reserved tables' own `CREATE TABLE` text ever declares
+/// a `DEFAULT`, `REFERENCES`, `RANK_POLICY`, a context-id column, a scope
+/// label, or an ACL reference -- so `canonical` never carries one either;
+/// asserted on both sides below (never just assumed of `canonical`) so a
+/// future installer DDL that DID start declaring one of these would fail
+/// the comparison loudly rather than being silently exempted.
+fn column_def_matches_canonical(
+    candidate: &contextdb_parser::ast::ColumnDef,
+    canonical: &contextdb_parser::ast::ColumnDef,
+) -> bool {
+    let contextdb_parser::ast::ColumnDef {
+        name,
+        data_type,
+        nullable,
+        primary_key,
+        unique,
+        default,
+        references,
+        expires,
+        immutable,
+        quantization,
+        rank_policy,
+        context_id,
+        scope_label,
+        acl_ref,
+    } = candidate;
+    *name == canonical.name
+        && *data_type == canonical.data_type
+        && *nullable == canonical.nullable
+        && *primary_key == canonical.primary_key
+        && *unique == canonical.unique
+        && default.is_none()
+        && canonical.default.is_none()
+        && references.is_none()
+        && canonical.references.is_none()
+        && *expires == canonical.expires
+        && *immutable == canonical.immutable
+        && *quantization == canonical.quantization
+        && rank_policy.is_none()
+        && canonical.rank_policy.is_none()
+        && *context_id == canonical.context_id
+        && scope_label.is_none()
+        && canonical.scope_label.is_none()
+        && acl_ref.is_none()
+        && canonical.acl_ref.is_none()
+}
+
+/// What about a reserved-name `CREATE TABLE` / column-shape `ALTER TABLE`
+/// mismatched, named in [`engine_owned_reserved_shape_refusal`]'s message so
+/// a dissatisfied operator has something to diagnose with -- the fix for
+/// the round-7 finding that the old message's "name, type, and primary key"
+/// claim was false for every hidden-attribute mismatch (UNIQUE / DEFAULT /
+/// nullability / IMMUTABLE / EXPIRES) since all of those satisfy
+/// name/type/primary-key exactly.
+enum ReservedShapeMismatch<'a> {
+    /// A table-level UNIQUE, table-level composite PRIMARY KEY, or composite
+    /// FOREIGN KEY -- none of the nine reserved tables' own DDL declares one.
+    TableLevelConstraint,
+    /// A different number of columns than the canonical shape declares.
+    ColumnCount,
+    /// One column, named here, differs on some field the canonical shape
+    /// pins (see [`column_def_matches_canonical`] for the full field list).
+    Column(&'a str),
+    /// The arriving wire column text does not even parse as a column shape.
+    Unparseable,
+    /// A table-level option the canonical shape does not declare -- named
+    /// here (`"IMMUTABLE"` / `"STATE_MACHINE"` / `"DAG"` / `"PROPAGATE"`).
+    TableOption(&'static str),
+}
+
+/// The shared refusal for a structurally-mismatched `CREATE TABLE` /
+/// column-shape `ALTER TABLE` of one of the nine reserved names, local or
+/// wire. States the REAL rule: columns must structurally match the
+/// canonical shape the owning installer declares -- NOT that only the
+/// installer may ever type the name. A canonical-shape `CREATE TABLE` of
+/// any of these nine names, typed by a consumer directly, is legal (see
+/// `create_table_work_capabilities_with_canonical_columns_silent_on_policy_still_works`
+/// and its five hub-refereed siblings in `engine_owned_ledger_policy_tests.rs`);
+/// only a structural mismatch refuses.
+fn engine_owned_reserved_shape_refusal(table: &str, mismatch: ReservedShapeMismatch<'_>) -> Error {
+    let detail = match mismatch {
+        ReservedShapeMismatch::TableLevelConstraint => {
+            "a table-level UNIQUE, composite PRIMARY KEY, or composite FOREIGN KEY -- none of \
+             which the canonical shape declares"
+                .to_string()
+        }
+        ReservedShapeMismatch::ColumnCount => {
+            "a different number of columns than the canonical shape declares".to_string()
+        }
+        ReservedShapeMismatch::Column(column) => {
+            format!("its '{column}' column")
+        }
+        ReservedShapeMismatch::Unparseable => {
+            "columns whose declared type text does not even parse as a valid column shape"
+                .to_string()
+        }
+        ReservedShapeMismatch::TableOption(option) => {
+            format!("a table-level {option} option -- the canonical shape declares none")
+        }
+    };
+    Error::SchemaInvalid {
+        reason: format!(
+            "table '{table}' is engine-owned infrastructure, not an operator table: its shape \
+             does not structurally match the canonical shape {} declares for {table} -- the \
+             mismatch is {detail}. A CREATE TABLE or column-shape ALTER TABLE naming {table} is \
+             accepted only when every column matches the canonical shape across name, type, \
+             nullability, primary key, uniqueness, default, references, EXPIRES, and IMMUTABLE, \
+             and no table-level IMMUTABLE / STATE_MACHINE / DAG / PROPAGATE option is added. \
+             Choose a different name for a table of your own, or match {table}'s canonical \
+             shape exactly.",
+            engine_owned_reserved_name_installer(table)
+        ),
+    }
+}
+
+/// The function name of the installer that owns one of the nine reserved
+/// names, named in [`engine_owned_reserved_shape_refusal`]'s refusal
+/// message.
 fn engine_owned_reserved_name_installer(table: &str) -> &'static str {
     match table {
-        "work_inputs" | "work_capabilities" => "install_work_ledger_schema",
+        "work_jobs" | "work_claims" | "work_results" | "work_failures" | "work_cancellations"
+        | "work_inputs" | "work_capabilities" => "install_work_ledger_schema",
         "peer_directory" => "install_peer_directory_schema",
         "work_node_contacts" => "install_node_contacts_schema",
         _ => "the owning installer",
     }
 }
 
-/// The column-shape half of the reserved-name door: refuses a LOCAL `CREATE
-/// TABLE` of one of the four [`ENGINE_OWNED_LEDGER_TABLES`] names whose
-/// columns do not structurally match ([`engine_owned_reserved_table_columns`])
-/// the shape the owning installer's own `CREATE TABLE` text declares. `Ok`
-/// for any other table name.
+/// The candidate shape a reserved-name `CREATE TABLE` (local or wire) is
+/// judged on -- the type-agnostic bridge [`refuse_reserved_name_table_shape`]
+/// accepts so both the local door (whose input is a planner
+/// `CreateTablePlan`, carrying `propagation_rules: Vec<contextdb_core::
+/// PropagationRule>`) and the wire door (whose input, after reparse, is an
+/// `ast::CreateTable`, carrying `propagation_rules: Vec<AstPropagationRule>`)
+/// can feed it their own already-typed answer to "is this axis present at
+/// all" without either door needing to know the other's type.
+struct ReservedShapeCandidate<'a> {
+    columns: &'a [contextdb_parser::ast::ColumnDef],
+    unique_constraints: &'a [Vec<String>],
+    primary_key_columns: &'a [String],
+    has_composite_foreign_keys: bool,
+    immutable: bool,
+    has_state_machine: bool,
+    has_dag_edge_types: bool,
+    has_propagation_rules: bool,
+}
+
+/// The shared judge for a reserved-name `CREATE TABLE` / column-shape
+/// `ALTER TABLE`, local or wire: EVERY structural axis a `CreateTable`
+/// carries, not columns alone. Round 8 finding: round 7 closed the
+/// per-COLUMN subset-checklist class (`IMMUTABLE` / `EXPIRES` hiding on one
+/// column), but the door still compared only `columns` /
+/// `unique_constraints` / `primary_key_columns` / `composite_foreign_keys`
+/// -- the SAME subset-checklist failure one level up, on the table's own
+/// options: `CreateTablePlan.immutable` / `.state_machine` /
+/// `.dag_edge_types` / `.propagation_rules` never reached any door, so a
+/// table-level `IMMUTABLE` on `work_claims` armed `Error::ImmutableTable` on
+/// its own lease-renewal UPDATE while `SHOW` still reported it governed.
 ///
-/// This is deliberately a COLUMN check only, run independently of
-/// [`refuse_engine_owned_policy_axes`] (the policy half, run separately once
-/// the projected `TableMeta` exists): a create that restates the exact
-/// canonical columns but is silent on RETAIN / HISTORY / SYNC CONFLICT / SYNC
-/// still passes here -- that is exactly the shape a pre-declaration legacy
-/// root (or reconciliation tests that construct that
-/// legacy root directly through this same local `CREATE TABLE` path) needs to
-/// keep working. What this check closes is different: before it existed,
-/// fresh LOCAL creation of one of these four names was entirely unguarded --
-/// neither door in this file nor its sync-apply mirrors judge a `CreateTable`
-/// for a table that does not yet exist locally, so a consumer could hand any
-/// column shape at all to a reserved name (see
-/// `engine_owned_ledger_policy_tests.rs`'s
-/// `drop_then_recreate_from_older_binary_lands_undeclared_pending_next_reconcile`
-/// doc comment, which describes the same fresh-create limitation).
-fn refuse_engine_owned_reserved_name_shape(
+/// EXPLICIT EXEMPTION (C1-1, owner-deferred -- do not fold these in without
+/// a fresh owner ruling): `RETAIN` / `SYNC` direction / `HISTORY` are judged
+/// by [`refuse_engine_owned_policy_axes`] once a projected `TableMeta`
+/// exists, not here; `SYNC CONFLICT` is judged by that door and
+/// [`refuse_hub_refereed_ledger_sync_conflict_mismatch`]. This door judges
+/// only the axes that were NEVER anyone's job before round 8: table-level
+/// `IMMUTABLE` / `STATE_MACHINE` / `DAG` / `PROPAGATE`, plus the round-7
+/// column/table-level-constraint checks it already owned.
+fn refuse_reserved_name_table_shape(
     table: &str,
-    columns: &[contextdb_parser::ast::ColumnDef],
+    candidate: ReservedShapeCandidate<'_>,
 ) -> Result<()> {
-    let Some(canonical) = engine_owned_reserved_table_columns(table) else {
+    let Some(canonical) = engine_owned_reserved_table_canonical_create(table) else {
         return Ok(());
     };
-    let matches_canonical = columns.len() == canonical.len()
-        && columns
-            .iter()
-            .zip(canonical.iter())
-            .all(|(column, (name, data_type, primary_key))| {
-                column.name == *name
-                    && column.data_type == *data_type
-                    && column.primary_key == *primary_key
-            });
-    if matches_canonical {
+    // None of the nine reserved tables' own CREATE TABLE text declares a
+    // table-level constraint -- no composite UNIQUE, no table-level
+    // PRIMARY KEY (a, b, ...), no composite FOREIGN KEY. Refuse any of the
+    // three outright before the per-column comparison below: cheap (three
+    // emptiness checks), and it closes the same smuggling shape as a
+    // hidden per-column UNIQUE without needing a canonical value to vary
+    // per table.
+    if !candidate.unique_constraints.is_empty()
+        || !candidate.primary_key_columns.is_empty()
+        || candidate.has_composite_foreign_keys
+    {
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::TableLevelConstraint,
+        ));
+    }
+    // None of the nine reserved tables' own CREATE TABLE text declares a
+    // table-level IMMUTABLE / STATE_MACHINE / DAG / PROPAGATE option --
+    // asserted of `canonical` below (never just assumed), so an installer
+    // DDL that DID start declaring one of these would fail loudly rather
+    // than being silently exempted, mirroring `column_def_matches_canonical`'s
+    // own two-sided assertions.
+    if candidate.immutable {
+        debug_assert!(!canonical.immutable);
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::TableOption("IMMUTABLE"),
+        ));
+    }
+    if candidate.has_state_machine {
+        debug_assert!(canonical.state_machine.is_none());
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::TableOption("STATE_MACHINE"),
+        ));
+    }
+    if candidate.has_dag_edge_types {
+        debug_assert!(canonical.dag_edge_types.is_empty());
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::TableOption("DAG"),
+        ));
+    }
+    if candidate.has_propagation_rules {
+        debug_assert!(canonical.propagation_rules.is_empty());
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::TableOption("PROPAGATE"),
+        ));
+    }
+    if candidate.columns.len() != canonical.columns.len() {
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::ColumnCount,
+        ));
+    }
+    if let Some((column, _)) = candidate
+        .columns
+        .iter()
+        .zip(canonical.columns.iter())
+        .find(|(column, canon)| !column_def_matches_canonical(column, canon))
+    {
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::Column(&column.name),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that an arriving wire-format `CREATE TABLE` / column-shape-
+/// restating `ALTER TABLE` (see `database.rs`'s
+/// `refuse_engine_owned_policy_sync_ddl`, which calls this from both arms)
+/// of one of the nine engine-owned reserved tables match the FULL canonical
+/// shape -- the wire-format mirror of
+/// [`refuse_engine_owned_reserved_name_shape`], sharing its judge
+/// ([`refuse_reserved_name_table_shape`]). `Ok` for any other table name,
+/// `Ok` for a canonical match, `Err` for a structural mismatch.
+///
+/// DESIGN CHOICE (round 7, replacing round 6's token-matching; round 8
+/// widened the reconstruction to carry `constraints` too, closing the
+/// table-level-options gap on this side the same way): the wire format
+/// carries each column as one flat `(name, type-and-constraints-string)`
+/// pair and table options as a flat `Vec<String>`, neither a structured
+/// `ast::CreateTable`. This reconstructs both into real `CREATE TABLE` SQL
+/// text (`database.rs`'s own `sync_create_table_sql`, the SAME builder its
+/// `validate_sync_table_shape_ddl` / `validate_sync_alter_table_shape_ddl`
+/// already use to pre-validate arriving DDL) and runs it through the REAL
+/// parser, then judges the WHOLE parsed statement with the identical
+/// [`refuse_reserved_name_table_shape`] the local door uses. There is no
+/// keyword list left to fall out of sync with the AST, on the column axis
+/// or the table-option axis.
+///
+/// `composite_unique` / `composite_foreign_keys` arrive already structured
+/// (the wire protocol never flattens table-level constraints into a
+/// string), so that half of the table-level check costs nothing beyond an
+/// emptiness test -- refused up front, same as the local AST door, and
+/// passed as empty into the reconstruction below (composite table elements
+/// never legally appear in a reserved-name `constraints` string either).
+pub(crate) fn refuse_engine_owned_reserved_name_shape_wire(
+    table: &str,
+    columns: &[(String, String)],
+    constraints: &[String],
+    foreign_keys: &[contextdb_core::SingleColumnForeignKey],
+    composite_unique: &[Vec<String>],
+    composite_foreign_keys: &[contextdb_core::CompositeForeignKey],
+) -> Result<()> {
+    if engine_owned_reserved_table_create_ddl(table).is_none() {
+        return Ok(());
+    }
+    if !composite_unique.is_empty() || !composite_foreign_keys.is_empty() {
+        return Err(engine_owned_reserved_shape_refusal(
+            table,
+            ReservedShapeMismatch::TableLevelConstraint,
+        ));
+    }
+
+    let candidate_ddl = crate::database::sync_create_table_sql(
+        table,
+        columns,
+        constraints,
+        foreign_keys,
+        composite_foreign_keys,
+        composite_unique,
+    );
+    let candidate = match contextdb_parser::parse(&candidate_ddl) {
+        Ok(contextdb_parser::ast::Statement::CreateTable(create)) => create,
+        _ => {
+            return Err(engine_owned_reserved_shape_refusal(
+                table,
+                ReservedShapeMismatch::Unparseable,
+            ));
+        }
+    };
+
+    refuse_reserved_name_table_shape(
+        table,
+        ReservedShapeCandidate {
+            columns: &candidate.columns,
+            unique_constraints: &candidate.unique_constraints,
+            primary_key_columns: &candidate.primary_key_columns,
+            has_composite_foreign_keys: !candidate.composite_foreign_keys.is_empty(),
+            immutable: candidate.immutable,
+            has_state_machine: candidate.state_machine.is_some(),
+            has_dag_edge_types: !candidate.dag_edge_types.is_empty(),
+            has_propagation_rules: !candidate.propagation_rules.is_empty(),
+        },
+    )
+}
+
+/// The column-and-table-option-shape half of the reserved-name door:
+/// refuses a LOCAL `CREATE TABLE` of one of the nine reserved names whose
+/// shape does not structurally match
+/// ([`refuse_reserved_name_table_shape`]) the shape the owning installer's
+/// own `CREATE TABLE` text declares
+/// ([`engine_owned_reserved_table_canonical_create`]). `Ok` for any other
+/// table name.
+///
+/// This is deliberately independent of [`refuse_engine_owned_policy_axes`]
+/// (the RETAIN/HISTORY/SYNC-direction/SYNC-CONFLICT policy half, run
+/// separately once the projected `TableMeta` exists -- see C1-1 in
+/// [`refuse_reserved_name_table_shape`]'s doc comment): a create that
+/// restates the exact canonical shape but is silent on those axes still
+/// passes here -- that is exactly the shape a pre-declaration legacy root
+/// (or reconciliation tests that construct that legacy root directly
+/// through this same local `CREATE TABLE` path) needs to keep working.
+///
+/// `plan` is destructured EXHAUSTIVELY (no `..`), the same structural
+/// guarantee round 7 gave `ColumnDef`: a future `CreateTablePlan` field is a
+/// COMPILE ERROR here until this door is told how the new field
+/// participates -- either compared, or explicitly exempted with a comment
+/// naming why (as `retain` / `sync_direction` / `conflict_policy` /
+/// `history` are below) -- instead of silently smuggling through the way
+/// `immutable` / `state_machine` / `dag_edge_types` / `propagation_rules`
+/// did before round 8.
+fn refuse_engine_owned_reserved_name_shape(
+    plan: &contextdb_planner::CreateTablePlan,
+) -> Result<()> {
+    let contextdb_planner::CreateTablePlan {
+        name,
+        columns,
+        unique_constraints,
+        primary_key_columns,
+        composite_foreign_keys,
+        immutable,
+        state_machine,
+        dag_edge_types,
+        propagation_rules,
+        // C1-1 (owner-deferred): RETAIN / SYNC direction / HISTORY are
+        // judged by `refuse_engine_owned_policy_axes` once a projected
+        // `TableMeta` exists, not by this shape-only door -- do not fold
+        // them in here without a fresh owner ruling; that would silently
+        // widen a deliberate deferral.
+        retain: _,
+        sync_direction: _,
+        // Judged by `refuse_engine_owned_policy_axes` /
+        // `refuse_hub_refereed_ledger_sync_conflict_mismatch`, not here.
+        conflict_policy: _,
+        history: _,
+    } = plan;
+    refuse_reserved_name_table_shape(
+        name,
+        ReservedShapeCandidate {
+            columns,
+            unique_constraints,
+            primary_key_columns,
+            has_composite_foreign_keys: !composite_foreign_keys.is_empty(),
+            immutable: *immutable,
+            has_state_machine: state_machine.is_some(),
+            has_dag_edge_types: !dag_edge_types.is_empty(),
+            has_propagation_rules: !propagation_rules.is_empty(),
+        },
+    )
+}
+
+/// The column-shape half of the reserved-name door for a LOCAL `ALTER
+/// TABLE ... ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` naming one of the
+/// nine reserved names -- refuses outright, before any other ALTER
+/// validation runs, so a rejected statement applies no part of itself. Column
+/// shape on these nine names is declared exactly once, by the owning
+/// installer's own `CREATE TABLE` text
+/// ([`engine_owned_reserved_table_create_ddl`]); the engine's own
+/// bookkeeping (`work_ledger.rs`, `peer_directory.rs`, and
+/// `contextdb-server`'s node-contacts tracking) reads these tables' columns
+/// by name and depends on them staying exactly as declared, the same reason
+/// [`refuse_engine_owned_reserved_name_shape`] refuses a mismatched fresh
+/// `CREATE TABLE` of one of these names. `Ok` for any other table name --
+/// column-shape ALTERs on an operator table are entirely unaffected.
+fn refuse_engine_owned_reserved_name_column_alter(table: &str) -> Result<()> {
+    if engine_owned_reserved_table_create_ddl(table).is_none() {
         return Ok(());
     }
     Err(Error::SchemaInvalid {
         reason: format!(
             "table '{table}' is engine-owned infrastructure, not an operator table: its column \
-             shape is declared once, in the engine's own CREATE TABLE text for {table}, and the \
-             engine's own bookkeeping depends on it staying exactly as declared there. {table} is \
-             (re)declared only by the installer that owns it ({}), never by a CREATE TABLE a \
-             consumer types directly -- choose a different name for a table of your own.",
+             shape is declared once, in the engine's own CREATE TABLE text for {table} \
+             ({}), and the engine's own bookkeeping depends on it staying exactly as declared \
+             there -- an ALTER TABLE ADD COLUMN / DROP COLUMN / RENAME COLUMN naming {table} is \
+             refused outright, never applied. Reshape a table of your own instead.",
             engine_owned_reserved_name_installer(table)
         ),
     })
@@ -9104,18 +9512,184 @@ pub(crate) fn engine_owned_policy_refusal(table: &str, clause: &str) -> Error {
     } else {
         ""
     };
+    // The five hub-refereed work-ledger tables outside `ENGINE_OWNED_LEDGER_TABLES`
+    // (`work_jobs` / `work_claims` / `work_results` / `work_failures` /
+    // `work_cancellations`) get an axis-scoped message, never the table-wide
+    // "never by an ALTER an operator types" claim below: SYNC CONFLICT is the
+    // ONLY axis any door judges for these five today (RETAIN / HISTORY / SYNC
+    // direction are unguarded on them -- filed as C1-1, owner-deferred), so a
+    // categorical "unalterable" claim would be false. `work_claims` /
+    // `work_results` / `work_cancellations` additionally carry NO `SYNC
+    // CONFLICT` clause in their own `CREATE TABLE` text at all (see
+    // `CREATE_WORK_CLAIMS` / `CREATE_WORK_RESULTS` / `CREATE_WORK_CANCELLATIONS`
+    // in `work_ledger.rs`) -- their real arbitration is a purely
+    // engine-INTERNAL `ServerWins` override
+    // (`work_ledger::apply_work_ledger_policy_overrides_inner`) that no DDL
+    // text anywhere declares, so pointing a dissatisfied operator at "the
+    // engine's own CREATE TABLE text" for these three would name a document
+    // that does not exist; `work_jobs` / `work_failures` DO carry the clause
+    // in their own DDL, so their message may cite it.
+    if clause == "SYNC CONFLICT" && is_hub_refereed_sync_conflict_table(table) {
+        let arbitration_source =
+            if matches!(table, "work_claims" | "work_results" | "work_cancellations") {
+                format!(
+                    "its {clause} arbitration is decided entirely inside the engine -- a \
+                     hub-refereed override applied at every sync chokepoint, not a clause \
+                     {table}'s own CREATE TABLE text declares"
+                )
+            } else {
+                format!(
+                    "its {clause} declaration lives once, in the engine's own CREATE TABLE text \
+                     for {table}, mirrored by the same hub-refereed override applied at every \
+                     sync chokepoint"
+                )
+            };
+        // Not installer-exclusive: a consumer CAN legally restate this
+        // axis verbatim (the honest, canonical-matching clause) in their
+        // own CREATE TABLE -- only a MISMATCHING value is refused. Say
+        // that, not a categorical "only the installer may declare this".
+        return Error::SchemaInvalid {
+            reason: format!(
+                "table '{table}' is engine-owned infrastructure, not an operator table: \
+                 {arbitration_source}. A {clause} clause that restates this arbitration \
+                 verbatim, or no {clause} clause at all, is accepted here; a value that \
+                 mismatches it is refused."
+            ),
+        };
+    }
+    // The four ORIGINAL `ENGINE_OWNED_LEDGER_TABLES` (`work_inputs` /
+    // `work_capabilities` / `peer_directory` / `work_node_contacts`) reach
+    // here for a MISMATCHING SYNC CONFLICT declaration. RETAIN / HISTORY /
+    // SYNC direction on these four are held to the identical mismatch-only
+    // contract, not ALTER-immunity: an ALTER naming one of these tables is
+    // refused only when the table already exists (the caller checks
+    // existence before any of these doors run) AND the value it declares
+    // mismatches the canonical one -- a verbatim restate, or silence on the
+    // axis, is accepted on every one of them, RETAIN / HISTORY / SYNC
+    // direction included, the same as SYNC CONFLICT here.
+    // `refuse_engine_owned_policy_mutation` already tolerates an honest
+    // VERBATIM restate of SYNC CONFLICT specifically
+    // (`restating_the_declared_value_verbatim_is_not_refused`), so a
+    // categorical "never alterable" claim would be false for this axis --
+    // exactly the same falsehood already fixed on the five hub-refereed
+    // tables above. Give SYNC CONFLICT its own mismatch-only wording here
+    // too, before falling through to the shared mismatch-only message every
+    // other axis reaches.
+    if clause == "SYNC CONFLICT" {
+        // `work_node_contacts` is the one member of `ENGINE_OWNED_LEDGER_TABLES`
+        // whose own CREATE TABLE text (`CREATE_WORK_NODE_CONTACTS`) declares
+        // NO SYNC CONFLICT clause at all -- `engine_owned_ledger_policy`'s
+        // own canonical entry for it is `conflict: None`. The generic
+        // wording below is false for it on both counts: there is no
+        // declaration "living once" in its DDL text to point at, and there
+        // is no canonical value for a caller to "restate verbatim" and be
+        // accepted -- EVERY explicit SYNC CONFLICT value mismatches the
+        // undeclared `None`, not just a wrong one.
+        if engine_owned_ledger_policy(table).is_some_and(|policy| policy.conflict.is_none()) {
+            return Error::SchemaInvalid {
+                reason: format!(
+                    "table '{table}' is engine-owned infrastructure, not an operator table: its \
+                     own CREATE TABLE text declares no {clause} clause at all, and the engine's \
+                     own bookkeeping depends on that staying undeclared -- an explicit {clause} \
+                     value is refused here regardless of what it names.{tunable_surface}"
+                ),
+            };
+        }
+        return Error::SchemaInvalid {
+            reason: format!(
+                "table '{table}' is engine-owned infrastructure, not an operator table: its \
+                 {clause} declaration lives once, in the engine's own CREATE TABLE text for \
+                 {table}, and the engine's own bookkeeping depends on it staying exactly as \
+                 declared there. A {clause} clause that restates this arbitration verbatim, \
+                 or no {clause} clause at all, is accepted here; a value that mismatches it \
+                 is refused.{tunable_surface}"
+            ),
+        };
+    }
     Error::SchemaInvalid {
         reason: format!(
             "table '{table}' is engine-owned infrastructure, not an operator table: its \
              {clause} declaration lives once, in the engine's own CREATE TABLE text for \
              {table}, and the engine's own bookkeeping depends on it staying exactly as \
              declared there -- changing it here would leave the engine reasoning about a \
-             shape the stored rows no longer match. {table} is (re)declared only by the \
-             installer that owns it, never by an ALTER an operator types. Declare RETAIN / \
-             HISTORY / SYNC CONFLICT on tables you create instead -- ALTER TABLE there is \
-             unrestricted.{tunable_surface}"
+             shape the stored rows no longer match. A {clause} clause that restates this \
+             declaration verbatim, or no {clause} clause at all, is accepted here; a value \
+             that mismatches it is refused. Declare RETAIN / HISTORY / SYNC CONFLICT on \
+             tables you create instead -- ALTER TABLE there is unrestricted.{tunable_surface}"
         ),
     }
+}
+
+/// The five hub-refereed work-ledger tables not in
+/// [`ENGINE_OWNED_LEDGER_TABLES`] (`work_jobs`, `work_claims`,
+/// `work_results`, `work_failures`, `work_cancellations`), paired with each
+/// one's TRUE arbitration display word -- derived from the SAME live source
+/// [`crate::work_ledger::work_ledger_conflict_policy_entries_inner`]'s
+/// `SHOW SYNC_CONFLICT_POLICY` reads
+/// ([`crate::work_ledger::engine_owned_work_ledger_conflict_policy_display`]),
+/// filtered to the names outside `ENGINE_OWNED_LEDGER_TABLES` (which already
+/// get full-axis coverage from [`refuse_engine_owned_policy_axes`] and so
+/// are excluded here). One source of truth, so a future ledger-policy
+/// change can never split SHOW's rendering from what these doors refuse.
+fn hub_refereed_sync_conflict_tables() -> Vec<(&'static str, &'static str)> {
+    crate::work_ledger::engine_owned_work_ledger_conflict_policy_display()
+        .into_iter()
+        .filter(|(table, _)| !ENGINE_OWNED_LEDGER_TABLES.contains(table))
+        .collect()
+}
+
+/// `true` iff `table` is one of the five
+/// [`hub_refereed_sync_conflict_tables`] names -- the membership half,
+/// shared by [`engine_owned_policy_refusal`]'s message-wording branch and
+/// `database.rs`'s fresh-CreateTable wire preflight (which widens its match
+/// guard with this alongside [`ENGINE_OWNED_LEDGER_TABLES`]).
+pub(crate) fn is_hub_refereed_sync_conflict_table(table: &str) -> bool {
+    hub_refereed_sync_conflict_tables()
+        .iter()
+        .any(|(owned_table, _)| *owned_table == table)
+}
+
+/// Refuses an EXPLICIT `SYNC CONFLICT` value that mismatches
+/// [`hub_refereed_sync_conflict_tables`]'s true arbitration word for one of
+/// the five hub-refereed work-ledger tables: the local ALTER arm
+/// (`AlterAction::SetSyncConflict`), fresh local `CREATE TABLE`, and the
+/// three arriving-sync-DDL preflights in `database.rs` (`AlterTable`,
+/// `CreateTable` adopting an existing table, and fresh `CreateTable` of a
+/// reserved name) -- every door that can move this axis for these five
+/// tables.
+///
+/// Deliberately narrower than [`refuse_engine_owned_policy_axes`] (the
+/// full-axis door the four [`ENGINE_OWNED_LEDGER_TABLES`] get): it judges
+/// ONLY the SYNC CONFLICT axis. RETAIN / HISTORY / SYNC direction on these
+/// five carry no canonical value anywhere the way the four
+/// `ENGINE_OWNED_LEDGER_TABLES` do (`engine_owned_ledger_policy` declares a
+/// full canonical shape on every axis for those four, and its `match` would
+/// need a real value for axes these five never declare) -- so this is a
+/// separate, axis-scoped door rather than a widened
+/// `ENGINE_OWNED_LEDGER_TABLES`. Widening the RETAIN/HISTORY/SYNC gap on
+/// these five is filed as C1-1 (owner-deferred); do not fold it in here.
+///
+/// `Ok` for any other table, `Ok` when `incoming_conflict_policy` is `None`
+/// (silence, e.g. the pre-declaration legacy shape, or a table create/alter
+/// that never mentions SYNC CONFLICT at all), `Ok` for a verbatim restate of
+/// the table's true arbitration word, `Err` for any other explicit value.
+pub(crate) fn refuse_hub_refereed_ledger_sync_conflict_mismatch(
+    table: &str,
+    incoming_conflict_policy: Option<contextdb_core::ConflictPolicy>,
+) -> Result<()> {
+    let Some(policy) = incoming_conflict_policy else {
+        return Ok(());
+    };
+    let Some((_, true_word)) = hub_refereed_sync_conflict_tables()
+        .into_iter()
+        .find(|(owned_table, _)| *owned_table == table)
+    else {
+        return Ok(());
+    };
+    if declared_conflict_policy_to_string(policy) != true_word {
+        return Err(engine_owned_policy_refusal(table, "SYNC CONFLICT"));
+    }
+    Ok(())
 }
 
 fn expires_column_name(columns: &[contextdb_parser::ast::ColumnDef]) -> Result<Option<String>> {
@@ -9682,7 +10256,7 @@ struct ResolvedRankPolicy {
     formula: Arc<RankFormula>,
 }
 
-fn core_column_from_ast(
+pub(crate) fn core_column_from_ast(
     col: &contextdb_parser::ast::ColumnDef,
     rank_policy: Option<contextdb_core::RankPolicy>,
 ) -> contextdb_core::ColumnDef {

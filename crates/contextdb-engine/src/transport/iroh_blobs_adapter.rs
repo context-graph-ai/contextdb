@@ -1,5 +1,6 @@
-//! The media-plane fetch backend, contained here per Rule 2: this module is
-//! the ONLY place iroh-blobs is named. It wraps the upstream content store
+//! The media-plane fetch backend, contained here by the transport adapter
+//! purity guard: this module is the ONLY place iroh-blobs is named. It
+//! wraps the upstream content store
 //! (BLAKE3-addressed, Bao-verified streaming, partial-state resume) and the
 //! upstream provider path, composing both UNDER contextdb's ledger
 //! authorization: the serving side evaluates the caller's verdict — supplied

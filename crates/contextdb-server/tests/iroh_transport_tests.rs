@@ -2804,7 +2804,8 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         "contextdb-server/src/transport/iroh.rs",
         // The media-plane fetch backend: the second adapter file under
         // src/transport/, the sole sanctioned home of the iroh-blobs backend
-        // (Rule 2), enforced by media_transfer_containment.rs.
+        // (the transport adapter purity guard), enforced by
+        // media_transfer_containment.rs.
         "contextdb-engine/src/transport/iroh_blobs_adapter.rs",
         // The seam wiring: feature gate + factory routing only.
         "contextdb-server/src/transport/mod.rs",

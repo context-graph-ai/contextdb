@@ -31,7 +31,7 @@ const GROUP_DDL: &str = "CREATE TABLE claim_groups (id TEXT PRIMARY KEY, label T
 /// The claim references its group, so a push carrying both is ONE connected,
 /// dependency-complete unit — the shape whose refusal is decided as a single
 /// acceptance and retires the resend obligation with a receipt.
-const DDL: &str = "CREATE TABLE work_claims (claim_key TEXT PRIMARY KEY, \
+const DDL: &str = "CREATE TABLE relay_claims (claim_key TEXT PRIMARY KEY, \
      group_id TEXT REFERENCES claim_groups(id), holder TEXT) \
      SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
@@ -63,7 +63,7 @@ fn claim(db: &Database, key: &str, holder: &str) {
     .expect("insert claim group");
     db.execute_in_tx(
         tx,
-        "INSERT INTO work_claims (claim_key, group_id, holder) \
+        "INSERT INTO relay_claims (claim_key, group_id, holder) \
          VALUES ($claim_key, $group_id, $holder)",
         &HashMap::from([
             ("claim_key".to_string(), Value::Text(key.to_string())),
@@ -83,7 +83,7 @@ fn claim(db: &Database, key: &str, holder: &str) {
 fn holder(db: &Database, key: &str) -> Option<String> {
     let result = db
         .execute(
-            "SELECT holder FROM work_claims WHERE claim_key = $claim_key",
+            "SELECT holder FROM relay_claims WHERE claim_key = $claim_key",
             &HashMap::from([("claim_key".to_string(), Value::Text(key.to_string()))]),
         )
         .expect("claim scan");
@@ -214,7 +214,7 @@ async fn a_refused_pusher_is_served_the_winning_claim_on_its_next_pull() {
     );
     let claim_diagnostic = diagnostics
         .iter()
-        .find(|entry| entry.get("table") == Some(&json!("work_claims")))
+        .find(|entry| entry.get("table") == Some(&json!("relay_claims")))
         .expect("the colliding claim is reported");
     assert_eq!(
         claim_diagnostic.get("natural_key"),
@@ -265,7 +265,7 @@ async fn a_refused_pusher_is_served_the_winning_claim_on_its_next_pull() {
     assert_eq!(
         group_diagnostic.get("refusal_cause"),
         Some(&json!({
-            "table": "work_claims",
+            "table": "relay_claims",
             "natural_key": { "column": "claim_key", "value": { "Text": "job-1" }, "rest": [] },
         })),
         "the winnerless member names the claim whose winner refused the unit: \

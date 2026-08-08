@@ -1986,13 +1986,13 @@ impl SyncClient {
                 })?;
             saw_deliverable_changes |=
                 applied_page.suppressed_live_replay_only || applied_page.has_deliverable_changes;
+            let stop_for_trigger_bootstrap =
+                has_more && applied_page.awaits_trigger_callback_registration;
             // Counted from the SAME row set the bytes are counted from: what
             // this end took off the wire. Using the applied count here instead
             // would pair an items figure with a payload figure drawn from two
             // different sets, so a pull with skipped rows would report bytes for
             // rows its own item count denied.
-            let stop_for_trigger_bootstrap =
-                has_more && applied_page.awaits_trigger_callback_registration;
             self.receipts.record(
                 hub.as_deref(),
                 TransferPlane::Sync,
