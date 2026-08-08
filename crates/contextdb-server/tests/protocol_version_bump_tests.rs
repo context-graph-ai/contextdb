@@ -454,3 +454,85 @@ async fn a_version_mismatched_peer_is_refused_on_the_status_exchange() {
 
     hub.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// `WirePushError::ReplaysAcceptedDelete` (commit 861588c) added a NEW enum
+// variant to the wire. OWNER RULING (2026-08-06): no version bump is needed
+// for this — everything on this wire is greenfield, nothing has been
+// released, and every consumer builds from the same `dev` path and rebuilds
+// together, so the wire may change in place until the first public release
+// (version-bump discipline applies starting at that first release, not
+// before it). These two tests are both permanent, GREEN pins, not defect
+// proofs:
+// ---------------------------------------------------------------------------
+
+/// GREEN pin: freezes today's actual encoded bytes for the new variant, so
+/// any future accidental reshaping of `WirePushError::ReplaysAcceptedDelete`
+/// is caught here rather than discovered as a silent wire break.
+#[test]
+fn replays_accepted_delete_wire_bytes_are_frozen() {
+    let err = contextdb_server::protocol::WirePushError::ReplaysAcceptedDelete {
+        table: "notes".to_string(),
+        key: vec![("id".to_string(), Value::Int64(7))],
+    };
+    let bytes = rmp_serde::to_vec(&err).expect("encode ReplaysAcceptedDelete");
+    let frozen: &[u8] = &[
+        129, 181, 82, 101, 112, 108, 97, 121, 115, 65, 99, 99, 101, 112, 116, 101, 100, 68, 101,
+        108, 101, 116, 101, 146, 165, 110, 111, 116, 101, 115, 145, 146, 162, 105, 100, 129, 165,
+        73, 110, 116, 54, 52, 7,
+    ];
+    assert_eq!(
+        bytes, frozen,
+        "the on-wire encoding of WirePushError::ReplaysAcceptedDelete has changed; if this \
+         is deliberate, refreeze the literal AND re-check every already-shipped peer's \
+         decode compatibility with the new shape"
+    );
+}
+
+/// GREEN, permanent documentation of the compat boundary this repo is
+/// deliberately relying on pre-release, not a defect proof: `rmp_serde::to_vec`
+/// (compact mode, used by `encode`/`decode` above) tags an enum externally BY
+/// VARIANT NAME, not by index — so a `WirePushError` shape compiled BEFORE
+/// this variant existed cannot recognize the "ReplaysAcceptedDelete" tag at
+/// all and fails to decode any `PushResponse` carrying it. This is exactly
+/// WHY every machine on this wire must rebuild from `dev` together until the
+/// first public release (owner ruling, 2026-08-06) — there is no version
+/// negotiation covering this gap today, only the "everyone tracks `dev`"
+/// discipline. Once a release ships, this same fact is the argument FOR
+/// applying version-bump discipline from then on.
+#[test]
+fn pre_release_wire_additions_are_incompatible_with_a_stale_build_not_covered_by_a_version_bump() {
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    enum StaleWirePushError {
+        PurgeRequiresAuthoritativeHub { hub_node_id: String },
+    }
+
+    let new_variant = contextdb_server::protocol::WirePushError::ReplaysAcceptedDelete {
+        table: "notes".to_string(),
+        key: vec![("id".to_string(), Value::Int64(7))],
+    };
+    let bytes = rmp_serde::to_vec(&new_variant).expect("encode new variant");
+
+    let decoded = rmp_serde::from_slice::<StaleWirePushError>(&bytes);
+    assert!(
+        decoded.is_err(),
+        "a build compiled before this variant existed must fail to decode it \
+         (proving why every machine must rebuild from dev together pre-release), \
+         but it decoded as {decoded:?}"
+    );
+
+    // The pre-existing variant, unchanged, still decodes cleanly under the
+    // stale shape — this is an addition-only gap, not a wholesale one.
+    let old_variant = contextdb_server::protocol::WirePushError::PurgeRequiresAuthoritativeHub {
+        hub_node_id: "hub-1".to_string(),
+    };
+    let old_bytes = rmp_serde::to_vec(&old_variant).expect("encode old variant");
+    let old_decoded = rmp_serde::from_slice::<StaleWirePushError>(&old_bytes)
+        .expect("the pre-existing variant must remain decodable under the stale shape");
+    assert_eq!(
+        old_decoded,
+        StaleWirePushError::PurgeRequiresAuthoritativeHub {
+            hub_node_id: "hub-1".to_string()
+        }
+    );
+}

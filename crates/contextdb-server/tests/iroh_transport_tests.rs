@@ -2856,6 +2856,14 @@ fn iroh_word_confined_to_adapter_and_config_surface() {
         // endpoint configuration while keeping production callers neutral.
         "contextdb-cli/tests/declared_sync_surface_tests.rs",
         "contextdb-cli/tests/json_stderr_purity_tests.rs",
+        // These CLI pull-liveness/tombstone-replay/purge-verb suites bind a
+        // real localhost endpoint (the same pattern as
+        // declared_sync_surface_tests.rs) to drive `.sync pull`/`.purge`
+        // through the real authenticated transport contract, not a double.
+        "contextdb-cli/tests/sync_pull_liveness_tests.rs",
+        "contextdb-cli/tests/sync_pull_progress_counter_tests.rs",
+        "contextdb-cli/tests/tombstone_exit_push_false_failure_tests.rs",
+        "contextdb-cli/tests/purge_cli_verb_tests.rs",
         "contextdb-engine/tests/fixtures/public_api_forbidden/src/main.rs",
         // The engine mirrors the server transport adapter and its seam.
         "contextdb-engine/src/transport/iroh.rs",

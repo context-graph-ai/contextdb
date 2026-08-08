@@ -260,6 +260,27 @@ fn main() {
                                 caught_up: false,
                             });
                         }
+                        Err(contextdb_core::Error::SyncReplayOfAcceptedDelete { table, key }) => {
+                            // The store already agrees: benign convergence,
+                            // not a failure -- see
+                            // `Error::SyncReplayOfAcceptedDelete`'s doc
+                            // comment. Report it once as a notice (not a
+                            // repeating "could not push" failure message)
+                            // and mark caught up so auto-sync stops
+                            // retrying a push that will never resolve any
+                            // differently.
+                            output.report_notice(
+                                ErrorClass::Sync,
+                                &format!(
+                                    "Background auto-sync push re-offered {table} {key:?}, which \
+                                     the hub already converged on as deleted; nothing to do."
+                                ),
+                            );
+                            return Ok(auto_sync::PushOutcome {
+                                conflicts: Vec::new(),
+                                caught_up: true,
+                            });
+                        }
                         Err(err) => return Err(err.to_string()),
                     };
                     Ok(auto_sync::PushOutcome {
@@ -342,6 +363,27 @@ fn main() {
                     if exit_code == 0 {
                         exit_code = EXIT_INTERRUPTED_PUSH_UNCONFIRMED;
                     }
+                }
+                Err(contextdb_core::Error::SyncReplayOfAcceptedDelete { table, key }) => {
+                    // The store already agrees: this exit-push re-offered a
+                    // row the hub had already terminated by an accepted
+                    // delete (the durable delete row itself has no local
+                    // "arrived by sync" provenance surviving a fresh
+                    // process, so the preflight above could not tell it
+                    // apart from a genuine unpushed local change — see
+                    // `Error::SyncReplayOfAcceptedDelete`'s doc comment).
+                    // The hub's typed refusal proves both sides already
+                    // converged on the delete, so this is benign, not a
+                    // failure: a quiet notice, exit code left at whatever it
+                    // already was (never downgraded to success, never
+                    // bumped to a failure).
+                    output.report_notice(
+                        ErrorClass::Sync,
+                        &format!(
+                            "Final sync push re-offered {table} {key:?}, which the hub already \
+                             converged on as deleted; nothing to do."
+                        ),
+                    );
                 }
                 Err(err) => {
                     output.report_error(

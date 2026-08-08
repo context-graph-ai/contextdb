@@ -59,8 +59,13 @@ $ echo ".schema decisions" | contextdb ./my.db --json | jq '{pk: .primary_key, r
 
 ```bash
 $ echo ".sync status" | contextdb ./my.db --tenant-id acme --sync-endpoint <ticket> --json
-{"sync":{"configured":true,"tenant":"acme","endpoint":"...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17}}
+{"sync":{"configured":true,"tenant":"acme","endpoint":"...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17,"pull_pages_read":0,"pull_in_progress":false}}
 ```
+
+`pull_pages_read` (cumulative pages this client has read, across every pull it has issued) and
+`pull_in_progress` (`true` only while a pull sharing this exact `SyncClient` handle is actively
+running) are liveness signals distinct from the watermarks above, which by contract only move once
+a pull fully completes — see the `sync` and `operating-a-store` skills for how to read them.
 
 | Command | Document |
 |---------|----------|
@@ -68,8 +73,9 @@ $ echo ".sync status" | contextdb ./my.db --tenant-id acme --sync-endpoint <tick
 | `.schema <table>` | `{"table":...,"columns":[...],"primary_key":[...],"indexes":[...],"ddl":...}` plus each declared policy |
 | `.explain <sql>` | `{"explain":{"physical_plan":...,"runtime_trace":true,"index_used":...,"predicates_pushed":[...],"indexes_considered":[...],"sort_elided":...}}` for a read-only statement; `{"explain":{"physical_plan":...,"runtime_trace":false}}` for any other |
 | `.trace on\|off` | `{"trace":"on"}` / `{"trace":"off"}` |
-| `.sync status` | `{"sync":{...}}` |
-| `.sync push` / `.sync pull` | `{"sync_push":{"applied_rows":N,"skipped_rows":N,"conflicts":[...],"outcome":"applied"}}` (`"unconfirmed"` for an interrupted push) |
+| `.sync status` | `{"sync":{...,"pull_pages_read":N,"pull_in_progress":bool}}` |
+| `.sync push` | `{"sync_push":{"applied_rows":N,"skipped_rows":N,"conflicts":[...],"outcome":"applied"}}` (`"unconfirmed"` for an interrupted push) |
+| `.sync pull` | `{"sync_pull":{"applied_rows":N,"skipped_rows":N,"conflicts":[...],"outcome":"applied","pull_pages_read":N,"pull_pages_read_this_pull":N}}` |
 | `.sync reconnect` / `destination` / `auto` | `{"sync_reconnect":...}`, `{"sync_destination":...}`, `{"sync_auto":...}` |
 | `.help` | `{"help":["line", ...]}`, on stderr (see below) |
 
@@ -326,6 +332,12 @@ For file-backed databases, `SET DISK_LIMIT` persists in the database file and su
 
 Every command below emits a JSON document under `--json`; `.help` is the one whose document goes to stderr instead of stdout, because it is guidance for a person rather than a result. See [`--json`](#--json) for every shape.
 
+**A meta-command consumes exactly one line — unlike a SQL statement (above), it never accumulates
+across newlines until a terminating `;`.** `.explain <sql>` is the one that most often tempts a
+multi-line paste (a long `WHERE` clause); splitting it across lines parses only the first line as
+the command and fails to parse the rest as SQL. Always paste a meta-command's whole invocation,
+including any SQL it takes as an argument, on one line.
+
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `.help` | `\?` | Show available commands. |
@@ -528,7 +540,7 @@ By default nothing is published anywhere and dialing uses exactly the addresses 
 Example — hub and edges on one LAN, immune to DHCP changes, still zero external infrastructure:
 
 ```bash
-contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?identity=./hub.key&lookup=mdns"
+contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?identity=./hub.db.fabric-identity.key&lookup=mdns"
 contextdb ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=<ticket>&lookup=mdns"
 ```
 

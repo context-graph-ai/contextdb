@@ -67,9 +67,21 @@ pub struct PushResponse {
     pub application_error: Option<WirePushError>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WirePushError {
-    PurgeRequiresAuthoritativeHub { hub_node_id: String },
+    PurgeRequiresAuthoritativeHub {
+        hub_node_id: String,
+    },
+    /// A push re-offered a row this hub already terminated by an accepted
+    /// delete -- the store already agrees, this is benign convergence, not
+    /// a definitive failure. Additive variant (mirrors how
+    /// `application_error` itself was added to `PushResponse` without a
+    /// `PROTOCOL_VERSION` bump): an old server never sends it, so an old
+    /// client never has to decode it.
+    ReplaysAcceptedDelete {
+        table: String,
+        key: Vec<(String, Value)>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]

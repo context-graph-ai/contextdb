@@ -15,18 +15,26 @@ Knowledge captured on any machine becomes available on all of them.
 
 There is **no broker**. An edge reaches the hub by dialing the hub's own cryptographic identity
 (dial-by-key), carried in an *enrollment ticket* the hub prints. The edge dials outbound, so a hub
-behind NAT works, no port forwarding and no VPN. Two machines on one LAN sync with nothing running
-in between and no internet; the default configuration contacts no third-party service.
+behind NAT works with no port forwarding and no VPN **once relay is enabled** (`relay=n0`, or a
+self-hosted relay — see "Crossing networks" below). By default the ticket carries only the hub's
+own addresses, so an edge on a genuinely different network than the hub (not just a different
+device on the same LAN) needs that step before it can connect. Two machines on one LAN sync with
+nothing running in between and no internet; the default configuration contacts no third-party
+service.
 
 ## Recipe checklist — hub, enroll, push, pull, converge
 
 1. Start the hub (below) and capture its ticket.
-2. Enroll edge A with that ticket, create a table, insert a row, `.sync push`.
-3. Enroll edge B with the same ticket, `.sync pull`, confirm the row arrived.
-4. Read `.sync status` and validate the counts mean what you think (§5 below) before trusting a
+2. **If the edge is on a different network than the hub** (not just a different device on the same
+   LAN — e.g. a remote or cloud edge reaching a home or office hub), the default ticket alone will
+   not connect them — go to "Crossing networks" below and restart the hub with `relay=n0` (or a
+   self-hosted relay) before enrolling.
+3. Enroll edge A with that ticket, create a table, insert a row, `.sync push`.
+4. Enroll edge B with the same ticket, `.sync pull`, confirm the row arrived.
+5. Read `.sync status` and validate the counts mean what you think (§5 below) before trusting a
    green run.
-5. **If a push or pull exits `3`**, that is not a failure — go to §6 ("Handle exit code 3").
-6. **If you need a DELETE to survive sync and a process restart**, the push/pull walkthrough
+6. **If a push or pull exits `3`**, that is not a failure — go to §6 ("Handle exit code 3").
+7. **If you need a DELETE to survive sync and a process restart**, the push/pull walkthrough
    below is not enough by itself — go straight to the dedicated recipe in §7.
 
 ## 1. Start the hub
@@ -35,16 +43,23 @@ The hub only serves. You don't type SQL at it — your data lives on the edges t
 
 ```bash
 rm -f ./hub.ticket
-contextdb-server --db-path ./hub.db --tenant-id demo --ticket-file ./hub.ticket &
+contextdb-server --db-path ./hub.db --tenant-id demo --ticket-file ./hub.ticket \
+  > ./hub.log 2>&1 &
 until [ -s ./hub.ticket ]; do sleep 0.2; done
 TICKET="$(cat ./hub.ticket)"
 ```
 
-`--ticket-file` writes the ticket once the endpoint is bound and then serves normally. **The ticket
-is sensitive bearer enrollment material, not a public identifier** — anyone who obtains it can
-enroll and sync with this hub until the hub's identity changes, so keep `./hub.ticket` (and any
-other file or log a ticket lands in) out of version control and restrict its file permissions. Two
-other modes, when that shape doesn't fit:
+Redirect stdout/stderr to a file (`./hub.log` above) rather than leaving them attached to your
+shell — run this verbatim over ssh with a bare `&`, and the unredirected output both leaks the
+ticket into whatever is capturing the session and holds the ssh session open.
+
+`--ticket-file` writes the ticket once the endpoint is bound and then serves normally — but the
+server still also prints the same ticket and dial command to stdout, so redirect that too (as
+above) or you've recreated the exact log-hazard this section warns about. **The ticket is sensitive
+bearer enrollment material, not a public identifier** — anyone who obtains it can enroll and sync
+with this hub until the hub's identity changes, so keep `./hub.ticket` (and any other file or log a
+ticket lands in) out of version control and restrict its file permissions. Two other modes, when
+that shape doesn't fit:
 
 ```bash
 # One JSON object with the ticket and a ready-to-paste dial command; then serves.
@@ -137,7 +152,7 @@ printf '.sync pull\nSELECT id, name FROM items ORDER BY name;\n' \
 ```
 
 ```json
-{"sync_pull":{"applied_rows":1,"conflicts":[],"outcome":"applied","skipped_rows":0}}
+{"sync_pull":{"applied_rows":1,"conflicts":[],"outcome":"applied","pull_pages_read":1,"pull_pages_read_this_pull":1,"skipped_rows":0}}
 [{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","name":"from edge A"},{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","name":"from edge B"}]
 ```
 
@@ -151,12 +166,19 @@ waiting for may not have been pushed from its origin edge yet.
 printf '.sync status\n' | contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
 ```
 ```json
-{"sync":{"configured":true,"tenant":"demo","endpoint":"iroh:?to=...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17}}
+{"sync":{"configured":true,"tenant":"demo","endpoint":"iroh:?to=...","transport":"connected","database_lsn":42,"push_watermark":40,"pull_watermark":38,"committed_txid":17,"pull_pages_read":1,"pull_in_progress":false}}
 ```
 
 An **LSN** is a position in the change log. The push and pull watermarks say how far each direction
 has progressed — the instrument for diagnosing lag. They arrive as JSON numbers, so you can compare
-them without parsing.
+them without parsing. `pull_pages_read` is a cumulative, monotonically increasing count of pages
+this client has read across every pull it has issued — a script polling it twice tells a genuinely
+working catch-up rescan from a stuck one, distinct from the watermark, which by contract only moves
+once a pull fully completes. `pull_in_progress` turns `true` only while a pull issued through this
+same `SyncClient` handle is actively running; a single CLI session blocks for the whole duration of
+its own `.sync pull` (one statement at a time, one process), so running `.sync status` before and
+after a pull in the same session only ever observes before/after, never `true` mid-pull — that
+signal is for an embedding consumer sharing one client handle across threads.
 
 The pull watermark is bound to the specific hub that issued it, not just a bare number. Repointing
 an edge at a different hub for the same tenant — a new `--sync-endpoint`, or the same endpoint
@@ -166,7 +188,11 @@ idempotent), not a sign of data loss on the old hub.
 
 If the endpoint is down, sync prints one clear line —
 `Warning: sync endpoint unreachable: …` — rather than failing hard, and `transport` reads
-`unreachable`.
+`unreachable`. **If the hub and edge are on different networks, this warning (with a `dial timed
+out` cause) usually does not mean the hub is down** — the default ticket carries only the hub's own
+addresses, so dialing across networks fails the same way. See "Crossing networks" below for the
+`relay=n0` fix; retrying `.sync reconnect` / `.sync push` alone will not resolve it in that
+topology.
 
 ## 5. Read the counts truthfully
 
@@ -312,14 +338,18 @@ echo "SELECT COUNT(*) AS n FROM records;" \
 [{"n":0}]
 ```
 
-The delete survived the restart — `n` is `0`, which is what step 5 validates. **A known, separate
-gotcha you may see right after that same line: the process still exits `1`**, with a stderr line
-like `Final sync push failed: ... strict received row records ... replays a lineage terminated by
-an accepted delete`. This is the CLI's unconditional final-push-on-exit (§6) re-offering the
-tombstone edge Y just pulled, which the hub's replay guard refuses because that lineage is already
-terminated. **The data is correct — `n` is genuinely `0` — this exit code is not evidence the
-delete failed.** Read the query result first; only treat that specific `class:sync` message as
-informational. <!-- VERIFY-AT-TIP -->
+The delete survived the restart — `n` is `0`, which is what step 5 validates. **The same fresh
+process's exit code is now `0`, not `1`** — a stderr *notice* (not an error) appears alongside it:
+`{"notice":{"class":"sync","message":"Final sync push re-offered records [(\"id\", Uuid(...))],
+which the hub already converged on as deleted; nothing to do."}}`. This is the CLI's unconditional
+final-push-on-exit (§6) re-offering the tombstone edge Y just pulled; the hub's replay guard still
+refuses the re-offer internally, but the CLI now recognizes that specific refusal as benign
+convergence (both sides already agree on the delete) and reports it as a notice rather than a
+failure — exit code stays `0`. Confirmed live against tip debug binaries
+(`target/debug/contextdb`); if you observe exit `1` with a `strict received row ... replays a
+lineage terminated by an accepted delete` **error** instead of this notice, you're on an older
+binary that predates this fix — the data is still correct either way (`n` is genuinely `0`), only
+the exit code differs.
 
 ### Contrast: the same sequence under the default `KEEP FIRST` (what NOT to declare here)
 
@@ -402,7 +432,7 @@ Address lookup is separately opt-in, so a ticket survives an IP change:
 
 ```bash
 # hub and edges on one LAN, immune to DHCP changes, still zero external infrastructure
-contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?identity=./hub.key&lookup=mdns"
+contextdb-server --db-path ./hub.db --tenant-id prod --sync-endpoint "iroh:?identity=./hub.db.fabric-identity.key&lookup=mdns"
 contextdb ./edge.db --tenant-id prod --sync-endpoint "iroh:?to=$TICKET&lookup=mdns"
 ```
 
@@ -423,3 +453,4 @@ A typo in an endpoint spec errors loudly and names the accepted parameters.
 - Lint a store's sync policy before you ship a table declaration → [`scripts/sync-policy-lint.sh`](../../scripts/sync-policy-lint.sh)
 - Open a database, run SQL, read `--json` → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)
 - Distribute jobs and blobs over this same hub → [`skills/work-fabric/SKILL.md`](../work-fabric/SKILL.md)
+- Tell a healthy pull from a stuck one, purge, back up before a destructive op → [`skills/operating-a-store/SKILL.md`](../operating-a-store/SKILL.md)

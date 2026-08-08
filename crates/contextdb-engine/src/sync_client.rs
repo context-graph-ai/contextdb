@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 #[cfg(feature = "test-seams")]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "test-seams")]
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -56,6 +56,20 @@ struct PreparedPushBatch {
     ddl_provenance: Vec<crate::protocol::WireDdlProvenance>,
 }
 
+/// Resets `pull_in_progress` back to `false` on drop -- every exit path out
+/// of the paging call (success, an early `?` return, or a panic unwind)
+/// clears it, so a caller sharing the `SyncClient` handle across
+/// threads/tasks never observes it stuck `true` after a pull that failed.
+struct PullInProgressGuard<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for PullInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct SyncClient {
     db: Arc<Database>,
     transport: Arc<dyn ClientTransport>,
@@ -73,6 +87,25 @@ pub struct SyncClient {
     /// mismatched page is applied as if it were a legitimate continuation.
     /// Cumulative across every `pull`/`pull_default` call on this client.
     pages_discarded_for_source_mismatch: AtomicUsize,
+    /// Pages read across every `pull`/`pull_default` call on this client, in
+    /// memory only (a liveness signal, not durable state) — a
+    /// monotonically-advancing counter so an operator or agent watching a
+    /// long multi-page pull can tell healthy progress from a hang, via
+    /// `.sync status --json` mid-pull or the pull result JSON afterward.
+    pull_pages_read: AtomicU64,
+    /// Pages read by the MOST RECENT `pull`/`pull_default` call, reset to 0
+    /// at the start of each such call. Distinct from `pull_pages_read`
+    /// (cumulative across every call): a caller can read "how much did THIS
+    /// pull actually do" without diffing two cumulative reads itself (e.g. a
+    /// second, no-op pull reads 0 here while the cumulative counter holds
+    /// steady).
+    pull_pages_read_this_pull: AtomicU64,
+    /// Whether a `pull`/`pull_default` call is genuinely in flight right
+    /// now, observable by a caller sharing this `SyncClient` handle across
+    /// threads/tasks (an embedding consumer, not the CLI's own
+    /// single-blocking-session process — see `pull_in_progress`'s doc
+    /// comment).
+    pull_in_progress: std::sync::atomic::AtomicBool,
     /// The store this client's pull cursor addresses — the serving store's
     /// incarnation last seen on a pull response. `None` until the first
     /// successful pull binds it. Loaded from the persisted `(source, lsn)`
@@ -377,6 +410,9 @@ impl SyncClient {
             pending_push_confirmation: AtomicLsn::new(pending_push_confirmation),
             pull_watermark: AtomicLsn::new(pull_watermark),
             pages_discarded_for_source_mismatch: AtomicUsize::new(0),
+            pull_pages_read: AtomicU64::new(0),
+            pull_pages_read_this_pull: AtomicU64::new(0),
+            pull_in_progress: std::sync::atomic::AtomicBool::new(false),
             pull_source: std::sync::RwLock::new(pull_source),
             receipts: Arc::new(TransferLedger::new()),
             #[cfg(feature = "test-seams")]
@@ -1526,6 +1562,14 @@ impl SyncClient {
         initial_adoption: SyncAdoption,
         probe_status: bool,
     ) -> Result<ApplyResult, Error> {
+        self.pull_in_progress.store(true, Ordering::SeqCst);
+        self.pull_pages_read_this_pull.store(0, Ordering::SeqCst);
+        // Resets `pull_in_progress` to false on EVERY exit path -- success,
+        // an early `?` return, or a panic -- so a caller sharing this
+        // handle never observes it stuck `true` after a failed pull.
+        let _pull_in_progress_guard = PullInProgressGuard {
+            flag: &self.pull_in_progress,
+        };
         self.bind_authenticated_hub()?;
         self.ensure_connected().await.map_err(Error::SyncError)?;
         let authenticated_hub = self.hub_node_id().ok_or_else(|| {
@@ -1653,6 +1697,25 @@ impl SyncClient {
                 ordinary: mut response,
                 dependency_units,
             } = self.request_pull(request).await?;
+            // A caught-up client's page request still round-trips (the
+            // loop needs at least one response to learn "nothing new"), but
+            // that probe carries no actual catch-up work -- counting it
+            // would make `pull_pages_read`/`pull_pages_read_this_pull`
+            // advance forever on a healthy, converged store's routine
+            // pulls, and would make a genuine no-op pull look identical to
+            // one that fetched real data. Only a page that actually carried
+            // something counts as progress.
+            let page_had_content = !response.changeset.rows.is_empty()
+                || !response.changeset.edges.is_empty()
+                || !response.changeset.vectors.is_empty()
+                || !response.changeset.ddl.is_empty()
+                || !response.changeset.purges.is_empty()
+                || !dependency_units.is_empty();
+            if page_had_content {
+                self.pull_pages_read.fetch_add(1, Ordering::SeqCst);
+                self.pull_pages_read_this_pull
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             self.pause_after_pull_response_for_test_if_armed();
             let served_source = response.source;
 
@@ -2095,6 +2158,34 @@ impl SyncClient {
         self.pull_watermark.load(Ordering::SeqCst)
     }
 
+    /// Pages read across every `pull`/`pull_default` call on this client, in
+    /// memory only. Strictly increases with each page request the paging
+    /// loop issues — a liveness signal for `.sync status` and the pull
+    /// result, not a durable watermark.
+    pub fn pull_pages_read(&self) -> u64 {
+        self.pull_pages_read.load(Ordering::SeqCst)
+    }
+
+    /// Pages read by the MOST RECENT `pull`/`pull_default` call, distinct
+    /// from the cumulative `pull_pages_read` counter above -- e.g. a
+    /// second, no-op pull reads 0 here while the cumulative counter holds
+    /// steady. Meaningful once that call has returned; reset to 0 the
+    /// moment the NEXT call starts.
+    pub fn pull_pages_read_this_pull(&self) -> u64 {
+        self.pull_pages_read_this_pull.load(Ordering::SeqCst)
+    }
+
+    /// Whether a `pull`/`pull_default` call is genuinely in flight right
+    /// now. A single CLI session blocks for the whole duration of its own
+    /// pull, so within one script `.sync status` can only ever observe
+    /// before/after, never during -- this is the signal a caller sharing
+    /// the SAME `SyncClient` handle across threads or async tasks (an
+    /// embedding consumer, not the CLI) uses to observe a pull genuinely in
+    /// progress.
+    pub fn pull_in_progress(&self) -> bool {
+        self.pull_in_progress.load(Ordering::SeqCst)
+    }
+
     /// How many served pages this client has discarded unapplied, across
     /// every pull, because they reported an incarnation other than the one
     /// its cursor addresses. Zero until that detection exists.
@@ -2190,6 +2281,9 @@ fn decode_push_response(reply: &[u8]) -> Result<ApplyResult, PushReplyError> {
         return Err(PushReplyError::Terminal(match application_error {
             WirePushError::PurgeRequiresAuthoritativeHub { hub_node_id } => {
                 Error::PurgeRequiresAuthoritativeHub { hub_node_id }
+            }
+            WirePushError::ReplaysAcceptedDelete { table, key } => {
+                Error::SyncReplayOfAcceptedDelete { table, key }
             }
         }));
     }

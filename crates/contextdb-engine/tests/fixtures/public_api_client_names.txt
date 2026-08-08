@@ -11,6 +11,9 @@ push
 pull_default
 push_watermark
 pull_watermark
+pull_in_progress
+pull_pages_read
+pull_pages_read_this_pull
 pages_discarded_for_source_mismatch
 tenant_id
 endpoint

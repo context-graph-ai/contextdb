@@ -180,10 +180,13 @@ fn reject_dependency_complete_accepted_lineage_replays_against_generation_projec
         )
         .err()
         .expect("an accepted-delete replay rejects the complete dependency unit");
+    let message = error.to_string();
     assert!(
-        error
-            .to_string()
-            .contains("replays a lineage terminated by an accepted delete"),
-        "the terminated member rejects the entire unit instead of returning its sibling"
+        message.contains("replays a lineage the hub already terminated by an accepted delete"),
+        "the terminated member rejects the entire unit instead of returning its sibling: {message}"
+    );
+    assert!(
+        message.contains("store already agrees"),
+        "the refusal must state benign convergence, not just that it terminated: {message}"
     );
 }

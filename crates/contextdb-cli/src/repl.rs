@@ -122,6 +122,23 @@ pub fn session_exit_code(session: &SessionState) -> i32 {
 /// `sqlite3` do. A scripted session has nobody watching, so there every error
 /// is reported. An unconfirmed push is reported in both, because nobody can act
 /// on it once the process is gone.
+/// Whether this process is running under `--json`, recorded once at the top
+/// of [`run`] (the single per-process entry point). Read by background
+/// helpers — the pull-progress streamer chief among them — that have no
+/// path back to the caller's [`OutputOptions`] without adding a parameter to
+/// `run_sync_command`/`handle_sync_command`, both of which several
+/// test-module call sites already fix at their current arities. A
+/// process-global is safe here specifically because `run` is called exactly
+/// once per real process (the compiled `contextdb` binary); no in-process
+/// test calls `run` itself (tests exercise `feed_line`/`run_sync_command`
+/// directly), so this never observes a stale value left by an unrelated
+/// test in the same test binary.
+static JSON_OUTPUT_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn json_output_mode() -> bool {
+    *JSON_OUTPUT_MODE.get().unwrap_or(&false)
+}
+
 pub fn run(
     db: Arc<Database>,
     sync_client: Option<&SyncClient>,
@@ -129,6 +146,7 @@ pub fn run(
     sync_plugin: Option<&SyncPlugin>,
     output: OutputOptions,
 ) -> i32 {
+    let _ = JSON_OUTPUT_MODE.set(output.json);
     let interactive = std::io::stdin().is_terminal();
     if interactive {
         eprintln!("ContextDB v{}", env!("CARGO_PKG_VERSION"));
@@ -1032,6 +1050,80 @@ fn handle_sync_command(
     run_sync_command(sync_client, rt, args, sync_plugin, &mut unconfirmed_push)
 }
 
+/// The pull-progress rendering DECISION, pulled out of the sleep-driven
+/// ticker loop so it is directly testable: pure, no thread, no sleep, no
+/// terminal. `None` when `pages_read` has not moved since the last report
+/// (nothing new to say); `Some(line)` naming the current page count when it
+/// has.
+fn interactive_pull_progress_line(pages_read: u64, last_reported: u64) -> Option<String> {
+    if pages_read == last_reported {
+        None
+    } else {
+        Some(format!("Pulling... {pages_read} page(s) read so far"))
+    }
+}
+
+/// Runs `.sync pull`, streaming periodic liveness signals from the SAME
+/// per-call page counter (`SyncClient::pull_pages_read_this_pull`) while it
+/// runs, so a caller can tell a long multi-page pull is alive, not stuck.
+///
+/// A single CLI session blocks for the whole duration of its own pull (one
+/// process, one store lock) — polling `.sync status --json` from elsewhere
+/// mid-pull is not the story here (see the doc comment on `.sync status`'s
+/// `pull_in_progress` field for the actual cross-thread signal a library
+/// consumer sharing one `SyncClient` handle gets). This is the in-session
+/// liveness story instead: at an interactive terminal with human output,
+/// periodic text lines via the pure `interactive_pull_progress_line` seam;
+/// under `--json`, periodic `{"sync_pull_progress":{"pages_read":N}}` JSON
+/// Lines notices on stderr — which stream regardless of whether stdout is a
+/// terminal, since a script or agent piping `--json` needs the same
+/// liveness signal a human at a prompt gets. A non-interactive, non-`--json`
+/// session (plain text piped through a script) gets neither: nobody is
+/// watching stdout as text and nothing parses stderr as JSON there, so
+/// there's nothing to usefully stream.
+fn pull_with_progress(
+    client: &SyncClient,
+    rt: &tokio::runtime::Runtime,
+) -> Result<contextdb_engine::sync_types::ApplyResult, contextdb_core::Error> {
+    let json = json_output_mode();
+    let interactive_terminal = std::io::stdin().is_terminal();
+    let stream_progress = json || interactive_terminal;
+    let progress_stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        if stream_progress {
+            scope.spawn(|| {
+                let mut last_reported = client.pull_pages_read_this_pull();
+                let mut waited = std::time::Duration::ZERO;
+                let tick = std::time::Duration::from_millis(200);
+                let report_every = std::time::Duration::from_secs(2);
+                while !progress_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(tick);
+                    waited += tick;
+                    if waited < report_every {
+                        continue;
+                    }
+                    waited = std::time::Duration::ZERO;
+                    let now = client.pull_pages_read_this_pull();
+                    if json {
+                        if now != last_reported {
+                            json_output::print_stderr_document(
+                                &json_output::sync_pull_progress_document(now),
+                            );
+                            last_reported = now;
+                        }
+                    } else if let Some(line) = interactive_pull_progress_line(now, last_reported) {
+                        eprintln!("{line}");
+                        last_reported = now;
+                    }
+                }
+            });
+        }
+        let result = rt.block_on(client.pull_default());
+        progress_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        result
+    })
+}
+
 fn run_sync_command(
     sync_client: Option<&SyncClient>,
     rt: Option<&tokio::runtime::Runtime>,
@@ -1084,6 +1176,8 @@ fn run_sync_command(
                 push_watermark: client.push_watermark().to_string(),
                 pull_watermark: client.pull_watermark().to_string(),
             };
+            let pull_pages_read = client.pull_pages_read();
+            let pull_in_progress = client.pull_in_progress();
             let base = crate::sync_status::render_sync_endpoint_status(&view);
             let render = contextdb_engine::cli_render::render_sync_status(client.db());
             let mut document = crate::sync_status::sync_endpoint_status_json(&view);
@@ -1092,9 +1186,34 @@ fn run_sync_command(
                     "committed_txid".to_string(),
                     serde_json::json!(client.db().committed_watermark().0),
                 );
+                // Liveness signals (not part of the stable watermark
+                // vocabulary `sync_status.rs` owns). `pull_pages_read` is
+                // the cumulative page count across every pull this client
+                // has issued. NOTE the real liveness story here: a single
+                // CLI session BLOCKS for the whole duration of its own
+                // `.sync pull` (one statement at a time, one process, one
+                // store lock), so a script running `.sync status` before
+                // and after a pull in the SAME session only ever observes
+                // before/after, never during -- it cannot poll this twice
+                // mid-pull the way a second, concurrent process might hope
+                // to. The actual mid-pull liveness signals are: (1) the
+                // periodic `sync_pull_progress` stderr notices a long pull
+                // streams while it runs (see `pull_with_progress`), and (2)
+                // `pull_in_progress` below, which DOES turn `true` mid-pull
+                // -- but only for a caller sharing this exact `SyncClient`
+                // handle across threads/tasks (an embedding consumer, not
+                // the CLI's own single-blocking-session process).
+                object.insert(
+                    "pull_pages_read".to_string(),
+                    serde_json::json!(pull_pages_read),
+                );
+                object.insert(
+                    "pull_in_progress".to_string(),
+                    serde_json::json!(pull_in_progress),
+                );
             }
             SyncCommandOutcome::succeeded(
-                format!("{base}\n{render}"),
+                format!("{base}\nPull pages read: {pull_pages_read}\n{render}"),
                 serde_json::json!({ "sync": document }),
             )
         }
@@ -1137,6 +1256,18 @@ fn run_sync_command(
                     serde_json::json!({ "sync_push": { "outcome": "unconfirmed" } }),
                 )
             }
+            Err(contextdb_core::Error::SyncReplayOfAcceptedDelete { table, key }) => {
+                // The hub's typed refusal proves both sides already agree
+                // the row is deleted -- benign convergence, not a failure.
+                // Same contract as the CLI's own unconditional exit-push.
+                SyncCommandOutcome::succeeded(
+                    format!(
+                        "Push re-offered {table} {key:?}, which the hub already converged on \
+                         as deleted; nothing to do."
+                    ),
+                    serde_json::json!({ "sync_push": { "outcome": "converged" } }),
+                )
+            }
             Err(e) => SyncCommandOutcome::failed(
                 ErrorClass::of(&e),
                 format!(
@@ -1146,7 +1277,7 @@ fn run_sync_command(
                 ),
             ),
         },
-        "pull" => match rt.block_on(client.pull_default()) {
+        "pull" => match pull_with_progress(client, rt) {
             Ok(result) => {
                 let mut msg = format!(
                     "Pulled: {} applied, {} skipped, {} conflicts",
@@ -1160,10 +1291,24 @@ fn run_sync_command(
                         contextdb_engine::cli_render::render_sync_conflict(conflict)
                     ));
                 }
-                SyncCommandOutcome::succeeded(
-                    msg,
-                    serde_json::json!({ "sync_pull": apply_result_json(&result, "applied") }),
-                )
+                let mut pull_doc = apply_result_json(&result, "applied");
+                if let Some(object) = pull_doc.as_object_mut() {
+                    // Cumulative across every pull this client has issued.
+                    object.insert(
+                        "pull_pages_read".to_string(),
+                        serde_json::json!(client.pull_pages_read()),
+                    );
+                    // THIS pull's own page count, distinct from the
+                    // cumulative counter above -- a no-op second pull reads
+                    // 0 here while the cumulative counter holds steady, so
+                    // a caller can tell "this pull did nothing" from "this
+                    // pull did a lot" without diffing two cumulative reads.
+                    object.insert(
+                        "pull_pages_read_this_pull".to_string(),
+                        serde_json::json!(client.pull_pages_read_this_pull()),
+                    );
+                }
+                SyncCommandOutcome::succeeded(msg, serde_json::json!({ "sync_pull": pull_doc }))
             }
             Err(e) => SyncCommandOutcome::failed(
                 ErrorClass::of(&e),
@@ -1586,6 +1731,51 @@ mod tests {
              schedules and their delivery/fire counters via a `.events status`-style \
              meta-command; got a usage error instead, meaning no such introspection \
              command exists yet"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // CLI pull liveness (owner-folded correction, 2026-08-06), interactive
+    // printer half. `pull_with_interactive_progress`'s own doc comment
+    // admits it is "deliberately untested (a wall-clock-timed background
+    // printer is not worth pinning in a test)" — that stance is now
+    // folded/overridden: the printer's RENDERING decision (does pages_read
+    // having moved since the last report produce a new line, and what does
+    // that line say) is pure and must be pulled out from under the
+    // sleep-driven ticker loop into its own deterministic, directly testable
+    // function. Proposed shape (implementer may rename/restructure —
+    // e.g. as an injectable `Write` sink plus tick source instead — the
+    // load-bearing requirement is just that the RENDER DECISION itself is
+    // reachable without a real thread, a real sleep, or a real terminal):
+    //
+    //   fn interactive_pull_progress_line(pages_read: u64, last_reported: u64) -> Option<String>
+    //
+    // returning `None` when nothing has changed since the last report, and
+    // `Some(line)` when it has — so `pull_with_interactive_progress`'s
+    // ticker loop becomes a thin driver over this pure function instead of
+    // an inline, unpinnable `if now != last { eprintln!(...) }`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn interactive_pull_progress_line_is_silent_when_pages_read_has_not_moved() {
+        assert_eq!(
+            interactive_pull_progress_line(3, 3),
+            None,
+            "no new page has been read since the last report, so there is nothing new to say"
+        );
+    }
+
+    #[test]
+    fn interactive_pull_progress_line_reports_when_pages_read_advances() {
+        let line = interactive_pull_progress_line(5, 3).unwrap_or_else(|| {
+            panic!(
+                "pages_read advanced from 3 to 5 since the last report; the deterministic \
+                 rendering seam must produce a line an operator can read, not silence"
+            )
+        });
+        assert!(
+            line.contains('5'),
+            "the reported line must name the current page count: {line:?}"
         );
     }
 

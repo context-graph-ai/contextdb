@@ -12,6 +12,7 @@ committed_watermark
 compact_currency_versions
 compact_now
 complete_initialization
+cron_status
 current_lsn
 ddl_log_since
 delete_edge
@@ -21,6 +22,7 @@ disk_file_size
 disk_limit
 disk_limit_startup_ceiling
 edge_count
+event_bus_status
 execute
 execute_at_snapshot
 execute_in_tx
@@ -36,6 +38,7 @@ insert_edge
 insert_row
 insert_vector
 instance_id
+is_memory_backed
 list_triggers
 live_vector_entry
 maintenance_policy

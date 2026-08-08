@@ -228,6 +228,22 @@ pub enum Error {
     SyncError(String),
     #[error("PURGE must originate at authoritative hub {hub_node_id}; run PURGE there")]
     PurgeRequiresAuthoritativeHub { hub_node_id: String },
+    /// A push re-offered a row the hub already knows was deleted -- the SAME
+    /// terminated lineage, not a fresh write. The store already agrees (both
+    /// sides converged on the delete); refusing the replay is correct, but
+    /// it is NOT a definitive push failure the way a constraint violation or
+    /// an unreachable endpoint is. A caller driving an unconditional
+    /// exit-time push (the CLI's final-flush-on-quit) should treat this as
+    /// benign convergence -- exit clean, optional notice -- never as a hard
+    /// failure. See [`Error::SyncPushUnconfirmed`] for the sibling
+    /// "indeterminate, not failed" contract this mirrors.
+    #[error(
+        "push replays a lineage the hub already terminated by an accepted delete: {table} key {key:?} (store already agrees; no action needed)"
+    )]
+    SyncReplayOfAcceptedDelete {
+        table: String,
+        key: Vec<(String, Value)>,
+    },
     #[error("PURGE must run as a standalone authoritative statement")]
     PurgeRequiresStandaloneExecution,
     #[error(

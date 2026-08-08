@@ -867,11 +867,15 @@ async fn authenticated_iroh_rejects_stale_connected_replay_as_a_whole_before_rec
     let error = within(stale_client.pull_default())
         .await
         .expect_err("terminated child lineage refuses the whole stale connected pull");
+    let error_message = error.to_string();
     assert!(
-        error
-            .to_string()
-            .contains("replays a lineage terminated by an accepted delete"),
+        error_message
+            .contains("replays a lineage the hub already terminated by an accepted delete"),
         "the stale pull must fail at the accepted-lineage boundary: {error}"
+    );
+    assert!(
+        error_message.contains("store already agrees"),
+        "the refusal must state benign convergence, not just that it terminated: {error}"
     );
     assert_eq!(
         observing_transport.pull_response_types(),

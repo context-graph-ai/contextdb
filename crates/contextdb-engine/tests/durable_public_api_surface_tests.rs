@@ -514,14 +514,8 @@ fn durable_public_mutation_surface_matches_the_frozen_allowlist() {
     let engine = engine_root();
     let root = engine.ancestors().nth(2).expect("contextdb root");
     let database = database_public_methods(&engine);
-    let client = public_impl_methods(
-        &root.join("crates/contextdb-server/src/sync_client.rs"),
-        "SyncClient",
-    );
-    let server = public_impl_methods(
-        &root.join("crates/contextdb-server/src/sync_server.rs"),
-        "SyncServer",
-    );
+    let client = public_impl_methods(&engine.join("src/sync_client.rs"), "SyncClient");
+    let server = public_impl_methods(&engine.join("src/sync_server.rs"), "SyncServer");
     let engine_exports =
         std::fs::read_to_string(engine_root().join("src/lib.rs")).expect("read engine reexports");
     let server_exports = std::fs::read_to_string(root.join("crates/contextdb-server/src/lib.rs"))

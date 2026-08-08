@@ -15693,10 +15693,17 @@ impl Database {
             });
             if same_terminated_lineage {
                 if dependency_complete {
-                    return Err(Error::SyncError(format!(
-                        "strict received row {} {:?} replays a lineage terminated by an accepted delete",
-                        row.table, row.natural_key
-                    )));
+                    // The store already agrees: the pushing edge's own copy
+                    // is the SAME terminated lineage the hub already
+                    // committed as deleted, no fresh same-key row exists.
+                    // This is benign convergence, not a definitive failure
+                    // -- see `Error::SyncReplayOfAcceptedDelete`'s doc
+                    // comment for the caller-facing contract this feeds
+                    // (`WirePushError::ReplaysAcceptedDelete` on the wire).
+                    return Err(Error::SyncReplayOfAcceptedDelete {
+                        table: row.table.clone(),
+                        key: row.natural_key.pairs(),
+                    });
                 }
                 let visible = if self.table_meta(&row.table).is_some() {
                     self.visible_row_by_natural_key(

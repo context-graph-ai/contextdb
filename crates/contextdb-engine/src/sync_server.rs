@@ -663,11 +663,23 @@ async fn handle_push(
             .await?;
         }
         Err(err) => {
-            let response = PushResponse {
-                result: None,
-                error: Some(err.to_string()),
-                application_error: None,
-            };
+            let response =
+                if let contextdb_core::Error::SyncReplayOfAcceptedDelete { table, key } = &err {
+                    PushResponse {
+                        result: None,
+                        error: None,
+                        application_error: Some(WirePushError::ReplaysAcceptedDelete {
+                            table: table.clone(),
+                            key: key.clone(),
+                        }),
+                    }
+                } else {
+                    PushResponse {
+                        result: None,
+                        error: Some(err.to_string()),
+                        application_error: None,
+                    }
+                };
             publish_in_flight_push_response(
                 state.in_flight_push_applies.clone(),
                 request_key,

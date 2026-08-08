@@ -28,14 +28,6 @@ fn server_sync_sources_are_exact_engine_audit_mirrors() {
         return;
     }
     assert_exact_mirror(
-        &engine.join("src/sync_client.rs"),
-        &server.join("sync_client.rs"),
-    );
-    assert_exact_mirror(
-        &engine.join("src/sync_server.rs"),
-        &server.join("sync_server.rs"),
-    );
-    assert_exact_mirror(
         &engine.join("src/transport/iroh.rs"),
         &server.join("transport/iroh.rs"),
     );

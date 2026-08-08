@@ -228,10 +228,13 @@ printf '.sync status\n' | contextdb ./edge-a.db --tenant-id p --sync-endpoint "$
 ```
 
 ```json
-{"sync":{"committed_txid":1,"configured":true,"database_lsn":2,"endpoint":"iroh:?to=...&identity=./edge-a.db.fabric-identity.key","pull_pages_read":0,"pull_watermark":0,"push_watermark":2,"tenant":"p","transport":"connected"}}
+{"sync":{"committed_txid":1,"configured":true,"database_lsn":2,"endpoint":"iroh:?to=...&identity=./edge-a.db.fabric-identity.key","pull_in_progress":false,"pull_pages_read":0,"pull_watermark":0,"push_watermark":2,"tenant":"p","transport":"connected"}}
 ```
 
 `pull_pages_read:0` here is correct and not a bug — this edge has only ever pushed, never pulled.
+`pull_in_progress` is a live cross-thread signal, not a durable fact — it turns `true` only while a
+pull sharing this exact `SyncClient` handle is actively running, so a one-shot CLI process (which
+blocks until its own pull returns) always reports `false` here regardless of history.
 
 ### Worked example 2 — after a real pull, human output
 

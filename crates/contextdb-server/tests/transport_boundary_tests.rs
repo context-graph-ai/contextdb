@@ -1707,9 +1707,20 @@ fn sync_logic_stays_behind_the_transport_and_protocol_seams() {
     let mut sources = Vec::new();
     collect_rust_sources(&Path::new(root).join("src"), &mut sources);
 
-    let client_src = std::fs::read_to_string(format!("{root}/src/sync_client.rs"))
+    // The server crate re-exports `SyncClient`/`SyncServer` from the engine
+    // (`pub mod sync_client { pub use contextdb_engine::sync_client::*; }` in
+    // lib.rs, same for `sync_server`); there is no server-local
+    // implementation to scan, so this audit reads the engine's own sources --
+    // the sync logic these invariants describe actually lives there.
+    let engine_src = Path::new(root)
+        .ancestors()
+        .nth(2)
+        .expect("contextdb workspace root")
+        .join("crates/contextdb-engine/src");
+
+    let client_src = std::fs::read_to_string(engine_src.join("sync_client.rs"))
         .expect("read sync client source");
-    let server_src = std::fs::read_to_string(format!("{root}/src/sync_server.rs"))
+    let server_src = std::fs::read_to_string(engine_src.join("sync_server.rs"))
         .expect("read sync server source");
     assert!(
         client_src.contains("ClientTransport") && client_src.contains(".request("),
@@ -1721,18 +1732,19 @@ fn sync_logic_stays_behind_the_transport_and_protocol_seams() {
     );
 
     for (rel, needle) in [
-        ("src/sync_client.rs", "InProcess"),
-        ("src/sync_server.rs", "InProcess"),
-        ("src/sync_client.rs", "transport::in_process"),
-        ("src/sync_server.rs", "transport::in_process"),
-        ("src/sync_client.rs", "downcast"),
-        ("src/sync_server.rs", "downcast"),
-        ("src/sync_client.rs", "std::any::Any"),
-        ("src/sync_server.rs", "std::any::Any"),
-        ("src/sync_server.rs", "subscribe"),
+        ("sync_client.rs", "InProcess"),
+        ("sync_server.rs", "InProcess"),
+        ("sync_client.rs", "transport::in_process"),
+        ("sync_server.rs", "transport::in_process"),
+        ("sync_client.rs", "downcast"),
+        ("sync_server.rs", "downcast"),
+        ("sync_client.rs", "std::any::Any"),
+        ("sync_server.rs", "std::any::Any"),
+        ("sync_server.rs", "subscribe"),
     ] {
-        let path = format!("{root}/{rel}");
-        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let path = engine_src.join(rel);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         assert!(
             !src.contains(needle),
             "{rel} must not special-case the in-process fake; sync logic must use only the transport traits"
@@ -1799,8 +1811,6 @@ fn sync_logic_stays_behind_the_transport_and_protocol_seams() {
         };
 
         let sync_engine_allowed = [
-            "src/sync_client.rs",
-            "src/sync_server.rs",
             "src/protocol.rs",
             "src/main.rs",
             "src/sync_plugin.rs",
@@ -1843,8 +1853,6 @@ fn sync_logic_stays_behind_the_transport_and_protocol_seams() {
 
         let concrete_adapter_path = format!("src/transport/{CONCRETE_TRANSPORT_ADAPTER}.rs");
         let sync_protocol_allowed = [
-            "src/sync_client.rs",
-            "src/sync_server.rs",
             "src/protocol.rs",
             // The concrete byte-stream adapter is below the transport seam and owns
             // byte framing/parsing for its streams. No other transport file

@@ -61,9 +61,10 @@ impl ErrorClass {
     pub fn of(error: &contextdb_core::Error) -> Self {
         use contextdb_core::Error;
         match error {
-            Error::SyncError(_) | Error::NotSyncEligible(_) | Error::SyncPushUnconfirmed { .. } => {
-                ErrorClass::Sync
-            }
+            Error::SyncError(_)
+            | Error::NotSyncEligible(_)
+            | Error::SyncPushUnconfirmed { .. }
+            | Error::SyncReplayOfAcceptedDelete { .. } => ErrorClass::Sync,
             Error::StoreCorrupted { .. }
             | Error::LegacyVectorStoreDetected { .. }
             | Error::DatabaseLocked { .. }
@@ -289,6 +290,24 @@ pub(crate) fn print_notice_document(class: ErrorClass, message: &str, detail: &V
 /// Print one result document to stdout.
 pub(crate) fn print_document(document: &Value) {
     println!("{document}");
+}
+
+/// Write one document to stderr, verbatim, as its own top-level shape (not
+/// wrapped in the generic `{"notice":{...}}` envelope `print_notice` uses).
+/// For a streamed signal with its own stable machine-readable key — e.g.
+/// `sync_pull_progress_document` below — where the top-level key itself
+/// carries the meaning a consumer filters on.
+pub(crate) fn print_stderr_document(document: &Value) {
+    eprintln!("{document}");
+}
+
+/// A periodic liveness signal streamed to stderr during a long `.sync pull`,
+/// under `--json`: how many pages this pull has read so far. Distinct from
+/// the generic notice envelope so a consumer can filter on the
+/// `sync_pull_progress` key directly, the same way it filters on `sync_pull`
+/// for the final result.
+pub(crate) fn sync_pull_progress_document(pages_read: u64) -> Value {
+    json!({ "sync_pull_progress": { "pages_read": pages_read } })
 }
 
 /// `.tables` — the table names this database holds, in the order the engine

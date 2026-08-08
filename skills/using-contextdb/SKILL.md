@@ -306,3 +306,5 @@ use literals. Details and the plugin/subscription surface:
 - Replicate across machines → [`skills/sync/SKILL.md`](../sync/SKILL.md)
 - Similarity search and ranking → [`skills/vector-search/SKILL.md`](../vector-search/SKILL.md)
 - Distribute jobs and blobs → [`skills/work-fabric/SKILL.md`](../work-fabric/SKILL.md)
+- Retention, purge, backups, sync liveness → [`skills/operating-a-store/SKILL.md`](../operating-a-store/SKILL.md)
+- Routes, sinks, schedules → [`skills/running-triggers-and-schedules/SKILL.md`](../running-triggers-and-schedules/SKILL.md)
