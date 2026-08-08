@@ -11,3 +11,6 @@ spikes/
 *~
 .DS_Store
 book/
+# Generated agent-consumable docs bundle (scripts/generate-agent-bundle.sh) — build output,
+# never hand-maintained, never committed.
+/llms-full.txt

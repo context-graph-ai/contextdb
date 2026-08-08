@@ -428,6 +428,11 @@ end-to-end-encrypted bytes (`relay=<url>`, plus `relay-ca=<cert-file>` if it pre
 certificate) or opts into the free public relays (`relay=n0`). **Connectivity is never a paid
 feature.**
 
+```bash
+# restart the hub with relay enabled before enrolling a cross-network edge
+contextdb-server --db-path ./hub.db --tenant-id demo --sync-endpoint "iroh:?identity=./hub.db.fabric-identity.key&relay=n0" --ticket-file ./hub.ticket
+```
+
 Address lookup is separately opt-in, so a ticket survives an IP change:
 
 ```bash

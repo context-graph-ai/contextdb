@@ -4,6 +4,56 @@ Earlier versions: see git tags.
 
 ## Unreleased
 
+- **Behavior change.** The push-refusal reason for a `SYNC CONFLICT KEEP FIRST` collision is
+  now `keep_first_refused`, naming the declared policy that refused the row, not the internal
+  transport-unit mechanism formerly exposed as `dependency_complete_refused`. Any consumer
+  matching on the old reason string must update it; the rest of the typed refusal (table, key,
+  mutation kind, winning author, position) is unchanged.
+- **Behavior change.** The engine-owned reserved-table shape guard, previously covering four
+  built-in work-fabric tables (`work_capabilities`, `peer_directory`, `work_node_contacts`,
+  `work_inputs`), now spans all nine reserved names — adding the five hub-refereed work-ledger
+  tables (`work_jobs`, `work_claims`, `work_results`, `work_failures`, `work_cancellations`).
+  A `CREATE TABLE` naming one of the nine, locally or arriving over sync, now refuses unless
+  its declared shape structurally matches the installer's own canonical `CREATE TABLE` text
+  (every column and every table-level option); the five newly-covered tables additionally
+  refuse an explicit `SYNC CONFLICT` value other than their true `keep_first` arbitration
+  (silence, or an explicit restate of `keep_first`, still passes). `SHOW SYNC_CONFLICT_POLICY`
+  now renders all seven work-ledger tables this governs, plus `peer_directory`, each marked
+  `(engine-owned)`, distinct from an operator-declared row.
+- **Behavior change.** `ALTER TABLE ... ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` naming
+  one of the nine reserved names is now refused outright, before any other ALTER validation
+  runs — column shape on these tables is exactly as fixed against a column-level ALTER as it
+  already was against `SET RETAIN` / `SET HISTORY` / `SET SYNC CONFLICT` / `SET SYNC ...`.
+  Existence is checked first: a reserved name the store never installed reports "table not
+  found," not this refusal, so an absent table and a governed one are never confused.
+- **Added.** `contextdb purge <path> --table <name> --force` — a guarded CLI door onto the
+  engine's authoritative `PURGE FROM <table>` statement, refusing without `--force` exactly
+  like `reset`. Previously purge existed only as library-callable SQL with no CLI verb.
+- **Added.** In a `:memory:` session, the CLI now registers the engine's default sink and cron
+  callbacks right after a `CREATE SINK` / `CREATE SCHEDULE` statement runs, so a `CREATE SCHEDULE`
+  / `CREATE EVENT TYPE` / `CREATE SINK` / `CREATE ROUTE` sequence observably delivers/fires from
+  the shipped binary — previously the DDL parsed and the engine could execute it, but nothing in
+  the CLI ever wired the callbacks in, so no CLI-only session could make a route, sink, or
+  schedule actually fire. A **file-backed** session deliberately keeps the old behavior — events
+  and schedule fires queue durably without a registered callback (`.events status` shows
+  `delivered:0`, `queued:1`) rather than firing eagerly, so a later, separate process can register
+  the real callback and drain them without losing anything queued in between.
+- **Added.** `.events status` (and its `--json` form) lists every declared event type, sink,
+  and route, plus every schedule with its fire count and next/last fire time — the
+  introspection surface for the trigger/event/schedule door above.
+- **Added.** `.sync status --json` and a pull result's JSON both gain `pull_in_progress`
+  (boolean) and `pull_pages_read` (a monotonically increasing per-call page counter): a
+  consumer polling twice sees a moving number when a pull is genuinely working through a large
+  catch-up rescan and a frozen one when it is stuck, distinct from the pull watermark, which by
+  contract only moves once a pull fully completes. An interactive `.sync pull` at the prompt
+  now also prints periodic progress lines while a long pull is in flight, instead of sitting
+  silent until it returns.
+- **Fixed.** A CLI session that had just pulled a tombstone no longer exits `1` on quit. The
+  CLI's unconditional final-push-on-exit used to re-offer that same just-pulled delete back to
+  the hub; the hub's replay guard correctly refused it as a lineage already terminated by an
+  accepted delete, and the CLI surfaced that refusal as a failure even though every store
+  already agreed. That specific refusal — replaying a lineage the hub already accepted as
+  deleted, where the store already agrees — is now treated as benign convergence: exit `0`.
 - **Breaking.** Sync policy and direction are now declared only in table DDL.
   Callers must use `SYNC CONFLICT KEEP FIRST | KEEP LATEST` and
   `SYNC OFF | PUSH ONLY | PULL ONLY | TWO WAY`, then call

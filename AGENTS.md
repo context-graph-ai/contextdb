@@ -107,6 +107,8 @@ Reference docs, when a skill is not enough:
 | [`docs/architecture.md`](docs/architecture.md) | Crate map, MVCC, sync protocol, work ledger and blob plane, upgrades and recovery |
 | [`docs/usage-scenarios.md`](docs/usage-scenarios.md) | 16 problem-first walkthroughs with SQL |
 | [`docs/why-contextdb.md`](docs/why-contextdb.md) | Problem statement and comparison with alternatives |
+| [`docs/capability-index.md`](docs/capability-index.md) | One page: what contextdb is, is not, and the numbers it stops at |
+| [`docs/agent-readiness.md`](docs/agent-readiness.md) | How this repo measures whether AI assistants can use and contribute to it |
 
 contextdb ships **no built-in schema**. `decisions`, `observations`, `entities`, `edges` and
 friends are example tables the docs define; you define your own and attach policy to them.
@@ -124,6 +126,10 @@ Two policy declarations decide by themselves whether your data survives — pick
 
 All five must pass before any commit, release, or "done" claim. The fifth installs isolated
 release binaries and drives the production ticketed-Iroh durability smoke.
+
+**Run `cargo fmt --all` before you consider yourself done — formatting is the gate's first
+command, and an otherwise-correct change fails immediately on an unformatted line.** Run it first
+when you start and again as the last thing you do.
 
 ```bash
 cargo fmt --all --check
