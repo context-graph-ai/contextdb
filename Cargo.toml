@@ -40,7 +40,7 @@ tokio = { version = "1", features = ["full"] }
 rmp-serde = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-redb = "3"
+redb = "4"
 bincode = { version = "2", features = ["serde"] }
 tempfile = "3"
 anndists = "0.1"
