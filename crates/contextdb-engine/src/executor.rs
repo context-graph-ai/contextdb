@@ -8961,7 +8961,7 @@ pub(crate) fn refuse_engine_owned_policy_axes(table: &str, incoming: &TableMeta)
 
 /// The installer's own `CREATE TABLE` text for one of the nine reserved
 /// names -- the SINGLE SOURCE every shape door below parses to get the
-/// canonical column shape, replacing the round-6 hand-mirrored
+/// canonical column shape, replacing an earlier hand-mirrored
 /// `(name, data type, is primary key, is nullable)` tuple table (a checklist
 /// subset that silently admitted `IMMUTABLE` / `EXPIRES`, since neither was
 /// ever a column the tuple had room for). Changing one of the seven
@@ -9004,10 +9004,11 @@ pub const ENGINE_OWNED_WORK_NODE_CONTACTS_CREATE_DDL: &str = "CREATE TABLE work_
 /// reserved names -- [`engine_owned_reserved_table_create_ddl`]'s own text,
 /// run through the REAL parser (the identical parse every operator-typed
 /// `CREATE TABLE` goes through), not a hand-typed restatement of it. The
-/// WHOLE statement, not just `.columns`: round 7 held only the column list
-/// here, so the table-LEVEL options (`IMMUTABLE` / `STATE_MACHINE` / `DAG`
-/// / `PROPAGATE`) had no canonical value to compare against and repeated
-/// round 6's exact failure one level up (round 8's finding -- see
+/// WHOLE statement, not just `.columns`: an earlier revision of this door
+/// held only the column list here, so the table-LEVEL options (`IMMUTABLE`
+/// / `STATE_MACHINE` / `DAG` / `PROPAGATE`) had no canonical value to
+/// compare against and repeated the same failure one level up (a later
+/// review's finding -- see
 /// [`refuse_reserved_name_table_shape`]). `None` for any table name outside
 /// the nine.
 fn engine_owned_reserved_table_canonical_create(
@@ -9027,7 +9028,7 @@ fn engine_owned_reserved_table_canonical_create(
 /// `ColumnDef` carries -- an EXHAUSTIVE destructure of `candidate`, never a
 /// `..` pattern: if a future AST change adds a field to `ColumnDef`, this
 /// fails to COMPILE until this door is told how the new field
-/// participates, instead of silently ignoring it the way the round-6
+/// participates, instead of silently ignoring it the way an earlier
 /// count/name/type/primary-key/nullable subset let `IMMUTABLE` and
 /// `EXPIRES` slip through unseen.
 ///
@@ -9081,7 +9082,7 @@ fn column_def_matches_canonical(
 /// What about a reserved-name `CREATE TABLE` / column-shape `ALTER TABLE`
 /// mismatched, named in [`engine_owned_reserved_shape_refusal`]'s message so
 /// a dissatisfied operator has something to diagnose with -- the fix for
-/// the round-7 finding that the old message's "name, type, and primary key"
+/// a later review's finding that the old message's "name, type, and primary key"
 /// claim was false for every hidden-attribute mismatch (UNIQUE / DEFAULT /
 /// nullability / IMMUTABLE / EXPIRES) since all of those satisfy
 /// name/type/primary-key exactly.
@@ -9180,7 +9181,8 @@ struct ReservedShapeCandidate<'a> {
 
 /// The shared judge for a reserved-name `CREATE TABLE` / column-shape
 /// `ALTER TABLE`, local or wire: EVERY structural axis a `CreateTable`
-/// carries, not columns alone. Round 8 finding: round 7 closed the
+/// carries, not columns alone. A later review found that an earlier
+/// revision closed the
 /// per-COLUMN subset-checklist class (`IMMUTABLE` / `EXPIRES` hiding on one
 /// column), but the door still compared only `columns` /
 /// `unique_constraints` / `primary_key_columns` / `composite_foreign_keys`
@@ -9190,14 +9192,14 @@ struct ReservedShapeCandidate<'a> {
 /// table-level `IMMUTABLE` on `work_claims` armed `Error::ImmutableTable` on
 /// its own lease-renewal UPDATE while `SHOW` still reported it governed.
 ///
-/// EXPLICIT EXEMPTION (C1-1, owner-deferred -- do not fold these in without
-/// a fresh owner ruling): `RETAIN` / `SYNC` direction / `HISTORY` are judged
+/// EXPLICIT EXEMPTION (deliberately deferred -- do not fold these in
+/// without revisiting that deferral): `RETAIN` / `SYNC` direction / `HISTORY` are judged
 /// by [`refuse_engine_owned_policy_axes`] once a projected `TableMeta`
 /// exists, not here; `SYNC CONFLICT` is judged by that door and
 /// [`refuse_hub_refereed_ledger_sync_conflict_mismatch`]. This door judges
-/// only the axes that were NEVER anyone's job before round 8: table-level
-/// `IMMUTABLE` / `STATE_MACHINE` / `DAG` / `PROPAGATE`, plus the round-7
-/// column/table-level-constraint checks it already owned.
+/// only the axes that were NEVER anyone's job before that later review:
+/// table-level `IMMUTABLE` / `STATE_MACHINE` / `DAG` / `PROPAGATE`, plus the
+/// earlier column/table-level-constraint checks it already owned.
 fn refuse_reserved_name_table_shape(
     table: &str,
     candidate: ReservedShapeCandidate<'_>,
@@ -9284,9 +9286,10 @@ fn refuse_reserved_name_table_shape(
 /// ([`refuse_reserved_name_table_shape`]). `Ok` for any other table name,
 /// `Ok` for a canonical match, `Err` for a structural mismatch.
 ///
-/// DESIGN CHOICE (round 7, replacing round 6's token-matching; round 8
-/// widened the reconstruction to carry `constraints` too, closing the
-/// table-level-options gap on this side the same way): the wire format
+/// DESIGN CHOICE (an earlier revision replaced token-matching with this
+/// approach; a later revision widened the reconstruction to carry
+/// `constraints` too, closing the table-level-options gap on this side the
+/// same way): the wire format
 /// carries each column as one flat `(name, type-and-constraints-string)`
 /// pair and table options as a flat `Vec<String>`, neither a structured
 /// `ast::CreateTable`. This reconstructs both into real `CREATE TABLE` SQL
@@ -9373,13 +9376,13 @@ pub(crate) fn refuse_engine_owned_reserved_name_shape_wire(
 /// through this same local `CREATE TABLE` path) needs to keep working.
 ///
 /// `plan` is destructured EXHAUSTIVELY (no `..`), the same structural
-/// guarantee round 7 gave `ColumnDef`: a future `CreateTablePlan` field is a
+/// guarantee an earlier revision gave `ColumnDef`: a future `CreateTablePlan` field is a
 /// COMPILE ERROR here until this door is told how the new field
 /// participates -- either compared, or explicitly exempted with a comment
 /// naming why (as `retain` / `sync_direction` / `conflict_policy` /
 /// `history` are below) -- instead of silently smuggling through the way
 /// `immutable` / `state_machine` / `dag_edge_types` / `propagation_rules`
-/// did before round 8.
+/// did before that later review.
 fn refuse_engine_owned_reserved_name_shape(
     plan: &contextdb_planner::CreateTablePlan,
 ) -> Result<()> {
@@ -9393,11 +9396,11 @@ fn refuse_engine_owned_reserved_name_shape(
         state_machine,
         dag_edge_types,
         propagation_rules,
-        // C1-1 (owner-deferred): RETAIN / SYNC direction / HISTORY are
+        // Deliberately deferred: RETAIN / SYNC direction / HISTORY are
         // judged by `refuse_engine_owned_policy_axes` once a projected
         // `TableMeta` exists, not by this shape-only door -- do not fold
-        // them in here without a fresh owner ruling; that would silently
-        // widen a deliberate deferral.
+        // them in here without revisiting that deferral; that would silently
+        // widen it.
         retain: _,
         sync_direction: _,
         // Judged by `refuse_engine_owned_policy_axes` /

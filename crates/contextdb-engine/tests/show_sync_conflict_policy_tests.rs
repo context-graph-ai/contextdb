@@ -337,7 +337,7 @@ fn user_declared_table_stays_unmarked_and_alterable() {
     );
 }
 
-/// Blocker (fix round 2, item 1 -- ghost rows): `install_work_ledger_schema`
+/// Ghost rows: `install_work_ledger_schema`
 /// is OPT-IN, called only by fabric/server paths that actually use the work
 /// ledger (`work_ledger.rs`'s own doc comment: "Create the seven ledger
 /// tables if absent"). A plain `Database::open_memory()` with no install
@@ -377,7 +377,7 @@ fn show_never_renders_work_ledger_rows_when_the_ledger_is_not_installed() {
 
 /// The installed-store contrast half of the ghost-row fix: once
 /// `install_work_ledger_schema` actually runs, all seven tables exist and
-/// SHOW must render every one, marked engine-owned, exactly as the round-1
+/// SHOW must render every one, marked engine-owned, exactly as the earlier
 /// tests above already pin.
 #[test]
 fn show_renders_work_ledger_rows_once_the_ledger_is_installed() {
@@ -394,7 +394,7 @@ fn show_renders_work_ledger_rows_once_the_ledger_is_installed() {
     }
 }
 
-/// Blocker (fix round 2, item 2 -- refusal text honesty): the engine-owned
+/// Refusal text honesty: the engine-owned
 /// ALTER refusal (`engine_owned_policy_refusal`) is shared wording for two
 /// structurally different situations. For `work_inputs` / `work_capabilities`
 /// (and the other `ENGINE_OWNED_LEDGER_TABLES`) the claim "its SYNC CONFLICT
@@ -442,7 +442,7 @@ fn hub_refereed_refusal_never_claims_a_create_table_text_that_does_not_exist() {
     }
 }
 
-/// Blocker (fix round 2, item 4 -- existence first): for the five
+/// Existence first: for the five
 /// work-ledger tables covered only by
 /// `refuse_hub_refereed_ledger_sync_conflict_declaration` (`work_jobs`,
 /// `work_claims`, `work_results`, `work_failures`, `work_cancellations` --
@@ -551,9 +551,9 @@ fn alter_on_a_hub_refereed_table_reports_engine_owned_when_ledger_installed() {
 // than relying on a test pin here.
 
 // ---------------------------------------------------------------------
-// Fix round 5, item 3 (blocker -- MARK ALL ENGINE-GOVERNED ROWS): round
-// 1's ruling was "unmarked = operator-governed and settable, so no
-// engine-governed table may ever render unmarked" -- but `SHOW
+// MARK ALL ENGINE-GOVERNED ROWS: the standing rule is "unmarked =
+// operator-governed and settable, so no engine-governed table may ever
+// render unmarked" -- but `SHOW
 // SYNC_CONFLICT_POLICY`'s engine-owned second loop (`executor.rs`) only
 // iterates `engine_owned_work_ledger_conflict_policy_display()`, the SEVEN
 // work-ledger tables. `peer_directory` is engine-owned too (one of the

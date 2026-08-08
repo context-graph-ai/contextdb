@@ -40163,8 +40163,8 @@ fn rough_sync_table_meta(
 /// reconstruct-then-parse the shape door
 /// (`crate::executor::refuse_engine_owned_reserved_name_shape_wire`) already
 /// uses to JUDGE an arriving column, now reused to APPLY it too, so the two
-/// paths can never disagree about what a wire column text means. Round 8
-/// finding: the previous implementation read `PRIMARY KEY` / `UNIQUE` /
+/// paths can never disagree about what a wire column text means. A later
+/// review found: an earlier implementation read `PRIMARY KEY` / `UNIQUE` /
 /// `EXPIRES` / `IMMUTABLE` / `REFERENCES` / `CONTEXT_ID` off the RAW string
 /// via `.contains(...)`, so a token sitting inside a block comment (which
 /// the grammar's own `WHITESPACE` rule treats as skippable, exactly like a

@@ -3,8 +3,8 @@
 //! bytes + a hash — this module carries no work-class meaning of its own;
 //! that belongs to the work ledger, which resolves a `blob_ref` input and
 //! authorizes access, never this store. The fetch backend lives behind the
-//! adapter boundary (the transport adapter purity guard: this module names
-//! only contextdb types and the adapter's opaque facade, never a transport
+//! adapter boundary (the adapter purity guard: this module names only
+//! contextdb types and the adapter's opaque facade, never a network
 //! implementation crate directly).
 //!
 //! A consumer may only resolve a blob while it holds a LIVE work-ledger
@@ -492,7 +492,7 @@ impl BlobStore {
     /// an integration test file never has to name the network adapter or
     /// spell out its config-surface spec string itself — that stays
     /// confined to this already-sanctioned adapter/config surface (the
-    /// transport adapter purity guard). Returns the same endpoint handle
+    /// adapter purity guard). Returns the same endpoint handle
     /// `serve_on` takes; callers only need its existing public methods
     /// (`ticket()`, `close()`, ...).
     #[cfg(any(test, feature = "test-seams"))]

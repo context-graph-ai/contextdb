@@ -15,6 +15,9 @@ fn historical_phrases() -> Vec<String> {
         ["Finding", "2"].join(" "),
         ["own", "commit"].join(" "),
         ["deferral", "ledger"].join("-"),
+        ["fix", "round"].join(" "),
+        ["owner", "ruling"].join(" "),
+        ["review", "must-fix"].join(" "),
     ]
 }
 
@@ -24,6 +27,44 @@ fn repo_root() -> PathBuf {
         .nth(2)
         .expect("workspace root")
         .to_path_buf()
+}
+
+/// `git ls-files` scoped to the same three top-level directories, walked
+/// directly off the filesystem. Used only when the source tree is not a git
+/// repository (e.g. a `git archive` export) -- git stays the primary source
+/// because it honors `.gitignore`, so this fallback is only reached when git
+/// itself cannot answer.
+fn walk_tracked_like_paths(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for top in ["crates", "tests", "docs"] {
+        let dir = root.join(top);
+        if dir.is_dir() {
+            walk_dir_into(&dir, root, &mut out);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn walk_dir_into(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        if path.is_dir() {
+            walk_dir_into(&path, root, out);
+        } else if path.is_file()
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
 }
 
 fn is_identifier_byte(byte: u8) -> bool {
@@ -152,6 +193,55 @@ fn contains_uppercase_round_tag(value: &str) -> bool {
     false
 }
 
+/// Case-sensitive whole-word match on a reviewer/agent/model name. Case-
+/// sensitive so a lowercase, unrelated use of the same letters (a crate
+/// named for a Pacific island time zone, a source label naming a chat CLI
+/// in fixture data) is not mistaken for the capitalized reviewer identity.
+/// Each name is assembled from split fragments so this dictionary is not
+/// itself flagged when the audit below scans its own source file.
+fn contains_reviewer_name(value: &str) -> bool {
+    let names: [String; 6] = [
+        ["Cod", "ex"].concat(),
+        ["Op", "us"].concat(),
+        ["Cla", "ude"].concat(),
+        ["Sonn", "et"].concat(),
+        ["Hai", "ku"].concat(),
+        ["G", "PT"].concat(),
+    ];
+    let bytes = value.as_bytes();
+    names.iter().any(|name| {
+        value.match_indices(name.as_str()).any(|(start, matched)| {
+            let end = start + matched.len();
+            (start == 0 || !is_identifier_byte(bytes[start - 1])) && has_token_boundary(bytes, end)
+        })
+    })
+}
+
+/// A spelled-out, hyphenated, capitalized execution-round reference (a
+/// capital "Round" immediately followed by a hyphen and digits) -- the
+/// spelling this repo actually uses for that vocabulary. Scoped to the
+/// hyphenated form only: a space-separated capitalized round reference
+/// collides with legitimate, unrelated uses elsewhere in the tree (a smoke
+/// test's own numbered scenario stages), which are not execution-session
+/// vocabulary.
+fn contains_spelled_out_round_tag(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    for (start, _) in value.match_indices("Round-") {
+        if start > 0 && is_identifier_byte(bytes[start - 1]) {
+            continue;
+        }
+        let mut cursor = start + "Round-".len();
+        let digits_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor > digits_start && has_token_boundary(bytes, cursor) {
+            return true;
+        }
+    }
+    false
+}
+
 #[test]
 fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
     let root = repo_root();
@@ -163,17 +253,45 @@ fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
         .arg("-C")
         .arg(&root)
         .args(["ls-files", "-z", "crates", "tests", "docs"])
+        // The not-a-repo detection matches git's English message; pin the
+        // locale so a translated git cannot change the failure mode.
+        .env("LC_ALL", "C")
         .output()
         .expect("list tracked implementation files");
-    assert!(output.status.success(), "git ls-files failed: {output:?}");
+    let rel_paths: Vec<String> = if output.status.success() {
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|rel| {
+                std::str::from_utf8(rel)
+                    .expect("UTF-8 tracked path")
+                    .to_string()
+            })
+            .collect()
+    } else {
+        // Not every source tree that must pass this gate is a git checkout --
+        // a `git archive` export or source tarball has no `.git` directory.
+        // Fall back to a plain filesystem walk over the same scope; any
+        // OTHER git failure (corrupt repo, permissions, ...) still panics.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not a git repository"),
+            "git ls-files failed: {output:?}"
+        );
+        walk_tracked_like_paths(&root)
+    };
+    // An empty candidate set means the scan is vacuous — e.g. the source tree
+    // was unpacked inside an unrelated git repository, where ls-files matches
+    // nothing yet exits 0. A green audit must mean files were actually read.
+    assert!(
+        !rel_paths.is_empty(),
+        "vocabulary audit found no files to scan under crates/tests/docs"
+    );
 
     let mut hits = Vec::new();
-    for rel in output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        let rel = std::str::from_utf8(rel).expect("UTF-8 tracked path");
+    for rel in &rel_paths {
+        let rel = rel.as_str();
         if contains_campaign_test_filename(rel) || contains_campaign_prose(rel) {
             hits.push(format!(
                 "{rel}: execution-campaign vocabulary in tracked path"
@@ -253,11 +371,64 @@ fn tracked_implementation_prose_has_no_execution_session_vocabulary() {
                     line_number + 1
                 ));
             }
+            if contains_reviewer_name(line) {
+                hits.push(format!(
+                    "{rel}:{}: reviewer/agent/model name: {line}",
+                    line_number + 1
+                ));
+            }
+            if contains_spelled_out_round_tag(line) {
+                hits.push(format!(
+                    "{rel}:{}: spelled-out execution-round tag: {line}",
+                    line_number + 1
+                ));
+            }
         }
     }
     assert!(
         hits.is_empty(),
         "implementation-history vocabulary must be removed from tracked production/tests/docs:\n{}",
         hits.join("\n")
+    );
+}
+
+/// The filesystem-walk fallback only stands in for `git ls-files` when git is
+/// unavailable, so it must find at least everything git finds. Confirms scan
+/// parity (walk is a superset-or-equal of the git-tracked set) on this repo,
+/// where both sources are available to compare.
+#[test]
+fn filesystem_walk_fallback_is_a_superset_of_git_tracked_paths() {
+    let root = repo_root();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z", "crates", "tests", "docs"])
+        // The not-a-repo detection matches git's English message; pin the
+        // locale so a translated git cannot change the failure mode.
+        .env("LC_ALL", "C")
+        .output()
+        .expect("list tracked implementation files");
+    if !output.status.success() {
+        // No git repository here either -- nothing to compare against.
+        return;
+    }
+
+    let git_paths: std::collections::BTreeSet<String> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|rel| {
+            std::str::from_utf8(rel)
+                .expect("UTF-8 tracked path")
+                .to_string()
+        })
+        .collect();
+    let walk_paths: std::collections::BTreeSet<String> =
+        walk_tracked_like_paths(&root).into_iter().collect();
+
+    let missing: Vec<&String> = git_paths.difference(&walk_paths).collect();
+    assert!(
+        missing.is_empty(),
+        "filesystem walk fallback missed git-tracked paths that a git-free export must still scan: {missing:?}"
     );
 }

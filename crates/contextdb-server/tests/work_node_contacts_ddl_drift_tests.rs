@@ -13,7 +13,7 @@
 //! without the other, this test fails loudly instead of the shape door
 //! silently drifting from the table it actually governs (a mismatch here
 //! would reintroduce exactly the "which shape is canonical?" confusion the
-//! round-6/round-7/round-8 shape-door work exists to close).
+//! shape-door work across several earlier revisions exists to close).
 
 #[test]
 fn engine_owned_shape_door_copy_matches_the_real_installer_ddl() {

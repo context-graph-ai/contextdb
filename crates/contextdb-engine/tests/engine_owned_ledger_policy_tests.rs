@@ -965,7 +965,7 @@ fn create_table_work_capabilities_with_wrong_columns_refuses_locally() {
     );
 }
 
-/// Blocker (fix round 2, item 3 -- reserved names): the reserved-name door
+/// Reserved names: the reserved-name door
 /// (`refuse_engine_owned_reserved_name_shape`) only recognizes
 /// [`ENGINE_OWNED_LEDGER_TABLES`]'s four names (`work_inputs`,
 /// `work_capabilities`, `peer_directory`, `work_node_contacts`) --
@@ -1378,7 +1378,7 @@ fn drop_then_recreate_work_capabilities_with_canonical_columns_silent_policy_sti
 }
 
 // ---------------------------------------------------------------------
-// Fix round 3, item 1 (blocker -- POLICY-CLAUSE DOOR): the round-2 fix
+// POLICY-CLAUSE DOOR: an earlier fix
 // extended the RESERVED-NAME / column-shape door
 // (`refuse_engine_owned_reserved_name_shape`) to all nine names, but the
 // POLICY-CLAUSE door (`refuse_engine_owned_policy_axes`, gated on the
@@ -1389,12 +1389,12 @@ fn drop_then_recreate_work_capabilities_with_canonical_columns_silent_policy_sti
 // `work_claims` / `work_results` / `work_failures` / `work_cancellations`
 // (`refuse_hub_refereed_ledger_sync_conflict_declaration` -- the door that
 // DOES cover these five -- is wired only into the local ALTER arm and the
-// three wire-DDL preflights named in the round-3 brief; the local CREATE
-// arm calls only `refuse_engine_owned_policy_axes`). `db.table_meta`
+// three wire-DDL preflights named in the follow-up design brief; the local
+// CREATE arm calls only `refuse_engine_owned_policy_axes`). `db.table_meta`
 // then carries the lying `KEEP_LATEST`, while `SHOW SYNC_CONFLICT_POLICY`
-// (round-2 fix) still renders the true `keep_first (engine-owned)` --
-// `.schema`/SHOW disagreement, the same shape round 1's `work_jobs` bug
-// took.
+// (from that earlier fix) still renders the true `keep_first (engine-owned)`
+// -- `.schema`/SHOW disagreement, the same shape the original `work_jobs`
+// bug took.
 // ---------------------------------------------------------------------
 
 /// All five hub-refereed table names arbitrate `keep_first` (three via the
@@ -1749,7 +1749,7 @@ fn schema_and_show_never_disagree_after_a_refused_alter_or_wire_attempt_on_a_hub
     install_work_ledger_schema(&db).expect("install ledger schema");
 
     for table in HUB_REFEREED_TABLES {
-        // Local ALTER (already refused since round 2 -- re-attempted here
+        // Local ALTER (already refused since the earlier fix -- re-attempted here
         // only to build the post-attempt SHOW state this test checks).
         let _ = db.execute(
             &format!("ALTER TABLE {table} SET SYNC CONFLICT KEEP LATEST"),
@@ -1809,7 +1809,7 @@ fn schema_and_show_never_disagree_after_a_refused_alter_or_wire_attempt_on_a_hub
 }
 
 // ---------------------------------------------------------------------
-// Fix round 3, item 2 (blocker -- REFUSAL TEXT SCOPE): the SYNC-CONFLICT
+// REFUSAL TEXT SCOPE: the SYNC-CONFLICT
 // refusal for a hub-refereed table (`engine_owned_policy_refusal`, both its
 // `work_claims`/`work_results`/`work_cancellations` branch and its generic
 // fallback used by `work_jobs`/`work_failures`) says "{table} is
@@ -1818,7 +1818,7 @@ fn schema_and_show_never_disagree_after_a_refused_alter_or_wire_attempt_on_a_hub
 // CONFLICT is the ONLY axis any door actually judges: no door named in this
 // suite gates `ALTER TABLE work_jobs SET RETAIN ...` or `... SET SYNC OFF`
 // at all (that wider gap is filed separately, NOT this lane's scope -- see
-// the round-3 brief). The refusal text must speak only for the axis it
+// the follow-up design brief). The refusal text must speak only for the axis it
 // actually enforces.
 // ---------------------------------------------------------------------
 
@@ -1858,13 +1858,13 @@ fn hub_refereed_sync_conflict_refusal_names_only_the_conflict_axis() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 4 (blocker, small polish): the run's ruled decision makes a
+// SMALL POLISH: standing policy makes a
 // consumer-typed `CREATE TABLE work_jobs (<canonical columns>) SYNC
 // CONFLICT KEEP FIRST` (the HONEST clause -- true arbitration verbatim)
 // LEGAL, proven by the GREEN pin
 // `local_create_of_each_hub_refereed_table_with_the_honest_clause_still_works`
 // above. But the SYNC-CONFLICT refusal message
-// (`engine_owned_policy_refusal`'s hub-refereed branch, round 3's fix)
+// (`engine_owned_policy_refusal`'s hub-refereed branch, from an earlier fix)
 // still ends "{table}'s SYNC CONFLICT is (re)declared only by the
 // installer that owns it" -- installer-EXCLUSIVITY, which is now false: a
 // consumer CAN legally (re)declare it, verbatim, in their own CREATE
@@ -1904,8 +1904,8 @@ fn hub_refereed_sync_conflict_refusal_does_not_claim_installer_exclusivity() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 5, item 1 (blocker -- HONEST RESTATE AT ALTER): the refusal
-// message (round 4's fix, `engine_owned_policy_refusal`'s hub-refereed
+// HONEST RESTATE AT ALTER: the refusal
+// message (from an earlier fix, `engine_owned_policy_refusal`'s hub-refereed
 // branch) now says "A SYNC CONFLICT clause that restates this arbitration
 // verbatim, or no SYNC CONFLICT clause at all, is accepted here; a value
 // that mismatches it is refused" -- and the CREATE door
@@ -1952,7 +1952,7 @@ fn alter_honest_verbatim_restate_on_a_hub_refereed_table_succeeds() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 5, item 2 (blocker -- SHAPE-REFUSAL MESSAGE): round 4 fixed
+// SHAPE-REFUSAL MESSAGE: an earlier fix addressed
 // the installer-exclusivity overclaim on the SYNC-CONFLICT branch of
 // `engine_owned_policy_refusal` only. The SEPARATE shape-refusal message
 // (`refuse_engine_owned_reserved_name_shape` and its wire mirror
@@ -1963,7 +1963,7 @@ fn alter_honest_verbatim_restate_on_a_hub_refereed_table_succeeds() {
 // names (a canonical-shape consumer CREATE has always succeeded for them,
 // e.g. `create_table_work_capabilities_with_canonical_columns_silent_on_policy_still_works`
 // above) and is newly false for the five hub-refereed names too, since
-// round 3 extended the shape door to them
+// an earlier revision extended the shape door to them
 // (`local_create_of_each_hub_refereed_table_with_canonical_columns_and_no_clause_still_works`).
 // The message should state the REAL rule: columns must structurally match
 // the canonical shape, not that only the installer may ever type the name.
@@ -2010,7 +2010,7 @@ fn shape_refusal_does_not_claim_installer_exclusivity() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 6 (blocker, ship-gate finding with a LIVE repro): the shape
+// LIVE REPRO, SHIP-GATE FINDING: the shape
 // door (`refuse_engine_owned_reserved_name_shape` locally,
 // `refuse_engine_owned_reserved_name_shape_wire` over the wire) compares
 // only column COUNT / NAME / DATA TYPE / PRIMARY KEY -- never nullability,
@@ -2068,7 +2068,7 @@ fn work_jobs_hidden_attribute_mismatches() -> Vec<(&'static str, String)> {
             ),
         ),
         (
-            // Fix round 9: this suite's own comment above (naming
+            // This suite's own comment above (naming
             // `references: Option<ForeignKey>` alongside `unique`/`default`
             // as an axis the door checks) had never actually been exercised
             // by a matrix row -- `work_class` canonically carries no
@@ -2323,8 +2323,8 @@ fn two_jobs_sharing_a_work_class_both_insert_on_the_canonical_shape() {
 }
 
 // ---------------------------------------------------------------------
-// Round 6 addendum (blocker): `engine_owned_policy_refusal` has THREE
-// message branches. Rounds 4 and 5 fixed the two branches reachable only
+// A later addendum: `engine_owned_policy_refusal` has THREE
+// message branches. Two earlier fixes addressed the two branches reachable only
 // for the five hub-refereed work-ledger tables (the `work_claims` /
 // `work_results` / `work_cancellations` no-declared-clause branch, and the
 // `work_jobs` / `work_failures` declared-clause branch) to stop claiming
@@ -2337,8 +2337,8 @@ fn two_jobs_sharing_a_work_class_both_insert_on_the_canonical_shape() {
 // false for all four, so `clause == "SYNC CONFLICT" &&
 // is_hub_refereed_sync_conflict_table(table)` never matches them). It
 // still says "{table} is (re)declared only by the installer that owns it,
-// never by an ALTER an operator types" -- the SAME falsehood rounds 4/5
-// fixed elsewhere, surviving in the one branch those fixes edited around.
+// never by an ALTER an operator types" -- the SAME falsehood those two
+// earlier fixes addressed elsewhere, surviving in the one branch those fixes edited around.
 // Binary-disproven exactly like before: `restating_the_declared_value_verbatim_is_not_refused`
 // above already proves an honest verbatim ALTER restate succeeds on these
 // four tables; this test pins the message text alongside that proof.
@@ -2411,14 +2411,14 @@ fn fallback_sync_conflict_refusal_does_not_claim_installer_exclusivity_or_alter_
 }
 
 // ---------------------------------------------------------------------
-// Fix round 7 (blocker, two independent ship reviews at tip 8c69eea, both
-// with live binary repros): the reserved-name shape door
+// LIVE BINARY REPROS, confirmed by two independent ship reviews at tip
+// 8c69eea: the reserved-name shape door
 // (`refuse_engine_owned_reserved_name_shape` / its wire mirror) still
 // compares only column count/name/type/primary-key/nullable and the
-// UNIQUE/DEFAULT/REFERENCES absence round 6 added -- it never looks at
+// UNIQUE/DEFAULT/REFERENCES absence an earlier fix added -- it never looks at
 // `IMMUTABLE` or `EXPIRES`, both of which `ColumnDef` already carries
 // (`immutable: bool`, `expires: bool` -- no parser plumbing needed, exactly
-// the round-6 finding's shape). And no door anywhere judges a LOCAL `ALTER
+// the same shape as that earlier finding). And no door anywhere judges a LOCAL `ALTER
 // TABLE ... ADD/DROP/RENAME COLUMN` on a reserved name at all, nor does the
 // arriving-wire `AlterTable` preflight arm judge column shape (it calls only
 // the policy-axis doors) -- so `merge_sync_alter_existing_column`
@@ -2606,7 +2606,7 @@ fn arriving_fresh_create_table_of_work_jobs_with_a_hidden_expires_deadline_refus
 }
 
 // ---------------------------------------------------------------------
-// Fix round 7: the LOCAL ALTER shape door does not exist at all -- no code
+// The LOCAL ALTER shape door does not exist at all -- no code
 // anywhere refuses `ALTER TABLE <reserved-name> ADD/DROP/RENAME COLUMN`, so
 // an operator can freely reshape one of the nine reserved names' columns
 // after `install_work_ledger_schema` has already created it.
@@ -2725,7 +2725,7 @@ fn column_shape_alters_on_a_user_table_still_work() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 7: the arriving-wire `AlterTable` preflight arm of
+// The arriving-wire `AlterTable` preflight arm of
 // `refuse_engine_owned_policy_sync_ddl` (`database.rs:39930`) calls only
 // `refuse_engine_owned_policy_axes` and
 // `refuse_hub_refereed_ledger_sync_conflict_mismatch` -- neither judges
@@ -2738,8 +2738,8 @@ fn column_shape_alters_on_a_user_table_still_work() {
 /// RED, wire path: an arriving `AlterTable` restating an already-installed
 /// `work_jobs` with a hidden UNIQUE on `work_class` must refuse -- today it
 /// silently latches `unique=true` onto the engine's own job table, arming
-/// the identical silent-INSERT-no-op live repro round 6 fixed for the local
-/// CREATE door, reachable here through ALTER instead.
+/// the identical silent-INSERT-no-op live repro an earlier fix addressed for
+/// the local CREATE door, reachable here through ALTER instead.
 #[test]
 fn arriving_alter_table_with_a_hidden_unique_on_work_jobs_refuses() {
     let db = Database::open_memory();
@@ -2840,7 +2840,7 @@ fn arriving_alter_table_with_a_hidden_immutable_on_peer_directory_refuses() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 7 (blocker -- REFUSAL TEXT TRUTH, work_node_contacts): the
+// REFUSAL TEXT TRUTH, work_node_contacts: the
 // generic SYNC-CONFLICT fallback branch of `engine_owned_policy_refusal`
 // (`executor.rs`) says "its SYNC CONFLICT declaration lives once, in the
 // engine's own CREATE TABLE text for {table}" and "a SYNC CONFLICT clause
@@ -2902,10 +2902,10 @@ fn set_sync_conflict_on_work_node_contacts_does_not_lie_about_a_declaration() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 7 (blocker -- SHAPE-REFUSAL MESSAGE TRUTH): the shape-refusal
+// SHAPE-REFUSAL MESSAGE TRUTH: the shape-refusal
 // message (`engine_owned_reserved_shape_refusal`) says a CREATE is accepted
 // "only when its columns match that shape exactly, in name, type, and
-// primary key" -- but every one of round 6's own hidden-attribute-mismatch
+// primary key" -- but every one of an earlier fix's own hidden-attribute-mismatch
 // fixtures (`work_jobs_hidden_attribute_mismatches`) satisfies name, type,
 // AND primary key exactly; only an unrelated attribute (UNIQUE / nullability
 // / DEFAULT, and now IMMUTABLE / EXPIRES) differs. Claiming the refusal is
@@ -2941,15 +2941,15 @@ fn shape_refusal_names_the_offending_column_not_just_name_type_primary_key() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 8 (two independent verdicts at 1f13013, both confirming the
-// round-7 column-level fix works): the reserved-name shape door still
+// Two independent verdicts at 1f13013 both confirm the earlier
+// column-level fix works, but the reserved-name shape door still
 // compares only COLUMNS and table-level key constraints (composite UNIQUE /
 // PRIMARY KEY / FOREIGN KEY) -- it never compares the plan's table-level
 // OPTIONS (`CreateTablePlan.immutable` / `.state_machine` / `.dag_edge_types`
 // / `.propagation_rules`). None of the nine reserved tables' own CREATE
 // TABLE text declares a table-level IMMUTABLE, so a consumer typing one in
 // is a structural mismatch exactly like a hidden per-column UNIQUE was
-// before round 7 -- but nothing today judges it.
+// before that earlier fix -- but nothing today judges it.
 // ---------------------------------------------------------------------
 
 /// RED: a table-level `IMMUTABLE` option on `peer_directory`
@@ -2961,7 +2961,7 @@ fn shape_refusal_names_the_offending_column_not_just_name_type_primary_key() {
 /// `p.immutable` into `TableMeta.immutable` uncompared. Once installed, a
 /// table-level-immutable `peer_directory` arms `register_peer_ticket`'s own
 /// re-enrollment upsert to refuse with `Error::ImmutableTable` the next time
-/// a node rotates its ticket -- the ticket-rotation break round 7's
+/// a node rotates its ticket -- the ticket-rotation break the earlier
 /// column-level IMMUTABLE pin caught, reachable here through the
 /// TABLE-level option instead of a column-level one.
 ///
@@ -3096,8 +3096,8 @@ fn arriving_fresh_create_table_of_peer_directory_with_a_table_level_immutable_op
 }
 
 // ---------------------------------------------------------------------
-// Fix round 8 addendum (cold reviewer widened the table-level-options
-// finding with live probes): the gap is not IMMUTABLE-only, and not
+// A cold review widened the table-level-options
+// finding with live probes: the gap is not IMMUTABLE-only, and not
 // peer_directory-only -- STATE_MACHINE and DAG are the SAME uncompared
 // `CreateTablePlan` fields (`state_machine` / `dag_edge_types`), confirmed
 // accepted today on other reserved names. Table choice matters here: some
@@ -3357,8 +3357,7 @@ fn local_create_of_peer_directory_with_a_table_level_dag_option_refuses() {
 }
 
 // ---------------------------------------------------------------------
-// Fix round 8 (review must-fix, reverses a recorded owner ruling --
-// existence-first): round 7's LOCAL ALTER shape door
+// Existence-first, deliberately reversed here: the LOCAL ALTER shape door
 // (`refuse_engine_owned_reserved_name_column_alter`) runs BEFORE any
 // `db.table_meta` existence lookup in the `AddColumn` / `DropColumn` /
 // `RenameColumn` arms, so on a store where a reserved table was NEVER
@@ -3368,7 +3367,7 @@ fn local_create_of_peer_directory_with_a_table_level_dag_option_refuses() {
 // same table's own `SET SYNC CONFLICT` / `SET RETAIN` / `SET HISTORY` arms)
 // already reports and what a caller must see to tell "this table doesn't
 // exist yet" apart from "this table exists and is engine-governed" (the
-// same existence-first ruling the round-2 fix already applied to
+// same existence-first ruling an earlier fix already applied to
 // `AlterAction::SetSyncConflict`, pinned by
 // `alter_on_a_hub_refereed_table_reports_not_found_before_engine_owned_when_ledger_absent`
 // in `show_sync_conflict_policy_tests.rs`).
@@ -3408,7 +3407,7 @@ fn alter_column_shape_on_a_reserved_name_reports_not_found_before_engine_owned_w
             Error::SchemaInvalid { reason } => panic!(
                 "{table} does not exist in this store yet -- ALTER must report 'table not \
                  found', not the engine-owned refusal (existence must be checked before \
-                 ownership, matching the round-2 ruling already applied to SET SYNC CONFLICT): \
+                 ownership, matching the earlier ruling already applied to SET SYNC CONFLICT): \
                  {reason}"
             ),
             other => {
@@ -3419,7 +3418,7 @@ fn alter_column_shape_on_a_reserved_name_reports_not_found_before_engine_owned_w
 }
 
 // ---------------------------------------------------------------------
-// Fix round 8 (review low finding): the arriving-wire door reparses column
+// A low-severity review finding: the arriving-wire door reparses column
 // type strings through the real parser, but the SEPARATE code path that
 // actually APPLIES an arriving AlterTable's column shape
 // (`rough_sync_column_def`, `database.rs`) re-reads the SAME raw string
@@ -3523,7 +3522,7 @@ fn arriving_alter_table_comment_smuggled_immutable_on_an_operator_table_does_not
 }
 
 // ---------------------------------------------------------------------
-// Fix round 9, item 1 (blocker, live-reproduced): the sync AlterTable
+// Live-reproduced: the sync AlterTable
 // preflight (`refuse_engine_owned_policy_sync_ddl`'s `AlterTable` arm,
 // `database.rs`) calls `refuse_engine_owned_reserved_name_shape_wire`
 // WITHOUT the arriving `foreign_keys` field, even though it is available
@@ -3664,8 +3663,8 @@ fn arriving_alter_table_restating_work_jobs_with_empty_foreign_keys_still_applie
 }
 
 // ---------------------------------------------------------------------
-// Fix round 9, item 2 (must-fix, fourth recurrence of the same
-// falsehood): `engine_owned_policy_refusal`'s final fall-through arm --
+// Fourth recurrence of the same falsehood:
+// `engine_owned_policy_refusal`'s final fall-through arm --
 // reached for the RETAIN / HISTORY / SYNC-direction axes on the four
 // ORIGINAL `ENGINE_OWNED_LEDGER_TABLES` -- still says "{table} is
 // (re)declared only by the installer that owns it, never by an ALTER an
@@ -3778,7 +3777,7 @@ fn fallback_sync_direction_refusal_does_not_claim_installer_exclusivity_or_alter
 }
 
 // ---------------------------------------------------------------------
-// Fix round 10 (cold review must-fix): existence-first ordering was never
+// Existence-first ordering was never
 // door-wide -- `alter_column_shape_on_a_reserved_name_reports_not_found_
 // before_engine_owned_when_ledger_absent` above only exercises the three
 // column-shape `AlterAction` variants. Of the other five, `SetHistory` and

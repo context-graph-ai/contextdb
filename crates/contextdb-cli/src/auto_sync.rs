@@ -95,7 +95,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_sync_retries_until_success_after_error() {
         let (tx, rx) = mpsc::unbounded_channel();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -146,7 +146,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_sync_coalesces_burst_notifications() {
         let (tx, rx) = mpsc::unbounded_channel();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -241,7 +241,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn auto_sync_retries_until_caught_up() {
         let (tx, rx) = mpsc::unbounded_channel();
         let attempts = Arc::new(AtomicUsize::new(0));

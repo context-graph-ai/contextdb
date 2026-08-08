@@ -457,7 +457,7 @@ async fn a_version_mismatched_peer_is_refused_on_the_status_exchange() {
 
 // ---------------------------------------------------------------------------
 // `WirePushError::ReplaysAcceptedDelete` (commit 861588c) added a NEW enum
-// variant to the wire. OWNER RULING (2026-08-06): no version bump is needed
+// variant to the wire. Standing policy: no version bump is needed
 // for this — everything on this wire is greenfield, nothing has been
 // released, and every consumer builds from the same `dev` path and rebuilds
 // together, so the wire may change in place until the first public release
@@ -496,7 +496,7 @@ fn replays_accepted_delete_wire_bytes_are_frozen() {
 /// this variant existed cannot recognize the "ReplaysAcceptedDelete" tag at
 /// all and fails to decode any `PushResponse` carrying it. This is exactly
 /// WHY every machine on this wire must rebuild from `dev` together until the
-/// first public release (owner ruling, 2026-08-06) — there is no version
+/// first public release — there is no version
 /// negotiation covering this gap today, only the "everyone tracks `dev`"
 /// discipline. Once a release ships, this same fact is the argument FOR
 /// applying version-bump discipline from then on.
