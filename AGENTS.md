@@ -35,8 +35,8 @@ there, run them freely and without asking.
 | Recreate a wedged or corrupt store | `contextdb reset <path> --force` | Destroys all data. Recover what you need from a backup or a healthy sync peer first. `--force` is mandatory; without it the CLI refuses and exits `2`. |
 | Take a backup before any of the above | `contextdb snapshot export <path> <dest>` | Purge-fenced; the safe prerequisite for `migrate` and `reset`. |
 | Apply declared `RETAIN` windows now instead of waiting for the background cycle | `.maintenance run` (REPL meta-command) | Synchronous; expires rows the table's own DDL already declared expirable. |
-| Erase rows permanently | TODO-D34 — guarded CLI purge verb | Not yet reachable from the CLI; purge is library-only until that verb lands. |
-| Make a route, sink or schedule actually fire | TODO-D34 — CLI door for triggers/events/schedules | `CREATE EVENT TYPE`/`SINK`/`ROUTE`/`SCHEDULE` parse and the engine executes them, but no CLI path delivers yet. Drive them from the Rust library, or wait for that verb. |
+| Erase rows permanently | `contextdb purge <path> --table <t> --force` | Purge-fenced; refuses without `--force` (exit `2`). Only legal on a store that has never connected to a sync hub. |
+| Make a route, sink or schedule actually fire | Run the DDL in a `:memory:` CLI session; inspect with `.events status` | In an ephemeral `:memory:` session the CLI registers default callbacks, so routes deliver and schedules fire observably. On a file-backed store, events queue durably until your own program registers its callbacks (`register_sink` / `register_cron_callback`) — that durable queueing is the contract, not a gap. |
 
 ### Migration rehearsal — run these four steps in order, do not add flags
 
@@ -91,9 +91,11 @@ Task-shaped recipes, copy-paste runnable. Read the one matching what you are doi
 |---|---|---|
 | `using-contextdb` | Open a database, define tables, run SQL (including multi-line paste), read `--json`, branch on exit codes. | [`skills/using-contextdb/SKILL.md`](skills/using-contextdb/SKILL.md) |
 | `querying-the-graph` | Declare a DAG edge table, traverse it with `GRAPH_TABLE`, get cycle inserts refused, enforce `STATE MACHINE` transitions with `PROPAGATE` cascades. | [`skills/querying-the-graph/SKILL.md`](skills/querying-the-graph/SKILL.md) |
+| `running-triggers-and-schedules` | Declare `CREATE EVENT TYPE`/`SINK`/`ROUTE`/`SCHEDULE`, see them fire observably in `:memory:`, and wire `register_sink`/`register_cron_callback` so a file-backed store's durably-queued events actually deliver. | [`skills/running-triggers-and-schedules/SKILL.md`](skills/running-triggers-and-schedules/SKILL.md) |
 | `sync` | Stand up a hub, enroll an edge with its ticket, push/pull, and read the applied / skipped / conflicts counts correctly. | [`skills/sync/SKILL.md`](skills/sync/SKILL.md) |
 | `vector-search` | Embedding columns, `<=>` nearest-neighbour search, schema-declared `USE RANK` policies, and the hybrid graph + vector query. | [`skills/vector-search/SKILL.md`](skills/vector-search/SKILL.md) |
 | `work-fabric` | Hand a job to another machine over the work ledger and move the bytes it needs over the blob plane. Library API — no CLI. | [`skills/work-fabric/SKILL.md`](skills/work-fabric/SKILL.md) |
+| `operating-a-store` | Enforce `RETAIN` windows on demand with `.maintenance run`, permanently erase rows with `purge` (never-connected stores only), back up before a destructive op, and read `pull_pages_read` sync liveness. | [`skills/operating-a-store/SKILL.md`](skills/operating-a-store/SKILL.md) |
 
 Reference docs, when a skill is not enough:
 

@@ -36,6 +36,10 @@ struct CronSchedule {
     policy: CronMissedPolicy,
     next_fire_at_ms: u64,
     last_fire_at_ms: Option<u64>,
+    /// Count of successful fires. Additive field (defaults to 0 on
+    /// deserialization of schedules persisted before this counter existed).
+    #[serde(default)]
+    fire_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +194,7 @@ impl Database {
             policy,
             next_fire_at_ms: now_millis().saturating_add(every_ms),
             last_fire_at_ms: None,
+            fire_count: 0,
         };
         {
             let _dispatch = self.cron.dispatch_lock.lock();
@@ -266,10 +271,39 @@ impl Database {
         Ok(())
     }
 
+    /// Point-in-time status of every declared schedule: what it's wired to,
+    /// whether that callback name has ever been registered, when it last
+    /// fired, and how many times it has fired successfully. Backs the CLI's
+    /// `.events status` introspection and is a real public accessor, not a
+    /// test seam.
+    pub fn cron_status(&self) -> Vec<CronScheduleStatus> {
+        let _operation = self.assert_open_operation();
+        let callbacks = self.cron.callbacks.read();
+        self.cron
+            .schedules
+            .lock()
+            .values()
+            .map(|schedule| CronScheduleStatus {
+                name: schedule.name.clone(),
+                every_text: schedule.every_text.clone(),
+                callback: schedule.callback.clone(),
+                callback_registered: callbacks.contains_key(&schedule.callback),
+                next_fire_at_ms: schedule.next_fire_at_ms,
+                last_fire_at_ms: schedule.last_fire_at_ms,
+                fire_count: schedule.fire_count,
+            })
+            .collect()
+    }
+
     #[cfg(any(test, feature = "test-seams"))]
     pub fn cron_run_due_now_for_test(&self) -> Result<u64> {
         let _operation = self.open_operation()?;
-        self.wait_for_imminent_cron_due_for_test(Duration::from_millis(75));
+        // Bounded at 1s: comfortably covers the short-but-not-instant
+        // intervals a real test schedule uses (e.g. "EVERY '200
+        // MILLISECONDS'") without ever hanging -- a schedule further out
+        // than that returns unfired rather than sleeping the test through
+        // it.
+        self.wait_for_imminent_cron_due_for_test(Duration::from_millis(1_000));
         self.dispatch_due_cron_schedules(true)
     }
 
@@ -536,6 +570,9 @@ impl Database {
             match self.run_cron_callback_transaction(callback.clone()) {
                 Ok(lsn) => {
                     *successful_fires += 1;
+                    if let Some(current) = self.cron.schedules.lock().get_mut(&schedule.name) {
+                        current.fire_count = current.fire_count.saturating_add(1);
+                    }
                     self.append_cron_audit(&schedule.name, CronAuditKind::Fired, lsn)?;
                 }
                 Err(err) => {

@@ -100,9 +100,10 @@ pub use blob_store::{BlobStore, ResolveError};
 pub use database::CommitStageStats;
 pub use database::TriggerProgressTelemetrySnapshot;
 pub use database::{
-    ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, SinkError, SinkEvent,
-    SinkMetrics, TriggerAuditEntry, TriggerAuditFilter, TriggerAuditStatus,
-    TriggerAuditStatusFilter, TriggerContext, TriggerDeclaration, TriggerEvent,
+    ApplyPhasePauseGuard, CronAuditEntry, CronAuditKind, CronPauseGuard, CronScheduleStatus,
+    EventBusStatus, EventTypeStatus, RouteStatus, SinkError, SinkEvent, SinkMetrics, SinkStatus,
+    TriggerAuditEntry, TriggerAuditFilter, TriggerAuditStatus, TriggerAuditStatusFilter,
+    TriggerContext, TriggerDeclaration, TriggerEvent,
 };
 pub use database::{
     CascadeReport, Database, ExportReport, IndexCandidate, QueryResult, QueryTrace,

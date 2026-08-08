@@ -1208,6 +1208,49 @@ impl Database {
         self.sink_metrics(sink)
     }
 
+    /// Point-in-time view of every declared event type, sink (with its
+    /// delivery metrics and whether a callback is currently registered), and
+    /// route. Backs the CLI's `.events status` introspection and is a real
+    /// public accessor, not a test seam.
+    pub fn event_bus_status(&self) -> EventBusStatus {
+        let _operation = self.assert_open_operation();
+        let definitions = self.event_bus.definitions.lock().clone();
+        let callbacks_registered = self.event_bus.callbacks.read();
+        let event_types = definitions
+            .event_types
+            .values()
+            .map(|event_type| EventTypeStatus {
+                name: event_type.name.clone(),
+                trigger: event_type.trigger.as_ddl_trigger().to_string(),
+                table: event_type.table.clone(),
+            })
+            .collect();
+        let sinks = definitions
+            .sinks
+            .values()
+            .map(|sink| SinkStatus {
+                name: sink.name.clone(),
+                sink_type: sink.sink_type.as_ddl_sink_type().to_string(),
+                callback_registered: callbacks_registered.contains_key(&sink.name),
+                metrics: self.sink_metrics(&sink.name),
+            })
+            .collect();
+        let routes = definitions
+            .routes
+            .values()
+            .map(|route| RouteStatus {
+                name: route.name.clone(),
+                event_type: route.event_type.clone(),
+                sink: route.sink.clone(),
+            })
+            .collect();
+        EventBusStatus {
+            event_types,
+            sinks,
+            routes,
+        }
+    }
+
     /// Ordered in-memory queue identity/payload view for received-schema race
     /// tests. The accessor is compiled only for tests; production dispatch
     /// continues to own and mutate the queue privately.

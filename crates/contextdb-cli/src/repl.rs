@@ -801,6 +801,23 @@ pub(crate) fn handle_meta_command(
                 return MetaCommandOutcome::failed();
             }
         },
+        ".events" => match rest {
+            "status" => {
+                let event_bus = db.event_bus_status();
+                let schedules = db.cron_status();
+                if input.output.json {
+                    json_output::print_document(&json_output::events_status_document(
+                        &event_bus, &schedules,
+                    ));
+                } else {
+                    print_events_status(&event_bus, &schedules);
+                }
+            }
+            _ => {
+                report_failure(ErrorClass::Usage, "Usage: .events status", input);
+                return MetaCommandOutcome::failed();
+            }
+        },
         ".sync" | "\\sync" => {
             let outcome = handle_sync_command(sync_client, rt, rest, sync_plugin);
             if !outcome.ok {
@@ -871,6 +888,7 @@ fn help_lines(topic: &str) -> Vec<&'static str> {
         ".sync reconnect           Reconnect to the sync endpoint",
         ".sync destination         Move retained-data delivery to the connected hub",
         ".sync auto [on|off]       Toggle auto-sync after DML",
+        ".events status            List event types/sinks/routes/schedules and their counters",
     ]
 }
 
@@ -1281,11 +1299,151 @@ fn print_table_meta(table: &str, meta: &TableMeta) {
     );
 }
 
+/// Human-readable rendering of `.events status`: every declared event type,
+/// sink (with delivery metrics), route, and schedule (with fire counts).
+fn print_events_status(
+    event_bus: &contextdb_engine::EventBusStatus,
+    schedules: &[contextdb_engine::CronScheduleStatus],
+) {
+    println!("Event types:");
+    if event_bus.event_types.is_empty() {
+        println!("  (none)");
+    }
+    for event_type in &event_bus.event_types {
+        println!(
+            "  {} WHEN {} ON {}",
+            event_type.name, event_type.trigger, event_type.table
+        );
+    }
+    println!("Sinks:");
+    if event_bus.sinks.is_empty() {
+        println!("  (none)");
+    }
+    for sink in &event_bus.sinks {
+        println!(
+            "  {} TYPE {} registered={} delivered={} queued={} retried={} \
+             permanent_failures={} examined={}",
+            sink.name,
+            sink.sink_type,
+            sink.callback_registered,
+            sink.metrics.delivered,
+            sink.metrics.queued,
+            sink.metrics.retried,
+            sink.metrics.permanent_failures,
+            sink.metrics.examined,
+        );
+    }
+    println!("Routes:");
+    if event_bus.routes.is_empty() {
+        println!("  (none)");
+    }
+    for route in &event_bus.routes {
+        println!(
+            "  {} EVENT {} TO {}",
+            route.name, route.event_type, route.sink
+        );
+    }
+    println!("Schedules:");
+    if schedules.is_empty() {
+        println!("  (none)");
+    }
+    for schedule in schedules {
+        println!(
+            "  {} EVERY {} TX ({}) registered={} fired={} next_fire_at_ms={} last_fire_at_ms={:?}",
+            schedule.name,
+            schedule.every_text,
+            schedule.callback,
+            schedule.callback_registered,
+            schedule.fire_count,
+            schedule.next_fire_at_ms,
+            schedule.last_fire_at_ms,
+        );
+    }
+}
+
 /// Execute a SQL statement and print the result. Returns `true` on success, `false` on error.
+/// After a statement the CLI's own statement-execution path just ran
+/// successfully, register the CLI's own zero-config default for whatever
+/// needs an external callback to do anything observable: `CREATE SINK` gets
+/// a delivery callback so a routed event actually delivers (the engine's
+/// queue-until-registered contract — acceptance `t5_26` — is untouched,
+/// since this registers only AFTER the sink already exists, same as any
+/// other consumer would); `CREATE SCHEDULE` gets a cron callback so a
+/// declared schedule fires. `.events status` already renders the resulting
+/// delivered/queued/fire_count counters, so the default is deliberately a
+/// quiet no-op rather than printing anything itself -- a background
+/// dispatcher thread writing ad hoc lines to stderr at an unpredictable time
+/// would violate the `--json` stderr-is-JSON-Lines-only contract
+/// (`json_stderr_purity_tests.rs`).
+///
+/// This is a CLI-layer convenience, not an engine default: an embedding
+/// consumer (context-graph, vigil) that opens a `Database` directly and
+/// never calls through `feed_line`/`execute_sql` never sees it — only a
+/// session driven through the CLI's real per-line path does. Best-effort:
+/// a parse failure or a registration error must never turn an
+/// already-successful DDL statement into a failure the operator sees.
+/// Ephemeral (`:memory:`) sessions only -- see `Database::is_memory_backed`'s
+/// doc comment. A file-backed store is durable-until-explicitly-registered
+/// on purpose: a CLI script is routinely used to seed schema/data for a
+/// SEPARATE, later process (its own Rust program, possibly principal- or
+/// context-scoped) to open and register the real callback against; eagerly
+/// registering and draining here would consume those durably-queued events
+/// out from under that later, legitimate registration before it ever gets a
+/// chance to run (acceptance `t5_16`/`t5_06`/`t5_13`/`t5_15`/`t5_31` all
+/// depend on this). An interactive/piped `:memory:` session has no later
+/// process to hand off to -- it IS the whole session -- so it gets the
+/// zero-config convenience instead.
+fn register_cli_defaults_for_statement(db: &Database, sql: &str) {
+    if !db.is_memory_backed() {
+        return;
+    }
+    let Ok(statement) = contextdb_parser::parse(sql) else {
+        return;
+    };
+    match statement {
+        contextdb_parser::Statement::CreateSink { name, .. } => {
+            let _ = db.register_sink(&name, None, |_event| Ok(()));
+        }
+        contextdb_parser::Statement::CreateSchedule { callback, .. } => {
+            let _ = db.register_cron_callback(&callback, |_db| Ok(()));
+        }
+        _ => {}
+    }
+}
+
+/// Briefly wait for a sink the CLI's own statement path registered a
+/// callback for to drain to zero queued after a statement, so the operator
+/// sees delivery settle before the next prompt/statement rather than racing
+/// an unpredictable background dispatcher-thread wakeup. Bounded: a sink
+/// that will never drain (an ACL-denied item, a slow external callback that
+/// isn't ours) gives up after the bound instead of hanging the session.
+/// Costs nothing when nothing is queued -- the common case. Ephemeral
+/// (`:memory:`) sessions only, for the same reason
+/// `register_cli_defaults_for_statement` is scoped that way.
+fn settle_cli_registered_sinks(db: &Database) {
+    if !db.is_memory_backed() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let still_settling = db
+            .event_bus_status()
+            .sinks
+            .iter()
+            .any(|sink| sink.callback_registered && sink.metrics.queued > 0);
+        if !still_settling || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 fn execute_sql(db: &Database, sql: &str, input: InputContext, trace_enabled: bool) -> bool {
     let output = input.output;
     match db.execute(sql, &HashMap::new()) {
         Ok(result) => {
+            register_cli_defaults_for_statement(db, sql);
+            settle_cli_registered_sinks(db);
             if result.columns.is_empty() {
                 if output.json {
                     // A non-query statement: a small JSON status object so the
@@ -1390,6 +1548,159 @@ mod tests {
         let db = Database::open_memory();
         let outcome = handle_meta_command(&db, None, None, ".maintenance", scripted_input(), None);
         assert!(outcome.keep_going && !outcome.ok);
+    }
+
+    // -----------------------------------------------------------------
+    // D3 — trigger/event/schedule CLI door (owner-ruled 2026-08-06).
+    //
+    // `CREATE EVENT TYPE`/`SINK`/`ROUTE`/`SCHEDULE` parse and the engine
+    // executes them, but nothing in the CLI's statement path ever calls
+    // `register_sink`/`register_cron_callback`/`complete_initialization`.
+    // These three tests drive the exact statements an operator can type —
+    // `db.execute` is what the REPL's main loop calls for every non-meta
+    // line — and prove there is today no CLI-only way to observe a
+    // route/sink deliver or a schedule fire.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn events_status_meta_command_is_unrecognized_today() {
+        // An operator who has declared a route/sink/schedule needs a way to
+        // see what's registered and whether it has ever delivered/fired. No
+        // such introspection meta-command exists yet, so `.events status`
+        // falls through to the generic "Unknown command" usage error.
+        let db = Database::open_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &HashMap::new())
+            .unwrap();
+        db.execute("CREATE EVENT TYPE t_ins WHEN INSERT ON t", &HashMap::new())
+            .unwrap();
+        db.execute("CREATE SINK s TYPE callback", &HashMap::new())
+            .unwrap();
+        db.execute("CREATE ROUTE r EVENT t_ins TO s", &HashMap::new())
+            .unwrap();
+
+        let outcome =
+            handle_meta_command(&db, None, None, ".events status", scripted_input(), None);
+        assert!(
+            outcome.ok,
+            "an operator must be able to list registered event types/sinks/routes/\
+             schedules and their delivery/fire counters via a `.events status`-style \
+             meta-command; got a usage error instead, meaning no such introspection \
+             command exists yet"
+        );
+    }
+
+    /// Drive `lines` through the REPL's REAL per-line statement-execution
+    /// path (`feed_line` — what both the interactive and scripted adapters
+    /// call for every line), not raw `db.execute`. Panics if any line makes
+    /// the session quit or if any statement reports an error, since none of
+    /// these fixtures are expected to fail.
+    fn drive_lines(db: &Database, lines: &[&str]) {
+        let mut session = SessionState::default();
+        let mut pending = StatementBuffer::default();
+        for line in lines {
+            let keep_going = feed_line(
+                db,
+                None,
+                None,
+                line,
+                scripted_input(),
+                None,
+                &mut session,
+                &mut pending,
+            );
+            assert!(keep_going, "line must not end the session: {line}");
+        }
+        assert!(
+            !session.had_error,
+            "every fixture statement must succeed through the real CLI statement path"
+        );
+    }
+
+    #[test]
+    fn cli_statement_flow_never_registers_a_sink_so_a_routed_event_queues_undelivered() {
+        // Driven through `feed_line`, the REAL per-line path both the
+        // interactive and scripted adapters call — not raw `db.execute` —
+        // exactly what running these same lines at the `contextdb` prompt
+        // does today. The event fires into the sink's durable queue and
+        // sits there forever; nothing an operator typed makes it observably
+        // deliver. RULED contract (owner, 2026-08-06): when the CLI's own
+        // statement-execution path processes CREATE SINK, the CLI registers
+        // its own default callback — the engine's queue-until-registered
+        // contract (acceptance t5_26) stays intact, and delivery becomes
+        // observable through the CLI alone.
+        let db = Database::open_memory();
+        drive_lines(
+            &db,
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY);",
+                "CREATE EVENT TYPE t_ins WHEN INSERT ON t;",
+                "CREATE SINK s TYPE callback;",
+                "CREATE ROUTE r EVENT t_ins TO s;",
+                "INSERT INTO t (id) VALUES (1);",
+            ],
+        );
+
+        let metrics = db.sink_metrics("s");
+        assert_eq!(
+            metrics.delivered, 1,
+            "the CLI's real statement-execution path must register a default \
+             delivery callback when it processes CREATE SINK, so a routed event \
+             observably delivers when it fires; today nothing in that path does \
+             this (queued={}, delivered={})",
+            metrics.queued, metrics.delivered
+        );
+    }
+
+    #[test]
+    fn cli_statement_flow_never_registers_a_cron_callback_so_a_schedule_never_fires() {
+        // Same story for CREATE SCHEDULE, driven through the real `feed_line`
+        // path. `cron_run_due_now_for_test` synchronously drives any due
+        // schedule (a bounded, sleep-free engine test seam) rather than this
+        // test sleeping to wait for wall-clock time to pass — but it only
+        // bound-waits up to 75ms for an imminently-due schedule
+        // (`wait_for_imminent_cron_due_for_test`), so the interval below is
+        // kept under that bound (a schedule due further out than the wait
+        // window is silently skipped by that one call, independent of
+        // whatever the ALSO-running background tickler thread does). And
+        // because that background tickler can fire the schedule on its own
+        // wall-clock cadence at any time, the assertion reads the schedule's
+        // PERSISTED fire_count via `cron_status()` rather than trusting
+        // `cron_run_due_now_for_test`'s own return value, which only counts
+        // fires from this one call and misses a tickler fire that already
+        // landed first.
+        let db = Database::open_memory();
+        drive_lines(
+            &db,
+            &[
+                "CREATE TABLE cron_log (id INTEGER PRIMARY KEY);",
+                "CREATE SCHEDULE hb EVERY '30 MILLISECONDS' TX (hb_cb);",
+            ],
+        );
+
+        // Each call re-evaluates due state against a FRESH 75ms budget, so a
+        // few attempts absorb ordinary scheduler jitter on a loaded box
+        // without this test ever sleeping itself — every wait is inside the
+        // engine's own bounded seam.
+        let mut fire_count = 0;
+        for _ in 0..5 {
+            let _ = db.cron_run_due_now_for_test();
+            fire_count = db
+                .cron_status()
+                .iter()
+                .find(|schedule| schedule.name == "hb")
+                .expect("schedule hb must be registered after CREATE SCHEDULE")
+                .fire_count;
+            if fire_count > 0 {
+                break;
+            }
+        }
+        assert!(
+            fire_count > 0,
+            "a SCHEDULE declared purely through CLI SQL must be able to fire \
+             observably — the CLI must supply a default callback so an operator \
+             who never writes Rust still sees it run; got persisted fire_count=0 \
+             after 5 attempts"
+        );
     }
 
     #[test]

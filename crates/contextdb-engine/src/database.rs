@@ -5347,6 +5347,55 @@ pub struct SinkMetrics {
     pub examined: u64,
 }
 
+/// One declared `CREATE EVENT TYPE`, for `.events status`-style operator
+/// introspection.
+#[derive(Debug, Clone)]
+pub struct EventTypeStatus {
+    pub name: String,
+    pub trigger: String,
+    pub table: String,
+}
+
+/// One declared `CREATE SINK`, with its current delivery metrics and whether
+/// a delivery callback is registered right now.
+#[derive(Debug, Clone)]
+pub struct SinkStatus {
+    pub name: String,
+    pub sink_type: String,
+    pub callback_registered: bool,
+    pub metrics: SinkMetrics,
+}
+
+/// One declared `CREATE ROUTE`.
+#[derive(Debug, Clone)]
+pub struct RouteStatus {
+    pub name: String,
+    pub event_type: String,
+    pub sink: String,
+}
+
+/// Point-in-time snapshot of every declared event type / sink / route.
+#[derive(Debug, Clone)]
+pub struct EventBusStatus {
+    pub event_types: Vec<EventTypeStatus>,
+    pub sinks: Vec<SinkStatus>,
+    pub routes: Vec<RouteStatus>,
+}
+
+/// A point-in-time view of one declared `CREATE SCHEDULE`, for CLI/operator
+/// introspection (`.events status`-style surfaces). Not a test seam — this is
+/// a real public accessor any embedding consumer can use.
+#[derive(Debug, Clone)]
+pub struct CronScheduleStatus {
+    pub name: String,
+    pub every_text: String,
+    pub callback: String,
+    pub callback_registered: bool,
+    pub next_fire_at_ms: u64,
+    pub last_fire_at_ms: Option<u64>,
+    pub fire_count: u64,
+}
+
 #[derive(Debug, Clone)]
 struct CachedStatement {
     stmt: Statement,
@@ -32516,6 +32565,16 @@ impl Database {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Whether this handle has no on-disk persistence backing it (opened via
+    /// `open_memory*`). A caller-side convenience default -- e.g. the CLI's
+    /// own zero-config event/cron callback registration -- can use this to
+    /// stay scoped to ephemeral sessions and leave a file-backed store's
+    /// durable-until-explicitly-registered contract untouched for a later,
+    /// possibly different, process to consume.
+    pub fn is_memory_backed(&self) -> bool {
+        self.persistence.is_none()
     }
 
     /// Returns the current LSN of this database.

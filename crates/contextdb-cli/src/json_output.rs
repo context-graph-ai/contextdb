@@ -16,7 +16,10 @@ use contextdb_core::table_meta::{
 use contextdb_engine::QueryResult;
 use contextdb_engine::cli_render;
 use contextdb_engine::database::QueryTrace;
-use contextdb_engine::{CompactionReport, MaintenancePolicy, MaintenanceReport, MaintenanceStatus};
+use contextdb_engine::{
+    CompactionReport, CronScheduleStatus, EventBusStatus, MaintenancePolicy, MaintenanceReport,
+    MaintenanceStatus,
+};
 use serde_json::{Map, Value, json};
 
 /// Which family an error belongs to, for the `--json` error envelope.
@@ -157,6 +160,48 @@ pub(crate) fn maintenance_status_document(status: &MaintenanceStatus) -> Value {
             "currency_compaction_enabled": status.currency_compaction_enabled,
             "active_maintenance_loops": status.active_maintenance_loops,
             "policy": maintenance_policy_wire_word(status.policy),
+        }
+    })
+}
+
+/// `.events status` under `--json`: every declared event type/sink/route,
+/// plus their delivery metrics and whether a callback is registered, and
+/// every declared schedule with its fire count.
+pub(crate) fn events_status_document(
+    event_bus: &EventBusStatus,
+    schedules: &[CronScheduleStatus],
+) -> Value {
+    json!({
+        "events": {
+            "event_types": event_bus.event_types.iter().map(|event_type| json!({
+                "name": event_type.name,
+                "trigger": event_type.trigger,
+                "table": event_type.table,
+            })).collect::<Vec<_>>(),
+            "sinks": event_bus.sinks.iter().map(|sink| json!({
+                "name": sink.name,
+                "type": sink.sink_type,
+                "callback_registered": sink.callback_registered,
+                "delivered": sink.metrics.delivered,
+                "queued": sink.metrics.queued,
+                "retried": sink.metrics.retried,
+                "permanent_failures": sink.metrics.permanent_failures,
+                "examined": sink.metrics.examined,
+            })).collect::<Vec<_>>(),
+            "routes": event_bus.routes.iter().map(|route| json!({
+                "name": route.name,
+                "event_type": route.event_type,
+                "sink": route.sink,
+            })).collect::<Vec<_>>(),
+            "schedules": schedules.iter().map(|schedule| json!({
+                "name": schedule.name,
+                "every": schedule.every_text,
+                "callback": schedule.callback,
+                "callback_registered": schedule.callback_registered,
+                "next_fire_at_ms": schedule.next_fire_at_ms,
+                "last_fire_at_ms": schedule.last_fire_at_ms,
+                "fire_count": schedule.fire_count,
+            })).collect::<Vec<_>>(),
         }
     })
 }

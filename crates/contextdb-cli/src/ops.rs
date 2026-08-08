@@ -1,4 +1,4 @@
-//! The `migrate` / `reset` / `repair` / `snapshot` / `inspect`
+//! The `migrate` / `reset` / `repair` / `snapshot` / `inspect` / `purge`
 //! store-maintenance subcommands.
 //!
 //! Dispatch happens BEFORE the existing REPL's `clap` parsing (see
@@ -27,6 +27,7 @@ pub fn dispatch_if_subcommand(raw_args: &[String]) -> Option<i32> {
         "repair" => Some(run_repair(&raw_args[2..])),
         "snapshot" => Some(run_snapshot(&raw_args[2..])),
         "inspect" => Some(run_inspect(&raw_args[2..])),
+        "purge" => Some(run_purge(&raw_args[2..])),
         _ => None,
     }
 }
@@ -594,6 +595,76 @@ fn run_reset(args: &[String]) -> i32 {
         }
         Err(err) => {
             eprintln!("Error: reset failed for '{}': {err}", path.display());
+            EXIT_ERROR
+        }
+    }
+}
+
+/// `contextdb purge <path> --table <t> --force` — permanently and
+/// authoritatively erase every row of `<t>` (no `WHERE` support at the
+/// operator door; use the engine's `PURGE FROM <table> WHERE ...` SQL
+/// directly if a narrower selection is needed). Refuses without `--force`,
+/// exactly like `reset`. Dispatches straight to the engine's existing
+/// `PURGE FROM <table>` statement (B_2's authoritative-purge machinery) so
+/// this door shares the exact same purge-fence semantics `.maintenance` and
+/// snapshot restore already rely on -- including the standalone-edge-only
+/// refusal (`Error::PurgeRequiresAuthoritativeHub`) once a sync peer is
+/// configured.
+fn run_purge(args: &[String]) -> i32 {
+    let Some(path_str) = positional_path(args) else {
+        eprintln!("Error: purge requires a database path");
+        return EXIT_USAGE;
+    };
+    let path = Path::new(path_str);
+    let table = args
+        .iter()
+        .position(|arg| arg == "--table")
+        .and_then(|idx| args.get(idx + 1));
+    let Some(table) = table else {
+        eprintln!("Error: purge requires --table <name>");
+        return EXIT_USAGE;
+    };
+    let force = args.iter().any(|arg| arg == "--force");
+    if !force {
+        eprintln!(
+            "Error: purge permanently and irreversibly erases rows, so it requires the \
+             explicit --force flag; rerun as `contextdb purge {} --table {table} --force` \
+             once you're certain.",
+            path.display()
+        );
+        return EXIT_USAGE;
+    }
+
+    let db = match Database::open(path) {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("Error: failed to open '{}': {err}", path.display());
+            return EXIT_ERROR;
+        }
+    };
+    let result = db.execute(
+        &format!("PURGE FROM {table}"),
+        &std::collections::HashMap::new(),
+    );
+    let close_result = db.close();
+    match result {
+        Ok(outcome) => {
+            if let Err(err) = close_result {
+                eprintln!(
+                    "Error: purge succeeded but failed to close '{}': {err}",
+                    path.display()
+                );
+                return EXIT_ERROR;
+            }
+            println!(
+                "purge '{}': erased {} row(s) from '{table}'.",
+                path.display(),
+                outcome.rows_affected,
+            );
+            EXIT_OK
+        }
+        Err(err) => {
+            eprintln!("Error: purge failed for '{}': {err}", path.display());
             EXIT_ERROR
         }
     }
