@@ -5066,10 +5066,44 @@ fn execute_index_scan(
     let mut postings: Vec<contextdb_relational::IndexEntry> = Vec::new();
     let mut rows_examined: u64 = 0;
 
+    // `BTreeMap::range` panics if the supplied bound pair is inverted (start
+    // > end) or degenerately empty (start == end with both ends excluded).
+    // A normal query never constructs an inverted pair, but a NaN bound does:
+    // the index's total order (`DirectedValue`/`value_total_cmp`, built on
+    // `f64::total_cmp`) sorts the canonical NaN constant AFTER every other
+    // value, so `NaN` as a lower bound can sort above a perfectly ordinary
+    // upper bound. Rather than special-case NaN, guard the whole class: if
+    // the bound pair can't form a non-empty range under this order, the
+    // answer is the empty set (matching a non-indexed scan's IEEE-754
+    // behavior, where every comparison against NaN is false), not a panic.
+    let range_is_empty = |lower: &Bound<Vec<DirectedValue>>, upper: &Bound<Vec<DirectedValue>>| {
+        let (lower_key, lower_excluded) = match lower {
+            Bound::Included(v) => (Some(v), false),
+            Bound::Excluded(v) => (Some(v), true),
+            Bound::Unbounded => (None, false),
+        };
+        let (upper_key, upper_excluded) = match upper {
+            Bound::Included(v) => (Some(v), false),
+            Bound::Excluded(v) => (Some(v), true),
+            Bound::Unbounded => (None, false),
+        };
+        match (lower_key, upper_key) {
+            (Some(l), Some(u)) => match l.cmp(u) {
+                Ordering::Greater => true,
+                Ordering::Equal => lower_excluded || upper_excluded,
+                Ordering::Less => false,
+            },
+            _ => false,
+        }
+    };
+
     let collect_range = |postings: &mut Vec<contextdb_relational::IndexEntry>,
                          examined: &mut u64,
                          lower: Bound<Vec<DirectedValue>>,
                          upper: Bound<Vec<DirectedValue>>| {
+        if range_is_empty(&lower, &upper) {
+            return;
+        }
         for (_k, entries) in storage.tree.range((lower, upper)) {
             for e in entries {
                 *examined += 1;
@@ -5182,7 +5216,21 @@ fn execute_index_scan(
             }
             IndexPredicateShape::Range { lower, upper } => {
                 if is_composite {
-                    let lower_key = match lower {
+                    // A DESCENDING leading column stores keys in the OPPOSITE
+                    // physical order from a plain value comparison
+                    // (`TotalOrdDesc::cmp` reverses `value_total_cmp`), so the
+                    // SQL-lower bound wraps to the PHYSICALLY GREATER key and
+                    // the SQL-upper bound wraps to the PHYSICALLY LESSER one.
+                    // Swap which SQL bound plays the "physical lower" (walk
+                    // start / `in_lower` test) vs "physical upper" (`in_upper`
+                    // test / early-exit) role before using either -- the
+                    // single-column arm below does the identical swap.
+                    let (phys_lower, phys_upper) = if first_dir == SortDirection::Desc {
+                        (upper, lower)
+                    } else {
+                        (lower, upper)
+                    };
+                    let lower_key = match phys_lower {
                         Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
                         Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
                         Bound::Unbounded => Bound::Unbounded,
@@ -5192,7 +5240,7 @@ fn execute_index_scan(
                     // the first component is beyond the upper bound.
                     for (key, entries) in storage.tree.range((lower_key, Bound::Unbounded)) {
                         let Some(first) = key.first() else { continue };
-                        let in_lower = match lower {
+                        let in_lower = match phys_lower {
                             Bound::Unbounded => true,
                             Bound::Included(v) => first >= &wrap(v.clone()),
                             Bound::Excluded(v) => first > &wrap(v.clone()),
@@ -5200,7 +5248,7 @@ fn execute_index_scan(
                         if !in_lower {
                             continue;
                         }
-                        let in_upper = match upper {
+                        let in_upper = match phys_upper {
                             Bound::Unbounded => true,
                             Bound::Included(v) => first <= &wrap(v.clone()),
                             Bound::Excluded(v) => first < &wrap(v.clone()),
@@ -5225,6 +5273,18 @@ fn execute_index_scan(
                         Bound::Included(v) => Bound::Included(vec![wrap(v.clone())]),
                         Bound::Excluded(v) => Bound::Excluded(vec![wrap(v.clone())]),
                         Bound::Unbounded => Bound::Unbounded,
+                    };
+                    // Same physical-order inversion as the composite arm
+                    // above: swap which wrapped bound plays the physically
+                    // lesser vs greater role for a DESC leading column,
+                    // BEFORE handing the pair to `collect_range` (and its
+                    // `range_is_empty` guard) -- so an ordinary DESC-index
+                    // range never looks inverted, and the guard still fires
+                    // only on a genuinely inverted pair (the NaN class).
+                    let (l, u) = if first_dir == SortDirection::Desc {
+                        (u, l)
+                    } else {
+                        (l, u)
                     };
                     collect_range(&mut postings, &mut rows_examined, l, u);
                 }

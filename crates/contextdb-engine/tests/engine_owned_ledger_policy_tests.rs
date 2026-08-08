@@ -2427,7 +2427,7 @@ fn fallback_sync_conflict_refusal_does_not_claim_installer_exclusivity_or_alter_
 // front of it at all.
 // ---------------------------------------------------------------------
 
-/// RED, live repro (Codex): a hidden `IMMUTABLE` on `peer_directory`'s
+/// RED: a hidden `IMMUTABLE` on `peer_directory`'s
 /// `ticket` column must refuse locally -- `CREATE_PEER_DIRECTORY` declares
 /// `ticket` as plain `TEXT NOT NULL`, never `IMMUTABLE`. Accepted today: an
 /// `IMMUTABLE` ticket column arms `register_peer_ticket`'s own re-enrollment
@@ -2952,7 +2952,7 @@ fn shape_refusal_names_the_offending_column_not_just_name_type_primary_key() {
 // before round 7 -- but nothing today judges it.
 // ---------------------------------------------------------------------
 
-/// RED, live repro (Codex): a table-level `IMMUTABLE` option on `peer_directory`
+/// RED: a table-level `IMMUTABLE` option on `peer_directory`
 /// -- structurally different from `CREATE_PEER_DIRECTORY`, which declares no
 /// table-level IMMUTABLE at all -- must refuse locally. Accepted today:
 /// `refuse_engine_owned_reserved_name_shape` reads `p.columns` /
@@ -3523,7 +3523,7 @@ fn arriving_alter_table_comment_smuggled_immutable_on_an_operator_table_does_not
 }
 
 // ---------------------------------------------------------------------
-// Fix round 9, item 1 (Codex blocker, live-reproduced): the sync AlterTable
+// Fix round 9, item 1 (blocker, live-reproduced): the sync AlterTable
 // preflight (`refuse_engine_owned_policy_sync_ddl`'s `AlterTable` arm,
 // `database.rs`) calls `refuse_engine_owned_reserved_name_shape_wire`
 // WITHOUT the arriving `foreign_keys` field, even though it is available
@@ -3664,7 +3664,7 @@ fn arriving_alter_table_restating_work_jobs_with_empty_foreign_keys_still_applie
 }
 
 // ---------------------------------------------------------------------
-// Fix round 9, item 2 (Opus must-fix, fourth recurrence of the same
+// Fix round 9, item 2 (must-fix, fourth recurrence of the same
 // falsehood): `engine_owned_policy_refusal`'s final fall-through arm --
 // reached for the RETAIN / HISTORY / SYNC-direction axes on the four
 // ORIGINAL `ENGINE_OWNED_LEDGER_TABLES` -- still says "{table} is
