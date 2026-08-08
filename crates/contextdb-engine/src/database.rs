@@ -3290,6 +3290,8 @@ mod retired_generation_refusal_tests;
 mod same_key_replace_apply_tests;
 #[cfg(test)]
 mod sync_trigger_vector_epoch_tests;
+#[cfg(test)]
+mod vector_owner_pairing_ordering_tests;
 
 #[derive(Debug, Clone)]
 #[cfg(feature = "test-seams")]
@@ -37210,9 +37212,16 @@ fn supplement_loaded_vectors_from_table_rows(
             )
         })
         .collect::<HashSet<_>>();
-    let mut live_owners = vectors
+    // Every (index, row_id) the persisted vector store has EVER recorded an
+    // occurrence for, live or deleted. A deliberate deletion here (e.g.
+    // `PROPAGATE ON STATE ... EXCLUDE VECTOR`, which tombstones the vector
+    // entry but leaves the row's own vector column value untouched) means
+    // the engine already made and recorded a decision about this row's
+    // vector -- recovery below exists only for a row whose vector the engine
+    // has NEVER recorded at all (legacy/pre-index data), never to reverse an
+    // explicit deletion decision it already made and persisted.
+    let mut known_owners = vectors
         .iter()
-        .filter(|entry| entry.deleted_tx.is_none())
         .map(|entry| (entry.index.clone(), entry.row_id))
         .collect::<HashSet<_>>();
     let mut supplemented = false;
@@ -37233,11 +37242,12 @@ fn supplement_loaded_vectors_from_table_rows(
                     continue;
                 }
                 // A relational body-only update gets a newer row version but
-                // does not create another vector occurrence.  The persisted
-                // live owner is authoritative for that row ID; only recover a
-                // live row when no such owner exists.  Historical and deleted
-                // occurrences still use their full version identity below.
-                if row.deleted_tx.is_none() && live_owners.contains(&(index.clone(), row.row_id)) {
+                // does not create another vector occurrence.  A previously
+                // recorded owner -- live OR deleted -- is authoritative for
+                // that row ID; only recover a live row when NO such owner
+                // exists at all.  Historical and deleted row versions still
+                // use their full version identity below.
+                if row.deleted_tx.is_none() && known_owners.contains(&(index.clone(), row.row_id)) {
                     continue;
                 }
                 let occurrence = (index.clone(), row.row_id, row.created_tx, row.lsn);
@@ -37250,9 +37260,7 @@ fn supplement_loaded_vectors_from_table_rows(
                         deleted_tx: row.deleted_tx,
                         lsn: row.lsn,
                     });
-                    if row.deleted_tx.is_none() {
-                        live_owners.insert((index.clone(), row.row_id));
-                    }
+                    known_owners.insert((index.clone(), row.row_id));
                     supplemented = true;
                 }
             }
