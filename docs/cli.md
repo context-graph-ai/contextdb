@@ -158,9 +158,9 @@ contextdb migrate <PATH>
 contextdb reset <PATH> --force
 contextdb repair <PATH>
 contextdb snapshot export <PATH> <NEW_ARTIFACT> [--json]
-contextdb inspect key <SNAPSHOT_ARTIFACT> --table <TABLE> --key-json <NATURAL_KEY_JSON> [--column <COLUMN>]... [--json]
-contextdb inspect blob <SNAPSHOT_ARTIFACT> --hash <64_HEX_CHARS> [--json]
-contextdb inspect sync-apply-state <SNAPSHOT_ARTIFACT> [--json]
+contextdb inspect key <SNAPSHOT_OR_DATABASE_PATH> --table <TABLE> --key-json <NATURAL_KEY_JSON> [--column <COLUMN>]... [--json]
+contextdb inspect blob <SNAPSHOT_OR_DATABASE_PATH> --hash <64_HEX_CHARS> [--json]
+contextdb inspect sync-apply-state <SNAPSHOT_OR_DATABASE_PATH> [--json]
 ```
 
 ### `migrate` — bring a legacy-format root forward in place
@@ -214,7 +214,7 @@ contextdb repair ./old-format.db
 # to migrate it in place.
 
 contextdb repair ./maybe-corrupt.db
-# repair: './maybe-corrupt.db' — corrupt vector store at './maybe-corrupt.db': metadata/format
+# repair: './maybe-corrupt.db' — corrupt vector store at ./maybe-corrupt.db: metadata/format
 # could not be read: ... — run `contextdb repair <path>` to see what is salvageable (it never
 # modifies the store), or `contextdb reset <path> --force` to recreate it — restore from a
 # backup or a healthy sync peer first if you need the existing data.
@@ -233,12 +233,12 @@ exist. If an authoritative purge wins the race after capture, publication is
 refused instead of producing a backup that silently resurrects the purged
 lineage.
 
-### `inspect` — read durable key and media state from an exported snapshot
+### `inspect` — read durable key and media state from a snapshot artifact or database file
 
-`inspect` never opens the supplied artifact. It copies the completed snapshot
-into a private temporary directory, opens only that disposable copy, and emits
-a bounded report with no raw media bytes, tag names, identity material, or
-storage paths.
+`inspect` never opens the supplied path directly. It copies the supplied
+snapshot artifact or database file into a private temporary directory, opens
+only that disposable copy, and emits a bounded report with no raw media
+bytes, tag names, identity material, or storage paths.
 
 For a row identity, pass the same `NaturalKey` JSON shape used by sync
 diagnostics. The report counts every physical retained version and emits the
@@ -283,9 +283,14 @@ Equal reports from before and after a refused authenticated DDL rewrite prove
 that the receiver changed none of those durable categories. The digest is a
 same-release comparison aid, not a stable cross-version data format.
 
-The input must be an artifact completed by `contextdb snapshot export`, not a
-live database file. Inspecting a copy avoids interfering with the live owner
-and keeps Redb housekeeping writes away from the supplied artifact.
+`inspect` runs on any readable data root, including a live database file still
+in use by another process — it copies before opening, so it never interferes
+with the live owner or leaves Redb housekeeping writes on the path you gave
+it. A `contextdb snapshot export` artifact is the guaranteed-consistent input
+(a transactionally consistent point-in-time capture, purge-fenced), which is
+why the examples above use one; pointing `inspect` at a live file instead
+gives you whatever that file's state happens to be at copy time, not a
+promised consistent snapshot.
 
 ---
 
@@ -515,6 +520,8 @@ A typo in the endpoint spec errors loudly. An unknown parameter reports which na
 ```
 unknown parameter at position N in sync endpoint spec (accepted: identity, port, relay, relay-ca, publish, lookup, response-staging-bytes, pre-admission-connections, pre-admission-bytes, request-read-idle-ms, to)
 ```
+
+This detailed, accepted-list message is the **client's** `--sync-endpoint` (dial) path. `contextdb-server`'s own `--sync-endpoint` (bind) flag validates the same grammar but reports only a generic `invalid --sync-endpoint bind specification: <spec>` on a bad parameter — no accepted-list breakdown. If you're debugging a server invocation, don't expect the parameter-name detail this message shows.
 
 Full spec grammar:
 

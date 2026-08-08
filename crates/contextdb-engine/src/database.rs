@@ -4300,9 +4300,9 @@ pub struct ExportReport {
     pub bytes_written: u64,
 }
 
-/// A retained row and its durable deletion lineage, read from a completed
-/// snapshot artifact. This is an inspection DTO: it grants no mutation or
-/// raw-storage capability.
+/// A retained row and its durable deletion lineage, read from a snapshot
+/// artifact or database file. This is an inspection DTO: it grants no
+/// mutation or raw-storage capability.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct KeyInspection {
     pub total_retained_versions: u64,
@@ -4406,10 +4406,13 @@ pub struct SyncApplyStateInspection {
     pub sink_queue_entries: u64,
 }
 
-/// Read-only operator inspection of a completed snapshot export. Opening a
-/// Redb file performs housekeeping writes, so this type first copies the
-/// supplied artifact into a private temporary directory and opens only that
-/// disposable copy. It deliberately exposes no [`Database`] handle.
+/// Read-only operator inspection of a snapshot artifact or a database file
+/// path. Opening a Redb file performs housekeeping writes, so this type
+/// first copies the supplied path into a private temporary directory and
+/// opens only that disposable copy -- a live file under a concurrent
+/// writer is copied as-is, so the inspection reflects whatever
+/// point-in-time state the copy captured, not necessarily the writer's
+/// latest state. It deliberately exposes no [`Database`] handle.
 pub struct SnapshotInspector {
     database: Database,
     _copy: tempfile::TempDir,
@@ -4426,7 +4429,7 @@ impl SnapshotInspector {
         let artifact = artifact.as_ref();
         if !artifact.is_file() {
             return Err(Error::Other(format!(
-                "snapshot inspection requires a completed file artifact: '{}'",
+                "inspection requires a snapshot artifact or database file path: '{}'",
                 artifact.display()
             )));
         }
@@ -4439,7 +4442,7 @@ impl SnapshotInspector {
         let copy_path = copy.path().join("snapshot.redb");
         std::fs::copy(artifact, &copy_path).map_err(|err| {
             Error::Other(format!(
-                "failed to copy snapshot artifact '{}' for inspection: {err}",
+                "failed to copy '{}' for inspection: {err}",
                 artifact.display()
             ))
         })?;

@@ -56,12 +56,24 @@ SQL
 ```text
 ok (rows_affected=0)
 ok (rows_affected=0)
+INSERT INTO nodes (id, name) VALUES ('11111111-1111-1111-1111-111111111111', 'root');
 ok (rows_affected=1)
+INSERT INTO nodes (id, name) VALUES ('22222222-2222-2222-2222-222222222222', 'mid');
 ok (rows_affected=1)
+INSERT INTO nodes (id, name) VALUES ('33333333-3333-3333-3333-333333333333', 'leaf');
 ok (rows_affected=1)
+INSERT INTO edges (id, source_id, target_id, edge_type)
+  VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 'DEPENDS_ON');
 ok (rows_affected=1)
+INSERT INTO edges (id, source_id, target_id, edge_type)
+  VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '22222222-2222-2222-2222-222222222222', '33333333-3333-3333-3333-333333333333', 'DEPENDS_ON');
 ok (rows_affected=1)
 ```
+
+In human mode (not `--json`), a piped `INSERT` echoes its own literal statement text right before its
+`ok (...)` line — this is a scripted-input affordance so a transcript is readable without cross-checking
+the input; `CREATE TABLE` and other statement kinds are not echoed. `--json` mode never echoes anything
+(stdout stays pure result data).
 
 Now close the loop (`leaf -> root`, which combined with the existing chain would be a cycle):
 
@@ -71,8 +83,12 @@ echo "INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ('cccccccc-
 ```
 
 ```text
+INSERT INTO edges (id, source_id, target_id, edge_type) VALUES ('cccccccc-cccc-cccc-cccc-cccccccccccc', '33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 'DEPENDS_ON');
 Error: cycle detected: inserting DEPENDS_ON edge from 33333333-3333-3333-3333-333333333333 to 11111111-1111-1111-1111-111111111111 would create a cycle
 ```
+
+(The echo line prints to stdout before the statement runs, whether it succeeds or is refused; the
+`Error:` line is on stderr.)
 
 Exit code `1`. The row was never inserted — validate with `SELECT COUNT(*) FROM edges;` (still `2`,
 not `3`).
@@ -202,6 +218,7 @@ SQL
 
 ```text
 ok (rows_affected=0)
+INSERT INTO tasks (id, status) VALUES ('11111111-1111-1111-1111-111111111111', 'active');
 ok (rows_affected=1)
 ok (rows_affected=1)
 +-------------+
@@ -243,7 +260,7 @@ what you typed rather than guessing.
 ### Worked example — invalidating a basis cascades to what cites it
 
 ```bash
-contextdb ./cascade.db <<'SQL'
+contextdb ./cascade.db --json <<'SQL'
 CREATE TABLE tasks (
   id UUID PRIMARY KEY,
   name TEXT NOT NULL,
@@ -268,8 +285,13 @@ SQL
 `invalidated` afterward:
 
 ```json
-[{"id":"11111111-1111-1111-1111-111111111111","name":"basis-decision","status":"invalidated"},
- {"id":"22222222-2222-2222-2222-222222222222","name":"dependent-decision","status":"invalidated"}]
+{"rows_affected":0}
+{"rows_affected":0}
+{"rows_affected":1}
+{"rows_affected":1}
+{"rows_affected":1}
+{"rows_affected":1}
+[{"id":"11111111-1111-1111-1111-111111111111","name":"basis-decision","status":"invalidated"},{"id":"22222222-2222-2222-2222-222222222222","name":"dependent-decision","status":"invalidated"}]
 ```
 
 **If the cascade didn't reach a row you expected**, check the edge direction against the clause's

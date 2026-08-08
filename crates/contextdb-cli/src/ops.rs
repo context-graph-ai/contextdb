@@ -32,9 +32,11 @@ pub fn dispatch_if_subcommand(raw_args: &[String]) -> Option<i32> {
     }
 }
 
-/// Inspect durable facts from a completed snapshot artifact without opening
-/// the supplied file. The engine owns a private disposable copy and exposes
-/// only bounded key/blob DTOs.
+/// Inspect durable facts from any readable data root -- a completed snapshot
+/// export or a live database file still in use by another process -- without
+/// ever opening the caller-supplied path directly. The engine copies it into
+/// a private disposable copy first, opens only that copy, and exposes only
+/// bounded key/blob DTOs.
 fn run_inspect(args: &[String]) -> i32 {
     enum Request {
         Key {
@@ -53,7 +55,7 @@ fn run_inspect(args: &[String]) -> i32 {
         return EXIT_USAGE;
     };
     let Some(artifact) = args.get(1).filter(|arg| !arg.starts_with("--")) else {
-        eprintln!("Error: inspect requires a completed snapshot artifact");
+        eprintln!("Error: inspect requires a snapshot artifact or database file path");
         return EXIT_USAGE;
     };
     let request = match kind {

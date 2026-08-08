@@ -214,7 +214,25 @@ This combines all three paradigms:
 -- The entity that changed
 -- (application records the observation and updates the entity)
 
--- Find all decisions that were BASED_ON this entity
+-- Find the ids of all decisions that were BASED_ON this entity
+SELECT b_id FROM GRAPH_TABLE(
+  edges
+  MATCH (entity)<-[:BASED_ON]-(decision)
+  WHERE entity.id = $changed_entity_id
+  COLUMNS (decision.id AS b_id)
+)
+```
+
+The PROPAGATE constraints (Scenario 3) handle automatic invalidation. This query is for when the application wants to inspect what *would* be affected before triggering a state change.
+In the CLI, enable `.trace on` before the query above (shown bare, not wrapped in a `WITH` / `JOIN`);
+an id-pinned single-hop traversal prints `AdjacencyProbe index=reverse_adj pushed=[entity.id]
+rows_examined=N`, proving the work is proportional to the changed entity's connections rather than
+the total edge-table size.
+
+To pull the matched decisions' own columns (`description`, `status`, `confidence`), wrap this in a
+`WITH` CTE and `JOIN` against `decisions`, filtering on `status`:
+
+```sql
 WITH affected AS (
   SELECT b_id FROM GRAPH_TABLE(
     edges
@@ -229,11 +247,13 @@ INNER JOIN affected a ON d.id = a.b_id
 WHERE d.status = 'active'
 ```
 
-The PROPAGATE constraints (Scenario 3) handle automatic invalidation. This query is for when the application wants to inspect what *would* be affected before triggering a state change.
-In the CLI, enable `.trace on` before the query; an id-pinned single-hop
-traversal prints `AdjacencyProbe ... rows_examined=N`, proving the work is
-proportional to the changed entity's connections rather than the total
-edge-table size.
+**This composed form does not get the same trace as the bare query above.** Today it plans as a
+`Scan` over `decisions` (`.trace on` prints `Scan rows_examined=N` for the `decisions` scan, not
+`AdjacencyProbe`) — the CTE's own `GRAPH_TABLE` traversal still probes internally, but the join
+against `decisions` is not planned index-driven the way the bare probe is. Functionally correct
+either way (both return the right rows), but if you're specifically validating "is this
+proportional to the connection count, not the table size," trace the bare `GRAPH_TABLE` query, not
+the full CTE+JOIN — the join-routing gap is a known limitation, not something this doc papers over.
 
 For application-side edge-table lookups, use a composite index that matches the
 full route predicate:
@@ -249,11 +269,13 @@ CREATE TABLE edge_refs (
 
 CREATE INDEX idx_edge_refs_route ON edge_refs (source_id, target_id, edge_type);
 
-.explain SELECT id FROM edge_refs
-WHERE source_id IN ($changed_entity_id, $related_entity_id)
-  AND target_id = $decision_id
-  AND edge_type = 'BASED_ON';
+.explain SELECT id FROM edge_refs WHERE source_id IN ($changed_entity_id, $related_entity_id) AND target_id = $decision_id AND edge_type = 'BASED_ON';
 ```
+
+A dot-command like `.explain` consumes exactly one line — unlike an ordinary SQL statement, it does
+not accumulate across newlines until a terminating `;`, so splitting it across multiple lines
+parses only the first line as the command and fails on the rest. Always paste a dot-command's
+whole invocation on one line, however long.
 
 The routed explanation shows a three-column covering index serving all three
 predicates. Note the chosen index: any table with `source_id`, `target_id`, and

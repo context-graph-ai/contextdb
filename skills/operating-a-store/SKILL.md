@@ -80,13 +80,18 @@ printf '.maintenance run\nSELECT COUNT(*) AS n FROM pings;\n' | contextdb ./life
 ```
 
 ```text
-pruned_rows=1 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true
+pruned_rows=0 currency_pruned_versions=0 pruned_trigger_audit_rows=0 auto_compact_ran=true
 +---+
 | n |
 +---+
 | 0 |
 +---+
 ```
+
+Run right after Worked example 1 on the same `life.db`, `pruned_rows` here is honestly `0`, not `1`
+— example 1's `.maintenance run` already pruned the one expired row, so this second cycle has
+nothing left to reclaim; `n:0` still confirms the table stays empty. If you want to see `pruned_rows`
+fire again, insert and let expire a fresh row first (repeat Worked example 1's setup).
 
 `retention_enabled:false` on `.maintenance status` means no table in this store declared `RETAIN`
 at all — that's a sign to go back to step 1, not a broken maintenance loop.

@@ -169,7 +169,9 @@ LIMIT 5;
 SQL
 ```
 
-Expected ordering:
+Expected ordering (simplified for readability — the real session also prints an `ok (...)` line
+per statement above, with each piped `INSERT`'s own literal text echoed right before its `ok`
+line, and the actual `SELECT` renders as a bordered `+---+` table, not this bare list):
 
 ```text
 22222222-2222-2222-2222-222222222222 | less similar but worked | 1.0
