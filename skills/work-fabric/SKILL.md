@@ -15,6 +15,23 @@ command, there isn't one — embed the crates: add `contextdb-engine` and `conte
 your `Cargo.toml` `[dependencies]` (see [`docs/getting-started.md`](../../docs/getting-started.md)
 for the exact lines), or, inside a checkout of this repo, depend on the crates in `crates/` directly.
 
+## Recipe checklist
+
+1. Pick the right `work_ledger` module first (below) — importing the wrong one is the most common
+   mistake here.
+2. Install the ledger schema once at open (`install_work_ledger_schema`).
+3. Submit a job (`contextdb_engine::work_ledger::submit_job`) — inline inputs or a `blob_ref`.
+4. Claim it across machines (`contextdb_server::work_ledger::claim_job`) if more than one node
+   might race for it; skip straight to `WorkExecutor` if not.
+5. If the job references a `blob_ref` input, ingest + serve the bytes on the holder and
+   `resolve_blob_ref` on the worker (§ "Move the bytes") — the ledger tracks that a job depends on
+   a blob, it does not move the bytes itself.
+6. **If `materialize_inputs` returns `Err(Error::InputRequiresBlobResolver)`**, you skipped step 5
+   — the job's input is a `blob_ref`, not inline data; go wire the blob plane instead of retrying
+   `materialize_inputs`.
+7. **If a claim never proves out (stays `Won { synced: false }`)**, the hub was unreachable when
+   you claimed — that is provisional, not arbitrated; do not treat it as a confirmed win.
+
 ## Two modules named `work_ledger` — pick the right one
 
 Importing the wrong one is the easy mistake here. They are different layers, owned by different
@@ -87,6 +104,32 @@ job** — that is how a CPU-only node stays out of the way of GPU work. `claimab
 Inputs are either carried inline (the `&[I]` argument, small payloads) or referenced:
 `InputRef::local_path(...)` or `InputRef::blob_ref(hash)`.
 
+### Worked example 2 — a job whose input is a blob reference, not inline bytes
+
+The shape for media/large-payload work (from the shipped test suite,
+`crates/contextdb-engine/tests/blob_ref_ledger.rs`) — no `&[u8]` payload travels through the
+ledger at all, only the hash:
+
+```rust
+use contextdb_engine::work_ledger::{BlobHash, InputRef, JobSpec, submit_job};
+
+fn blob_job(job_id: &str, submitter: &str, hash: &BlobHash) -> JobSpec {
+    JobSpec::builder(job_id, "media.demo", "batch", submitter)
+        .input_refs(vec![InputRef::blob_ref(hash.clone())])
+        .submitted_at_ms(now_ms)
+        .build()
+}
+
+let no_direct_inputs: [&[u8]; 0] = [];
+submit_job(&db, &blob_job("job-1", "node-a", &blob_hash), &no_direct_inputs)?;
+```
+
+Contrast with worked example 1 above: that job carries its input THROUGH the ledger
+(`ledger_input`, subject to the 7-day retention window below); this one only carries a
+content-addressed pointer — the bytes travel over the blob plane separately (§ "Move the bytes").
+Pick inline for small payloads you're fine re-fetching from the ledger; pick `blob_ref` for
+anything large enough that you'd rather move it once, node-to-node, hash-verified.
+
 **Inline (`ledger_input`) inputs are NOT kept until the job is terminal.** `work_inputs` declares
 `RETAIN 7 DAYS`, so a job's ledger-carried input copies age out on that window regardless of
 whether the job was ever claimed. `materialize_inputs` distinguishes a job that never declared
@@ -94,27 +137,47 @@ ledger input (returns `Ok` with an empty result) from one whose input aged out (
 `Err(Error::WorkInputExpired { job_id })`) — a worker must handle the typed refusal rather than
 executing on silently-empty input. Submit and claim promptly if the job's inputs are inline.
 
-**That `RETAIN 7 DAYS` window is engine-owned policy, not something you tune with `ALTER TABLE`
-on `work_inputs`** — nor is `work_capabilities`' (or `peer_directory`'s / `work_node_contacts`')
-`HISTORY` / `SYNC CONFLICT` / `SYNC ...` / `SYNC SAFE` declaration. All four are built-in tables
-this module and its siblings install, and each one's own bookkeeping depends on staying at the
-shape declared in its own `CREATE TABLE` text. A locally-typed `ALTER TABLE ... DROP RETAIN` /
-`SET RETAIN <other window>` / `SET HISTORY ALL` / `SET SYNC CONFLICT KEEP FIRST` / `SET SYNC ...`
-against one of these four tables refuses loudly instead of silently taking effect and then being
-silently reverted by the next installer call. You also can't get around any of this by typing your
-own `CREATE TABLE` for one of these four names: it refuses unless your columns structurally match
-the owning installer's own declaration, and unless any policy clause you DO write matches what
-that installer declares (silence on policy is fine — that is what a pre-declaration root looks
-like before its first reconcile). The identical mutation arriving from a PEER over sync is
-held to the same bar: an explicit differing value — whether spelled as an `ALTER TABLE`, as a
-`CREATE TABLE` adopting one of these tables from a peer that already has it, or as a fresh
-`CREATE TABLE` of a reserved name from a peer that has already dropped it (guarding against
-DROP + CREATE circumvention) — refuses the whole sync batch; an axis the arriving DDL is
-simply silent on preserves this table's current declared value rather than clearing it, so a
-half-healed peer converging on the same declaration interoperates instead of wedging. If your workload needs a different input-copy lifetime than 7
-days, that is not a schema knob on this table — it is `run_input_retention`'s `grace_ms`
-argument, which you call on your own
-schedule.
+**The engine reserves NINE table names for this module and its siblings: `work_jobs`,
+`work_claims`, `work_results`, `work_failures`, `work_cancellations`, `work_inputs`,
+`work_capabilities`, `peer_directory`, `work_node_contacts`.** A `CREATE TABLE` of any of these
+nine names refuses unless your columns structurally match the owning installer's own declaration —
+you can't shadow a reserved name with an incompatible shape.
+
+**What IS guarded on all nine today: the `SYNC CONFLICT` axis only.** A `SYNC CONFLICT` clause
+that mismatches the engine's own arbitration for that table refuses — on `CREATE`, on `ALTER`, and
+on the identical mutation arriving from a peer over sync (an explicit differing value refuses the
+whole sync batch; silence, or writing back the table's own current policy, is accepted — that is
+what a pre-declaration root looks like before its first reconcile, and what an honest restate looks
+like). `SHOW SYNC_CONFLICT_POLICY` renders the eight of these nine tables that actually carry a
+policy — `peer_directory` plus every work-ledger table except `work_node_contacts`, which declares
+none and so shows no row at all.
+
+**`work_inputs`, `work_capabilities`, `peer_directory`, and `work_node_contacts` are fully
+guarded** — every axis (`RETAIN`, `HISTORY`, sync-direction, `SYNC CONFLICT`) refuses a mismatching
+`ALTER TABLE`, locally and on arrival from a peer; restating the table's own already-declared value
+verbatim is accepted as a no-op, not a mismatch. `work_inputs`' own `RETAIN 7 DAYS` window is a
+real example of this: `ALTER TABLE work_inputs DROP RETAIN` and `ALTER TABLE work_inputs SET
+RETAIN 30 DAYS` both refuse today, naming `work_inputs` as engine-owned in the error. If your
+workload needs a different input-copy lifetime than 7 days, the sanctioned way is
+`run_input_retention`'s `grace_ms` argument, which you call on your own schedule — not an `ALTER
+TABLE` on `work_inputs`, which will refuse.
+
+**What is NOT yet guarded: `RETAIN`, `HISTORY`, and sync-direction (`SYNC OFF` / `SYNC PUSH ONLY` /
+etc.) on the OTHER five reserved names — the hub-refereed work-ledger tables `work_jobs`,
+`work_claims`, `work_results`, `work_failures`, `work_cancellations`.** `ALTER TABLE work_jobs SET
+SYNC OFF` or `SET RETAIN <window>` against one of these succeeds and is honored today, even though
+it should be refused the same way the four tables above (and every table's `SYNC CONFLICT` axis)
+are — this is a filed bug, deferred to a follow-up run, not a contract you should rely on.
+**Practical guidance: don't run those ALTERs against a fabric store, whether or not the engine
+currently stops you.**
+
+<!-- VERIFY-AT-TIP --> The exact guard boundary above (SYNC CONFLICT guarded on all nine; RETAIN /
+HISTORY / sync-direction unguarded on the five hub-refereed tables; eight of nine rows rendering
+under `SHOW SYNC_CONFLICT_POLICY`) reflects the current gap plus a round-5 fix landing on the
+sibling `run-c-flow0` branch; this skill's own worked examples were executed against binaries
+pinned at `7e2d22a`, which predate that work, so re-verify this paragraph specifically (not the
+rest of the file) against a binary built at tip once `run-c-flow0` merges, before treating it as
+executed/confirmed.
 
 ## Claim across machines
 
@@ -232,3 +295,8 @@ automatically.
 - [`docs/architecture.md`](../../docs/architecture.md#work-ledger-and-media-plane) — the module
   disambiguation, entitlement rule, and the worked two-node example above
 - [`skills/sync/SKILL.md`](../sync/SKILL.md) — the `SyncClient`/hub the execution layer rides on
+
+## Next
+
+- Stand up the hub/edge `SyncClient` this crate's execution layer rides on → [`skills/sync/SKILL.md`](../sync/SKILL.md)
+- Open a database, run SQL directly (no ledger) → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)

@@ -18,6 +18,17 @@ There is **no broker**. An edge reaches the hub by dialing the hub's own cryptog
 behind NAT works, no port forwarding and no VPN. Two machines on one LAN sync with nothing running
 in between and no internet; the default configuration contacts no third-party service.
 
+## Recipe checklist — hub, enroll, push, pull, converge
+
+1. Start the hub (below) and capture its ticket.
+2. Enroll edge A with that ticket, create a table, insert a row, `.sync push`.
+3. Enroll edge B with the same ticket, `.sync pull`, confirm the row arrived.
+4. Read `.sync status` and validate the counts mean what you think (§5 below) before trusting a
+   green run.
+5. **If a push or pull exits `3`**, that is not a failure — go to §6 ("Handle exit code 3").
+6. **If you need a DELETE to survive sync and a process restart**, the push/pull walkthrough
+   below is not enough by itself — go straight to the dedicated recipe in §7.
+
 ## 1. Start the hub
 
 The hub only serves. You don't type SQL at it — your data lives on the edges that dial in.
@@ -107,6 +118,33 @@ Pulled: 1 applied, 0 skipped, 0 conflicts
 Push from edge B and pull on edge A for the other direction; both edges then hold the same rows,
 converged through the hub.
 
+### Worked example 2 — the other direction, machine-readable
+
+```bash
+contextdb ./edge-b.db --tenant-id demo --sync-endpoint "$TICKET" <<'SQL'
+INSERT INTO items (id, name) VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'from edge B');
+.sync push
+SQL
+```
+
+```text
+Pushed: 1 applied, 0 skipped, 0 conflicts
+```
+
+```bash
+printf '.sync pull\nSELECT id, name FROM items ORDER BY name;\n' \
+  | contextdb ./edge-a.db --tenant-id demo --sync-endpoint "$TICKET" --json
+```
+
+```json
+{"sync_pull":{"applied_rows":1,"conflicts":[],"outcome":"applied","skipped_rows":0}}
+[{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","name":"from edge A"},{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","name":"from edge B"}]
+```
+
+Validate: both edges now read 2 rows. **If a pull reports `applied_rows:0` and you expected a
+row**, run `.sync status` (§4) and compare `push_watermark`/`pull_watermark` — the row you're
+waiting for may not have been pushed from its origin edge yet.
+
 ## 4. Check state
 
 ```bash
@@ -182,6 +220,123 @@ esac
 
 A scripted `push && shutdown` must treat `3` as "retry on next start". Precedence: a definitive
 sync error is `1`, an unconfirmed push is `3`, success is `0`.
+
+## 7. A delete that stays deleted — across sync AND restart
+
+This is the recipe to reach for whenever a delete must actually leave the machine it happened on
+and survive a process restart on the receiving edge. Compressed into one pass so you don't have to
+assemble it turn-by-turn from the push/pull pattern above.
+
+1. **Declare the table `SYNC CONFLICT KEEP LATEST` up front.** This is the load-bearing step —
+   under the default `SYNC CONFLICT KEEP FIRST`, a delete is arbitrated exactly like a write: the
+   first accepted value for a key wins, so a delete pushed after the insert was already accepted
+   does **not** propagate. The pulling edge reports `skipped:1`, the row survives, and there is no
+   error to alert you — it is a silent stranding, not a refusal. `KEEP LATEST` is what makes "last
+   accepted change wins" include a delete. Run
+   [`scripts/sync-policy-lint.sh`](../../scripts/sync-policy-lint.sh) against a store to catch this
+   before it bites — it flags exactly this combination.
+2. Stand up the hub, enroll both edges, insert on edge X, push, pull on edge Y — same shape as §§1–3.
+3. On edge X, `DELETE` the row and `.sync push`.
+4. On edge Y, `.sync pull` and confirm `applied` includes the delete (not `skipped`) and the row is
+   gone.
+5. Start a genuinely **new** `contextdb` process against edge Y's file and re-read the table — the
+   delete must still be gone after the restart, not just within the same session.
+6. **If step 4 shows `skipped` instead of `applied`, go back to step 1** — the table is still on
+   `KEEP FIRST`. Retiring the row and re-deleting it after fixing the policy is the recovery; there
+   is no way to make an already-stranded delete propagate without a policy change.
+
+### Worked example — hub, two edges, delete, restart
+
+```bash
+contextdb-server --db-path ./hub2.db --tenant-id lifecycle --ticket-file ./hub.ticket &
+until [ -s ./hub.ticket ]; do sleep 0.2; done
+TICKET="$(cat ./hub.ticket)"
+
+contextdb ./edge-x.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+CREATE TABLE records (id UUID PRIMARY KEY, body TEXT) SYNC CONFLICT KEEP LATEST;
+INSERT INTO records (id, body) VALUES ('cccccccc-3333-4ccc-8ccc-cccccccccccc', 'will be deleted');
+.sync push
+SQL
+```
+```text
+Pushed: 1 applied, 0 skipped, 0 conflicts
+```
+
+```bash
+contextdb ./edge-y.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+.sync pull
+SELECT COUNT(*) AS n FROM records;
+SQL
+```
+```text
+Pulled: 1 applied, 0 skipped, 0 conflicts
++---+
+| n |
++---+
+| 1 |
++---+
+```
+
+```bash
+contextdb ./edge-x.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+DELETE FROM records WHERE id = 'cccccccc-3333-4ccc-8ccc-cccccccccccc';
+.sync push
+SQL
+```
+```text
+Pushed: 1 applied, 0 skipped, 0 conflicts
+```
+
+```bash
+contextdb ./edge-y.db --tenant-id lifecycle --sync-endpoint "$TICKET" <<'SQL'
+.sync pull
+SELECT COUNT(*) AS n FROM records;
+SQL
+```
+```text
+Pulled: 1 applied, 0 skipped, 0 conflicts
++---+
+| n |
++---+
+| 0 |
++---+
+```
+
+Now the restart — a **fresh process**, same file:
+
+```bash
+echo "SELECT COUNT(*) AS n FROM records;" \
+  | contextdb ./edge-y.db --tenant-id lifecycle --sync-endpoint "$TICKET" --json
+```
+```json
+[{"n":0}]
+```
+
+The delete survived the restart — `n` is `0`, which is what step 5 validates. **A known, separate
+gotcha you may see right after that same line: the process still exits `1`**, with a stderr line
+like `Final sync push failed: ... strict received row records ... replays a lineage terminated by
+an accepted delete`. This is the CLI's unconditional final-push-on-exit (§6) re-offering the
+tombstone edge Y just pulled, which the hub's replay guard refuses because that lineage is already
+terminated. **The data is correct — `n` is genuinely `0` — this exit code is not evidence the
+delete failed.** Read the query result first; only treat that specific `class:sync` message as
+informational. <!-- VERIFY-AT-TIP -->
+
+### Contrast: the same sequence under the default `KEEP FIRST` (what NOT to declare here)
+
+```text
+Pulled: 0 applied, 1 skipped, 0 conflicts
++---+
+| n |
++---+
+| 1 |
++---+
+```
+
+Same commands, only the table's conflict policy differs (`KEEP FIRST`, the default, instead of
+`KEEP LATEST`). The delete is pushed successfully from edge X but edge Y's pull reports `skipped`,
+and the row is still there. This is ratified engine behavior, not a bug to work around — a delete
+is arbitrated by the declared policy exactly like an upsert, so the fix is declaring the right
+policy up front (step 1), never retrying the push.
 
 ## Per-table control
 
@@ -262,3 +417,9 @@ A typo in an endpoint spec errors loudly and names the accepted parameters.
 - Full flag, meta-command and document reference: [`docs/cli.md`](../../docs/cli.md#sync-commands)
 - Protocol, watermarks, conflict semantics, tenants vs contexts: [`docs/architecture.md`](../../docs/architecture.md#sync)
 - Two-machine walkthrough: [`docs/getting-started.md`](../../docs/getting-started.md#sync-across-two-machines)
+
+## Next
+
+- Lint a store's sync policy before you ship a table declaration → [`scripts/sync-policy-lint.sh`](../../scripts/sync-policy-lint.sh)
+- Open a database, run SQL, read `--json` → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)
+- Distribute jobs and blobs over this same hub → [`skills/work-fabric/SKILL.md`](../work-fabric/SKILL.md)

@@ -15,6 +15,19 @@ traverse a graph, and rank by similarity without leaving the database.
 The operator is pgvector's `<=>` (cosine distance) in `ORDER BY`. There is **no `vector_search()`
 function** — `<=>` is the whole surface.
 
+## Recipe checklist
+
+1. Declare one `VECTOR(n)` column per embedding space you need (below) — a row can carry more than
+   one.
+2. Search with `ORDER BY <col> <=> <vector> LIMIT n` (mandatory `LIMIT`). Add a `WHERE` clause to
+   pre-filter, not post-filter.
+3. **If you need "close AND actually worked", not just "close"**, go to `USE RANK` below — plain
+   `<=>` order alone cannot express that.
+4. **If you need "close, but only within this graph neighborhood"**, go to the hybrid query at the
+   bottom — that's the graph skill's traversal composed with steps 1–2 here.
+5. **If a query errors `VectorIndexDimensionMismatch`**, the literal you passed doesn't match the
+   column's declared `VECTOR(n)` — go back to step 1 and check `.schema <table>`.
+
 ## Declare an embedding column
 
 ```bash
@@ -168,6 +181,29 @@ row on the joined side.
 **Rank policies are schema.** To change one today, recreate the table with the new `RANK_POLICY`
 clause and reload the rows.
 
+### Worked example 2 — the same query, without `USE RANK`, to see what the policy actually changes
+
+Run this against the identical `rank.db` from example 1, dropping `USE RANK effective_confidence`:
+
+```bash
+echo "SELECT id, description FROM decisions ORDER BY embedding <=> [1.0, 0.0] LIMIT 5;" \
+  | contextdb ./rank.db --json
+```
+
+```json
+[{"description":"closest but failed","id":"11111111-1111-1111-1111-111111111111"},{"description":"less similar but worked","id":"22222222-2222-2222-2222-222222222222"},{"description":"fallback with no outcome","id":"33333333-3333-3333-3333-333333333333"}]
+```
+
+Plain cosine order puts the row that FAILED first, because it's the closest vector. That is exactly
+the ordering `USE RANK` exists to override. **Validate you actually declared the rank policy** by
+comparing these two queries — if adding `USE RANK <sort_key>` doesn't change the order at all, the
+policy isn't attached to the column you're querying (check `.schema decisions` for a `rank_policy`
+key) or `USE RANK` named the wrong `SORT_KEY`.
+
+**If `ORDER BY ... USE RANK <name>` is refused as unknown**, the `SORT_KEY` in the `RANK_POLICY`
+clause doesn't match — re-check `.schema decisions` for the exact declared name; it is
+case-sensitive and not inferred from the formula.
+
 ## The hybrid query — graph narrows, vector ranks
 
 This is the query contextdb exists for: find decisions that are semantically similar *and* still
@@ -267,3 +303,9 @@ depth is 10.
 - Operator, `ROW_VECTOR`, pre-filtering, indexing thresholds, rank-policy grammar: [`docs/query-language.md`](../../docs/query-language.md#vector-similarity-search)
 - Rank policy walkthrough with expected ordering: [`docs/getting-started.md`](../../docs/getting-started.md#rank-vector-search-by-outcomes)
 - More hybrid patterns: [`docs/usage-scenarios.md`](../../docs/usage-scenarios.md) scenarios 4, 7, 8, 13
+
+## Next
+
+- `GRAPH_TABLE`, `DAG`, state machines, `PROPAGATE` — the graph half of the hybrid query → [`skills/querying-the-graph/SKILL.md`](../querying-the-graph/SKILL.md)
+- Open a database, run SQL, read `--json` → [`skills/using-contextdb/SKILL.md`](../using-contextdb/SKILL.md)
+- Replicate embeddings across machines → [`skills/sync/SKILL.md`](../sync/SKILL.md)

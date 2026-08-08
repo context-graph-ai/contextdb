@@ -24,6 +24,14 @@ A file has exactly one owner at a time. A second open of the same path — from 
 another — fails with `DatabaseLocked`. Keep one session; don't fan out concurrent CLI calls at the
 same file.
 
+**There is no read-only way to open a store with plain `contextdb <path>` — not even a no-op
+meta-command like `.help`.** Every session, including one that only reads, rewrites the file's
+bytes. Before you open a store you must not alter — someone else's, a backup, anything you didn't
+create for this task — read
+[`AGENTS.md`'s "There is no read-only way to open a store"](../../AGENTS.md#there-is-no-read-only-way-to-open-a-store)
+for the sanctioned copy-first / `repair` pattern. `scripts/store-health-check.sh` (below) already
+follows it — read it as a working example of the pattern, not just the prose.
+
 When stdin is not a terminal the CLI runs in **pipe mode**: no banner, no prompt, results on
 stdout, every error and diagnostic on stderr, and the process exit code tells you what happened.
 That is the mode to script in.
@@ -234,6 +242,33 @@ from an interactive session, because nobody can act on it once the process is go
   other than `COUNT`. Full list: [`docs/query-language.md`](../../docs/query-language.md#unsupported-features).
 - **Logs go to stderr** at level `ERROR` by default; raise with `RUST_LOG=debug`.
 
+## Verify a store deterministically — run the script, don't hand-check
+
+Whenever you need to confirm a store is healthy and readable — opens cleanly, `.tables` lists what
+you expect, every table's row count is actually readable — run
+[`scripts/store-health-check.sh`](../../scripts/store-health-check.sh) instead of re-deriving the
+same three checks by hand:
+
+1. `CONTEXTDB_CLI=<path-to-contextdb> scripts/store-health-check.sh ./demo.db`
+2. Expected output on a healthy store: an `OK   repair: ...` line, an `OK   .tables: N table(s)`
+   line, then one `OK   <table>  <n> row(s)` line per table.
+3. Exit code `0` means every check passed. **If it exits `1`, the printed line tells you exactly
+   which check failed** (repair reported a problem, or one table's row count was unreadable) — go
+   fix that specific thing rather than re-running the whole store from scratch.
+
+```bash
+CONTEXTDB_CLI=./bin/contextdb scripts/store-health-check.sh ./demo.db
+```
+```text
+OK   repair: repair: './demo.db' is current-format and its schema layout reads cleanly; nothing to repair.
+OK   .tables: 1 table(s)
+OK   decisions                        1 row(s)
+```
+
+The script itself follows the copy-first pattern above — it never opens your original file for the
+inspection half, only a `mktemp -d` peek copy — so it is also the reference implementation to copy
+if you're writing your own read-only-feeling check.
+
 ## Embedding it instead
 
 The CLI is for exploration and scripting. The primary interface is the Rust API — same engine,
@@ -267,6 +302,7 @@ use literals. Details and the plugin/subscription surface:
 
 ## Next
 
+- DAG edges, graph traversal, state machines, cascades → [`skills/querying-the-graph/SKILL.md`](../querying-the-graph/SKILL.md)
 - Replicate across machines → [`skills/sync/SKILL.md`](../sync/SKILL.md)
 - Similarity search and ranking → [`skills/vector-search/SKILL.md`](../vector-search/SKILL.md)
 - Distribute jobs and blobs → [`skills/work-fabric/SKILL.md`](../work-fabric/SKILL.md)
