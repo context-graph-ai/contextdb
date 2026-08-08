@@ -1,0 +1,120 @@
+name: Flake Hunt
+
+# Runs the workspace test suite up to 3 times looking for intermittent
+# (flaky) failures — a test that fails on one attempt and passes on another
+# with no code change in between. A test that fails on every attempt is a
+# real regression, not a flake; this workflow still files it (the failure
+# list makes that visible either way), but its purpose is catching the
+# flaky class that a single green/red CI run cannot distinguish from luck.
+on:
+  schedule:
+    - cron: '0 3 * * 1' # every Monday 03:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: never
+  RUSTFLAGS: "-D warnings"
+  CARGO_INCREMENTAL: 0
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  flake-hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo test --workspace up to 3 times
+        id: runs
+        shell: bash
+        run: |
+          set +e
+          mkdir -p flake-hunt-logs
+          for attempt in 1 2 3; do
+            echo "::group::attempt $attempt"
+            cargo test --workspace 2>&1 | tee "flake-hunt-logs/attempt-${attempt}.log"
+            status=${PIPESTATUS[0]}
+            echo "attempt $attempt exit status: $status"
+            echo "$status" > "flake-hunt-logs/attempt-${attempt}.status"
+            echo "::endgroup::"
+          done
+
+      - name: Extract failing test names
+        id: extract
+        run: |
+          set -e
+          # `cargo test` prints one line per failing test as
+          # `test <name> ... FAILED`; collect the unique set across every
+          # attempt so a test that only fails sometimes is still caught.
+          grep -h -E '^test .* \.\.\. FAILED$' flake-hunt-logs/attempt-*.log \
+            | sed -E 's/^test (.*) \.\.\. FAILED$/\1/' \
+            | sort -u > flake-hunt-logs/failing-tests.txt || true
+
+          if [ -s flake-hunt-logs/failing-tests.txt ]; then
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+            first_failing=$(head -n1 flake-hunt-logs/failing-tests.txt)
+            echo "first_failing=$first_failing" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Upload flake-hunt logs
+        if: steps.extract.outputs.has_failures == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-hunt-logs
+          path: flake-hunt-logs/
+          retention-days: 30
+
+      - name: File or update the flaky-test issue
+        if: steps.extract.outputs.has_failures == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FIRST_FAILING: ${{ steps.extract.outputs.first_failing }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -e
+          title="flaky-test: ${FIRST_FAILING}"
+
+          # Idempotent label create: succeeds once, silently no-ops on
+          # every later run once the label already exists.
+          gh label create flaky-test \
+            --color ededed \
+            --description "Failed at least once in the scheduled flake-hunt workflow" \
+            --repo "${GITHUB_REPOSITORY}" 2>/dev/null || true
+
+          body_file=$(mktemp)
+          {
+            echo "The scheduled [flake-hunt workflow](${RUN_URL}) ran \`cargo test --workspace\` up to 3 times and saw at least one failing run."
+            echo
+            echo "Failing test(s) observed across the attempts:"
+            echo
+            sed 's/^/- `/; s/$/`/' flake-hunt-logs/failing-tests.txt
+            echo
+            echo "Attempt exit statuses: $(cat flake-hunt-logs/attempt-1.status flake-hunt-logs/attempt-2.status flake-hunt-logs/attempt-3.status | tr '\n' ' ')"
+            echo
+            echo "Full logs are attached to the workflow run as the \`flake-hunt-logs\` artifact: ${RUN_URL}"
+          } > "$body_file"
+
+          existing=$(gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --state open \
+            --search "in:title \"${title}\"" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "${GITHUB_REPOSITORY}" --body-file "$body_file"
+          else
+            gh issue create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "$title" \
+              --label flaky-test \
+              --body-file "$body_file"
+          fi
+        shell: bash
